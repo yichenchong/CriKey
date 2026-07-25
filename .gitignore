@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Local plugin corpora and profiles
+/compatibility/real-plugin-corpus/packages/
+/.crikey-dev/
+*.profraw

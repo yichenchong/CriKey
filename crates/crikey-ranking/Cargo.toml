@@ -1,0 +1,16 @@
+[package]
+name = "crikey-ranking"
+description = "Ranking signals and the default ranker (match quality, history, context)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crikey-core.workspace = true
+crikey-query.workspace = true

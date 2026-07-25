@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+// CriKey plugin protocol, version 1 (spec 16.3).
+// Additive evolution only: never renumber or reuse a field tag.
+package crikey.v1;
+
+message Envelope {
+  uint64 connection_id = 1;
+  uint64 request_id = 2;
+  // Query generation this message belongs to, when applicable (spec 8.1).
+  uint64 generation = 3;
+  // Milliseconds from receipt, when the host imposes a deadline.
+  uint64 deadline_ms = 4;
+
+  oneof payload {
+    Handshake handshake = 10;
+    HandshakeAck handshake_ack = 11;
+    SuggestRequest suggest = 12;
+    ResultBatch results = 13;
+    Cancel cancel = 14;
+    Shutdown shutdown = 15;
+  }
+}
+
+message Handshake {
+  uint32 protocol_version = 1;
+  string plugin_id = 2;
+  string plugin_version = 3;
+  repeated string capabilities = 4;
+}
+
+message HandshakeAck {
+  uint32 protocol_version = 1;
+  repeated string host_capabilities = 2;
+}
+
+message SuggestRequest {
+  string text = 1;
+  string normalized_text = 2;
+  // Item the user already selected, for argument suggestions.
+  string selected_item_id = 3;
+}
+
+message Item {
+  string stable_id = 1;
+  string label = 2;
+  string description = 3;
+  string target = 4;
+  string category = 5;
+  repeated string search_terms = 6;
+  string icon_reference = 7;
+  int32 score_hint = 8;
+  map<string, string> metadata = 9;
+}
+
+message ResultBatch {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    PARTIAL = 1;
+    FINAL = 2;
+    CANCELLED = 3;
+    FAILED = 4;
+  }
+  State state = 1;
+  repeated Item items = 2;
+}
+
+message Cancel {
+  string reason = 1;
+}
+
+message Shutdown {
+  bool immediate = 1;
+}

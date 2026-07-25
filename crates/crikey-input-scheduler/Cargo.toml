@@ -1,0 +1,15 @@
+[package]
+name = "crikey-input-scheduler"
+description = "Query generation tracking, modern debouncing, legacy obsolete-work replacement, cancellation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crikey-core.workspace = true

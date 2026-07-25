@@ -1,0 +1,18 @@
+[package]
+name = "crikey-python-host"
+description = "Modern CPython worker host and managed-environment launch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crikey-core.workspace = true
+crikey-native-protocol.workspace = true
+crikey-plugin-model.workspace = true
+crikey-plugin-supervisor.workspace = true

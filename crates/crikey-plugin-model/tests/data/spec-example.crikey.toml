@@ -1,0 +1,41 @@
+manifest-version = 1
+
+[plugin]
+id = "dev.example.repositories"
+name = "Repository Search"
+version = "1.0.0"
+runtime = "native"
+entrypoint.windows-x86_64 = "bin/repository-search.exe"
+entrypoint.linux-x86_64 = "bin/repository-search"
+entrypoint.macos-aarch64 = "bin/repository-search"
+api = ">=1.0,<2"
+
+[platform]
+os = ["windows", "macos", "linux"]
+arch = ["x86_64", "aarch64"]
+
+[activation]
+minimum-query-length = 2
+prefixes = ["repo", "git"]
+
+[query]
+debounce-ms = 50
+maximum-wait-ms = 200
+leading-edge = true
+trailing-edge = true
+max-concurrent-requests = 1
+
+[permissions]
+filesystem = [
+    { scope = "user-selected", access = "read" }
+]
+network = false
+clipboard = "none"
+process = false
+
+[performance]
+startup = "lazy"
+suggest-soft-timeout-ms = 50
+suggest-hard-timeout-ms = 500
+maximum-results-per-query = 250
+maximum-results-per-batch = 50

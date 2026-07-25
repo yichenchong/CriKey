@@ -1,0 +1,20 @@
+# Real-plugin compatibility corpus (spec 27.4).
+# Packages are referenced, never vendored. Update `classification` from the
+# results of `crikey dev test-legacy-compat`.
+#
+# classification =
+#   works-unchanged | works-with-configuration-changes |
+#   works-with-minimal-source-changes | windows-only-but-compatible |
+#   blocked-missing-apis | blocked-python-version |
+#   blocked-undocumented-behaviour | works-only-under-legacy-optimized |
+#   requires-legacy-strict
+
+corpus-version = 1
+
+# [[package]]
+# id = "example.package"
+# source = "https://github.com/example/keypirinha-package"
+# revision = "0000000000000000000000000000000000000000"
+# licence = "MIT"
+# classification = "untested"
+# notes = ""

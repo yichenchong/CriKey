@@ -1,0 +1,18 @@
+[package]
+name = "crikey-native-host"
+description = "Supervised native subprocess plugin host."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crikey-core.workspace = true
+crikey-native-protocol.workspace = true
+crikey-plugin-model.workspace = true
+crikey-plugin-supervisor.workspace = true

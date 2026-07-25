@@ -1,0 +1,40 @@
+# Legacy API compatibility matrix (spec 14.10).
+# status = full | behavioural-difference | windows-only | partial | unsupported | planned
+matrix-version = 1
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.should_terminate"
+status = "planned"
+notes = "Cooperative cancellation backed by the obsolete-work manager."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.set_suggestions"
+status = "planned"
+notes = "Translated into one complete internal result publication per callback."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.set_catalog"
+status = "planned"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.merge_catalog"
+status = "planned"
+
+[[api]]
+module = "keypirinha_util"
+symbol = "*"
+status = "planned"
+
+[[api]]
+module = "keypirinha_net"
+symbol = "*"
+status = "planned"
+
+[[api]]
+module = "keypirinha_wintypes"
+symbol = "*"
+status = "windows-only"

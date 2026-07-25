@@ -1,0 +1,16 @@
+[package]
+name = "crikey-catalog"
+description = "Catalog store: in-memory index, persistence, incremental updates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crikey-core.workspace = true
+crikey-query.workspace = true

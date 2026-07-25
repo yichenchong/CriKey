@@ -1,0 +1,16 @@
+[package]
+name = "crikey-plugin-sdk"
+description = "Official Rust SDK for CriKey native plugins."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crikey-core.workspace = true
+crikey-native-protocol.workspace = true

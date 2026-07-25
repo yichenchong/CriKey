@@ -1,0 +1,15 @@
+[package]
+name = "crikey-query"
+description = "Query normalization, tokenization, prefix/substring/fuzzy/acronym matching, scoring primitives."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crikey-core.workspace = true

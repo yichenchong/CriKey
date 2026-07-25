@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/crikey-core",
+    "crates/crikey-query",
+    "crates/crikey-ranking",
+    "crates/crikey-catalog",
+    "crates/crikey-result-aggregator",
+    "crates/crikey-input-scheduler",
+    "crates/crikey-plugin-model",
+    "crates/crikey-plugin-supervisor",
+    "crates/crikey-native-protocol",
+    "crates/crikey-native-host",
+    "crates/crikey-python-host",
+    "crates/crikey-legacy-compat",
+    "crates/crikey-platform",
+    "crates/crikey-platform-windows",
+    "crates/crikey-platform-macos",
+    "crates/crikey-platform-linux",
+    "crates/crikey-package-manager",
+    "crates/crikey-ui",
+    "crates/crikey-app",
+    "crates/crikey-cli",
+    "sdk/rust",
+    "benchmarks",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/crikey-launcher/crikey"
+authors = ["The CriKey Authors"]
+
+[workspace.dependencies]
+crikey-core = { path = "crates/crikey-core", version = "0.1.0" }
+crikey-query = { path = "crates/crikey-query", version = "0.1.0" }
+crikey-ranking = { path = "crates/crikey-ranking", version = "0.1.0" }
+crikey-catalog = { path = "crates/crikey-catalog", version = "0.1.0" }
+crikey-result-aggregator = { path = "crates/crikey-result-aggregator", version = "0.1.0" }
+crikey-input-scheduler = { path = "crates/crikey-input-scheduler", version = "0.1.0" }
+crikey-plugin-model = { path = "crates/crikey-plugin-model", version = "0.1.0" }
+crikey-plugin-supervisor = { path = "crates/crikey-plugin-supervisor", version = "0.1.0" }
+crikey-native-protocol = { path = "crates/crikey-native-protocol", version = "0.1.0" }
+crikey-native-host = { path = "crates/crikey-native-host", version = "0.1.0" }
+crikey-python-host = { path = "crates/crikey-python-host", version = "0.1.0" }
+crikey-legacy-compat = { path = "crates/crikey-legacy-compat", version = "0.1.0" }
+crikey-platform = { path = "crates/crikey-platform", version = "0.1.0" }
+crikey-platform-windows = { path = "crates/crikey-platform-windows", version = "0.1.0" }
+crikey-platform-macos = { path = "crates/crikey-platform-macos", version = "0.1.0" }
+crikey-platform-linux = { path = "crates/crikey-platform-linux", version = "0.1.0" }
+crikey-package-manager = { path = "crates/crikey-package-manager", version = "0.1.0" }
+crikey-ui = { path = "crates/crikey-ui", version = "0.1.0" }
+crikey-app = { path = "crates/crikey-app", version = "0.1.0" }
+crikey-cli = { path = "crates/crikey-cli", version = "0.1.0" }
+crikey-plugin-sdk = { path = "sdk/rust", version = "0.1.0" }
+
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_debug_implementations = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

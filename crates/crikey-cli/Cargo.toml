@@ -1,0 +1,20 @@
+[package]
+name = "crikey-cli"
+description = "The `crikey` command-line entrypoint."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "crikey"
+path = "src/main.rs"
+
+[dependencies]
+crikey-app.workspace = true
+crikey-core.workspace = true
