@@ -61,17 +61,28 @@ impl App {
 
     /// Name of the platform backend compiled into this build.
     pub fn platform_backend_name() -> &'static str {
-        if cfg!(windows) {
-            "windows"
-        } else if cfg!(target_os = "macos") {
-            "macos"
-        } else if cfg!(target_os = "linux") {
-            "linux"
-        } else {
-            "unsupported"
-        }
+        Backend::NAME
     }
 }
+
+/// The platform backend selected for this target.
+///
+/// Per ADR-0001 this is the only place in the workspace that names a backend
+/// crate. Resolving the alias is what makes the `cfg` target dependencies
+/// load-bearing: a mis-gated or renamed backend fails the build here rather
+/// than silently falling back.
+#[cfg(windows)]
+pub type Backend = crikey_platform_windows::WindowsBackend;
+#[cfg(target_os = "macos")]
+pub type Backend = crikey_platform_macos::MacOsBackend;
+#[cfg(target_os = "linux")]
+pub type Backend = crikey_platform_linux::LinuxBackend;
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+compile_error!(
+    "CriKey has no platform backend for this target; \
+     implement one behind the crikey-platform traits (spec 18)"
+);
 
 #[cfg(test)]
 mod tests {
@@ -82,6 +93,16 @@ mod tests {
         assert_eq!(
             App::new().default_legacy_profile(),
             SchedulingProfile::LegacyStrict
+        );
+    }
+
+    #[test]
+    fn the_selected_backend_identifies_itself() {
+        let _backend = Backend::new();
+        assert!(
+            matches!(App::platform_backend_name(), "windows" | "macos" | "linux"),
+            "backend NAME must be a known platform id, got {:?}",
+            App::platform_backend_name()
         );
     }
 }

@@ -27,7 +27,14 @@ jobs:
       - run: cargo test --workspace --all-targets
 
   python-sdk:
-    runs-on: ubuntu-latest
+    # The Python worker and the legacy shim are the most OS-sensitive code in
+    # the tree (path separators, encodings, pipe and subprocess setup), and
+    # Windows is the primary compatibility target. Same fan-out as the Rust job.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -14,6 +14,9 @@ use crikey_platform::{Capability, CapabilityState};
 pub struct MacOsBackend;
 
 impl MacOsBackend {
+    /// Stable backend identifier surfaced by diagnostics and `crikey version`.
+    pub const NAME: &'static str = "macos";
+
     pub fn new() -> Self {
         Self
     }

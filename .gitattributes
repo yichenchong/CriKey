@@ -1,0 +1,10 @@
+# Normalize to LF in the repository so a Windows checkout cannot introduce
+# CRLF diffs, and rustfmt/clippy behave identically on all three CI runners.
+* text=auto eol=lf
+
+# Keypirinha package archives and plugin binaries are opaque.
+*.keypirinha-package binary
+*.lnk binary
+*.png binary
+*.ico binary
+*.icns binary

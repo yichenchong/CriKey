@@ -14,6 +14,9 @@ use crikey_platform::{Capability, CapabilityState};
 pub struct WindowsBackend;
 
 impl WindowsBackend {
+    /// Stable backend identifier surfaced by diagnostics and `crikey version`.
+    pub const NAME: &'static str = "windows";
+
     pub fn new() -> Self {
         Self
     }
