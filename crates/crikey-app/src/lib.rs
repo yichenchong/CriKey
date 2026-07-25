@@ -8,8 +8,11 @@ use crikey_core::GenerationTracker;
 use crikey_input_scheduler::SchedulingProfile;
 use crikey_result_aggregator::ResultLimits;
 
-/// Staged startup (spec 25.6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// State-only milestones for staged startup (spec 25.6).
+///
+/// Completing a milestone records coordination state only. The caller remains
+/// responsible for performing and verifying the corresponding startup work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupStage {
     WindowAndHotkey,
     PersistedCatalog,
@@ -17,6 +20,68 @@ pub enum StartupStage {
     RequiredWorkers,
     LegacyPlugins,
     BackgroundRefresh,
+    LazyModernPlugins,
+}
+
+/// A rejected acknowledgement of a startup milestone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupError {
+    /// The acknowledged milestone precedes the milestone currently pending.
+    StaleAcknowledgement {
+        expected: StartupStage,
+        pending: StartupStage,
+    },
+    /// The acknowledged milestone has not become pending yet.
+    OutOfOrderAcknowledgement {
+        expected: StartupStage,
+        pending: StartupStage,
+    },
+    /// The eager startup sequence has already handed off to lazy activation.
+    AlreadyComplete,
+}
+
+impl std::fmt::Display for StartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaleAcknowledgement { expected, pending } => write!(
+                formatter,
+                "startup milestone {expected:?} is stale; {pending:?} is pending"
+            ),
+            Self::OutOfOrderAcknowledgement { expected, pending } => write!(
+                formatter,
+                "startup milestone {expected:?} is out of order; {pending:?} is pending"
+            ),
+            Self::AlreadyComplete => formatter.write_str("eager startup coordination is already complete"),
+        }
+    }
+}
+
+impl std::error::Error for StartupError {}
+
+impl StartupStage {
+    /// Returns the next startup stage in specification order.
+    pub const fn next(self) -> Option<Self> {
+        match self {
+            Self::WindowAndHotkey => Some(Self::PersistedCatalog),
+            Self::PersistedCatalog => Some(Self::AcceptQueries),
+            Self::AcceptQueries => Some(Self::RequiredWorkers),
+            Self::RequiredWorkers => Some(Self::LegacyPlugins),
+            Self::LegacyPlugins => Some(Self::BackgroundRefresh),
+            Self::BackgroundRefresh => Some(Self::LazyModernPlugins),
+            Self::LazyModernPlugins => None,
+        }
+    }
+
+    fn precedes(self, other: Self) -> bool {
+        let mut candidate = self.next();
+        while let Some(stage) = candidate {
+            if stage == other {
+                return true;
+            }
+            candidate = stage.next();
+        }
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -25,6 +90,7 @@ pub struct App {
     limits: ResultLimits,
     default_legacy_profile: SchedulingProfile,
     stage: StartupStage,
+    eager_startup_complete: bool,
 }
 
 impl Default for App {
@@ -40,6 +106,7 @@ impl App {
             limits: ResultLimits::default(),
             default_legacy_profile: SchedulingProfile::LegacyStrict,
             stage: StartupStage::WindowAndHotkey,
+            eager_startup_complete: false,
         }
     }
 
@@ -55,8 +122,71 @@ impl App {
         self.default_legacy_profile
     }
 
+    /// Returns the milestone currently awaiting acknowledgement.
+    ///
+    /// After eager startup completes, the terminal lazy-activation milestone
+    /// remains visible for diagnostics.
     pub fn stage(&self) -> StartupStage {
         self.stage
+    }
+
+    /// Acknowledges completion of the expected current startup milestone.
+    ///
+    /// This method coordinates state only: it performs no window, catalog,
+    /// worker, plugin, or refresh work. Intermediate acknowledgements return
+    /// the next pending milestone. Acknowledging `LazyModernPlugins` returns
+    /// `None` and completes the eager sequence, handing responsibility to
+    /// demand-driven lazy activation without activating a plugin itself.
+    pub fn complete_stage(&mut self, expected: StartupStage) -> Result<Option<StartupStage>, StartupError> {
+        if self.eager_startup_complete {
+            return Err(StartupError::AlreadyComplete);
+        }
+
+        if expected != self.stage {
+            let error = if expected.precedes(self.stage) {
+                StartupError::StaleAcknowledgement {
+                    expected,
+                    pending: self.stage,
+                }
+            } else {
+                StartupError::OutOfOrderAcknowledgement {
+                    expected,
+                    pending: self.stage,
+                }
+            };
+            return Err(error);
+        }
+
+        match self.stage.next() {
+            Some(next) => {
+                self.stage = next;
+                Ok(Some(next))
+            }
+            None => {
+                self.eager_startup_complete = true;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Whether the acknowledged milestones permit user queries.
+    pub fn can_accept_queries(&self) -> bool {
+        match self.stage {
+            StartupStage::WindowAndHotkey | StartupStage::PersistedCatalog | StartupStage::AcceptQueries => {
+                false
+            }
+            StartupStage::RequiredWorkers
+            | StartupStage::LegacyPlugins
+            | StartupStage::BackgroundRefresh
+            | StartupStage::LazyModernPlugins => true,
+        }
+    }
+
+    /// Whether eager startup coordination has handed off to lazy activation.
+    ///
+    /// This does not mean that any lazy modern plugin has been activated.
+    pub fn startup_complete(&self) -> bool {
+        self.eager_startup_complete
     }
 
     /// Name of the platform backend compiled into this build.
