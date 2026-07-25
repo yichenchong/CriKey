@@ -1,6 +1,6 @@
 //! The catalog item model (spec 10.1 - 10.3).
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt::Write};
 
 use crate::action::Action;
 
@@ -14,8 +14,36 @@ pub struct ItemId(pub String);
 
 impl ItemId {
     /// Host-side fallback when a plugin does not supply an identifier.
+    ///
+    /// Every tuple component is byte-length-prefixed, and the category variant
+    /// has its own tag. The encoding is therefore injective even when values
+    /// contain the separators used by older display-oriented encodings.
     pub fn derived(plugin: &PluginId, category: &Category, target: &str) -> Self {
-        ItemId(format!("{}::{}::{}", plugin.0, category.as_str(), target))
+        let (category_tag, category_value) = match category {
+            Category::Application => ("application", ""),
+            Category::File => ("file", ""),
+            Category::Directory => ("directory", ""),
+            Category::Url => ("url", ""),
+            Category::Command => ("command", ""),
+            Category::Expression => ("expression", ""),
+            Category::Keyword => ("keyword", ""),
+            Category::Contact => ("contact", ""),
+            Category::ClipboardItem => ("clipboard-item", ""),
+            Category::PluginDefined(name) => ("plugin-defined", name.as_str()),
+        };
+
+        let mut encoded = String::new();
+        for component in [
+            "crikey-derived-item-v1",
+            plugin.0.as_str(),
+            category_tag,
+            category_value,
+            target,
+        ] {
+            write!(&mut encoded, "{}:", component.len()).expect("writing to a String cannot fail");
+            encoded.push_str(component);
+        }
+        ItemId(encoded)
     }
 }
 
@@ -97,5 +125,35 @@ mod tests {
         let a = ItemId::derived(&plugin, &Category::Application, "/usr/bin/foo");
         let b = ItemId::derived(&plugin, &Category::Application, "/usr/bin/foo");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derived_identity_distinguishes_builtin_and_plugin_defined_categories() {
+        let plugin = PluginId("dev.example.apps".into());
+        let builtin = ItemId::derived(&plugin, &Category::Application, "/usr/bin/foo");
+        let plugin_defined = ItemId::derived(
+            &plugin,
+            &Category::PluginDefined("application".into()),
+            "/usr/bin/foo",
+        );
+
+        assert_ne!(builtin, plugin_defined);
+    }
+
+    #[test]
+    fn derived_identity_is_unambiguous_when_components_contain_separators() {
+        let plugin = PluginId("dev.example.apps".into());
+        let category_separator = ItemId::derived(
+            &plugin,
+            &Category::PluginDefined("documents::recent".into()),
+            "entry",
+        );
+        let target_separator = ItemId::derived(
+            &plugin,
+            &Category::PluginDefined("documents".into()),
+            "recent::entry",
+        );
+
+        assert_ne!(category_separator, target_separator);
     }
 }

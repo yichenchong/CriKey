@@ -59,6 +59,9 @@ crikey-plugin-sdk = { path = "sdk/rust", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "2"
+unicode-normalization = "0.1.24"
+unicode-casefold = "0.2.0"
+unicode-general-category = "1.1.0"
 
 [workspace.lints.rust]
 unsafe_code = "warn"
