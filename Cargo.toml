@@ -55,6 +55,7 @@ crikey-ui = { path = "crates/crikey-ui", version = "0.1.0" }
 crikey-app = { path = "crates/crikey-app", version = "0.1.0" }
 crikey-cli = { path = "crates/crikey-cli", version = "0.1.0" }
 crikey-plugin-sdk = { path = "sdk/rust", version = "0.1.0" }
+crikey-benchmarks = { path = "benchmarks", version = "0.1.0" }
 
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

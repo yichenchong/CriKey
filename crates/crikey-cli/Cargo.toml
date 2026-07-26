@@ -17,4 +17,5 @@ path = "src/main.rs"
 
 [dependencies]
 crikey-app.workspace = true
+crikey-benchmarks.workspace = true
 crikey-core.workspace = true

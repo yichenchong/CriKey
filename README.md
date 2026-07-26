@@ -9,8 +9,10 @@ on Windows.
 
 ## Status
 
-Skeleton. The workspace builds and the scheduling core is under construction.
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the delivery plan and
+M0 skeleton complete. M1 core search, catalog persistence, launcher view model,
+Linux discovery, startup staging, and supervisor state are implemented; native
+window integration and Windows platform backends remain. See
+[docs/ROADMAP.md](docs/ROADMAP.md) for measured status and
 [docs/architecture.md](docs/architecture.md) for the component map.
 
 ## Layout

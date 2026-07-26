@@ -67,13 +67,13 @@ round-trips the specification's example verbatim.
 
 Exit: `cargo test --workspace --all-targets` green on Linux; `crikey version` runs.
 
-### M1 — Core launcher (§30 Phase 1) — XL
+### M1 — Core launcher (§30 Phase 1) — XL — in progress
 
 | Deliverable | Crates | Notes |
 | --- | --- | --- |
 | Query normalization + matcher | query | Unicode NFKC, case fold, tokens, prefix/substring/fuzzy/acronym |
 | Default ranker | ranking | match quality, prefix bonus, position, category, score hint |
-| Catalog store + persistent cache | catalog | zero-copy mmap load, per-plugin slices (ADR-0008) |
+| Catalog store + persistent cache | catalog | versioned per-plugin archive, full decode + indexes (ADR-0008) |
 | Result aggregator | result-aggregator | generation gating, dedup by `ItemId`, limits |
 | Launcher window | ui | winit + wgpu/egui, hidden-window warm activation (ADR-0002) |
 | Global hotkey + app discovery | platform, platform-windows | Start Menu, `.lnk`, packaged apps, AppUserModelIDs |
@@ -83,6 +83,21 @@ Exit: `cargo test --workspace --all-targets` green on Linux; `crikey version` ru
 Exit criteria: warm activation < 30 ms p95 and cached local results < 16 ms p95
 on the reference machine; 500k synthetic items searchable; query text renders in
 the next frame with no debounce (§25.1, §31.1–3, §31.27).
+
+Status snapshot (2026-07-26):
+
+- Complete: query normalization and matching, default ranking, bounded result
+  aggregation, persistent per-plugin cache, indexed catalog search, launcher
+  view model, hotkey parsing, Linux desktop-entry discovery, startup staging,
+  and supervisor state skeleton.
+- Measured in release mode on the Intel N150 reference machine: 500,000 items
+  round-trip through the shipped cache; cached local query p95 is 13.099 ms over
+  1,355 typed-prefix samples. The archive is 125,275,069 bytes; full decoding
+  takes 1.801 s and leaves 506.6 MB resident at stress scale (ADR-0008).
+- Remaining before M1 can close: the real launcher renderer/window integration,
+  Windows global-hotkey and application discovery backends, and a measured warm
+  activation p95 below 30 ms. Query latency and catalog scale are green; the M1
+  milestone as a whole is not.
 
 ### M2 — Scheduling and resilience (§30 Phase 2) — L
 
@@ -213,5 +228,5 @@ Tracked as ADRs. Provisional ones carry an explicit revisit trigger.
 | [0005](adr/0005-python-hosting.md) | Out-of-process CPython workers, no in-process interpreter | Accepted |
 | [0006](adr/0006-legacy-scheduling.md) | Obsolete-work replacement for `legacy-strict` | Accepted |
 | [0007](adr/0007-path-representation.md) | Lossless platform paths across IPC | Accepted |
-| [0008](adr/0008-catalog-persistence.md) | Zero-copy memory-mapped catalog cache | Provisional |
+| [0008](adr/0008-catalog-persistence.md) | Versioned per-plugin catalog archive with owned decode | Accepted for M1 |
 | [0009](adr/0009-branding-and-attribution.md) | Branding and attribution rules | Accepted |

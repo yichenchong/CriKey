@@ -1,43 +1,76 @@
 # ADR-0008: Catalog persistence
 
-Status: Provisional — revisit when the M1 benchmark exists
+Status: Accepted for M1
 Spec: §22.1, §25.1, §25.6, §31.27
 
 ## Context
 
-Startup must reach "user can type" quickly with a persisted catalog of up to
-500,000 items, and main-process idle memory should stay under 100 MiB. Parsing
-half a million items from JSON at every launch is not compatible with that.
+Startup stage 2 must recover cached catalog slices without trusting plugin-owned
+files, and the stress path must keep 500,000 items searchable. The specification
+also asks main-process idle memory to remain below 100 MiB where practical.
+Those constraints require a measured format decision rather than an assumed
+zero-copy design.
 
-## Decision (provisional)
+## Decision
 
-- The persisted core catalog is a single memory-mapped, zero-copy archive per
-  plugin slice, loaded without a parse step during startup stage 2.
-- Candidate format: `rkyv`. Selection is confirmed by an M1 benchmark measuring
-  load time, resident memory and search latency at 500k items against a
-  `bincode`-decode baseline.
-- Strings are stored as bytes with an encoding tag (ADR-0007), not `String`.
-- Each plugin owns a slice; invalidation, rebuild and rollback are per slice, so
-  one plugin's rebuild never invalidates the whole catalog.
-- A schema version is embedded; a version mismatch discards the cache and
-  rebuilds rather than attempting migration.
+- M1 uses the versioned `crikey-catalog-archive-v1` binary format implemented by
+  `FileCatalogCache`.
+- Each plugin owns one checksummed slice. Writes replace that slice atomically;
+  corruption, truncation, a foreign schema, or a hostile element count turns
+  only that slice into a cache miss.
+- Loads decode into owned `Item` values and build the in-memory presence,
+  ordered-pair, and label-prefix indexes. M1 does not claim mmap or zero-copy
+  loading.
+- Platform paths retain their ADR-0007 encoding tag.
+- A schema mismatch discards and rebuilds the slice; the cache is never migrated
+  in place.
+
+This is the boring format whose behavior is already bounded and tested. An mmap
+format remains an optimization option, not an architectural prerequisite.
+
+## Measured evidence
+
+Release measurements on the reference Intel N150 machine, using 64 complete
+labels typed one character at a time through `SearchService::submit_query`:
+
+| Items | Archive | Load | Query p95 | Resident after load | Peak RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 50,000 | 12,527,569 B | 147,756,924 ns | 1,213,171 ns | 65,806,336 B | 65,871,872 B |
+| 500,000 | 125,275,069 B | 1,800,725,150 ns | 13,099,462 ns | 506,626,048 B | 630,509,568 B |
+
+The 500,000-item run meets the 16 ms cached-local-result target. The 50,000-item
+working set remains below 100 MiB. The stress-scale resident footprint and load
+time expose the cost of full decoding; they do not justify relabelling the
+current codec as zero-copy.
+
+The harness measures the shipped archive only. No `rkyv`, `bincode`, or mmap
+baseline exists in this workspace, so this ADR makes no comparative claim about
+one.
 
 ## Consequences
 
-- Startup cost approaches an `mmap` plus index fix-up rather than a parse.
-- Resident memory is dominated by page cache the OS can reclaim.
-- Zero-copy formats constrain the data model: variable-length and optional
-  fields need care, and the archive layout becomes part of the compatibility
-  surface guarded by the schema version.
+- The archive and decoder are small, dependency-free, and covered against
+  truncation, checksum failures, path escape, hostile counts, and schema drift.
+- Search owns prepared labels and indexes, so query latency is decoupled from
+  the on-disk representation.
+- Full decode duplicates the file-backed payload in owned heap state and makes
+  stress-scale startup and memory materially more expensive.
+- A future mmap representation may replace the codec behind `CatalogCache`
+  without changing query, ranking, or application APIs.
 
 ## Revisit trigger
 
-If the M1 benchmark shows a plain `bincode` decode meeting both the startup and
-the memory targets, take the simpler format and drop the zero-copy constraint.
+Re-open this ADR when a product requirement places a hard bound on stage-2 load
+time or requires a 500,000-item steady-state footprint near 100 MiB. Any
+replacement must benchmark the same end-to-end query path, preserve per-slice
+fault isolation, and show a material improvement over the measurements above.
 
 ## Alternatives
 
-- **SQLite.** Excellent for incremental updates and queries; adds a dependency
-  and a per-query cost the in-memory index does not have. Reconsider if
-  incremental catalog updates dominate.
-- **JSON/TOML.** Debuggable, far too slow at this scale.
+- **Memory-mapped zero-copy archive (`rkyv` or bespoke).** Plausibly lowers
+  decode cost and owned memory, but adds layout, validation, and alignment
+  complexity. Deferred until the revisit trigger fires and a measured prototype
+  exists.
+- **SQLite.** Strong incremental-update and query behavior; adds a dependency
+  and a second indexing model. Reconsider if incremental catalog churn dominates.
+- **JSON/TOML.** Debuggable, but unsuitable for this scale and trust boundary.

@@ -17,7 +17,7 @@
 use std::cmp::Ordering;
 
 use crikey_core::{Category, Item};
-use crikey_query::{MatchMethod, MatchOutcome, NormalizedQuery};
+use crikey_query::{MatchMethod, MatchOutcome, MatchSummary, NormalizedQuery};
 
 // ---------------------------------------------------------------------------
 // Signal weights. Only the relative magnitudes matter.
@@ -227,6 +227,34 @@ impl DefaultRanker {
         total += W_USER_PREFERENCE * sanitize(user_preference, 0.0, 1.0);
 
         Score::new(sanitize(total, MIN_SCORE, MAX_SCORE))
+    }
+
+    /// Scores allocation-free match data produced during bounded selection.
+    pub fn score_match(&self, item: &Item, summary: MatchSummary) -> Score {
+        self.score_signals(RankingSignals {
+            match_quality: summary.score,
+            exact_prefix: summary.method == MatchMethod::ExactPrefix,
+            match_position: summary.match_position,
+            category_weight: category_weight(&item.category),
+            plugin_score_hint: item.score_hint,
+            selection_frequency: 0,
+            selection_recency_secs: None,
+            query_history: 0.0,
+            context_match: false,
+            user_preference: 0.0,
+        })
+    }
+
+    /// Highest score this item can earn without a label-prefix match.
+    pub fn non_prefix_upper_bound(&self, item: &Item) -> Score {
+        self.score_match(
+            item,
+            MatchSummary {
+                score: 0.72,
+                method: MatchMethod::Substring,
+                match_position: Some(0),
+            },
+        )
     }
 }
 

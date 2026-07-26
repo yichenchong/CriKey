@@ -13,4 +13,9 @@ publish = false
 workspace = true
 
 [dependencies]
+crikey-app.workspace = true
+crikey-catalog.workspace = true
 crikey-core.workspace = true
+crikey-query.workspace = true
+crikey-ranking.workspace = true
+crikey-result-aggregator.workspace = true

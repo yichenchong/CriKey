@@ -20,6 +20,13 @@
 //! byte lengths (`ﬁ` folds to `fi`, `Ⅷ` folds to `viii`), so the matcher keeps a
 //! mapping from normalized offsets back to source offsets instead of reusing
 //! normalized offsets directly, which would slice labels mid-character.
+//!
+//! [`presence_mask`] is the cheap half of that work: a 64-bit set over the
+//! normalized characters of a text. Because every match method needs each
+//! query character to occur in the item, an item whose mask is missing one of
+//! them cannot match, and the catalog can skip scoring it entirely
+//! (spec 11.1). [`searchable_text`] folds the fields the mask is taken over
+//! once, at index time.
 
 use std::borrow::Cow;
 
@@ -77,6 +84,15 @@ pub struct MatchOutcome {
     pub method: MatchMethod,
     /// Byte ranges within the item label, for UI highlighting.
     pub highlights: Vec<(usize, usize)>,
+}
+
+/// Allocation-free match data sufficient for ranking.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MatchSummary {
+    pub score: f32,
+    pub method: MatchMethod,
+    /// Character offset of the earliest label match.
+    pub match_position: Option<u32>,
 }
 
 /// Unicode normalization, case folding and tokenization (spec 11.1).
@@ -146,6 +162,153 @@ fn normalize_field(raw: &str) -> Cow<'_, str> {
 }
 
 // ---------------------------------------------------------------------------
+// Presence masks (candidate pruning)
+// ---------------------------------------------------------------------------
+
+/// Bits standing for exactly one character: `a`-`z` in `0..26`, `0`-`9` in
+/// `26..36`. These are the characters queries are actually made of, so giving
+/// them private bits is what makes the filter selective.
+pub const DEDICATED_BITS: u32 = 36;
+
+/// Bits every other character shares.
+const SHARED_BITS: u32 = u64::BITS - DEDICATED_BITS;
+
+/// Spreads a code point across the shared buckets.
+///
+/// Accented Latin, Greek, Cyrillic and CJK all arrive as runs of adjacent code
+/// points, so a plain remainder would drop a whole script into two or three
+/// buckets and blunt the filter. This is the usual xor-shift-multiply
+/// avalanche: fixed constants, integer arithmetic only, therefore identical on
+/// every platform and every run — a mask stored at index time still means the
+/// same thing when a query is folded against it later.
+const fn scramble(code: u32) -> u32 {
+    let mut hash = code ^ 0x9e37_79b9;
+    hash = hash.wrapping_mul(0x85eb_ca6b);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0xc2b2_ae35);
+    hash ^ (hash >> 16)
+}
+
+/// The one bit standing for an already-normalized character, or `0` for
+/// whitespace.
+///
+/// Whitespace is what [`Normalizer`] splits tokens *on*, so no query token can
+/// contain any. Dropping it costs nothing on the query side and stops a
+/// character carried by practically every item from occupying — and so
+/// permanently satisfying — one of the scarce shared buckets.
+fn char_bit(ch: char) -> u64 {
+    let code = ch as u32;
+    let bit = match ch {
+        'a'..='z' => code - 'a' as u32,
+        '0'..='9' => code - '0' as u32 + 26,
+        _ if ch.is_whitespace() => return 0,
+        _ => DEDICATED_BITS + scramble(code) % SHARED_BITS,
+    };
+    1u64 << bit
+}
+
+/// A 64-bit set over the distinct **normalized** characters of `text`.
+///
+/// This is the catalog's candidate prefilter (spec 11.1). Every method
+/// [`DefaultMatcher`] supports — exact prefix, prefix, substring, acronym,
+/// keyword and fuzzy — can only fire when every character of the token already
+/// occurs somewhere in the item's searchable text. So for a token mask `q` and
+/// an item mask `m`, `q & !m == 0` is a *necessary* condition for a match, and
+/// an item it rejects cannot have matched.
+///
+/// # Invariant
+///
+/// The mask is a monotone union over characters: a superset of characters sets
+/// a superset of bits, and no character ever clears one. Two things follow,
+/// and both are the safe direction. Adding text to an item — a description, a
+/// search term — can only admit it for *more* queries, never fewer. And two
+/// characters sharing a bucket merely make the filter less discriminating, so
+/// a collision can only let an item through to the matcher, which then answers
+/// exactly as it would have without any pruning. There are no false negatives
+/// by construction.
+///
+/// The input is folded with the crate's own normalization, so `Chapter Ⅷ`
+/// answers to `viii`, `Straße` to `strasse` and `ﬁle` to `file`. Folding is
+/// idempotent, so already-normalized text — an item's cached searchable text,
+/// a [`NormalizedQuery`] token — costs only the scan and gives the same
+/// answer. Neither path builds an intermediate string.
+pub fn presence_mask(text: &str) -> u64 {
+    if text.is_ascii() {
+        // ASCII is fixed by NFKC and folds by lowercasing, so the byte is the
+        // character.
+        text.bytes()
+            .fold(0, |mask, byte| mask | char_bit(byte.to_ascii_lowercase() as char))
+    } else {
+        text.nfkc()
+            .case_fold()
+            .nfkc()
+            .fold(0, |mask, ch| mask | char_bit(ch))
+    }
+}
+
+/// Everything the matcher is allowed to read from `item`, folded once: the
+/// label, the description and the search terms, joined by single spaces.
+///
+/// Intended to be computed once when an item enters the catalog and kept
+/// beside it, so a query pays for [`presence_mask`] over one already-folded
+/// string instead of re-folding every field on every keystroke.
+///
+/// The `target` and the `stable_id` are deliberately absent. The matcher
+/// ignores both — a `target` is an execution payload, and folding it in would
+/// offer candidates for `usr` that can never match.
+///
+/// This text is for masking only. Its byte offsets mean nothing in the raw
+/// label, which is why [`DefaultMatcher`] folds the label separately and keeps
+/// its own map back to raw offsets; highlight ranges must never be taken from
+/// here.
+pub fn searchable_text(item: &Item) -> String {
+    searchable_text_with_label(item).0
+}
+
+/// [`searchable_text`], plus the byte length of the folded label prefix.
+///
+/// A catalog caching this text needs the label fold kept apart from the
+/// keyword fold, so that whatever it does with a label never depends on where
+/// a description happens to start. `text[..label_bytes]` is the folded label
+/// and the rest is the folded keyword text, its leading separator included —
+/// one allocation for both instead of a second pass over the item.
+///
+/// These are offsets into *folded* text. Folding changes byte lengths, so they
+/// are not offsets into the raw label and must never be reported as
+/// highlights; [`DefaultMatcher`] keeps its own map back to raw label bytes
+/// for that.
+pub fn searchable_text_with_label(item: &Item) -> (String, usize) {
+    let terms: usize = item.search_terms.iter().map(|term| term.len() + 1).sum();
+    let mut out = String::with_capacity(item.label.len() + item.description.len() + terms + 1);
+    push_searchable_field(&mut out, &item.label);
+    let label_bytes = out.len();
+    push_searchable_field(&mut out, &item.description);
+    for term in &item.search_terms {
+        push_searchable_field(&mut out, term);
+    }
+    (out, label_bytes)
+}
+
+/// Appends one normalized field, separated from what came before by a space.
+///
+/// A space is a starter that nothing composes across, so folding field by
+/// field agrees with folding the joined text.
+fn push_searchable_field(out: &mut String, raw: &str) {
+    if raw.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    if raw.is_ascii() {
+        // Borrows outright when the field is already lowercase.
+        out.push_str(&normalize_field(raw));
+    } else {
+        push_normalized(raw, out);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Normalized label with a mapping back to raw byte offsets
 // ---------------------------------------------------------------------------
 
@@ -168,10 +331,8 @@ struct Mark {
 const MAX_RUN_BYTES: usize = 128;
 
 /// How normalized byte offsets map back onto raw label bytes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum OffsetMap {
-    /// The label is ASCII: normalization is byte-for-byte, offsets are equal.
-    Identity,
     /// Precisely mapped normalized prefix. Bytes at or beyond `mapped_end`
     /// belong to a degraded tail and must not produce highlights.
     Marks { marks: Vec<Mark>, mapped_end: u32 },
@@ -179,40 +340,91 @@ enum OffsetMap {
     Unavailable,
 }
 
-/// An item label folded once per match, plus the map back to raw offsets.
-#[derive(Debug)]
-struct NormalizedLabel<'a> {
-    text: Cow<'a, str>,
-    map: OffsetMap,
-    /// Character count of `text`, used for coverage ratios.
+/// An item label normalized once, with a map back to raw byte offsets.
+///
+/// Catalogs retain this beside the item so repeated queries do not normalize
+/// the same label on every keystroke.
+#[derive(Debug, Clone)]
+pub struct PreparedLabel {
+    /// Folded label followed by optional folded keyword text.
+    text: Box<str>,
+    label_bytes: usize,
+    /// `None` is the byte-for-byte ASCII identity map.
+    map: Option<Box<OffsetMap>>,
+    /// Character count of the label portion of `text`.
     char_len: usize,
 }
 
-impl<'a> NormalizedLabel<'a> {
-    fn new(raw: &'a str) -> Self {
-        if raw.is_ascii() {
-            let text = normalize_field(raw);
-            let char_len = text.len();
-            return Self {
-                text,
-                map: OffsetMap::Identity,
-                char_len,
-            };
-        }
+impl PreparedLabel {
+    /// Normalizes `raw` and prepares highlight offset translation.
+    pub fn new(raw: &str) -> Self {
+        let text = normalize_field(raw).into_owned();
+        let label_bytes = text.len();
+        Self::from_searchable_text(raw, text, label_bytes)
+    }
 
-        let text = normalize_text(raw);
-        let char_len = text.chars().count();
-        let map = if u32::try_from(raw.len()).is_ok() && u32::try_from(text.len()).is_ok() {
-            let (marks, mapped_end) = align_marks(raw, &text, char_len);
-            OffsetMap::Marks { marks, mapped_end }
+    /// Builds a prepared label from the folded searchable buffer produced by
+    /// [`searchable_text_with_label`].
+    pub fn from_searchable_text(raw: &str, text: String, label_bytes: usize) -> Self {
+        let label = text
+            .get(..label_bytes)
+            .expect("label_bytes must end on a folded-text boundary");
+        let char_len = label.chars().count();
+        let map = if raw.is_ascii() {
+            None
+        } else if u32::try_from(raw.len()).is_ok() && u32::try_from(label.len()).is_ok() {
+            let (marks, mapped_end) = align_marks(raw, label, char_len);
+            Some(Box::new(OffsetMap::Marks { marks, mapped_end }))
         } else {
-            OffsetMap::Unavailable
+            Some(Box::new(OffsetMap::Unavailable))
         };
         Self {
-            text: Cow::Owned(text),
+            text: text.into_boxed_str(),
+            label_bytes,
             map,
             char_len,
         }
+    }
+
+    /// The normalized label used by the matcher.
+    pub fn normalized(&self) -> &str {
+        &self.text[..self.label_bytes]
+    }
+
+    /// Folded description and search terms retained after the label.
+    pub fn keywords(&self) -> &str {
+        self.text[self.label_bytes..]
+            .strip_prefix(' ')
+            .unwrap_or(&self.text[self.label_bytes..])
+    }
+
+    /// Every folded searchable field in catalog order.
+    pub fn searchable_text(&self) -> &str {
+        &self.text
+    }
+
+    /// Cheaply rejects items that no matcher interpretation can accept.
+    ///
+    /// This repeats only the boolean shape of matching over ingestion-time
+    /// folded text: no highlight vectors, keyword normalization, outcomes or
+    /// scores are built. Returning `true` is permission to run the full
+    /// matcher; returning `false` is definitive.
+    pub fn may_match(&self, query: &NormalizedQuery) -> bool {
+        if query.tokens.is_empty()
+            || !query
+                .normalized
+                .split_whitespace()
+                .eq(query.tokens.iter().map(String::as_str))
+        {
+            return false;
+        }
+
+        let label = self.normalized();
+        let keywords = self.keywords();
+        query
+            .tokens
+            .iter()
+            .all(|token| token_may_match(label, keywords, token))
     }
 
     /// Translates a byte range of the normalized label into the raw label byte
@@ -225,10 +437,10 @@ impl<'a> NormalizedLabel<'a> {
         if start >= end {
             return None;
         }
-        match &self.map {
-            OffsetMap::Identity => Some((start, end)),
-            OffsetMap::Unavailable => None,
-            OffsetMap::Marks { marks, mapped_end } => {
+        match self.map.as_deref() {
+            None => Some((start, end)),
+            Some(OffsetMap::Unavailable) => None,
+            Some(OffsetMap::Marks { marks, mapped_end }) => {
                 if end > *mapped_end as usize {
                     return None;
                 }
@@ -243,6 +455,33 @@ impl<'a> NormalizedLabel<'a> {
             }
         }
     }
+}
+
+/// Boolean counterpart of `match_token`, over already-normalized fields.
+fn token_may_match(label: &str, keywords: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    if label.contains(token) || keywords.contains(token) {
+        return true;
+    }
+
+    if token.chars().count() >= 2 {
+        let mut initials = word_initials(label).map(|(_, character)| character);
+        if token
+            .chars()
+            .all(|needle| initials.next().is_some_and(|initial| initial == needle))
+        {
+            return true;
+        }
+
+        let mut haystack = label.chars();
+        return token
+            .chars()
+            .all(|needle| haystack.by_ref().any(|character| character == needle));
+    }
+
+    false
 }
 
 /// Aligns the precisely attributable prefix of `text` (the normalization of
@@ -345,8 +584,19 @@ pub struct DefaultMatcher {
     _private: (),
 }
 
-impl Matcher for DefaultMatcher {
-    fn match_item(&self, query: &NormalizedQuery, item: &Item) -> Option<MatchOutcome> {
+impl DefaultMatcher {
+    /// Scores a prepared label while reusing caller-owned highlight storage.
+    ///
+    /// `spans` is scratch state, not part of the result. Callers retaining only
+    /// the best candidates can materialize full highlights after selection.
+    pub fn score_prepared(
+        &self,
+        query: &NormalizedQuery,
+        item: &Item,
+        label: &PreparedLabel,
+        spans: &mut Vec<(usize, usize)>,
+    ) -> Option<MatchSummary> {
+        spans.clear();
         if query.tokens.is_empty()
             || !query
                 .normalized
@@ -356,9 +606,28 @@ impl Matcher for DefaultMatcher {
             return None;
         }
 
-        let label = NormalizedLabel::new(&item.label);
-        if let Some(outcome) = exact_label_match(query, &label) {
-            return Some(outcome);
+        let normalized = label.normalized();
+        let trimmed = normalized.trim();
+        if !trimmed.is_empty() && query.normalized.trim() == trimmed {
+            let normalized_start = normalized.len() - normalized.trim_start().len();
+            let raw_span = label.to_raw(normalized_start, normalized_start + trimmed.len());
+            return Some(MatchSummary {
+                score: score_for(MatchMethod::ExactPrefix, 1.0),
+                method: MatchMethod::ExactPrefix,
+                match_position: raw_span.map(|(start, _)| item.label[..start].chars().count() as u32),
+            });
+        }
+
+        let phrase = query.normalized.trim();
+        if normalized.starts_with(phrase) {
+            let raw_span = label.to_raw(0, phrase.len());
+            push_span(spans, raw_span);
+            let quality = ratio(phrase.chars().count(), label.char_len);
+            return Some(MatchSummary {
+                score: score_for(MatchMethod::Prefix, quality),
+                method: MatchMethod::Prefix,
+                match_position: raw_span.map(|(start, _)| item.label[..start].chars().count() as u32),
+            });
         }
 
         let mut view = ItemView {
@@ -366,25 +635,54 @@ impl Matcher for DefaultMatcher {
             keywords: None,
             item,
         };
-        let mut spans: Vec<(usize, usize)> = Vec::new();
         let mut weakest = MatchMethod::ExactPrefix;
         let mut quality_total = 0.0f32;
 
         for token in &query.tokens {
-            let (method, quality) = match_token(&mut view, token, &mut spans)?;
+            let (method, quality) = match_token(&mut view, token, spans)?;
             if method.precedence() > weakest.precedence() {
                 weakest = method;
             }
             quality_total += unit(quality);
         }
 
-        // `tokens` is non-empty, so the mean is well defined.
+        let match_position = spans
+            .iter()
+            .map(|(start, _)| item.label[..*start].chars().count() as u32)
+            .min();
         let quality = quality_total / query.tokens.len() as f32;
-        Some(MatchOutcome {
+        Some(MatchSummary {
             score: score_for(weakest, quality),
             method: weakest,
+            match_position,
+        })
+    }
+
+    /// Matches using a label prepared when the catalog admitted the item.
+    pub fn match_prepared(
+        &self,
+        query: &NormalizedQuery,
+        item: &Item,
+        label: &PreparedLabel,
+    ) -> Option<MatchOutcome> {
+        let mut spans = Vec::new();
+        let summary = self.score_prepared(query, item, label, &mut spans)?;
+        if summary.method == MatchMethod::ExactPrefix {
+            return exact_label_match(query, label);
+        }
+        Some(MatchOutcome {
+            score: summary.score,
+            method: summary.method,
             highlights: merge_spans(spans),
         })
+    }
+}
+
+impl Matcher for DefaultMatcher {
+    fn match_item(&self, query: &NormalizedQuery, item: &Item) -> Option<MatchOutcome> {
+        let (text, label_bytes) = searchable_text_with_label(item);
+        let label = PreparedLabel::from_searchable_text(&item.label, text, label_bytes);
+        self.match_prepared(query, item, &label)
     }
 }
 
@@ -394,7 +692,7 @@ impl Matcher for DefaultMatcher {
 /// whose tokens all land on the label never pays for them.
 #[derive(Debug)]
 struct ItemView<'a> {
-    label: NormalizedLabel<'a>,
+    label: &'a PreparedLabel,
     keywords: Option<Vec<Cow<'a, str>>>,
     item: &'a Item,
 }
@@ -416,12 +714,12 @@ impl<'a> ItemView<'a> {
 }
 
 /// The whole query reproduces the whole label: the strongest possible match.
-fn exact_label_match(query: &NormalizedQuery, label: &NormalizedLabel<'_>) -> Option<MatchOutcome> {
-    let trimmed = label.text.trim();
+fn exact_label_match(query: &NormalizedQuery, label: &PreparedLabel) -> Option<MatchOutcome> {
+    let trimmed = label.normalized().trim();
     if trimmed.is_empty() || query.normalized.trim() != trimmed {
         return None;
     }
-    let start = label.text.len() - label.text.trim_start().len();
+    let start = label.normalized().len() - label.normalized().trim_start().len();
     Some(MatchOutcome {
         score: score_for(MatchMethod::ExactPrefix, 1.0),
         method: MatchMethod::ExactPrefix,
@@ -443,35 +741,37 @@ fn match_token(
 
     let token_chars = token.chars().count();
 
-    if let Some(found) = match_label(&view.label, token, token_chars, spans) {
+    if let Some(found) = match_label(view.label, token, token_chars, spans) {
         return Some(found);
     }
 
-    let keyword = keyword_quality(view.keywords(), token, token_chars);
-    if let Some(quality) = keyword {
-        return Some((MatchMethod::Keyword, quality));
+    if view.label.keywords().contains(token) {
+        let keyword = keyword_quality(view.keywords(), token, token_chars);
+        if let Some(quality) = keyword {
+            return Some((MatchMethod::Keyword, quality));
+        }
     }
 
-    fuzzy_quality(&view.label, token, token_chars, spans).map(|quality| (MatchMethod::Fuzzy, quality))
+    fuzzy_quality(view.label, token, token_chars, spans).map(|quality| (MatchMethod::Fuzzy, quality))
 }
 
 /// Prefix, substring and acronym matching, in precedence order.
 fn match_label(
-    label: &NormalizedLabel<'_>,
+    label: &PreparedLabel,
     token: &str,
     token_chars: usize,
     spans: &mut Vec<(usize, usize)>,
 ) -> Option<(MatchMethod, f32)> {
-    if label.text.starts_with(token) {
+    if label.normalized().starts_with(token) {
         push_span(spans, label.to_raw(0, token.len()));
         return Some((MatchMethod::Prefix, ratio(token_chars, label.char_len)));
     }
 
-    if let Some(at) = label.text.find(token) {
+    if let Some(at) = label.normalized().find(token) {
         push_span(spans, label.to_raw(at, at + token.len()));
         let coverage = ratio(token_chars, label.char_len);
         // A hit close to the front of the label reads as more relevant.
-        let position = 1.0 / (1 + label.text[..at].chars().count()) as f32;
+        let position = 1.0 / (1 + label.normalized()[..at].chars().count()) as f32;
         return Some((MatchMethod::Substring, 0.5 * coverage + 0.5 * position));
     }
 
@@ -480,7 +780,7 @@ fn match_label(
 
 /// The token spells the leading word initials of the label.
 fn acronym_quality(
-    label: &NormalizedLabel<'_>,
+    label: &PreparedLabel,
     token: &str,
     token_chars: usize,
     spans: &mut Vec<(usize, usize)>,
@@ -491,7 +791,7 @@ fn acronym_quality(
     }
 
     let mark = spans.len();
-    let mut initials = word_initials(&label.text);
+    let mut initials = word_initials(label.normalized());
     let mut matched = 0usize;
 
     for needle in token.chars() {
@@ -513,7 +813,7 @@ fn acronym_quality(
 
 /// The token's characters occur in the label in order, not necessarily adjacent.
 fn fuzzy_quality(
-    label: &NormalizedLabel<'_>,
+    label: &PreparedLabel,
     token: &str,
     token_chars: usize,
     spans: &mut Vec<(usize, usize)>,
@@ -524,7 +824,7 @@ fn fuzzy_quality(
     }
 
     let mark = spans.len();
-    let mut haystack = label.text.char_indices().enumerate();
+    let mut haystack = label.normalized().char_indices().enumerate();
     let mut first_ordinal = 0usize;
     let mut last_ordinal = 0usize;
     let mut matched = 0usize;

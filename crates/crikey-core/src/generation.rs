@@ -12,6 +12,19 @@ pub struct Generation(u64);
 impl Generation {
     pub const ZERO: Generation = Generation(0);
 
+    /// Rebuilds a generation from a value that was previously produced by
+    /// [`Generation::get`] and carried across a process boundary: a persisted
+    /// catalog slice, an IPC frame, a stored query state.
+    ///
+    /// Decoding only. Live generations are minted exclusively by
+    /// [`GenerationTracker::advance`], which is what keeps them monotonic; a
+    /// value invented here has no relationship to any tracker's sequence and
+    /// would make staleness answers meaningless.
+    #[inline]
+    pub const fn from_raw(value: u64) -> Generation {
+        Generation(value)
+    }
+
     #[inline]
     pub const fn get(self) -> u64 {
         self.0

@@ -29,7 +29,12 @@ dependencies = [
 name = "crikey-benchmarks"
 version = "0.1.0"
 dependencies = [
+ "crikey-app",
+ "crikey-catalog",
  "crikey-core",
+ "crikey-query",
+ "crikey-ranking",
+ "crikey-result-aggregator",
 ]
 
 [[package]]
@@ -45,6 +50,7 @@ name = "crikey-cli"
 version = "0.1.0"
 dependencies = [
  "crikey-app",
+ "crikey-benchmarks",
  "crikey-core",
 ]
 
