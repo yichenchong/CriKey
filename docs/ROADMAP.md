@@ -112,17 +112,35 @@ Status snapshot (2026-07-27):
   catalog scale, and Linux native presentation are green; the M1 milestone as a
   whole is not.
 
-### M2 — Scheduling and resilience (§30 Phase 2) — L
+### M2 — Scheduling and resilience (§30 Phase 2) — L — done
 
-Wires the M0 scheduling primitives into a live pipeline: per-plugin debounce
-policy resolution from manifests, leading/trailing/max-wait, cancellation
-propagation, stale-result rejection at the aggregator boundary, bounded request
-and result queues with named overflow policies, per-plugin budgets and fair
-queuing, and the developer query trace (§26.4).
+Wires the M0 scheduling primitives into the live launcher pipeline:
+manifest-resolved per-plugin debounce and activation policy,
+leading/trailing/max-wait dispatch, legacy obsolete-work replacement,
+cancellation propagation, stale-result rejection at both intake and aggregation
+boundaries, bounded request and result queues with named overflow policies,
+per-plugin budgets and fair queuing, and deterministic developer query traces
+(§26.4).
 
-Exit criteria: rapid-typing stress test shows bounded queue depth, zero stale
+Exit criteria: rapid-typing stress tests show bounded queue depth, zero stale
 results displayed, no cross-generation reordering, and a slow plugin never
 delaying a fast one (§31.4–8, §31.24–25).
+
+Status snapshot (2026-07-27):
+
+- Modern leading/trailing debounce, maximum-wait dispatch, activation gates,
+  concurrency limits, and all request overflow policies execute in the composed
+  `QueryPipeline`; unchanged legacy plugins retain serial `legacy-strict`
+  obsolete-work replacement and immediate cooperative cancellation.
+- `QueryPipeline` owns bounded per-plugin intake, round-robin drain budgets,
+  backpressure transitions, generation retirement, aggregator merge, stable
+  presentation, and terminal-publication rollback. The launcher publishes the
+  built-in application provider only after its real result batch crosses this
+- Focused M2 verification passes 242 tests across plugin-model, scheduler,
+  result-aggregator, app, and CLI targets with warnings denied. The deterministic
+  `trace-query` and `simulate-typing` commands cover every §26.4 trace category;
+  the 381-keystroke stress fixture reports bounded queues, zero stale display,
+  and independent fast/slow plugin progress.
 
 ### M3 — Legacy Compatibility Layer (§30 Phase 3) — XL
 

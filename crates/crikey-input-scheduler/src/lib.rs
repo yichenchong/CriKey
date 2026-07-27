@@ -12,10 +12,12 @@
 pub mod debounce;
 pub mod legacy;
 pub mod profile;
+pub mod runtime;
 
 pub use debounce::{DebouncePolicy, Debouncer, Dispatch};
 pub use legacy::{LegacyDispatch, ObsoleteWorkManager};
 pub use profile::SchedulingProfile;
+pub use runtime::*;
 
 /// Monotonic milliseconds since an arbitrary epoch chosen by the caller.
 pub type Millis = u64;

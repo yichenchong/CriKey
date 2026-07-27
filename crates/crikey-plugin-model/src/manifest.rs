@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::permissions::Permissions;
+use crate::scheduling::SchedulingProfile;
 use crate::ManifestError;
 
 pub const SUPPORTED_MANIFEST_VERSION: u32 = 1;
@@ -28,10 +29,26 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn parse(text: &str) -> Result<Self, ManifestError> {
-        let manifest: Manifest = toml::from_str(text)?;
+        let manifest: Manifest = match toml::from_str(text) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let Some((normalized, oversized)) = normalize_oversized_query_integers(text) else {
+                    return Err(error.into());
+                };
+                let mut manifest: Manifest = toml::from_str(&normalized)?;
+                if let Some(value) = oversized.debounce_ms {
+                    manifest.query.debounce_ms = Some(value);
+                }
+                if let Some(value) = oversized.maximum_wait_ms {
+                    manifest.query.maximum_wait_ms = Some(value);
+                }
+                manifest
+            }
+        };
         if manifest.manifest_version != SUPPORTED_MANIFEST_VERSION {
             return Err(ManifestError::UnsupportedVersion(manifest.manifest_version));
         }
+        manifest.validate_query_policy()?;
         Ok(manifest)
     }
 
@@ -49,6 +66,110 @@ impl Manifest {
                 arch: arch.into(),
             })
     }
+}
+
+#[derive(Default)]
+struct OversizedQueryIntegers {
+    debounce_ms: Option<u64>,
+    maximum_wait_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum QueryIntegerField {
+    Debounce,
+    MaximumWait,
+}
+
+/// TOML represents integers as `i64`, while the manifest declaration is a
+/// `u64`. Preserve the full declared domain so `u64` values can be validated
+/// as out of range; values beyond `u64` remain ordinary parse failures.
+fn normalize_oversized_query_integers(text: &str) -> Option<(String, OversizedQueryIntegers)> {
+    let mut in_query = false;
+    let mut offset = 0;
+    let mut replacements = Vec::new();
+    let mut oversized = OversizedQueryIntegers::default();
+
+    for line in text.split_inclusive('\n') {
+        let statement = line
+            .trim()
+            .split_once('#')
+            .map_or_else(|| line.trim(), |(before, _)| before.trim());
+        if statement.starts_with('[') {
+            in_query = statement == "[query]";
+            offset += line.len();
+            continue;
+        }
+        if !in_query {
+            offset += line.len();
+            continue;
+        }
+
+        let Some(equals) = line.find('=') else {
+            offset += line.len();
+            continue;
+        };
+        let field = match line[..equals].trim() {
+            "debounce-ms" => QueryIntegerField::Debounce,
+            "maximum-wait-ms" => QueryIntegerField::MaximumWait,
+            _ => {
+                offset += line.len();
+                continue;
+            }
+        };
+        let right = &line[equals + 1..];
+        let before_comment = right.split_once('#').map_or(right, |(value, _)| value);
+        let value_text = before_comment.trim();
+        let Some(value) = oversized_decimal(value_text) else {
+            offset += line.len();
+            continue;
+        };
+
+        let leading_whitespace = before_comment.len() - before_comment.trim_start().len();
+        let start = offset + equals + 1 + leading_whitespace;
+        replacements.push((start, start + value_text.len()));
+        match field {
+            QueryIntegerField::Debounce => oversized.debounce_ms = Some(value),
+            QueryIntegerField::MaximumWait => oversized.maximum_wait_ms = Some(value),
+        }
+        offset += line.len();
+    }
+
+    if replacements.is_empty() {
+        return None;
+    }
+
+    let mut normalized = String::with_capacity(text.len());
+    let mut copied_through = 0;
+    for (start, end) in replacements {
+        normalized.push_str(&text[copied_through..start]);
+        normalized.push('0');
+        copied_through = end;
+    }
+    normalized.push_str(&text[copied_through..]);
+    Some((normalized, oversized))
+}
+
+fn oversized_decimal(text: &str) -> Option<u64> {
+    let digits = text.strip_prefix('+').unwrap_or(text);
+    if digits.is_empty() {
+        return None;
+    }
+
+    let bytes = digits.as_bytes();
+    let mut value = 0_u64;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        match byte {
+            b'0'..=b'9' => {
+                value = value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+            }
+            b'_' if index > 0
+                && index + 1 < bytes.len()
+                && bytes[index - 1].is_ascii_digit()
+                && bytes[index + 1].is_ascii_digit() => {}
+            _ => return None,
+        }
+    }
+    (value > i64::MAX as u64).then_some(value)
 }
 
 /// Runtime that executes the plugin (spec 19.2).
@@ -69,6 +190,8 @@ pub struct PluginSection {
     pub name: String,
     pub version: String,
     pub runtime: Runtime,
+    #[serde(default)]
+    pub scheduling_profile: Option<SchedulingProfile>,
     /// Keyed by `<os>-<arch>`, or a plain string for runtime-neutral plugins.
     #[serde(default, deserialize_with = "entrypoint_map")]
     pub entrypoint: BTreeMap<String, String>,
@@ -106,7 +229,7 @@ pub struct PlatformSection {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ActivationSection {
     #[serde(default)]
-    pub minimum_query_length: usize,
+    pub minimum_query_length: Option<usize>,
     #[serde(default)]
     pub prefixes: Vec<String>,
     #[serde(default)]
@@ -114,38 +237,25 @@ pub struct ActivationSection {
     #[serde(default)]
     pub categories: Vec<String>,
     #[serde(default)]
-    pub empty_query: bool,
+    pub empty_query: Option<bool>,
 }
 
 /// Modern query policy (spec 19.4).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct QuerySection {
-    #[serde(default = "default_debounce_ms")]
-    pub debounce_ms: u64,
+    #[serde(default)]
+    pub debounce_ms: Option<u64>,
     #[serde(default)]
     pub maximum_wait_ms: Option<u64>,
-    #[serde(default = "yes")]
-    pub leading_edge: bool,
-    #[serde(default = "yes")]
-    pub trailing_edge: bool,
-    #[serde(default = "one")]
-    pub max_concurrent_requests: u32,
     #[serde(default)]
-    pub network_backed: bool,
-}
-
-impl Default for QuerySection {
-    fn default() -> Self {
-        Self {
-            debounce_ms: default_debounce_ms(),
-            maximum_wait_ms: None,
-            leading_edge: true,
-            trailing_edge: true,
-            max_concurrent_requests: 1,
-            network_backed: false,
-        }
-    }
+    pub leading_edge: Option<bool>,
+    #[serde(default)]
+    pub trailing_edge: Option<bool>,
+    #[serde(default)]
+    pub max_concurrent_requests: Option<u32>,
+    #[serde(default)]
+    pub network_backed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -183,15 +293,6 @@ impl Default for PerformanceSection {
     }
 }
 
-fn default_debounce_ms() -> u64 {
-    50
-}
-fn yes() -> bool {
-    true
-}
-fn one() -> u32 {
-    1
-}
 fn default_soft_timeout() -> u64 {
     50
 }
@@ -217,7 +318,7 @@ mod tests {
         let manifest = Manifest::parse(SPEC_EXAMPLE).expect("spec example must parse");
         assert_eq!(manifest.plugin.id, "dev.example.repositories");
         assert_eq!(manifest.plugin.runtime, Runtime::Native);
-        assert_eq!(manifest.activation.minimum_query_length, 2);
+        assert_eq!(manifest.activation.minimum_query_length, Some(2));
         assert_eq!(manifest.query.maximum_wait_ms, Some(200));
         assert_eq!(manifest.performance.startup, Startup::Lazy);
         assert_eq!(

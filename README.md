@@ -11,9 +11,11 @@ on Windows.
 
 M0 skeleton complete. M1 core search, catalog persistence, native launcher
 runtime, Linux discovery, startup staging, supervisor state, and Windows
-hotkey/application backends are implemented. This Linux host has no graphical
-session and no Windows runtime, so native presentation, Windows execution, and
-warm-activation p95 remain unverified. See
+hotkey/application backends are implemented; Windows execution and
+warm-activation p95 remain unverified. M2 scheduling and resilience is complete:
+manifest-resolved policy, modern and legacy scheduling, cancellation, stale
+rejection, bounded/fair request and result queues, and deterministic developer
+traces are wired through the live query pipeline. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for measured status and
 [docs/architecture.md](docs/architecture.md) for the component map.
 

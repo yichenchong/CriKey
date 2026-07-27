@@ -1,13 +1,21 @@
 //! `crikey` command-line entrypoint (spec 28).
 
-use std::process::ExitCode;
+mod dev_commands;
 
-use crikey_app::{App, SearchService, StartupStage};
+use std::process::ExitCode;
+use std::time::Instant;
+
+use crikey_app::{App, BatchState, PipelineConfig, QueryPipeline, ResultBatch, SearchService, StartupStage};
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
 };
-use crikey_core::PluginId;
-use crikey_ui::{LauncherViewModel, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, UiEffect};
+use crikey_core::{Item, PluginId};
+use crikey_input_scheduler::{
+    ActivationPolicy, DebouncePolicy, PluginPolicy, QueuePolicy, SchedulingProfile,
+};
+use crikey_ui::{
+    LauncherViewModel, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, UiEffect, ViewModel,
+};
 
 const USAGE: &str = "\
 crikey - a fast, keyboard-driven application launcher
@@ -29,14 +37,7 @@ COMMANDS:
 /// Kept apart from an unknown word on purpose: "advertised, not built" and "no
 /// such subcommand" are different answers, and a script can tell them apart by
 /// exit status without parsing prose.
-const UNIMPLEMENTED_DEV: [&str; 6] = [
-    "run",
-    "test",
-    "trace-query",
-    "simulate-typing",
-    "inspect-protocol",
-    "test-legacy-compat",
-];
+const UNIMPLEMENTED_DEV: [&str; 4] = ["run", "test", "inspect-protocol", "test-legacy-compat"];
 
 /// Queries the reported percentiles are drawn from, and results each retains.
 ///
@@ -132,6 +133,16 @@ fn run_native_launcher() -> Result<(), String> {
     search
         .complete_stage(StartupStage::AcceptQueries)
         .map_err(|error| error.to_string())?;
+    // SearchService remains the synchronous matcher and ranker. Its actual
+    // result items still cross the M2 intake and presentation boundary before
+    // its richer ranked/highlighted rows become visible.
+    let mut query_pipeline = QueryPipeline::new(PipelineConfig::default());
+    query_pipeline
+        .register_plugin(owner.clone(), application_provider_policy())
+        .map_err(|error| {
+            format!("cannot register the application provider with the query pipeline: {error:?}")
+        })?;
+    let query_clock = Instant::now();
 
     let activation_handle = render_handle.clone();
     activation_handle
@@ -157,8 +168,17 @@ fn run_native_launcher() -> Result<(), String> {
             match effect {
                 Some(UiEffect::Query(raw)) => {
                     if let Ok(generation) = search.submit_query(&raw) {
+                        let items = search.results().iter().map(|hit| hit.item.clone()).collect();
                         view_model.begin_generation(generation);
-                        view_model.publish(generation, search.result_rows(), false);
+
+                        let now = u64::try_from(query_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        if let Some(frame) =
+                            drive_application_provider(&mut query_pipeline, &owner, &raw, items, now)
+                        {
+                            if frame.generation == generation {
+                                view_model.publish(generation, search.result_rows(), frame.pending_plugins);
+                            }
+                        }
                     }
                 }
                 Some(UiEffect::Dismissed) => {
@@ -196,11 +216,84 @@ fn run_native_launcher() -> Result<(), String> {
         })
         .map_err(|error| error.to_string())
 }
+fn application_provider_policy() -> PluginPolicy {
+    PluginPolicy {
+        profile: SchedulingProfile::Modern,
+        debounce: DebouncePolicy {
+            debounce_ms: 0,
+            maximum_wait_ms: None,
+            leading_edge: true,
+            trailing_edge: true,
+            minimum_query_length: 0,
+        },
+        activation: ActivationPolicy {
+            supports_empty_query: true,
+            prefixes: Vec::new(),
+            keywords: Vec::new(),
+        },
+        max_concurrent_requests: 1,
+        queue_policy: QueuePolicy::ReplaceOldest,
+        queue_capacity: 1,
+    }
+}
+
+fn drive_application_provider(
+    pipeline: &mut QueryPipeline,
+    owner: &PluginId,
+    query: &str,
+    items: Vec<Item>,
+    now: u64,
+) -> Option<ViewModel> {
+    let generation = pipeline.keystroke(query, now);
+    let tick = pipeline.tick(now);
+    let tick_succeeded = tick.errors.is_empty();
+
+    for cancellation in tick.cancellations {
+        let _ = pipeline.complete(&cancellation.plugin, cancellation.generation, now);
+    }
+
+    let mut items = Some(items);
+    let mut delivered_current = false;
+    for request in tick.dispatches {
+        if request.plugin != *owner {
+            continue;
+        }
+        if request.generation != generation {
+            let _ = pipeline.complete(&request.plugin, request.generation, now);
+            continue;
+        }
+        let Some(batch_items) = items.take() else {
+            let _ = pipeline.complete(&request.plugin, request.generation, now);
+            continue;
+        };
+        delivered_current = pipeline
+            .deliver(
+                ResultBatch {
+                    generation: request.generation,
+                    plugin: request.plugin.clone(),
+                    state: BatchState::Final,
+                    items: batch_items,
+                },
+                now,
+            )
+            .is_ok();
+        let _ = pipeline.complete(&request.plugin, request.generation, now);
+    }
+
+    let frame = pipeline.present(now);
+    let presentation_succeeded = pipeline.take_errors().is_empty();
+    if !tick_succeeded || !delivered_current || !presentation_succeeded {
+        return None;
+    }
+    frame.filter(|frame| frame.generation == generation)
+}
 
 /// Routes a `crikey dev` invocation.
 fn dev(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("benchmark") => benchmark(&args[1..]),
+        Some("trace-query") => dev_commands::trace_query(&args[1..]),
+        Some("simulate-typing") => dev_commands::simulate_typing(&args[1..]),
         Some(subcommand) if UNIMPLEMENTED_DEV.contains(&subcommand) => {
             eprintln!("crikey: `dev {subcommand}` is not implemented yet");
             ExitCode::from(69) // EX_UNAVAILABLE
@@ -609,6 +702,177 @@ mod tests {
             ..sound_report()
         };
         assert!(measurement_failure(&config(), &unsearchable).is_some());
+    }
+
+    #[test]
+    fn built_in_application_results_cross_intake_before_prompt_publication() {
+        use std::collections::BTreeMap;
+
+        use crikey_core::{ArgumentPolicy, Category, HitPolicy, ItemId};
+        use crikey_input_scheduler::{BatchCompletion, QueryTraceEvent};
+
+        let owner = PluginId(APPLICATION_CATALOG_PLUGIN.to_owned());
+        let application = |id: &str, label: &str, score_hint: i32| Item {
+            stable_id: ItemId(id.to_owned()),
+            plugin_id: owner.clone(),
+            category: Category::Application,
+            label: label.to_owned(),
+            description: format!("launch {label}"),
+            target: format!("app://{id}"),
+            search_terms: Vec::new(),
+            icon_reference: None,
+            argument_policy: ArgumentPolicy::Forbidden,
+            hit_policy: HitPolicy::Recorded,
+            score_hint,
+            metadata: BTreeMap::new(),
+            actions: Vec::new(),
+        };
+
+        let mut search = SearchService::new(App::new());
+        search
+            .complete_stage(StartupStage::WindowAndHotkey)
+            .expect("window startup completes");
+        search
+            .replace_catalog(
+                &owner,
+                1,
+                vec![
+                    application("firefox", "Firefox Browser", 30),
+                    application("campfire", "Campfire Notes", 20),
+                    application("water", "Water Clock", 10),
+                ],
+            )
+            .expect("the application catalog is valid");
+        search
+            .complete_stage(StartupStage::PersistedCatalog)
+            .expect("catalog startup completes");
+        search
+            .complete_stage(StartupStage::AcceptQueries)
+            .expect("query startup completes");
+
+        let search_generation = search.submit_query("fire").expect("the local query is immediate");
+        let search_rows = search.result_rows();
+        assert_eq!(search_rows.len(), 2);
+        assert!(
+            search_rows.iter().all(|row| !row.highlights.is_empty()),
+            "the renderer must receive SearchService match evidence"
+        );
+        let expected_ids = search_rows.iter().map(|row| row.item.clone()).collect::<Vec<_>>();
+        let expected_highlights = search_rows
+            .iter()
+            .map(|row| row.highlights.clone())
+            .collect::<Vec<_>>();
+        let result_items = search
+            .results()
+            .iter()
+            .map(|hit| hit.item.clone())
+            .collect::<Vec<_>>();
+
+        let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+        pipeline
+            .register_plugin(owner.clone(), application_provider_policy())
+            .expect("the built-in provider registers once");
+        let mut view_model = LauncherViewModel::new();
+        view_model.activate();
+        view_model.begin_generation(search_generation);
+
+        let frame = drive_application_provider(&mut pipeline, &owner, "fire", result_items, 17)
+            .expect("the admitted current batch produces a frame");
+        assert_eq!(frame.generation, search_generation);
+        if frame.generation == search_generation {
+            view_model.publish(search_generation, search_rows, frame.pending_plugins);
+        }
+        let published = view_model
+            .frame()
+            .expect("the successful current frame unlocks UI publication");
+
+        let pipeline_ids = frame.rows.iter().map(|row| row.item.clone()).collect::<Vec<_>>();
+        let published_ids = published
+            .rows
+            .iter()
+            .map(|row| row.item.clone())
+            .collect::<Vec<_>>();
+        let published_highlights = published
+            .rows
+            .iter()
+            .map(|row| row.highlights.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(pipeline_ids, expected_ids);
+        assert_eq!(published_ids, expected_ids);
+        assert_eq!(published_highlights, expected_highlights);
+
+        let diagnostics = pipeline.diagnostics();
+        assert_eq!(diagnostics.dispatched_requests, 1);
+        assert_eq!(diagnostics.in_flight_requests, 0);
+        assert_eq!(diagnostics.rejected_stale_results, 0);
+        assert_eq!(pipeline.intake_diagnostics().admitted(), 1);
+        assert_eq!(pipeline.intake_diagnostics().merged(), 1);
+        assert_eq!(pipeline.intake_depth().batches, 0);
+        assert_eq!(
+            pipeline.next_wakeup(),
+            None,
+            "local search must not wait on debounce"
+        );
+        assert!(pipeline.trace().iter().any(|event| {
+            matches!(
+                event,
+                QueryTraceEvent::Keystroke {
+                    at: 17,
+                    generation: observed,
+                    ..
+                } if *observed == search_generation
+            )
+        }));
+        assert!(pipeline.trace().iter().any(|event| {
+            matches!(
+                event,
+                QueryTraceEvent::Dispatched {
+                    at: 17,
+                    plugin,
+                    generation: observed,
+                } if plugin == &owner && *observed == search_generation
+            )
+        }));
+        assert!(pipeline.trace().iter().any(|event| {
+            matches!(
+                event,
+                QueryTraceEvent::ResultBatch {
+                    at: 17,
+                    plugin,
+                    generation: observed,
+                    items: 2,
+                    completion: BatchCompletion::Final,
+                } if plugin == &owner && *observed == search_generation
+            )
+        }));
+        assert!(pipeline.trace().iter().any(|event| {
+            matches!(
+                event,
+                QueryTraceEvent::FinalResult {
+                    at: 17,
+                    plugin,
+                    generation: observed,
+                    ..
+                } if plugin == &owner && *observed == search_generation
+            )
+        }));
+        assert!(pipeline.trace().iter().any(|event| {
+            matches!(
+                event,
+                QueryTraceEvent::Presentation {
+                    at: 17,
+                    generation: observed,
+                    visible_items: 2,
+                } if *observed == search_generation
+            )
+        }));
+        assert!(
+            !pipeline
+                .trace()
+                .iter()
+                .any(|event| matches!(event, QueryTraceEvent::StaleResultRejected { .. })),
+            "the UI boundary must never receive a stale built-in batch"
+        );
     }
 
     #[test]

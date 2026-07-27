@@ -423,6 +423,7 @@ dependencies = [
  "crikey-app",
  "crikey-benchmarks",
  "crikey-core",
+ "crikey-input-scheduler",
  "crikey-ui",
 ]
 

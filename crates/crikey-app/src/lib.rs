@@ -9,6 +9,15 @@
 //! engine, the ranker and the result aggregator, and turns typed text into a
 //! ranked answer.
 
+mod query_pipeline;
+
+pub use crikey_result_aggregator::{
+    BatchPriority, BatchState, DrainBudget, DrainReport, InboundBatch, IntakePolicy, MergedBatch,
+    OverflowPolicy, ProducerState, QueueDepth, QueueDiagnostics, QueueEvent, QueueEventKind, QueueLimits,
+    QueueReject, RejectReason, ResultBatch, ResultLimits,
+};
+pub use query_pipeline::{PipelineConfig, PipelineError, PipelineTick, QueryPipeline};
+
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap},
@@ -31,9 +40,7 @@ use crikey_query::{
     DefaultMatcher, DefaultNormalizer, MatchMethod, MatchOutcome, NormalizedQuery, Normalizer, PreparedLabel,
 };
 use crikey_ranking::{DefaultRanker, Ranker, Score};
-use crikey_result_aggregator::{
-    BatchState, MemoryResultAggregator, RejectReason, ResultAggregator, ResultBatch, ResultLimits,
-};
+use crikey_result_aggregator::{MemoryResultAggregator, ResultAggregator};
 use crikey_ui::ResultRow;
 
 /// State-only milestones for staged startup (spec 25.6).

@@ -11,6 +11,14 @@
 //! then arrival order is the deterministic tie-break that keeps rows from
 //! moving under the user's selection (spec 11.6).
 
+mod intake;
+
+pub use intake::{
+    BatchPriority, DrainBudget, DrainReport, InboundBatch, InboundResultQueue, IntakePolicy, MergedBatch,
+    OverflowPolicy, ProducerState, QueueDepth, QueueDiagnostics, QueueEvent, QueueEventKind, QueueLimits,
+    QueueReject,
+};
+
 use std::collections::{HashMap, HashSet};
 
 use crikey_core::{Generation, Item, ItemId, PluginId};

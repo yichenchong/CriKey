@@ -19,5 +19,6 @@ path = "src/main.rs"
 crikey-app.workspace = true
 crikey-benchmarks.workspace = true
 crikey-core.workspace = true
+crikey-input-scheduler.workspace = true
 
 crikey-ui.workspace = true
