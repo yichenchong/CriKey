@@ -84,7 +84,7 @@ Exit criteria: warm activation < 30 ms p95 and cached local results < 16 ms p95
 on the reference machine; 500k synthetic items searchable; query text renders in
 the next frame with no debounce (§25.1, §31.1–3, §31.27).
 
-Status snapshot (2026-07-26):
+Status snapshot (2026-07-27):
 
 - Implemented: query normalization and matching, default ranking, bounded
   result aggregation, persistent per-plugin cache, indexed catalog search,
@@ -96,19 +96,21 @@ Status snapshot (2026-07-26):
   round-trip through the shipped cache; cached local query p95 is 13.099 ms over
   1,355 typed-prefix samples. The archive is 125,275,069 bytes; full decoding
   takes 1.801 s and leaves 506.6 MB resident at stress scale (ADR-0008).
-- Verification limit: this Linux workstation has no `DISPLAY`,
-  `WAYLAND_DISPLAY`, Xvfb, or headless compositor. `crikey run` reaches the
-  native event-loop boundary and exits with a diagnostic rather than hanging,
-  but no window could be presented here. The Windows CLI and all test targets
-  cross-compile for `x86_64-pc-windows-msvc`; the Win32 backends have not been
-  executed in a Windows session.
-  On a platform with no registered reactivation source, dismissal exits
-  cleanly rather than retaining an unreachable hidden process; repeated warm
-  activation therefore requires a working hotkey backend.
-- Remaining before M1 can close: exercise the retained window on a graphical
-  session, exercise hotkey/discovery/launch on Windows, and measure warm
-  activation below 30 ms p95. Query latency and catalog scale are green; the M1
-  milestone as a whole is not.
+- Linux presentation smoke test passed under Xvfb at 1280×720×24 using Mesa
+  Lavapipe: the retained window presented a non-empty GPU-rendered frame, accepted
+  the `smoke` query, displayed and selected an isolated `.desktop` fixture, and
+  Enter launched its controlled executable with the exact arguments
+  `["alpha beta", "gamma"]`. The launcher then exited cleanly with status 0.
+  Xvfb reported only its expected lack of DRI3 acceleration.
+- The Windows CLI and all test targets cross-compile for
+  `x86_64-pc-windows-msvc`; the Win32 backends have not been executed in a
+  Windows session. On a platform with no registered reactivation source,
+  dismissal exits cleanly rather than retaining an unreachable hidden process;
+  repeated warm activation therefore requires a working hotkey backend.
+- Remaining before M1 can close: exercise hotkey/discovery/launch on Windows and
+  measure warm activation below 30 ms p95 on the reference path. Query latency,
+  catalog scale, and Linux native presentation are green; the M1 milestone as a
+  whole is not.
 
 ### M2 — Scheduling and resilience (§30 Phase 2) — L
 
