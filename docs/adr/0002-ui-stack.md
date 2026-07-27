@@ -21,6 +21,11 @@ Warm activation is achieved by creating the window and its GPU surface at
 startup and keeping it alive but hidden; the hotkey path shows an existing
 surface rather than constructing one.
 
+The renderer stack is pinned at `egui` 0.29.1, `wgpu` 22.1.0 and `winit`
+0.30.5. Its current Wayland dependency graph requires Rust 1.86, so that is the
+workspace MSRV; declaring 1.82 would be false even though the direct renderer
+crates themselves compile with older rustc releases.
+
 ## Consequences
 
 - Consistent rendering across platforms, one code path for the result list.

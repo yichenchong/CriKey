@@ -69,6 +69,12 @@
 //! the faults below are scripted by a cache double that touches no file at
 //! all.
 
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
+use std::thread;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 use std::{
     collections::BTreeMap,
     fs, io,
@@ -78,7 +84,12 @@ use std::{
 
 use crikey_app::{App, SearchError, SearchHit, SearchService, StartupStage};
 use crikey_catalog::{CacheError, CachedSlice, CatalogCache, FileCatalogCache};
-use crikey_core::{ArgumentPolicy, Category, Generation, HitPolicy, Item, ItemId, PluginId};
+use crikey_core::{
+    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, Generation, HitPolicy, Item, ItemId,
+    PluginId,
+};
+#[cfg(target_os = "linux")]
+use crikey_platform::{application_items, DiscoveredApplication, APPLICATION_LAUNCH_ACTION_ID};
 use crikey_query::{DefaultMatcher, DefaultNormalizer, MatchMethod, Matcher, Normalizer};
 use crikey_ranking::{DefaultRanker, Ranker, Score};
 use crikey_result_aggregator::ResultLimits;
@@ -1244,4 +1255,153 @@ fn a_match_whose_label_shares_no_character_with_the_query_survives_pruning() {
         assert_eq!(ids(service.results()), [expected_id]);
         assert_eq!(service.results()[0].method, MatchMethod::Keyword);
     }
+}
+
+#[test]
+fn a_live_catalog_replacement_is_immediately_searchable_and_drops_the_old_slice() {
+    let owner = PluginId(PLUGIN.to_owned());
+    let mut service = accepting_service();
+
+    assert_eq!(
+        service.replace_catalog(&owner, 1, vec![candidate("old", "Old Calculator", "", &[])],),
+        Ok(1)
+    );
+    service.submit_query("old").expect("query accepted");
+    assert_eq!(ids(service.results()), ["old"]);
+
+    assert_eq!(
+        service.replace_catalog(&owner, 2, vec![candidate("new", "New Calculator", "", &[])],),
+        Ok(1)
+    );
+    service.submit_query("old").expect("query accepted");
+    assert!(
+        service.results().is_empty(),
+        "replacement must remove the previous live slice"
+    );
+    service.submit_query("new").expect("query accepted");
+    assert_eq!(ids(service.results()), ["new"]);
+}
+
+#[test]
+fn renderer_rows_preserve_ranked_hit_content_and_action_order() {
+    let owner = PluginId(PLUGIN.to_owned());
+    let mut item = candidate("terminal", "Terminal", "Open a shell", &[]);
+    item.icon_reference = Some("terminal-icon".to_owned());
+    item.argument_policy = ArgumentPolicy::Required;
+    item.actions = ["open", "open-admin"]
+        .into_iter()
+        .map(|id| Action {
+            action_id: ActionId(id.to_owned()),
+            label: id.to_owned(),
+            description: String::new(),
+            applicable_categories: vec![Category::Application],
+            icon_reference: None,
+            execution_policy: ExecutionPolicy::HostMediated,
+        })
+        .collect();
+
+    let mut service = accepting_service();
+    service
+        .replace_catalog(&owner, 1, vec![item])
+        .expect("live application slice accepted");
+    service.submit_query("term").expect("query accepted");
+
+    let rows = service.result_rows();
+    let row = rows.first().expect("matching item becomes one renderer row");
+    assert_eq!(row.item, ItemId("terminal".to_owned()));
+    assert_eq!(row.label, "Terminal");
+    assert_eq!(row.description, "Open a shell");
+    assert_eq!(row.icon_reference.as_deref(), Some("terminal-icon"));
+    assert_eq!(row.category, "application");
+    assert_eq!(row.plugin_name, PLUGIN);
+    assert_eq!(row.argument_hint.as_deref(), Some("argument required"));
+    assert_eq!(
+        row.default_action
+            .as_ref()
+            .map(|action| action.action_id.0.as_str()),
+        Some("open")
+    );
+    assert_eq!(
+        row.alternate_actions
+            .iter()
+            .map(|action| action.action_id.0.as_str())
+            .collect::<Vec<_>>(),
+        ["open-admin"]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_selected_discovered_application_launches_with_its_exact_argument_vector() {
+    let root = TempRoot::new("application-launch");
+    let program = root.path().join("record-launch");
+    let pending = root.path().join("arguments.pending");
+    let recorded = root.path().join("arguments");
+    fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\0' \"$#\" > '{pending}'\n\
+             for argument in \"$@\"; do printf '%s\\0' \"$argument\" >> '{pending}'; done\n\
+             mv '{pending}' '{recorded}'\n",
+            pending = pending.display(),
+            recorded = recorded.display(),
+        ),
+    )
+    .expect("write the application fixture");
+    let mut permissions = fs::metadata(&program)
+        .expect("read the application fixture metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&program, permissions).expect("make the application fixture executable");
+
+    let arguments = vec![
+        "--profile".to_owned(),
+        "two words".to_owned(),
+        String::new(),
+        "quote\"and\\slash".to_owned(),
+    ];
+    let owner = PluginId("builtin.crikey.applications".to_owned());
+    let discovered = [DiscoveredApplication {
+        name: "Launch Recorder".to_owned(),
+        target: crikey_core::PlatformPath::from(program),
+        arguments: arguments.clone(),
+        icon_reference: None,
+        platform_id: None,
+    }];
+    let item = application_items(&owner, &discovered)
+        .pop()
+        .expect("one discovered application becomes one item");
+    let item_id = item.stable_id.clone();
+    let action_id = item.actions[0].action_id.clone();
+    assert_eq!(action_id.0, APPLICATION_LAUNCH_ACTION_ID);
+
+    let mut service = accepting_service();
+    service
+        .replace_catalog(&owner, 1, vec![item])
+        .expect("application catalog accepted");
+    service
+        .submit_query("recorder")
+        .expect("application query accepted");
+    service
+        .execute(&item_id, &action_id)
+        .expect("selected application action launches");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let bytes = loop {
+        match fs::read(&recorded) {
+            Ok(bytes) => break bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("launched application did not record its arguments: {error}"),
+        }
+    };
+    let fields = bytes
+        .split(|byte| *byte == 0)
+        .take(arguments.len() + 1)
+        .map(|field| String::from_utf8(field.to_vec()).expect("fixture records UTF-8"))
+        .collect::<Vec<_>>();
+    assert_eq!(fields[0], arguments.len().to_string());
+    assert_eq!(&fields[1..], arguments);
 }

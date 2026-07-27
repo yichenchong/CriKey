@@ -9,9 +9,11 @@ on Windows.
 
 ## Status
 
-M0 skeleton complete. M1 core search, catalog persistence, launcher view model,
-Linux discovery, startup staging, and supervisor state are implemented; native
-window integration and Windows platform backends remain. See
+M0 skeleton complete. M1 core search, catalog persistence, native launcher
+runtime, Linux discovery, startup staging, supervisor state, and Windows
+hotkey/application backends are implemented. This Linux host has no graphical
+session and no Windows runtime, so native presentation, Windows execution, and
+warm-activation p95 remain unverified. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for measured status and
 [docs/architecture.md](docs/architecture.md) for the component map.
 

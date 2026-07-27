@@ -28,8 +28,8 @@ use std::ffi::OsString;
 
 use crikey_core::{Category, Item, ItemId, PlatformPath, PluginId};
 use crikey_platform::{
-    application_items, decode_target, encode_target, Accelerator, DiscoveredApplication, HotkeyError,
-    Modifiers, TargetError,
+    application_arguments, application_items, decode_target, encode_target, Accelerator,
+    DiscoveredApplication, HotkeyError, Modifiers, TargetError, APPLICATION_LAUNCH_ACTION_ID,
 };
 
 #[cfg(unix)]
@@ -383,6 +383,31 @@ fn arguments_are_recorded_in_metadata_in_order() {
         app.arguments.len(),
         "one metadata key per argument, no stragglers"
     );
+}
+
+#[test]
+fn application_arguments_rebuilds_exact_argument_boundaries() {
+    let mut app = discovered("Terminal", "/usr/bin/xterm");
+    app.arguments = vec!["".to_owned(), "two words".to_owned(), "\"quoted\"".to_owned()];
+    let item = application_items(&plugin(), &[app])
+        .pop()
+        .expect("one discovery produces one item");
+
+    assert_eq!(
+        application_arguments(&item).expect("host-owned metadata is valid"),
+        ["", "two words", "\"quoted\""]
+    );
+}
+
+#[test]
+fn discovered_applications_have_one_host_launch_action() {
+    let item = application_items(&plugin(), &[discovered("Firefox", "/usr/bin/firefox")])
+        .pop()
+        .expect("one discovery produces one item");
+
+    assert_eq!(item.actions.len(), 1);
+    assert_eq!(item.actions[0].action_id.0, APPLICATION_LAUNCH_ACTION_ID);
+    assert_eq!(item.actions[0].label, "Launch");
 }
 
 #[test]

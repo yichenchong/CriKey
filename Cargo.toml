@@ -28,7 +28,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.86"
 license = "Apache-2.0"
 repository = "https://github.com/crikey-launcher/crikey"
 authors = ["The CriKey Authors"]
@@ -57,12 +57,24 @@ crikey-cli = { path = "crates/crikey-cli", version = "0.1.0" }
 crikey-plugin-sdk = { path = "sdk/rust", version = "0.1.0" }
 crikey-benchmarks = { path = "benchmarks", version = "0.1.0" }
 
+egui = { version = "=0.29.1", default-features = false }
+egui-wgpu = { version = "=0.29.1", default-features = false }
+egui-winit = { version = "=0.29.1", default-features = false }
+pollster = "=0.3.0"
+wgpu = { version = "=22.1.0", default-features = false }
+winit = { version = "=0.30.5", default-features = false }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "2"
 unicode-normalization = "0.1.24"
 unicode-casefold = "0.2.0"
 unicode-general-category = "1.1.0"
+
+# Microsoft's generated Win32/COM bindings, used only by the Windows backend
+# and pulled in only on that target (spec 18.4). Hand written `extern "system"`
+# declarations for the COM interfaces `.lnk` resolution and Start-app
+# enumeration need would be a second, unreviewed copy of the same ABI.
+windows = { version = "0.61", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

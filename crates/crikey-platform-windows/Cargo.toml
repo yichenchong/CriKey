@@ -14,3 +14,32 @@ workspace = true
 [dependencies]
 crikey-core.workspace = true
 crikey-platform.workspace = true
+
+# Only the Windows target links Win32, so a Linux or macOS build of the
+# workspace still compiles this crate -- as an honestly unsupported backend --
+# without downloading a single import library.
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+workspace = true
+features = [
+    # The crate's own default, restored explicitly because the workspace
+    # declaration turns defaults off to keep the feature list auditable.
+    "std",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    # Not for the registry itself: `SHELLEXECUTEINFOW` carries an `HKEY` field,
+    # so the whole `ShellExecuteExW` surface is gated on this feature.
+    "Win32_System_Registry",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+# The cross-check in `tests/virtual_keys.rs` compares this crate's hand written
+# Win32 numbers against Microsoft's generated ones, so it needs the metadata
+# the library deliberately does not carry on any other target.
+[target.'cfg(target_os = "windows")'.dev-dependencies.windows]
+workspace = true
+features = ["Win32_UI_Input_KeyboardAndMouse"]

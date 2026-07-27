@@ -3,15 +3,25 @@
 //! The UI owns no plugin state: it renders a view model produced for one query
 //! generation and never blocks on plugin work.
 //!
-//! Nothing here touches a window system, a GPU surface, a wall clock or a
-//! thread. [`LauncherWindow`] is the seam a renderer implements and
-//! [`LauncherViewModel`] is the renderer-free state machine behind it, so the
-//! whole interaction contract stays testable on a headless machine and the
-//! renderer stays replaceable without touching another crate (ADR-0002).
+//! [`LauncherViewModel`] is the renderer-independent state machine. The native
+//! [`NativeLauncher`] implements ADR-0002 with a retained `winit` window,
+//! `wgpu` surface, and egui widget frame while preserving [`LauncherWindow`] as
+//! the presentation seam. [`build_launcher_frame`] stays independently
+//! callable for deterministic headless rendering checks.
 
 use std::sync::Arc;
 
 use crikey_core::{Action, ActionId, Generation, ItemId};
+
+mod native;
+mod theme;
+
+pub use egui;
+pub use native::{
+    build_launcher_frame, create_launcher_context, ActivationLatencySnapshot, ActivationLatencyTracker,
+    NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, NativeLauncherHandle, NativeUiFrame,
+    RendererError, ACTIVATION_SAMPLE_CAPACITY,
+};
 
 /// One row in the result list (spec 6.4).
 #[derive(Debug, Clone)]
@@ -376,6 +386,25 @@ impl LauncherViewModel {
         self.query.push_str(&row.label);
         self.dirty = true;
         Some(UiEffect::Query(self.query.clone()))
+    }
+
+    /// Attaches an actionable failure message to the selected row.
+    ///
+    /// This copies the current row slice only on an action failure, never on
+    /// query or navigation hot paths. The next frame renders the message
+    /// through the row's existing `status` field.
+    pub fn set_selected_status(&mut self, status: String) {
+        let Some(selected) = self.rows.get(self.selected) else {
+            return;
+        };
+        if selected.status.as_deref() == Some(status.as_str()) {
+            return;
+        }
+
+        let mut rows = self.rows.to_vec();
+        rows[self.selected].status = Some(status);
+        self.rows = rows.into();
+        self.dirty = true;
     }
 
     /// Opens the action list of the selected row (spec 6.3).

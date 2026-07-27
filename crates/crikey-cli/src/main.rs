@@ -2,10 +2,12 @@
 
 use std::process::ExitCode;
 
-use crikey_app::App;
+use crikey_app::{App, SearchService, StartupStage};
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
 };
+use crikey_core::PluginId;
+use crikey_ui::{LauncherViewModel, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, UiEffect};
 
 const USAGE: &str = "\
 crikey - a fast, keyboard-driven application launcher
@@ -44,6 +46,9 @@ const UNIMPLEMENTED_DEV: [&str; 6] = [
 /// from that test describe one workload rather than two.
 const BENCHMARK_QUERIES: usize = 64;
 const BENCHMARK_TOP_K: usize = 20;
+const APPLICATION_CATALOG_PLUGIN: &str = "builtin.crikey.applications";
+#[cfg(windows)]
+const DEFAULT_ACTIVATION_HOTKEY: &str = "Ctrl+Alt+Space";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -61,7 +66,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("dev") => dev(&args[1..]),
-        Some(command @ ("run" | "plugin" | "package")) => {
+        Some("run") => run_launcher(&args[1..]),
+        Some(command @ ("plugin" | "package")) => {
             eprintln!("crikey: `{command}` is not implemented yet");
             ExitCode::from(69) // EX_UNAVAILABLE
         }
@@ -70,6 +76,125 @@ fn main() -> ExitCode {
             ExitCode::from(64) // EX_USAGE
         }
     }
+}
+
+/// Starts the retained native launcher and wires immediate local search.
+fn run_launcher(args: &[String]) -> ExitCode {
+    if !args.is_empty() {
+        eprintln!("crikey: `run` takes no arguments\n\n{USAGE}");
+        return ExitCode::from(64); // EX_USAGE
+    }
+
+    match run_native_launcher() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("crikey: launcher failed: {message}");
+            ExitCode::from(70) // EX_SOFTWARE
+        }
+    }
+}
+
+fn run_native_launcher() -> Result<(), String> {
+    let launcher = NativeLauncher::new(NativeLauncherConfig::default()).map_err(|error| error.to_string())?;
+    let render_handle = launcher.handle();
+    let mut search = SearchService::new(App::new());
+
+    #[cfg(windows)]
+    let has_activation_source = {
+        let hotkey_handle = render_handle.clone();
+        search
+            .register_activation_hotkey(
+                DEFAULT_ACTIVATION_HOTKEY,
+                Box::new(move |_| {
+                    let _ = hotkey_handle.request_toggle();
+                }),
+            )
+            .map_err(|error| format!("cannot register {DEFAULT_ACTIVATION_HOTKEY}: {error}"))?;
+        true
+    };
+    #[cfg(not(windows))]
+    let has_activation_source = false;
+
+    search
+        .complete_stage(StartupStage::WindowAndHotkey)
+        .map_err(|error| error.to_string())?;
+
+    let owner = PluginId(APPLICATION_CATALOG_PLUGIN.to_owned());
+    let applications = search
+        .discover_application_items(&owner)
+        .map_err(|error| format!("application discovery failed: {error}"))?;
+    search
+        .replace_catalog(&owner, 1, applications)
+        .map_err(|error| format!("application catalog was rejected: {error}"))?;
+    search
+        .complete_stage(StartupStage::PersistedCatalog)
+        .map_err(|error| error.to_string())?;
+    search
+        .complete_stage(StartupStage::AcceptQueries)
+        .map_err(|error| error.to_string())?;
+
+    let activation_handle = render_handle.clone();
+    activation_handle
+        .request_activation()
+        .map_err(|error| error.to_string())?;
+    let mut view_model = LauncherViewModel::new();
+    launcher
+        .run(move |event| {
+            let (command_session, effect) = match event {
+                NativeLauncherEvent::Activated => {
+                    // A rapid off/on hotkey pair may supersede the queued
+                    // dismissal. Reset the old session before opening the new
+                    // one so its query and rows cannot cross the boundary.
+                    view_model.dismiss();
+                    view_model.activate();
+                    (None, None)
+                }
+                NativeLauncherEvent::Command { session, command } => {
+                    (Some(session), view_model.apply(command))
+                }
+            };
+
+            match effect {
+                Some(UiEffect::Query(raw)) => {
+                    if let Ok(generation) = search.submit_query(&raw) {
+                        view_model.begin_generation(generation);
+                        view_model.publish(generation, search.result_rows(), false);
+                    }
+                }
+                Some(UiEffect::Dismissed) => {
+                    if let Some(session) = command_session {
+                        let _ = render_handle.request_hide_session(session);
+                    }
+                    // Without a registered reactivation source, retaining a
+                    // hidden process would make the launcher unreachable.
+                    if !has_activation_source {
+                        let _ = render_handle.request_exit();
+                    }
+                }
+                Some(UiEffect::Execute { item, action }) => match search.execute(&item, &action) {
+                    Ok(()) => {
+                        view_model.dismiss();
+                        if let Some(session) = command_session {
+                            let _ = render_handle.request_hide_session(session);
+                        }
+                        if !has_activation_source {
+                            let _ = render_handle.request_exit();
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("Launch failed: {error}");
+                        view_model.set_selected_status(message.clone());
+                        eprintln!("crikey: {message}");
+                    }
+                },
+                None => {}
+            }
+
+            if let Some(frame) = view_model.frame() {
+                let _ = render_handle.submit_frame(&frame);
+            }
+        })
+        .map_err(|error| error.to_string())
 }
 
 /// Routes a `crikey dev` invocation.

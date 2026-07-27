@@ -1506,3 +1506,22 @@ fn frames_share_one_row_allocation_instead_of_deep_copying_it() {
         "the retired row set is released as soon as the last frame holding it goes"
     );
 }
+
+#[test]
+fn an_action_failure_becomes_visible_on_the_selected_row() {
+    let generation = fresh_generation();
+    let mut view_model = open_showing(generation, &["alpha", "beta"]);
+    let _ = expect_frame(&mut view_model);
+    select_index(&mut view_model, 1);
+    let _ = expect_frame(&mut view_model);
+
+    view_model.set_selected_status("launch failed: access denied".to_owned());
+    let frame = expect_frame(&mut view_model);
+
+    assert_eq!(frame.selected, 1);
+    assert_eq!(frame.rows[0].status, None);
+    assert_eq!(
+        frame.rows[1].status.as_deref(),
+        Some("launch failed: access denied")
+    );
+}

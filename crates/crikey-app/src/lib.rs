@@ -14,9 +14,19 @@ use std::{
     collections::{BinaryHeap, HashMap},
 };
 
-use crikey_catalog::{CacheError, CachedSlice, CatalogCache, CatalogStore, CatalogUpdate, MemoryCatalog};
-use crikey_core::{Generation, GenerationTracker, Item, ItemId, PluginId};
+use crikey_catalog::{
+    CacheError, CachedSlice, CatalogCache, CatalogError, CatalogStore, CatalogUpdate, MemoryCatalog,
+};
+use crikey_core::{
+    ActionId, ArgumentPolicy, ExecutionPolicy, Generation, GenerationTracker, Item, ItemId, PluginId,
+    Result as CoreResult,
+};
 use crikey_input_scheduler::SchedulingProfile;
+#[cfg(any(windows, target_os = "linux"))]
+use crikey_platform::application_items;
+use crikey_platform::{application_arguments, decode_target, APPLICATION_LAUNCH_ACTION_ID};
+#[cfg(windows)]
+use crikey_platform::{HotkeyActivationHandler, HotkeyBinding};
 use crikey_query::{
     DefaultMatcher, DefaultNormalizer, MatchMethod, MatchOutcome, NormalizedQuery, Normalizer, PreparedLabel,
 };
@@ -24,6 +34,7 @@ use crikey_ranking::{DefaultRanker, Ranker, Score};
 use crikey_result_aggregator::{
     BatchState, MemoryResultAggregator, RejectReason, ResultAggregator, ResultBatch, ResultLimits,
 };
+use crikey_ui::ResultRow;
 
 /// State-only milestones for staged startup (spec 25.6).
 ///
@@ -103,6 +114,8 @@ impl StartupStage {
 
 #[derive(Debug)]
 pub struct App {
+    #[cfg(any(windows, target_os = "linux"))]
+    backend: Backend,
     generations: GenerationTracker,
     limits: ResultLimits,
     default_legacy_profile: SchedulingProfile,
@@ -119,6 +132,8 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         Self {
+            #[cfg(any(windows, target_os = "linux"))]
+            backend: Backend::new(),
             generations: GenerationTracker::new(),
             limits: ResultLimits::default(),
             default_legacy_profile: SchedulingProfile::LegacyStrict,
@@ -215,6 +230,64 @@ impl App {
     /// This does not mean that any lazy modern plugin has been activated.
     pub fn startup_complete(&self) -> bool {
         self.eager_startup_complete
+    }
+
+    /// Discovers the current platform's applications and maps them into one
+    /// catalog slice owned by `plugin`.
+    pub fn discover_application_items(&self, plugin: &PluginId) -> CoreResult<Vec<Item>> {
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let discovered = self.backend.application_discovery().discover()?;
+            Ok(application_items(plugin, &discovered))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let _ = plugin;
+            Err(crikey_core::CoreError::Invalid(
+                "application discovery is unavailable on the macOS backend".to_owned(),
+            ))
+        }
+    }
+
+    /// Registers the Windows activation shortcut and connects it to the native
+    /// UI loop's wake-up callback.
+    #[cfg(windows)]
+    pub fn register_activation_hotkey(
+        &mut self,
+        accelerator: &str,
+        handler: HotkeyActivationHandler,
+    ) -> CoreResult<()> {
+        let binding = HotkeyBinding {
+            accelerator: accelerator.to_owned(),
+        };
+        let hotkeys = self.backend.hotkeys();
+        hotkeys.set_activation_handler(Some(handler));
+        if let Err(error) = hotkeys.register(&binding) {
+            hotkeys.set_activation_handler(None);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn launch_application(&self, item: &Item) -> CoreResult<()> {
+        let target = decode_target(&item.target).map_err(|error| {
+            crikey_core::CoreError::Invalid(format!("invalid application target: {error}"))
+        })?;
+        let arguments = application_arguments(item)?;
+
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            self.backend.process_launcher().launch(&target, &arguments)
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (target, arguments);
+            Err(crikey_core::CoreError::Invalid(
+                "process launching is unavailable on the macOS backend".to_owned(),
+            ))
+        }
     }
 
     /// Name of the platform backend compiled into this build.
@@ -457,6 +530,20 @@ impl SearchService {
     pub fn complete_stage(&mut self, expected: StartupStage) -> Result<Option<StartupStage>, StartupError> {
         self.app.complete_stage(expected)
     }
+    /// Discovers application items through the selected platform backend.
+    pub fn discover_application_items(&self, plugin: &PluginId) -> CoreResult<Vec<Item>> {
+        self.app.discover_application_items(plugin)
+    }
+
+    /// Connects the Windows global shortcut to a native UI event-loop wake-up.
+    #[cfg(windows)]
+    pub fn register_activation_hotkey(
+        &mut self,
+        accelerator: &str,
+        handler: HotkeyActivationHandler,
+    ) -> CoreResult<()> {
+        self.app.register_activation_hotkey(accelerator, handler)
+    }
 
     /// Admits every readable cached slice into the live catalog and reports
     /// what became searchable and what had to be skipped (spec 22.1, 25.6).
@@ -501,6 +588,49 @@ impl SearchService {
         Ok(load)
     }
 
+    /// Replaces one live owner's catalog slice and returns the retained count.
+    ///
+    /// The caller supplies the worker instance that owns the publication.
+    /// Replacing a slice invalidates incremental-query state before touching the
+    /// catalog, and a rejected publication retires the newly activated instance
+    /// so failed startup work cannot retain publishing authority.
+    pub fn replace_catalog(
+        &mut self,
+        plugin: &PluginId,
+        instance: u64,
+        items: Vec<Item>,
+    ) -> Result<usize, CatalogError> {
+        self.candidate_cache = None;
+        self.non_prefix_upper.remove(plugin);
+        self.catalog.activate_instance(plugin, instance)?;
+        if let Err(error) = self
+            .catalog
+            .apply(plugin, instance, CatalogUpdate::Replace, items)
+        {
+            let _ = self.catalog.retire_instance(plugin, instance);
+            return Err(error);
+        }
+
+        let retained = self.catalog.plugin_len(plugin);
+        if let Some(upper) = self
+            .catalog
+            .items(plugin)
+            .iter()
+            .map(|item| self.ranker.non_prefix_upper_bound(item))
+            .max()
+        {
+            self.non_prefix_upper.insert(plugin.clone(), upper);
+        }
+        match (retained, self.owners.binary_search(plugin)) {
+            (0, Ok(at)) => {
+                self.owners.remove(at);
+            }
+            (0, Err(_)) | (_, Ok(_)) => {}
+            (_, Err(at)) => self.owners.insert(at, plugin.clone()),
+        }
+        Ok(retained)
+    }
+
     /// Publishes one cached slice, returning the items the catalog retained,
     /// or `None` when the slice never became catalog state.
     ///
@@ -525,37 +655,7 @@ impl SearchService {
             items,
             ..
         } = slice;
-
-        if self.catalog.activate_instance(&plugin, instance).is_err() {
-            return None;
-        }
-        if self
-            .catalog
-            .apply(&plugin, instance, CatalogUpdate::Replace, items)
-            .is_err()
-        {
-            let _ = self.catalog.retire_instance(&plugin, instance);
-            return None;
-        }
-
-        let retained = self.catalog.plugin_len(&plugin);
-        if let Some(upper) = self
-            .catalog
-            .items(&plugin)
-            .iter()
-            .map(|item| self.ranker.non_prefix_upper_bound(item))
-            .max()
-        {
-            self.non_prefix_upper.insert(plugin.clone(), upper);
-        } else {
-            self.non_prefix_upper.remove(&plugin);
-        }
-        if retained > 0 {
-            if let Err(at) = self.owners.binary_search(&plugin) {
-                self.owners.insert(at, plugin);
-            }
-        }
-        Some(retained)
+        self.replace_catalog(&plugin, instance, items).ok()
     }
 
     /// Accepts a query and allocates the generation that makes its answer the
@@ -664,6 +764,74 @@ impl SearchService {
     /// The ranked answer to the most recently accepted query.
     pub fn results(&self) -> &[SearchHit] {
         &self.results
+    }
+
+    /// Materializes the current ranked answer into the renderer's row model.
+    ///
+    /// Search hits stay authoritative for ordering and highlights. The first
+    /// declared item action is the default; remaining actions are alternates.
+    pub fn result_rows(&self) -> Vec<ResultRow> {
+        self.results
+            .iter()
+            .map(|hit| {
+                let mut actions = hit.item.actions.iter();
+                let default_action = actions.next().cloned();
+                let alternate_actions = actions.cloned().collect();
+                let argument_hint = match hit.item.argument_policy {
+                    ArgumentPolicy::Forbidden => None,
+                    ArgumentPolicy::Optional => Some("optional argument".to_owned()),
+                    ArgumentPolicy::Required => Some("argument required".to_owned()),
+                };
+                ResultRow {
+                    item: hit.item.stable_id.clone(),
+                    label: hit.item.label.clone(),
+                    description: hit.item.description.clone(),
+                    icon_reference: hit.item.icon_reference.clone(),
+                    category: hit.item.category.as_str().to_owned(),
+                    plugin_name: hit.item.plugin_id.0.clone(),
+                    highlights: hit.highlights.clone(),
+                    argument_hint,
+                    status: None,
+                    default_action,
+                    alternate_actions,
+                }
+            })
+            .collect()
+    }
+
+    /// Executes an action from the currently presented result set.
+    ///
+    /// Host-mediated application launches are routed through the selected
+    /// platform backend. Plugin-owned actions remain outside the M1 runtime and
+    /// fail explicitly instead of becoming a silent Enter key.
+    pub fn execute(&self, item_id: &ItemId, action_id: &ActionId) -> CoreResult<()> {
+        let hit = self
+            .results
+            .iter()
+            .find(|hit| &hit.item.stable_id == item_id)
+            .ok_or_else(|| {
+                crikey_core::CoreError::Invalid("selected result is no longer current".to_owned())
+            })?;
+        let action = hit
+            .item
+            .actions
+            .iter()
+            .find(|action| &action.action_id == action_id)
+            .ok_or_else(|| {
+                crikey_core::CoreError::Invalid("selected action is no longer available".to_owned())
+            })?;
+        if action.execution_policy != ExecutionPolicy::HostMediated {
+            return Err(crikey_core::CoreError::Invalid(
+                "plugin-owned action execution is not wired in the M1 runtime".to_owned(),
+            ));
+        }
+        if action.action_id.0 != APPLICATION_LAUNCH_ACTION_ID {
+            return Err(crikey_core::CoreError::Invalid(format!(
+                "unsupported host-mediated action {:?}",
+                action.action_id.0
+            )));
+        }
+        self.app.launch_application(&hit.item)
     }
 
     /// Work performed by the most recently accepted query.

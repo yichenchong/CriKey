@@ -13,3 +13,10 @@ workspace = true
 
 [dependencies]
 crikey-core.workspace = true
+egui = { workspace = true, features = ["default_fonts"] }
+egui-wgpu.workspace = true
+egui-winit = { workspace = true, features = ["clipboard"] }
+pollster.workspace = true
+thiserror.workspace = true
+wgpu = { workspace = true, features = ["dx12", "metal", "wgsl"] }
+winit = { workspace = true, features = ["rwh_06", "wayland", "wayland-dlopen", "x11"] }

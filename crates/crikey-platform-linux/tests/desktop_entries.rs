@@ -646,7 +646,6 @@ fn capabilities_without_a_linux_implementation_report_unavailable() {
         Capability::FileSearch,
         Capability::Clipboard,
         Capability::GlobalHotkeys,
-        Capability::ProcessLaunch,
         Capability::UriOpen,
         Capability::WindowEnumeration,
         Capability::WindowActivation,

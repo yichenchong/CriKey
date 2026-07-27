@@ -6,11 +6,14 @@
 //! Compiled only for its target so platform-independent crates can never
 //! accidentally depend on it (spec 5.3).
 //!
-//! Implemented so far: application discovery over XDG desktop entries. The
-//! parser stops at what the core actually consumes -- group scoping, `Type`,
-//! the visibility keys and `Exec` -- so locale selection, action groups as
-//! separately launchable entries and recursive root layouts stay for a later
-//! milestone. Everything else keeps reporting itself unavailable (spec 18.2).
+//! Implemented so far: application discovery over XDG desktop entries, and
+//! process launching for the entries it finds. The parser stops at what the
+//! core actually consumes -- group scoping, `Type`, the visibility keys and
+//! `Exec` -- so locale selection, action groups as separately launchable
+//! entries and recursive root layouts stay for a later milestone. Launching
+//! runs a program directly and stops there: URI opening needs a portal or a
+//! session handler this backend does not have, so it -- and everything else
+//! -- keeps reporting itself unavailable (spec 18.2).
 //!
 //! A root is only as trustworthy as whatever last wrote into it, so a
 //! candidate is stat checked and read through a cap before it is parsed:
@@ -26,10 +29,15 @@ use std::fs;
 use std::io::Read;
 use std::mem;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 
-use crikey_core::{PlatformPath, Result};
-use crikey_platform::{ApplicationDiscovery, Capability, CapabilityState, DiscoveredApplication};
+use crikey_core::{CoreError, PlatformPath, Result};
+use crikey_platform::{
+    ApplicationDiscovery, Capability, CapabilityState, DiscoveredApplication, ProcessLauncher,
+};
 
 /// The only group a launchable entry is read from.
 const DESKTOP_ENTRY_GROUP: &[u8] = b"Desktop Entry";
@@ -126,9 +134,104 @@ impl ApplicationDiscovery for DesktopEntryScanner {
     }
 }
 
+/// Process launching for filesystem targets (spec 18.1).
+///
+/// A discovered application already arrives split into a program and an
+/// argument vector -- that is what [`exec_command`] produces -- so launching
+/// is a direct spawn: no shell, no re-quoting, no re-splitting. Keeping the
+/// arguments a vector all the way down is the whole point of the split, since
+/// an `Exec` line's `"My Documents"` has to reach the program as one argument
+/// and not as two.
+#[derive(Debug, Default)]
+pub struct CommandLauncher {
+    /// Handles of children that were spawned and never waited for.
+    ///
+    /// A process that has exited but whose parent has not collected its status
+    /// stays a zombie holding a pid, and a launcher lives for a whole desktop
+    /// session: without this the pid table fills with every application the
+    /// user ever started. Waiting is out of the question, so the handles are
+    /// kept and swept without blocking on the next launch, which bounds the
+    /// list by the number of launched applications still running.
+    running: Mutex<Vec<Child>>,
+}
+
+impl CommandLauncher {
+    /// A launcher holding no children yet.
+    ///
+    /// Construction starts nothing: every process appears inside
+    /// [`ProcessLauncher::launch`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records `child`, first dropping the handles of children that already
+    /// exited.
+    ///
+    /// `try_wait` reports only the children the kernel already has a status
+    /// for and returns immediately for the rest, so the sweep never delays the
+    /// launch that triggered it. A handle whose wait errored is dropped too:
+    /// there is no status left to collect from it.
+    fn keep(&self, child: Child) {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        running.retain_mut(|spawned| matches!(spawned.try_wait(), Ok(None)));
+        running.push(child);
+    }
+}
+
+impl ProcessLauncher for CommandLauncher {
+    /// Starts `target` with exactly `args` and returns as soon as the process
+    /// exists.
+    ///
+    /// The target is handed over as its own `OsStr`, so an install path that
+    /// is not UTF-8 launches unchanged (spec 18.3), and every argument is
+    /// passed individually: spaces, quotes and empty strings inside one
+    /// argument reach the program as written.
+    ///
+    /// Nothing is waited for. A launcher must be usable again the instant the
+    /// application it started is on its way, and an application outlives the
+    /// launcher that started it.
+    ///
+    /// Standard streams are detached and the child enters a new process group.
+    /// A terminal interrupt sent to CriKey's foreground group therefore does
+    /// not kill the application, and the application cannot block writing into
+    /// a pipe nobody drains.
+    fn launch(&self, target: &PlatformPath, args: &[String]) -> Result<()> {
+        let mut command = Command::new(target.as_os_str());
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = command.spawn().map_err(|error| {
+            // Both halves matter to whoever reads this: which target was
+            // tried, and what the kernel said about it.
+            CoreError::Invalid(format!("cannot launch {}: {error}", target.display()))
+        })?;
+
+        self.keep(child);
+        Ok(())
+    }
+
+    /// Always fails: this backend cannot open URIs (spec 18.2).
+    ///
+    /// Opening a URI on Linux means handing it to whatever the session
+    /// designates as its handler -- a desktop portal, or the handler lookup a
+    /// helper like `xdg-open` performs -- and this crate has neither a portal
+    /// client nor a rule for choosing a helper. Picking a command here would
+    /// be a guess, and a launcher that quietly runs the wrong program with a
+    /// user's URI is worse than one that admits it cannot do it.
+    fn open_uri(&self, uri: &str) -> Result<()> {
+        Err(CoreError::Invalid(format!(
+            "the linux backend cannot open URIs: {uri}"
+        )))
+    }
+}
+
 #[derive(Debug)]
 pub struct LinuxBackend {
     applications: DesktopEntryScanner,
+    processes: CommandLauncher,
 }
 
 impl LinuxBackend {
@@ -146,6 +249,7 @@ impl LinuxBackend {
     pub fn with_application_roots(roots: Vec<PathBuf>) -> Self {
         Self {
             applications: DesktopEntryScanner::new(roots),
+            processes: CommandLauncher::new(),
         }
     }
 
@@ -155,11 +259,10 @@ impl LinuxBackend {
     /// forces a deliberate answer here instead of inheriting a wildcard.
     pub fn capability(&self, capability: Capability) -> CapabilityState {
         match capability {
-            Capability::ApplicationDiscovery => CapabilityState::Available,
+            Capability::ApplicationDiscovery | Capability::ProcessLaunch => CapabilityState::Available,
             Capability::FileSearch
             | Capability::Clipboard
             | Capability::GlobalHotkeys
-            | Capability::ProcessLaunch
             | Capability::UriOpen
             | Capability::WindowEnumeration
             | Capability::WindowActivation
@@ -174,6 +277,11 @@ impl LinuxBackend {
     /// The discovery service behind [`Capability::ApplicationDiscovery`].
     pub fn application_discovery(&self) -> &dyn ApplicationDiscovery {
         &self.applications
+    }
+
+    /// The launcher behind [`Capability::ProcessLaunch`].
+    pub fn process_launcher(&self) -> &dyn ProcessLauncher {
+        &self.processes
     }
 }
 

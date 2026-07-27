@@ -13,7 +13,10 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use crikey_core::{ArgumentPolicy, Category, HitPolicy, Item, ItemId, PlatformPath, PluginId, Result};
+use crikey_core::{
+    Action, ActionId, ArgumentPolicy, Category, CoreError, ExecutionPolicy, HitPolicy, Item, ItemId,
+    PlatformPath, PluginId, Result,
+};
 
 /// Optional platform capabilities and their availability (spec 18.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -61,6 +64,11 @@ pub trait ApplicationDiscovery {
 // Discovered applications as catalog items (spec 10.2, 10.3, 18.3)
 // ---------------------------------------------------------------------------
 
+/// Host-mediated action attached to every discovered application item.
+pub const APPLICATION_LAUNCH_ACTION_ID: &str = "crikey.application.launch";
+
+const MAX_APPLICATION_ARGUMENTS: usize = 4_096;
+
 /// Metadata key holding how many launch arguments an item records.
 const ARGUMENT_COUNT_KEY: &str = "application.argument.count";
 
@@ -95,7 +103,14 @@ pub fn application_items(plugin: &PluginId, discovered: &[DiscoveredApplication]
                 hit_policy: HitPolicy::Recorded,
                 score_hint: 0,
                 metadata: argument_metadata(&application.arguments),
-                actions: Vec::new(),
+                actions: vec![Action {
+                    action_id: ActionId(APPLICATION_LAUNCH_ACTION_ID.to_owned()),
+                    label: "Launch".to_owned(),
+                    description: "Open this application".to_owned(),
+                    applicable_categories: vec![Category::Application],
+                    icon_reference: None,
+                    execution_policy: ExecutionPolicy::HostMediated,
+                }],
             }
         })
         .collect()
@@ -109,6 +124,34 @@ fn argument_metadata(arguments: &[String]) -> BTreeMap<String, String> {
         metadata.insert(format!("{ARGUMENT_KEY_PREFIX}{index}"), argument.clone());
     }
     metadata
+}
+
+/// Rebuilds the exact argument vector recorded by [`application_items`].
+///
+/// Malformed or hostile metadata is rejected instead of being re-split or
+/// partially executed. Empty arguments and arguments containing spaces remain
+/// distinct values.
+pub fn application_arguments(item: &Item) -> Result<Vec<String>> {
+    let count = item
+        .metadata
+        .get(ARGUMENT_COUNT_KEY)
+        .ok_or_else(|| CoreError::Invalid("application item has no argument count".to_owned()))?
+        .parse::<usize>()
+        .map_err(|_| CoreError::Invalid("application argument count is not a whole number".to_owned()))?;
+    if count > MAX_APPLICATION_ARGUMENTS {
+        return Err(CoreError::CapacityExceeded("application launch arguments"));
+    }
+
+    let mut arguments = Vec::with_capacity(count);
+    for index in 0..count {
+        let key = format!("{ARGUMENT_KEY_PREFIX}{index}");
+        let argument = item
+            .metadata
+            .get(&key)
+            .ok_or_else(|| CoreError::Invalid(format!("application item is missing argument {index}")))?;
+        arguments.push(argument.clone());
+    }
+    Ok(arguments)
 }
 
 // ---------------------------------------------------------------------------
@@ -489,9 +532,22 @@ pub struct HotkeyBinding {
     pub accelerator: String,
 }
 
+/// Callback installed by a hotkey backend to wake the launcher event loop.
+///
+/// It runs on a platform message thread and therefore must hand the event off
+/// without doing query, rendering, or plugin work itself.
+pub type HotkeyActivationHandler = Box<dyn Fn(&HotkeyBinding) + Send + Sync + 'static>;
+
 pub trait HotkeyService {
     fn register(&mut self, binding: &HotkeyBinding) -> Result<()>;
     fn unregister(&mut self, binding: &HotkeyBinding) -> Result<()>;
+
+    /// Replaces the handler invoked when a registered accelerator fires.
+    ///
+    /// Clearing the handler must leave registrations intact. Implementations
+    /// invoke it on their platform message thread, so hosts should do no more
+    /// than send an event through the native UI loop's wake-up mechanism.
+    fn set_activation_handler(&mut self, handler: Option<HotkeyActivationHandler>);
 }
 
 // ---------------------------------------------------------------------------
