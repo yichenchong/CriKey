@@ -5,7 +5,8 @@ pub mod permissions;
 pub mod scheduling;
 
 pub use manifest::{
-    ActivationSection, Manifest, PerformanceSection, PluginSection, QuerySection, Runtime, Startup,
+    ActivationSection, Manifest, PerformanceSection, PluginSection, PythonSection, QuerySection, Runtime,
+    Startup,
 };
 pub use permissions::{ClipboardPermission, FilesystemAccess, FilesystemScope, Permissions};
 pub use scheduling::{

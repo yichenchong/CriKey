@@ -25,6 +25,8 @@ pub struct Manifest {
     pub permissions: Permissions,
     #[serde(default)]
     pub performance: PerformanceSection,
+    #[serde(default)]
+    pub python: PythonSection,
 }
 
 impl Manifest {
@@ -222,6 +224,16 @@ pub struct PlatformSection {
     pub os: Vec<String>,
     #[serde(default)]
     pub arch: Vec<String>,
+}
+
+/// Modern-Python managed-environment inputs (spec 15.2, 19; M4 contract §6).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PythonSection {
+    #[serde(default, rename = "requires-python")]
+    pub requires_python: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
 }
 
 /// Relevance gating metadata (spec 8.11). Never applied to `legacy-strict`.

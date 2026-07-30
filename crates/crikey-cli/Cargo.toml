@@ -25,6 +25,12 @@ crikey-input-scheduler.workspace = true
 # package loading, interpreter discovery, the CPython worker, `legacy-strict`
 # scheduling and the version-controlled compatibility data (spec 26.3, 28).
 crikey-legacy-compat.workspace = true
-# `RuntimeProfile`, the discovery input of spec 14.11.
+# `RuntimeProfile`, interpreter discovery and the modern CPython worker
+# (spec 14.11, 15.6): `dev run`/`dev test` drive a real worker end to end.
 crikey-python-host.workspace = true
+# Managed environments (spec 15.3, 15.4, 23.2): resolve and materialise a
+# modern plugin's declared dependencies before spawning its worker.
+crikey-package-manager.workspace = true
+# `Manifest`: parse a modern plugin's `crikey.toml` (id, entrypoint, `[python]`).
+crikey-plugin-model.workspace = true
 crikey-ui.workspace = true

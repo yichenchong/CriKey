@@ -14,4 +14,7 @@ workspace = true
 [dependencies]
 crikey-core.workspace = true
 crikey-plugin-model.workspace = true
+serde.workspace = true
+toml.workspace = true
+sha2.workspace = true
 thiserror.workspace = true

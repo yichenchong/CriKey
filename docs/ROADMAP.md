@@ -198,15 +198,26 @@ Status snapshot (2026-07-30):
   separation is not demonstrated. Icons round-trip as opaque handles and are
   classified `partial`; no icon is loaded or rendered.
 
-### M4 — Modern Python plugins (§30 Phase 4) — L
+### M4 — Modern Python plugins (§30 Phase 4) — L — done
 
-Python SDK worker loop over the v1 protocol, manifest/`pyproject` dependency
-declaration, content-addressed managed environments with lockfiles and hash
-verification, worker sharing rules, cancellation object, async callback support,
-and `crikey dev` tooling for Python plugins.
+Python SDK worker loop over the v1 protocol; manifest `[python]` dependency
+declaration; content-addressed managed environments with verified locks; and
+out-of-process interpreter supervision. Modern workers are keyed by interpreter,
+environment, entrypoint, and source path; partial streams have aggregate
+deadlines and byte/item caps; plugin faults, crashes, stale generations, and
+cooperative cancellation remain contained at the worker boundary.
 
-Exit criteria: two plugins with conflicting dependency versions run
-simultaneously; an interpreter crash does not affect CriKey (§31.10, §31.19–20).
+Evidence: `cargo test --workspace --all-targets` passes with warnings denied;
+`cargo clippy --workspace --all-targets -- -D warnings` passes; Windows and
+macOS workspace checks pass. The M4 integration suite proves conflicting managed
+dependency versions, crash containment, cancellation followed by worker reuse,
+catalog-error diagnostics, and distinct same-environment plugins. A live
+`crikey dev run` and `crikey dev test` smoke against
+`.crikey-dev/modern-smoke` each returned the plugin's emitted result.
+
+Native-code permission and native package builds remain deferred to M5 (§15.5);
+M4's package manager accepts only the local verified package material required
+by modern Python plugins.
 
 ### M5 — Native plugins (§30 Phase 5) — L
 

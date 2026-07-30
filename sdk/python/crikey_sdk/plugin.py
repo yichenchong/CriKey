@@ -1,12 +1,13 @@
-"""Modern Python plugin surface (spec 13.2, 15.7)."""
+"""Modern Python plugin surface (spec 13.2, 15.7, 15.8)."""
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
-from typing import Iterable, Protocol
+from typing import Awaitable, Callable, Iterable, Protocol
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True)
 class Action:
     action_id: str
     label: str
@@ -14,7 +15,7 @@ class Action:
     icon_reference: str | None = None
 
 
-@dataclass(slots=True)
+@dataclass
 class Item:
     """A catalog item or suggestion. ``stable_id`` must not depend on the label."""
 
@@ -25,11 +26,12 @@ class Item:
     description: str = ""
     icon_reference: str | None = None
     score_hint: int = 0
+    search_terms: list[str] = field(default_factory=list)
     metadata: dict[str, str] = field(default_factory=dict)
     actions: list[Action] = field(default_factory=list)
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True)
 class Query:
     text: str
     normalized: str
@@ -47,6 +49,14 @@ class SuggestContext(Protocol):
         """Streams one result. Batching is handled by the worker."""
 
     def log(self, message: str) -> None: ...
+
+    def spawn(self, coro: Awaitable[object]) -> object:
+        """Registers a background coroutine (spec 15.8).
+
+        A registered task is awaited to completion at the end of the callback;
+        an un-registered raw pending task is cancelled and reported instead of
+        being left running.
+        """
 
 
 class Plugin:
@@ -66,3 +76,56 @@ class Plugin:
     def execute(self, item: Item, action_id: str | None, argument: str | None) -> None: ...
 
     def stop(self) -> None: ...
+
+
+class WorkerContext:
+    """The concrete :class:`SuggestContext` the modern worker supplies.
+
+    The worker owns result batching, log capture and the asyncio loop; this
+    object is the thin, plugin-facing surface over them. ``cancelled`` reads the
+    control-frame event set by the worker's daemon reader thread; ``emit`` and
+    ``log`` funnel into worker-provided sinks; ``spawn`` registers a coroutine
+    the worker awaits at callback end (spec 15.8).
+    """
+
+    __slots__ = ("_is_cancelled", "_sink", "_logger", "_loop", "registered_tasks")
+
+    def __init__(
+        self,
+        is_cancelled: Callable[[], bool],
+        sink: Callable[[Item], None],
+        logger: Callable[[str], None],
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> None:
+        self._is_cancelled = is_cancelled
+        self._sink = sink
+        self._logger = logger
+        self._loop = loop
+        self.registered_tasks: list[object] = []
+
+    @property
+    def cancelled(self) -> bool:
+        return self._is_cancelled()
+
+    def emit(self, item: Item) -> None:
+        self._sink(item)
+
+    def log(self, message: str) -> None:
+        self._logger(str(message))
+
+    def spawn(self, coro: Awaitable[object]) -> object:
+        if not asyncio.iscoroutine(coro):
+            raise TypeError("context.spawn(coro) expects a coroutine")
+        # A synchronous suggest/execute has no running loop, so
+        # ``asyncio.get_running_loop()`` would raise and abort the whole
+        # request. Fall back to the worker's loop (the sync-drain branch in the
+        # worker runs it) or, absent one, a private loop kept for this context.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = self._loop
+            if loop is None:
+                loop = self._loop = asyncio.new_event_loop()
+        task = loop.create_task(coro)
+        self.registered_tasks.append(task)
+        return task

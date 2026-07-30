@@ -337,7 +337,7 @@ impl QueryPipeline {
         let mut rows_changed = false;
 
         if let Some(mut items) = update {
-            items.sort_by(|left, right| right.score_hint.cmp(&left.score_hint));
+            items.sort_by_key(|item| std::cmp::Reverse(item.score_hint));
             self.rows = items.into_iter().map(result_row).collect::<Vec<_>>().into();
             self.visible_generation = Some(self.generation);
             rows_changed = true;
@@ -622,7 +622,7 @@ fn batch_completion(state: BatchState) -> BatchCompletion {
     }
 }
 
-fn plugin_policy_from_manifest(manifest: &Manifest) -> PluginPolicy {
+pub(crate) fn plugin_policy_from_manifest(manifest: &Manifest) -> PluginPolicy {
     let resolved = manifest.query_policy();
     let defaults = match resolved.profile {
         crikey_plugin_model::SchedulingProfile::LegacyStrict => PluginPolicy::legacy_strict(),

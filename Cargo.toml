@@ -69,6 +69,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 thiserror = "2"
+
+# SHA-256 for the modern Python package manager (spec 23.2, 23.3). A lockfile
+# pins each resolved package's digest and materialisation recomputes and
+# compares it, so a tampered or wrong artefact is refused. This is a security
+# claim about third-party code, unlike the legacy layer's non-cryptographic
+# cache-reuse digest, so it uses the algorithm pip and PEP 503 use rather than a
+# hand-rolled hash.
+sha2 = "0.10"
 unicode-normalization = "0.1.24"
 unicode-casefold = "0.2.0"
 unicode-general-category = "1.1.0"

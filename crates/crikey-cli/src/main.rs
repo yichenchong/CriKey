@@ -2,18 +2,19 @@
 
 mod dev_commands;
 mod legacy_commands;
+mod modern_commands;
 
 use std::process::ExitCode;
 use std::time::Instant;
 
 use crikey_app::{
-    App, BatchState, LegacyDriver, LegacyProvider, PipelineConfig, QueryPipeline, ResultBatch, SearchService,
-    StartupStage,
+    App, BatchState, LegacyDriver, LegacyProvider, ModernDriver, ModernProvider, PipelineConfig,
+    QueryPipeline, ResultBatch, SearchService, StartupStage,
 };
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
 };
-use crikey_core::{Item, PluginId};
+use crikey_core::{Generation, Item, PluginId};
 use crikey_input_scheduler::{
     ActivationPolicy, DebouncePolicy, PluginPolicy, QueuePolicy, SchedulingProfile,
 };
@@ -43,7 +44,7 @@ COMMANDS:
 /// Kept apart from an unknown word on purpose: "advertised, not built" and "no
 /// such subcommand" are different answers, and a script can tell them apart by
 /// exit status without parsing prose.
-const UNIMPLEMENTED_DEV: [&str; 3] = ["run", "test", "inspect-protocol"];
+const UNIMPLEMENTED_DEV: [&str; 1] = ["inspect-protocol"];
 
 /// Queries the reported percentiles are drawn from, and results each retains.
 ///
@@ -185,6 +186,34 @@ fn run_native_launcher() -> Result<(), String> {
     let legacy_driver = LegacyDriver::spawn(legacy_provider, legacy_pipeline, move |frame| {
         let _ = legacy_publish_handle.submit_frame(frame);
     });
+
+    // Modern python plugins join the same live query path, driven off the UI
+    // thread by their own supervisor (spec 15.6; acceptance 31.10). Discovery
+    // scans `CRIKEY_MODERN_PLUGIN_ROOTS`; an unset variable loads nothing, so
+    // `crikey run` behaves exactly as before on a host with no modern plugins.
+    // A crashing interpreter degrades to a recorded diagnostic and never aborts
+    // the process (contract §8), so no load failure here is fatal to the launch.
+    let mut modern_pipeline = QueryPipeline::new(PipelineConfig::default());
+    let cache_root = modern_cache_root()?;
+    let modern_provider = ModernProvider::load(
+        &mut modern_pipeline,
+        &modern_plugin_roots(),
+        modern_index_root(),
+        cache_root,
+    );
+    for entry in modern_provider.unavailable() {
+        eprintln!(
+            "crikey: modern plugin unavailable ({}): {}",
+            entry.package, entry.reason
+        );
+    }
+    // The supervisor publishes each merged frame straight to the renderer,
+    // mirroring the legacy driver above; both run off the UI thread so a slow
+    // or dead child interpreter can never block it.
+    let modern_publish_handle = render_handle.clone();
+    let modern_driver = ModernDriver::spawn(modern_provider, modern_pipeline, move |frame| {
+        let _ = modern_publish_handle.submit_frame(frame);
+    });
     let query_clock = Instant::now();
 
     let activation_handle = render_handle.clone();
@@ -192,6 +221,7 @@ fn run_native_launcher() -> Result<(), String> {
         .request_activation()
         .map_err(|error| error.to_string())?;
     let mut view_model = LauncherViewModel::new();
+    let mut retained = RetainedRows::default();
     launcher
         .run(move |event| {
             // Fold any legacy rows the supervisor produced since the last turn
@@ -199,7 +229,26 @@ fn run_native_launcher() -> Result<(), String> {
             // keeps them. `publish` refuses a superseded or retired generation,
             // so a late answer can never land under a newer one.
             if let Some(outcome) = legacy_driver.take_outcome() {
-                view_model.publish(outcome.generation, outcome.rows.to_vec(), outcome.pending_plugins);
+                retained.absorb(
+                    outcome.generation,
+                    RowSource::Legacy,
+                    &outcome.rows,
+                    outcome.pending_plugins,
+                );
+                view_model.publish(outcome.generation, retained.merged(), retained.pending());
+            }
+            // Fold the modern supervisor's rows the same way. Both drivers
+            // publish the built-in rows ahead of their own; merging by source
+            // keeps legacy and modern rows coexisting instead of the later fold
+            // clobbering the earlier (contract §8).
+            if let Some(outcome) = modern_driver.take_outcome() {
+                retained.absorb(
+                    outcome.generation,
+                    RowSource::Modern,
+                    &outcome.rows,
+                    outcome.pending_plugins,
+                );
+                view_model.publish(outcome.generation, retained.merged(), retained.pending());
             }
 
             let (command_session, effect) = match event {
@@ -252,11 +301,25 @@ fn run_native_launcher() -> Result<(), String> {
                                         0,
                                     );
                                 }
-                                view_model.publish(
-                                    generation,
-                                    rows,
-                                    frame.pending_plugins || legacy_outstanding,
-                                );
+                                // Modern plugins are dispatched off the UI thread
+                                // just like legacy ones; their supervisor folds
+                                // its rows into the renderer under this same
+                                // generation as they arrive.
+                                let modern_outstanding = modern_driver.has_plugins();
+                                if modern_outstanding {
+                                    modern_driver.submit(
+                                        generation,
+                                        &raw,
+                                        now,
+                                        rows.clone(),
+                                        frame.pending_plugins,
+                                        0,
+                                    );
+                                }
+                                retained.set_builtin(generation, rows, frame.pending_plugins);
+                                retained.mark_pending(generation, RowSource::Legacy, legacy_outstanding);
+                                retained.mark_pending(generation, RowSource::Modern, modern_outstanding);
+                                view_model.publish(generation, retained.merged(), retained.pending());
                             }
                         }
                     }
@@ -310,6 +373,237 @@ fn legacy_package_roots() -> Vec<std::path::PathBuf> {
         None => Vec::new(),
     }
 }
+
+/// Directories scanned for modern python plugins on the live path (spec 15.1).
+///
+/// Read from `CRIKEY_MODERN_PLUGIN_ROOTS` using the platform path-list syntax,
+/// mirroring [`legacy_package_roots`]. Each root holds `<id>/crikey.toml` plugin
+/// subdirectories (contract §11). An unset variable means no modern roots, which
+/// loads nothing rather than failing — `crikey run` is unchanged on a host with
+/// none.
+fn modern_plugin_roots() -> Vec<std::path::PathBuf> {
+    match std::env::var_os("CRIKEY_MODERN_PLUGIN_ROOTS") {
+        Some(value) => std::env::split_paths(&value).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The offline modern package index root, read from `CRIKEY_MODERN_INDEX_ROOT`
+/// (the same path-var discipline as [`modern_plugin_roots`]).
+///
+/// Unset means NO index: declared dependencies do not resolve, and such plugins
+/// are recorded unavailable with a clear reason, rather than the launcher
+/// trusting a shared, world-writable directory as the hash-verification trust
+/// root (spec 15.4). It never defaults to a temporary directory.
+fn modern_index_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("CRIKEY_MODERN_INDEX_ROOT")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The managed-environment cache root, read from `CRIKEY_MODERN_CACHE_ROOT`.
+///
+/// Unset defaults to a NON-world-writable per-user directory
+/// (`$XDG_CACHE_HOME/crikey/modern`, else `$HOME/.cache/crikey/modern`), created
+/// `0700` on unix. This is security-critical: [`EnvironmentStore`] reuses a
+/// committed env at `cache_root/<env_id>` by PATH with no re-verification of the
+/// on-disk bytes, and `<env_id>` is a predictable SHA-256, so a world-writable
+/// cache (such as `env::temp_dir()`) would let a local attacker pre-plant
+/// `cache_root/<env_id>/site/<evil>.py` that the victim then imports under `-S`.
+/// The default is therefore per-user and is NEVER a shared temporary directory;
+/// when no per-user location can be determined the launcher refuses rather than
+/// fall back to one.
+fn modern_cache_root() -> Result<std::path::PathBuf, String> {
+    if let Some(value) = std::env::var_os("CRIKEY_MODERN_CACHE_ROOT").filter(|value| !value.is_empty()) {
+        return Ok(std::path::PathBuf::from(value));
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })
+        .ok_or_else(|| {
+            "cannot determine a per-user cache directory for modern plugins: set \
+             CRIKEY_MODERN_CACHE_ROOT, XDG_CACHE_HOME or HOME (refusing to use a \
+             world-writable shared temporary directory as a trust root)"
+                .to_owned()
+        })?;
+    let dir = base.join("crikey").join("modern");
+    create_private_dir(&dir)?;
+    Ok(dir)
+}
+
+/// Creates `dir` (and parents) as a private, per-user directory. On unix the
+/// leaf is forced to `0700` so the managed-environment cache a later import
+/// trusts by path can never be world- or group-writable (spec 15.4). If the
+/// directory already exists but is not ours, forcing the mode fails and the
+/// caller refuses rather than trust it.
+fn create_private_dir(dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|error| {
+        format!(
+            "cannot create modern cache directory `{}`: {error}",
+            dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!(
+                "cannot secure modern cache directory `{}`: {error}",
+                dir.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The provider group a published row belongs to, used to merge the built-in,
+/// legacy and modern row sets into one presented frame without one clobbering
+/// another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowSource {
+    Builtin,
+    Legacy,
+    Modern,
+}
+
+/// Classifies a published row by the source group its owning plugin belongs to
+/// (spec 10.2 namespacing): `legacy.*` and `modern.*` are the two asynchronous
+/// providers; everything else — the built-in application catalog included — is
+/// built-in.
+fn row_source(plugin_name: &str) -> RowSource {
+    if plugin_name.starts_with("legacy.") {
+        RowSource::Legacy
+    } else if plugin_name.starts_with("modern.") {
+        RowSource::Modern
+    } else {
+        RowSource::Builtin
+    }
+}
+
+/// The presented row set kept between UI turns, grouped by source so folding one
+/// provider's asynchronous outcome never clobbers another's rows.
+///
+/// Both the legacy and the modern supervisor publish the built-in rows ahead of
+/// their own, and each calls back independently through `take_outcome`; without
+/// per-source retention the second fold of a turn would overwrite the first's
+/// provider rows and modern rows would vanish on the next republish. Keeping the
+/// three groups and re-merging on every fold makes legacy and modern rows
+/// coexist under one generation (contract §8). A new generation drops every
+/// retained group first, so stale rows never cross a query boundary.
+#[derive(Debug, Default)]
+struct RetainedRows {
+    generation: Option<Generation>,
+    builtin: Vec<crikey_ui::ResultRow>,
+    legacy: Vec<crikey_ui::ResultRow>,
+    modern: Vec<crikey_ui::ResultRow>,
+    builtin_pending: bool,
+    legacy_pending: bool,
+    modern_pending: bool,
+}
+
+impl RetainedRows {
+    /// Prepares the retained set for `generation`, returning whether it is
+    /// current-or-newer (and therefore worth folding). A NEWER generation drops
+    /// every stale group first; the SAME generation keeps the groups; an OLDER
+    /// (already-superseded) generation is ignored, so a late outcome that
+    /// arrives after the UI moved on can never resurrect nor clobber the current
+    /// generation's rows.
+    fn begin(&mut self, generation: Generation) -> bool {
+        match self.generation {
+            Some(current) if generation < current => false,
+            Some(current) if generation == current => true,
+            _ => {
+                *self = RetainedRows {
+                    generation: Some(generation),
+                    ..RetainedRows::default()
+                };
+                true
+            }
+        }
+    }
+
+    /// Refreshes the built-in group from the synchronous publish.
+    fn set_builtin(&mut self, generation: Generation, rows: Vec<crikey_ui::ResultRow>, pending: bool) {
+        if !self.begin(generation) {
+            return;
+        }
+        self.builtin = rows;
+        self.builtin_pending = pending;
+    }
+
+    /// Records that a provider's answer is still outstanding for `generation`, so
+    /// the merged frame stays marked pending until that outcome folds in.
+    fn mark_pending(&mut self, generation: Generation, source: RowSource, pending: bool) {
+        if !self.begin(generation) {
+            return;
+        }
+        match source {
+            RowSource::Builtin => self.builtin_pending = pending,
+            RowSource::Legacy => self.legacy_pending = pending,
+            RowSource::Modern => self.modern_pending = pending,
+        }
+    }
+
+    /// Folds one provider's outcome. `rows` are the built-in rows followed by
+    /// `source`'s own rows; only the built-in group and `source`'s group are
+    /// refreshed, so a sibling provider's rows survive this fold. A stale
+    /// (already-superseded) outcome is ignored.
+    fn absorb(
+        &mut self,
+        generation: Generation,
+        source: RowSource,
+        rows: &[crikey_ui::ResultRow],
+        pending: bool,
+    ) {
+        if !self.begin(generation) {
+            return;
+        }
+        self.builtin = rows
+            .iter()
+            .filter(|row| row_source(&row.plugin_name) == RowSource::Builtin)
+            .cloned()
+            .collect();
+        match source {
+            RowSource::Builtin => self.builtin_pending = pending,
+            RowSource::Legacy => {
+                self.legacy = rows
+                    .iter()
+                    .filter(|row| row_source(&row.plugin_name) == RowSource::Legacy)
+                    .cloned()
+                    .collect();
+                self.legacy_pending = pending;
+            }
+            RowSource::Modern => {
+                self.modern = rows
+                    .iter()
+                    .filter(|row| row_source(&row.plugin_name) == RowSource::Modern)
+                    .cloned()
+                    .collect();
+                self.modern_pending = pending;
+            }
+        }
+    }
+
+    /// The merged presentation order: built-in rows, then legacy, then modern.
+    fn merged(&self) -> Vec<crikey_ui::ResultRow> {
+        let mut rows = Vec::with_capacity(self.builtin.len() + self.legacy.len() + self.modern.len());
+        rows.extend(self.builtin.iter().cloned());
+        rows.extend(self.legacy.iter().cloned());
+        rows.extend(self.modern.iter().cloned());
+        rows
+    }
+
+    /// Whether any source still has work outstanding for the retained generation.
+    fn pending(&self) -> bool {
+        self.builtin_pending || self.legacy_pending || self.modern_pending
+    }
+}
+
 fn application_provider_policy() -> PluginPolicy {
     PluginPolicy {
         profile: SchedulingProfile::Modern,
@@ -386,6 +680,8 @@ fn drive_application_provider(
 fn dev(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("benchmark") => benchmark(&args[1..]),
+        Some("run") => modern_commands::run(&args[1..]),
+        Some("test") => modern_commands::test(&args[1..]),
         Some("trace-query") => dev_commands::trace_query(&args[1..]),
         Some("simulate-typing") => dev_commands::simulate_typing(&args[1..]),
         Some("test-legacy-compat") => legacy_commands::test_legacy_compat(&args[1..]),
@@ -985,6 +1281,83 @@ mod tests {
         assert!(
             !UNIMPLEMENTED_DEV.contains(&"benchmark"),
             "`dev benchmark` is implemented and must not be reported as unbuilt"
+        );
+    }
+
+    fn row(plugin: &str, label: &str) -> crikey_ui::ResultRow {
+        crikey_ui::ResultRow {
+            item: crikey_core::ItemId(label.to_owned()),
+            label: label.to_owned(),
+            description: String::new(),
+            icon_reference: None,
+            category: String::new(),
+            plugin_name: plugin.to_owned(),
+            highlights: Vec::new(),
+            argument_hint: None,
+            status: None,
+            default_action: None,
+            alternate_actions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn retained_rows_merge_legacy_and_modern_by_source() {
+        let generation = Generation::from_raw(7);
+        let mut retained = RetainedRows::default();
+
+        // The synchronous built-in publish, with both async providers still out.
+        retained.set_builtin(generation, vec![row("builtin.app", "app")], false);
+        retained.mark_pending(generation, RowSource::Legacy, true);
+        retained.mark_pending(generation, RowSource::Modern, true);
+        assert!(retained.pending(), "outstanding providers keep the frame pending");
+
+        // The legacy supervisor answers first with built-in + legacy rows.
+        retained.absorb(
+            generation,
+            RowSource::Legacy,
+            &[row("builtin.app", "app"), row("legacy.files", "file")],
+            false,
+        );
+        // Then the modern supervisor answers with built-in + modern rows. A
+        // merge that replaced the whole frame would drop the legacy row here.
+        retained.absorb(
+            generation,
+            RowSource::Modern,
+            &[row("builtin.app", "app"), row("modern.web", "web")],
+            false,
+        );
+
+        let sources: Vec<String> = retained.merged().iter().map(|r| r.plugin_name.clone()).collect();
+        // Kills the "each supervisor's publish clobbers the other" mutation:
+        // whole-frame replacement would leave only built-in + `modern.web`.
+        assert_eq!(
+            sources,
+            vec!["builtin.app", "legacy.files", "modern.web"],
+            "built-in, legacy and modern rows coexist in that presentation order",
+        );
+        assert!(
+            !retained.pending(),
+            "once every source has answered the merged frame is no longer pending",
+        );
+    }
+
+    #[test]
+    fn retained_rows_drop_a_superseded_generation() {
+        let old = Generation::from_raw(1);
+        let new = Generation::from_raw(2);
+        let mut retained = RetainedRows::default();
+
+        retained.absorb(old, RowSource::Legacy, &[row("legacy.old", "x")], false);
+        // A newer generation's first fold drops every stale group first, so an
+        // older generation's rows never cross the boundary. Kills the "reuse
+        // retained rows across generations" mutation.
+        retained.absorb(new, RowSource::Modern, &[row("modern.new", "y")], false);
+
+        let sources: Vec<String> = retained.merged().iter().map(|r| r.plugin_name.clone()).collect();
+        assert_eq!(
+            sources,
+            vec!["modern.new"],
+            "stale legacy rows from an older generation are dropped",
         );
     }
 }

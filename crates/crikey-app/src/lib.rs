@@ -10,6 +10,7 @@
 //! ranked answer.
 
 mod legacy_provider;
+mod modern_provider;
 mod query_pipeline;
 
 pub use crikey_result_aggregator::{
@@ -18,6 +19,7 @@ pub use crikey_result_aggregator::{
     QueueReject, RejectReason, ResultBatch, ResultLimits,
 };
 pub use legacy_provider::{LegacyDriver, LegacyProvider, LegacyUnavailable, LegacyWorkerPool};
+pub use modern_provider::{ModernDriver, ModernProvider, ModernUnavailable};
 pub use query_pipeline::{PipelineConfig, PipelineError, PipelineTick, QueryPipeline};
 
 use std::{

@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "Official Python SDK for CriKey plugins."
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
+# NOTE: a PLUGIN's own `requires-python` and `dependencies` are read from that
+# plugin's manifest/pyproject (spec 15.2) and resolved into a managed
+# environment by `crikey-package-manager` -- they are NOT declared here. The SDK
+# itself is pure stdlib and has no third-party runtime dependencies.
 dependencies = []
 
 [build-system]

@@ -356,7 +356,7 @@ pub enum LegacyRequestKind {
     /// `on_execute`: the user launched an item, optionally through an action.
     Execute {
         /// The item the user picked.
-        item: Item,
+        item: Box<Item>,
         /// The secondary action, when the user chose one.
         action: Option<Action>,
     },

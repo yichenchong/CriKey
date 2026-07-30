@@ -1029,7 +1029,7 @@ class Fixture(kp.Plugin):
             "legacy.execute",
             9,
             LegacyRequestKind::Execute {
-                item: selected,
+                item: Box::new(selected),
                 action: Some(action),
             },
         ),

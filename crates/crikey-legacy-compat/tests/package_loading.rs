@@ -582,7 +582,7 @@ fn a_loose_directory_with_a_top_level_module_is_discovered_with_its_id_main_modu
     write_file(&package_dir.join("icon.png"), b"\x89PNG\r\n\x1a\n");
 
     let loader = PackageLoader::new(tree.cache_root());
-    let discovered = discover_ok(&loader, &[root.clone()]);
+    let discovered = discover_ok(&loader, std::slice::from_ref(&root));
 
     assert_eq!(
         ids(&discovered),
