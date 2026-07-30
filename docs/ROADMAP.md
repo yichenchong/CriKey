@@ -142,7 +142,7 @@ Status snapshot (2026-07-27):
   the 381-keystroke stress fixture reports bounded queues, zero stale display,
   and independent fast/slow plugin progress.
 
-### M3 — Legacy Compatibility Layer (§30 Phase 3) — XL
+### M3 — Legacy Compatibility Layer (§30 Phase 3) — XL — done
 
 Legacy package discovery and loading (directories and `.keypirinha-package`),
 the CPython legacy worker, `keypirinha` / `keypirinha_util` / `keypirinha_net` /
@@ -154,6 +154,49 @@ data, and compatibility diagnostics (§26.2).
 Exit criteria: the synthetic legacy test-plugin suite passes, including a plugin
 that ignores `should_terminate()`; the real-plugin corpus is classified and
 published; every acceptance item §31.11–18 has a test.
+
+Status snapshot (2026-07-30):
+
+- Packages load from loose directories and from `.keypirinha-package` archives.
+  Archive members are genuinely importable: extraction is content-addressed
+  under the loader's cache root and that directory becomes the worker's
+  `sys.path[0]`, so a package-local `import lib.helpers` resolves. Entries that
+  escape the package root, carry non-UTF-8 names, or breach the size caps are
+  refused before anything is written.
+- Legacy plugins execute in a supervised child CPython process over
+  newline-delimited JSON. `print()` is redirected so stdout stays a protocol
+  channel; stderr is drained continuously; the child is its own process group,
+  so a hard stop reaps grandchildren too. Every buffer, log and tail is capped.
+- `legacy-strict` holds: initial queries broadcast to every loaded plugin at the
+  submit timestamp with no host debounce and no host gating, callbacks serialise
+  per instance, a supersession raises `should_terminate()` once for the obsolete
+  generation and lowers it before fresh work starts, only the newest pending
+  query survives, stale answers are rejected, and dynamic suggestions are never
+  cached without an explicit opt-in.
+- Legacy plugins serve the live launcher: `crikey run` discovers packages,
+  registers them with `QueryPipeline` under `PluginPolicy::legacy_strict()`, and
+  drives them on a dedicated supervisor thread, so the UI thread never blocks on
+  a plugin and a late answer cannot surface under a newer generation.
+- The compatibility matrix (114 rows) and the referenced plugin corpus (11
+  packages, never vendored) are parsed and asserted as typed data, and
+  `crikey dev compatibility-report` publishes their classification.
+- Verification: 183 M3 tests pass with warnings denied — 167 across nine
+  `crikey-legacy-compat` targets (including 21 worker and 20 shim tests against
+  a real interpreter), 16 black-box CLI tests, plus 2 app-path pipeline tests.
+  No M3 test is `#[ignore]`d and none can skip: a missing interpreter fails.
+  `crikey dev test-legacy-compat` scores `well-behaved` 13/13 `pass`, fails
+  `ignores-should-terminate` on `should_terminate_observed` alone, fails
+  `caches-dynamic-suggestions` on `dynamic_suggestions_not_cached` alone, and
+  reports `windows-only` as `incomplete` with `portable=false` rather than
+  inventing a pass it cannot earn here.
+- Verification limit: this Linux host has no Windows runtime, so §31.11
+  (discovery and loading of existing packages *on Windows*) and the Win32 half
+  of `keypirinha_wintypes` are exercised only through their honest
+  `windows-only` / `unavailable` reports. §14.11 is partial: an operator may
+  point the layer at a specific interpreter, but nothing yet maps a plugin's
+  declared Python requirement to a runtime profile, so per-version process
+  separation is not demonstrated. Icons round-trip as opaque handles and are
+  classified `partial`; no icon is loaded or rendered.
 
 ### M4 — Modern Python plugins (§30 Phase 4) — L
 

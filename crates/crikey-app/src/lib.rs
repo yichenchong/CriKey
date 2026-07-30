@@ -9,6 +9,7 @@
 //! engine, the ranker and the result aggregator, and turns typed text into a
 //! ranked answer.
 
+mod legacy_provider;
 mod query_pipeline;
 
 pub use crikey_result_aggregator::{
@@ -16,6 +17,7 @@ pub use crikey_result_aggregator::{
     OverflowPolicy, ProducerState, QueueDepth, QueueDiagnostics, QueueEvent, QueueEventKind, QueueLimits,
     QueueReject, RejectReason, ResultBatch, ResultLimits,
 };
+pub use legacy_provider::{LegacyDriver, LegacyProvider, LegacyUnavailable, LegacyWorkerPool};
 pub use query_pipeline::{PipelineConfig, PipelineError, PipelineTick, QueryPipeline};
 
 use std::{

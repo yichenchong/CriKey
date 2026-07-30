@@ -1,0 +1,3 @@
+First deterministic catalog fixture entry
+Second entry, whose label exercises the output encoding
+Third deterministic catalog fixture entry

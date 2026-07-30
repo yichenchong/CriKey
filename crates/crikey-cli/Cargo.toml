@@ -20,5 +20,11 @@ crikey-app.workspace = true
 crikey-benchmarks.workspace = true
 crikey-core.workspace = true
 crikey-input-scheduler.workspace = true
-
+# The M3 developer commands (`dev test-legacy-compat`, `dev inspect-catalog`,
+# `dev compatibility-report`) drive the Legacy Compatibility Layer directly:
+# package loading, interpreter discovery, the CPython worker, `legacy-strict`
+# scheduling and the version-controlled compatibility data (spec 26.3, 28).
+crikey-legacy-compat.workspace = true
+# `RuntimeProfile`, the discovery input of spec 14.11.
+crikey-python-host.workspace = true
 crikey-ui.workspace = true

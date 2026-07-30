@@ -1,20 +1,140 @@
 # Real-plugin compatibility corpus (spec 27.4).
-# Packages are referenced, never vendored. Update `classification` from the
-# results of `crikey dev test-legacy-compat`.
+#
+# Packages are REFERENCED, never vendored: `source` plus a full 40-character
+# `revision` is what makes a classification reproducible against the exact tree
+# it describes, without importing anyone else's licence into this repository.
 #
 # classification =
 #   works-unchanged | works-with-configuration-changes |
 #   works-with-minimal-source-changes | windows-only-but-compatible |
 #   blocked-missing-apis | blocked-python-version |
 #   blocked-undocumented-behaviour | works-only-under-legacy-optimized |
-#   requires-legacy-strict
+#   requires-legacy-strict | untested
+#
+# EVIDENCE. Every classification below carries the evidence that produced it in
+# its `notes`, and its strength is stated rather than implied. At M3 the
+# evidence is a static API audit: each package's plugin sources were read at the
+# pinned revision and every `keypirinha*` name it touches was looked up in
+# ../api-matrix/matrix.toml. That is enough to say a package cannot work (it
+# calls something classified `planned`) and enough to say nothing stands in its
+# way, but it is not an execution record: the CI host is headless Linux with no
+# Win32 and no desktop session, so no entry here claims to have been run. An
+# entry whose sources have not been audited is `untested` - the honest state -
+# and stays counted in the published totals so coverage is never overstated.
+#
+# `crikey dev test-legacy-compat` will replace the static audits with observed
+# results as the worker gains the ability to drive these packages.
 
 corpus-version = 1
 
-# [[package]]
-# id = "example.package"
-# source = "https://github.com/example/keypirinha-package"
-# revision = "0000000000000000000000000000000000000000"
-# licence = "MIT"
-# classification = "untested"
-# notes = ""
+# ---------------------------------------------------------------------------
+# Works unchanged (acceptance 31.13)
+# ---------------------------------------------------------------------------
+
+[[package]]
+id = "prayzzz.keypirinha-epoch"
+source = "https://github.com/prayzzz/keypirinha-epoch"
+revision = "ea2177868d078bf614e1c7a841f95a2aee5111bd"
+licence = "MIT"
+classification = "works-unchanged"
+notes = "Static audit of src/epoch.py and src/epoch_parser.py: uses keypirinha.Plugin, the item enums, create_item, set_catalog, set_suggestions and keypirinha_util.set_clipboard, and nothing else. Every one of those is classified full, and the plugin reads no configuration and touches no Win32. The clipboard copy on execute needs a desktop session (set_clipboard is partial), so on a headless host that one action raises UnavailableError while catalog and suggestions work."
+
+[[package]]
+id = "fuhrmann.keypirinha-myip"
+source = "https://github.com/Fuhrmann/keypirinha-myip"
+revision = "5a68e1061d6c597dfc21ab8cd86319c4d32efb07"
+licence = "MIT"
+classification = "works-unchanged"
+notes = "Static audit of src/myip.py: keypirinha.Plugin, the item enums, Events.NETOPTIONS, keypirinha_net.build_urllib_opener and keypirinha_util.set_clipboard only. No undelivered symbol and no Win32. Two of its dependencies are partial rather than full - build_urllib_opener applies no proxy configuration, set_clipboard needs a desktop session - so the source needs no change but the public-IP lookup behaves differently behind a proxy."
+
+# ---------------------------------------------------------------------------
+# Works after configuration changes (spec 14.1)
+# ---------------------------------------------------------------------------
+
+[[package]]
+id = "clarkb7.keypirinha-pass"
+source = "https://github.com/clarkb7/keypirinha-pass"
+revision = "2a7d4e39e684395618ed2fbd8ed20c0563e6bd66"
+licence = "MIT"
+classification = "works-with-configuration-changes"
+notes = "Static audit of src/pass.py and src/backends/: the API surface it uses is entirely delivered (Settings.get, Settings.get_bool, keypirinha_util.get_clipboard and set_clipboard, the item enums). What it cannot inherit is its configuration: the `backend` setting defaults to `wsl` and the alternative is `gpg4win`, both Windows-hosted routes to the POSIX `pass` tool, and `[pass] path` points at a Windows store location. Re-pointing those settings at the local pass and gpg is a configuration change with no source edit."
+
+# ---------------------------------------------------------------------------
+# Works after minimal, documented source changes (acceptance 31.13)
+# ---------------------------------------------------------------------------
+
+[[package]]
+id = "laughk.keypirinha-github"
+source = "https://github.com/laughk/Keypirinha-GitHub"
+revision = "08064188a1e7b0feb1abf2c92bbc77537ff692f8"
+licence = "MIT"
+classification = "works-with-minimal-source-changes"
+notes = "Static audit of src/github.py: exactly one undelivered call, keypirinha_util.web_browser_command(url=..., execute=True) on execute, which is `planned`. Replacing it with the delivered keypirinha_util.open_url is a one-line change; everything else the plugin touches is classified full. Its GitHub account and host settings must also be filled in, as they must under Keypirinha."
+
+[[package]]
+id = "fuhrmann.keypirinha-url-shortener"
+source = "https://github.com/Fuhrmann/keypirinha-url-shortener"
+revision = "0b5b6fb666eb7cd86f6b72620e9b46c6cef4e2d9"
+licence = "MIT"
+classification = "works-with-minimal-source-changes"
+notes = "Static audit of src/urlshortener.py and src/services/: one undelivered call, keypirinha_util.web_browser_command, substitutable with keypirinha_util.open_url as above. keypirinha_util.set_clipboard and the settings accessors it uses are delivered. Its shortener services need API keys in configuration, exactly as upstream."
+
+# ---------------------------------------------------------------------------
+# Windows-only but otherwise compatible (acceptance 31.31)
+# ---------------------------------------------------------------------------
+
+[[package]]
+id = "armotic.keypirinha-audioswitcher"
+source = "https://github.com/armotic/keypirinha-audioswitcher"
+revision = "95e6627da680d170aaa16aaa8c233cd4264207fe"
+licence = "MIT"
+classification = "windows-only-but-compatible"
+notes = "Static audit of src/audioswitcher.py and src/AudioApi/: the legacy API surface it uses is fully delivered (Plugin, the item enums, Settings.get_bool). Its device switching is bundled Core Audio COM code driven through comtypes, so it can only ever run on Windows - which is a platform dependency of the package, not a gap in the compatibility layer. It must never be advertised as portable."
+
+[[package]]
+id = "drorharari.keypirinha-svc"
+source = "https://github.com/DrorHarari/keypirinha-svc"
+revision = "d861044394a688a7c205961229b2205ba4984df3"
+licence = "MIT"
+classification = "windows-only-but-compatible"
+notes = "Static audit of svc.py and lib/svcutil.py: uses only delivered APIs, including keypirinha_util.shell_execute. It drives Windows services through sc.exe with verb=\"runas\" and reads the service database through ctypes, so it is Windows-only by dependency. shell_execute is partial off Windows and its verb and show arguments are accepted but not honoured there, which is exactly why this package cannot be reported as portable."
+
+# ---------------------------------------------------------------------------
+# Blocked on APIs M3 does not ship
+# ---------------------------------------------------------------------------
+
+[[package]]
+id = "ronan696.keypirinha-tldr"
+source = "https://github.com/ronan696/keypirinha-tldr"
+revision = "b78cd016473b007127a84c9adea54c3ffe1a9d79"
+licence = "MIT"
+classification = "blocked-missing-apis"
+notes = "Static audit of src/tldr.py: calls Plugin.set_actions and Plugin.create_action in on_start, Plugin.create_error_item throughout on_suggest, and keypirinha_util.web_browser_command on execute. All four are `planned`, and the first pair fails during startup rather than in a branch, so the plugin cannot load at all. Nothing here is a behavioural mismatch - it is the M3 actions and error-item gap."
+
+[[package]]
+id = "s-oram.keypirinha-recent-items"
+source = "https://github.com/s-oram/keypirinha-recent_items"
+revision = "646108958f1f47e0c526d2e5f774d9bbbaff4f8c"
+licence = "MIT"
+classification = "blocked-missing-apis"
+notes = "Static audit of src/recentitems.py: needs keypirinha_util.shell_known_folder_path to find the Windows Recent Items folder, keypirinha_util.read_link to resolve each .lnk, and keypirinha_util.execute_default_action to open a hit. All three are `planned` and all three are Win32-backed, so this package is blocked twice over: it is Windows-only by nature and unrunnable even there until those land."
+
+[[package]]
+id = "ueffel.keypirinha-windowsapps"
+source = "https://github.com/ueffel/Keypirinha-WindowsApps"
+revision = "439c84ac45e0158acc5f978d9a13034497358109"
+licence = "MIT"
+classification = "blocked-missing-apis"
+notes = "Static audit of windowsapps.py and lib/helper.py: uses Plugin.load_icon, Plugin.set_actions, Plugin.create_action and Settings.get_enum, all `planned`. It also enumerates Universal Windows Apps through PowerShell and the Windows package manifests, so it is Windows-only; the classification records the API gap because that is what blocks it first."
+
+# ---------------------------------------------------------------------------
+# Referenced, not yet audited (honest and still counted)
+# ---------------------------------------------------------------------------
+
+[[package]]
+id = "ehsankia.keypirinha-plugins"
+source = "https://github.com/EhsanKia/keypirinha-plugins"
+revision = "367b2e0f9cdc3aff1dd68de8d204ffa2d47a01fe"
+licence = "MIT"
+classification = "untested"
+notes = "A repository holding two separate packages (keypirinha-launchy, keypirinha-steam) rather than one, so each needs its own audit and its own corpus entry before either can be classified. Referenced now so the split is tracked; deliberately not given a classification it has not earned."

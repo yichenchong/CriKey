@@ -64,11 +64,20 @@ pollster = "=0.3.0"
 wgpu = { version = "=22.1.0", default-features = false }
 winit = { version = "=0.30.5", default-features = false }
 serde = { version = "1", features = ["derive"] }
+# JSON-lines framing for the out-of-process legacy CPython worker (spec 14, ADR
+# pending: protobuf v1 is the M5 native transport, not the M3 legacy one).
+serde_json = "1"
 toml = "0.8"
 thiserror = "2"
 unicode-normalization = "0.1.24"
 unicode-casefold = "0.2.0"
 unicode-general-category = "1.1.0"
+
+# ZIP container support. Required by the Legacy Compatibility Layer to read
+# `.keypirinha-package` archives (spec 14.3) and by its tests to build
+# well-formed archive fixtures. `deflate` is the only compression method a
+# Keypirinha package uses beyond `stored`.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Microsoft's generated Win32/COM bindings, used only by the Windows backend
 # and pulled in only on that target (spec 18.4). Hand written `extern "system"`

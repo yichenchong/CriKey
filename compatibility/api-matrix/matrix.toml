@@ -1,40 +1,679 @@
 # Legacy API compatibility matrix (spec 14.10).
+#
+# Version-controlled AND tested: `crates/crikey-legacy-compat/tests/compatibility_matrix.rs`
+# loads this file, cross-checks it against the symbols the shim under
+# `crates/crikey-legacy-compat/python/` actually defines, and fails if a row
+# overstates the layer, omits a documented API, or leaves a caveat unexplained.
+#
 # status = full | behavioural-difference | windows-only | partial | unsupported | planned
+#   full                    - the documented behaviour, reproduced.
+#   behavioural-difference  - present and usable, but observably different. `notes` mandatory.
+#   windows-only            - backed by Win32; unavailable on other platforms.
+#   partial                 - present, with a documented gap. `notes` mandatory.
+#   unsupported             - deliberately not reproduced (spec 14.12 non-goal).
+#   planned                 - documented Keypirinha API this milestone does not ship.
+#
+# `symbol = "*"` is a literal catch-all row for the rest of a module, not a
+# glob: an exact row always wins and no pattern matching is performed.
+
 matrix-version = 1
 
-[[api]]
-module = "keypirinha"
-symbol = "Plugin.should_terminate"
-status = "planned"
-notes = "Cooperative cancellation backed by the obsolete-work manager."
+# ---------------------------------------------------------------------------
+# keypirinha - module level (spec 14.2, 14.4)
+# ---------------------------------------------------------------------------
 
 [[api]]
 module = "keypirinha"
-symbol = "Plugin.set_suggestions"
+symbol = "KeypirinhaError"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "UndocumentedApiError"
+status = "full"
+notes = "CriKey addition (spec 14.12): a reach for an undocumented internal raises this instead of a bare AttributeError, so the diagnostic is attributable to the plugin."
+
+[[api]]
+module = "keypirinha"
+symbol = "InvalidItemError"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "SettingsError"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "HostUnavailableError"
+status = "full"
+notes = "CriKey addition: an optional host capability the installed host does not implement is refused by name rather than failing inside the shim."
+
+[[api]]
+module = "keypirinha"
+symbol = "ItemCategory"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "ItemArgsHint"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "ItemHitHint"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Match"
+status = "behavioural-difference"
+notes = "The requested matching method is honoured, but matching is performed by CriKey's own matcher: which items match is the same, the relative order of similarly-scored items is not. Spec 14.12 exempts exact reproduction of undocumented ranking behaviour."
+
+[[api]]
+module = "keypirinha"
+symbol = "Sort"
+status = "behavioural-difference"
+notes = "Label orders are exact. Score-based orders follow CriKey's ranking, so items the legacy scorer would have separated can tie and appear in a different order."
+
+[[api]]
+module = "keypirinha"
+symbol = "Events"
+status = "full"
+notes = "Bit values mirror the host event flags bit for bit; the shim and crikey-legacy-compat share the numbering as an ABI."
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "CatalogItem"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Action"
+status = "behavioural-difference"
+notes = "Keypirinha hands on_execute a second catalog item describing the chosen action; CriKey hands a keypirinha.Action (or None for the default action) whose name()/label()/short_desc() map onto crikey_core::Action. A plugin that called item accessors on the action argument sees only these three."
+
+[[api]]
+module = "keypirinha"
+symbol = "Action.name"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Action.label"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Action.short_desc"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "name"
+status = "behavioural-difference"
+notes = "Returns \"CriKey\". Spec 14.13 forbids presenting this layer as a Keypirinha component, so a plugin that string-matches the product name sees a different value."
+
+[[api]]
+module = "keypirinha"
+symbol = "version"
+status = "behavioural-difference"
+notes = "Returns CriKey's version tuple, not a Keypirinha release number, so a plugin that gates a feature on a Keypirinha version comparison will conclude it is running on an older host."
+
+[[api]]
+module = "keypirinha"
+symbol = "version_string"
+status = "behavioural-difference"
+notes = "Dotted CriKey version, never a Keypirinha version string (spec 14.13)."
+
+[[api]]
+module = "keypirinha"
+symbol = "should_terminate"
+status = "full"
+notes = "Level-triggered and read afresh on every call; the optional delay waits on the host's own cancellation event where one exists and otherwise polls in short slices, so a cooperative plugin neither spins nor goes deaf to cancellation (spec 7.1, 14.5)."
+
+[[api]]
+module = "keypirinha"
+symbol = "user_config_dir"
 status = "planned"
-notes = "Translated into one complete internal result publication per callback."
+notes = "Legacy configuration reaches plugins through Plugin.load_settings in M3; the module-level directory helpers land with the legacy configuration layout."
+
+[[api]]
+module = "keypirinha"
+symbol = "installed_package_dir"
+status = "planned"
+notes = "Plugin.package_full_path covers the only documented use M3 needs; the installation-wide directory is deferred."
+
+[[api]]
+module = "keypirinha"
+symbol = "package_cache_dir"
+status = "planned"
+notes = "Plugin.get_package_cache_path covers the per-plugin case; the installation-wide cache directory is deferred."
+
+# ---------------------------------------------------------------------------
+# keypirinha.Settings
+# ---------------------------------------------------------------------------
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings.DEFAULT_SECTION"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings.get"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings.get_bool"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings.get_int"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings.get_float"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings.sections"
+status = "behavioural-difference"
+notes = "Sorted first-seen spellings rather than file order, so a plugin that relied on configuration order to break a tie must sort explicitly. Sorting is deliberate: it makes a plugin's own catalog deterministic across reloads."
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings.keys"
+status = "behavioural-difference"
+notes = "Sorted first-seen spellings rather than file order, for the same determinism reason as Settings.sections."
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings.has"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings.get_multiline"
+status = "planned"
+notes = "Widely used by published packages; not shipped in M3, so a plugin calling it raises AttributeError. Tracked as a one-line source workaround (get + splitlines)."
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings.get_stripped"
+status = "planned"
+notes = "Not shipped in M3. Equivalent to get() plus str.strip() and an unquote step, so it is a documented gap rather than a behavioural one."
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings.get_enum"
+status = "planned"
+
+[[api]]
+module = "keypirinha"
+symbol = "Settings.get_mapped"
+status = "planned"
+
+# ---------------------------------------------------------------------------
+# keypirinha.CatalogItem
+# ---------------------------------------------------------------------------
+
+[[api]]
+module = "keypirinha"
+symbol = "CatalogItem.category"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "CatalogItem.label"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "CatalogItem.short_desc"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "CatalogItem.target"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "CatalogItem.args_hint"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "CatalogItem.hit_hint"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "CatalogItem.loop_on_suggest"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "CatalogItem.icon_handle"
+status = "partial"
+notes = "The handle a plugin supplies is stored and returned by identity, but M3 has no legacy icon registry: nothing resolves a Win32 resource reference such as \"@C:/app.exe,0\" into a rendered icon, so items display without one. Plugin.load_icon, which produces such handles, is itself planned."
+
+[[api]]
+module = "keypirinha"
+symbol = "CatalogItem.data_bag"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "CatalogItem.set_data_bag"
+status = "full"
+
+# ---------------------------------------------------------------------------
+# keypirinha.Plugin
+# ---------------------------------------------------------------------------
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.id"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.friendly_name"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.package_full_name"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.on_start"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.on_catalog"
+status = "full"
+notes = "Each rebuild is a complete replacement (spec 14.8)."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.on_suggest"
+status = "behavioural-difference"
+notes = "Under legacy-strict scheduling a superseded query is cancelled through the obsolete-work manager instead of being debounced (spec 14.5), so a long-running on_suggest observes should_terminate() turning true more often than under Keypirinha, and its late results are discarded by generation rather than displayed."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.on_execute"
+status = "behavioural-difference"
+notes = "The second argument is a keypirinha.Action or None, not an action catalog item; see the keypirinha.Action row."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.on_activated"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.on_deactivated"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.on_events"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.create_item"
+status = "full"
 
 [[api]]
 module = "keypirinha"
 symbol = "Plugin.set_catalog"
-status = "planned"
+status = "full"
 
 [[api]]
 module = "keypirinha"
 symbol = "Plugin.merge_catalog"
+status = "full"
+notes = "The host performs the merge; the shim publishes only the items this call contributed, which keeps a repeated rebuild linear instead of quadratic."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.set_suggestions"
+status = "behavioural-difference"
+notes = "Each call publishes one complete replacement and the newest call within a callback wins, so a plugin that called it repeatedly to append to a growing list now shows only its final list. The published list is snapshotted, so mutating the plugin's own list afterwards changes nothing."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.should_terminate"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.load_settings"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.package_full_path"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.get_package_cache_path"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.load_text_resource"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.load_binary_resource"
+status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.info"
+status = "behavioural-difference"
+notes = "Written to the worker's stderr log channel as \"[info][PluginName] ...\" and collected by the diagnostics layer; there is no Keypirinha console window to read it in. stdout is the protocol channel and is never used."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.warn"
+status = "behavioural-difference"
+notes = "Same log channel and prefix convention as Plugin.info."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.err"
+status = "behavioural-difference"
+notes = "Same log channel and prefix convention as Plugin.info."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.dbg"
+status = "behavioural-difference"
+notes = "Same log channel and prefix convention as Plugin.info; always emitted rather than gated on a host debug flag."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.set_actions"
+status = "planned"
+notes = "Per-category action lists are not shipped in M3, so on_execute receives None for the action. Published packages use this heavily; it is the largest single M3 gap."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.create_action"
+status = "planned"
+notes = "Deferred with Plugin.set_actions; keypirinha.Action itself exists so on_execute can already be handed one."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.load_icon"
+status = "planned"
+notes = "Requires an icon registry and Win32 resource extraction; deferred with CatalogItem.icon_handle resolution."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.set_default_icon"
+status = "planned"
+notes = "Deferred with Plugin.load_icon."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.create_error_item"
+status = "planned"
+notes = "A plugin can publish an ordinary item to report an error meanwhile, so this is a convenience gap rather than a functional one."
+
+[[api]]
+module = "keypirinha"
+symbol = "Plugin.find_resources"
+status = "planned"
+notes = "Resource enumeration is deferred; Plugin.load_text_resource and Plugin.load_binary_resource cover access by name."
+
+# ---------------------------------------------------------------------------
+# keypirinha_util (spec 14.2)
+# ---------------------------------------------------------------------------
+
+[[api]]
+module = "keypirinha_util"
+symbol = "UnavailableError"
+status = "full"
+notes = "CriKey addition and the honest-unavailability channel itself: subclasses RuntimeError, never AttributeError or OSError, because those are routinely swallowed and would turn a refusal into a silent no-op. Carries .operation, .platform and .reason."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "ScanFlags"
+status = "full"
+
+[[api]]
+module = "keypirinha_util"
+symbol = "cmdline_split"
+status = "full"
+notes = "Implements the documented CommandLineToArgvW rules as a pure string function on every platform, so unchanged plugins parse identically off Windows."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "cmdline_quote"
+status = "full"
+notes = "The exact inverse of cmdline_split, including empty arguments, embedded quotes and trailing backslashes."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "expand_variables"
+status = "behavioural-difference"
+notes = "Windows %VAR% syntax with case-insensitive lookup is implemented on every platform, including hosts whose real environment is case-sensitive, so %path% and %PATH% resolve to the same value here while the surrounding OS would treat them as two variables. Unknown variables are left verbatim rather than emptied, and %% escapes a literal percent."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "scan_directory"
+status = "behavioural-difference"
+notes = "Returns sorted, base-relative paths using the host separator, so results are deterministic where Keypirinha's directory order was not. Hidden and system filtering is a Win32 file-attribute concept and cannot be reproduced off Windows, where only the name pattern and the FILES/FOLDERS/RECURSIVE flags apply."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "desktop_available"
+status = "full"
+notes = "CriKey addition: lets a plugin ask whether the desktop-touching helpers can work instead of provoking UnavailableError to find out."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "set_clipboard"
+status = "partial"
+notes = "Needs a desktop session. On a headless host it raises keypirinha_util.UnavailableError naming the operation and platform rather than pretending to have copied anything."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "get_clipboard"
+status = "partial"
+notes = "Needs a desktop session; raises keypirinha_util.UnavailableError on a headless host instead of returning an empty string, which a plugin could not tell from an empty clipboard."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "open_url"
+status = "partial"
+notes = "Needs a desktop session with a registered browser; raises keypirinha_util.UnavailableError on a headless host."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "shell_execute"
+status = "partial"
+notes = "Launches through the platform backend. Win32-specific arguments are accepted for source compatibility but only honoured on Windows: the `verb` (\"runas\") and `show` window codes have no equivalent elsewhere. Raises keypirinha_util.UnavailableError when no desktop session can start a program."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "explore_file"
+status = "partial"
+notes = "Needs a desktop session with a file manager; raises keypirinha_util.UnavailableError on a headless host."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "fuzzy_score"
+status = "unsupported"
+notes = "Spec 14.12 makes exact reproduction of the undocumented legacy ranking a non-goal. Exposing a different score under the same name would silently reorder every plugin that filters on it, so the name is refused instead; plugins should let the host match and sort."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "chardet_open"
 status = "planned"
 
 [[api]]
 module = "keypirinha_util"
-symbol = "*"
+symbol = "decode_bytes"
 status = "planned"
 
 [[api]]
-module = "keypirinha_net"
-symbol = "*"
+module = "keypirinha_util"
+symbol = "kwargs_encode"
 status = "planned"
+notes = "Used by published packages to pack structured data into an item target; deferred with kwargs_decode so the pair lands together and round-trips."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "kwargs_decode"
+status = "planned"
+notes = "Deferred with kwargs_encode."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "execute_default_action"
+status = "planned"
+notes = "Depends on the per-category action lists that Plugin.set_actions will bring."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "web_browser_command"
+status = "planned"
+notes = "Building a browser command line with private-mode and new-window flags is deferred; keypirinha_util.open_url covers plain opening today, which is a one-line substitution for most callers."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "read_link"
+status = "planned"
+notes = "Resolving a Windows .lnk shortcut needs the Win32 shell interfaces; it will be windows-only when it lands."
+
+[[api]]
+module = "keypirinha_util"
+symbol = "shell_known_folder_path"
+status = "planned"
+notes = "Win32 known-folder GUID resolution; it will be windows-only when it lands."
+
+# ---------------------------------------------------------------------------
+# keypirinha_net (spec 14.2)
+# ---------------------------------------------------------------------------
+
+[[api]]
+module = "keypirinha_net"
+symbol = "InvalidUrlError"
+status = "full"
+notes = "Subclasses ValueError, so a plugin that already guarded a URL build with `except ValueError` keeps working."
+
+[[api]]
+module = "keypirinha_net"
+symbol = "Request"
+status = "full"
+
+[[api]]
+module = "keypirinha_net"
+symbol = "DEFAULT_TIMEOUT"
+status = "full"
+notes = "10 seconds. Every request carries a timeout by construction: an unbounded network wait inside a plugin callback would pin a worker."
+
+[[api]]
+module = "keypirinha_net"
+symbol = "user_agent"
+status = "behavioural-difference"
+notes = "Reports \"CriKey/<version>\" and never the Keypirinha product name (spec 14.13), so a server-side or plugin-side check for a Keypirinha user agent sees a different client."
+
+[[api]]
+module = "keypirinha_net"
+symbol = "build_request"
+status = "full"
+notes = "Rejects anything that is not http(s) with InvalidUrlError at build time rather than letting it fail deep inside urllib; no network I/O is performed while building."
+
+[[api]]
+module = "keypirinha_net"
+symbol = "build_urllib_opener"
+status = "partial"
+notes = "Returns a real urllib.request.OpenerDirector carrying the CriKey user agent, so unchanged plugins can use it as they always have. M3 configures no proxy, no TLS trust-store override and no legacy network settings, so a plugin that relied on the host's configured proxy must install its own handlers."
+
+[[api]]
+module = "keypirinha_net"
+symbol = "Request.url"
+status = "full"
+
+[[api]]
+module = "keypirinha_net"
+symbol = "Request.headers"
+status = "behavioural-difference"
+notes = "Header names are normalised to canonical HTTP casing, so a header supplied as \"x-test\" is stored as \"X-Test\"; a plugin that indexes the mapping with its own spelling should use Request.get_header, which is case-insensitive."
+
+[[api]]
+module = "keypirinha_net"
+symbol = "Request.timeout"
+status = "full"
+
+[[api]]
+module = "keypirinha_net"
+symbol = "Request.user_agent"
+status = "full"
+
+[[api]]
+module = "keypirinha_net"
+symbol = "Request.get_header"
+status = "full"
+
+# ---------------------------------------------------------------------------
+# keypirinha_wintypes (spec 14.2, 14.10; acceptance 31.31)
+#
+# The module imports and these four names resolve on every platform: they are
+# the honest-unavailability surface itself, not Win32 calls. Every actual Win32
+# entry point is covered by the `*` row below.
+# ---------------------------------------------------------------------------
+
+[[api]]
+module = "keypirinha_wintypes"
+symbol = "WINDOWS_ONLY"
+status = "full"
+
+[[api]]
+module = "keypirinha_wintypes"
+symbol = "WINDOWS_ONLY_SYMBOLS"
+status = "full"
+
+[[api]]
+module = "keypirinha_wintypes"
+symbol = "WindowsOnlyError"
+status = "full"
+
+[[api]]
+module = "keypirinha_wintypes"
+symbol = "is_available"
+status = "full"
 
 [[api]]
 module = "keypirinha_wintypes"
 symbol = "*"
 status = "windows-only"
+notes = "Catch-all for every Win32 entry point in the module - kernel32, user32, shell32, ole32, declare_func and GUID. Each resolves only against Win32 and raises WindowsOnlyError elsewhere, so none of them may ever be reported as portable (acceptance 31.31). One row rather than an enumeration, because the set is defined by the shim's WINDOWS_ONLY_SYMBOLS and would otherwise drift."

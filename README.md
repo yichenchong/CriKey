@@ -15,8 +15,17 @@ hotkey/application backends are implemented; Windows execution and
 warm-activation p95 remain unverified. M2 scheduling and resilience is complete:
 manifest-resolved policy, modern and legacy scheduling, cancellation, stale
 rejection, bounded/fair request and result queues, and deterministic developer
-traces are wired through the live query pipeline. See
-[docs/ROADMAP.md](docs/ROADMAP.md) for measured status and
+traces are wired through the live query pipeline.
+
+M3 is complete: the Legacy Compatibility Layer loads Keypirinha package
+directories and `.keypirinha-package` archives, runs their plugins in supervised
+child CPython processes under `legacy-strict` scheduling, reproduces the
+documented `keypirinha` module surface, publishes a tested compatibility matrix
+and referenced plugin corpus, and serves legacy suggestions through the live
+query pipeline without ever blocking the UI thread. Windows execution of the
+Win32-only surface is reported honestly as unavailable rather than simulated.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for measured status and
 [docs/architecture.md](docs/architecture.md) for the component map.
 
 ## Layout

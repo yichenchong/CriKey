@@ -1,11 +1,15 @@
 //! `crikey` command-line entrypoint (spec 28).
 
 mod dev_commands;
+mod legacy_commands;
 
 use std::process::ExitCode;
 use std::time::Instant;
 
-use crikey_app::{App, BatchState, PipelineConfig, QueryPipeline, ResultBatch, SearchService, StartupStage};
+use crikey_app::{
+    App, BatchState, LegacyDriver, LegacyProvider, PipelineConfig, QueryPipeline, ResultBatch, SearchService,
+    StartupStage,
+};
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
 };
@@ -13,6 +17,7 @@ use crikey_core::{Item, PluginId};
 use crikey_input_scheduler::{
     ActivationPolicy, DebouncePolicy, PluginPolicy, QueuePolicy, SchedulingProfile,
 };
+use crikey_legacy_compat::LegacyDeadlines;
 use crikey_ui::{
     LauncherViewModel, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, UiEffect, ViewModel,
 };
@@ -26,7 +31,8 @@ USAGE:
 COMMANDS:
     run                             Start the launcher
     plugin list|install|remove|enable|disable|doctor|scheduling-profile
-    dev   run|test|benchmark|trace-query|simulate-typing|inspect-protocol|test-legacy-compat
+    dev   run|test|benchmark|trace-query|simulate-typing|inspect-protocol
+    dev   test-legacy-compat|inspect-catalog|compatibility-report
     package build|verify|inspect|migrate-keypirinha
     version                         Print version information
     help                            Print this message
@@ -37,7 +43,7 @@ COMMANDS:
 /// Kept apart from an unknown word on purpose: "advertised, not built" and "no
 /// such subcommand" are different answers, and a script can tell them apart by
 /// exit status without parsing prose.
-const UNIMPLEMENTED_DEV: [&str; 4] = ["run", "test", "inspect-protocol", "test-legacy-compat"];
+const UNIMPLEMENTED_DEV: [&str; 3] = ["run", "test", "inspect-protocol"];
 
 /// Queries the reported percentiles are drawn from, and results each retains.
 ///
@@ -142,6 +148,43 @@ fn run_native_launcher() -> Result<(), String> {
         .map_err(|error| {
             format!("cannot register the application provider with the query pipeline: {error:?}")
         })?;
+
+    // Legacy plugins join the live query path here, not only the `crikey dev`
+    // commands. Without this the Legacy Compatibility Layer would never load a
+    // real package or serve a suggestion through the pipeline that `crikey run`
+    // drives (spec 14.5; roadmap M3). No modern worker is required at this
+    // milestone, so the required-worker milestone is trivially complete and is
+    // acknowledged only to reach the legacy milestone in specification order.
+    search
+        .complete_stage(StartupStage::RequiredWorkers)
+        .map_err(|error| error.to_string())?;
+    let mut legacy_pipeline = QueryPipeline::new(PipelineConfig::default());
+    let legacy_provider = LegacyProvider::load(
+        &mut legacy_pipeline,
+        &legacy_package_roots(),
+        std::env::temp_dir().join("crikey-legacy-packages"),
+        LegacyDeadlines::default(),
+    );
+    for entry in legacy_provider.unavailable() {
+        eprintln!(
+            "crikey: legacy plugin unavailable ({}): {}",
+            entry.package, entry.reason
+        );
+    }
+    // Truthful staging (spec 25.6): the milestone is acknowledged only now that
+    // legacy loading has actually completed.
+    search
+        .complete_stage(StartupStage::LegacyPlugins)
+        .map_err(|error| error.to_string())?;
+    // Legacy plugins run out-of-process on a dedicated supervisor thread so a
+    // slow child interpreter can never block the UI thread (Finding 8; spec
+    // 6.5, acceptance 31.1, 31.8). The supervisor publishes each merged frame
+    // straight to the renderer through this cloned handle; the UI thread folds
+    // the same frame into its retained view model on its next turn.
+    let legacy_publish_handle = render_handle.clone();
+    let legacy_driver = LegacyDriver::spawn(legacy_provider, legacy_pipeline, move |frame| {
+        let _ = legacy_publish_handle.submit_frame(frame);
+    });
     let query_clock = Instant::now();
 
     let activation_handle = render_handle.clone();
@@ -151,6 +194,14 @@ fn run_native_launcher() -> Result<(), String> {
     let mut view_model = LauncherViewModel::new();
     launcher
         .run(move |event| {
+            // Fold any legacy rows the supervisor produced since the last turn
+            // into the retained view model, so a later navigation keystroke
+            // keeps them. `publish` refuses a superseded or retired generation,
+            // so a late answer can never land under a newer one.
+            if let Some(outcome) = legacy_driver.take_outcome() {
+                view_model.publish(outcome.generation, outcome.rows.to_vec(), outcome.pending_plugins);
+            }
+
             let (command_session, effect) = match event {
                 NativeLauncherEvent::Activated => {
                     // A rapid off/on hotkey pair may supersede the queued
@@ -172,11 +223,40 @@ fn run_native_launcher() -> Result<(), String> {
                         view_model.begin_generation(generation);
 
                         let now = u64::try_from(query_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        if let Some(frame) =
-                            drive_application_provider(&mut query_pipeline, &owner, &raw, items, now)
-                        {
+                        // The built-in provider stays synchronous: it is fast,
+                        // in-process, and its rows must reach this frame without
+                        // waiting on anything. Its pipeline generation stays in
+                        // lockstep with the search generation this frame is
+                        // published under.
+                        let application_frame =
+                            drive_application_provider(&mut query_pipeline, &owner, &raw, items, now);
+                        if let Some(frame) = application_frame {
                             if frame.generation == generation {
-                                view_model.publish(generation, search.result_rows(), frame.pending_plugins);
+                                let rows = search.result_rows();
+                                // Legacy plugins are driven off the UI thread
+                                // (Finding 8): hand the query to the supervisor
+                                // and return. The built-in rows publish now, with
+                                // work marked pending while a legacy answer is
+                                // outstanding; the legacy rows fold in
+                                // asynchronously through `take_outcome` and the
+                                // supervisor's own frame submission, always under
+                                // this generation (spec 14.5).
+                                let legacy_outstanding = legacy_driver.has_plugins();
+                                if legacy_outstanding {
+                                    legacy_driver.submit(
+                                        generation,
+                                        &raw,
+                                        now,
+                                        rows.clone(),
+                                        frame.pending_plugins,
+                                        0,
+                                    );
+                                }
+                                view_model.publish(
+                                    generation,
+                                    rows,
+                                    frame.pending_plugins || legacy_outstanding,
+                                );
                             }
                         }
                     }
@@ -215,6 +295,20 @@ fn run_native_launcher() -> Result<(), String> {
             }
         })
         .map_err(|error| error.to_string())
+}
+
+/// Directories scanned for legacy packages on the live path (spec 14.3).
+///
+/// Read from `CRIKEY_LEGACY_PACKAGE_ROOTS` using the platform path-list syntax,
+/// so an operator can point `crikey run` at their installed packages today.
+/// Resolving roots from the settings file (spec 14.7) is left to a later
+/// milestone; an unset variable means no legacy roots, which loads nothing
+/// rather than failing.
+fn legacy_package_roots() -> Vec<std::path::PathBuf> {
+    match std::env::var_os("CRIKEY_LEGACY_PACKAGE_ROOTS") {
+        Some(value) => std::env::split_paths(&value).collect(),
+        None => Vec::new(),
+    }
 }
 fn application_provider_policy() -> PluginPolicy {
     PluginPolicy {
@@ -294,6 +388,9 @@ fn dev(args: &[String]) -> ExitCode {
         Some("benchmark") => benchmark(&args[1..]),
         Some("trace-query") => dev_commands::trace_query(&args[1..]),
         Some("simulate-typing") => dev_commands::simulate_typing(&args[1..]),
+        Some("test-legacy-compat") => legacy_commands::test_legacy_compat(&args[1..]),
+        Some("inspect-catalog") => legacy_commands::inspect_catalog(&args[1..]),
+        Some("compatibility-report") => legacy_commands::compatibility_report(&args[1..]),
         Some(subcommand) if UNIMPLEMENTED_DEV.contains(&subcommand) => {
             eprintln!("crikey: `dev {subcommand}` is not implemented yet");
             ExitCode::from(69) // EX_UNAVAILABLE

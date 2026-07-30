@@ -16,3 +16,17 @@ crikey-core.workspace = true
 crikey-input-scheduler.workspace = true
 crikey-plugin-model.workspace = true
 crikey-python-host.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+# Reads `.keypirinha-package` archives (spec 14.3). Extraction is bounded and
+# refuses entries that escape the package root.
+zip.workspace = true
+
+[dev-dependencies]
+# Builds the well-formed `.keypirinha-package` fixtures in
+# `tests/package_loading.rs`. Adversarial fixtures (path traversal, non-UTF-8
+# entry names) are hand-written raw bytes in that test: a security fixture must
+# not be produced by a writer that is free to sanitize it.
+zip.workspace = true
