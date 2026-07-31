@@ -39,6 +39,23 @@ pub struct NativeLauncherConfig {
     pub title: String,
     pub width: u32,
     pub height: u32,
+    /// Whether the launcher window is composited with what is behind it.
+    ///
+    /// Drives both `with_transparent` on the window and the surface's
+    /// compositing mode, so the two cannot disagree. The shipped theme is
+    /// currently opaque, but that is a theming decision rather than a renderer
+    /// invariant: a translucent launcher is enabled here, not by editing the
+    /// surface configuration.
+    pub transparent: bool,
+    /// How the surface paces presentation.
+    ///
+    /// [`wgpu::PresentMode::AutoVsync`] is the shipped default and the right
+    /// one for the product: tearing is worse than a frame of latency. It is
+    /// configurable only so a measurement harness can separate CriKey's own
+    /// cost from the vblank wait, which is otherwise inside the same span —
+    /// `get_current_texture` blocks on swapchain backpressure, and that happens
+    /// inside the activation-to-present measurement.
+    pub present_mode: wgpu::PresentMode,
 }
 
 impl Default for NativeLauncherConfig {
@@ -47,6 +64,8 @@ impl Default for NativeLauncherConfig {
             title: "CriKey".to_owned(),
             width: theme::DEFAULT_WINDOW_WIDTH,
             height: theme::DEFAULT_WINDOW_HEIGHT,
+            transparent: false,
+            present_mode: wgpu::PresentMode::AutoVsync,
         }
     }
 }
@@ -948,6 +967,43 @@ struct GraphicsState {
     egui_state: egui_winit::State,
 }
 
+/// Picks the surface compositing mode that matches how the window was created.
+///
+/// This is deliberately *not* a judgement about how the launcher should look.
+/// `transparent` is whatever [`NativeLauncherConfig`] asked for, and the same
+/// flag drives `with_transparent` on the window, so the surface and the window
+/// can never disagree: a translucent theme is a configuration change, not a
+/// renderer change.
+///
+/// egui produces premultiplied colours, so a transparent window wants
+/// [`CompositeAlphaMode::PreMultiplied`] and an opaque one wants
+/// [`CompositeAlphaMode::Opaque`]. `Auto` — which resolves to opaque or inherit
+/// against the real surface — is the fallback for both, and the first
+/// advertised mode is the last resort so a backend offering neither still
+/// starts.
+fn preferred_alpha_mode(
+    modes: &[wgpu::CompositeAlphaMode],
+    transparent: bool,
+) -> Option<wgpu::CompositeAlphaMode> {
+    let ranked: [wgpu::CompositeAlphaMode; 2] = if transparent {
+        [
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::PostMultiplied,
+        ]
+    } else {
+        [wgpu::CompositeAlphaMode::Opaque, wgpu::CompositeAlphaMode::Auto]
+    };
+    for preferred in ranked {
+        if modes.contains(&preferred) {
+            return Some(preferred);
+        }
+    }
+    if modes.contains(&wgpu::CompositeAlphaMode::Auto) {
+        return Some(wgpu::CompositeAlphaMode::Auto);
+    }
+    modes.first().copied()
+}
+
 impl GraphicsState {
     fn new(
         event_loop: &ActiveEventLoop,
@@ -966,13 +1022,24 @@ impl GraphicsState {
             ))
             .with_resizable(true)
             .with_decorations(false)
+            .with_transparent(config.transparent)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_visible(false);
         let window = Arc::new(event_loop.create_window(attributes)?);
-        pollster::block_on(Self::initialize(window, proxy))
+        pollster::block_on(Self::initialize(
+            window,
+            proxy,
+            config.transparent,
+            config.present_mode,
+        ))
     }
 
-    async fn initialize(window: Arc<Window>, proxy: Arc<EventProxy>) -> Result<Self, RendererError> {
+    async fn initialize(
+        window: Arc<Window>,
+        proxy: Arc<EventProxy>,
+        transparent: bool,
+        present_mode: wgpu::PresentMode,
+    ) -> Result<Self, RendererError> {
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(Arc::clone(&window))?;
         let preferred = wgpu::RequestAdapterOptions {
@@ -1010,10 +1077,7 @@ impl GraphicsState {
         let capabilities = surface.get_capabilities(&adapter);
         let format = egui_wgpu::preferred_framebuffer_format(&capabilities.formats)
             .map_err(|_| RendererError::NoSurfaceFormat)?;
-        let alpha_mode = capabilities
-            .alpha_modes
-            .first()
-            .copied()
+        let alpha_mode = preferred_alpha_mode(&capabilities.alpha_modes, transparent)
             .ok_or(RendererError::NoSurfaceAlphaMode)?;
         let size = window.inner_size();
         let surface_config = wgpu::SurfaceConfiguration {
@@ -1021,8 +1085,8 @@ impl GraphicsState {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 1,
+            present_mode,
             alpha_mode,
             view_formats: Vec::new(),
         };
@@ -1535,5 +1599,87 @@ mod lifecycle_tests {
         state.restore_visible(first);
 
         assert!(state.is_visible_session(second));
+    }
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::*;
+
+    /// An opaque window takes an advertised `Opaque` mode no matter where the
+    /// backend lists it. This is the case `.first()` got right only by luck.
+    #[test]
+    fn an_opaque_window_chooses_opaque_even_when_listed_late() {
+        let modes = [
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::Opaque,
+        ];
+        assert_eq!(
+            preferred_alpha_mode(&modes, false),
+            Some(wgpu::CompositeAlphaMode::Opaque)
+        );
+    }
+
+    /// The renderer must not impose opacity on a theme that asked for
+    /// transparency: a transparent window takes a blending mode even when an
+    /// opaque one is advertised first.
+    #[test]
+    fn a_transparent_window_is_not_forced_opaque() {
+        let modes = [
+            wgpu::CompositeAlphaMode::Opaque,
+            wgpu::CompositeAlphaMode::PreMultiplied,
+        ];
+        assert_eq!(
+            preferred_alpha_mode(&modes, true),
+            Some(wgpu::CompositeAlphaMode::PreMultiplied)
+        );
+    }
+
+    /// egui emits premultiplied colours, so that mode is preferred over
+    /// postmultiplied when a transparent surface offers both.
+    #[test]
+    fn a_transparent_window_prefers_premultiplied() {
+        let modes = [
+            wgpu::CompositeAlphaMode::PostMultiplied,
+            wgpu::CompositeAlphaMode::PreMultiplied,
+        ];
+        assert_eq!(
+            preferred_alpha_mode(&modes, true),
+            Some(wgpu::CompositeAlphaMode::PreMultiplied)
+        );
+    }
+
+    /// `Auto` resolves against the real surface and is the shared fallback
+    /// when neither preference is advertised.
+    #[test]
+    fn auto_is_the_fallback_for_either_intent() {
+        let modes = [wgpu::CompositeAlphaMode::Auto];
+        assert_eq!(
+            preferred_alpha_mode(&modes, false),
+            Some(wgpu::CompositeAlphaMode::Auto)
+        );
+        assert_eq!(
+            preferred_alpha_mode(&modes, true),
+            Some(wgpu::CompositeAlphaMode::Auto)
+        );
+    }
+
+    /// A surface offering none of the preferred modes still starts rather than
+    /// refusing to open.
+    #[test]
+    fn the_first_advertised_mode_is_the_last_resort() {
+        let modes = [wgpu::CompositeAlphaMode::PostMultiplied];
+        assert_eq!(
+            preferred_alpha_mode(&modes, false),
+            Some(wgpu::CompositeAlphaMode::PostMultiplied)
+        );
+    }
+
+    /// An empty capability list stays an error: there is no mode to configure
+    /// the surface with.
+    #[test]
+    fn no_advertised_mode_is_an_error_rather_than_a_guess() {
+        assert_eq!(preferred_alpha_mode(&[], false), None);
+        assert_eq!(preferred_alpha_mode(&[], true), None);
     }
 }

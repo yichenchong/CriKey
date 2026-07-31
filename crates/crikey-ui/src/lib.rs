@@ -22,6 +22,10 @@ pub use native::{
     NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, NativeLauncherHandle, NativeUiFrame,
     RendererError, ACTIVATION_SAMPLE_CAPACITY,
 };
+/// Re-exported so a caller can name [`NativeLauncherConfig::present_mode`]
+/// without taking its own `wgpu` dependency and risking a version skew with
+/// the one the renderer is built against.
+pub use wgpu;
 
 /// One row in the result list (spec 6.4).
 #[derive(Debug, Clone)]

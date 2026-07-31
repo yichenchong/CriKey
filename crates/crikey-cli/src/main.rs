@@ -1,5 +1,6 @@
 //! `crikey` command-line entrypoint (spec 28).
 
+mod activation_commands;
 mod dev_commands;
 mod legacy_commands;
 mod modern_commands;
@@ -33,7 +34,7 @@ USAGE:
 COMMANDS:
     run                             Start the launcher
     plugin list|install|remove|enable|disable|doctor|scheduling-profile
-    dev   run|test|benchmark|trace-query|simulate-typing|inspect-protocol
+    dev   run|test|benchmark|measure-activation|trace-query|simulate-typing|inspect-protocol
     dev   test-legacy-compat|inspect-catalog|compatibility-report
     package build|verify|inspect|migrate-keypirinha
     version                         Print version information
@@ -757,6 +758,7 @@ fn dev(args: &[String]) -> ExitCode {
         Some("inspect-catalog") => legacy_commands::inspect_catalog(&args[1..]),
         Some("compatibility-report") => legacy_commands::compatibility_report(&args[1..]),
         Some("inspect-protocol") => native_commands::inspect_protocol(&args[1..]),
+        Some("measure-activation") => activation_commands::measure_activation(&args[1..]),
         Some(other) => {
             eprintln!("crikey: unknown dev subcommand `{other}`\n\n{USAGE}");
             ExitCode::from(64) // EX_USAGE

@@ -107,10 +107,28 @@ Status snapshot (2026-07-27):
   Windows session. On a platform with no registered reactivation source,
   dismissal exits cleanly rather than retaining an unreachable hidden process;
   repeated warm activation therefore requires a working hotkey backend.
-- Remaining before M1 can close: exercise hotkey/discovery/launch on Windows and
-  measure warm activation below 30 ms p95 on the reference path. Query latency,
-  catalog scale, and Linux native presentation are green; the M1 milestone as a
-  whole is not.
+- Warm activation is instrumented and measurable, but not yet measured on
+  hardware that can settle it. `crikey dev measure-activation` drives real
+  hide→activate→present cycles against the retained window and reports p95 over
+  the renderer's own sample ring. The span is `request_activation` →
+  first present, which is the platform-independent half: it **excludes**
+  global-hotkey delivery (the OS dispatch happens before that call) and display
+  scanout (`presented_at` is taken after `frame.present()` returns). Cold
+  starts are excluded by the renderer itself, which opens no sample for an
+  activation requested before the GPU surface existed.
+- That proxy did **not** produce a usable figure on this host. Six runs of the
+  identical configuration under Xvfb 1280×720×24 with Mesa Lavapipe reported
+  p95 of 17.7, 18.5, 21.5, 27.5, 34.8 and 40.6 ms — a spread that straddles the
+  30 ms budget, so the run decides the verdict rather than the code does. A
+  `--present-mode no-vsync` run moved p95 by under 2 ms, so swapchain pacing is
+  not the cause; software rasterisation and machine noise dominate. The harness
+  is kept because it is the instrument that will settle this on a GPU, but no
+  Lavapipe figure is recorded as evidence for or against §25.1.
+- Remaining before M1 can close: exercise hotkey/discovery/launch on Windows,
+  and measure warm activation below 30 ms p95 on hardware with a real GPU and
+  compositor. Both remaining items need a runtime this host does not have.
+  Query latency, catalog scale, and Linux native presentation are green; the M1
+  milestone as a whole is not.
 
 ### M2 — Scheduling and resilience (§30 Phase 2) — L — done
 
@@ -346,7 +364,7 @@ Keypirinha branding, logos, or implied endorsement anywhere in UI or docs.
 | --- | --- | --- |
 | Undocumented Keypirinha behaviour that real plugins depend on | Compatibility gaps found late | Build the real-plugin corpus during M3, not after; classify and publish gaps rather than guessing at internals |
 | CPython startup cost inflating first-query latency | Misses §25.1 targets | Lazy worker start, warm pooling per runtime profile, catalog served from cache while workers boot |
-| Warm-activation budget (30 ms p95) on a cold GPU surface | Misses §31.1 | Keep window and surface alive and hidden; measure from hotkey to first presented frame in CI-adjacent harness |
+| Warm-activation budget (30 ms p95) on a cold GPU surface | Misses §31.1 | Keep window and surface alive and hidden; `crikey dev measure-activation` is the diagnostic instrument today and times `request_activation` → first present only, so it excludes hotkey dispatch and scanout. The §31.1 verdict needs the end-to-end Win32 measurement from hotkey to presented frame, on hardware with a real GPU and compositor — not this proxy, and not a software rasteriser |
 | Debounce tuning fighting perceived responsiveness | Poor feel | Local catalog is never debounced; defaults follow §25.4 bands and are per-plugin configurable |
 | Protocol churn after third-party SDK release | Ecosystem breakage | Freeze v1 at M5 with additive-only evolution and unknown-field round-tripping |
 | Scope creep from §2.2 "later scope" | M1–M6 slip | Later-scope items require an ADR and a milestone before any code lands |
