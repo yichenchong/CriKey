@@ -255,6 +255,11 @@ def _item_to_wire(item):
                 "label": getattr(action, "label", ""),
                 "description": getattr(action, "description", "") or "",
                 "icon_reference": getattr(action, "icon_reference", None),
+                "applicable_categories": [
+                    str(c) for c in getattr(action, "applicable_categories", None) or ()
+                ],
+                "execution_policy": getattr(action, "execution_policy", "host-mediated")
+                or "host-mediated",
             }
         )
     metadata = {}
@@ -286,6 +291,10 @@ def _item_from_wire(payload):
             label=a.get("label", ""),
             description=a.get("description", "") or "",
             icon_reference=a.get("icon_reference"),
+            applicable_categories=tuple(
+                str(c) for c in (a.get("applicable_categories") or ())
+            ),
+            execution_policy=a.get("execution_policy", "host-mediated") or "host-mediated",
         )
         for a in (payload.get("actions") or [])
     ]

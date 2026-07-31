@@ -269,6 +269,12 @@ conversion is now defended by generated adversarial properties plus a
 field-completeness guard that fails to COMPILE when a core field is added
 without being mapped.
 
+The modern host integration test exercises the real CPython worker with a
+non-empty action category set containing both
+`PluginDefined("application")` and built-in `Application`, plus explicit
+`ExecutionPolicy::Plugin`; it asserts all fields after the subprocess
+round-trip.
+
 Verification limits, honestly: the Windows named-pipe transport, job-object
 limits and `DuplicateHandle` cloning are compile-verified only — this host
 cannot run them. Deferred to M6 with no code pretending otherwise: §24.2

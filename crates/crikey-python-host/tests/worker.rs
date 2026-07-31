@@ -42,7 +42,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crikey_core::{ActionId, ArgumentPolicy, Category, HitPolicy, Item, ItemId, PluginId};
+use crikey_core::{
+    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, PluginId,
+};
 use crikey_package_manager::ImportPath;
 use crikey_python_host::{
     discover_interpreter, sdk_root, BatchState, CancelHandle, ExecuteOutcome, HostError, Interpreter,
@@ -190,7 +192,17 @@ fn core_item(plugin: &str, stable: &str) -> Item {
         hit_policy: HitPolicy::default(),
         score_hint: 0,
         metadata: BTreeMap::new(),
-        actions: Vec::new(),
+        actions: vec![Action {
+            action_id: ActionId("open".to_owned()),
+            label: "Open".to_owned(),
+            description: "Open from the host".to_owned(),
+            applicable_categories: vec![
+                Category::PluginDefined("application".to_owned()),
+                Category::Application,
+            ],
+            icon_reference: Some("icon-open".to_owned()),
+            execution_policy: ExecutionPolicy::Plugin,
+        }],
     }
 }
 
@@ -238,14 +250,21 @@ fn process_table_contains(pid: u32) -> Option<bool> {
 /// Emits an ordered run of suggestions, returns a two-item catalog, and either
 /// succeeds or raises in `execute` depending on the action id.
 const WELL_BEHAVED: &str = r#"
-from crikey_sdk.plugin import Plugin, Item, Action
+from crikey_sdk.plugin import Plugin, Item, Action, plugin_defined_category
 
 
 class Fixture(Plugin):
     def build_catalog(self):
         return [
             Item(stable_id="cat-1", label="Catalog One", target="t1",
-                 actions=[Action(action_id="open", label="Open")]),
+                 actions=[Action(
+                     action_id="open", label="Open",
+                     icon_reference="icon-open",
+                     applicable_categories=(
+                         plugin_defined_category("application"), "application"
+                     ),
+                     execution_policy="plugin",
+                 )]),
             Item(stable_id="cat-2", label="Catalog Two", target="t2",
                  description="second"),
         ]
@@ -257,6 +276,14 @@ class Fixture(Plugin):
                               target="target-%02d" % index))
 
     def execute(self, item, action_id, argument):
+        if action_id == "open":
+            action = item.actions[0]
+            if (
+                action.applicable_categories
+                != ("plugin-defined:application", "application")
+                or action.execution_policy != "plugin"
+            ):
+                raise RuntimeError("action fields were rewritten before execute")
         if action_id == "raise":
             raise RuntimeError("execute boom for %s" % item.stable_id)
 "#;
@@ -479,6 +506,21 @@ fn build_catalog_returns_the_plugins_catalog_with_fields_intact() {
         items[0].actions.first().map(|a| &a.action_id),
         Some(&ActionId("open".to_owned())),
         "an item's actions cross the boundary"
+    );
+    let action = items[0].actions.first().expect("catalog action exists");
+    assert_eq!(action.icon_reference.as_deref(), Some("icon-open"));
+    assert_eq!(
+        action.applicable_categories,
+        vec![
+            Category::PluginDefined("application".to_owned()),
+            Category::Application,
+        ],
+        "non-empty action categories survive the real Python worker"
+    );
+    assert_eq!(
+        action.execution_policy,
+        ExecutionPolicy::Plugin,
+        "the Python worker does not replace an explicit execution policy"
     );
     assert_eq!(
         items[1].stable_id,

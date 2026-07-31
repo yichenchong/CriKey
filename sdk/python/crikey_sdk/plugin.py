@@ -13,6 +13,13 @@ class Action:
     label: str
     description: str = ""
     icon_reference: str | None = None
+    #: Category tags this action applies to (spec 10.4). Empty means "any item
+    #: this plugin returns". Use :func:`plugin_defined_category` for a name
+    #: that could collide with a built-in category.
+    applicable_categories: tuple[str, ...] = ()
+    #: "host-mediated" or "plugin" (spec 10.4). Absent keeps the historical
+    #: host-mediated behaviour.
+    execution_policy: str = "host-mediated"
 
 
 #: Prefix that marks a category name as plugin-defined rather than one of the

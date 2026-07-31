@@ -14,7 +14,9 @@
 
 use serde_json::{json, Map, Value};
 
-use crikey_core::{Action, ActionId, ArgumentPolicy, Category, HitPolicy, Item, ItemId, PluginId};
+use crikey_core::{
+    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, PluginId,
+};
 
 use crate::worker::SuggestRequest;
 
@@ -131,8 +133,8 @@ pub(crate) fn encode_shutdown(id: u64) -> Value {
 /// Renders a core item as the §2 wire `Item` a plugin receives in `execute`.
 ///
 /// The plugin-facing shape carries no `plugin_id` (ownership is the host's, not
-/// the plugin's to read back) and no argument/hit policy (those are host-side
-/// concepts the modern SDK does not surface): exactly the §2 vocabulary.
+/// the plugin's to read back). Policies and actions are included in full so a
+/// modern plugin can inspect and return the same §10.1/§10.4 contract.
 pub(crate) fn encode_item(item: &Item) -> Value {
     json!({
         "stable_id": item.stable_id.0,
@@ -153,13 +155,21 @@ pub(crate) fn encode_item(item: &Item) -> Value {
     })
 }
 
-/// `{"action_id","label","description","icon_reference"}`
+/// `{"action_id","label","description","icon_reference","applicable_categories","execution_policy"}`
+/// — the full §10.4 action, not a subset: dropping a field here silently
+/// discards what the plugin declared.
 pub(crate) fn encode_action(action: &Action) -> Value {
     json!({
         "action_id": action.action_id.0,
         "label": action.label,
         "description": action.description,
         "icon_reference": action.icon_reference,
+        "applicable_categories": action
+            .applicable_categories
+            .iter()
+            .map(Category::wire_tag)
+            .collect::<Vec<_>>(),
+        "execution_policy": execution_policy_name(action.execution_policy),
     })
 }
 
@@ -297,7 +307,9 @@ fn decode_actions(value: Option<&Value>) -> Vec<Action> {
     entries.iter().filter_map(decode_action).collect()
 }
 
-/// `{"action_id","label","description","icon_reference"}` → [`Action`].
+/// The full §10.4 action, including the applicable-category set and execution
+/// policy. Absent fields mean "the plugin did not declare one" and keep the
+/// historical defaults, so plugins written before they existed are unaffected.
 fn decode_action(value: &Value) -> Option<Action> {
     let object = value.as_object()?;
     Some(Action {
@@ -308,15 +320,38 @@ fn decode_action(value: &Value) -> Option<Action> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        // The wire carries no applicable-category set or execution policy for a
-        // modern action; both take their host-side defaults.
-        applicable_categories: Vec::new(),
+        applicable_categories: decode_strings(object.get("applicable_categories"))
+            .iter()
+            .map(|tag| Category::from_wire_tag(tag))
+            .collect(),
         icon_reference: object
             .get("icon_reference")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        execution_policy: crikey_core::ExecutionPolicy::default(),
+        execution_policy: object
+            .get("execution_policy")
+            .and_then(Value::as_str)
+            .map(decode_execution_policy)
+            .unwrap_or_default(),
     })
+}
+
+/// An unknown execution policy keeps the conservative host-mediated default
+/// (spec 10.4): running plugin-side code the plugin never asked for would be
+/// worse than mediating it.
+pub(crate) fn decode_execution_policy(name: &str) -> ExecutionPolicy {
+    match name {
+        "plugin" => ExecutionPolicy::Plugin,
+        _ => ExecutionPolicy::HostMediated,
+    }
+}
+
+/// Wire spelling of an execution policy (spec 10.4).
+pub(crate) fn execution_policy_name(policy: ExecutionPolicy) -> &'static str {
+    match policy {
+        ExecutionPolicy::HostMediated => "host-mediated",
+        ExecutionPolicy::Plugin => "plugin",
+    }
 }
 
 /// A JSON array of strings, dropping any non-string entries.
@@ -441,6 +476,36 @@ mod tests {
             );
             assert_ne!(decoded.category, Category::from_wire_tag(name));
         }
+    }
+
+    /// §10.4 is not just metadata: a non-empty category set and explicit
+    /// plugin execution policy must survive the modern Python boundary. The
+    /// shadowed category proves this uses the injective wire tag rather than
+    /// the display spelling.
+    #[test]
+    fn action_fields_and_shadowed_categories_survive_worker_round_trip() {
+        let action = Action {
+            action_id: ActionId("open".to_owned()),
+            label: "Open".to_owned(),
+            description: "Open with the plugin".to_owned(),
+            applicable_categories: vec![
+                Category::PluginDefined("application".to_owned()),
+                Category::Application,
+            ],
+            icon_reference: Some("icon-open".to_owned()),
+            execution_policy: ExecutionPolicy::Plugin,
+        };
+
+        let decoded = decode_action(&encode_action(&action)).expect("action decodes");
+        assert_eq!(decoded.action_id, action.action_id);
+        assert_eq!(decoded.label, action.label);
+        assert_eq!(decoded.description, action.description);
+        assert_eq!(decoded.icon_reference, action.icon_reference);
+        assert_eq!(
+            decoded.applicable_categories, action.applicable_categories,
+            "non-empty action categories were rewritten or dropped"
+        );
+        assert_eq!(decoded.execution_policy, action.execution_policy);
     }
 
     /// The historical bare spelling keeps its meaning, so plugins written
