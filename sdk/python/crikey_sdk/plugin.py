@@ -15,6 +15,25 @@ class Action:
     icon_reference: str | None = None
 
 
+#: Prefix that marks a category name as plugin-defined rather than one of the
+#: host's built-in categories (spec 10.3). A bare name is matched against the
+#: built-ins first, so a plugin whose own category is called "application"
+#: must write ``plugin_defined_category("application")`` to keep it distinct;
+#: the host treats the two as different categories and derives different item
+#: identities from them.
+PLUGIN_DEFINED_PREFIX = "plugin-defined:"
+
+
+def plugin_defined_category(name: str) -> str:
+    """Returns the category tag for a plugin-defined category called ``name``.
+
+    Use this instead of a bare string whenever the name might collide with a
+    built-in category ("application", "file", "directory", "url", "command",
+    "expression", "keyword", "contact", "clipboard-item").
+    """
+    return f"{PLUGIN_DEFINED_PREFIX}{name}"
+
+
 @dataclass
 class Item:
     """A catalog item or suggestion. ``stable_id`` must not depend on the label."""
@@ -29,6 +48,11 @@ class Item:
     search_terms: list[str] = field(default_factory=list)
     metadata: dict[str, str] = field(default_factory=dict)
     actions: list[Action] = field(default_factory=list)
+    #: "forbidden", "optional" or "required" (spec 10.1). Left at the
+    #: conservative default unless the plugin declares otherwise.
+    argument_policy: str = "forbidden"
+    #: "recorded" or "ignored" (spec 10.1).
+    hit_policy: str = "recorded"
 
 
 @dataclass(frozen=True)

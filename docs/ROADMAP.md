@@ -255,6 +255,20 @@ allocation, credit leaks, a session token embedded in the endpoint name,
 orphaned process trees, fabricated trace/health diagnostics, and hard-coded
 conformance checks — were fixed and are now defended by tests.
 
+Three further defects of one class were found after that: spec-mandated item
+and action fields the wire silently dropped or rewrote —
+`Action.applicable_categories` (§10.4), `Item.argument_policy`/`hit_policy`
+(§10.1), and a category encoding that collapsed
+`PluginDefined("application")` into the built-in `Application`, changing the
+derived item identity. M4's Python transport had the identical category
+collapse and the same missing policy fields, so both runtimes were corrected
+together and the canonical encoding now lives in `crikey-core`
+(`Category::wire_tag`) where neither transport can drift from it. Each had
+slipped through a round-trip test whose fixture used convenient values, so
+conversion is now defended by generated adversarial properties plus a
+field-completeness guard that fails to COMPILE when a core field is added
+without being mapped.
+
 Verification limits, honestly: the Windows named-pipe transport, job-object
 limits and `DuplicateHandle` cloning are compile-verified only — this host
 cannot run them. Deferred to M6 with no code pretending otherwise: §24.2

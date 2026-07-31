@@ -12,5 +12,5 @@ pub mod path;
 pub use action::{Action, ActionId, ExecutionPolicy};
 pub use error::{CoreError, Result};
 pub use generation::{Generation, GenerationTracker};
-pub use item::{ArgumentPolicy, Category, HitPolicy, Item, ItemId, PluginId};
+pub use item::{ArgumentPolicy, Category, HitPolicy, Item, ItemId, PluginId, PLUGIN_DEFINED_PREFIX};
 pub use path::PlatformPath;

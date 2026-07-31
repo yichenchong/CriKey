@@ -139,12 +139,17 @@ pub(crate) fn encode_item(item: &Item) -> Value {
         "label": item.label,
         "description": item.description,
         "target": item.target,
-        "category": item.category.as_str(),
+        // `wire_tag`, not `as_str`: the worker echoes categories back and a
+        // display spelling would let a plugin-defined name shadowing a
+        // built-in decode into the wrong category (spec 10.3).
+        "category": item.category.wire_tag(),
         "search_terms": item.search_terms,
         "icon_reference": item.icon_reference,
         "score_hint": item.score_hint,
         "metadata": item.metadata,
         "actions": item.actions.iter().map(encode_action).collect::<Vec<_>>(),
+        "argument_policy": argument_policy_name(item.argument_policy),
+        "hit_policy": hit_policy_name(item.hit_policy),
     })
 }
 
@@ -212,11 +217,20 @@ pub(crate) fn decode_item(plugin: &PluginId, value: &Value) -> Option<Item> {
             .get("icon_reference")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        // The modern SDK does not surface argument/hit policy to a plugin, so
-        // these take their defaults: inventing a policy the plugin never
-        // declared could let an item accept arguments it was meant to forbid.
-        argument_policy: ArgumentPolicy::default(),
-        hit_policy: HitPolicy::default(),
+        // Absent means "the plugin did not declare one", which takes the
+        // conservative default: inventing a policy could let an item accept
+        // arguments it was meant to forbid. A plugin that DOES declare one
+        // (spec 10.1) now has its value carried instead of discarded.
+        argument_policy: object
+            .get("argument_policy")
+            .and_then(Value::as_str)
+            .map(decode_argument_policy)
+            .unwrap_or_default(),
+        hit_policy: object
+            .get("hit_policy")
+            .and_then(Value::as_str)
+            .map(decode_hit_policy)
+            .unwrap_or_default(),
         score_hint: object
             .get("score_hint")
             .and_then(Value::as_i64)
@@ -228,18 +242,48 @@ pub(crate) fn decode_item(plugin: &PluginId, value: &Value) -> Option<Item> {
 }
 
 /// An unknown category is a plugin-defined one, never an error (spec 10.3).
+///
+/// Delegates to [`Category::from_wire_tag`], so a Python plugin can name a
+/// plugin-defined category `"application"` (by writing
+/// `"plugin-defined:application"`) without it collapsing into the built-in
+/// category of that name — the two are distinct in the core model and produce
+/// different derived item identities. A bare name keeps its historical
+/// meaning, so existing plugins are unaffected.
 pub(crate) fn decode_category(name: &str) -> Category {
+    Category::from_wire_tag(name)
+}
+
+/// An unknown argument policy is the conservative default (spec 10.1).
+pub(crate) fn decode_argument_policy(name: &str) -> ArgumentPolicy {
     match name {
-        "application" => Category::Application,
-        "file" => Category::File,
-        "directory" => Category::Directory,
-        "url" => Category::Url,
-        "command" => Category::Command,
-        "expression" => Category::Expression,
-        "keyword" => Category::Keyword,
-        "contact" => Category::Contact,
-        "clipboard-item" => Category::ClipboardItem,
-        other => Category::PluginDefined(other.to_owned()),
+        "optional" => ArgumentPolicy::Optional,
+        "required" => ArgumentPolicy::Required,
+        _ => ArgumentPolicy::Forbidden,
+    }
+}
+
+/// An unknown hit policy is the conservative default (spec 10.1).
+pub(crate) fn decode_hit_policy(name: &str) -> HitPolicy {
+    match name {
+        "ignored" => HitPolicy::Ignored,
+        _ => HitPolicy::Recorded,
+    }
+}
+
+/// Wire spelling of an argument policy (spec 10.1).
+pub(crate) fn argument_policy_name(policy: ArgumentPolicy) -> &'static str {
+    match policy {
+        ArgumentPolicy::Forbidden => "forbidden",
+        ArgumentPolicy::Optional => "optional",
+        ArgumentPolicy::Required => "required",
+    }
+}
+
+/// Wire spelling of a hit policy (spec 10.1).
+pub(crate) fn hit_policy_name(policy: HitPolicy) -> &'static str {
+    match policy {
+        HitPolicy::Recorded => "recorded",
+        HitPolicy::Ignored => "ignored",
     }
 }
 
@@ -356,4 +400,61 @@ pub(crate) fn floor_char_boundary(text: &str, limit: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A modern Python plugin may name its own category after a built-in one.
+    /// The worker passes the `category` string through verbatim in both
+    /// directions, so if the host encoded the display spelling the value would
+    /// come back as the BUILT-IN category — a silent rewrite that also changes
+    /// the derived item identity (spec 10.3). Kills a regression to
+    /// `Category::as_str` on either side of this boundary.
+    #[test]
+    fn a_plugin_defined_category_shadowing_a_builtin_survives_the_worker_round_trip() {
+        let plugin = PluginId("dev.example.modern".to_owned());
+        for name in ["application", "file", "directory", "url", "command"] {
+            let shadowed = Category::PluginDefined(name.to_owned());
+            let item = Item {
+                stable_id: ItemId("stable".to_owned()),
+                plugin_id: plugin.clone(),
+                category: shadowed.clone(),
+                label: "Label".to_owned(),
+                description: String::new(),
+                target: "/target".to_owned(),
+                search_terms: Vec::new(),
+                icon_reference: None,
+                argument_policy: ArgumentPolicy::Forbidden,
+                hit_policy: HitPolicy::Recorded,
+                score_hint: 0,
+                metadata: std::collections::BTreeMap::new(),
+                actions: Vec::new(),
+            };
+
+            let decoded =
+                decode_item(&plugin, &encode_item(&item)).expect("an encoded item decodes back into an item");
+            assert_eq!(
+                decoded.category, shadowed,
+                "plugin-defined `{name}` collapsed into the built-in category"
+            );
+            assert_ne!(decoded.category, Category::from_wire_tag(name));
+        }
+    }
+
+    /// The historical bare spelling keeps its meaning, so plugins written
+    /// before the discriminator existed are unaffected.
+    #[test]
+    fn bare_category_names_keep_their_historical_meaning() {
+        assert_eq!(decode_category("application"), Category::Application);
+        assert_eq!(
+            decode_category("plugin-defined"),
+            Category::PluginDefined("plugin-defined".to_owned())
+        );
+        assert_eq!(
+            decode_category("documents"),
+            Category::PluginDefined("documents".to_owned())
+        );
+    }
 }

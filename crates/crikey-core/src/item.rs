@@ -63,7 +63,20 @@ pub enum Category {
     PluginDefined(String),
 }
 
+/// Prefix that discriminates a plugin-defined category from a built-in one in
+/// any tag-based encoding (spec 10.3).
+///
+/// [`Category::as_str`] is a DISPLAY spelling and is deliberately not
+/// injective: `PluginDefined("application")` renders as `"application"`, the
+/// same as [`Category::Application`]. Those two are different categories —
+/// [`ItemId::derived`] gives them different identities — so any encoding that
+/// has to be decoded again must use [`Category::wire_tag`], never `as_str`.
+pub const PLUGIN_DEFINED_PREFIX: &str = "plugin-defined:";
+
 impl Category {
+    /// The display spelling. NOT injective: a plugin-defined category renders
+    /// as its bare name, which may shadow a built-in one. Use
+    /// [`Category::wire_tag`] for anything that will be parsed back.
     pub fn as_str(&self) -> &str {
         match self {
             Category::Application => "application",
@@ -76,6 +89,42 @@ impl Category {
             Category::Contact => "contact",
             Category::ClipboardItem => "clipboard-item",
             Category::PluginDefined(name) => name,
+        }
+    }
+
+    /// The canonical, injective tag every plugin transport encodes.
+    ///
+    /// Built-ins keep their bare canonical name; a plugin-defined category is
+    /// prefixed with [`PLUGIN_DEFINED_PREFIX`], so a plugin category merely
+    /// named `"application"` never decodes into the built-in one.
+    pub fn wire_tag(&self) -> String {
+        match self {
+            Category::PluginDefined(name) => format!("{PLUGIN_DEFINED_PREFIX}{name}"),
+            builtin => builtin.as_str().to_owned(),
+        }
+    }
+
+    /// Parses a [`Category::wire_tag`].
+    ///
+    /// An explicitly prefixed tag is always plugin-defined, even when the name
+    /// shadows a built-in. A bare unrecognised tag is still accepted as
+    /// plugin-defined, so an SDK that has not adopted the prefix keeps working;
+    /// it simply cannot express a shadowing name.
+    pub fn from_wire_tag(tag: &str) -> Self {
+        if let Some(name) = tag.strip_prefix(PLUGIN_DEFINED_PREFIX) {
+            return Category::PluginDefined(name.to_owned());
+        }
+        match tag {
+            "application" => Category::Application,
+            "file" => Category::File,
+            "directory" => Category::Directory,
+            "url" => Category::Url,
+            "command" => Category::Command,
+            "expression" => Category::Expression,
+            "keyword" => Category::Keyword,
+            "contact" => Category::Contact,
+            "clipboard-item" => Category::ClipboardItem,
+            other => Category::PluginDefined(other.to_owned()),
         }
     }
 }

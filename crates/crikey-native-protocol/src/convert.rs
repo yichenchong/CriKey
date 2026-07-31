@@ -1,6 +1,8 @@
 //! Conversion between core catalog values and the native wire schema.
 
-use crikey_core::{Action, ActionId, Category, ExecutionPolicy, Item, ItemId, PluginId};
+use crikey_core::{
+    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, PluginId,
+};
 
 use crate::message;
 use crate::wire::UnknownFields;
@@ -18,6 +20,8 @@ pub fn to_proto_item(item: &Item) -> message::Item {
         score_hint: item.score_hint,
         metadata: item.metadata.clone(),
         actions: item.actions.iter().map(to_proto_action).collect(),
+        argument_policy: argument_policy_tag(item.argument_policy).to_owned(),
+        hit_policy: hit_policy_tag(item.hit_policy).to_owned(),
         unknown: UnknownFields::default(),
     }
 }
@@ -40,11 +44,45 @@ pub fn from_proto_item(plugin: &PluginId, item: &message::Item) -> Item {
         target: item.target.clone(),
         search_terms: item.search_terms.clone(),
         icon_reference: (!item.icon_reference.is_empty()).then(|| item.icon_reference.clone()),
-        argument_policy: crikey_core::ArgumentPolicy::default(),
-        hit_policy: crikey_core::HitPolicy::default(),
+        argument_policy: argument_policy_from_tag(&item.argument_policy),
+        hit_policy: hit_policy_from_tag(&item.hit_policy),
         score_hint: item.score_hint,
         metadata: item.metadata.clone(),
         actions: item.actions.iter().map(from_proto_action).collect(),
+    }
+}
+
+/// Wire spelling of an argument policy (spec 10.1).
+pub fn argument_policy_tag(policy: ArgumentPolicy) -> &'static str {
+    match policy {
+        ArgumentPolicy::Forbidden => "forbidden",
+        ArgumentPolicy::Optional => "optional",
+        ArgumentPolicy::Required => "required",
+    }
+}
+
+/// Parses an argument policy; an unknown value is the conservative default.
+pub fn argument_policy_from_tag(tag: &str) -> ArgumentPolicy {
+    match tag {
+        "optional" => ArgumentPolicy::Optional,
+        "required" => ArgumentPolicy::Required,
+        _ => ArgumentPolicy::Forbidden,
+    }
+}
+
+/// Wire spelling of a hit policy (spec 10.1).
+pub fn hit_policy_tag(policy: HitPolicy) -> &'static str {
+    match policy {
+        HitPolicy::Recorded => "recorded",
+        HitPolicy::Ignored => "ignored",
+    }
+}
+
+/// Parses a hit policy; an unknown value is the conservative default.
+pub fn hit_policy_from_tag(tag: &str) -> HitPolicy {
+    match tag {
+        "ignored" => HitPolicy::Ignored,
+        _ => HitPolicy::Recorded,
     }
 }
 
@@ -84,50 +122,20 @@ pub fn from_proto_action(action: &message::Action) -> Action {
     }
 }
 
-/// Prefix that discriminates a plugin-defined category from a built-in one on
-/// the wire (spec 10.3).
-///
-/// Without it the encoding is not injective: `PluginDefined("application")`
-/// and `Category::Application` both render as `"application"`, so a decoder
-/// silently rewrites the former into the latter. `crikey-core` treats them as
-/// genuinely different categories — `ItemId::derived` gives them distinct
-/// identities — so collapsing them would rewrite a plugin's item identity.
-/// Core discriminates with a `plugin-defined` tag component; the wire mirrors
-/// that spelling.
-pub const PLUGIN_DEFINED_PREFIX: &str = "plugin-defined:";
+/// Re-exported so a transport-level caller does not have to reach into
+/// `crikey-core` for the discriminator (spec 10.3).
+pub use crikey_core::PLUGIN_DEFINED_PREFIX;
 
-/// Stable category tag used by the proto schema (spec 10.3).
+/// Stable, injective category tag used by the proto schema (spec 10.3).
 ///
-/// Built-in categories keep their canonical bare name; a plugin-defined one is
-/// prefixed, so every distinct `Category` maps to a distinct tag.
+/// Delegates to [`Category::wire_tag`]: the encoding lives beside the type it
+/// encodes, so this transport and the Python worker protocol cannot drift into
+/// two different spellings.
 pub fn category_tag(category: &Category) -> String {
-    match category {
-        Category::PluginDefined(name) => format!("{PLUGIN_DEFINED_PREFIX}{name}"),
-        builtin => builtin.as_str().to_owned(),
-    }
+    category.wire_tag()
 }
 
 /// Parses a category tag, retaining unknown plugin-defined categories.
-///
-/// An explicitly prefixed tag is always plugin-defined, even when the name
-/// collides with a built-in. A bare unknown tag is still accepted as
-/// plugin-defined, so an SDK in another language that has not adopted the
-/// prefix keeps working; it simply cannot express a plugin-defined category
-/// whose name shadows a built-in one.
 pub fn category_from_tag(tag: &str) -> Category {
-    if let Some(name) = tag.strip_prefix(PLUGIN_DEFINED_PREFIX) {
-        return Category::PluginDefined(name.to_owned());
-    }
-    match tag {
-        "application" => Category::Application,
-        "file" => Category::File,
-        "directory" => Category::Directory,
-        "url" => Category::Url,
-        "command" => Category::Command,
-        "expression" => Category::Expression,
-        "keyword" => Category::Keyword,
-        "contact" => Category::Contact,
-        "clipboard-item" => Category::ClipboardItem,
-        other => Category::PluginDefined(other.to_owned()),
-    }
+    Category::from_wire_tag(tag)
 }

@@ -150,6 +150,12 @@ message Item {
   int32 score_hint = 8;
   map<string, string> metadata = 9;
   repeated Action actions = 10;
+  // "forbidden", "optional" or "required" (spec 10.1); unknown values are
+  // treated as "forbidden".
+  string argument_policy = 11;
+  // "recorded" or "ignored" (spec 10.1); unknown values are treated as
+  // "recorded".
+  string hit_policy = 12;
 }
 
 message ResultBatch {

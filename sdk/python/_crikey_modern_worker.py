@@ -271,6 +271,8 @@ def _item_to_wire(item):
         "score_hint": int(getattr(item, "score_hint", 0) or 0),
         "metadata": metadata,
         "actions": actions,
+        "argument_policy": getattr(item, "argument_policy", "forbidden") or "forbidden",
+        "hit_policy": getattr(item, "hit_policy", "recorded") or "recorded",
     }
 
 
@@ -301,6 +303,8 @@ def _item_from_wire(payload):
             for k, v in (payload.get("metadata") or {}).items()
         },
         actions=actions,
+        argument_policy=payload.get("argument_policy", "forbidden") or "forbidden",
+        hit_policy=payload.get("hit_policy", "recorded") or "recorded",
     )
 
 

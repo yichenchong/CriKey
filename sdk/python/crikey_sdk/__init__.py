@@ -5,7 +5,23 @@ user-interface thread, and use ordinary Python imports with managed
 dependencies declared in the plugin manifest's ``[python]`` section.
 """
 
-from .plugin import Action, Item, Plugin, Query, SuggestContext, WorkerContext
+from .plugin import (
+    Action,
+    Item,
+    Plugin,
+    Query,
+    SuggestContext,
+    WorkerContext,
+    plugin_defined_category,
+)
 
-__all__ = ["Action", "Item", "Plugin", "Query", "SuggestContext", "WorkerContext"]
+__all__ = [
+    "Action",
+    "Item",
+    "Plugin",
+    "Query",
+    "SuggestContext",
+    "WorkerContext",
+    "plugin_defined_category",
+]
 __version__ = "0.1.0"

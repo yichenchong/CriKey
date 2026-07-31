@@ -229,6 +229,8 @@ fn control_item(index: usize, kind: &str) -> Item {
         score_hint: 0,
         metadata: BTreeMap::new(),
         actions: Vec::new(),
+        argument_policy: String::new(),
+        hit_policy: String::new(),
         unknown: UnknownFields::default(),
     }
 }
@@ -245,6 +247,8 @@ fn trigger_item(index: usize) -> Item {
         score_hint: 0,
         metadata: BTreeMap::new(),
         actions: Vec::new(),
+        argument_policy: String::new(),
+        hit_policy: String::new(),
         unknown: UnknownFields::default(),
     }
 }

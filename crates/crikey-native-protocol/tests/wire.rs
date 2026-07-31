@@ -50,6 +50,9 @@ fn item() -> message::Item {
             ("a-first".to_owned(), "value-a".to_owned()),
         ]),
         actions: vec![action()],
+        // Non-default so the all-fields round-trip covers tags 11 and 12.
+        argument_policy: "required".to_owned(),
+        hit_policy: "ignored".to_owned(),
         unknown: unknown(),
     }
 }
@@ -226,6 +229,8 @@ fn proto3_defaults_elide_and_decode_from_empty() {
         score_hint: 0,
         metadata: BTreeMap::new(),
         actions: Vec::new(),
+        argument_policy: String::new(),
+        hit_policy: String::new(),
         unknown: unknown(),
     });
     assert_default_encoding(message::ResultBatch {
@@ -571,6 +576,8 @@ fn minimal_messages_pin_frozen_field_numbers() {
             score_hint: 0,
             metadata: BTreeMap::new(),
             actions: Vec::new(),
+            argument_policy: String::new(),
+            hit_policy: String::new(),
             unknown: unknown(),
         },
         0x0a

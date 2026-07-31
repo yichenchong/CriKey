@@ -514,7 +514,9 @@ impl_simple!(Item {
     icon_reference: String = String::new(),
     score_hint: i32 = 0,
     metadata: BTreeMap<String, String> = BTreeMap::new(),
-    actions: Vec<Action> = Vec::new()
+    actions: Vec<Action> = Vec::new(),
+    argument_policy: String = String::new(),
+    hit_policy: String = String::new()
 } encode(this, out) {
     if !this.stable_id.is_empty() { put_string(1, &this.stable_id, &mut out); }
     if !this.label.is_empty() { put_string(2, &this.label, &mut out); }
@@ -526,6 +528,8 @@ impl_simple!(Item {
     if this.score_hint != 0 { put_varint(8, this.score_hint as i64 as u64, &mut out); }
     for (key, value) in &this.metadata { put_map(9, key, value, &mut out); }
     for action in &this.actions { put_message(10, action, &mut out); }
+    if !this.argument_policy.is_empty() { put_string(11, &this.argument_policy, &mut out); }
+    if !this.hit_policy.is_empty() { put_string(12, &this.hit_policy, &mut out); }
 } decode(value, field, budget) {
     1 => value.stable_id = decode_string(field, budget)?,
     2 => value.label = decode_string(field, budget)?,
@@ -537,6 +541,8 @@ impl_simple!(Item {
     8 => value.score_hint = decode_field_varint(field)? as i32,
     9 => { let (key, map_value) = map_entry(field, budget)?; insert_map(&mut value.metadata, key, map_value, budget)?; },
     10 => push_decoded(&mut value.actions, nested(field, budget)?, budget)?,
+    11 => value.argument_policy = decode_string(field, budget)?,
+    12 => value.hit_policy = decode_string(field, budget)?,
 });
 
 impl_simple!(ResultBatch {
