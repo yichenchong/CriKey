@@ -84,12 +84,14 @@ Exit criteria: cached local results < 16 ms p95 on the reference machine; 500k
 synthetic items searchable; query text renders in the next frame with no
 debounce (§25.1, §31.2–3, §31.27).
 
-Warm activation < 30 ms p95 (§31.1) was an M1 exit criterion and is **moved to
-M6**, together with the Win32 hotkey/discovery/launch runtime exercise. Both
-need a runtime this milestone never had: a Windows session, and hardware with a
-real GPU and compositor. Neither is abandoned and neither is claimed — they are
-listed under M6 with the evidence each still owes. M1 closes on what a Linux
-host can actually settle.
+Two M1 items are **moved to M6**: the Win32 hotkey/discovery/launch runtime
+exercise, and warm activation < 30 ms p95 (§31.1). The latter's evidence is an
+end-to-end Win32 measurement from hotkey delivery to the presented frame on
+real GPU hardware — `crikey dev measure-activation` is a diagnostic component
+of that, not a substitute, since its span begins after hotkey dispatch. Both
+need a runtime this milestone never had. Neither is abandoned and neither is
+claimed: they are listed under M6 with the evidence each still owes. M1 closes
+on what a Linux host can actually settle.
 
 Status snapshot (2026-07-27):
 
@@ -136,9 +138,9 @@ Status snapshot (2026-07-27):
   this on a GPU, but no Lavapipe figure is recorded as evidence for or against
   §25.1.
 - Carried to M6, with the evidence each still owes: the Win32
-  hotkey/discovery/launch runtime exercise, and warm activation < 30 ms p95 on
-  hardware with a real GPU and compositor. Query latency, catalog scale, and
-  Linux native presentation are settled here.
+  hotkey/discovery/launch runtime exercise, and warm activation < 30 ms p95
+  measured end to end on Win32 from hotkey delivery to the presented frame.
+  Query latency, catalog scale, and Linux native presentation are settled here.
 
 ### M2 — Scheduling and resilience (§30 Phase 2) — L — done
 
@@ -317,19 +319,19 @@ macOS and Linux backends behind the same traits, honest capability reporting
 per desktop environment, cross-platform packaging, portable built-ins.
 
 This milestone is where everything needing a runtime the development host
-lacks comes due. Carried in from earlier milestones, each with the evidence it
-owes:
+lacks comes due — items inherited from earlier milestones, and scope first
+identified here. Each is listed with the evidence it owes:
 
-| Carried from | Item | Evidence still owed |
+| Origin | Item | Evidence still owed |
 | --- | --- | --- |
 | M1 | Win32 hotkey, Start Menu / packaged-app discovery, `.lnk` COM resolution, `ShellExecuteExW` launch | Executed in an interactive Windows desktop session. The 60 existing tests in `crates/crikey-platform-windows/tests/` pin the mapping and bookkeeping only and deliberately do not make these calls |
-| M1 | Warm activation < 30 ms p95 (§31.1) | Measured on hardware with a real GPU and compositor. `crikey dev measure-activation` is the instrument; a software rasteriser cannot settle it |
-| M1 | Global hotkeys and window activation on Linux | `LinuxBackend::capability` reports both `Unavailable` and there is no `HotkeyService`; a reactivation backend is needed before Linux can toggle or re-activate |
+| M1 | Warm activation < 30 ms p95 (§31.1) | Measured **end to end on Win32**: from global-hotkey delivery to the presented frame, on hardware with a real GPU and compositor. `crikey dev measure-activation` is a diagnostic component only and is NOT sufficient — it starts at `request_activation`, so hotkey dispatch is outside its span, and a software rasteriser cannot settle the budget |
+| M6 (new) | Global hotkeys and window activation on Linux | Not carried from M1, whose hotkey deliverable was scoped to `platform-windows`. Found while building the activation harness: `LinuxBackend::capability` reports both `Unavailable` and there is no `HotkeyService`, so Linux cannot toggle or re-activate at all. Needs a reactivation backend |
 | M5 | Windows named-pipe transport, job-object limits, `DuplicateHandle` cloning | Compile-verified only today; needs a Windows runtime |
 | M5 | §24.2 startup recovery and safe mode after repeated startup failures | Not implemented; no code pretends otherwise |
 | M5 | §13.5 per-plugin action/background/catalog concurrency budgets | Not implemented, as distinct from the §24.4 OS resource limits, which are implemented and reported per platform |
 
-Exit criteria: full test suite green on all three CI runners; every carried
+Exit criteria: full test suite green on all three CI runners; every listed
 item above either satisfied with the evidence named or explicitly re-deferred
 with a reason; Windows-only legacy plugins are labelled as such and never
 advertised as portable (§31.26, §31.31).
