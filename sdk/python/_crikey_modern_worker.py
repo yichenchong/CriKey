@@ -244,8 +244,9 @@ def _item_to_wire(item):
     """One :class:`crikey_sdk.Item` as a §2 JSON-ready dict.
 
     The plugin supplies its own ``stable_id`` (spec 10.2); ``plugin_id`` is the
-    host's to assign and is never sent. ``argument_policy``/``hit_policy`` are
-    host-side defaults in M4 and are likewise absent.
+    host's to assign and is never sent. ``argument_policy`` and ``hit_policy``
+    are part of the item contract and are carried with conservative defaults
+    when an older plugin omits them.
     """
     actions = []
     for action in getattr(item, "actions", None) or ():
