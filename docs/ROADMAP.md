@@ -219,15 +219,48 @@ Native-code permission and native package builds remain deferred to M5 (§15.5);
 M4's package manager accepts only the local verified package material required
 by modern Python plugins.
 
-### M5 — Native plugins (§30 Phase 5) — L
+### M5 — Native plugins (§30 Phase 5) — L — done
 
-`sdk/protocol` v1 frozen and generated bindings, named-pipe/UDS transports,
-native process supervision with restart and exit accounting, streaming catalogs
-and suggestions with backpressure, Rust SDK, packaging and a conformance test
-harness (`crikey dev inspect-protocol`).
+`sdk/protocol` v1 frozen, with a hand-written proto3 codec (ADR-0010) rather
+than generated bindings: unknown fields round-trip, decoding is total against
+hostile input, and it carries an allocation budget so a legal 8 MiB frame
+cannot make the host allocate proportional to a declared repetition count.
+Unix-socket, stdio and Windows named-pipe transports; supervised native
+processes with restricted environments, CSPRNG session tokens, process-group /
+job-object ownership, restart accounting, circuit breaking and per-plugin OS
+resource limits; credit-based streaming with bounded queues on both sides;
+cooperative cancellation; the Rust SDK with builders, a test harness, packaging
+and bench helpers; `crikey package build|verify|inspect`; and
+`crikey dev inspect-protocol` as the conformance harness.
 
-Exit criteria: an out-of-tree Rust plugin connects, streams incremental results,
-is cancelled mid-query, is killed, and is recovered (§31.21–23, §31.30).
+Exit criteria: an out-of-tree Rust plugin connects, streams incremental
+results, is cancelled mid-query, is killed, and is recovered (§31.21–23,
+§31.30). Proven by `out_of_tree_plugin_streams_cancels_isolated_and_restarts`,
+which drives ONE supervised plugin built from `compatibility/native-conformance`
+(its own workspace, against the published SDK by path) through that whole
+lifecycle and checks the child pid differs from the host's and changes across
+the restart.
+
+Evidence: `cargo test --workspace --all-targets` passes with warnings denied;
+`cargo clippy --workspace --all-targets -- -D warnings` passes; Windows and
+macOS workspace checks pass. Live smoke: `crikey dev inspect-protocol` against
+the out-of-tree plugin reports `verdict=conformant` over a Unix socket, reports
+`cooperated=true` for a cooperative cancel, and `--trace` prints the frames
+actually observed on the wire.
+
+Three independent audits of the first green implementation each returned
+"incorrect"; the defects they found — a live provider that never used its
+supervisor, serialized sibling dispatch, unbounded decode and reader-queue
+allocation, credit leaks, a session token embedded in the endpoint name,
+orphaned process trees, fabricated trace/health diagnostics, and hard-coded
+conformance checks — were fixed and are now defended by tests.
+
+Verification limits, honestly: the Windows named-pipe transport, job-object
+limits and `DuplicateHandle` cloning are compile-verified only — this host
+cannot run them. Deferred to M6 with no code pretending otherwise: §24.2
+startup recovery and safe mode after repeated startup failures, and §13.5
+per-plugin action/background/catalog concurrency budgets (as distinct from the
+§24.4 OS resource limits, which are implemented and reported per platform).
 
 ### M6 — Additional platforms (§30 Phase 6) — L
 

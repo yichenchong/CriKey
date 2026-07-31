@@ -11,6 +11,7 @@
 
 mod legacy_provider;
 mod modern_provider;
+mod native_provider;
 mod query_pipeline;
 
 pub use crikey_result_aggregator::{
@@ -20,6 +21,7 @@ pub use crikey_result_aggregator::{
 };
 pub use legacy_provider::{LegacyDriver, LegacyProvider, LegacyUnavailable, LegacyWorkerPool};
 pub use modern_provider::{ModernDriver, ModernProvider, ModernUnavailable};
+pub use native_provider::{NativeDriver, NativeProvider, NativeUnavailable};
 pub use query_pipeline::{PipelineConfig, PipelineError, PipelineTick, QueryPipeline};
 
 use std::{

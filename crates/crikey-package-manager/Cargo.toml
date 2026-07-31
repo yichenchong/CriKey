@@ -17,4 +17,5 @@ crikey-plugin-model.workspace = true
 serde.workspace = true
 toml.workspace = true
 sha2.workspace = true
+zip.workspace = true
 thiserror.workspace = true

@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+
+[package]
+name = "crikey-native-conformance"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+
+[[bin]]
+name = "crikey-conformance-plugin"
+path = "src/bin/crikey-conformance-plugin.rs"
+
+[[bin]]
+name = "crikey-misbehaving-plugin"
+path = "src/bin/crikey-misbehaving-plugin.rs"
+
+[dependencies]
+crikey-plugin-sdk = { path = "../../sdk/rust" }
+crikey-core = { path = "../../crates/crikey-core" }
+crikey-native-protocol = { path = "../../crates/crikey-native-protocol" }

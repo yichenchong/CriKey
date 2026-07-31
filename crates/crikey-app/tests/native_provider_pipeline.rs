@@ -1,0 +1,707 @@
+//! Red-first live native-provider tests (contract §6; spec 5.2, 13.8, 19.4,
+//! 24.1; acceptance 31.7, 31.8, 31.9, 31.21, 31.23).
+//!
+//! These tests deliberately drive the real out-of-tree conformance executable
+//! through [`NativeProvider`] and [`NativeDriver`]. They do not substitute an
+//! in-process fake: native code must cross the supervised process boundary,
+//! bounded query intake and presented [`ViewModel`].
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+use crikey_app::{NativeDriver, NativeProvider, PipelineConfig, QueryPipeline};
+use crikey_core::{Generation, PluginId};
+use crikey_ui::ViewModel;
+
+/// A private directory removed when the test that made it ends. Every package
+/// manifest and mode witness is written at test time, never committed.
+#[derive(Debug)]
+struct Scratch {
+    path: PathBuf,
+}
+
+impl Scratch {
+    fn new(label: &str) -> Self {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "crikey-native-provider-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // A crashed earlier run must never leak fixtures into this one.
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("scratch directory is creatable");
+
+        Self { path }
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+
+    fn subdir(&self, name: &str) -> PathBuf {
+        let path = self.join(name);
+        fs::create_dir_all(&path).expect("scratch subdirectory is creatable");
+        path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The host plugin id a native package answers as (contract §6).
+fn native_plugin(id: &str) -> PluginId {
+    PluginId(format!("native.{id}"))
+}
+
+/// Finds the repository root by walking to the directory containing
+/// `compatibility/`, as required by conformance contract §8.
+fn workspace_root() -> PathBuf {
+    let mut directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        if directory.join("compatibility").is_dir() {
+            return directory;
+        }
+        assert!(
+            directory.pop(),
+            "could not find the workspace root containing compatibility/ from {}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+    }
+}
+
+/// Builds the out-of-tree conformance workspace once and returns both binaries.
+/// Cargo's own lock serializes concurrent integration-test processes.
+fn conformance_binaries() -> (PathBuf, PathBuf) {
+    static BINARIES: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+
+    BINARIES
+        .get_or_init(|| {
+            let root = workspace_root();
+            let manifest = root.join("compatibility/native-conformance/Cargo.toml");
+            let target = root.join("target/native-conformance");
+            let output = Command::new("cargo")
+                .arg("build")
+                .arg("--bins")
+                .arg("--manifest-path")
+                .arg(&manifest)
+                .arg("--target-dir")
+                .arg(&target)
+                .output()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to invoke cargo for the native conformance workspace {}: {error}",
+                        manifest.display()
+                    )
+                });
+            assert!(
+                output.status.success(),
+                "native conformance workspace failed to build ({}):\nstdout:\n{}\nstderr:\n{}",
+                manifest.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+
+            let suffix = if cfg!(windows) { ".exe" } else { "" };
+            let plugin = target
+                .join("debug")
+                .join(format!("crikey-conformance-plugin{suffix}"));
+            let misbehaving = target
+                .join("debug")
+                .join(format!("crikey-misbehaving-plugin{suffix}"));
+            assert!(
+                plugin.is_file(),
+                "conformance plugin binary was not produced: {}",
+                plugin.display()
+            );
+            assert!(
+                misbehaving.is_file(),
+                "misbehaving conformance binary was not produced: {}",
+                misbehaving.display()
+            );
+            (plugin, misbehaving)
+        })
+        .clone()
+}
+
+/// Escapes a path for a TOML basic string, including Windows separators.
+fn toml_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// Writes one native package manifest and, when requested, the fixture's mode
+/// file. The clean absolute executable path is intentionally left as a single
+/// manifest entrypoint; the provider supplies the package directory as the
+/// child's working directory, where the conformance fixture reads this mode.
+fn write_native_manifest(
+    root: &Path,
+    id: &str,
+    entrypoint: Option<&Path>,
+    mode: Option<&str>,
+    minimum_query_length: Option<usize>,
+) -> PathBuf {
+    let directory = root.join(id);
+    fs::create_dir_all(&directory).expect("native plugin directory is creatable");
+
+    let entrypoint = entrypoint
+        .map(|path| format!("entrypoint = \"{}\"\n", toml_string(&path.to_string_lossy())))
+        .unwrap_or_default();
+    let activation = minimum_query_length
+        .map(|minimum| format!("\n[activation]\nminimum-query-length = {minimum}\n"))
+        .unwrap_or_default();
+    let manifest = format!(
+        "manifest-version = 1\n\n\
+         [plugin]\n\
+         id = \"{id}\"\n\
+         name = \"{id}\"\n\
+         version = \"1.0.0\"\n\
+         runtime = \"native\"\n\
+         {entrypoint}{activation}"
+    );
+    fs::write(directory.join("crikey.toml"), manifest).expect("native manifest is writable");
+    if let Some(mode) = mode {
+        fs::write(directory.join("conformance-mode"), mode).expect("native mode witness is writable");
+    }
+    directory
+}
+
+/// Writes a normal native fixture with a mode selected by its working-dir file.
+fn write_native_plugin(root: &Path, id: &str, binary: &Path, mode: &str) -> PathBuf {
+    write_native_manifest(root, id, Some(binary), Some(mode), None)
+}
+
+/// A bounded poll used only for observable child-process state, never to order
+/// two test actions. This follows the supervised-worker tests' hard cap.
+fn wait_for_process_table_absence(path: &Path) -> bool {
+    for _ in 0..1_000 {
+        if process_table_contains_working_dir(path) != Some(true) {
+            return true;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// Whether Linux still has a process whose current directory is `path`.
+///
+/// The non-Linux arm is a compiling counterpart: the app tests still exercise
+/// the portable shutdown call, while process-table inspection is unavailable
+/// without a platform-specific dependency on those targets.
+fn process_table_contains_working_dir(path: &Path) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let directory = fs::canonicalize(path).ok()?;
+        let entries = fs::read_dir("/proc").ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if !name.to_string_lossy().bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            if fs::read_link(entry.path().join("cwd")).ok().as_deref() == Some(directory.as_path()) {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[test]
+fn native_suggestions_cross_pipeline_intake_under_current_generation() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("intake");
+    let plugins_root = scratch.subdir("plugins");
+    let package = write_native_plugin(&plugins_root, "healthy", &conformance, "echo");
+    let healthy = native_plugin("healthy");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root]);
+
+    assert!(
+        provider.plugins().contains(&healthy),
+        "the healthy native plugin must load and register; unavailable: {:?}",
+        provider.unavailable(),
+    );
+
+    let frame = provider
+        .drive_query(&mut pipeline, "report", 17)
+        .expect("the admitted current native batch produces a frame");
+    assert_eq!(
+        pipeline.visible_generation(),
+        Some(frame.generation),
+        "the presented frame is the current generation",
+    );
+    assert!(
+        pipeline.intake_diagnostics().admitted() >= 1,
+        "the native batch must be admitted to intake",
+    );
+    assert!(
+        pipeline.intake_diagnostics().merged() >= 1,
+        "the native batch must be merged out of intake",
+    );
+    assert!(
+        frame.rows.iter().any(|row| row.plugin_name == healthy.0),
+        "the presented frame must carry the native plugin's suggestion, found: {:?}",
+        frame
+            .rows
+            .iter()
+            .map(|row| (row.plugin_name.clone(), row.label.clone()))
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        frame.rows.iter().any(|row| row.label.contains("report")),
+        "the native conformance item must reach the frame with the query label, found: {:?}",
+        frame
+            .rows
+            .iter()
+            .map(|row| (row.plugin_name.clone(), row.label.clone()))
+            .collect::<Vec<_>>(),
+    );
+
+    // The process cwd is the package directory, not the test's cwd. This is
+    // also the witness used by the dedicated shutdown test below.
+    if let Some(is_present) = process_table_contains_working_dir(&package) {
+        assert!(
+            is_present,
+            "the native child runs with its package as working_dir"
+        );
+    }
+    provider.shutdown(180);
+}
+
+#[test]
+fn native_distinct_source_dirs_use_their_own_workers() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("identity");
+    let plugins_root = scratch.subdir("plugins");
+
+    // The executable and manifest entrypoint are identical. Only each package's
+    // source directory and mode witness differ; sharing one worker would make
+    // both plugins emit the same number of rows (contract §6 identity pin).
+    write_native_plugin(&plugins_root, "alpha", &conformance, "stream:1");
+    write_native_plugin(&plugins_root, "beta", &conformance, "stream:2");
+
+    let alpha = native_plugin("alpha");
+    let beta = native_plugin("beta");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root]);
+    assert!(
+        provider.plugins().contains(&alpha) && provider.plugins().contains(&beta),
+        "both native plugins must load; unavailable: {:?}",
+        provider.unavailable(),
+    );
+
+    let frame = provider
+        .drive_query(&mut pipeline, "identity", 17)
+        .expect("both native plugins produce a frame");
+    let alpha_rows = frame.rows.iter().filter(|row| row.plugin_name == alpha.0).count();
+    let beta_rows = frame.rows.iter().filter(|row| row.plugin_name == beta.0).count();
+    assert_eq!(
+        alpha_rows,
+        1,
+        "alpha's package-local mode must produce exactly one item; rows: {:?}",
+        frame
+            .rows
+            .iter()
+            .map(|row| (row.plugin_name.clone(), row.label.clone()))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        beta_rows,
+        2,
+        "beta's package-local mode must produce exactly two items, not alpha's worker output; rows: {:?}",
+        frame
+            .rows
+            .iter()
+            .map(|row| (row.plugin_name.clone(), row.label.clone()))
+            .collect::<Vec<_>>(),
+    );
+
+    provider.shutdown(180);
+}
+
+#[test]
+fn native_worker_crash_is_contained_and_a_sibling_keeps_serving() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("crash");
+    let plugins_root = scratch.subdir("plugins");
+    write_native_plugin(&plugins_root, "healthy", &conformance, "echo");
+    write_native_plugin(&plugins_root, "crashy", &conformance, "crash-on-suggest");
+
+    let healthy = native_plugin("healthy");
+    let crashy = native_plugin("crashy");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root]);
+    assert!(
+        provider.plugins().contains(&healthy) && provider.plugins().contains(&crashy),
+        "both native plugins load before the runtime crash; unavailable: {:?}",
+        provider.unavailable(),
+    );
+
+    for iteration in 0..5 {
+        let frame = provider.drive_query(
+            &mut pipeline,
+            &format!("report {iteration}"),
+            100 * (iteration + 1),
+        );
+        assert!(
+            frame.as_ref().is_some_and(|frame| {
+                frame.rows.iter().any(|row| row.plugin_name == healthy.0)
+                    && !frame.rows.iter().any(|row| row.plugin_name == crashy.0)
+            }),
+            "the healthy sibling keeps serving and the crashed plugin contributes no rows on query {iteration}"
+        );
+    }
+
+    // Crash teardown is asynchronous to the provider's bounded collection
+    // window; wait only for the observed diagnostic, with a hard cap.
+    for _ in 0..2_000 {
+        if provider
+            .dispatch_failures()
+            .iter()
+            .any(|(plugin, _)| plugin == &crashy)
+        {
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+
+    let crashy_failures = provider
+        .dispatch_failures()
+        .iter()
+        .filter(|(plugin, _)| plugin == &crashy)
+        .count();
+    assert_eq!(
+        crashy_failures,
+        1,
+        "a crashed native plugin's dispatch failure is recorded once, not per keystroke; failures: {:?}",
+        provider.dispatch_failures(),
+    );
+    let crash_reason = provider
+        .dispatch_failures()
+        .iter()
+        .find(|(plugin, _)| plugin == &crashy)
+        .map(|(_, reason)| reason);
+    assert!(
+        crash_reason.is_some_and(|reason| !reason.trim().is_empty()),
+        "the runtime crash has an attributable reason"
+    );
+    assert!(
+        !provider
+            .unavailable()
+            .iter()
+            .any(|entry| entry.plugin.as_ref() == Some(&crashy)),
+        "runtime crashes belong in dispatch_failures, not load-time NativeUnavailable"
+    );
+
+    provider.shutdown(180);
+}
+
+#[test]
+fn native_unavailable_packages_are_recorded_without_aborting_load() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("unavailable");
+    let plugins_root = scratch.subdir("plugins");
+    write_native_plugin(&plugins_root, "healthy", &conformance, "echo");
+
+    // No entrypoint for this target: a keyed map with neither the host's
+    // os-arch nor the fallback `any` key.
+    let no_entrypoint = plugins_root.join("no-entrypoint");
+    fs::create_dir_all(&no_entrypoint).expect("no-entrypoint directory is creatable");
+    fs::write(
+        no_entrypoint.join("crikey.toml"),
+        "manifest-version = 1\n\n\
+         [plugin]\n\
+         id = \"no-entrypoint\"\n\
+         name = \"no-entrypoint\"\n\
+         version = \"1.0.0\"\n\
+         runtime = \"native\"\n\
+         entrypoint = { \"unsupported-os-unsupported-arch\" = \"bin/plugin\" }\n",
+    )
+    .expect("no-entrypoint manifest is writable");
+
+    // Entrypoint exists in the manifest but points at no binary.
+    let missing_binary = scratch.join("missing-native-binary");
+    assert!(!missing_binary.exists(), "missing-binary witness must be absent");
+    write_native_manifest(&plugins_root, "missing-binary", Some(&missing_binary), None, None);
+
+    // A parse failure is an unavailable package, not an aborted discovery pass.
+    let malformed = plugins_root.join("malformed");
+    fs::create_dir_all(&malformed).expect("malformed directory is creatable");
+    fs::write(malformed.join("crikey.toml"), "[plugin\nid = \"broken\"\n")
+        .expect("malformed manifest is writable");
+
+    let healthy = native_plugin("healthy");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root]);
+    assert!(
+        provider.plugins().contains(&healthy),
+        "a healthy sibling still loads around unavailable packages; unavailable: {:?}",
+        provider.unavailable(),
+    );
+
+    for package in ["no-entrypoint", "missing-binary", "malformed"] {
+        let entries = provider
+            .unavailable()
+            .iter()
+            .filter(|entry| entry.package == package)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.len(),
+            1,
+            "package {package} becomes exactly one NativeUnavailable entry; unavailable: {:?}",
+            provider.unavailable(),
+        );
+        assert!(
+            !entries[0].reason.trim().is_empty(),
+            "package {package} has an actionable unavailable reason"
+        );
+    }
+
+    provider.shutdown(180);
+}
+
+#[test]
+fn native_plugin_is_scheduled_under_its_manifest_query_policy() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("policy");
+    let plugins_root = scratch.subdir("plugins");
+    write_native_manifest(
+        &plugins_root,
+        "gated",
+        Some(&conformance),
+        Some("stream:1"),
+        Some(5),
+    );
+
+    let gated = native_plugin("gated");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root]);
+    assert!(
+        provider.plugins().contains(&gated),
+        "the gated native plugin must load; unavailable: {:?}",
+        provider.unavailable(),
+    );
+
+    let short = provider.drive_query(&mut pipeline, "hi", 17);
+    assert!(
+        short.is_none_or(|frame| !frame.rows.iter().any(|row| row.plugin_name == gated.0)),
+        "a query below minimum-query-length must not dispatch the native plugin"
+    );
+
+    let long = provider
+        .drive_query(&mut pipeline, "hello there", 5_000)
+        .expect("a query above minimum-query-length produces a frame");
+    assert!(
+        long.rows.iter().any(|row| row.plugin_name == gated.0),
+        "a query above the manifest minimum must dispatch the native plugin; rows: {:?}",
+        long.rows
+            .iter()
+            .map(|row| (row.plugin_name.clone(), row.label.clone()))
+            .collect::<Vec<_>>(),
+    );
+
+    provider.shutdown(180);
+}
+
+#[test]
+fn native_slow_sibling_does_not_delay_healthy_results() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("slow-sibling");
+    let plugins_root = scratch.subdir("plugins");
+    write_native_plugin(&plugins_root, "healthy", &conformance, "echo");
+    write_native_plugin(&plugins_root, "slow", &conformance, "slow:750");
+
+    let healthy = native_plugin("healthy");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root]);
+    assert_eq!(
+        provider.unavailable(),
+        &[],
+        "both latency-test plugins must load: {:?}",
+        provider.unavailable(),
+    );
+
+    let started = Instant::now();
+    let frame = provider
+        .drive_query(&mut pipeline, "latency", 17)
+        .expect("the healthy sibling publishes a current frame");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "a slow sibling must not hold the healthy result until its 750ms call deadline (elapsed {elapsed:?})"
+    );
+    assert!(
+        frame.rows.iter().any(|row| row.plugin_name == healthy.0),
+        "the healthy sibling's rows arrive while the slow sibling is still pending: {:?}",
+        frame
+            .rows
+            .iter()
+            .map(|row| (row.plugin_name.clone(), row.label.clone()))
+            .collect::<Vec<_>>(),
+    );
+
+    provider.shutdown(180);
+}
+
+#[test]
+fn native_driver_refuses_a_superseded_generation_without_blocking_submit() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("supersede");
+    let plugins_root = scratch.subdir("plugins");
+    // This fixture deliberately ignores cancellation, so the provider thread
+    // has one call in flight while the mailbox receives several replacements.
+    write_native_plugin(&plugins_root, "slow", &conformance, "ignore-cancel:500");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = NativeProvider::load(&mut pipeline, &[plugins_root]);
+    assert!(
+        provider.plugins().contains(&native_plugin("slow")),
+        "the slow native plugin must load; unavailable: {:?}",
+        provider.unavailable(),
+    );
+
+    let published: Arc<Mutex<Vec<Generation>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&published);
+    let driver = NativeDriver::spawn(
+        provider,
+        pipeline,
+        Box::new(move |frame: &ViewModel| {
+            sink.lock()
+                .expect("the publish sink is not poisoned")
+                .push(frame.generation);
+        }),
+    );
+    assert!(
+        driver.has_plugins(),
+        "the native supervisor must serve the loaded plugin"
+    );
+
+    let older = Generation::from_raw(1);
+    let first_newer = Generation::from_raw(2);
+    let second_newer = Generation::from_raw(3);
+    let newest = Generation::from_raw(4);
+    let submit_started = Instant::now();
+    driver.submit(older, "report old", 17, Vec::new(), false, 0);
+    let first_submit_elapsed = submit_started.elapsed();
+    assert!(
+        first_submit_elapsed < Duration::from_millis(100),
+        "submitting a query must not wait on a slow native child (elapsed {first_submit_elapsed:?})"
+    );
+
+    let mut observed_in_flight = false;
+    for _ in 0..10_000 {
+        if driver.is_busy() {
+            observed_in_flight = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        observed_in_flight,
+        "the first query must be observed in flight before mailbox replacement"
+    );
+
+    driver.submit(first_newer, "report first", 18, Vec::new(), false, 0);
+    driver.submit(second_newer, "report second", 19, Vec::new(), false, 0);
+    driver.submit(newest, "report newest", 20, Vec::new(), false, 0);
+    assert!(
+        driver.pending_replacements() >= 1,
+        "a single-slot mailbox replaces an older pending job when more than its capacity is submitted"
+    );
+
+    let mut seen_newest = false;
+    for _ in 0..2_000 {
+        if published
+            .lock()
+            .expect("the publish sink is not poisoned")
+            .contains(&newest)
+        {
+            seen_newest = true;
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    assert!(seen_newest, "the newest native generation must be presented");
+
+    let generations = published
+        .lock()
+        .expect("the publish sink is not poisoned")
+        .clone();
+    assert!(
+        generations.iter().all(|generation| *generation == newest),
+        "only the newest generation is presented; saw {generations:?}"
+    );
+
+    drop(driver);
+}
+
+#[test]
+fn native_shutdown_reaps_every_child() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("shutdown");
+    let plugins_root = scratch.subdir("plugins");
+    let packages = [
+        write_native_plugin(&plugins_root, "healthy-a", &conformance, "echo"),
+        write_native_plugin(&plugins_root, "healthy-b", &conformance, "echo"),
+    ];
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root]);
+    provider
+        .drive_query(&mut pipeline, "shutdown", 17)
+        .expect("the children are alive and serve before shutdown");
+
+    let states = packages
+        .iter()
+        .map(|package| process_table_contains_working_dir(package))
+        .collect::<Vec<_>>();
+    let can_inspect = states.iter().all(|state| state.is_some());
+    if can_inspect {
+        for (package, state) in packages.iter().zip(states) {
+            assert_eq!(
+                state,
+                Some(true),
+                "the native child for {} is observable before shutdown",
+                package.display()
+            );
+        }
+    }
+
+    provider.shutdown(180);
+    if can_inspect {
+        for package in &packages {
+            assert!(
+                wait_for_process_table_absence(package),
+                "NativeProvider::shutdown reaps every child; package cwd remains in the process table: {}",
+                package.display()
+            );
+        }
+    }
+    // On targets without a portable process-table query, the portable shutdown
+    // call above remains exercised; Linux provides the orphan-sensitive proof.
+}

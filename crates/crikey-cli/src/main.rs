@@ -3,13 +3,12 @@
 mod dev_commands;
 mod legacy_commands;
 mod modern_commands;
-
-use std::process::ExitCode;
-use std::time::Instant;
+mod native_commands;
+mod package_commands;
 
 use crikey_app::{
-    App, BatchState, LegacyDriver, LegacyProvider, ModernDriver, ModernProvider, PipelineConfig,
-    QueryPipeline, ResultBatch, SearchService, StartupStage,
+    App, BatchState, LegacyDriver, LegacyProvider, ModernDriver, ModernProvider, NativeDriver,
+    NativeProvider, PipelineConfig, QueryPipeline, ResultBatch, SearchService, StartupStage,
 };
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
@@ -22,6 +21,8 @@ use crikey_legacy_compat::LegacyDeadlines;
 use crikey_ui::{
     LauncherViewModel, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, UiEffect, ViewModel,
 };
+use std::process::ExitCode;
+use std::time::Instant;
 
 const USAGE: &str = "\
 crikey - a fast, keyboard-driven application launcher
@@ -38,13 +39,6 @@ COMMANDS:
     version                         Print version information
     help                            Print this message
 ";
-
-/// `crikey dev` subcommands the usage advertises but nothing implements yet.
-///
-/// Kept apart from an unknown word on purpose: "advertised, not built" and "no
-/// such subcommand" are different answers, and a script can tell them apart by
-/// exit status without parsing prose.
-const UNIMPLEMENTED_DEV: [&str; 1] = ["inspect-protocol"];
 
 /// Queries the reported percentiles are drawn from, and results each retains.
 ///
@@ -75,8 +69,9 @@ fn main() -> ExitCode {
         }
         Some("dev") => dev(&args[1..]),
         Some("run") => run_launcher(&args[1..]),
-        Some(command @ ("plugin" | "package")) => {
-            eprintln!("crikey: `{command}` is not implemented yet");
+        Some("package") => package_commands::run(&args[1..]),
+        Some("plugin") => {
+            eprintln!("crikey: `plugin` is not implemented yet");
             ExitCode::from(69) // EX_UNAVAILABLE
         }
         Some(other) => {
@@ -214,6 +209,26 @@ fn run_native_launcher() -> Result<(), String> {
     let modern_driver = ModernDriver::spawn(modern_provider, modern_pipeline, move |frame| {
         let _ = modern_publish_handle.submit_frame(frame);
     });
+
+    // Native plugins use the same asynchronous query boundary as the legacy
+    // and modern providers. Discovery is intentionally empty unless the
+    // operator names native package roots (spec 16.1, 16.6).
+    let mut native_pipeline = QueryPipeline::new(PipelineConfig::default());
+    let native_provider = NativeProvider::load(&mut native_pipeline, &native_plugin_roots());
+    for entry in native_provider.unavailable() {
+        eprintln!(
+            "crikey: native plugin unavailable ({}): {}",
+            entry.package, entry.reason
+        );
+    }
+    let native_publish_handle = render_handle.clone();
+    let native_driver = NativeDriver::spawn(
+        native_provider,
+        native_pipeline,
+        Box::new(move |frame| {
+            let _ = native_publish_handle.submit_frame(frame);
+        }),
+    );
     let query_clock = Instant::now();
 
     let activation_handle = render_handle.clone();
@@ -245,6 +260,17 @@ fn run_native_launcher() -> Result<(), String> {
                 retained.absorb(
                     outcome.generation,
                     RowSource::Modern,
+                    &outcome.rows,
+                    outcome.pending_plugins,
+                );
+                view_model.publish(outcome.generation, retained.merged(), retained.pending());
+            }
+            // Native rows are folded independently, preserving both existing
+            // provider groups and stale-generation rejection.
+            if let Some(outcome) = native_driver.take_outcome() {
+                retained.absorb(
+                    outcome.generation,
+                    RowSource::Native,
                     &outcome.rows,
                     outcome.pending_plugins,
                 );
@@ -316,8 +342,23 @@ fn run_native_launcher() -> Result<(), String> {
                                         0,
                                     );
                                 }
+                                // Native plugins are dispatched through their
+                                // own supervisor and merged on the same
+                                // generation as the built-in rows.
+                                let native_outstanding = native_driver.has_plugins();
+                                if native_outstanding {
+                                    native_driver.submit(
+                                        generation,
+                                        &raw,
+                                        now,
+                                        rows.clone(),
+                                        frame.pending_plugins,
+                                        0,
+                                    );
+                                }
                                 retained.set_builtin(generation, rows, frame.pending_plugins);
                                 retained.mark_pending(generation, RowSource::Legacy, legacy_outstanding);
+                                retained.mark_pending(generation, RowSource::Native, native_outstanding);
                                 retained.mark_pending(generation, RowSource::Modern, modern_outstanding);
                                 view_model.publish(generation, retained.merged(), retained.pending());
                             }
@@ -383,6 +424,18 @@ fn legacy_package_roots() -> Vec<std::path::PathBuf> {
 /// none.
 fn modern_plugin_roots() -> Vec<std::path::PathBuf> {
     match std::env::var_os("CRIKEY_MODERN_PLUGIN_ROOTS") {
+        Some(value) => std::env::split_paths(&value).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Directories scanned for native packages on the live path (spec 16.1).
+///
+/// The native provider performs manifest and platform/architecture filtering;
+/// this helper only applies the platform path-list syntax and keeps an unset
+/// variable equivalent to an empty discovery set.
+fn native_plugin_roots() -> Vec<std::path::PathBuf> {
+    match std::env::var_os("CRIKEY_NATIVE_PLUGIN_ROOTS") {
         Some(value) => std::env::split_paths(&value).collect(),
         None => Vec::new(),
     }
@@ -462,24 +515,27 @@ fn create_private_dir(dir: &std::path::Path) -> Result<(), String> {
 }
 
 /// The provider group a published row belongs to, used to merge the built-in,
-/// legacy and modern row sets into one presented frame without one clobbering
-/// another.
+/// legacy, modern and native row sets into one presented frame without one
+/// clobbering another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowSource {
     Builtin,
     Legacy,
     Modern,
+    Native,
 }
 
 /// Classifies a published row by the source group its owning plugin belongs to
-/// (spec 10.2 namespacing): `legacy.*` and `modern.*` are the two asynchronous
-/// providers; everything else — the built-in application catalog included — is
-/// built-in.
+/// (spec 10.2 namespacing): `legacy.*`, `modern.*` and `native.*` are the three
+/// asynchronous providers; everything else — the built-in application catalog
+/// included — is built-in.
 fn row_source(plugin_name: &str) -> RowSource {
     if plugin_name.starts_with("legacy.") {
         RowSource::Legacy
     } else if plugin_name.starts_with("modern.") {
         RowSource::Modern
+    } else if plugin_name.starts_with("native.") {
+        RowSource::Native
     } else {
         RowSource::Builtin
     }
@@ -488,22 +544,24 @@ fn row_source(plugin_name: &str) -> RowSource {
 /// The presented row set kept between UI turns, grouped by source so folding one
 /// provider's asynchronous outcome never clobbers another's rows.
 ///
-/// Both the legacy and the modern supervisor publish the built-in rows ahead of
-/// their own, and each calls back independently through `take_outcome`; without
-/// per-source retention the second fold of a turn would overwrite the first's
-/// provider rows and modern rows would vanish on the next republish. Keeping the
-/// three groups and re-merging on every fold makes legacy and modern rows
-/// coexist under one generation (contract §8). A new generation drops every
-/// retained group first, so stale rows never cross a query boundary.
+/// Each asynchronous provider publishes the built-in rows ahead of its own,
+/// and each calls back independently through `take_outcome`; without per-source
+/// retention the second fold of a turn would overwrite the first provider's
+/// rows. Keeping the four groups and re-merging on every fold makes legacy,
+/// modern and native rows coexist under one generation (contract §8). A new
+/// generation drops every retained group first, so stale rows never cross a
+/// query boundary.
 #[derive(Debug, Default)]
 struct RetainedRows {
     generation: Option<Generation>,
     builtin: Vec<crikey_ui::ResultRow>,
     legacy: Vec<crikey_ui::ResultRow>,
     modern: Vec<crikey_ui::ResultRow>,
+    native: Vec<crikey_ui::ResultRow>,
     builtin_pending: bool,
     legacy_pending: bool,
     modern_pending: bool,
+    native_pending: bool,
 }
 
 impl RetainedRows {
@@ -546,6 +604,7 @@ impl RetainedRows {
             RowSource::Builtin => self.builtin_pending = pending,
             RowSource::Legacy => self.legacy_pending = pending,
             RowSource::Modern => self.modern_pending = pending,
+            RowSource::Native => self.native_pending = pending,
         }
     }
 
@@ -586,21 +645,31 @@ impl RetainedRows {
                     .collect();
                 self.modern_pending = pending;
             }
+            RowSource::Native => {
+                self.native = rows
+                    .iter()
+                    .filter(|row| row_source(&row.plugin_name) == RowSource::Native)
+                    .cloned()
+                    .collect();
+                self.native_pending = pending;
+            }
         }
     }
-
-    /// The merged presentation order: built-in rows, then legacy, then modern.
+    /// The merged presentation order: built-in rows, then legacy, modern and native.
     fn merged(&self) -> Vec<crikey_ui::ResultRow> {
-        let mut rows = Vec::with_capacity(self.builtin.len() + self.legacy.len() + self.modern.len());
+        let mut rows = Vec::with_capacity(
+            self.builtin.len() + self.legacy.len() + self.modern.len() + self.native.len(),
+        );
         rows.extend(self.builtin.iter().cloned());
         rows.extend(self.legacy.iter().cloned());
         rows.extend(self.modern.iter().cloned());
+        rows.extend(self.native.iter().cloned());
         rows
     }
 
     /// Whether any source still has work outstanding for the retained generation.
     fn pending(&self) -> bool {
-        self.builtin_pending || self.legacy_pending || self.modern_pending
+        self.builtin_pending || self.legacy_pending || self.modern_pending || self.native_pending
     }
 }
 
@@ -687,10 +756,7 @@ fn dev(args: &[String]) -> ExitCode {
         Some("test-legacy-compat") => legacy_commands::test_legacy_compat(&args[1..]),
         Some("inspect-catalog") => legacy_commands::inspect_catalog(&args[1..]),
         Some("compatibility-report") => legacy_commands::compatibility_report(&args[1..]),
-        Some(subcommand) if UNIMPLEMENTED_DEV.contains(&subcommand) => {
-            eprintln!("crikey: `dev {subcommand}` is not implemented yet");
-            ExitCode::from(69) // EX_UNAVAILABLE
-        }
+        Some("inspect-protocol") => native_commands::inspect_protocol(&args[1..]),
         Some(other) => {
             eprintln!("crikey: unknown dev subcommand `{other}`\n\n{USAGE}");
             ExitCode::from(64) // EX_USAGE
@@ -1265,22 +1331,6 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, QueryTraceEvent::StaleResultRejected { .. })),
             "the UI boundary must never receive a stale built-in batch"
-        );
-    }
-
-    #[test]
-    fn dev_separates_an_unbuilt_subcommand_from_an_unknown_one() {
-        // Every subcommand the top-level usage advertises is either implemented
-        // or listed as unbuilt; a word in neither set is a typo, not a promise.
-        for advertised in UNIMPLEMENTED_DEV {
-            assert!(
-                USAGE.contains(advertised),
-                "`dev {advertised}` is reported as unbuilt but never advertised"
-            );
-        }
-        assert!(
-            !UNIMPLEMENTED_DEV.contains(&"benchmark"),
-            "`dev benchmark` is implemented and must not be reported as unbuilt"
         );
     }
 

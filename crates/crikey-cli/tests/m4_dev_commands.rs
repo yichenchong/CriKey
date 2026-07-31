@@ -26,10 +26,9 @@
 //! the report still on stdout. A `--plugin` that is not a loadable modern plugin
 //! is the caller's fault and exits `EX_USAGE` (64) with an empty stdout.
 //! `EX_UNAVAILABLE` (69) is reserved for a subcommand that is advertised but
-//! unbuilt — `dev inspect-protocol` is still M5, so it must keep answering 69
-//! and an implemented command must never do so. A CI job that cannot tell "this
-//! plugin is broken" from "you typed the flag wrong" from "we never wrote this"
-//! reports all three as red.
+//! unbuilt, and an implemented command must never answer with it. A CI job that
+//! cannot tell "this plugin is broken" from "you typed the flag wrong" from "we
+//! never wrote this" reports all three as red.
 //!
 //! # Determinism
 //!
@@ -502,26 +501,6 @@ fn dev_run_and_dev_test_are_implemented_rather_than_advertised() {
             "help for `dev {command}` must document the flag it cannot run without{help}"
         );
     }
-}
-
-#[test]
-fn inspect_protocol_remains_unavailable_until_m5() {
-    // A guard against `dev inspect-protocol` being accidentally implemented in
-    // M4: it is M5's native transport probe, so it must keep answering 69.
-    let run = run(&["dev", "inspect-protocol"]);
-    assert!(
-        !run.stderr.contains("panicked at"),
-        "`dev inspect-protocol` panicked instead of reporting unavailable{run}"
-    );
-    assert_eq!(
-        run.code,
-        Some(EX_UNAVAILABLE),
-        "`dev inspect-protocol` is unbuilt (M5) and must exit {EX_UNAVAILABLE}{run}"
-    );
-    assert!(
-        run.stdout.trim().is_empty(),
-        "an unbuilt command must not print a report{run}"
-    );
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,13 @@
 use crikey_core::PluginId;
 
 mod environment;
+mod native;
+
+pub use native::{
+    build_package, inspect_package, install_native, rollback_native, verify_package, NativeInstall,
+    NativePackageReport,
+};
+
 mod import_path;
 mod index;
 mod lockfile;
@@ -52,6 +59,12 @@ pub enum PackageError {
     IncompatiblePlatform,
     #[error("requires-python {required} not satisfied by {found}")]
     UnsatisfiedRequiresPython { required: String, found: String },
+    #[error("malformed native package archive: {0}")]
+    MalformedArchive(String),
+    #[error("invalid native package manifest: {0}")]
+    Manifest(String),
+    #[error("native package installation failed: {0}")]
+    Install(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

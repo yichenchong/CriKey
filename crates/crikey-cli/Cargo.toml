@@ -28,6 +28,8 @@ crikey-legacy-compat.workspace = true
 # `RuntimeProfile`, interpreter discovery and the modern CPython worker
 # (spec 14.11, 15.6): `dev run`/`dev test` drive a real worker end to end.
 crikey-python-host.workspace = true
+crikey-native-host.workspace = true
+crikey-native-protocol.workspace = true
 # Managed environments (spec 15.3, 15.4, 23.2): resolve and materialise a
 # modern plugin's declared dependencies before spawning its worker.
 crikey-package-manager.workspace = true

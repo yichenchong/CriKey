@@ -25,6 +25,11 @@ members = [
     "benchmarks",
 ]
 
+# The native-plugin conformance fixture is deliberately OUT of this workspace:
+# acceptance §31.21 is about a plugin built the way a third party builds one,
+# against the published SDK by path, with its own lockfile and target dir.
+exclude = ["compatibility/native-conformance"]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

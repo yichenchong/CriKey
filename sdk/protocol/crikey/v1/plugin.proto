@@ -2,6 +2,9 @@ syntax = "proto3";
 
 // CriKey plugin protocol, version 1 (spec 16.3).
 // Additive evolution only: never renumber or reuse a field tag.
+// Unknown fields must round-trip: a decoder retains bytes it does not
+// understand and re-emits them, so a newer peer talking to an older one never
+// silently loses data.
 package crikey.v1;
 
 message Envelope {
@@ -19,19 +22,89 @@ message Envelope {
     ResultBatch results = 13;
     Cancel cancel = 14;
     Shutdown shutdown = 15;
+    CatalogRequest catalog_request = 16;
+    CatalogBatch catalog_batch = 17;
+    ExecuteRequest execute = 18;
+    ExecuteResult execute_result = 19;
+    ConfigurationChange configuration = 20;
+    Event event = 21;
+    LogRecord log = 22;
+    HealthCheck health_check = 23;
+    HealthReport health_report = 24;
+    Error error = 25;
+    FlowControl flow = 26;
+    ResourceRequest resource_request = 27;
+    ResourceResponse resource_response = 28;
+    Lifecycle lifecycle = 29;
+    LifecycleAck lifecycle_ack = 30;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Handshake and negotiation (spec 16.3, 16.6)
+// ---------------------------------------------------------------------------
 
 message Handshake {
   uint32 protocol_version = 1;
   string plugin_id = 2;
   string plugin_version = 3;
   repeated string capabilities = 4;
+  // Echoed back to the host so a connection cannot be hijacked by another
+  // process that merely guessed the endpoint (spec 16.6).
+  string session_token = 5;
+  string plugin_name = 6;
+  string sdk_version = 7;
 }
 
 message HandshakeAck {
   uint32 protocol_version = 1;
   repeated string host_capabilities = 2;
+  string host_version = 3;
+  // False when the host refuses the connection; `reject_reason` says why and
+  // the plugin must exit.
+  bool accepted = 4;
+  string reject_reason = 5;
+  uint64 max_frame_bytes = 6;
+  // Result batches the plugin may send before the host replenishes credit
+  // with a FlowControl message (spec 12.3).
+  uint32 initial_credits = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle (spec 13.2)
+// ---------------------------------------------------------------------------
+
+message Lifecycle {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    START = 1;
+    STOP = 2;
+    ACTIVATED = 3;
+    DEACTIVATED = 4;
+  }
+  Kind kind = 1;
+}
+
+message LifecycleAck {
+  Lifecycle.Kind kind = 1;
+  bool ok = 2;
+  Error error = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Catalog and suggestions (spec 16.5, 12.1, 12.5)
+// ---------------------------------------------------------------------------
+
+message CatalogRequest {
+  // Zero means the host imposes no item ceiling beyond its own limits.
+  uint64 max_items = 1;
+}
+
+message CatalogBatch {
+  repeated Item items = 1;
+  bool done = 2;
+  uint64 sequence = 3;
+  Error error = 4;
 }
 
 message SuggestRequest {
@@ -39,6 +112,18 @@ message SuggestRequest {
   string normalized_text = 2;
   // Item the user already selected, for argument suggestions.
   string selected_item_id = 3;
+  // Per-query quota the host will enforce; zero means host default.
+  uint64 max_items = 4;
+  uint64 max_batches = 5;
+}
+
+message Action {
+  string action_id = 1;
+  string label = 2;
+  string description = 3;
+  string icon_reference = 4;
+  // "host-mediated" or "plugin"; unknown values are treated as plugin.
+  string execution_policy = 5;
 }
 
 message Item {
@@ -51,6 +136,7 @@ message Item {
   string icon_reference = 7;
   int32 score_hint = 8;
   map<string, string> metadata = 9;
+  repeated Action actions = 10;
 }
 
 message ResultBatch {
@@ -63,10 +149,138 @@ message ResultBatch {
   }
   State state = 1;
   repeated Item items = 2;
+  uint64 sequence = 3;
+  Error error = 4;
 }
 
 message Cancel {
   string reason = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Action execution (spec 10.4, 16.3)
+// ---------------------------------------------------------------------------
+
+message ExecuteRequest {
+  string item_id = 1;
+  string action_id = 2;
+  string argument = 3;
+}
+
+message ExecuteResult {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    OK = 1;
+    FAILED = 2;
+    UNSUPPORTED = 3;
+  }
+  Outcome outcome = 1;
+  Error error = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Configuration and events (spec 21.4, 14.6, 18.7)
+// ---------------------------------------------------------------------------
+
+message ConfigurationChange {
+  map<string, string> values = 1;
+  // True when `values` is the complete configuration state rather than a
+  // delta; the host coalesces rapid edits into one complete publication.
+  bool complete = 2;
+}
+
+message Event {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    FILESYSTEM = 1;
+    NETWORK = 2;
+    CONFIGURATION = 3;
+    APPLICATIONS = 4;
+    CUSTOM = 5;
+  }
+  Kind kind = 1;
+  map<string, string> attributes = 2;
+  uint64 flags = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Resources, logging, health, errors (spec 16.3, 24.3, 26.1)
+// ---------------------------------------------------------------------------
+
+message ResourceRequest {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    ICON = 1;
+    FILE = 2;
+    CONFIGURATION = 3;
+  }
+  Kind kind = 1;
+  string reference = 2;
+}
+
+message ResourceResponse {
+  string reference = 1;
+  bool found = 2;
+  bytes content = 3;
+  string media_type = 4;
+  Error error = 5;
+}
+
+message LogRecord {
+  enum Level {
+    LEVEL_UNSPECIFIED = 0;
+    ERROR = 1;
+    WARN = 2;
+    INFO = 3;
+    DEBUG = 4;
+    TRACE = 5;
+  }
+  Level level = 1;
+  string message = 2;
+  uint64 timestamp_ms = 3;
+}
+
+message HealthCheck {
+  uint64 nonce = 1;
+}
+
+message HealthReport {
+  uint64 nonce = 1;
+  bool healthy = 2;
+  uint64 memory_bytes = 3;
+  uint32 queue_depth = 4;
+  uint32 in_flight = 5;
+  string detail = 6;
+}
+
+message Error {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    PROTOCOL = 1;
+    PLUGIN = 2;
+    TIMEOUT = 3;
+    CANCELLED = 4;
+    RESOURCE = 5;
+    UNSUPPORTED = 6;
+  }
+  Code code = 1;
+  string message = 2;
+  string detail = 3;
+  uint64 request_id = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Flow control (spec 12.3, 12.4)
+// ---------------------------------------------------------------------------
+
+message FlowControl {
+  // Additional result batches the plugin may send, added to its remaining
+  // credit. A plugin that sends a batch with no credit commits a protocol
+  // violation and is disconnected.
+  uint32 credits = 1;
+  // True while the host has stopped consuming; the plugin must pause emitting
+  // even if it still holds credit.
+  bool paused = 2;
 }
 
 message Shutdown {
