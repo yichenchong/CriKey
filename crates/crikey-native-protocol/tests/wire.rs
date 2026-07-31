@@ -1008,6 +1008,17 @@ fn category_conversion_round_trips_and_empty_stable_id_is_derived() {
         Category::Contact,
         Category::ClipboardItem,
         Category::PluginDefined("documents".to_owned()),
+        // Shadowing names: a plugin category merely CALLED "application" is not
+        // the built-in one, and core proves it (`ItemId::derived` gives them
+        // different identities). An encoding that renders both as
+        // "application" silently rewrites the plugin's category and its item
+        // identity, so every built-in name is round-tripped in its shadowed
+        // form too.
+        Category::PluginDefined("application".to_owned()),
+        Category::PluginDefined("file".to_owned()),
+        Category::PluginDefined("clipboard-item".to_owned()),
+        // A name that itself looks like the wire prefix must survive intact.
+        Category::PluginDefined("plugin-defined:nested".to_owned()),
     ];
     let plugin = PluginId("dev.example.native".to_owned());
 
@@ -1018,6 +1029,29 @@ fn category_conversion_round_trips_and_empty_stable_id_is_derived() {
         let proto = crikey_native_protocol::convert::to_proto_item(&original);
         let decoded = crikey_native_protocol::convert::from_proto_item(&plugin, &proto);
         assert_core_item_eq(&decoded, &original);
+    }
+
+    // The shadowed pair must stay distinct end to end, including the derived
+    // identity core computes from the category.
+    for name in ["application", "file", "directory", "url", "command"] {
+        let builtin = crikey_native_protocol::convert::category_from_tag(name);
+        let shadowed = Category::PluginDefined(name.to_owned());
+        assert_ne!(builtin, shadowed, "`{name}` decoded into the plugin-defined form");
+        let builtin_tag = crikey_native_protocol::convert::category_tag(&builtin);
+        let shadowed_tag = crikey_native_protocol::convert::category_tag(&shadowed);
+        assert_ne!(
+            builtin_tag, shadowed_tag,
+            "built-in `{name}` and a plugin category of the same name share one wire tag"
+        );
+        assert_eq!(
+            crikey_native_protocol::convert::category_from_tag(&shadowed_tag),
+            shadowed
+        );
+        assert_ne!(
+            ItemId::derived(&plugin, &builtin, "/same/target"),
+            ItemId::derived(&plugin, &shadowed, "/same/target"),
+            "a shadowed category must not collapse onto the built-in's item identity"
+        );
     }
 
     let original = core_item(Category::Url, "ignored", "https://example.test");

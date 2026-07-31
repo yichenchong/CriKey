@@ -117,6 +117,15 @@ message SuggestRequest {
   uint64 max_batches = 5;
 }
 
+// Category tags (spec 10.3) are encoded so that every distinct category has a
+// distinct tag. A built-in category uses its canonical bare name
+// ("application", "file", "directory", "url", "command", "expression",
+// "keyword", "contact", "clipboard-item"). A PLUGIN-DEFINED category is
+// prefixed with "plugin-defined:", because a plugin category merely named
+// "application" is not the built-in one and must not decode into it. A bare
+// unrecognised tag is still accepted as plugin-defined for SDKs that have not
+// adopted the prefix.
+
 message Action {
   string action_id = 1;
   string label = 2;
@@ -134,6 +143,7 @@ message Item {
   string label = 2;
   string description = 3;
   string target = 4;
+  // Category tag; see the encoding note above `Action`.
   string category = 5;
   repeated string search_terms = 6;
   string icon_reference = 7;

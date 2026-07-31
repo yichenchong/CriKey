@@ -84,13 +84,40 @@ pub fn from_proto_action(action: &message::Action) -> Action {
     }
 }
 
+/// Prefix that discriminates a plugin-defined category from a built-in one on
+/// the wire (spec 10.3).
+///
+/// Without it the encoding is not injective: `PluginDefined("application")`
+/// and `Category::Application` both render as `"application"`, so a decoder
+/// silently rewrites the former into the latter. `crikey-core` treats them as
+/// genuinely different categories — `ItemId::derived` gives them distinct
+/// identities — so collapsing them would rewrite a plugin's item identity.
+/// Core discriminates with a `plugin-defined` tag component; the wire mirrors
+/// that spelling.
+pub const PLUGIN_DEFINED_PREFIX: &str = "plugin-defined:";
+
 /// Stable category tag used by the proto schema (spec 10.3).
+///
+/// Built-in categories keep their canonical bare name; a plugin-defined one is
+/// prefixed, so every distinct `Category` maps to a distinct tag.
 pub fn category_tag(category: &Category) -> String {
-    category.as_str().to_owned()
+    match category {
+        Category::PluginDefined(name) => format!("{PLUGIN_DEFINED_PREFIX}{name}"),
+        builtin => builtin.as_str().to_owned(),
+    }
 }
 
 /// Parses a category tag, retaining unknown plugin-defined categories.
+///
+/// An explicitly prefixed tag is always plugin-defined, even when the name
+/// collides with a built-in. A bare unknown tag is still accepted as
+/// plugin-defined, so an SDK in another language that has not adopted the
+/// prefix keeps working; it simply cannot express a plugin-defined category
+/// whose name shadows a built-in one.
 pub fn category_from_tag(tag: &str) -> Category {
+    if let Some(name) = tag.strip_prefix(PLUGIN_DEFINED_PREFIX) {
+        return Category::PluginDefined(name.to_owned());
+    }
     match tag {
         "application" => Category::Application,
         "file" => Category::File,
