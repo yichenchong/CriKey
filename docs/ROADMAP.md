@@ -67,7 +67,7 @@ round-trips the specification's example verbatim.
 
 Exit: `cargo test --workspace --all-targets` green on Linux; `crikey version` runs.
 
-### M1 — Core launcher (§30 Phase 1) — XL — in progress
+### M1 — Core launcher (§30 Phase 1) — XL — done
 
 | Deliverable | Crates | Notes |
 | --- | --- | --- |
@@ -80,9 +80,16 @@ Exit: `cargo test --workspace --all-targets` green on Linux; `crikey version` ru
 | Startup staging | app | window/hotkey → cached catalog → accept queries → workers |
 | Supervisor skeleton | plugin-supervisor | states, deadlines, health counters, no runtime yet |
 
-Exit criteria: warm activation < 30 ms p95 and cached local results < 16 ms p95
-on the reference machine; 500k synthetic items searchable; query text renders in
-the next frame with no debounce (§25.1, §31.1–3, §31.27).
+Exit criteria: cached local results < 16 ms p95 on the reference machine; 500k
+synthetic items searchable; query text renders in the next frame with no
+debounce (§25.1, §31.2–3, §31.27).
+
+Warm activation < 30 ms p95 (§31.1) was an M1 exit criterion and is **moved to
+M6**, together with the Win32 hotkey/discovery/launch runtime exercise. Both
+need a runtime this milestone never had: a Windows session, and hardware with a
+real GPU and compositor. Neither is abandoned and neither is claimed — they are
+listed under M6 with the evidence each still owes. M1 closes on what a Linux
+host can actually settle.
 
 Status snapshot (2026-07-27):
 
@@ -128,11 +135,10 @@ Status snapshot (2026-07-27):
   variation. The harness is kept because it is the instrument that will settle
   this on a GPU, but no Lavapipe figure is recorded as evidence for or against
   §25.1.
-- Remaining before M1 can close: exercise hotkey/discovery/launch on Windows,
-  and measure warm activation below 30 ms p95 on hardware with a real GPU and
-  compositor. Both remaining items need a runtime this host does not have.
-  Query latency, catalog scale, and Linux native presentation are green; the M1
-  milestone as a whole is not.
+- Carried to M6, with the evidence each still owes: the Win32
+  hotkey/discovery/launch runtime exercise, and warm activation < 30 ms p95 on
+  hardware with a real GPU and compositor. Query latency, catalog scale, and
+  Linux native presentation are settled here.
 
 ### M2 — Scheduling and resilience (§30 Phase 2) — L — done
 
@@ -299,18 +305,34 @@ round-trip.
 
 Verification limits, honestly: the Windows named-pipe transport, job-object
 limits and `DuplicateHandle` cloning are compile-verified only — this host
-cannot run them. Deferred to M6 with no code pretending otherwise: §24.2
-startup recovery and safe mode after repeated startup failures, and §13.5
-per-plugin action/background/catalog concurrency budgets (as distinct from the
-§24.4 OS resource limits, which are implemented and reported per platform).
+cannot run them. Those, plus §24.2 startup recovery and safe mode and §13.5
+per-plugin concurrency budgets, are carried to M6 with no code pretending
+otherwise; the M6 table below records what each still owes. The §24.4 OS
+resource limits are distinct from §13.5 and are implemented and reported per
+platform.
 
 ### M6 — Additional platforms (§30 Phase 6) — L
 
 macOS and Linux backends behind the same traits, honest capability reporting
 per desktop environment, cross-platform packaging, portable built-ins.
 
-Exit criteria: full test suite green on all three CI runners; Windows-only
-legacy plugins are labelled as such and never advertised as portable (§31.26, §31.31).
+This milestone is where everything needing a runtime the development host
+lacks comes due. Carried in from earlier milestones, each with the evidence it
+owes:
+
+| Carried from | Item | Evidence still owed |
+| --- | --- | --- |
+| M1 | Win32 hotkey, Start Menu / packaged-app discovery, `.lnk` COM resolution, `ShellExecuteExW` launch | Executed in an interactive Windows desktop session. The 60 existing tests in `crates/crikey-platform-windows/tests/` pin the mapping and bookkeeping only and deliberately do not make these calls |
+| M1 | Warm activation < 30 ms p95 (§31.1) | Measured on hardware with a real GPU and compositor. `crikey dev measure-activation` is the instrument; a software rasteriser cannot settle it |
+| M1 | Global hotkeys and window activation on Linux | `LinuxBackend::capability` reports both `Unavailable` and there is no `HotkeyService`; a reactivation backend is needed before Linux can toggle or re-activate |
+| M5 | Windows named-pipe transport, job-object limits, `DuplicateHandle` cloning | Compile-verified only today; needs a Windows runtime |
+| M5 | §24.2 startup recovery and safe mode after repeated startup failures | Not implemented; no code pretends otherwise |
+| M5 | §13.5 per-plugin action/background/catalog concurrency budgets | Not implemented, as distinct from the §24.4 OS resource limits, which are implemented and reported per platform |
+
+Exit criteria: full test suite green on all three CI runners; every carried
+item above either satisfied with the evidence named or explicitly re-deferred
+with a reason; Windows-only legacy plugins are labelled as such and never
+advertised as portable (§31.26, §31.31).
 
 ### M7 — Optional runtimes and ecosystem (§30 Phase 7) — open-ended
 
@@ -368,7 +390,7 @@ Keypirinha branding, logos, or implied endorsement anywhere in UI or docs.
 | --- | --- | --- |
 | Undocumented Keypirinha behaviour that real plugins depend on | Compatibility gaps found late | Build the real-plugin corpus during M3, not after; classify and publish gaps rather than guessing at internals |
 | CPython startup cost inflating first-query latency | Misses §25.1 targets | Lazy worker start, warm pooling per runtime profile, catalog served from cache while workers boot |
-| Warm-activation budget (30 ms p95) on a cold GPU surface | Misses §31.1 | Keep window and surface alive and hidden; `crikey dev measure-activation` is the diagnostic instrument today and times `request_activation` → first present only, so it excludes hotkey dispatch and scanout. The §31.1 verdict needs the end-to-end Win32 measurement from hotkey to presented frame, on hardware with a real GPU and compositor — not this proxy, and not a software rasteriser |
+| Warm-activation budget (30 ms p95) on a cold GPU surface | Misses §31.1 | Keep window and surface alive and hidden. `crikey dev measure-activation` is the instrument, but it times `request_activation` → first present only, so it excludes hotkey dispatch and scanout, and a software rasteriser cannot settle the budget. Carried to M6, where the §31.1 verdict is the end-to-end Win32 measurement from hotkey to presented frame on real hardware |
 | Debounce tuning fighting perceived responsiveness | Poor feel | Local catalog is never debounced; defaults follow §25.4 bands and are per-plugin configurable |
 | Protocol churn after third-party SDK release | Ecosystem breakage | Freeze v1 at M5 with additive-only evolution and unknown-field round-tripping |
 | Scope creep from §2.2 "later scope" | M1–M6 slip | Later-scope items require an ADR and a milestone before any code lands |

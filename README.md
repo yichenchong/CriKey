@@ -9,10 +9,12 @@ on Windows.
 
 ## Status
 
-M0 skeleton complete. M1 core search, catalog persistence, native launcher
-runtime, Linux discovery, startup staging, supervisor state, and Windows
-hotkey/application backends are implemented; Windows execution and
-warm-activation p95 remain unverified. M2 scheduling and resilience is complete:
+M0 and M1 are complete: core search, catalog persistence, native launcher
+runtime, Linux discovery, startup staging, supervisor state, and the Windows
+hotkey/application backends are implemented. Two M1 items are carried to M6
+rather than claimed here — executing the Win32 backends in a Windows session,
+and measuring warm-activation p95 on hardware with a real GPU.
+M2 scheduling and resilience is complete:
 manifest-resolved policy, modern and legacy scheduling, cancellation, stale
 rejection, bounded/fair request and result queues, and deterministic developer
 traces are wired through the live query pipeline.
