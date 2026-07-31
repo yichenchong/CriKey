@@ -119,11 +119,15 @@ Status snapshot (2026-07-27):
 - That proxy did **not** produce a usable figure on this host. Six runs of the
   identical configuration under Xvfb 1280×720×24 with Mesa Lavapipe reported
   p95 of 17.7, 18.5, 21.5, 27.5, 34.8 and 40.6 ms — a spread that straddles the
-  30 ms budget, so the run decides the verdict rather than the code does. A
-  `--present-mode no-vsync` run moved p95 by under 2 ms, so swapchain pacing is
-  not the cause; software rasterisation and machine noise dominate. The harness
-  is kept because it is the instrument that will settle this on a GPU, but no
-  Lavapipe figure is recorded as evidence for or against §25.1.
+  30 ms budget, so the run decides the verdict rather than the code does.
+  Requesting `--present-mode no-vsync` moved p95 by under 2 ms, but
+  `AutoNoVsync` is only a request — wgpu falls back Immediate → Mailbox → Fifo,
+  and this surface may have stayed FIFO — so pacing was not discriminated here
+  and nothing is claimed about its contribution. What the spread does show is
+  that software rasterisation and machine noise dominate the observed
+  variation. The harness is kept because it is the instrument that will settle
+  this on a GPU, but no Lavapipe figure is recorded as evidence for or against
+  §25.1.
 - Remaining before M1 can close: exercise hotkey/discovery/launch on Windows,
   and measure warm activation below 30 ms p95 on hardware with a real GPU and
   compositor. Both remaining items need a runtime this host does not have.
