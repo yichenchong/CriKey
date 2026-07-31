@@ -124,6 +124,9 @@ message Action {
   string icon_reference = 4;
   // "host-mediated" or "plugin"; unknown values are treated as plugin.
   string execution_policy = 5;
+  // Category tags this action applies to (spec 10.3, 10.4). Empty means the
+  // action applies to any item the plugin returns.
+  repeated string applicable_categories = 6;
 }
 
 message Item {

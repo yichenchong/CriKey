@@ -132,6 +132,14 @@ impl ActionBuilder {
         self
     }
 
+    /// Restricts this action to items of `category` (spec 10.4). Repeatable;
+    /// leaving it unset means the action applies to any item the plugin
+    /// returns.
+    pub fn applicable_category(mut self, category: Category) -> Self {
+        self.applicable_categories.push(category);
+        self
+    }
+
     /// Selects host-mediated execution instead of plugin execution.
     pub fn host_mediated(mut self) -> Self {
         self.execution_policy = ExecutionPolicy::HostMediated;

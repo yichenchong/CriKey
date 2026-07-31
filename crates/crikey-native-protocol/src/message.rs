@@ -486,19 +486,22 @@ impl_simple!(Action {
     label: String = String::new(),
     description: String = String::new(),
     icon_reference: String = String::new(),
-    execution_policy: String = String::new()
+    execution_policy: String = String::new(),
+    applicable_categories: Vec<String> = Vec::new()
 } encode(this, out) {
     if !this.action_id.is_empty() { put_string(1, &this.action_id, &mut out); }
     if !this.label.is_empty() { put_string(2, &this.label, &mut out); }
     if !this.description.is_empty() { put_string(3, &this.description, &mut out); }
     if !this.icon_reference.is_empty() { put_string(4, &this.icon_reference, &mut out); }
     if !this.execution_policy.is_empty() { put_string(5, &this.execution_policy, &mut out); }
+    for value in &this.applicable_categories { put_string(6, value, &mut out); }
 } decode(value, field, budget) {
     1 => value.action_id = decode_string(field, budget)?,
     2 => value.label = decode_string(field, budget)?,
     3 => value.description = decode_string(field, budget)?,
     4 => value.icon_reference = decode_string(field, budget)?,
     5 => value.execution_policy = decode_string(field, budget)?,
+    6 => push_decoded(&mut value.applicable_categories, decode_string(field, budget)?, budget)?,
 });
 
 impl_simple!(Item {

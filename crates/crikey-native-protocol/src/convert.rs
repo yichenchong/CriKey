@@ -59,6 +59,7 @@ pub fn to_proto_action(action: &Action) -> message::Action {
             ExecutionPolicy::HostMediated => "host-mediated".to_owned(),
             ExecutionPolicy::Plugin => "plugin".to_owned(),
         },
+        applicable_categories: action.applicable_categories.iter().map(category_tag).collect(),
         unknown: UnknownFields::default(),
     }
 }
@@ -69,7 +70,11 @@ pub fn from_proto_action(action: &message::Action) -> Action {
         action_id: ActionId(action.action_id.clone()),
         label: action.label.clone(),
         description: action.description.clone(),
-        applicable_categories: Vec::new(),
+        applicable_categories: action
+            .applicable_categories
+            .iter()
+            .map(|tag| category_from_tag(tag))
+            .collect(),
         icon_reference: (!action.icon_reference.is_empty()).then(|| action.icon_reference.clone()),
         execution_policy: if action.execution_policy == "host-mediated" {
             ExecutionPolicy::HostMediated

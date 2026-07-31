@@ -29,6 +29,8 @@ fn action() -> message::Action {
         description: "Open the selected item".to_owned(),
         icon_reference: "icon-open".to_owned(),
         execution_policy: "plugin".to_owned(),
+        // Non-default so the all-fields round-trip actually covers tag 6.
+        applicable_categories: vec!["application".to_owned(), "documents".to_owned()],
         unknown: unknown(),
     }
 }
@@ -210,6 +212,7 @@ fn proto3_defaults_elide_and_decode_from_empty() {
         description: String::new(),
         icon_reference: String::new(),
         execution_policy: String::new(),
+        applicable_categories: Vec::new(),
         unknown: unknown(),
     });
     assert_default_encoding(message::Item {
@@ -551,6 +554,7 @@ fn minimal_messages_pin_frozen_field_numbers() {
             description: String::new(),
             icon_reference: String::new(),
             execution_policy: String::new(),
+            applicable_categories: Vec::new(),
             unknown: unknown(),
         },
         0x0a
@@ -954,7 +958,13 @@ fn core_item(category: Category, stable_id: &str, target: &str) -> Item {
             action_id: ActionId("open".to_owned()),
             label: "Open".to_owned(),
             description: "Open it".to_owned(),
-            applicable_categories: Vec::new(),
+            // Non-empty on purpose: with an empty vector the equality check in
+            // `assert_core_item_eq` compares nothing, and a codec that drops
+            // `applicable_categories` entirely still passes (spec 10.4).
+            applicable_categories: vec![
+                Category::Application,
+                Category::PluginDefined("documents".to_owned()),
+            ],
             icon_reference: Some("icon-open".to_owned()),
             execution_policy: ExecutionPolicy::Plugin,
         }],
