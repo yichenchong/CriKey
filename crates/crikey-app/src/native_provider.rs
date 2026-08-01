@@ -318,7 +318,15 @@ pub struct NativeProvider {
     loaded: Vec<LoadedPlugin>,
     plugins: Vec<PluginId>,
     unavailable: Vec<NativeUnavailable>,
+    collection_window: Duration,
 }
+
+/// How long one query waits for native workers before presenting what arrived.
+///
+/// This is the bound that stops a slow plugin holding a healthy sibling's
+/// result until its own call deadline: whatever has not answered inside the
+/// window contributes no rows to this frame. Production always uses it.
+pub const DEFAULT_COLLECTION_WINDOW: Duration = Duration::from_millis(100);
 
 impl NativeProvider {
     /// Discovers native `crikey.toml` packages under `roots`, resolves the
@@ -330,11 +338,27 @@ impl NativeProvider {
     /// directory is the package directory itself so shipped witness/config
     /// files are visible to the child (contract §3.1(8), §11.1).
     pub fn load(pipeline: &mut QueryPipeline, roots: &[PathBuf]) -> Self {
+        Self::load_with_collection_window(pipeline, roots, DEFAULT_COLLECTION_WINDOW)
+    }
+
+    /// [`Self::load`] with an explicit collection window.
+    ///
+    /// Exists for tests whose subject is that a worker's rows cross the
+    /// provider boundary at all, not how long that takes. Those tests would
+    /// otherwise race a real subprocess round-trip against the production
+    /// window and fail on a loaded machine for reasons unrelated to what they
+    /// assert. A test about the window itself must use [`Self::load`].
+    pub fn load_with_collection_window(
+        pipeline: &mut QueryPipeline,
+        roots: &[PathBuf],
+        collection_window: Duration,
+    ) -> Self {
         let mut provider = Self {
             pool: NativeWorkerPool::default(),
             loaded: Vec::new(),
             plugins: Vec::new(),
             unavailable: Vec::new(),
+            collection_window,
         };
 
         for root in roots {
@@ -693,7 +717,7 @@ impl NativeProvider {
         }
 
         let mut by_plugin = BTreeMap::new();
-        let deadline = Instant::now() + Duration::from_millis(100);
+        let deadline = Instant::now() + self.collection_window;
         while pending != 0 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
