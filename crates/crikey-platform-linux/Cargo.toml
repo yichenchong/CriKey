@@ -14,3 +14,17 @@ workspace = true
 [dependencies]
 crikey-core.workspace = true
 crikey-platform.workspace = true
+
+# X11 is what the global-hotkey backend grabs against, and it exists only on
+# this target: a shared dependency table would break the Windows and macOS
+# cross-target checks.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"
+
+# The X11 backends' tests drive a server directly, so the same client library
+# is needed at test time, gated the same way. The `xtest` feature is what lets
+# the delivery tests synthesise a real key press against their own Xvfb:
+# without it nothing in the suite can prove a grabbed chord ever reaches the
+# activation handler.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = { version = "0.13", features = ["xtest"] }

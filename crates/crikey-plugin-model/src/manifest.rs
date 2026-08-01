@@ -22,6 +22,8 @@ pub struct Manifest {
     #[serde(default)]
     pub query: QuerySection,
     #[serde(default)]
+    pub concurrency: ConcurrencySection,
+    #[serde(default)]
     pub permissions: Permissions,
     #[serde(default)]
     pub performance: PerformanceSection,
@@ -268,6 +270,25 @@ pub struct QuerySection {
     pub max_concurrent_requests: Option<u32>,
     #[serde(default)]
     pub network_backed: Option<bool>,
+}
+
+/// Declared per-plugin concurrency budgets (spec 13.5).
+///
+/// Each budget is optional so the declaration layer can distinguish "the
+/// author said nothing" (`None`) from "the author switched this surface off"
+/// (`Some(0)`). Collapsing the two would either mute a plugin or uncap it;
+/// resolving `None` to an effective limit is the enforcement layer's job.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ConcurrencySection {
+    #[serde(default)]
+    pub max_suggestion_requests: Option<u32>,
+    #[serde(default)]
+    pub max_action_requests: Option<u32>,
+    #[serde(default)]
+    pub max_background_tasks: Option<u32>,
+    #[serde(default)]
+    pub max_catalog_tasks: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

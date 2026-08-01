@@ -55,8 +55,16 @@ pub enum PackageError {
     HashMismatch(String),
     #[error("dependency resolution failed: {0}")]
     Resolution(String),
+    /// The package does not declare this target at all (spec 19.3): the
+    /// `[platform]` lists exclude it, so nothing about it was ever built.
     #[error("no binary for this platform/architecture")]
     IncompatiblePlatform,
+    /// The package *declares* this target but ships no entrypoint for it. This
+    /// is a different defect from [`PackageError::IncompatiblePlatform`] — the
+    /// build is expected to exist and is simply absent — so the message names
+    /// the `<os>-<arch>` key an operator has to go look for.
+    #[error("package declares {os}-{arch} but ships no entrypoint for {os}-{arch}")]
+    MissingEntrypoint { os: String, arch: String },
     #[error("requires-python {required} not satisfied by {found}")]
     UnsatisfiedRequiresPython { required: String, found: String },
     #[error("malformed native package archive: {0}")]

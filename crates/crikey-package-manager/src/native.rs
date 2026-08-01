@@ -617,8 +617,14 @@ fn ensure_compatible(manifest: &Manifest, os: &str, arch: &str) -> Result<(), Pa
     let os_ok = manifest.platform.os.is_empty() || manifest.platform.os.iter().any(|value| value == os);
     let arch_ok =
         manifest.platform.arch.is_empty() || manifest.platform.arch.iter().any(|value| value == arch);
-    if !os_ok || !arch_ok || manifest.entrypoint_for(os, arch).is_err() {
+    if !os_ok || !arch_ok {
         return Err(PackageError::IncompatiblePlatform);
+    }
+    if manifest.entrypoint_for(os, arch).is_err() {
+        return Err(PackageError::MissingEntrypoint {
+            os: os.to_owned(),
+            arch: arch.to_owned(),
+        });
     }
     Ok(())
 }

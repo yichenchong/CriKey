@@ -10,8 +10,11 @@ use crikey_input_scheduler::{
     DispatchedRequest, Millis, PluginDiagnostics, PluginPolicy, QueryScheduler, QueryTraceEvent,
     SchedulerConfig, SchedulerDiagnostics, SchedulingProfile,
 };
-use crikey_plugin_model::Manifest;
-use crikey_plugin_supervisor::{CircuitBreakerConfig, MemorySupervisor, PluginHealth, Supervisor};
+use crikey_plugin_model::{ConcurrencySection, Manifest};
+use crikey_plugin_supervisor::{
+    BudgetKind, CircuitBreakerConfig, ConcurrencyBudget, MemorySupervisor, OwnedBudgetGuard, PluginHealth,
+    Supervisor,
+};
 use crikey_result_aggregator::{
     BatchPriority, BatchState, DrainBudget, DrainReport, InboundBatch, InboundResultQueue, IntakePolicy,
     MemoryResultAggregator, MergedBatch, OverflowPolicy, ProducerState, QueueDepth, QueueDiagnostics,
@@ -104,6 +107,13 @@ pub struct QueryPipeline {
     unranked_batches: usize,
     registered: Vec<PluginId>,
     health_sync: HashMap<PluginId, HealthSync>,
+    /// One admission gate per registered plugin, resolved from its
+    /// `[concurrency]` declaration (spec 13.5). Shared behind an `Arc` so a
+    /// caller can hold the same gate a dispatch site consults.
+    budgets: HashMap<PluginId, Arc<ConcurrencyBudget>>,
+    /// Slots held by dispatched-but-unretired work, released in
+    /// [`Self::finish_completion`] — the pipeline's single retirement edge.
+    admitted: HashMap<(PluginId, Generation), OwnedBudgetGuard>,
     active_requests: HashSet<(PluginId, Generation)>,
     unresolved_cancellations: HashMap<(PluginId, Generation), ()>,
     pending_cancellations: Vec<CancelledRequest>,
@@ -144,6 +154,8 @@ impl QueryPipeline {
             unranked_batches: 0,
             registered: Vec::new(),
             health_sync: HashMap::new(),
+            budgets: HashMap::new(),
+            admitted: HashMap::new(),
             active_requests: HashSet::new(),
             unresolved_cancellations: HashMap::new(),
             pending_cancellations: Vec::new(),
@@ -170,9 +182,37 @@ impl QueryPipeline {
         policy: PluginPolicy,
         intake_policy: IntakePolicy,
     ) -> Result<(), PipelineError> {
+        self.register_plugin_with_concurrency(plugin, policy, intake_policy, &ConcurrencySection::default())
+    }
+
+    /// Registers a plugin together with the `[concurrency]` declaration that
+    /// bounds its simultaneous work (spec 13.5).
+    ///
+    /// The suggestion budget has two authors. `[query] max-concurrent-requests`
+    /// already bounds simultaneous suggestion dispatch in the scheduler, and
+    /// `[concurrency] max-suggestion-requests` bounds it here. Neither may be
+    /// exceeded, so the effective limit is the smaller of the two; a manifest
+    /// that mentions only `[query]` keeps exactly the limit it asked for
+    /// instead of being silently narrowed to the host default. The other three
+    /// kinds have no second author and resolve through
+    /// [`ConcurrencyBudget::from_section`] alone.
+    pub fn register_plugin_with_concurrency(
+        &mut self,
+        plugin: PluginId,
+        policy: PluginPolicy,
+        intake_policy: IntakePolicy,
+        concurrency: &ConcurrencySection,
+    ) -> Result<(), PipelineError> {
         if self.health_sync.contains_key(&plugin) {
             return Err(PipelineError::AlreadyRegistered { plugin });
         }
+
+        let scheduler_limit = u32::try_from(policy.max_concurrent_requests).unwrap_or(u32::MAX);
+        let mut resolved = concurrency.clone();
+        resolved.max_suggestion_requests = Some(match resolved.max_suggestion_requests {
+            Some(declared) => declared.min(scheduler_limit),
+            None => scheduler_limit,
+        });
 
         self.supervisor
             .register(&plugin)
@@ -180,15 +220,37 @@ impl QueryPipeline {
         self.scheduler.register_plugin(plugin.clone(), policy);
         self.intake.register(plugin.clone(), intake_policy);
         self.health_sync.insert(plugin.clone(), HealthSync::default());
+        self.budgets.insert(
+            plugin.clone(),
+            Arc::new(ConcurrencyBudget::from_section(&resolved)),
+        );
         self.registered.push(plugin);
         Ok(())
     }
 
     pub fn register_manifest(&mut self, manifest: &Manifest) -> Result<PluginId, PipelineError> {
         let plugin = PluginId(manifest.plugin.id.clone());
-        let policy = plugin_policy_from_manifest(manifest);
-        self.register_plugin(plugin.clone(), policy)?;
+        self.register_namespaced_manifest(plugin.clone(), manifest)?;
         Ok(plugin)
+    }
+
+    /// [`Self::register_manifest`] for a provider that namespaces the plugin
+    /// id it exposes (`native.*`, `modern.*`). The scheduling policy and the
+    /// concurrency budget still come from the manifest, so a namespacing
+    /// provider cannot accidentally drop the author's `[concurrency]`
+    /// declaration on the floor.
+    pub fn register_namespaced_manifest(
+        &mut self,
+        plugin: PluginId,
+        manifest: &Manifest,
+    ) -> Result<(), PipelineError> {
+        let policy = plugin_policy_from_manifest(manifest);
+        self.register_plugin_with_concurrency(
+            plugin,
+            policy,
+            self.default_intake_policy,
+            &manifest.concurrency,
+        )
     }
 
     /// Mints and opens a generation. Worker dispatch remains exclusively a
@@ -230,10 +292,35 @@ impl QueryPipeline {
         let (drain_report, mut errors) = self.drain_intake(now);
         errors.splice(0..0, self.pending_errors.drain(..));
 
-        let dispatches = self.scheduler.tick(now);
-        for dispatch in &dispatches {
-            self.active_requests
-                .insert((dispatch.plugin.clone(), dispatch.generation));
+        // Admission is the production seam for spec 13.5: a plugin already at
+        // its declared suggestion budget does not receive a second request.
+        // The refusal is counted and the request is retired here, so the
+        // scheduler is not left holding an in-flight entry nobody will answer.
+        let mut dispatches = self.scheduler.tick(now);
+        let mut refused = Vec::new();
+        dispatches.retain(|dispatch| {
+            let Some(budget) = self.budgets.get(&dispatch.plugin) else {
+                return true;
+            };
+            match budget.try_acquire_owned(BudgetKind::Suggestion) {
+                Some(guard) => {
+                    self.admitted
+                        .insert((dispatch.plugin.clone(), dispatch.generation), guard);
+                    self.active_requests
+                        .insert((dispatch.plugin.clone(), dispatch.generation));
+                    true
+                }
+                None => {
+                    refused.push((dispatch.plugin.clone(), dispatch.generation));
+                    false
+                }
+            }
+        });
+        for (plugin, generation) in refused {
+            self.supervisor
+                .record_concurrency_refusal(&plugin, 1)
+                .expect("scheduler and supervisor plugin registries stay in lockstep");
+            let _ = self.finish_completion(&plugin, generation, now);
         }
         self.capture_cancellations();
         let cancellations = std::mem::take(&mut self.pending_cancellations);
@@ -390,6 +477,15 @@ impl QueryPipeline {
         self.scheduler.plugin_policy(plugin)
     }
 
+    /// The admission gate enforcing this plugin's `[concurrency]` limits.
+    ///
+    /// Exposed so a dispatch site outside the pipeline can consult the same
+    /// gate, and so operators can read per-kind `refusals` and live
+    /// `in_flight` occupancy alongside [`Self::health`].
+    pub fn plugin_budget(&self, plugin: &PluginId) -> Option<&Arc<ConcurrencyBudget>> {
+        self.budgets.get(plugin)
+    }
+
     pub fn intake_depth(&self) -> QueueDepth {
         self.intake.depth()
     }
@@ -497,6 +593,10 @@ impl QueryPipeline {
     ) -> CompletionOutcome {
         let outcome = self.scheduler.complete(plugin, generation, now);
         self.active_requests.remove(&(plugin.clone(), generation));
+        // The retirement edge for the admitted slot. Dropping the guard here
+        // — rather than at any earlier caller — keeps occupancy equal to the
+        // work the scheduler still believes is running.
+        self.admitted.remove(&(plugin.clone(), generation));
         if outcome == CompletionOutcome::Stale
             && self
                 .unresolved_cancellations

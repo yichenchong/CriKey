@@ -52,8 +52,8 @@ use crikey_legacy_compat::{
     discover_interpreter, CallbackObservation, CompatibilityMatrix, CompatibilityReport, Delivery,
     DiagnosticLimits, ImportOutcome, InstanceId, Interpreter, LegacyCallback, LegacyDeadlines,
     LegacyDiagnostics, LegacyOutcome, LegacyPackage, LegacyRequest, LegacyRequestKind, LegacyResponse,
-    LegacyRuntime, LegacyTraceEvent, LegacyWorker, LegacyWorkerHandle, PackageLoader, PluginCorpus,
-    TerminationReason, WorkerError, WorkerOptions, MINIMUM_SUPPORTED_PYTHON, WORKER_ENTRY_FILE,
+    LegacyRuntime, LegacyTraceEvent, LegacyWorker, LegacyWorkerHandle, PackageLoader, PluginClassification,
+    PluginCorpus, TerminationReason, WorkerError, WorkerOptions, MINIMUM_SUPPORTED_PYTHON, WORKER_ENTRY_FILE,
 };
 use crikey_python_host::RuntimeProfile;
 
@@ -219,6 +219,23 @@ pub(crate) fn test_legacy_compat(args: &[String]) -> ExitCode {
         }
     };
 
+    // The corpus is the project's own published verdict on this package (spec
+    // 27.4), and it has to reach the `portable` field below. The two
+    // Windows-only packages it references get to Win32 through bundled COM,
+    // `ctypes` and `sc.exe` rather than through `keypirinha_wintypes`, so the
+    // import scan above sees nothing and a report built on the scan alone would
+    // advertise them as cross-platform — the exact misrepresentation acceptance
+    // 31.31 forbids. An unreadable corpus is neither a conformance verdict nor
+    // the caller's fault, so it exits `EX_SOFTWARE` rather than being guessed at.
+    let corpus = match PluginCorpus::load(&workspace_root().join(CORPUS_PATH)) {
+        Ok(corpus) => corpus,
+        Err(error) => {
+            eprintln!("crikey: dev {command}: cannot read `{CORPUS_PATH}`: {error}");
+            return ExitCode::from(EX_SOFTWARE);
+        }
+    };
+    let declared = declared_classification(&corpus, &package);
+
     let ConformanceRun {
         mut checks,
         obsolete_callback,
@@ -269,10 +286,34 @@ pub(crate) fn test_legacy_compat(args: &[String]) -> ExitCode {
     field(&mut report, "interpreter", &interpreter.path().to_string_lossy());
     field(&mut report, "python_version", &interpreter.version().to_string());
     field(&mut report, "scheduling_profile", "legacy-strict");
+    // The §26.2 diagnostics store is fed nowhere else on a live path, so spec
+    // 26.2 ("CriKey should report…") and acceptance 31.29 are unmet in practice
+    // until it is fed here. Everything folded in is a fact this command already
+    // established: the profile it ran under, the package's own imports, the
+    // interpreter it resolved, the corpus's published classification, and —
+    // from the conformance run — a superseded callback that never polled
+    // `should_terminate()`.
+    //
+    // `portable` is then read back out of the store rather than recomputed, so
+    // the one-word claim and the findings printed beside it can never disagree.
+    let plugin = plugin_of(&package);
+    let diagnostics = compatibility_diagnostics(
+        &plugin,
+        &package,
+        &interpreter,
+        dependency.as_deref(),
+        declared,
+        obsolete_callback,
+        &undocumented,
+    );
     field(
         &mut report,
         "portable",
-        if dependency.is_some() { "false" } else { "true" },
+        if diagnostics.is_portable(&plugin) {
+            "true"
+        } else {
+            "false"
+        },
     );
     field(
         &mut report,
@@ -284,21 +325,6 @@ pub(crate) fn test_legacy_compat(args: &[String]) -> ExitCode {
     field(&mut report, "checks_unavailable", &unavailable.to_string());
     field(&mut report, "verdict", verdict);
 
-    // The §26.2 diagnostics store is fed nowhere else on a live path, so spec
-    // 26.2 ("CriKey should report…") and acceptance 31.29 are unmet in practice
-    // until it is fed here (Finding 5). Everything folded in is a fact this
-    // command already established: the profile it ran under, the package's own
-    // imports, the interpreter it resolved, and — from the conformance run — a
-    // superseded callback that never polled `should_terminate()`.
-    let plugin = plugin_of(&package);
-    let diagnostics = compatibility_diagnostics(
-        &plugin,
-        &package,
-        &interpreter,
-        dependency.as_deref(),
-        obsolete_callback,
-        &undocumented,
-    );
     render_diagnostics(&mut report, &diagnostics, &plugin);
     report.push_str(&detail_lines);
 
@@ -344,13 +370,24 @@ pub(crate) fn inspect_catalog(args: &[String]) -> ExitCode {
     field(&mut report, "items", &items.len().to_string());
 
     // Catalog inspection is the other place a legacy plugin's compatibility
-    // problems become visible to a developer, so it feeds the §26.2 store too
-    // (Finding 5). The import scan is best-effort here: an unreadable module
-    // must not turn `inspect-catalog` into a refusal.
+    // problems become visible to a developer, so it feeds the §26.2 store too.
+    // Both inputs are best-effort here: neither an unreadable module nor an
+    // unreadable corpus may turn `inspect-catalog` into a refusal, because this
+    // command prints no portability verdict that could be wrong without them.
     let plugin = plugin_of(&package);
     let dependency = scan_windows_only_dependency(&package).ok().flatten();
-    let diagnostics =
-        compatibility_diagnostics(&plugin, &package, &interpreter, dependency.as_deref(), None, &[]);
+    let declared = PluginCorpus::load(&workspace_root().join(CORPUS_PATH))
+        .ok()
+        .and_then(|corpus| declared_classification(&corpus, &package));
+    let diagnostics = compatibility_diagnostics(
+        &plugin,
+        &package,
+        &interpreter,
+        dependency.as_deref(),
+        declared,
+        None,
+        &[],
+    );
     render_diagnostics(&mut report, &diagnostics, &plugin);
     for (index, item) in items.iter().enumerate() {
         report.push_str(&item_line(index, item));
@@ -633,6 +670,21 @@ fn catalog_of(worker: &mut LegacyWorker, plugin: &PluginId) -> Result<Vec<Item>,
 // ---------------------------------------------------------------------------
 // Static portability scan (spec 14.12, acceptance 31.31)
 // ---------------------------------------------------------------------------
+
+/// The published corpus's classification of `package`, if the corpus references
+/// it (spec 27.4).
+///
+/// Matched on the package id, which is the corpus's own key. A package nobody
+/// has referenced yields `None` rather than `untested`: an absent entry is the
+/// absence of a classification, and reading it as one would file a finding
+/// about data that does not exist.
+fn declared_classification(corpus: &PluginCorpus, package: &LegacyPackage) -> Option<PluginClassification> {
+    corpus
+        .entries()
+        .iter()
+        .find(|entry| entry.id == package.id.as_str())
+        .map(|entry| entry.classification)
+}
 
 /// The Windows-only dependency this package declares, if any, named together
 /// with the module it was found in.
@@ -1706,6 +1758,7 @@ fn compatibility_diagnostics(
     package: &LegacyPackage,
     interpreter: &Interpreter,
     dependency: Option<&str>,
+    declared: Option<PluginClassification>,
     obsolete_callback: Option<CallbackObservation>,
     undocumented: &[(String, String)],
 ) -> LegacyDiagnostics {
@@ -1735,6 +1788,17 @@ fn compatibility_diagnostics(
                 detail: detail.to_owned(),
             },
         );
+    }
+
+    // The published classification (spec 27.4; acceptance 31.31). The corpus
+    // documents limitations no scan of this host can reproduce — a package that
+    // drives Core Audio through `comtypes`, or one blocked on APIs CriKey has
+    // not shipped — so without this the store would answer "portable" for a
+    // package the project itself has published as anything but. A portable
+    // classification, and a package the corpus does not reference, file
+    // nothing.
+    if let Some(classification) = declared {
+        diagnostics.observe_declared_classification(plugin, classification);
     }
 
     // Python version (spec 14.11): a legacy package declares no interpreter

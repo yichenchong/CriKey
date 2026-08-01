@@ -13,7 +13,12 @@
 //! entries and recursive root layouts stay for a later milestone. Launching
 //! runs a program directly and stops there: URI opening needs a portal or a
 //! session handler this backend does not have, so it -- and everything else
-//! -- keeps reporting itself unavailable (spec 18.2).
+//! without an implementation -- keeps reporting itself unavailable (spec 18.2).
+//!
+//! Global shortcuts and window control are reported against the detected
+//! session rather than in the abstract, because on Linux they are optional
+//! (spec 18.6) and the reason they are missing differs: a Wayland compositor
+//! withholds them, a headless unit has nothing to withhold.
 //!
 //! A root is only as trustworthy as whatever last wrote into it, so a
 //! candidate is stat checked and read through a cap before it is parsed:
@@ -32,12 +37,20 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use crikey_core::{CoreError, PlatformPath, Result};
 use crikey_platform::{
-    ApplicationDiscovery, Capability, CapabilityState, DiscoveredApplication, ProcessLauncher,
+    ApplicationDiscovery, Capability, CapabilityState, DiscoveredApplication, HotkeyService, ProcessLauncher,
+    WindowService,
 };
+
+pub mod hotkeys;
+pub mod window;
+
+pub use hotkeys::{x11_binding, X11HotkeyService, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_SUPER};
+pub use window::X11WindowService;
 
 /// The only group a launchable entry is read from.
 const DESKTOP_ENTRY_GROUP: &[u8] = b"Desktop Entry";
@@ -228,10 +241,68 @@ impl ProcessLauncher for CommandLauncher {
     }
 }
 
+/// How the running session presents itself, which decides what window control
+/// and global shortcuts can honestly be claimed (spec 18.2, 18.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopEnvironment {
+    /// An X11 server, where a client may grab keys and inspect other windows.
+    X11,
+    /// A Wayland compositor, which withholds both from ordinary clients.
+    Wayland,
+    /// No display server at all: a unit, a container or an SSH login.
+    Headless,
+}
+
+/// Names the session from the environment `get` describes.
+///
+/// The getter is injected rather than read from the process environment so
+/// that detection is a pure function: callers -- and tests -- decide what the
+/// session looks like, and nothing here can be perturbed by the ambient
+/// session a build happens to run in.
+///
+/// Order matters. A live socket outranks `XDG_SESSION_TYPE`, which is
+/// inherited across `su`, multiplexers and user units and routinely names a
+/// session that is no longer there. Between the two sockets Wayland wins:
+/// XWayland sets `DISPLAY` as a compatibility shim, so a set `DISPLAY` under a
+/// Wayland compositor would otherwise promise key grabs the compositor never
+/// delivers. An empty value is unset -- `DISPLAY=` is exactly what a stripped
+/// systemd unit hands a service -- so presence of the key alone proves
+/// nothing.
+pub fn detect_desktop_environment(get: impl Fn(&str) -> Option<String>) -> DesktopEnvironment {
+    let present = |key: &str| get(key).filter(|value| !value.is_empty());
+
+    if present("WAYLAND_DISPLAY").is_some() {
+        return DesktopEnvironment::Wayland;
+    }
+    if present("DISPLAY").is_some() {
+        return DesktopEnvironment::X11;
+    }
+    match present("XDG_SESSION_TYPE").as_deref() {
+        Some("wayland") => DesktopEnvironment::Wayland,
+        Some("x11") => DesktopEnvironment::X11,
+        // `tty` and friends positively state there is no display server, and
+        // an unrecognised value is not evidence that one exists.
+        _ => DesktopEnvironment::Headless,
+    }
+}
+
 #[derive(Debug)]
 pub struct LinuxBackend {
     applications: DesktopEntryScanner,
     processes: CommandLauncher,
+    desktop: DesktopEnvironment,
+    /// Connected on first use and cached: a connection is a side effect, and
+    /// the constructors are pure functions over their arguments.
+    window: OnceLock<Option<window::X11WindowService>>,
+    /// Connected on first use, like the window service, but held directly
+    /// rather than behind a `OnceLock`: [`HotkeyService`] registration takes
+    /// `&mut self`, which a shared cell cannot hand out.
+    hotkeys: Option<hotkeys::X11HotkeyService>,
+    /// The X server time of the last user action, written by the hotkey
+    /// reader and read by the window service so that an activation carries the
+    /// timestamp EWMH asks for. Shared here because it is the one thing the two
+    /// X connections have to agree about.
+    user_time: Arc<AtomicU32>,
 }
 
 impl LinuxBackend {
@@ -240,32 +311,83 @@ impl LinuxBackend {
 
     /// Discovers applications from the XDG base directories of the running
     /// user.
+    ///
+    /// The session is detected from the real process environment here, once,
+    /// at construction: a backend built for the running user should report the
+    /// session that user is actually in, and re-reading the environment on
+    /// every capability query would let a mid-run mutation change the answer a
+    /// plugin was already given.
     pub fn new() -> Self {
         Self::with_application_roots(xdg_application_roots())
     }
 
     /// Discovers applications from exactly these roots, highest precedence
-    /// first, instead of the XDG defaults.
+    /// first, instead of the XDG defaults. The session is still detected from
+    /// the process environment.
     pub fn with_application_roots(roots: Vec<PathBuf>) -> Self {
+        Self::build(
+            DesktopEntryScanner::new(roots),
+            detect_desktop_environment(|key| env::var(key).ok()),
+        )
+    }
+
+    /// Reports for `desktop` rather than for the session this process is in,
+    /// with the XDG application roots of the running user.
+    pub fn with_desktop_environment(desktop: DesktopEnvironment) -> Self {
+        Self::build(DesktopEntryScanner::new(xdg_application_roots()), desktop)
+    }
+
+    fn build(applications: DesktopEntryScanner, desktop: DesktopEnvironment) -> Self {
         Self {
-            applications: DesktopEntryScanner::new(roots),
+            applications,
             processes: CommandLauncher::new(),
+            desktop,
+            window: OnceLock::new(),
+            hotkeys: None,
+            user_time: Arc::new(AtomicU32::new(0)),
         }
     }
 
     /// Capability reporting is honest: a capability is claimed only once a
-    /// Linux implementation stands behind it (spec 18.2). The unimplemented
-    /// arms are listed one by one so that adding a capability to the enum
-    /// forces a deliberate answer here instead of inheriting a wildcard.
+    /// Linux implementation stands behind it *and* the session can carry it
+    /// (spec 18.2). The unimplemented arms are listed one by one so that adding
+    /// a capability to the enum forces a deliberate answer here instead of
+    /// inheriting a wildcard.
+    ///
+    /// Window control and global shortcuts are the session-dependent three
+    /// (spec 18.6). Under Wayland they report
+    /// [`CapabilityState::UnsupportedDesktopEnvironment`] rather than
+    /// [`CapabilityState::Unavailable`], because the two say different things
+    /// to a plugin author: the first is "this session does not offer it", which
+    /// is a fact about the compositor and not a CriKey defect to report or a
+    /// permission prompt away.
+    ///
+    /// The two window capabilities are [`CapabilityState::Partial`] under X11
+    /// rather than `Available`, and the difference is not hedging. This function
+    /// is a pure function of the detected session, deliberately: it must not
+    /// open a display to answer. But window control additionally needs an EWMH
+    /// *window manager*, which is a separate program that may not be running --
+    /// on a bare X server [`Self::window_service`] hands out nothing. "The
+    /// session type supports it, subject to a runtime gate" is exactly what
+    /// `Partial` says, and it is the strongest claim this function can back.
+    /// Global shortcuts stay `Available`: `GrabKey` is core protocol, so an X11
+    /// display with no window manager still delivers them.
     pub fn capability(&self, capability: Capability) -> CapabilityState {
         match capability {
             Capability::ApplicationDiscovery | Capability::ProcessLaunch => CapabilityState::Available,
+            Capability::GlobalHotkeys => match self.desktop {
+                DesktopEnvironment::X11 => CapabilityState::Available,
+                DesktopEnvironment::Wayland => CapabilityState::UnsupportedDesktopEnvironment,
+                DesktopEnvironment::Headless => CapabilityState::Unavailable,
+            },
+            Capability::WindowEnumeration | Capability::WindowActivation => match self.desktop {
+                DesktopEnvironment::X11 => CapabilityState::Partial,
+                DesktopEnvironment::Wayland => CapabilityState::UnsupportedDesktopEnvironment,
+                DesktopEnvironment::Headless => CapabilityState::Unavailable,
+            },
             Capability::FileSearch
             | Capability::Clipboard
-            | Capability::GlobalHotkeys
             | Capability::UriOpen
-            | Capability::WindowEnumeration
-            | Capability::WindowActivation
             | Capability::Notifications
             | Capability::Icons
             | Capability::FileWatching
@@ -282,6 +404,61 @@ impl LinuxBackend {
     /// The launcher behind [`Capability::ProcessLaunch`].
     pub fn process_launcher(&self) -> &dyn ProcessLauncher {
         &self.processes
+    }
+
+    /// The service behind [`Capability::WindowEnumeration`] and
+    /// [`Capability::WindowActivation`], or `None` when this session cannot
+    /// carry it.
+    ///
+    /// `None` for a non-X11 session without touching a display, and `None` in
+    /// an X11 session that fails the EWMH handshake: that per-server gate is
+    /// why [`Self::capability`] answers [`CapabilityState::Partial`] under X11
+    /// rather than `Available`. Connecting once and caching keeps a repeated
+    /// call from reconnecting; the cell is a `OnceLock` rather than a
+    /// `LazyLock` because the connection must not happen until a caller asks
+    /// for it, and a constructor stays free of that side effect.
+    pub fn window_service(&self) -> Option<&dyn WindowService> {
+        if self.desktop != DesktopEnvironment::X11 {
+            return None;
+        }
+        let user_time = Arc::clone(&self.user_time);
+        self.window
+            .get_or_init(move || window::X11WindowService::connect_sharing(None, user_time).ok())
+            .as_ref()
+            .map(|service| service as &dyn WindowService)
+    }
+
+    /// The service behind [`Capability::GlobalHotkeys`], connecting on first
+    /// use.
+    ///
+    /// `&mut` all the way down because [`HotkeyService::register`] is: a grab is
+    /// exclusive server state, and two callers taking one concurrently is not a
+    /// thing this backend should make expressible.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Invalid`] naming the session when it is not X11 -- a
+    /// compositor or a headless unit has no `GrabKey` to offer -- and the
+    /// connection's own refusal when the display will not carry a service. The
+    /// failure is never softened into a service that swallows registrations.
+    pub fn hotkeys(&mut self) -> Result<&mut dyn HotkeyService> {
+        if self.desktop != DesktopEnvironment::X11 {
+            return Err(CoreError::Invalid(format!(
+                "global hotkeys need an X11 session; this one is {:?}, which offers no GrabKey",
+                self.desktop
+            )));
+        }
+        if self.hotkeys.is_none() {
+            self.hotkeys = Some(hotkeys::X11HotkeyService::connect_sharing(
+                None,
+                Arc::clone(&self.user_time),
+            )?);
+        }
+        let service = self
+            .hotkeys
+            .as_mut()
+            .expect("the hotkey service was just connected");
+        Ok(service)
     }
 }
 

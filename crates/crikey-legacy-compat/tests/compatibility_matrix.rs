@@ -347,6 +347,11 @@ const REPORT_KEYS: &[&str] = &[
     "corpus_works_only_under_legacy_optimized",
     "corpus_requires_legacy_strict",
     "corpus_untested",
+    // The two portability totals of acceptance 31.31. Folded out of
+    // `PluginClassification::is_portable` rather than out of a slug, so they are
+    // listed literally instead of derived from `ALL` below.
+    "corpus_portable",
+    "corpus_not_portable",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1200,6 +1205,8 @@ fn the_report_renders_the_agreed_keys_in_a_fixed_order() {
             .iter()
             .map(|c| format!("corpus_{}", c.slug().replace('-', "_"))),
     );
+    derived.push("corpus_portable".to_string());
+    derived.push("corpus_not_portable".to_string());
     assert_eq!(
         derived, REPORT_KEYS,
         "the report keys must stay mechanically derivable from ApiSupport::ALL and PluginClassification::ALL"

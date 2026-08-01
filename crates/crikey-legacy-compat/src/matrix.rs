@@ -117,6 +117,38 @@ impl PluginClassification {
         }
     }
 
+    /// Whether a package with this classification may be presented as
+    /// cross-platform (acceptance 31.31).
+    ///
+    /// True only for the classifications that *assert* the package runs off
+    /// Windows. Three groups are deliberately excluded, and each exclusion is
+    /// load-bearing:
+    ///
+    /// * `windows-only-but-compatible` is the state acceptance 31.31 names: the
+    ///   package works, on Windows, and saying otherwise is the exact
+    ///   misrepresentation the criterion forbids.
+    /// * The `blocked-*` states describe a package that runs nowhere. "Not
+    ///   portable" is the weaker of the two true statements about it, and a
+    ///   portable verdict would be false on every platform including Windows.
+    /// * `untested` is an absence of evidence. A package that has never been
+    ///   exercised has demonstrated nothing, so reading it as portable would
+    ///   let coverage gaps advertise themselves as cross-platform support —
+    ///   portability is a claim that must be earned, never defaulted into.
+    pub fn is_portable(self) -> bool {
+        match self {
+            Self::WorksUnchanged
+            | Self::WorksWithConfigurationChanges
+            | Self::WorksWithMinimalSourceChanges
+            | Self::WorksOnlyUnderLegacyOptimized
+            | Self::RequiresLegacyStrict => true,
+            Self::WindowsOnlyButCompatible
+            | Self::BlockedMissingApis
+            | Self::BlockedPythonVersion
+            | Self::BlockedUndocumentedBehaviour
+            | Self::Untested => false,
+        }
+    }
+
     /// Total and case-sensitive: an unknown spelling is `None`, never a
     /// silently defaulted classification.
     pub fn parse_slug(slug: &str) -> Option<Self> {
@@ -534,6 +566,7 @@ pub struct CompatibilityReport {
     matrix_counts: [usize; ApiSupport::ALL.len()],
     corpus_total: usize,
     corpus_counts: [usize; PluginClassification::ALL.len()],
+    corpus_portable: usize,
 }
 
 impl CompatibilityReport {
@@ -548,11 +581,18 @@ impl CompatibilityReport {
             *slot = corpus.count(class);
         }
 
+        let corpus_portable = corpus
+            .entries()
+            .iter()
+            .filter(|entry| entry.classification.is_portable())
+            .count();
+
         Self {
             matrix_total: matrix.entries().len(),
             matrix_counts,
             corpus_total: corpus.entries().len(),
             corpus_counts,
+            corpus_portable,
         }
     }
 
@@ -564,6 +604,22 @@ impl CompatibilityReport {
     /// Total referenced packages.
     pub fn corpus_total(&self) -> usize {
         self.corpus_total
+    }
+
+    /// Packages whose classification permits a cross-platform claim
+    /// (acceptance 31.31).
+    ///
+    /// Folded out of [`PluginClassification::is_portable`] rather than counted
+    /// by hand, so a classification that stops asserting off-Windows operation
+    /// moves this number without anyone remembering to.
+    pub fn corpus_portable(&self) -> usize {
+        self.corpus_portable
+    }
+
+    /// Packages that may not be presented as cross-platform: the Windows-only
+    /// ones, the blocked ones, and the ones nobody has exercised.
+    pub fn corpus_not_portable(&self) -> usize {
+        self.corpus_total - self.corpus_portable
     }
 
     /// APIs classified `status`.
@@ -600,6 +656,12 @@ impl CompatibilityReport {
         for (class, count) in PluginClassification::ALL.into_iter().zip(self.corpus_counts) {
             push_prefixed_count(&mut out, "corpus_", class.slug(), count);
         }
+        // The two portability totals close the report on the question
+        // acceptance 31.31 actually asks. Without them a reader has to know
+        // which of the ten classifications assert off-Windows operation, and a
+        // reader who guesses wrong reads a Windows-only package as portable.
+        push_count(&mut out, "corpus_portable", self.corpus_portable);
+        push_count(&mut out, "corpus_not_portable", self.corpus_not_portable());
         out
     }
 }

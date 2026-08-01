@@ -1,5 +1,12 @@
 //! Plugin supervision (spec 5.2, 13, 24).
 
+mod concurrency;
+
+pub use concurrency::{
+    BudgetGuard, BudgetKind, ConcurrencyBudget, OwnedBudgetGuard, DEFAULT_ACTION_BUDGET,
+    DEFAULT_BACKGROUND_BUDGET, DEFAULT_CATALOG_BUDGET, DEFAULT_SUGGESTION_BUDGET,
+};
+
 use std::{collections::HashMap, fmt, time::Duration};
 
 use crikey_core::PluginId;
@@ -67,6 +74,10 @@ pub struct PluginHealth {
     pub cancellations_ignored: u64,
     pub stale_results_rejected: u64,
     pub obsolete_requests_dropped: u64,
+    /// Units of work refused because the plugin was already at its declared
+    /// `[concurrency]` limit (spec 13.5). A throttled plugin looks broken from
+    /// the outside, so the refusal is a first-class diagnostic.
+    pub concurrency_refusals: u64,
     pub queue_depth: u32,
     pub average_latency_ms: u64,
     pub peak_latency_ms: u64,
@@ -432,6 +443,15 @@ impl MemorySupervisor {
     pub fn record_obsolete_request_dropped(&mut self, plugin: &PluginId, delta: u64) -> Result<()> {
         let health = &mut self.record_mut(plugin)?.health;
         health.obsolete_requests_dropped = health.obsolete_requests_dropped.saturating_add(delta);
+        Ok(())
+    }
+
+    /// Records `delta` units of work refused by the plugin's concurrency
+    /// budget. Legal in any state: admission is decided before a worker is
+    /// consulted, so a refusal is not a lifecycle transition.
+    pub fn record_concurrency_refusal(&mut self, plugin: &PluginId, delta: u64) -> Result<()> {
+        let health = &mut self.record_mut(plugin)?.health;
+        health.concurrency_refusals = health.concurrency_refusals.saturating_add(delta);
         Ok(())
     }
 

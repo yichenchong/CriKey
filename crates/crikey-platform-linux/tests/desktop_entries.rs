@@ -31,7 +31,7 @@ use std::thread;
 use std::time::Duration;
 
 use crikey_platform::{ApplicationDiscovery, Capability, CapabilityState, DiscoveredApplication};
-use crikey_platform_linux::{DesktopEntryScanner, LinuxBackend};
+use crikey_platform_linux::{DesktopEntryScanner, DesktopEnvironment, LinuxBackend};
 
 const FIREFOX: &str = "[Desktop Entry]
 Type=Application
@@ -635,34 +635,69 @@ fn the_linux_backend_reports_application_discovery_as_available() {
     );
 }
 
+/// Nothing without a Linux implementation is ever claimed, and the three
+/// session-dependent capabilities answer for the session they were built for.
+///
+/// Built through `with_desktop_environment` rather than `new()`, because
+/// capability reporting is session aware: asserting one blanket answer would
+/// pass on a headless runner and fail under X11, which makes the assertion a
+/// statement about the runner instead of about the backend.
 #[test]
 fn capabilities_without_a_linux_implementation_report_unavailable() {
-    let scratch = Scratch::new();
-    let backends = [
-        LinuxBackend::new(),
-        LinuxBackend::with_application_roots(vec![scratch.root("applications")]),
-    ];
     let unimplemented = [
         Capability::FileSearch,
         Capability::Clipboard,
-        Capability::GlobalHotkeys,
         Capability::UriOpen,
-        Capability::WindowEnumeration,
-        Capability::WindowActivation,
         Capability::Notifications,
         Capability::Icons,
         Capability::FileWatching,
         Capability::SecretStorage,
         Capability::ShellIntegration,
     ];
+    // Global shortcuts rest on X11 `GrabKey` alone; window control additionally
+    // needs an EWMH window manager, which the session label cannot promise, so
+    // X11 claims it only as `Partial` (spec 18.2, 18.6).
+    let hotkeys_only = [Capability::GlobalHotkeys];
+    let window_control = [Capability::WindowEnumeration, Capability::WindowActivation];
 
-    for backend in &backends {
+    for (environment, expected_hotkeys, expected_windows) in [
+        (
+            DesktopEnvironment::X11,
+            CapabilityState::Available,
+            CapabilityState::Partial,
+        ),
+        (
+            DesktopEnvironment::Wayland,
+            CapabilityState::UnsupportedDesktopEnvironment,
+            CapabilityState::UnsupportedDesktopEnvironment,
+        ),
+        (
+            DesktopEnvironment::Headless,
+            CapabilityState::Unavailable,
+            CapabilityState::Unavailable,
+        ),
+    ] {
+        let backend = LinuxBackend::with_desktop_environment(environment);
         for capability in unimplemented {
             assert_eq!(
                 backend.capability(capability),
                 CapabilityState::Unavailable,
-                "{capability:?} has no Linux implementation yet and must not be claimed (spec 18.2)"
+                "{capability:?} has no Linux implementation yet and must not be claimed under \
+                 {environment:?} (spec 18.2)"
             );
+        }
+        for (group, expected) in [
+            (&hotkeys_only[..], expected_hotkeys),
+            (&window_control[..], expected_windows),
+        ] {
+            for &capability in group {
+                assert_eq!(
+                    backend.capability(capability),
+                    expected,
+                    "{capability:?} under {environment:?} must report what that session can actually \
+                     deliver (spec 18.2, 18.6)"
+                );
+            }
         }
     }
 }

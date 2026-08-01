@@ -61,15 +61,17 @@ use crikey_package_manager::{
     resolve, EnvironmentInputs, EnvironmentStore, ImportPath, MaterializedEnvironment, PackageIndex,
 };
 use crikey_python_host::{
-    discover_interpreter, discover_interpreter_in, sdk_root, BatchState, DiscoveryEnvironment, HostError,
-    Interpreter, ModernWorker, RequiresPython, RuntimeProfile, SuggestRequest, Suggestions, WorkerOptions,
-    WorkerPool,
+    discover_interpreter, discover_interpreter_in, sdk_root, BatchState, DiscoveryEnvironment, Interpreter,
+    ModernWorker, RequiresPython, RuntimeProfile, SuggestRequest, Suggestions, WorkerOptions, WorkerPool,
 };
 
 // Only the stand-in-interpreter tests name these, and synthesising a stand-in
 // needs a POSIX executable bit, so those tests and this import are `#[cfg(unix)]`.
+// `HostError` joins them because the only match on it is in that same
+// requires-python test, and an unconditional import is an unused-import error
+// on Windows under `-D warnings`.
 #[cfg(unix)]
-use crikey_python_host::{InterpreterSource, PythonVersion};
+use crikey_python_host::{HostError, InterpreterSource, PythonVersion};
 
 // ---------------------------------------------------------------------------
 // Bounds

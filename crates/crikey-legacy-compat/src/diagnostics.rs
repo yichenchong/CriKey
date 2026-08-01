@@ -46,7 +46,7 @@ use std::fmt;
 use crikey_core::PluginId;
 use crikey_input_scheduler::SchedulingProfile;
 
-use crate::{ApiSupport, LegacyCallback, PythonVersion, MINIMUM_SUPPORTED_PYTHON};
+use crate::{ApiSupport, LegacyCallback, PluginClassification, PythonVersion, MINIMUM_SUPPORTED_PYTHON};
 
 /// How much a finding matters, ordered so a report can be filtered with `>=`.
 ///
@@ -214,6 +214,17 @@ pub enum CompatibilityIssue {
     /// share of it and `dropped` findings were lost. Without this, an empty
     /// report and a truncated one would look the same.
     DiagnosticsOverflow { dropped: u64 },
+    /// Spec 27.4 / acceptance 31.31: the published corpus classifies this
+    /// package in a state that does not permit a cross-platform claim.
+    ///
+    /// Distinct from [`Self::WindowsOnlyDependency`], which is a claim about a
+    /// named Win32 entry point and is owed real Win32 evidence. Three quite
+    /// different situations withhold a portability claim — a package that is
+    /// Windows-only by its own dependencies, one that is blocked everywhere,
+    /// and one nobody has exercised — and only the first is about Windows at
+    /// all. Carrying the classification keeps the message, the severity and the
+    /// suggestion derived from what the corpus actually says.
+    DeclaredNonPortable { classification: PluginClassification },
 }
 
 impl CompatibilityIssue {
@@ -234,13 +245,17 @@ impl CompatibilityIssue {
             Self::SchedulingProfileReported { .. } => "scheduling-profile",
             Self::LongCallbackWithoutTerminationCheck { .. } => "long-callback-without-termination-check",
             Self::DiagnosticsOverflow { .. } => "diagnostics-overflow",
+            Self::DeclaredNonPortable { .. } => "declared-non-portable",
         }
     }
 
     /// Whether a plugin carrying this finding may still be advertised as
     /// cross-platform (acceptance 31.31).
     fn is_portable(&self) -> bool {
-        !matches!(self, Self::WindowsOnlyDependency { .. })
+        !matches!(
+            self,
+            Self::WindowsOnlyDependency { .. } | Self::DeclaredNonPortable { .. }
+        )
     }
 
     /// Clamp every retained string to `max_chars`, marking the cut with `…`.
@@ -277,6 +292,7 @@ impl CompatibilityIssue {
             Self::PythonVersionIncompatible { .. }
             | Self::SchedulingProfileReported { .. }
             | Self::LongCallbackWithoutTerminationCheck { .. }
+            | Self::DeclaredNonPortable { .. }
             | Self::DiagnosticsOverflow { .. } => {}
         }
     }
@@ -373,6 +389,11 @@ impl CompatibilityWarning {
                 "{dropped} further compatibility findings for this plugin were dropped after it \
                  exhausted its diagnostics budget"
             ),
+            CompatibilityIssue::DeclaredNonPortable { classification } => format!(
+                "the published corpus classifies this package `{classification}` (spec 27.4), \
+                 which does not permit a cross-platform claim: {}",
+                declared_reason(*classification)
+            ),
         }
     }
 
@@ -422,6 +443,9 @@ impl CompatibilityWarning {
                 "poll `should_terminate()` inside the long-running loop in `{callback}` and \
                      return promptly once it is set (spec 9.4)"
             )),
+            CompatibilityIssue::DeclaredNonPortable { classification } => {
+                declared_suggestion(*classification).map(str::to_owned)
+            }
             CompatibilityIssue::SchedulingProfileReported { .. }
             | CompatibilityIssue::DiagnosticsOverflow { .. } => None,
         }
@@ -452,8 +476,99 @@ impl CompatibilityWarning {
             | CompatibilityIssue::LongCallbackWithoutTerminationCheck { .. }
             // Losing diagnostics is real, but it is the host's problem.
             | CompatibilityIssue::DiagnosticsOverflow { .. } => Severity::Warning,
+            // A declared classification is as serious as what it declares: a
+            // package blocked on every platform cannot run, one that is
+            // Windows-only runs somewhere, and one nobody has audited is a
+            // coverage gap rather than a defect. Collapsing the three into one
+            // weight would either cry wolf over `untested` or bury a package
+            // that loads nowhere.
+            CompatibilityIssue::DeclaredNonPortable { classification } => match classification {
+                PluginClassification::BlockedMissingApis
+                | PluginClassification::BlockedPythonVersion
+                | PluginClassification::BlockedUndocumentedBehaviour => Severity::Blocking,
+                PluginClassification::WindowsOnlyButCompatible => Severity::Warning,
+                // `untested` is an absence of evidence. The remaining spellings
+                // are portable and never reach this variant through
+                // `observe_declared_classification`; if one is constructed by
+                // hand, reporting it as an observation rather than a defect is
+                // the honest reading of a state that asserts nothing wrong.
+                PluginClassification::Untested
+                | PluginClassification::WorksUnchanged
+                | PluginClassification::WorksWithConfigurationChanges
+                | PluginClassification::WorksWithMinimalSourceChanges
+                | PluginClassification::WorksOnlyUnderLegacyOptimized
+                | PluginClassification::RequiresLegacyStrict => Severity::Info,
+            },
             CompatibilityIssue::SchedulingProfileReported { .. } => Severity::Info,
         }
+    }
+}
+
+/// Why `classification` withholds a cross-platform claim, as the clause that
+/// completes [`CompatibilityWarning::message`].
+///
+/// One sentence per reason rather than one per state, because the reasons are
+/// what differ: naming a Win32 dependency for a package that is blocked on
+/// unimplemented APIs would send a developer looking for Windows code that is
+/// not there.
+fn declared_reason(classification: PluginClassification) -> &'static str {
+    match classification {
+        PluginClassification::WindowsOnlyButCompatible => {
+            "the package depends on Windows itself, which is a property of the package rather \
+             than a gap in the compatibility layer"
+        }
+        PluginClassification::BlockedMissingApis => {
+            "the package is blocked on legacy APIs CriKey has not implemented, so it runs on no \
+             platform yet"
+        }
+        PluginClassification::BlockedPythonVersion => {
+            "the package requires an interpreter CriKey does not support, so it runs on no \
+             platform yet"
+        }
+        PluginClassification::BlockedUndocumentedBehaviour => {
+            "the package relies on undocumented Keypirinha behaviour CriKey does not reproduce, \
+             so it runs on no platform yet"
+        }
+        PluginClassification::Untested => {
+            "the package has never been exercised, and portability is a claim that must be \
+             earned rather than defaulted into"
+        }
+        // Unreachable through `observe_declared_classification`, which files
+        // nothing for a portable state; total rather than a panic because a
+        // diagnostics store may never abort a report over its own input.
+        PluginClassification::WorksUnchanged
+        | PluginClassification::WorksWithConfigurationChanges
+        | PluginClassification::WorksWithMinimalSourceChanges
+        | PluginClassification::WorksOnlyUnderLegacyOptimized
+        | PluginClassification::RequiresLegacyStrict => {
+            "no reason is recorded: this classification does permit a cross-platform claim"
+        }
+    }
+}
+
+/// The action that would resolve a declared classification, where one exists.
+///
+/// `untested` has none: no source change makes an unaudited package audited,
+/// and the work belongs to whoever maintains the corpus. The portable spellings
+/// have none because there is nothing to resolve.
+fn declared_suggestion(classification: PluginClassification) -> Option<&'static str> {
+    match classification {
+        PluginClassification::WindowsOnlyButCompatible => Some(
+            "provide a non-Windows path for the package's own platform dependency, or keep it \
+             declared Windows-only and never advertise it as portable",
+        ),
+        PluginClassification::BlockedMissingApis
+        | PluginClassification::BlockedPythonVersion
+        | PluginClassification::BlockedUndocumentedBehaviour => Some(
+            "the corpus entry's notes name what blocks this package; resolve that and re-audit \
+             it at a new pinned revision (spec 27.4)",
+        ),
+        PluginClassification::Untested
+        | PluginClassification::WorksUnchanged
+        | PluginClassification::WorksWithConfigurationChanges
+        | PluginClassification::WorksWithMinimalSourceChanges
+        | PluginClassification::WorksOnlyUnderLegacyOptimized
+        | PluginClassification::RequiresLegacyStrict => None,
     }
 }
 
@@ -675,6 +790,42 @@ impl LegacyDiagnostics {
         })
     }
 
+    /// Fold in the classification the published corpus already declares for
+    /// `owner`, independently of anything this host observed (spec 27.4;
+    /// acceptance 31.31).
+    ///
+    /// Every other `observe_*` entry point folds in something that *happened*.
+    /// This one exists because acceptance 31.31 is violated by nothing
+    /// happening: [`Self::is_portable`] answers over the findings on file, so a
+    /// package the corpus documents as Windows-only would read as portable on
+    /// any host that simply never ran its Win32 branch — a cross-platform claim
+    /// obtained by not looking. Folding the declaration in makes the documented
+    /// limitation reach the verdict on its own.
+    ///
+    /// A classification that permits a cross-platform claim files nothing
+    /// ([`Recorded::Clean`]): a report that invents findings for healthy
+    /// packages is a report developers learn to skip.
+    pub fn observe_declared_classification(
+        &mut self,
+        owner: &PluginId,
+        classification: PluginClassification,
+    ) -> Recorded {
+        if classification.is_portable() {
+            return Recorded::Clean;
+        }
+        // Filed under its own code, never as a Win32 dependency. Only one of
+        // the non-portable states is about Windows at all, and the corpus's
+        // Windows-only packages reach Win32 through their own bundled COM,
+        // `ctypes` and `sc.exe` rather than through `keypirinha_wintypes` — so
+        // naming that module here would be a §14.12 diagnostic about a
+        // dependency the package does not have. `windows-only-dependency` stays
+        // reserved for an entry point somebody actually observed or matched.
+        self.report(CompatibilityWarning {
+            plugin: owner.clone(),
+            issue: CompatibilityIssue::DeclaredNonPortable { classification },
+        })
+    }
+
     /// Everything held for `owner`, in first-occurrence order.
     ///
     /// Stable ordering is what lets two runs of the same plugin be diffed. An
@@ -695,9 +846,10 @@ impl LegacyDiagnostics {
 
     /// Whether `owner` may be advertised as cross-platform (acceptance 31.31).
     ///
-    /// Per plugin, and false only for a Windows-only dependency: the other
-    /// findings are bad but platform-neutral, and one plugin needing Win32 says
-    /// nothing about the plugins loaded beside it.
+    /// Per plugin, and false only for an observed Windows-only dependency or a
+    /// declared non-portable classification: the other findings are bad but
+    /// platform-neutral, and one plugin's limitation says nothing about the
+    /// plugins loaded beside it.
     pub fn is_portable(&self, owner: &PluginId) -> bool {
         self.warnings_for(owner)
             .iter()

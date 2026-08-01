@@ -258,6 +258,15 @@ const CORPUS_CLASSES: [&str; 10] = [
     "corpus_untested",
 ];
 
+/// A corpus package `corpus.toml` classifies `windows-only-but-compatible`.
+///
+/// Pinned rather than looked up: this id is borrowed by the test below to prove
+/// the published classification reaches the `portable` field, and a lookup that
+/// followed the data would keep passing after the data stopped saying it.
+/// Its Windows dependency is bundled Core Audio COM driven through `comtypes`,
+/// which no `keypirinha_wintypes` import scan can ever see.
+const DECLARED_WINDOWS_ONLY_PACKAGE: &str = "armotic.keypirinha-audioswitcher";
+
 // ---------------------------------------------------------------------------
 // Running the binary
 // ---------------------------------------------------------------------------
@@ -1240,6 +1249,89 @@ fn a_windows_only_package_is_reported_honestly_and_never_as_portable() {
         "acceptance 31.31: a package that needs Win32 must never be presented as \
          cross-platform, on any host{run}"
     );
+}
+
+/// A package the published corpus documents as Windows-only is never reported
+/// portable, even though nothing on this host can observe its Win32 access.
+///
+/// The conforming fixture is copied under the corpus id so the command loads a
+/// package that is, by every static signal it can read, perfectly portable: it
+/// imports no `keypirinha_wintypes` and reaches no Win32 entry point. The only
+/// evidence that it must not be advertised as cross-platform is the
+/// classification `corpus.toml` publishes, so this is the test that the corpus
+/// actually reaches the `portable` field rather than sitting in a data file
+/// nothing consults (spec 27.4, acceptance 31.31).
+#[test]
+fn a_package_the_corpus_documents_as_windows_only_is_never_reported_portable() {
+    let scratch = Scratch::new("declared-windows-only");
+    let package = scratch.directory(DECLARED_WINDOWS_ONLY_PACKAGE);
+    copy_tree(
+        &workspace_root()
+            .join("compatibility/test-plugins")
+            .join(CONFORMING),
+        Path::new(&package),
+    );
+
+    let run = run(&["dev", "test-legacy-compat", "--package", &package]);
+    let records = parse(&run);
+    let summary = summary(&records, &run);
+
+    assert_eq!(
+        field(&summary, "package_id", &run),
+        DECLARED_WINDOWS_ONLY_PACKAGE,
+        "the copied package must load under the corpus id, or this test proves nothing{run}"
+    );
+    let declared = check_named(&records, "windows_only_dependencies_declared", &run);
+    assert_eq!(
+        declared.need("result", &run),
+        "pass",
+        "precondition: the package declares no Win32 dependency, which is exactly the state in \
+         which the corpus has to be what refuses the portable verdict{run}"
+    );
+    assert_eq!(
+        field(&summary, "portable", &run),
+        "false",
+        "acceptance 31.31: a package the corpus publishes as Windows-only must never be reported \
+         as cross-platform, however little this host observed{run}"
+    );
+
+    let finding = decode(field(&summary, "warning.declared-non-portable.message", &run));
+    assert!(
+        finding.contains("windows-only-but-compatible"),
+        "the finding must name the classification it came from; got {finding:?}{run}"
+    );
+    assert!(
+        !summary.contains_key("warning.windows-only-dependency.message"),
+        "the package imports no `keypirinha_wintypes`, so no §14.12 Win32-dependency diagnostic \
+         may be filed against it{run}"
+    );
+}
+
+/// Copies every file and directory under `source` into `destination`.
+///
+/// Depth is bounded by the fixture, which is a handful of files and one `data`
+/// directory; a failure panics rather than being skipped, because a test that
+/// silently ran against an empty package would be green for the wrong reason.
+fn copy_tree(source: &Path, destination: &Path) {
+    let entries =
+        fs::read_dir(source).unwrap_or_else(|error| panic!("could not read {}: {error}", source.display()));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| panic!("could not read {}: {error}", source.display()));
+        let target = destination.join(entry.file_name());
+        if entry.path().is_dir() {
+            fs::create_dir_all(&target)
+                .unwrap_or_else(|error| panic!("could not create {}: {error}", target.display()));
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap_or_else(|error| {
+                panic!(
+                    "could not copy {} to {}: {error}",
+                    entry.path().display(),
+                    target.display()
+                )
+            });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

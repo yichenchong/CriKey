@@ -18,6 +18,12 @@ use crikey_core::{
     PlatformPath, PluginId, Result,
 };
 
+mod bundle;
+pub mod window;
+
+pub use bundle::{bundle_display_name, parse_info_plist, AppBundle};
+pub use window::{WindowHandle, WindowInfo, WindowService};
+
 /// Optional platform capabilities and their availability (spec 18.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {

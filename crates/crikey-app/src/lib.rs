@@ -13,6 +13,7 @@ mod legacy_provider;
 mod modern_provider;
 mod native_provider;
 mod query_pipeline;
+mod startup_recovery;
 
 pub use crikey_result_aggregator::{
     BatchPriority, BatchState, DrainBudget, DrainReport, InboundBatch, IntakePolicy, MergedBatch,
@@ -23,6 +24,7 @@ pub use legacy_provider::{LegacyDriver, LegacyProvider, LegacyUnavailable, Legac
 pub use modern_provider::{ModernDriver, ModernProvider, ModernUnavailable};
 pub use native_provider::{NativeDriver, NativeProvider, NativeUnavailable};
 pub use query_pipeline::{PipelineConfig, PipelineError, PipelineTick, QueryPipeline};
+pub use startup_recovery::{admitted_plugin_roots, StartupJournal, StartupMode, SAFE_MODE_AFTER_FAILURES};
 
 use std::{
     cmp::{Ordering, Reverse},
@@ -37,10 +39,10 @@ use crikey_core::{
     Result as CoreResult,
 };
 use crikey_input_scheduler::SchedulingProfile;
+use crikey_platform::{
+    application_arguments, application_items, decode_target, APPLICATION_LAUNCH_ACTION_ID,
+};
 #[cfg(any(windows, target_os = "linux"))]
-use crikey_platform::application_items;
-use crikey_platform::{application_arguments, decode_target, APPLICATION_LAUNCH_ACTION_ID};
-#[cfg(windows)]
 use crikey_platform::{HotkeyActivationHandler, HotkeyBinding};
 use crikey_query::{
     DefaultMatcher, DefaultNormalizer, MatchMethod, MatchOutcome, NormalizedQuery, Normalizer, PreparedLabel,
@@ -127,7 +129,6 @@ impl StartupStage {
 
 #[derive(Debug)]
 pub struct App {
-    #[cfg(any(windows, target_os = "linux"))]
     backend: Backend,
     generations: GenerationTracker,
     limits: ResultLimits,
@@ -145,7 +146,6 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         Self {
-            #[cfg(any(windows, target_os = "linux"))]
             backend: Backend::new(),
             generations: GenerationTracker::new(),
             limits: ResultLimits::default(),
@@ -248,24 +248,21 @@ impl App {
     /// Discovers the current platform's applications and maps them into one
     /// catalog slice owned by `plugin`.
     pub fn discover_application_items(&self, plugin: &PluginId) -> CoreResult<Vec<Item>> {
-        #[cfg(any(windows, target_os = "linux"))]
-        {
-            let discovered = self.backend.application_discovery().discover()?;
-            Ok(application_items(plugin, &discovered))
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let _ = plugin;
-            Err(crikey_core::CoreError::Invalid(
-                "application discovery is unavailable on the macOS backend".to_owned(),
-            ))
-        }
+        let discovered = self.backend.application_discovery().discover()?;
+        Ok(application_items(plugin, &discovered))
     }
 
-    /// Registers the Windows activation shortcut and connects it to the native
-    /// UI loop's wake-up callback.
-    #[cfg(windows)]
+    /// Registers the activation shortcut and connects it to the native UI
+    /// loop's wake-up callback.
+    ///
+    /// Compiled for the targets whose backend has a real global-shortcut
+    /// implementation behind [`Capability::GlobalHotkeys`]: Win32
+    /// `RegisterHotKey` and X11 `GrabKey`. A target without one has no method
+    /// here at all, so a host that calls it fails to build rather than being
+    /// handed a shortcut nothing can deliver.
+    ///
+    /// [`Capability::GlobalHotkeys`]: crikey_platform::Capability::GlobalHotkeys
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn register_activation_hotkey(
         &mut self,
         accelerator: &str,
@@ -274,7 +271,12 @@ impl App {
         let binding = HotkeyBinding {
             accelerator: accelerator.to_owned(),
         };
+        // The Windows backend always has a service; the Linux one has to reach
+        // an X display first, and says so when it cannot.
+        #[cfg(windows)]
         let hotkeys = self.backend.hotkeys();
+        #[cfg(target_os = "linux")]
+        let hotkeys = self.backend.hotkeys()?;
         hotkeys.set_activation_handler(Some(handler));
         if let Err(error) = hotkeys.register(&binding) {
             hotkeys.set_activation_handler(None);
@@ -288,19 +290,7 @@ impl App {
             crikey_core::CoreError::Invalid(format!("invalid application target: {error}"))
         })?;
         let arguments = application_arguments(item)?;
-
-        #[cfg(any(windows, target_os = "linux"))]
-        {
-            self.backend.process_launcher().launch(&target, &arguments)
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let _ = (target, arguments);
-            Err(crikey_core::CoreError::Invalid(
-                "process launching is unavailable on the macOS backend".to_owned(),
-            ))
-        }
+        self.backend.process_launcher().launch(&target, &arguments)
     }
 
     /// Name of the platform backend compiled into this build.
@@ -548,8 +538,8 @@ impl SearchService {
         self.app.discover_application_items(plugin)
     }
 
-    /// Connects the Windows global shortcut to a native UI event-loop wake-up.
-    #[cfg(windows)]
+    /// Connects the platform global shortcut to a native UI event-loop wake-up.
+    #[cfg(any(windows, target_os = "linux"))]
     pub fn register_activation_hotkey(
         &mut self,
         accelerator: &str,

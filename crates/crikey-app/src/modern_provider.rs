@@ -403,9 +403,9 @@ impl ModernProvider {
         }
 
         // Register with the pipeline under the manifest-derived modern policy so
-        // host debouncing and gating are the pipeline's own, not a second path.
-        let policy = crate::query_pipeline::plugin_policy_from_manifest(&manifest);
-        if let Err(error) = pipeline.register_plugin(plugin.clone(), policy) {
+        // host debouncing, gating and concurrency budgets are the pipeline's
+        // own, not a second path.
+        if let Err(error) = pipeline.register_namespaced_manifest(plugin.clone(), &manifest) {
             self.record_unavailable(
                 package,
                 Some(plugin),

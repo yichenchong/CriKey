@@ -490,8 +490,7 @@ impl NativeProvider {
         let supervisor = Arc::new(Mutex::new(supervisor));
         self.pool.supervisors.insert(key.clone(), supervisor);
 
-        let policy = crate::query_pipeline::plugin_policy_from_manifest(&manifest);
-        if let Err(error) = pipeline.register_plugin(plugin.clone(), policy) {
+        if let Err(error) = pipeline.register_namespaced_manifest(plugin.clone(), &manifest) {
             self.record_unavailable(
                 package,
                 Some(plugin),

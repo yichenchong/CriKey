@@ -8,8 +8,9 @@ mod native_commands;
 mod package_commands;
 
 use crikey_app::{
-    App, BatchState, LegacyDriver, LegacyProvider, ModernDriver, ModernProvider, NativeDriver,
-    NativeProvider, PipelineConfig, QueryPipeline, ResultBatch, SearchService, StartupStage,
+    admitted_plugin_roots, App, BatchState, LegacyDriver, LegacyProvider, ModernDriver, ModernProvider,
+    NativeDriver, NativeProvider, PipelineConfig, QueryPipeline, ResultBatch, SearchService, StartupJournal,
+    StartupMode, StartupStage,
 };
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
@@ -22,7 +23,9 @@ use crikey_legacy_compat::LegacyDeadlines;
 use crikey_ui::{
     LauncherViewModel, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, UiEffect, ViewModel,
 };
+use std::cell::RefCell;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::time::Instant;
 
 const USAGE: &str = "\
@@ -155,10 +158,58 @@ fn run_native_launcher() -> Result<(), String> {
     search
         .complete_stage(StartupStage::RequiredWorkers)
         .map_err(|error| error.to_string())?;
+
+    // Startup recovery (spec 24.2). The journal is opened and the attempt is
+    // committed BEFORE any third-party runtime loads: a launch that dies while
+    // loading a plugin must leave that attempt on disk, and the mode it was
+    // admitted under has to gate every provider below.
+    let mut journal = match startup_journal_path() {
+        Some(path) => Some(StartupJournal::load(&path)),
+        None => {
+            eprintln!(
+                "crikey: no per-user state directory (set XDG_STATE_HOME or HOME); \
+                 startup recovery is disabled for this launch"
+            );
+            None
+        }
+    };
+    if let Some(blamed) = journal
+        .as_ref()
+        .map(StartupJournal::active_during_abnormal_shutdown)
+        .filter(|blamed| !blamed.is_empty())
+    {
+        let names = blamed
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("crikey: previous shutdown was abnormal; plugins then active: {names}");
+    }
+    let startup_mode = match journal.as_mut() {
+        Some(journal) => {
+            let mode = journal.begin_startup(std::slice::from_ref(&owner));
+            commit_startup_journal(journal);
+            mode
+        }
+        None => StartupMode::Normal,
+    };
+    if let StartupMode::SafeMode { consecutive_failures } = startup_mode {
+        eprintln!(
+            "crikey: safe mode after {consecutive_failures} consecutive failed startups; \
+             third-party plugins are disabled (spec 24.2)"
+        );
+    }
+    // The record from here on is owned by a ledger shared with the renderer
+    // callback: the composition root refreshes the active plugin set as each
+    // provider comes up, and the callback is what proves the renderer started.
+    let ledger = StartupLedger::new(journal);
+    // Every third-party runtime is gated, not just the native one: a safe-mode
+    // boot that still spawns a legacy or modern interpreter would defeat 24.2.
+    let mut active_plugins = vec![owner.clone()];
     let mut legacy_pipeline = QueryPipeline::new(PipelineConfig::default());
     let legacy_provider = LegacyProvider::load(
         &mut legacy_pipeline,
-        &legacy_package_roots(),
+        &admitted_plugin_roots(&startup_mode, &legacy_package_roots()),
         std::env::temp_dir().join("crikey-legacy-packages"),
         LegacyDeadlines::default(),
     );
@@ -168,6 +219,12 @@ fn run_native_launcher() -> Result<(), String> {
             entry.package, entry.reason
         );
     }
+    active_plugins.extend_from_slice(legacy_provider.plugins());
+    // Committed before the supervisor is spawned and before anything below can
+    // fail: a launch that dies between two providers must leave behind the
+    // plugins that were active at that moment, not the set it would have had
+    // if it had finished (spec 24.2).
+    ledger.borrow_mut().record_active(&active_plugins);
     // Truthful staging (spec 25.6): the milestone is acknowledged only now that
     // legacy loading has actually completed.
     search
@@ -193,7 +250,7 @@ fn run_native_launcher() -> Result<(), String> {
     let cache_root = modern_cache_root()?;
     let modern_provider = ModernProvider::load(
         &mut modern_pipeline,
-        &modern_plugin_roots(),
+        &admitted_plugin_roots(&startup_mode, &modern_plugin_roots()),
         modern_index_root(),
         cache_root,
     );
@@ -203,6 +260,8 @@ fn run_native_launcher() -> Result<(), String> {
             entry.package, entry.reason
         );
     }
+    active_plugins.extend_from_slice(modern_provider.plugins());
+    ledger.borrow_mut().record_active(&active_plugins);
     // The supervisor publishes each merged frame straight to the renderer,
     // mirroring the legacy driver above; both run off the UI thread so a slow
     // or dead child interpreter can never block it.
@@ -215,13 +274,18 @@ fn run_native_launcher() -> Result<(), String> {
     // and modern providers. Discovery is intentionally empty unless the
     // operator names native package roots (spec 16.1, 16.6).
     let mut native_pipeline = QueryPipeline::new(PipelineConfig::default());
-    let native_provider = NativeProvider::load(&mut native_pipeline, &native_plugin_roots());
+    let native_provider = NativeProvider::load(
+        &mut native_pipeline,
+        &admitted_plugin_roots(&startup_mode, &native_plugin_roots()),
+    );
     for entry in native_provider.unavailable() {
         eprintln!(
             "crikey: native plugin unavailable ({}): {}",
             entry.package, entry.reason
         );
     }
+    active_plugins.extend_from_slice(native_provider.plugins());
+    ledger.borrow_mut().record_active(&active_plugins);
     let native_publish_handle = render_handle.clone();
     let native_driver = NativeDriver::spawn(
         native_provider,
@@ -236,10 +300,14 @@ fn run_native_launcher() -> Result<(), String> {
     activation_handle
         .request_activation()
         .map_err(|error| error.to_string())?;
+    // `request_activation` only QUEUES an event: the window and GPU are built
+    // later, in the event loop's `resumed`, and can still fail terminally
+    // there. Readiness is therefore recorded by the callback below, on the
+    // first event the loop actually delivers - see `ready_on_first_event`.
     let mut view_model = LauncherViewModel::new();
     let mut retained = RetainedRows::default();
-    launcher
-        .run(move |event| {
+    let outcome = launcher
+        .run(ready_on_first_event(Rc::clone(&ledger), move |event| {
             // Fold any legacy rows the supervisor produced since the last turn
             // into the retained view model, so a later navigation keystroke
             // keeps them. `publish` refuses a superseded or retired generation,
@@ -398,8 +466,14 @@ fn run_native_launcher() -> Result<(), String> {
             if let Some(frame) = view_model.frame() {
                 let _ = render_handle.submit_frame(&frame);
             }
-        })
-        .map_err(|error| error.to_string())
+        }))
+        .map_err(|error| error.to_string());
+    // Only a deliberate exit clears the record; a run that ended in an error
+    // leaves its plugin set on disk for the next launch to read.
+    if outcome.is_ok() {
+        ledger.borrow_mut().mark_clean_shutdown();
+    }
+    outcome
 }
 
 /// Directories scanned for legacy packages on the live path (spec 14.3).
@@ -453,6 +527,125 @@ fn modern_index_root() -> Option<std::path::PathBuf> {
     std::env::var_os("CRIKEY_MODERN_INDEX_ROOT")
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
+}
+
+/// Where the startup-recovery journal lives, read from
+/// `CRIKEY_STARTUP_JOURNAL`, else a per-user state directory
+/// (`$XDG_STATE_HOME/crikey`, else `$HOME/.local/state/crikey`).
+///
+/// `None` when no per-user location can be determined. The journal decides
+/// whether third-party plugins load at all, so a shared temporary directory is
+/// not an acceptable fallback: any local user could plant a record there and
+/// either force this account into safe mode or hide a real crash loop from it.
+/// Losing recovery for the launch is the smaller failure, and it is announced.
+fn startup_journal_path() -> Option<std::path::PathBuf> {
+    if let Some(value) = std::env::var_os("CRIKEY_STARTUP_JOURNAL").filter(|value| !value.is_empty()) {
+        return Some(std::path::PathBuf::from(value));
+    }
+    std::env::var_os("XDG_STATE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| std::path::PathBuf::from(home).join(".local").join("state"))
+        })
+        .map(|base| base.join("crikey").join("startup.json"))
+}
+
+/// Persists the journal, degrading to a diagnostic.
+///
+/// An unwritable journal costs the next launch its recovery evidence; it must
+/// never cost this one its startup.
+fn commit_startup_journal(journal: &StartupJournal) {
+    if let Err(error) = journal.save() {
+        eprintln!("crikey: cannot write the startup-recovery journal: {error}");
+    }
+}
+
+/// The startup-recovery record of the launch in progress (spec 24.2).
+///
+/// Two parties write it and neither can own it alone: the composition root
+/// refreshes the active plugin set as each provider finishes loading, and the
+/// renderer callback — which `NativeLauncher::run` takes by value for the rest
+/// of the process — records that the launch became usable. Hence one cell both
+/// hold, rather than a journal moved into the callback and unreachable
+/// afterwards.
+///
+/// A launcher with no per-user state directory carries no journal; every method
+/// here is then a no-op, so the absence is handled once at construction instead
+/// of at every call site.
+#[derive(Debug)]
+struct StartupLedger {
+    journal: Option<StartupJournal>,
+    ready: bool,
+}
+
+impl StartupLedger {
+    fn new(journal: Option<StartupJournal>) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(Self {
+            journal,
+            ready: false,
+        }))
+    }
+
+    /// Persists the plugins this launch would blame if it died right now.
+    ///
+    /// Repeats the verdict `begin_startup` already reached; it never charges a
+    /// second attempt.
+    fn record_active(&mut self, plugins: &[PluginId]) {
+        if let Some(journal) = self.journal.as_mut() {
+            journal.record_active_plugins(plugins);
+            commit_startup_journal(journal);
+        }
+    }
+
+    /// Clears the failure run, once, on proof that the renderer came up.
+    fn mark_renderer_running(&mut self) {
+        if self.ready {
+            return;
+        }
+        self.ready = true;
+        if let Some(journal) = self.journal.as_mut() {
+            journal.mark_ready();
+            commit_startup_journal(journal);
+        }
+    }
+
+    /// Clears the abnormal-shutdown record after a deliberate exit.
+    fn mark_clean_shutdown(&mut self) {
+        if let Some(journal) = self.journal.as_mut() {
+            journal.mark_clean_shutdown();
+            commit_startup_journal(journal);
+        }
+    }
+}
+
+/// Wraps the launcher callback so the first event the event loop delivers is
+/// what marks this launch ready (spec 24.2).
+///
+/// `NativeLauncherHandle::request_activation` only QUEUES an event. The window
+/// and GPU are created afterwards, from the event loop's `resumed`, and a
+/// failure there is terminal: the renderer clears its visible bit and exits,
+/// which drops the queued activation before any `NativeLauncherEvent` is
+/// dispatched. So no event reaching this callback is the observable signature
+/// of a renderer that never started, and the first event that does reach it is
+/// the earliest proof available to a host that one did.
+///
+/// Marking ready next to `request_activation` instead would persist zero
+/// failures for every launch that dies in renderer startup, and a repeated
+/// renderer crash could never reach safe mode — the loop 24.2 exists for.
+fn ready_on_first_event<F>(
+    ledger: Rc<RefCell<StartupLedger>>,
+    mut deliver: F,
+) -> impl FnMut(NativeLauncherEvent)
+where
+    F: FnMut(NativeLauncherEvent) + 'static,
+{
+    move |event| {
+        ledger.borrow_mut().mark_renderer_running();
+        deliver(event);
+    }
 }
 
 /// The managed-environment cache root, read from `CRIKEY_MODERN_CACHE_ROOT`.
@@ -1410,6 +1603,147 @@ mod tests {
             sources,
             vec!["modern.new"],
             "stale legacy rows from an older generation are dropped",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup recovery: when this launch counts as ready (spec 24.2)
+    // -----------------------------------------------------------------------
+
+    /// A private directory removed when the test that made it ends.
+    struct Scratch {
+        path: std::path::PathBuf,
+    }
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("crikey-cli-{label}-{}-{unique}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("the scratch directory is creatable");
+            Self { path }
+        }
+
+        fn journal(&self) -> std::path::PathBuf {
+            self.path.join("startup.json")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// A launch in progress whose journal already carries one failure short of
+    /// the safe-mode threshold, with this attempt recorded on disk.
+    ///
+    /// One more unfinished attempt is exactly what tips the next launch into
+    /// safe mode, so the two tests below read a mode rather than a counter:
+    /// `SafeMode` means this launch was never credited as ready, `Normal`
+    /// means it was.
+    fn ledger_mid_startup(path: &std::path::Path) -> Rc<RefCell<StartupLedger>> {
+        for _ in 1..crikey_app::SAFE_MODE_AFTER_FAILURES {
+            let mut earlier = StartupJournal::load(path);
+            earlier.begin_startup(&[]);
+            earlier.save().expect("the scratch journal is writable");
+        }
+        let mut journal = StartupJournal::load(path);
+        journal.begin_startup(&[PluginId(APPLICATION_CATALOG_PLUGIN.to_owned())]);
+        journal.save().expect("the scratch journal is writable");
+        StartupLedger::new(Some(journal))
+    }
+
+    /// The mode the *next* launch would be admitted under, read from disk.
+    fn next_launch_mode(path: &std::path::Path) -> StartupMode {
+        StartupJournal::load(path).begin_startup(&[])
+    }
+
+    /// A renderer that dies in `GraphicsState::new` delivers no event, and that
+    /// launch must stay counted as a failure so the loop reaches safe mode.
+    ///
+    /// Kills the mutation that marks ready beside `request_activation`: a
+    /// queued activation is not a started renderer, and crediting it persists
+    /// zero failures for every launch that dies in renderer startup.
+    #[test]
+    fn a_launch_whose_renderer_never_delivers_an_event_stays_recorded_as_a_failure() {
+        let scratch = Scratch::new("renderer-never-started");
+        let path = scratch.journal();
+        let ledger = ledger_mid_startup(&path);
+
+        let mut callback = ready_on_first_event(Rc::clone(&ledger), |_| {
+            unreachable!("this renderer never reached its event loop")
+        });
+        let _ = &mut callback;
+
+        assert_eq!(
+            next_launch_mode(&path),
+            StartupMode::SafeMode {
+                consecutive_failures: crikey_app::SAFE_MODE_AFTER_FAILURES
+            },
+            "a repeated renderer-startup crash must reach safe mode",
+        );
+    }
+
+    /// The first event the running event loop delivers marks the launch ready,
+    /// and is still passed through to the launcher's own handler.
+    #[test]
+    fn the_first_event_from_the_running_event_loop_marks_the_launch_ready() {
+        let scratch = Scratch::new("renderer-started");
+        let path = scratch.journal();
+        let ledger = ledger_mid_startup(&path);
+
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let recorder = Rc::clone(&seen);
+        let mut callback = ready_on_first_event(Rc::clone(&ledger), move |event| {
+            recorder.borrow_mut().push(event);
+        });
+        callback(NativeLauncherEvent::Activated);
+
+        assert_eq!(
+            next_launch_mode(&path),
+            StartupMode::Normal,
+            "a renderer that reached its event loop clears the failure run",
+        );
+        assert_eq!(
+            *seen.borrow(),
+            vec![NativeLauncherEvent::Activated],
+            "the readiness wrapper still delivers the event it observed",
+        );
+    }
+
+    /// Each provider's plugins are on disk before the next provider loads, so a
+    /// crash between two of them names what was active at that moment.
+    ///
+    /// Kills the mutation that records the plugin set only once, after all
+    /// three providers are up: everything that crashed earlier then leaves a
+    /// record naming only the built-in catalog.
+    #[test]
+    fn plugins_are_recorded_as_each_provider_becomes_active_without_charging_a_second_attempt() {
+        let scratch = Scratch::new("provider-progress");
+        let path = scratch.journal();
+        let ledger = ledger_mid_startup(&path);
+        let builtin = PluginId(APPLICATION_CATALOG_PLUGIN.to_owned());
+        let legacy = PluginId("legacy.alpha".to_owned());
+
+        ledger
+            .borrow_mut()
+            .record_active(&[builtin.clone(), legacy.clone()]);
+
+        let recorded = StartupJournal::load(&path);
+        assert_eq!(
+            recorded.active_during_abnormal_shutdown(),
+            [builtin, legacy],
+            "a crash after the legacy provider must name the legacy plugin too",
+        );
+        assert_eq!(
+            next_launch_mode(&path),
+            StartupMode::SafeMode {
+                consecutive_failures: crikey_app::SAFE_MODE_AFTER_FAILURES
+            },
+            "refreshing the plugin set repeats the verdict; it never charges a second attempt",
         );
     }
 }

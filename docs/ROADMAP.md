@@ -313,28 +313,80 @@ otherwise; the M6 table below records what each still owes. The §24.4 OS
 resource limits are distinct from §13.5 and are implemented and reported per
 platform.
 
-### M6 — Additional platforms (§30 Phase 6) — L
+### M6 — Additional platforms (§30 Phase 6) — L — implementation complete, closure gated on Windows and macOS runtime verification
 
 macOS and Linux backends behind the same traits, honest capability reporting
 per desktop environment, cross-platform packaging, portable built-ins.
 
-This milestone is where everything needing a runtime the development host
-lacks comes due — items inherited from earlier milestones, and scope first
-identified here. Each is listed with the evidence it owes:
+Everything implementable without a Windows session or GPU hardware is done and
+verified. What landed:
+
+- **Linux global hotkeys (§18.6).** `X11HotkeyService` over `x11rb`: accelerator
+  → `(modifier mask, keysym)` mapping, grabs taken for every lock-modifier
+  permutation with the NumLock mask discovered at runtime, partial-grab
+  rollback, idempotent duplicate registration matching the Windows contract,
+  and a reader thread delivering activations. Delivery is proven by synthetic
+  XTEST key presses against a real Xvfb server, not asserted by construction.
+  Reachable from the live app through `LinuxBackend::hotkeys()` and
+  `App::register_activation_hotkey`, which is no longer Windows-only.
+- **Linux window control (§18.1).** A `WindowService` trait plus an EWMH
+  `X11WindowService`: a three-part handshake (typed `_NET_SUPPORTED` atom list,
+  required hints present, two-sided `_NET_SUPPORTING_WM_CHECK`), enumeration
+  from `_NET_CLIENT_LIST` with `_NET_WM_NAME`/`WM_NAME` fallback, and
+  `_NET_ACTIVE_WINDOW` client messages carrying the user-activity timestamp.
+- **Session-aware capability reporting (§18.2).** X11, Wayland and Headless are
+  detected and answered separately. Window control reports `Partial` under X11,
+  not `Available`: `capability()` is a pure function of the session and cannot
+  see the window-manager gate `window_service()` applies at runtime.
+- **macOS backend (§18.5).** Bundle discovery and Launch Services opening,
+  wired into `App` — the macOS arms previously returned a hard-coded
+  "unavailable" error, so the backend was unreachable.
+- **§24.2 startup recovery and safe mode.** A journal records the plugins active
+  at each attempt and enters safe mode after repeated failure. Safe mode gates
+  all three third-party runtimes (legacy, modern Python, native), and readiness
+  is marked only once the renderer has delivered an event — a queued activation
+  is not readiness, or a renderer crash loop could never reach safe mode.
+- **Cross-platform packaging and portable built-ins (§19.1–19.3).** Per-platform
+  entrypoint resolution, OS and architecture gating, and a `MissingEntrypoint`
+  failure naming the absent `<os>-<arch>` key distinctly from an undeclared
+  platform.
+- **§31.26 / §31.31 portability labelling.** A package the corpus documents as
+  Windows-only can no longer render as portable: the verdict is derived from
+  `LegacyDiagnostics::is_portable` on both user-facing CLI surfaces.
+
+Three independent audits of the first green implementation each returned
+"incorrect" against a passing 1132-test suite. The dominant defect was a
+capability advertised with no production consumer — `ConcurrencyBudget` never
+constructed outside its own test, `is_portable` with no caller, `GlobalHotkeys`
+reported `Available` while the only registration path was Windows-only, and a
+macOS backend `App` could not reach. Also found: a quadratic entity decoder in
+the plist parser (a 1 MiB bundle took 338 s, now 412 ms), a hotkey `Drop` that
+hung forever when its wake window was destroyed, an unbounded journal read, a
+shared staging filename, and an enumeration test that pinned the wrong
+behaviour. All fixed, each with a mutation showing the new test fails without
+the fix.
+
+Evidence: 1156 tests pass with warnings denied, stable over three consecutive
+runs (`cargo` exit 0, zero `FAILED` lines); `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo fmt --all --check` clean;
+`cargo check --workspace --all-targets` clean for `x86_64-pc-windows-msvc` and
+`aarch64-apple-darwin`.
+
+Still owed, each needing a runtime this host does not have:
 
 | Origin | Item | Evidence still owed |
 | --- | --- | --- |
-| M1 | Win32 hotkey, Start Menu / packaged-app discovery, `.lnk` COM resolution, `ShellExecuteExW` launch | Executed in an interactive Windows desktop session. The 60 existing tests in `crates/crikey-platform-windows/tests/` pin the mapping and bookkeeping only and deliberately do not make these calls |
-| M1 | Warm activation < 30 ms p95 (§31.1) | Measured **end to end on Win32**: from global-hotkey delivery to the presented frame, on hardware with a real GPU and compositor. `crikey dev measure-activation` is a diagnostic component only and is NOT sufficient — it starts at `request_activation`, so hotkey dispatch is outside its span, and a software rasteriser cannot settle the budget |
-| M6 (new) | Global hotkeys and window activation on Linux | Not carried from M1, whose hotkey deliverable was scoped to `platform-windows`. Found while building the activation harness: `LinuxBackend::capability` reports both `Unavailable` and there is no `HotkeyService`, so Linux cannot toggle or re-activate at all. Needs a reactivation backend |
-| M5 | Windows named-pipe transport, job-object limits, `DuplicateHandle` cloning | Compile-verified only today; needs a Windows runtime |
-| M5 | §24.2 startup recovery and safe mode after repeated startup failures | Not implemented; no code pretends otherwise |
-| M5 | §13.5 per-plugin action/background/catalog concurrency budgets | Not implemented, as distinct from the §24.4 OS resource limits, which are implemented and reported per platform |
+| M1 | Win32 hotkey, Start Menu / packaged-app discovery, `.lnk` COM resolution, `ShellExecuteExW` launch | Executed in an interactive Windows desktop session. The 60 tests in `crates/crikey-platform-windows/tests/` pin mapping and bookkeeping only and deliberately do not make these calls |
+| M1 | Warm activation < 30 ms p95 (§31.1) | Measured **end to end on Win32**, from global-hotkey delivery to the presented frame, on hardware with a real GPU and compositor. `crikey dev measure-activation` is a diagnostic component only: its span starts at `request_activation`, and a software rasteriser cannot settle the budget |
+| M5 | Windows named-pipe transport, job-object limits, `DuplicateHandle` cloning | Compile-verified only; needs a Windows runtime |
+| M6 | §13.5 action, background and catalog concurrency budgets | The registry is enforced on the live suggestion dispatch seam (`QueryPipeline::tick`), and refusals are observable through `PluginHealth::concurrency_refusals`. The other three kinds have **no dispatch site in the runtime to gate**: plugin-owned action execution is refused outright, and no background-task or modern/native catalog-build scheduler exists. They resolve to effective limits and are NOT claimed as enforced |
+| M6 | macOS backend runtime behaviour | Compile-verified only; `crikey-platform-macos` is `#![cfg(target_os = "macos")]` and cannot run here. The pure bundle parsing it depends on is tested cross-platform in `crikey-platform` |
 
-Exit criteria: full test suite green on all three CI runners; every listed
-item above either satisfied with the evidence named or explicitly re-deferred
-with a reason; Windows-only legacy plugins are labelled as such and never
-advertised as portable (§31.26, §31.31).
+Exit criteria: full test suite green on all three CI runners — **not yet
+satisfied**: only the Linux runner is exercised here, while Windows and macOS
+are compile-checked rather than run. Every other listed item is satisfied with
+the evidence named or re-deferred above with a reason. Windows-only legacy
+plugins are labelled as such and never advertised as portable (§31.26, §31.31).
 
 ### M7 — Optional runtimes and ecosystem (§30 Phase 7) — open-ended
 
