@@ -67,14 +67,14 @@ status = "full"
 [[api]]
 module = "keypirinha"
 symbol = "Match"
-status = "behavioural-difference"
-notes = "The requested matching method is honoured, but matching is performed by CriKey's own matcher: which items match is the same, the relative order of similarly-scored items is not. Spec 14.12 exempts exact reproduction of undocumented ranking behaviour."
+status = "partial"
+notes = "The enum is accepted and the Python shim serializes it into the reply's `match` field, but it never becomes usable metadata: the Rust decoder (`worker.rs::decode_outcome`) reads only `items`, and `LegacyOutcome::Suggestions` carries no policy, so the value is discarded on arrival. A published batch is then passed through without any host matching — `lifecycle.rs` truncates it to the publication cap, `legacy_provider.rs` delivers it unchanged, and the query pipeline only orders by `score_hint`. No requested method causes the host to filter or re-match the list, so Match.ANY happens to be the effective behaviour in every case."
 
 [[api]]
 module = "keypirinha"
 symbol = "Sort"
-status = "behavioural-difference"
-notes = "Label orders are exact. Score-based orders follow CriKey's ranking, so items the legacy scorer would have separated can tie and appear in a different order."
+status = "partial"
+notes = "Accepted and transmitted as the reply's `sort` field, then dropped on the same path as keypirinha.Match: the host never reads it. A published batch is ordered by descending `score_hint` alone, so Sort.NONE does not preserve the plugin's own order and neither label nor score orderings are applied as requested."
 
 [[api]]
 module = "keypirinha"
