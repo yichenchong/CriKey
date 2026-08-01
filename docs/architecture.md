@@ -82,9 +82,21 @@ in general. A plugin that wants its suggestions filtered against the query
 filters them itself — the host will not do it, and a plugin that publishes a
 broad list gets that list shown.
 
+Ordering within a batch differs by runtime, because the sort is a **stable**
+`sort_by_key` on `score_hint`:
+
+- **Modern** plugins set their own `score_hint`, so their batches are genuinely
+  reordered by it.
+- **Legacy** plugins cannot: the decoder gives every legacy item `score_hint:
+  0`, so every item ties and the stable sort leaves the plugin's published
+  order intact.
+
 This is why `keypirinha.Match` and `keypirinha.Sort` are recorded as `partial`
 in the API matrix: a legacy plugin can request a matching or sort policy, but
-there is no host-side stage on this path to apply it.
+there is no host-side stage on this path to apply it. `Sort.NONE` happens to
+behave correctly as a consequence of the tie above, not because the request is
+read — a future change giving legacy items a real score hint would break it
+with nothing to notice.
 
 ## Scheduling contracts side by side
 

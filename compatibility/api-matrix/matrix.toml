@@ -74,7 +74,7 @@ notes = "The enum is accepted and the Python shim serializes it into the reply's
 module = "keypirinha"
 symbol = "Sort"
 status = "partial"
-notes = "Accepted and transmitted as the reply's `sort` field, then dropped on the same path as keypirinha.Match: the host never reads it. A published batch is ordered by descending `score_hint` alone, so Sort.NONE does not preserve the plugin's own order and neither label nor score orderings are applied as requested."
+notes = "Accepted and transmitted as the reply's `sort` field, then dropped on the same path as keypirinha.Match: the host never reads it, so no requested order is applied and the label and score policies are not honoured. Sort.NONE is a special case that does hold: the legacy decoder gives every item `score_hint: 0` (`worker.rs:1618`) and the pipeline orders with a STABLE `sort_by_key` on that field (`query_pipeline.rs:340`), so a batch keeps its published order — incidentally, because every legacy item ties, not because the request was read. A plugin must not depend on it: giving legacy items a real score hint would silently reorder them."
 
 [[api]]
 module = "keypirinha"
