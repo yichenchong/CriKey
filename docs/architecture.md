@@ -58,13 +58,33 @@ sequenceDiagram
   S->>P: cancel obsolete work
   S->>P: dispatch per profile
   P-->>C: result batch (generation g)
-  C->>C: reject stale, dedup, rerank
+  C->>C: reject stale, dedup, order by score hint
   C-->>UI: batched update (generation g)
 ```
 
 Local catalog search is never debounced. Plugin dispatch is: modern plugins by
 manifest policy, legacy plugins by prompt dispatch plus obsolete-work
 replacement.
+
+### Two paths, two matching contracts
+
+Text matching does **not** apply uniformly to everything the user sees. Which
+path an item arrives on decides whether the host matches it at all:
+
+| Path | Who produces it | Host matching |
+| --- | --- | --- |
+| Catalog | `SearchService` over the indexed catalog | Normalizer → `DefaultMatcher` (exact-prefix, prefix, substring, acronym, keyword, fuzzy) → `DefaultRanker` |
+| Suggestion batch | A plugin's `on_suggest` / `suggest`, legacy or modern | **None.** The batch is delivered as the plugin published it; `QueryPipeline` orders by descending `score_hint` and nothing else |
+
+`DefaultMatcher` is owned by `SearchService` and is reachable from nowhere
+else, so fuzzy matching is a property of catalog search, not of the result list
+in general. A plugin that wants its suggestions filtered against the query
+filters them itself — the host will not do it, and a plugin that publishes a
+broad list gets that list shown.
+
+This is why `keypirinha.Match` and `keypirinha.Sort` are recorded as `partial`
+in the API matrix: a legacy plugin can request a matching or sort policy, but
+there is no host-side stage on this path to apply it.
 
 ## Scheduling contracts side by side
 
