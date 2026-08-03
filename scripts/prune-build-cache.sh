@@ -18,7 +18,7 @@
 #
 # WHAT IT DOES
 #
-# If the build directory is larger than the threshold, it deletes the whole
+# If `target/debug` is larger than the threshold, it deletes that whole
 # development profile directory (`target/debug`). That is deliberately blunt:
 # deleting individual files by age risks removing something Cargo still
 # considers current, whereas deleting the profile wholesale is always safe.
@@ -76,17 +76,42 @@ if [[ ! -d "$target_directory" ]]; then
 	exit 0
 fi
 
-# Refuse to run while a build is in progress: deleting artefacts from underneath
-# a live rustc produces confusing failures that look like source errors.
-if pgrep -u "$(id -u)" -x cargo >/dev/null 2>&1 || pgrep -u "$(id -u)" -x rustc >/dev/null 2>&1; then
-	printf 'prune-build-cache: a build is running, leaving it alone\n'
-	exit 0
-fi
-
 development_profile="$target_directory/debug"
 if [[ ! -d "$development_profile" ]]; then
 	printf 'prune-build-cache: nothing to do, no development profile at %s\n' \
 		"$development_profile"
+	exit 0
+fi
+
+# Do not delete artefacts from underneath a live compiler: that produces
+# failures which look like source errors and wastes someone's afternoon.
+#
+# Cargo holds an exclusive advisory lock on `<profile>/.cargo-lock` for the
+# duration of a build, so taking that same lock is real mutual exclusion rather
+# than a guess. A process check alone would be a race, because a build can start
+# between the check and the removal.
+#
+# Two details make the lock actually hold. First, we create the lock file if it
+# is missing, which is exactly what Cargo does, so we get real exclusion even
+# for a profile that has never been built rather than falling back to a guess.
+# Second, and less obviously, we must NOT delete the lock file itself: removing
+# it would leave us holding a lock on an unlinked inode while a newly started
+# Cargo creates a fresh lock file and builds happily alongside our deletion. So
+# the removal below clears the profile's *contents* and leaves `.cargo-lock` in
+# place, which keeps the inode a concurrent Cargo will contend on.
+lock_file="$development_profile/.cargo-lock"
+lock_descriptor=""
+if command -v flock >/dev/null 2>&1; then
+	: >>"$lock_file"
+	exec {lock_descriptor}<>"$lock_file"
+	if ! flock --exclusive --nonblock "$lock_descriptor"; then
+		printf 'prune-build-cache: a build holds the cargo lock, leaving it alone\n'
+		exit 0
+	fi
+elif pgrep -u "$(id -u)" -x cargo >/dev/null 2>&1 ||
+	pgrep -u "$(id -u)" -x rustc >/dev/null 2>&1; then
+	# Fallback only, and advisory only: without flock this cannot be raceless.
+	printf 'prune-build-cache: a build appears to be running, leaving it alone\n'
 	exit 0
 fi
 
@@ -105,11 +130,16 @@ fi
 reclaimable_megabytes="$size_in_megabytes"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-	printf 'prune-build-cache: would remove %s, reclaiming %s MB\n' \
+	printf 'prune-build-cache: would clear %s, reclaiming %s MB\n' \
 		"$development_profile" "$reclaimable_megabytes"
 	exit 0
 fi
 
-rm -rf "$development_profile"
-printf 'prune-build-cache: removed %s, reclaimed %s MB\n' \
+# Everything inside the profile except the lock file we are holding. See the
+# comment above the lock for why `.cargo-lock` has to survive.
+find "$development_profile" -mindepth 1 -maxdepth 1 \
+	! -name .cargo-lock \
+	-exec rm -rf {} +
+
+printf 'prune-build-cache: cleared %s, reclaimed %s MB\n' \
 	"$development_profile" "$reclaimable_megabytes"

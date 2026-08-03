@@ -127,9 +127,16 @@ Cargo still considers current, whereas removing the profile directory is always
 safe and costs only a rebuild. It leaves alone `target/release`, the
 cross-compilation directories such as `target/x86_64-pc-windows-msvc`, and
 `target/native-conformance` (the out-of-tree plugin fixture), because those are
-expensive to regenerate and are not rewritten on every edit. It refuses to run
-while a build is in progress, so it cannot pull artefacts out from under a live
-compiler.
+expensive to regenerate and are not rewritten on every edit.
+
+To avoid deleting artefacts out from under a live compiler, it takes Cargo's own
+exclusive build lock on `target/debug/.cargo-lock` and holds it across the
+removal. That is genuine mutual exclusion, not a guess: a build either completed
+before the script started, or it waits for the lock. Checking for running
+`cargo` processes instead would be a race, because a build can start between the
+check and the removal. Two honest caveats: if `flock` is not installed, or the
+lock file does not exist because this profile has never been built, the script
+falls back to a process check that is advisory only.
 
 ### Running it automatically
 

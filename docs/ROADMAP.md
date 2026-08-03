@@ -244,7 +244,7 @@ have aggregate deadlines and byte/item caps; plugin faults, crashes, stale
 generations, and cooperative cancellation remain contained at the worker
 boundary.
 
-Evidence on Linux: the current workspace baseline is 1166 tests passing with
+Evidence on Linux: the current workspace baseline is 1268 tests passing with
 warnings denied, and the M4 integration suite proves conflicting managed
 dependency versions, crash containment, cancellation followed by worker reuse,
 catalog-error diagnostics, and distinct same-environment plugins. A live
@@ -279,7 +279,7 @@ which drives ONE supervised plugin built from `compatibility/native-conformance`
 lifecycle and checks the child pid differs from the host's and changes across
 the restart.
 
-Evidence on Linux: the current workspace baseline is 1166 tests passing with
+Evidence on Linux: the current workspace baseline is 1268 tests passing with
 warnings denied, and the native integration suite proves the conformance
 lifecycle. Windows and macOS runtime behavior is not verified on this host;
 their compile checks are tracked under M6. Live smoke: `crikey dev
@@ -377,13 +377,17 @@ Windows-only. Also found: a quadratic entity decoder in the plist parser (a
 1 MiB bundle took 338 s, now 412 ms), a hotkey `Drop` that hung forever when
 its wake window was destroyed, an unbounded journal read, a shared staging
 filename, and an enumeration test that pinned the wrong behaviour. The
-backend and capability defects were partly corrected, but Linux live shortcut
-registration and the catalog persistence wiring remain open; the other fixes
-are defended by tests.
+backend and capability defects were partly corrected. Linux live shortcut
+registration remains open. The catalog persistence wiring was open at that
+point and has since been closed: `crikey run` now constructs the cache, loads
+slices at startup and writes a completed catalog, covered by an end-to-end test.
+The other fixes are defended by tests.
 
-Evidence: 1166 tests pass on Linux with warnings denied. Windows and macOS
-runtime behaviour is not verified on this host; the compile checks are
-reported separately below.
+Evidence at that point: 1166 tests passed on Linux with warnings denied. A
+later full-repository audit round raised this to 1268 tests, also with warnings
+denied and stable across three consecutive runs. Windows and macOS runtime
+behaviour is still not verified on this host; the compile checks are reported
+separately below.
 
 Still owed, each needing a runtime this host does not have:
 
