@@ -22,12 +22,17 @@ use crate::worker::SuggestRequest;
 
 /// The frame schema this host speaks. Echoed by the child's handshake.
 ///
-/// Deliberately the same number the native protocol uses, so one version bump
-/// is visible across every CriKey transport. Note what this does and does not
-/// buy: it keeps the version in step, but it is a shared constant, not a
-/// structural guarantee. This transport is newline-delimited JSON and shares no
+/// Deliberately the same number the NATIVE protocol uses, so a bump there
+/// reaches this transport too. That coupling covers these two transports only:
+/// the Legacy Compatibility Layer declares its own independent
+/// `PROTOCOL_VERSION` in `crikey-legacy-compat`, with its own environment
+/// variable, and a bump here does not touch it.
+///
+/// Note also what the shared constant does not buy. It keeps this transport's
+/// version in step with the native one, but it is a shared number, not a
+/// structural guarantee: this transport is newline-delimited JSON and shares no
 /// message definitions with the native protobuf schema, so the two shapes can
-/// still drift apart and only their respective tests will catch it.
+/// still drift apart with only their respective tests to catch it.
 pub const PROTOCOL_VERSION: u32 = crikey_native_protocol::PROTOCOL_VERSION;
 
 /// Ceiling on one protocol line, in bytes.
