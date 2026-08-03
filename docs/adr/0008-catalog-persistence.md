@@ -1,6 +1,6 @@
 # ADR-0008: Catalog persistence
 
-Status: Accepted for M1
+Status: Accepted for M1; production integration landed
 Spec: §22.1, §25.1, §25.6, §31.27
 
 ## Context
@@ -27,6 +27,14 @@ zero-copy design.
 
 This is the boring format whose behavior is already bounded and tested. An mmap
 format remains an optimization option, not an architectural prerequisite.
+
+The codec and `FileCatalogCache` are implemented and covered by library and
+integration tests. The current `crikey run` composition root constructs the
+cache, loads persisted slices before the persisted-catalog startup stage, and
+writes nonempty refreshed slices after successful catalog replacement. Torn,
+foreign, unreadable, or otherwise invalid individual slices are reported as
+rebuildable misses; cache write failures are reported, while a failure to
+enumerate the cache root is returned as a startup error.
 
 ## Measured evidence
 

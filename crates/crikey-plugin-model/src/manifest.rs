@@ -176,7 +176,8 @@ fn oversized_decimal(text: &str) -> Option<u64> {
     (value > i64::MAX as u64).then_some(value)
 }
 
-/// Runtime that executes the plugin (spec 19.2).
+/// Runtime declared by the manifest. Execution support is decided by the
+/// corresponding host; parsing a recognized value does not make it runnable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Runtime {
@@ -299,6 +300,8 @@ pub enum Startup {
     Eager,
 }
 
+/// Performance preferences declared by a plugin. A host must consume a field
+/// before presenting it as an enforced limit; parsing alone does not apply it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct PerformanceSection {

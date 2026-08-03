@@ -39,7 +39,7 @@
 //! is refused at the pipeline's intake boundary rather than shown out of order
 //! (acceptance 31.7).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -681,6 +681,22 @@ impl ModernProvider {
     fn execute_action_request(&mut self, request: ModernActionRequest) -> crikey_core::Result<()> {
         let _guard = request.guard;
         let plugin = request.plugin;
+        let item_id = request.item.stable_id.clone();
+        let item = self
+            .action_items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(plugin.clone(), item_id.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                crikey_core::CoreError::Invalid("modern action item snapshot is no longer current".to_owned())
+            })?;
+        if item.plugin_id != plugin {
+            return Err(crikey_core::CoreError::Invalid(format!(
+                "modern action item `{}` is owned by `{}`, not `{}`",
+                item.stable_id.0, item.plugin_id.0, plugin.0
+            )));
+        }
         let loaded = self
             .loaded
             .iter()
@@ -691,14 +707,7 @@ impl ModernProvider {
                     plugin.0
                 ))
             })?;
-        if request.item.plugin_id != plugin {
-            return Err(crikey_core::CoreError::Invalid(format!(
-                "modern action item `{}` is owned by `{}`, not `{}`",
-                request.item.stable_id.0, request.item.plugin_id.0, plugin.0
-            )));
-        }
-        let action = request
-            .item
+        let action = item
             .actions
             .iter()
             .find(|action| action.action_id == request.action_id)
@@ -710,14 +719,13 @@ impl ModernProvider {
                 "modern action request is not plugin-owned".to_owned(),
             ));
         }
-        if !action.applicable_categories.is_empty()
-            && !action.applicable_categories.contains(&request.item.category)
+        if !action.applicable_categories.is_empty() && !action.applicable_categories.contains(&item.category)
         {
             return Err(crikey_core::CoreError::Invalid(
                 "modern action is not applicable to the selected item category".to_owned(),
             ));
         }
-        match request.item.argument_policy {
+        match item.argument_policy {
             ArgumentPolicy::Forbidden if request.argument.is_some() => {
                 return Err(crikey_core::CoreError::Invalid(
                     "modern action item forbids arguments".to_owned(),
@@ -738,6 +746,10 @@ impl ModernProvider {
         if !worker.is_alive() {
             self.pool
                 .record_dispatch_failure(plugin.clone(), "modern worker is no longer alive".to_owned());
+            self.action_items
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .retain(|(owner, _), _| owner != &plugin);
             return Err(crikey_core::CoreError::Invalid(format!(
                 "modern action worker for `{}` is unavailable",
                 plugin.0
@@ -745,11 +757,7 @@ impl ModernProvider {
         }
 
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            worker.execute(
-                &request.item,
-                Some(&request.action_id.0),
-                request.argument.as_deref(),
-            )
+            worker.execute(&item, Some(&request.action_id.0), request.argument.as_deref())
         }));
         match outcome {
             Ok(Ok(ExecuteOutcome::Ok)) => Ok(()),
@@ -802,10 +810,8 @@ impl ModernProvider {
         now: Millis,
     ) -> Option<ViewModel> {
         let generation = pipeline.keystroke(query, now);
-        let mut suggestions = self.collect_suggestions(query, generation);
+        let (mut suggestions, dead_plugins) = self.collect_suggestions(query, generation);
 
-        let mut tick_succeeded = true;
-        let mut delivered = true;
         let mut at = now;
         // Advance the pipeline until its registered plugins have been dispatched
         // for this generation. Modern plugins debounce, so a query that is not a
@@ -813,9 +819,6 @@ impl ModernProvider {
         // scheduler's own wake-ups and is bounded by construction.
         for _ in 0..64 {
             let tick = pipeline.tick(at);
-            if !tick.errors.is_empty() {
-                tick_succeeded = false;
-            }
             for cancellation in tick.cancellations {
                 let _ = pipeline.complete(&cancellation.plugin, cancellation.generation, at);
             }
@@ -826,19 +829,20 @@ impl ModernProvider {
                     continue;
                 }
                 dispatched_current = true;
+                if dead_plugins.contains(&request.plugin) {
+                    let _ = pipeline.abort_request(&request.plugin, request.generation, at);
+                    continue;
+                }
                 let items = suggestions.remove(&request.plugin).unwrap_or_default();
-                let admitted = pipeline
-                    .deliver(
-                        ResultBatch {
-                            generation: request.generation,
-                            plugin: request.plugin.clone(),
-                            state: BatchState::Final,
-                            items,
-                        },
-                        at,
-                    )
-                    .is_ok();
-                delivered &= admitted;
+                let _ = pipeline.deliver(
+                    ResultBatch {
+                        generation: request.generation,
+                        plugin: request.plugin.clone(),
+                        state: BatchState::Final,
+                        items,
+                    },
+                    at,
+                );
                 let _ = pipeline.complete(&request.plugin, request.generation, at);
             }
 
@@ -852,10 +856,6 @@ impl ModernProvider {
         }
 
         let frame = pipeline.present(at);
-        let presentation_succeeded = pipeline.take_errors().is_empty();
-        if !tick_succeeded || !delivered || !presentation_succeeded {
-            return None;
-        }
         frame.filter(|frame| frame.generation == generation)
     }
 
@@ -877,7 +877,11 @@ impl ModernProvider {
     /// resulting items by owning plugin. Every failure — a dead worker, a crash
     /// mid-callback, or a plugin-raised error — is contained as a recorded
     /// dispatch failure and contributes no items.
-    fn collect_suggestions(&mut self, query: &str, generation: Generation) -> BTreeMap<PluginId, Vec<Item>> {
+    fn collect_suggestions(
+        &mut self,
+        query: &str,
+        generation: Generation,
+    ) -> (BTreeMap<PluginId, Vec<Item>>, BTreeSet<PluginId>) {
         let request = SuggestRequest {
             generation: generation.get(),
             text: query.to_owned(),
@@ -896,6 +900,7 @@ impl ModernProvider {
             .collect();
 
         let mut by_plugin: BTreeMap<PluginId, Vec<Item>> = BTreeMap::new();
+        let mut dead_plugins = BTreeSet::new();
 
         for (plugin, key) in targets {
             // A worker that has already died stays dead: skip it, leave the
@@ -903,12 +908,21 @@ impl ModernProvider {
             // rather than re-dispatching to a corpse every keystroke.
             let alive = match self.pool.workers.get(&key) {
                 Some(worker) => worker.is_alive(),
-                None => continue,
+                None => {
+                    dead_plugins.insert(plugin.clone());
+                    false
+                }
             };
             if !alive {
-                self.pool
-                    .record_dispatch_failure(plugin, "the modern worker is no longer alive".to_owned());
+                self.pool.record_dispatch_failure(
+                    plugin.clone(),
+                    "the modern worker is no longer alive".to_owned(),
+                );
                 self.pool.workers.remove(&key);
+                self.action_items
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .retain(|(owner, _), _| owner != &plugin);
                 continue;
             }
 
@@ -946,13 +960,19 @@ impl ModernProvider {
                     // failure once so a diagnostic can name the plugin, and drop
                     // the dead worker so the next query skips it rather than
                     // re-dispatching to a dead process.
-                    self.pool.record_dispatch_failure(plugin, error.to_string());
+                    dead_plugins.insert(plugin.clone());
+                    self.pool
+                        .record_dispatch_failure(plugin.clone(), error.to_string());
                     self.pool.workers.remove(&key);
+                    self.action_items
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .retain(|(owner, _), _| owner != &plugin);
                 }
             }
         }
 
-        by_plugin
+        (by_plugin, dead_plugins)
     }
 }
 
@@ -1024,6 +1044,28 @@ impl crate::PluginActionExecutor for ModernActionEndpoint {
         action_id: &ActionId,
         argument: Option<&str>,
     ) -> crikey_core::Result<ActionRequestId> {
+        if item.plugin_id != *plugin {
+            return Err(crikey_core::CoreError::Invalid(
+                "selected modern plugin result has stale ownership".to_owned(),
+            ));
+        }
+        let item_id = item.stable_id.clone();
+        let item = self
+            .items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(plugin.clone(), item_id))
+            .cloned()
+            .ok_or_else(|| {
+                crikey_core::CoreError::Invalid(
+                    "selected modern plugin result is no longer current".to_owned(),
+                )
+            })?;
+        if item.plugin_id != *plugin {
+            return Err(crikey_core::CoreError::Invalid(
+                "selected modern plugin result has stale ownership".to_owned(),
+            ));
+        }
         let reserved = self
             .in_flight
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {

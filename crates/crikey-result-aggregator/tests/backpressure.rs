@@ -4,8 +4,7 @@
 //! per-plugin budgets and fair queuing"; acceptance 31.4, 31.7, 31.8, 31.24,
 //! 31.25).
 //!
-//! These tests are written before the implementation. They pin a second,
-//! *transport-side* bound that does not exist yet and that is deliberately a
+//! These tests pin the transport-side bound and deliberately keep it as a
 //! separate object from [`MemoryResultAggregator`]:
 //!
 //! * [`ResultLimits`] bounds what is **retained and displayed** for a query.
@@ -540,6 +539,37 @@ fn the_replace_oldest_policy_keeps_the_newest_batch_and_reports_the_eviction() {
 
     boundary.drain(20, unlimited_budget());
     assert_eq!(boundary.visible(), ["a2", "a3"]);
+}
+
+#[test]
+fn unregistering_before_the_cursor_preserves_the_next_plugin() {
+    let mut boundary = Boundary::new(generous_queue_limits(), generous_result_limits());
+    let first = plugin("dev.crikey.a");
+    let second = plugin("dev.crikey.b");
+    let third = plugin("dev.crikey.c");
+    for owner in [&first, &second, &third] {
+        boundary
+            .queue
+            .register(owner.clone(), unbounded_intake(OverflowPolicy::RejectLowPriority));
+    }
+    let generation = boundary.begin_generation();
+
+    for (owner, id) in [(&first, "a1"), (&second, "b1"), (&third, "c1")] {
+        boundary
+            .queue
+            .submit(10, high(partial(generation, owner, &[id])))
+            .expect("initial batches fit");
+    }
+
+    // Consume A only. The cursor now points at B for the next pass.
+    boundary.drain(20, budget(1, 64, 1));
+    assert_eq!(boundary.visible(), ["a1"]);
+
+    boundary.queue.unregister(&first);
+
+    // Removing A must leave B as the next start, rather than skipping to C.
+    boundary.drain(30, budget(1, 64, 1));
+    assert_eq!(boundary.visible(), ["a1", "b1"]);
 }
 
 #[test]

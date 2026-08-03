@@ -169,6 +169,19 @@ fn a_corrupt_journal_file_loads_as_a_fresh_journal_instead_of_preventing_startup
     );
 }
 
+#[test]
+fn a_non_regular_journal_path_is_ignored_without_opening_it() {
+    let scratch = Scratch::new("non-regular");
+    let path = scratch.join("startup.json");
+    fs::create_dir(&path).expect("the directory fixture is creatable");
+
+    let journal = StartupJournal::load(&path);
+    assert!(
+        journal.active_during_abnormal_shutdown().is_empty(),
+        "a directory is not a journal and must not be treated as a prior crash"
+    );
+}
+
 /// A well-formed record built to exceed a byte budget.
 ///
 /// Deliberately *valid*: the size ceiling is only worth having if it stops the
@@ -403,6 +416,32 @@ fn marking_ready_resets_the_consecutive_failure_count_rather_than_saturating_it(
         reloaded.begin_startup(&plugins),
         StartupMode::Normal,
         "one failure since the last ready startup is not repeated failure",
+    );
+}
+
+/// Once a journal has reached ready, a later startup in the same process must
+/// decide its mode from the reset failure count rather than replaying the
+/// previous boot's verdict.
+#[test]
+fn reusing_a_ready_journal_does_not_replay_safe_mode_for_the_next_startup() {
+    let scratch = Scratch::new("reuse-after-ready");
+    let path = scratch.join("startup.json");
+    let plugins = active_set();
+
+    for _ in 0..SAFE_MODE_AFTER_FAILURES {
+        failed_startup(&path, &plugins);
+    }
+
+    let mut journal = StartupJournal::load(&path);
+    assert!(matches!(
+        journal.begin_startup(&plugins),
+        StartupMode::SafeMode { .. }
+    ));
+    journal.mark_ready();
+    assert_eq!(
+        journal.begin_startup(&plugins),
+        StartupMode::Normal,
+        "a new startup after readiness must not reuse the prior safe-mode verdict",
     );
 }
 

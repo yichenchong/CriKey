@@ -73,11 +73,11 @@ Exit: `cargo test --workspace --all-targets` green on Linux; `crikey version` ru
 | --- | --- | --- |
 | Query normalization + matcher | query | Unicode NFKC, case fold, tokens, prefix/substring/fuzzy/acronym |
 | Default ranker | ranking | match quality, prefix bonus, position, category, score hint |
-| Catalog store + persistent cache | catalog | versioned per-plugin archive, full decode + indexes (ADR-0008) |
+| Catalog store + persistent cache | catalog | versioned per-plugin archive, startup load, and writes after successful replacement (ADR-0008) |
 | Result aggregator | result-aggregator | generation gating, dedup by `ItemId`, limits |
 | Launcher window | ui | winit + wgpu/egui, hidden-window warm activation (ADR-0002) |
 | Global hotkey + app discovery | platform, platform-windows | Start Menu, `.lnk`, packaged apps, AppUserModelIDs |
-| Startup staging | app | window/hotkey → cached catalog → accept queries → workers |
+| Startup staging | app | window/hotkey → persisted catalog load → accept queries → workers |
 | Supervisor skeleton | plugin-supervisor | states, deadlines, health counters, no runtime yet |
 
 Exit criteria: cached local results < 16 ms p95 on the reference machine; 500k
@@ -90,17 +90,23 @@ end-to-end Win32 measurement from hotkey delivery to the presented frame on
 real GPU hardware — `crikey dev measure-activation` is a diagnostic component
 of that, not a substitute, since its span begins after hotkey dispatch. Both
 need a runtime this milestone never had. Neither is abandoned and neither is
-claimed: they are listed under M6 with the evidence each still owes. M1 closes
-on what a Linux host can actually settle.
+claimed: they are listed under M6 with the evidence each still owes. M1's Linux
+cache integration is now shipped; the remaining moved items need the runtime
+evidence described under M6.
 
 Status snapshot (2026-07-27):
 
 - Implemented: query normalization and matching, default ranking, bounded
-  result aggregation, persistent per-plugin cache, indexed catalog search,
-  native retained-window rendering and command routing, Linux desktop-entry
-  discovery and process launch, Windows hotkeys, Start Menu/packaged-app
-  discovery and shell launch, startup staging, and the supervisor state
-  skeleton.
+  result aggregation, the catalog archive codec and production startup
+  load/write integration, indexed catalog search, native retained-window
+  rendering and command routing, Linux desktop-entry discovery and process
+  launch, Windows hotkeys, Start Menu/packaged-app discovery and shell launch,
+  startup staging, and the supervisor state skeleton.
+- `crikey run` constructs a `FileCatalogCache`, loads slices before the
+  persisted-catalog startup stage, and writes nonempty refreshed slices after
+successful catalog replacement. Invalid individual slices are treated as
+rebuildable misses, write failures are reported, and a cache-root enumeration
+failure is returned as a startup error.
 - Measured in release mode on the Intel N150 reference machine: 500,000 items
   round-trip through the shipped cache; cached local query p95 is 13.099 ms over
   1,355 typed-prefix samples. The archive is 125,275,069 bytes; full decoding
@@ -230,20 +236,22 @@ Status snapshot (2026-07-30):
 
 ### M4 — Modern Python plugins (§30 Phase 4) — L — done
 
-Python SDK worker loop over the v1 protocol; manifest `[python]` dependency
-declaration; content-addressed managed environments with verified locks; and
-out-of-process interpreter supervision. Modern workers are keyed by interpreter,
-environment, entrypoint, and source path; partial streams have aggregate
-deadlines and byte/item caps; plugin faults, crashes, stale generations, and
-cooperative cancellation remain contained at the worker boundary.
+Python SDK worker loop over its bounded newline-delimited JSON protocol; manifest
+`[python]` dependency declaration; content-addressed managed environments with
+verified locks; and out-of-process interpreter supervision. Modern workers are
+keyed by interpreter, environment, entrypoint, and source path; partial streams
+have aggregate deadlines and byte/item caps; plugin faults, crashes, stale
+generations, and cooperative cancellation remain contained at the worker
+boundary.
 
-Evidence: `cargo test --workspace --all-targets` passes with warnings denied;
-`cargo clippy --workspace --all-targets -- -D warnings` passes; Windows and
-macOS workspace checks pass. The M4 integration suite proves conflicting managed
+Evidence on Linux: the current workspace baseline is 1166 tests passing with
+warnings denied, and the M4 integration suite proves conflicting managed
 dependency versions, crash containment, cancellation followed by worker reuse,
 catalog-error diagnostics, and distinct same-environment plugins. A live
 `crikey dev run` and `crikey dev test` smoke against
-`.crikey-dev/modern-smoke` each returned the plugin's emitted result.
+`.crikey-dev/modern-smoke` each returned the plugin's emitted result. Windows
+and macOS runtime behavior is not verified on this host; their compile checks
+are tracked under M6.
 
 Native-code permission and native package builds remain deferred to M5 (§15.5);
 M4's package manager accepts only the local verified package material required
@@ -271,12 +279,13 @@ which drives ONE supervised plugin built from `compatibility/native-conformance`
 lifecycle and checks the child pid differs from the host's and changes across
 the restart.
 
-Evidence: `cargo test --workspace --all-targets` passes with warnings denied;
-`cargo clippy --workspace --all-targets -- -D warnings` passes; Windows and
-macOS workspace checks pass. Live smoke: `crikey dev inspect-protocol` against
-the out-of-tree plugin reports `verdict=conformant` over a Unix socket, reports
-`cooperated=true` for a cooperative cancel, and `--trace` prints the frames
-actually observed on the wire.
+Evidence on Linux: the current workspace baseline is 1166 tests passing with
+warnings denied, and the native integration suite proves the conformance
+lifecycle. Windows and macOS runtime behavior is not verified on this host;
+their compile checks are tracked under M6. Live smoke: `crikey dev
+inspect-protocol` against the out-of-tree plugin reports `verdict=conformant`
+over a Unix socket, reports `cooperated=true` for a cooperative cancel, and
+`--trace` prints the frames actually observed on the wire.
 
 Three independent audits of the first green implementation each returned
 "incorrect"; the defects they found — a live provider that never used its
@@ -314,22 +323,23 @@ plugin actions, Python host-managed background tasks, and native/modern
 catalog builds. The §24.4 OS resource limits are distinct from §13.5 and are
 implemented and reported per platform.
 
-### M6 — Additional platforms (§30 Phase 6) — L — implementation complete, closure gated on Windows and macOS runtime verification
+### M6 — Additional platforms (§30 Phase 6) — L — implementation largely complete, closure gated on integration and Windows/macOS runtime verification
 
 macOS and Linux backends behind the same traits, honest capability reporting
-per desktop environment, cross-platform packaging, portable built-ins.
+per desktop environment, cross-platform packaging, portable built-ins, and
+explicit live integration of those backends.
 
-Everything implementable without a Windows session or GPU hardware is done and
-verified. What landed:
-
-- **Linux global hotkeys (§18.6).** `X11HotkeyService` over `x11rb`: accelerator
-  → `(modifier mask, keysym)` mapping, grabs taken for every lock-modifier
-  permutation with the NumLock mask discovered at runtime, partial-grab
-  rollback, idempotent duplicate registration matching the Windows contract,
-  and a reader thread delivering activations. Delivery is proven by synthetic
-  XTEST key presses against a real Xvfb server, not asserted by construction.
-  Reachable from the live app through `LinuxBackend::hotkeys()` and
-  `App::register_activation_hotkey`, which is no longer Windows-only.
+- **Linux global hotkey backend (§18.6).** `X11HotkeyService` over `x11rb`:
+  accelerator → `(modifier mask, keysym)` mapping, grabs taken for every
+  lock-modifier permutation with the NumLock mask discovered at runtime,
+  partial-grab rollback, idempotent duplicate registration matching the
+  Windows contract, and a reader thread delivering activations. Delivery is
+  proven by synthetic XTEST key presses against a real Xvfb server, not
+  asserted by construction. The backend is reachable through
+  `LinuxBackend::hotkeys()` and `App::register_activation_hotkey`, but the
+  current `crikey run` entry point registers the live global shortcut only
+  under its Windows configuration. Linux live activation registration remains
+  open.
 - **Linux window control (§18.1).** A `WindowService` trait plus an EWMH
   `X11WindowService`: a three-part handshake (typed `_NET_SUPPORTED` atom list,
   required hints present, two-sided `_NET_SUPPORTING_WM_CHECK`), enumeration
@@ -357,28 +367,23 @@ verified. What landed:
 - **Cross-platform packaging and portable built-ins (§19.1–19.3).** Per-platform
   entrypoint resolution, OS and architecture gating, and a `MissingEntrypoint`
   failure naming the absent `<os>-<arch>` key distinctly from an undeclared
-  platform.
-- **§31.26 / §31.31 portability labelling.** A package the corpus documents as
-  Windows-only can no longer render as portable: the verdict is derived from
-  `LegacyDiagnostics::is_portable` on both user-facing CLI surfaces.
 
 Three independent audits of the first green implementation each returned
-"incorrect" against a passing 1132-test suite. The dominant defect was a
-capability advertised with no production consumer — `ConcurrencyBudget` never
-constructed outside its own test, `is_portable` with no caller, `GlobalHotkeys`
-reported `Available` while the only registration path was Windows-only, and a
-macOS backend `App` could not reach. Also found: a quadratic entity decoder in
-the plist parser (a 1 MiB bundle took 338 s, now 412 ms), a hotkey `Drop` that
-hung forever when its wake window was destroyed, an unbounded journal read, a
-shared staging filename, and an enumeration test that pinned the wrong
-behaviour. All fixed, each with a mutation showing the new test fails without
-the fix.
+"incorrect" against an earlier 1132-test suite. The dominant defects included
+a capability advertised with no production consumer — `ConcurrencyBudget` never
+constructed outside its own test, `is_portable` with no caller, and
+`GlobalHotkeys` reported `Available` while the only live registration path was
+Windows-only. Also found: a quadratic entity decoder in the plist parser (a
+1 MiB bundle took 338 s, now 412 ms), a hotkey `Drop` that hung forever when
+its wake window was destroyed, an unbounded journal read, a shared staging
+filename, and an enumeration test that pinned the wrong behaviour. The
+backend and capability defects were partly corrected, but Linux live shortcut
+registration and the catalog persistence wiring remain open; the other fixes
+are defended by tests.
 
-Evidence: 1156 tests pass with warnings denied, stable over three consecutive
-runs (`cargo` exit 0, zero `FAILED` lines); `cargo clippy --workspace
---all-targets -- -D warnings` clean; `cargo fmt --all --check` clean;
-`cargo check --workspace --all-targets` clean for `x86_64-pc-windows-msvc` and
-`aarch64-apple-darwin`.
+Evidence: 1166 tests pass on Linux with warnings denied. Windows and macOS
+runtime behaviour is not verified on this host; the compile checks are
+reported separately below.
 
 Still owed, each needing a runtime this host does not have:
 
@@ -449,8 +454,7 @@ Keypirinha branding, logos, or implied endorsement anywhere in UI or docs.
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| Undocumented Keypirinha behaviour that real plugins depend on | Compatibility gaps found late | Build the real-plugin corpus during M3, not after; classify and publish gaps rather than guessing at internals |
-| CPython startup cost inflating first-query latency | Misses §25.1 targets | Lazy worker start, warm pooling per runtime profile, catalog served from cache while workers boot |
+| CPython startup cost inflating first-query latency | Misses §25.1 targets | Lazy worker start and serving the persisted catalog while workers boot; the cache is rebuilt when a slice is missing or rejected |
 | Warm-activation budget (30 ms p95) on a cold GPU surface | Misses §31.1 | Keep window and surface alive and hidden. `crikey dev measure-activation` is the instrument, but it times `request_activation` → first present only, so it excludes hotkey dispatch and scanout, and a software rasteriser cannot settle the budget. Carried to M6, where the §31.1 verdict is the end-to-end Win32 measurement from hotkey to presented frame on real hardware |
 | Debounce tuning fighting perceived responsiveness | Poor feel | Local catalog is never debounced; defaults follow §25.4 bands and are per-plugin configurable |
 | Protocol churn after third-party SDK release | Ecosystem breakage | Freeze v1 at M5 with additive-only evolution and unknown-field round-tripping |
@@ -467,9 +471,10 @@ Tracked as ADRs. Provisional ones carry an explicit revisit trigger.
 | [0001](adr/0001-workspace-layout.md) | Workspace layout and dependency direction | Accepted |
 | [0002](adr/0002-ui-stack.md) | UI stack: winit + wgpu with an egui widget layer | Accepted (revisit if warm activation misses 30 ms p95) |
 | [0003](adr/0003-concurrency-model.md) | Threading and async model | Accepted |
-| [0004](adr/0004-plugin-ipc.md) | Protobuf over named pipes / UDS / stdio | Accepted |
+| [0004](adr/0004-plugin-ipc.md) | Protobuf wire format and local transports (encoding amended by ADR-0010) | Accepted, amended |
 | [0005](adr/0005-python-hosting.md) | Out-of-process CPython workers, no in-process interpreter | Accepted |
 | [0006](adr/0006-legacy-scheduling.md) | Obsolete-work replacement for `legacy-strict` | Accepted |
 | [0007](adr/0007-path-representation.md) | Lossless platform paths across IPC | Accepted |
-| [0008](adr/0008-catalog-persistence.md) | Versioned per-plugin catalog archive with owned decode | Accepted for M1 |
+| [0008](adr/0008-catalog-persistence.md) | Versioned per-plugin catalog archive with owned decode | Accepted for M1; production integration landed |
 | [0009](adr/0009-branding-and-attribution.md) | Branding and attribution rules | Accepted |
+| [0010](adr/0010-protobuf-codec.md) | Hand-written proto3 codec instead of generated bindings | Accepted; amends ADR-0004 |

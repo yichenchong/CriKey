@@ -278,8 +278,16 @@ pub fn searchable_text(item: &Item) -> String {
 /// highlights; [`DefaultMatcher`] keeps its own map back to raw label bytes
 /// for that.
 pub fn searchable_text_with_label(item: &Item) -> (String, usize) {
-    let terms: usize = item.search_terms.iter().map(|term| term.len() + 1).sum();
-    let mut out = String::with_capacity(item.label.len() + item.description.len() + terms + 1);
+    let terms = item.search_terms.iter().fold(0usize, |total, term| {
+        total.saturating_add(term.len().saturating_add(1))
+    });
+    let capacity = item
+        .label
+        .len()
+        .saturating_add(item.description.len())
+        .saturating_add(terms)
+        .saturating_add(1);
+    let mut out = String::with_capacity(capacity);
     push_searchable_field(&mut out, &item.label);
     let label_bytes = out.len();
     push_searchable_field(&mut out, &item.description);
@@ -363,12 +371,19 @@ impl PreparedLabel {
         Self::from_searchable_text(raw, text, label_bytes)
     }
 
-    /// Builds a prepared label from the folded searchable buffer produced by
-    /// [`searchable_text_with_label`].
+    /// Builds a prepared label from a folded searchable buffer.
+    ///
+    /// `label_bytes` is the folded label prefix length returned by
+    /// [`searchable_text_with_label`]. If a caller supplies an offset that
+    /// does not land on a UTF-8 boundary, the constructor safely falls back
+    /// to preparing `raw` on its own.
     pub fn from_searchable_text(raw: &str, text: String, label_bytes: usize) -> Self {
-        let label = text
-            .get(..label_bytes)
-            .expect("label_bytes must end on a folded-text boundary");
+        let Some(label) = text.get(..label_bytes) else {
+            // This is a public performance-oriented constructor, so malformed
+            // caller metadata must degrade to the safe standalone preparation
+            // rather than panic while slicing a UTF-8 string.
+            return Self::new(raw);
+        };
         let char_len = label.chars().count();
         let map = if raw.is_ascii() {
             None
@@ -614,7 +629,7 @@ impl DefaultMatcher {
             return Some(MatchSummary {
                 score: score_for(MatchMethod::ExactPrefix, 1.0),
                 method: MatchMethod::ExactPrefix,
-                match_position: raw_span.map(|(start, _)| item.label[..start].chars().count() as u32),
+                match_position: raw_span.and_then(|(start, _)| raw_character_position(&item.label, start)),
             });
         }
 
@@ -622,11 +637,12 @@ impl DefaultMatcher {
         if normalized.starts_with(phrase) {
             let raw_span = label.to_raw(0, phrase.len());
             push_span(spans, raw_span);
+            retain_valid_spans(&item.label, spans);
             let quality = ratio(phrase.chars().count(), label.char_len);
             return Some(MatchSummary {
                 score: score_for(MatchMethod::Prefix, quality),
                 method: MatchMethod::Prefix,
-                match_position: raw_span.map(|(start, _)| item.label[..start].chars().count() as u32),
+                match_position: raw_span.and_then(|(start, _)| raw_character_position(&item.label, start)),
             });
         }
 
@@ -646,9 +662,10 @@ impl DefaultMatcher {
             quality_total += unit(quality);
         }
 
+        retain_valid_spans(&item.label, spans);
         let match_position = spans
             .iter()
-            .map(|(start, _)| item.label[..*start].chars().count() as u32)
+            .filter_map(|(start, _)| raw_character_position(&item.label, *start))
             .min();
         let quality = quality_total / query.tokens.len() as f32;
         Some(MatchSummary {
@@ -668,8 +685,11 @@ impl DefaultMatcher {
         let mut spans = Vec::new();
         let summary = self.score_prepared(query, item, label, &mut spans)?;
         if summary.method == MatchMethod::ExactPrefix {
-            return exact_label_match(query, label);
+            let mut outcome = exact_label_match(query, label)?;
+            retain_valid_spans(&item.label, &mut outcome.highlights);
+            return Some(outcome);
         }
+        retain_valid_spans(&item.label, &mut spans);
         Some(MatchOutcome {
             score: summary.score,
             method: summary.method,
@@ -702,7 +722,7 @@ impl<'a> ItemView<'a> {
         let item = self.item;
         self.keywords
             .get_or_insert_with(|| {
-                let mut fields = Vec::with_capacity(item.search_terms.len() + 1);
+                let mut fields = Vec::with_capacity(item.search_terms.len().saturating_add(1));
                 fields.extend(item.search_terms.iter().map(|term| normalize_field(term)));
                 if !item.description.is_empty() {
                     fields.push(normalize_field(&item.description));
@@ -768,10 +788,10 @@ fn match_label(
     }
 
     if let Some(at) = label.normalized().find(token) {
-        push_span(spans, label.to_raw(at, at + token.len()));
+        push_span(spans, label.to_raw(at, at.saturating_add(token.len())));
         let coverage = ratio(token_chars, label.char_len);
         // A hit close to the front of the label reads as more relevant.
-        let position = 1.0 / (1 + label.normalized()[..at].chars().count()) as f32;
+        let position = 1.0 / label.normalized()[..at].chars().count().saturating_add(1) as f32;
         return Some((MatchMethod::Substring, 0.5 * coverage + 0.5 * position));
     }
 
@@ -851,8 +871,8 @@ fn fuzzy_quality(
     }
 
     // Tight, early runs read as intentional; scattered ones as coincidence.
-    let compactness = ratio(matched, last_ordinal - first_ordinal + 1);
-    let earliness = 1.0 / (1 + first_ordinal) as f32;
+    let compactness = ratio(matched, (last_ordinal - first_ordinal).saturating_add(1));
+    let earliness = 1.0 / first_ordinal.saturating_add(1) as f32;
     Some(0.5 * compactness + 0.5 * earliness)
 }
 
@@ -909,6 +929,21 @@ fn is_mark(ch: char) -> bool {
             get_general_category(ch),
             GeneralCategory::NonspacingMark | GeneralCategory::SpacingMark | GeneralCategory::EnclosingMark
         )
+}
+
+/// Converts a raw-label byte boundary into a saturating character offset.
+///
+/// Prepared labels normally come from the same item that is being scored, but
+/// the public prepared-label API cannot enforce that relationship. Rejecting a
+/// boundary that is outside the candidate keeps ranking and matching panic-free
+/// when a caller accidentally reuses a label from another item.
+fn raw_character_position(label: &str, byte_offset: usize) -> Option<u32> {
+    let prefix = label.get(..byte_offset)?;
+    Some(u32::try_from(prefix.chars().count()).unwrap_or(u32::MAX))
+}
+
+fn retain_valid_spans(label: &str, spans: &mut Vec<(usize, usize)>) {
+    spans.retain(|&(start, end)| start < end && label.get(start..end).is_some());
 }
 
 fn push_span(spans: &mut Vec<(usize, usize)>, span: Option<(usize, usize)>) {

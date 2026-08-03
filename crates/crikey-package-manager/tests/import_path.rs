@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crikey_package_manager::{EnvironmentId, ImportPath, MaterializedEnvironment};
+use crikey_package_manager::{EnvironmentId, ImportPath, MaterializedEnvironment, PackageError};
 
 fn env(site_dir: &str) -> MaterializedEnvironment {
     MaterializedEnvironment {
@@ -76,7 +76,9 @@ fn to_pythonpath_joins_entries_with_the_os_path_list_separator() {
     let expected =
         std::env::join_paths(&import_path.entries).expect("assembled entries contain no path-list separator");
     assert_eq!(
-        import_path.to_pythonpath(),
+        import_path
+            .to_pythonpath()
+            .expect("ordinary paths can be encoded"),
         expected,
         "to_pythonpath must join the entries with the OS path-list separator"
     );
@@ -90,7 +92,11 @@ fn to_pythonpath_never_contains_a_global_site_packages_path() {
     let sdk = Path::new("/opt/crikey/modern-sdk");
 
     let import_path = ImportPath::assemble(plugin_source, &packaged, &managed, sdk);
-    let rendered = import_path.to_pythonpath().to_string_lossy().into_owned();
+    let rendered = import_path
+        .to_pythonpath()
+        .expect("ordinary paths can be encoded")
+        .to_string_lossy()
+        .into_owned();
 
     for global in ["site-packages", "dist-packages"] {
         assert!(
@@ -104,4 +110,29 @@ fn to_pythonpath_never_contains_a_global_site_packages_path() {
         rendered.contains("/cache/env-abc/site"),
         "the managed environment's site dir must be on the import path"
     );
+}
+
+#[test]
+fn to_pythonpath_reports_a_component_containing_the_platform_separator() {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let bad = PathBuf::from(format!("/plugins/bad{separator}name/src"));
+    let managed = env("/cache/env/site");
+    let import_path = ImportPath::assemble(&bad, &[], &managed, Path::new("/opt/crikey/sdk"));
+
+    let error = import_path
+        .to_pythonpath()
+        .expect_err("a path-list separator inside one component is not encodable");
+    match error {
+        PackageError::InvalidImportPath(message) => {
+            assert!(
+                message.contains("bad"),
+                "error names the offending component: {message}"
+            );
+            assert!(
+                message.contains(separator),
+                "error names the platform separator `{separator}`: {message}"
+            );
+        }
+        other => panic!("separator failure must be InvalidImportPath, got {other:?}"),
+    }
 }

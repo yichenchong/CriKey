@@ -22,7 +22,7 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -437,6 +437,10 @@ fn quoted_exec_tokens_stay_single_arguments() {
     assert_eq!(notes.arguments, ["--title", "Daily Notes", "--tag", "work"]);
 }
 
+/// The desktop-entry specification forbids field codes inside quoted
+/// arguments, so their expansion is unspecified for malformed files. The
+/// parser deliberately fails closed by stripping them rather than handing an
+/// unexpanded placeholder to the launched program.
 #[test]
 fn field_codes_are_stripped_inside_quotes_and_double_percent_collapses() {
     let scratch = Scratch::new();
@@ -614,9 +618,104 @@ fn a_directory_named_like_an_entry_is_ignored_and_leaves_the_id_unclaimed() {
     write_entry(&system, "editor.desktop", EDITOR_FROM_SYSTEM);
 
     let applications = discover(vec![user, system]);
-
     // A directory is not an entry, so it must not shadow the real one below it.
     assert_eq!(names(&applications), ["Calculator", "Editor (system)"]);
+}
+
+#[test]
+fn a_non_utf8_entry_is_skipped_without_aborting_other_discovery() {
+    let scratch = Scratch::new();
+    let root = scratch.root("applications");
+    fs::write(
+        root.join("broken.desktop"),
+        b"[Desktop Entry]\nType=Application\nName=Broken \xFF\nExec=/bin/true\n",
+    )
+    .expect("non-UTF-8 fixture is writable");
+    write_entry(&root, "working.desktop", CALCULATOR);
+
+    let applications = discover(vec![root]);
+
+    assert_eq!(names(&applications), ["Calculator"]);
+}
+
+#[test]
+fn try_exec_requires_an_executable_file() {
+    let scratch = Scratch::new();
+    let root = scratch.root("applications");
+    let installed = scratch.path.join("installed-helper");
+    fs::write(&installed, b"#!/bin/sh\n").expect("TryExec fixture is writable");
+    fs::set_permissions(&installed, fs::Permissions::from_mode(0o755))
+        .expect("TryExec fixture is executable");
+
+    write_entry(
+        &root,
+        "installed.desktop",
+        &format!(
+            "[Desktop Entry]\nType=Application\nName=Installed\nTryExec={}\nExec=/bin/true\n",
+            installed.display()
+        ),
+    );
+    write_entry(
+        &root,
+        "missing.desktop",
+        &format!(
+            "[Desktop Entry]\nType=Application\nName=Missing\nTryExec={}\nExec=/bin/true\n",
+            scratch.path.join("missing-helper").display()
+        ),
+    );
+
+    let applications = discover(vec![root]);
+
+    assert_eq!(names(&applications), ["Installed"]);
+}
+
+#[test]
+fn only_show_in_and_not_show_in_follow_the_active_desktop_names() {
+    let scratch = Scratch::new();
+    let root = scratch.root("applications");
+    write_entry(
+        &root,
+        "only-gnome.desktop",
+        "[Desktop Entry]\nType=Application\nName=GNOME Only\nOnlyShowIn=GNOME;\nExec=/bin/true\n",
+    );
+    write_entry(
+        &root,
+        "not-gnome.desktop",
+        "[Desktop Entry]\nType=Application\nName=Not GNOME\nNotShowIn=GNOME;\nExec=/bin/true\n",
+    );
+    write_entry(
+        &root,
+        "only-kde.desktop",
+        "[Desktop Entry]\nType=Application\nName=KDE Only\nOnlyShowIn=KDE;\nExec=/bin/true\n",
+    );
+
+    let scanner = DesktopEntryScanner::with_environment(
+        vec![root],
+        vec!["GNOME".to_owned(), "Unity".to_owned()],
+        Vec::new(),
+    );
+    let discovery: &dyn ApplicationDiscovery = &scanner;
+    let applications = discovery.discover().expect("desktop filtering succeeds");
+
+    assert_eq!(names(&applications), ["GNOME Only"]);
+}
+
+#[test]
+fn localized_name_uses_locale_fallback_before_the_base_name() {
+    let scratch = Scratch::new();
+    let root = scratch.root("applications");
+    write_entry(
+        &root,
+        "localized.desktop",
+        "[Desktop Entry]\nType=Application\nName=English\nName[fr]=Français\nName[de]=Deutsch\nExec=/bin/true\n",
+    );
+
+    let scanner =
+        DesktopEntryScanner::with_environment(vec![root], Vec::new(), vec!["fr_FR.UTF-8".to_owned()]);
+    let discovery: &dyn ApplicationDiscovery = &scanner;
+    let applications = discovery.discover().expect("localized discovery succeeds");
+
+    assert_eq!(names(&applications), ["Français"]);
 }
 
 #[test]

@@ -73,6 +73,12 @@ pub enum PackageError {
     Manifest(String),
     #[error("native package installation failed: {0}")]
     Install(String),
+    #[error("invalid import path: {0}")]
+    InvalidImportPath(String),
+    #[error("indexed package source unavailable: {0}")]
+    SourceUnavailable(String),
+    #[error("malformed package index: {0}")]
+    MalformedIndex(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

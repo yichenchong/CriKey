@@ -23,12 +23,27 @@ alive to serve the next request.
 
 import asyncio
 import importlib
+import inspect
 import json
 import os
 import queue
 import sys
 import threading
 import traceback
+
+from crikey_sdk import Action, Item, Query, WorkerContext
+
+
+def _pin_text_stream(stream, name, newline):
+    """Pins a protocol-adjacent text stream to strict UTF-8."""
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        reconfigure(encoding="utf-8", errors="strict", newline=newline)
+        return
+    if str(getattr(stream, "encoding", "")).lower() != "utf-8":
+        raise RuntimeError(
+            "{} must support explicit UTF-8 configuration".format(name)
+        )
 
 # --------------------------------------------------------------------------
 # stdout hygiene: FIRST, before the plugin module can write a single byte.
@@ -43,6 +58,10 @@ _PROTOCOL = sys.stdout
 #: The real stderr, kept before rebinding so captured lines can be mirrored on
 #: for a developer watching the child and for the host's crash tail.
 _REAL_STDERR = sys.stderr
+_pin_text_stream(sys.stdin, "stdin", None)
+_pin_text_stream(_PROTOCOL, "stdout", "\n")
+_pin_text_stream(_REAL_STDERR, "stderr", "\n")
+
 
 # --------------------------------------------------------------------------
 # Wire protocol constants (agreed with `crikey-python-host` worker codec).
@@ -66,6 +85,7 @@ _LOG_TRUNCATION_MARKER = " \u2026[log line truncated]"
 #: Items buffered before an intermediate ``result_batch`` / ``catalog_batch`` is
 #: flushed. Small on purpose: streaming beats a single fat frame.
 _FLUSH_THRESHOLD = 32
+_OVERSIZED = object()
 
 ENV_PLUGIN_ID = "CRIKEY_MODERN_PLUGIN_ID"
 ENV_ENTRYPOINT = "CRIKEY_MODERN_ENTRYPOINT"
@@ -300,21 +320,33 @@ def _item_to_wire(item):
 
 
 def _item_from_wire(payload):
-    """A :class:`crikey_sdk.Item` from a host ``execute`` item frame."""
-    from crikey_sdk import Action, Item
-
+    """Builds an :class:`crikey_sdk.Item`, rejecting malformed wire shapes."""
+    if not isinstance(payload, dict):
+        raise TypeError("execute item must be a JSON object")
+    raw_actions = payload.get("actions") or []
+    if not isinstance(raw_actions, list) or any(
+        not isinstance(action, dict) for action in raw_actions
+    ):
+        raise TypeError("execute item actions must be an array of objects")
+    raw_metadata = payload.get("metadata") or {}
+    if not isinstance(raw_metadata, dict):
+        raise TypeError("execute item metadata must be a JSON object")
+    raw_search_terms = payload.get("search_terms") or []
+    if not isinstance(raw_search_terms, list):
+        raise TypeError("execute item search_terms must be an array")
     actions = [
         Action(
-            action_id=a.get("action_id", ""),
-            label=a.get("label", ""),
-            description=a.get("description", "") or "",
-            icon_reference=a.get("icon_reference"),
+            action_id=action.get("action_id", ""),
+            label=action.get("label", ""),
+            description=action.get("description", "") or "",
+            icon_reference=action.get("icon_reference"),
             applicable_categories=tuple(
-                str(c) for c in (a.get("applicable_categories") or ())
+                str(category) for category in (action.get("applicable_categories") or ())
             ),
-            execution_policy=a.get("execution_policy", "host-mediated") or "host-mediated",
+            execution_policy=action.get("execution_policy", "host-mediated")
+            or "host-mediated",
         )
-        for a in (payload.get("actions") or [])
+        for action in raw_actions
     ]
     return Item(
         stable_id=payload.get("stable_id", ""),
@@ -324,16 +356,29 @@ def _item_from_wire(payload):
         description=payload.get("description", "") or "",
         icon_reference=payload.get("icon_reference"),
         score_hint=int(payload.get("score_hint", 0) or 0),
-        search_terms=[str(t) for t in (payload.get("search_terms") or [])],
+        search_terms=[str(term) for term in raw_search_terms],
         metadata={
-            str(k): (v if isinstance(v, str) else str(v))
-            for k, v in (payload.get("metadata") or {}).items()
+            str(key): (value if isinstance(value, str) else str(value))
+            for key, value in raw_metadata.items()
         },
         actions=actions,
         argument_policy=payload.get("argument_policy", "forbidden") or "forbidden",
         hit_policy=payload.get("hit_policy", "recorded") or "recorded",
     )
 
+
+
+def _generation_from_wire(frame):
+    """Returns a protocol generation, rejecting values outside host ``u64``."""
+    generation = frame.get("generation")
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+        or generation > (1 << 64) - 1
+    ):
+        raise ValueError("suggest generation must be an unsigned 64-bit integer")
+    return generation
 
 # --------------------------------------------------------------------------
 # Frames
@@ -376,8 +421,12 @@ def _emit(frame):
         ]
         line = _encode(trimmed)
     with _EMIT_LOCK:
-        _PROTOCOL.write(line)
-        _PROTOCOL.flush()
+        try:
+            _PROTOCOL.write(line)
+            _PROTOCOL.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            # The host can close stdout first during orderly shutdown.
+            return
 
 
 # --------------------------------------------------------------------------
@@ -418,21 +467,27 @@ class _BackgroundTask:
     __slots__ = (
         "task_id",
         "coro",
+        "wrapper",
         "decision",
         "admission_event",
         "future",
         "cancel_requested",
+        "started",
+        "completion_reported",
     )
 
     def __init__(self, task_id, coro):
         self.task_id = task_id
         self.coro = coro
+        self.wrapper = None
         # ``None`` means the Rust host has not answered registration yet;
         # ``True``/``False`` are the sole start/refuse decisions.
         self.decision = None
         self.admission_event = None
         self.future = None
         self.cancel_requested = False
+        self.started = False
+        self.completion_reported = False
 
 
 # --------------------------------------------------------------------------
@@ -457,7 +512,6 @@ class _Worker:
         # same process boundary as the callback that requested it.
         self._background_loop = asyncio.new_event_loop()
         self._background_tasks = {}
-        self._background_running = set()
         self._background_lock = threading.Lock()
         self._next_background_id = 0
         self._background_thread = threading.Thread(
@@ -528,19 +582,54 @@ class _Worker:
         # Registration is emitted before scheduling the coroutine. The wrapper
         # cannot pass its admission gate until the Rust host answers.
         _emit({"kind": KIND_BACKGROUND_REGISTER, "task_id": task_id})
-        task.future = asyncio.run_coroutine_threadsafe(
-            self._run_background(task),
-            self._background_loop,
+        task.wrapper = self._run_background(task)
+        try:
+            task.future = asyncio.run_coroutine_threadsafe(
+                task.wrapper,
+                self._background_loop,
+            )
+        except BaseException:
+            task.coro.close()
+            with self._background_lock:
+                self._background_tasks.pop(task.task_id, None)
+            raise
+        task.future.add_done_callback(
+            lambda future: self._background_future_done(task, future)
         )
         with self._background_lock:
             if task.cancel_requested:
                 task.future.cancel()
         return task.future
 
+    def _background_future_done(self, task, future):
+        if not future.cancelled():
+            return
+        with self._background_lock:
+            started = task.started
+            task.cancel_requested = True
+        if not started:
+            task.coro.close()
+        self._complete_background(task, "cancelled")
+
+    def _complete_background(self, task, status, error=None):
+        with self._background_lock:
+            if task.completion_reported:
+                return
+            task.completion_reported = True
+            self._background_tasks.pop(task.task_id, None)
+        frame = {
+            "kind": KIND_BACKGROUND_COMPLETE,
+            "task_id": task.task_id,
+            "status": status,
+        }
+        if error is not None:
+            frame["error"] = error
+        _emit(frame)
+
     async def _run_background(self, task):
         current = asyncio.current_task()
         with self._background_lock:
-            self._background_running.add(current)
+            task.started = True
         status = "ok"
         error = None
         try:
@@ -563,27 +652,26 @@ class _Worker:
             error = {"message": str(caught), "traceback": traceback.format_exc()}
         finally:
             with self._background_lock:
-                known = set(self._background_running)
+                managed = {
+                    entry.wrapper
+                    for entry in self._background_tasks.values()
+                    if entry.wrapper is not None
+                }
             leftovers = [
                 pending
                 for pending in asyncio.all_tasks(self._background_loop)
-                if pending is not current and pending not in known and not pending.done()
+                if (
+                    pending is not current
+                    and pending.get_coro() not in managed
+                    and not pending.done()
+                )
             ]
             if leftovers:
                 for pending in leftovers:
                     pending.cancel()
                 await asyncio.gather(*leftovers, return_exceptions=True)
-            with self._background_lock:
-                self._background_running.discard(current)
-                self._background_tasks.pop(task.task_id, None)
-            frame = {
-                "kind": KIND_BACKGROUND_COMPLETE,
-                "task_id": task.task_id,
-                "status": status,
-            }
-            if error is not None:
-                frame["error"] = error
-            _emit(frame)
+            self._complete_background(task, status, error)
+
 
     def stop_background(self):
         with self._background_lock:
@@ -593,6 +681,23 @@ class _Worker:
                 task.future.cancel()
         self._background_loop.call_soon_threadsafe(self._background_loop.stop)
         self._background_thread.join(timeout=1.0)
+
+    def shutdown(self):
+        """Runs plugin shutdown once, then closes both worker event loops."""
+        try:
+            callback = getattr(self._plugin, "stop", None)
+            if callable(callback):
+                self.run_lifecycle(callback)
+        except BaseException as error:  # noqa: BLE001 -- shutdown is best effort
+            _REAL_STDERR.write(
+                "[err][crikey] modern plugin stop failed: {}\n{}".format(
+                    error, traceback.format_exc()
+                )
+            )
+            _REAL_STDERR.flush()
+        finally:
+            self.stop_background()
+            self._loop.close()
 
     # -- dispatch ---------------------------------------------------------
 
@@ -628,10 +733,8 @@ class _Worker:
         )
 
     def _run_callback(self, context, result):
-        """Runs a callback result: sync returns immediately; a coroutine is
-        driven on the worker's loop, its registered tasks awaited and any
-        un-registered pending task cancelled and reported (spec 15.8)."""
-        if not asyncio.iscoroutine(result):
+        """Runs sync or awaitable callback results on the worker's event loop."""
+        if not inspect.isawaitable(result):
             # A sync callback may still have registered coroutines via spawn
             # (no running loop at call time); drive them now for completeness.
             if context.registered_tasks:
@@ -639,69 +742,85 @@ class _Worker:
             return
         self._loop.run_until_complete(self._drain(context, result))
 
-    async def _drain(self, context, coro):
-        if coro is not None:
-            await coro
-        # Await everything registered via context.spawn to completion.
-        registered = list(context.registered_tasks)
-        if registered:
-            await asyncio.gather(*registered, return_exceptions=True)
-        # Any remaining pending task was created raw (not registered): refuse to
-        # leave it running -- cancel it and report it, never leak it into a later
-        # request (spec 15.8 last sentence).
-        current = asyncio.current_task()
-        registered_set = set(registered)
-        leftover = [
-            task
-            for task in asyncio.all_tasks(self._loop)
-            if task is not current and task not in registered_set and not task.done()
-        ]
-        if leftover:
-            for task in leftover:
-                task.cancel()
-            await asyncio.gather(*leftover, return_exceptions=True)
-            context.log(
-                "[warn][crikey] cancelled {} unregistered pending background "
-                "task(s) at callback end; use context.spawn to register "
-                "background work".format(len(leftover))
-            )
-
-    def _suggest(self, frame):
-        from crikey_sdk import Query, WorkerContext
-
-        request_id = frame.get("id")
-        _CAPTURE.reset()
-        query = Query(
-            text=frame.get("text", "") or "",
-            normalized=frame.get("normalized", "") or "",
-            generation=int(frame.get("generation", 0) or 0),
-        )
-        buffer = []
-
-        def sink(item):
-            buffer.append(_item_to_wire(item))
-            if len(buffer) >= _FLUSH_THRESHOLD:
-                self._emit_batch(request_id, "partial", buffer, [])
-                buffer.clear()
-
+    def run_lifecycle(self, callback):
+        """Runs a lifecycle callback and supports both sync and async methods."""
         context = WorkerContext(
             self._cancel.is_set,
-            sink,
+            lambda _item: None,
             _CAPTURE.line,
             self._loop,
             self._register_background,
         )
+        self._run_callback(context, callback())
+
+    async def _drain(self, context, coro):
+        result = None
+        try:
+            if coro is not None:
+                result = await coro
+        finally:
+            # Await everything registered via context.spawn to completion.
+            registered = list(context.registered_tasks)
+            if registered:
+                await asyncio.gather(*registered, return_exceptions=True)
+            # Any remaining pending task was created raw (not registered):
+            # refuse to leave it running and report the cleanup.
+            current = asyncio.current_task()
+            registered_set = set(registered)
+            leftover = [
+                task
+                for task in asyncio.all_tasks(self._loop)
+                if task is not current and task not in registered_set and not task.done()
+            ]
+            if leftover:
+                for task in leftover:
+                    task.cancel()
+                await asyncio.gather(*leftover, return_exceptions=True)
+                context.log(
+                    "[warn][crikey] cancelled {} unregistered pending background "
+                    "task(s) at callback end; use context.spawn to register "
+                    "background work".format(len(leftover))
+                )
+        return result
+
+    def _suggest(self, frame):
+        request_id = frame.get("id")
+        _CAPTURE.reset()
+        generation = 0
+        buffer = []
+
+        def sink(item):
+            if self._cancel.is_set():
+                return
+            buffer.append(_item_to_wire(item))
+            if len(buffer) >= _FLUSH_THRESHOLD:
+                self._emit_batch(request_id, generation, "partial", buffer, [])
+                buffer.clear()
 
         try:
+            generation = _generation_from_wire(frame)
+            query = Query(
+                text=frame.get("text", "") or "",
+                normalized=frame.get("normalized", "") or "",
+                generation=generation,
+            )
+            context = WorkerContext(
+                self._cancel.is_set,
+                sink,
+                _CAPTURE.line,
+                self._loop,
+                self._register_background,
+            )
             result = self._plugin.suggest(query, context)
             self._run_callback(context, result)
         except BaseException as error:  # noqa: BLE001 -- a plugin bug is not ours
             # Flush anything already streamed, then a terminal failed frame.
             if buffer:
-                self._emit_batch(request_id, "partial", buffer, [])
+                self._emit_batch(request_id, generation, "partial", buffer, [])
                 buffer.clear()
             self._emit_batch(
                 request_id,
+                generation,
                 "failed",
                 [],
                 _CAPTURE.take(),
@@ -710,13 +829,14 @@ class _Worker:
             return
 
         state = "cancelled" if self._cancel.is_set() else "final"
-        self._emit_batch(request_id, state, buffer, _CAPTURE.take())
+        self._emit_batch(request_id, generation, state, buffer, _CAPTURE.take())
 
-    def _emit_batch(self, request_id, state, items, log, error=None):
+    def _emit_batch(self, request_id, generation, state, items, log, error=None):
         _emit(
             {
                 "id": request_id,
                 "kind": "result_batch",
+                "generation": generation,
                 "state": state,
                 "items": list(items),
                 "log": list(log),
@@ -724,18 +844,13 @@ class _Worker:
             }
         )
 
-    def _build_catalog(self, frame):
-        from crikey_sdk import WorkerContext
 
+    def _build_catalog(self, frame):
         request_id = frame.get("id")
         buffer = []
-
-        def sink(item):
-            buffer.append(_item_to_wire(item))
-
         context = WorkerContext(
             self._cancel.is_set,
-            sink,
+            lambda _item: None,
             _CAPTURE.line,
             self._loop,
             self._register_background,
@@ -743,17 +858,18 @@ class _Worker:
 
         try:
             produced = self._plugin.build_catalog()
-            # ``build_catalog`` returns an iterable of items rather than emitting;
-            # feed each through the same wire translation.
+            if inspect.isawaitable(produced):
+                produced = self._loop.run_until_complete(
+                    self._drain(context, produced)
+                )
+            # ``build_catalog`` returns an iterable of items rather than
+            # emitting; feed each through the same wire translation.
             if produced is not None:
                 for item in produced:
                     buffer.append(_item_to_wire(item))
                     if len(buffer) >= _FLUSH_THRESHOLD:
                         self._emit_catalog(request_id, buffer, False, [])
                         buffer.clear()
-            # Also honour any items emitted through context.emit for symmetry.
-            if context.registered_tasks:
-                self._loop.run_until_complete(self._drain(context, None))
         except BaseException as error:  # noqa: BLE001
             # A raise during catalog load is NOT an empty catalog: surface a
             # terminal frame carrying the fault so the host maps it to
@@ -787,22 +903,19 @@ class _Worker:
         _emit(frame)
 
     def _execute(self, frame):
-        from crikey_sdk import WorkerContext
-
         request_id = frame.get("id")
         _CAPTURE.reset()
-        item = _item_from_wire(frame.get("item") or {})
         action_id = frame.get("action_id")
         argument = frame.get("argument")
-        context = WorkerContext(
-            self._cancel.is_set,
-            lambda _item: None,
-            _CAPTURE.line,
-            self._loop,
-            self._register_background,
-        )
-
         try:
+            item = _item_from_wire(frame.get("item") or {})
+            context = WorkerContext(
+                self._cancel.is_set,
+                lambda _item: None,
+                _CAPTURE.line,
+                self._loop,
+                self._register_background,
+            )
             result = self._plugin.execute(item, action_id, argument)
             self._run_callback(context, result)
         except BaseException as error:  # noqa: BLE001
@@ -833,8 +946,30 @@ class _Worker:
 # --------------------------------------------------------------------------
 
 
+def _read_bounded_line(stream):
+    """Reads at most one protocol frame, measured in UTF-8 bytes."""
+    raw_stream = getattr(stream, "buffer", stream)
+    line = raw_stream.readline(_MAX_FRAME_BYTES + 1)
+    if isinstance(line, str):
+        line = line.encode("utf-8", "strict")
+    if not line:
+        return None
+    newline = line.find(b"\n")
+    if newline == -1:
+        if len(line) > _MAX_FRAME_BYTES:
+            return _OVERSIZED
+        payload = line
+    else:
+        if newline > _MAX_FRAME_BYTES:
+            return _OVERSIZED
+        payload = line[:newline]
+    if payload.endswith(b"\r"):
+        payload = payload[:-1]
+    return payload
+
+
 def _read_stdin(stream, pending, worker):
-    """Reads frames off stdin forever, on its own daemon thread.
+    """Reads bounded frames off stdin forever, on its own daemon thread.
 
     ``set_cancel`` is applied HERE, the moment it is parsed, so a plugin polling
     ``context.cancelled`` inside ``suggest`` observes cancellation while that
@@ -842,21 +977,28 @@ def _read_stdin(stream, pending, worker):
     """
     while True:
         try:
-            line = stream.readline()
-        except (OSError, ValueError):
+            payload = _read_bounded_line(stream)
+        except (OSError, ValueError, UnicodeError):
             pending.put(_EOF)
             return
-        if not line:
+        if payload is None:
             pending.put(_EOF)
             return
-
-        stripped = line.strip()
-        if not stripped:
+        if payload is _OVERSIZED:
+            _REAL_STDERR.write(
+                "[err][crikey] incoming frame exceeds {} bytes; worker exiting\n".format(
+                    _MAX_FRAME_BYTES
+                )
+            )
+            _REAL_STDERR.flush()
+            pending.put(_EOF)
+            return
+        if not payload.strip():
             continue
 
         try:
-            frame = json.loads(stripped)
-        except ValueError:
+            frame = json.loads(payload.decode("utf-8", "strict"))
+        except (UnicodeDecodeError, ValueError):
             _REAL_STDERR.write("[err][crikey] undecodable request line ignored\n")
             _REAL_STDERR.flush()
             continue
@@ -900,11 +1042,19 @@ def main():
             return 1
 
     entrypoint = os.environ.get(ENV_ENTRYPOINT, "")
+    worker = None
     try:
         plugin = _load_plugin(entrypoint)
-        if hasattr(plugin, "start"):
-            plugin.start()
+        worker = _Worker(plugin)
+        callback = getattr(plugin, "start", None)
+        if callable(callback):
+            _CAPTURE.reset()
+            worker.run_lifecycle(callback)
+            _CAPTURE.take()
     except BaseException as error:  # noqa: BLE001
+        if worker is not None:
+            worker.stop_background()
+            worker._loop.close()
         _REAL_STDERR.write(
             "[err][crikey] failed to load modern plugin from entrypoint {!r}: {}\n{}".format(
                 entrypoint, error, traceback.format_exc()
@@ -913,7 +1063,6 @@ def main():
         _REAL_STDERR.flush()
         return 1
 
-    worker = _Worker(plugin)
     pending = queue.Queue(maxsize=_PENDING_QUEUE_CAPACITY)
     reader = threading.Thread(
         target=_read_stdin,
@@ -926,12 +1075,12 @@ def main():
     while True:
         frame = pending.get()
         if frame is _EOF:
-            worker.stop_background()
+            worker.shutdown()
             return 0
         if frame.get("kind") == _KIND_SHUTDOWN:
             # No reply: the host drops stdin as it asks, and writing to a stdout
             # it has stopped reading risks a BrokenPipeError.
-            worker.stop_background()
+            worker.shutdown()
             return 0
         worker.serve(frame)
 

@@ -246,15 +246,23 @@ impl DefaultRanker {
     }
 
     /// Highest score this item can earn without a label-prefix match.
+    ///
+    /// The bound maximizes every optional signal as well as the strongest
+    /// non-prefix match. That keeps it valid for callers that use an enabled
+    /// history policy or supply context and preference signals.
     pub fn non_prefix_upper_bound(&self, item: &Item) -> Score {
-        self.score_match(
-            item,
-            MatchSummary {
-                score: 0.72,
-                method: MatchMethod::Substring,
-                match_position: Some(0),
-            },
-        )
+        self.score_signals(RankingSignals {
+            match_quality: 0.72,
+            exact_prefix: false,
+            match_position: Some(0),
+            category_weight: category_weight(&item.category),
+            plugin_score_hint: item.score_hint,
+            selection_frequency: u32::MAX,
+            selection_recency_secs: Some(0),
+            query_history: 1.0,
+            context_match: true,
+            user_preference: 1.0,
+        })
     }
 }
 

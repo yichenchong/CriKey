@@ -140,7 +140,8 @@ const GOOD_PACKAGE_ROW: &str = r#"id = "example.alpha"
 source = "https://github.com/example/alpha"
 revision = "0123456789abcdef0123456789abcdef01234567"
 licence = "MIT"
-classification = "works-unchanged""#;
+classification = "works-unchanged"
+notes = "synthetic validation fixture""#;
 
 /// A pinned revision is exactly 40 lowercase-or-uppercase hex characters.
 const PINNED_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -584,6 +585,7 @@ fn every_committed_entry_carries_its_identifying_fields() {
             source,
             revision,
             licence,
+            notes,
             ..
         } = entry;
         assert!(!id.trim().is_empty(), "corpus package[{index}] has an empty id");
@@ -598,6 +600,10 @@ fn every_committed_entry_carries_its_identifying_fields() {
         assert!(
             !licence.trim().is_empty(),
             "corpus package[{index}] ({id}) has an empty licence; an unlicensed reference cannot be redistributed or reproduced"
+        );
+        assert!(
+            !notes.trim().is_empty(),
+            "corpus package[{index}] ({id}) has no evidence notes"
         );
     }
 }
@@ -961,6 +967,52 @@ fn every_caveated_entry_in_the_committed_matrix_explains_the_difference() {
     }
 }
 
+#[test]
+fn settings_rows_disclose_missing_extended_interpolation() {
+    let matrix = load_matrix();
+    for symbol in [
+        "Settings.get",
+        "Settings.get_bool",
+        "Settings.get_int",
+        "Settings.get_float",
+    ] {
+        let entry = matrix
+            .get("keypirinha", symbol)
+            .unwrap_or_else(|| panic!("matrix must classify keypirinha.{symbol}"));
+        assert_eq!(
+            entry.status,
+            ApiSupport::BehaviouralDifference,
+            "a settings accessor cannot claim full support while extended interpolation is absent"
+        );
+        assert!(
+            entry.notes.contains("interpolation"),
+            "the {} caveat must name the missing interpolation behavior, got {:?}",
+            describe(entry),
+            entry.notes
+        );
+        assert!(
+            entry.notes.contains("${section:key}") && entry.notes.contains("${env:VARIABLE}"),
+            "the {} caveat must name both supported reference forms, got {:?}",
+            describe(entry),
+            entry.notes
+        );
+    }
+
+    let loader = matrix
+        .get("keypirinha", "Plugin.load_settings")
+        .expect("matrix must classify keypirinha.Plugin.load_settings");
+    assert_eq!(
+        loader.status,
+        ApiSupport::BehaviouralDifference,
+        "loading settings must carry through the parser's interpolation gap"
+    );
+    assert!(
+        loader.notes.contains("interpolation"),
+        "the load_settings caveat must name the missing interpolation behavior, got {:?}",
+        loader.notes
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The corpus is reproducible and unvendored
 // ---------------------------------------------------------------------------
@@ -1013,6 +1065,33 @@ classification = "works-unchanged""#
             (other, _) => panic!("revision {revision:?} must be rejected as unpinned, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn corpus_references_require_evidence_notes_and_https_sources() {
+    let no_notes = corpus_source(&[r#"id = "example.no-notes"
+source = "https://github.com/example/no-notes"
+revision = "0123456789abcdef0123456789abcdef01234567"
+licence = "MIT"
+classification = "works-unchanged""#]);
+    let error = PluginCorpus::parse(&no_notes).expect_err("a corpus claim without evidence must be rejected");
+    assert!(
+        matches!(&error, MatrixError::EmptyPackageField { field: "notes", .. }),
+        "missing corpus evidence must identify the notes field, got {error:?}"
+    );
+
+    let non_https = corpus_source(&[r#"id = "example.local"
+source = "file:///tmp/example"
+revision = "0123456789abcdef0123456789abcdef01234567"
+licence = "MIT"
+classification = "works-unchanged"
+notes = "synthetic evidence""#]);
+    let error = PluginCorpus::parse(&non_https)
+        .expect_err("a local corpus path is not reproducible upstream evidence");
+    assert!(
+        matches!(&error, MatrixError::InvalidPackageSource { .. }),
+        "non-HTTPS corpus sources must be rejected by the parser, got {error:?}"
+    );
 }
 
 #[test]

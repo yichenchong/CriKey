@@ -54,6 +54,7 @@ pub struct NativeSupervisor {
     config: SupervisorConfig,
     memory: MemorySupervisor,
     registrations: BTreeMap<PluginId, Registration>,
+    closed: bool,
 }
 
 impl NativeSupervisor {
@@ -62,10 +63,14 @@ impl NativeSupervisor {
             memory: MemorySupervisor::new(config.circuit),
             config,
             registrations: BTreeMap::new(),
+            closed: false,
         }
     }
 
     pub fn register(&mut self, spec: LaunchSpec, options: WorkerOptions) -> Result<(), HostError> {
+        if self.closed {
+            return Err(HostError::Closed);
+        }
         let plugin = spec.plugin.clone();
         if self.registrations.contains_key(&plugin) {
             return Err(HostError::ResourceLimit {
@@ -95,6 +100,9 @@ impl NativeSupervisor {
     }
 
     pub fn worker(&mut self, plugin: &PluginId, now_ms: u64) -> Result<&mut NativeWorker, HostError> {
+        if self.closed {
+            return Err(HostError::Closed);
+        }
         if !self.registrations.contains_key(plugin) {
             return Err(HostError::ResourceLimit {
                 plugin: plugin.clone(),
@@ -102,20 +110,25 @@ impl NativeSupervisor {
             });
         }
 
-        let (already_alive, dead_exit, call_failure) = {
+        let (already_alive, dead_exit, call_failure, call_success) = {
             let registration = self.registrations.get_mut(plugin).expect("checked above");
             let alive = registration.worker.as_mut().is_some_and(NativeWorker::is_alive);
             let call_failure = registration
                 .worker
                 .as_mut()
                 .and_then(NativeWorker::take_failure_kind);
+            let call_success = registration
+                .worker
+                .as_mut()
+                .is_some_and(NativeWorker::take_call_success);
             if alive {
-                (true, None, call_failure)
+                (true, None, call_failure, call_success)
             } else {
                 (
                     false,
                     registration.worker.take().map(NativeWorker::shutdown),
                     call_failure,
+                    call_success,
                 )
             }
         };
@@ -123,6 +136,8 @@ impl NativeSupervisor {
         if already_alive {
             if let Some(failure) = call_failure {
                 let _ = self.record_failure(plugin, failure, now_ms);
+            } else if call_success {
+                let _ = self.memory.record_success(plugin);
             }
         } else if let Some(exit) = dead_exit {
             let failure = call_failure.unwrap_or_else(|| failure_kind_for_exit(&exit));
@@ -207,7 +222,12 @@ impl NativeSupervisor {
         }
     }
 
+    /// Stops every child and permanently closes this supervisor.
     pub fn shutdown_all(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
         for registration in self.registrations.values_mut() {
             if let Some(worker) = registration.worker.take() {
                 registration.exits.push(worker.shutdown());

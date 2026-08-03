@@ -5,21 +5,31 @@
 //! clause the HIGHEST — by numeric, not lexical, ordering — is chosen; a
 //! requirement no indexed wheel satisfies is a [`PackageError::Resolution`].
 
-use crate::index::PackageIndex;
+use std::collections::BTreeMap;
+
+use crate::index::{normalize_name, PackageIndex};
 use crate::lockfile::{LockedPackage, Lockfile};
 use crate::PackageError;
 
-/// Resolve declared deps against the index into a byte-stable lockfile.
+/// Resolve declared deps against an offline index into a byte-stable lockfile.
 pub fn resolve(
     requires_python: &str,
     dependencies: &[String],
     index: &PackageIndex,
 ) -> Result<Lockfile, PackageError> {
-    let mut packages = Vec::new();
-
+    // Group requirements by their canonical package name. This both avoids
+    // duplicate lock entries and makes conflicting declarations fail together:
+    // `My.Pkg>=1` and `my-pkg<1` describe one package, not two.
+    let mut grouped: BTreeMap<String, (Vec<Clause>, Vec<String>)> = BTreeMap::new();
     for dep in dependencies {
         let (name, clauses) = parse_requirement(dep)?;
+        let entry = grouped.entry(name).or_default();
+        entry.0.extend(clauses);
+        entry.1.push(dep.clone());
+    }
 
+    let mut packages = Vec::with_capacity(grouped.len());
+    for (name, (clauses, declarations)) in grouped {
         // Highest indexed version satisfying every clause, compared numerically.
         let mut best: Option<(&str, &str, Vec<u64>)> = None;
         for candidate in index.versions(&name) {
@@ -37,22 +47,25 @@ pub fn resolve(
 
         match best {
             Some((version, hash, _)) => packages.push(LockedPackage {
-                name: name.clone(),
+                name,
                 version: version.to_owned(),
                 hash: hash.to_owned(),
             }),
             None => {
                 return Err(PackageError::Resolution(format!(
-                    "no indexed version of `{name}` satisfies `{dep}`"
+                    "conflicting or unsatisfied requirements for `{name}`: {}",
+                    declarations.join(", ")
                 )))
             }
         }
     }
 
-    Ok(Lockfile {
+    let lockfile = Lockfile {
         requires_python: requires_python.to_owned(),
         packages,
-    })
+    };
+    lockfile.validate()?;
+    Ok(lockfile)
 }
 
 /// A single comparison clause, e.g. `>=1.0`.
@@ -84,13 +97,13 @@ enum Op {
     Lt,
 }
 
-/// Split `acme>=1.0,<2.0` into a name and its comparison clauses.
+/// Split `acme>=1.0,<2.0` into a canonical name and comparison clauses.
 fn parse_requirement(spec: &str) -> Result<(String, Vec<Clause>), PackageError> {
     let spec = spec.trim();
     let split = spec
         .find(['<', '>', '='])
         .ok_or_else(|| PackageError::Resolution(format!("requirement `{spec}` has no version specifier")))?;
-    let name = spec[..split].trim().to_owned();
+    let name = normalize_name(spec[..split].trim());
     if name.is_empty() {
         return Err(PackageError::Resolution(format!(
             "requirement `{spec}` has an empty name"
@@ -118,6 +131,11 @@ fn parse_requirement(spec: &str) -> Result<(String, Vec<Clause>), PackageError> 
                 "requirement `{spec}` has an unsupported operator in `{raw}`"
             )));
         };
+        if rest.trim().is_empty() {
+            return Err(PackageError::Resolution(format!(
+                "requirement `{spec}` has an empty version"
+            )));
+        }
         clauses.push(Clause {
             op,
             version: parse_version(rest.trim()),

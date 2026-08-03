@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crikey_core::{ArgumentPolicy, Category, HitPolicy, Item, ItemId, PluginId};
 use crikey_query::{
     DefaultMatcher, DefaultNormalizer, MatchMethod, MatchOutcome, Matcher, NormalizedQuery, Normalizer,
+    PreparedLabel,
 };
 
 fn item(label: &str, description: &str, target: &str, search_terms: &[&str]) -> Item {
@@ -225,4 +226,40 @@ fn score_bands_enforce_the_full_declared_precedence() {
         );
         assert!(pair[0].method.precedence() < pair[1].method.precedence());
     }
+}
+
+#[test]
+fn malformed_prepared_label_boundary_does_not_panic() {
+    let result =
+        std::panic::catch_unwind(|| PreparedLabel::from_searchable_text("é", "é keyword".to_owned(), 1));
+
+    assert!(
+        result.is_ok(),
+        "a caller-provided folded offset must not panic on a non-character boundary"
+    );
+    assert_eq!(result.expect("the constructor did not panic").normalized(), "é");
+}
+
+#[test]
+fn mismatched_prepared_label_does_not_panic_or_emit_invalid_highlights() {
+    let candidate = item("z", "", "/test/mismatch", &[]);
+    let prepared = PreparedLabel::new("éx");
+    let query = normalize("x");
+    let result =
+        std::panic::catch_unwind(|| DefaultMatcher::default().match_prepared(&query, &candidate, &prepared));
+
+    assert!(
+        result.is_ok(),
+        "a prepared label from another item must not make score_prepared slice the candidate unsafely"
+    );
+    let outcome = result
+        .expect("matching did not panic")
+        .expect("the mismatched prepared label still contains the query");
+    assert!(
+        outcome
+            .highlights
+            .iter()
+            .all(|&(start, end)| candidate.label.get(start..end).is_some()),
+        "mismatched prepared labels must not emit ranges outside the candidate label"
+    );
 }

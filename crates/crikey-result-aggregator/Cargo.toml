@@ -1,6 +1,6 @@
 [package]
 name = "crikey-result-aggregator"
-description = "Per-generation result merge, dedup, incremental rerank, presentation batching."
+description = "Per-generation result merge, deduplication, bounded intake, and presentation batching."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,4 +13,3 @@ workspace = true
 
 [dependencies]
 crikey-core.workspace = true
-crikey-ranking.workspace = true

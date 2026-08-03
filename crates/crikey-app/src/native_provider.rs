@@ -434,6 +434,10 @@ pub struct NativeProvider {
 /// window contributes no rows to this frame. Production always uses it.
 pub const DEFAULT_COLLECTION_WINDOW: Duration = Duration::from_millis(100);
 
+/// Bound on one native worker callback. The same value is used by the native
+/// host and by the provider's action queue deadline.
+const NATIVE_CALL_TIMEOUT_MS: u64 = 5_000;
+
 impl NativeProvider {
     /// Discovers native `crikey.toml` packages under `roots`, resolves the
     /// current platform entrypoint, and starts one worker per usable package
@@ -573,7 +577,7 @@ impl NativeProvider {
             working_dir: Some(directory.to_path_buf()),
             environment: Vec::new(),
         };
-        let options = WorkerOptions::new();
+        let options = WorkerOptions::new().with_call_timeout_ms(NATIVE_CALL_TIMEOUT_MS);
 
         // Register first so this provider receives the exact shared budget
         // handle that the query pipeline stores for the plugin. A worker
@@ -773,6 +777,22 @@ impl NativeProvider {
     fn execute_action_request(&mut self, request: NativeActionRequest) -> crikey_core::Result<()> {
         let _guard = request.guard;
         let plugin = request.plugin;
+        let item_id = request.item.stable_id.clone();
+        let item = self
+            .action_items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(plugin.clone(), item_id.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                crikey_core::CoreError::Invalid("native action item snapshot is no longer current".to_owned())
+            })?;
+        if item.plugin_id != plugin {
+            return Err(crikey_core::CoreError::Invalid(format!(
+                "native action item `{}` is owned by `{}`, not `{}`",
+                item.stable_id.0, item.plugin_id.0, plugin.0
+            )));
+        }
         let loaded = self
             .loaded
             .iter()
@@ -783,14 +803,7 @@ impl NativeProvider {
                     plugin.0
                 ))
             })?;
-        if request.item.plugin_id != plugin {
-            return Err(crikey_core::CoreError::Invalid(format!(
-                "native action item `{}` is owned by `{}`, not `{}`",
-                request.item.stable_id.0, request.item.plugin_id.0, plugin.0
-            )));
-        }
-        let action = request
-            .item
+        let action = item
             .actions
             .iter()
             .find(|action| action.action_id == request.action_id)
@@ -802,14 +815,13 @@ impl NativeProvider {
                 "native action request is not plugin-owned".to_owned(),
             ));
         }
-        if !action.applicable_categories.is_empty()
-            && !action.applicable_categories.contains(&request.item.category)
+        if !action.applicable_categories.is_empty() && !action.applicable_categories.contains(&item.category)
         {
             return Err(crikey_core::CoreError::Invalid(
                 "native action is not applicable to the selected item category".to_owned(),
             ));
         }
-        match request.item.argument_policy {
+        match item.argument_policy {
             ArgumentPolicy::Forbidden if request.argument.is_some() => {
                 return Err(crikey_core::CoreError::Invalid(
                     "native action item forbids arguments".to_owned(),
@@ -884,16 +896,11 @@ impl NativeProvider {
         now: Millis,
     ) -> Option<ViewModel> {
         let generation = pipeline.keystroke(query, now);
-        let mut suggestions = self.collect_suggestions(query, generation, now);
+        let (mut suggestions, dead_plugins) = self.collect_suggestions(query, generation, now);
 
-        let mut tick_succeeded = true;
-        let mut delivered = true;
         let mut at = now;
         for _ in 0..64 {
             let tick = pipeline.tick(at);
-            if !tick.errors.is_empty() {
-                tick_succeeded = false;
-            }
             for cancellation in tick.cancellations {
                 let _ = pipeline.complete(&cancellation.plugin, cancellation.generation, at);
             }
@@ -905,22 +912,22 @@ impl NativeProvider {
                     continue;
                 }
                 dispatched_current = true;
+                if dead_plugins.contains(&request.plugin) {
+                    let _ = pipeline.abort_request(&request.plugin, request.generation, at);
+                    continue;
+                }
                 let items = suggestions.remove(&request.plugin).unwrap_or_default();
-                let admitted = pipeline
-                    .deliver(
-                        ResultBatch {
-                            generation: request.generation,
-                            plugin: request.plugin.clone(),
-                            state: BatchState::Final,
-                            items,
-                        },
-                        at,
-                    )
-                    .is_ok();
-                delivered &= admitted;
+                let _ = pipeline.deliver(
+                    ResultBatch {
+                        generation: request.generation,
+                        plugin: request.plugin.clone(),
+                        state: BatchState::Final,
+                        items,
+                    },
+                    at,
+                );
                 let _ = pipeline.complete(&request.plugin, request.generation, at);
             }
-
             if suggestions.is_empty() && dispatched_current {
                 break;
             }
@@ -937,10 +944,6 @@ impl NativeProvider {
         self.drain_completed_results();
 
         let frame = pipeline.present(at);
-        let presentation_succeeded = pipeline.take_errors().is_empty();
-        if !tick_succeeded || !delivered || !presentation_succeeded {
-            return None;
-        }
         frame.filter(|frame| frame.generation == generation)
     }
 
@@ -969,7 +972,7 @@ impl NativeProvider {
         query: &str,
         generation: Generation,
         now: Millis,
-    ) -> BTreeMap<PluginId, Vec<Item>> {
+    ) -> (BTreeMap<PluginId, Vec<Item>>, BTreeSet<PluginId>) {
         let generation_value = generation.get();
         self.pool.cancel_before(generation_value);
 
@@ -993,13 +996,17 @@ impl NativeProvider {
             .collect();
         let mut pending = 0usize;
 
+        let mut dead_plugins = BTreeSet::new();
         for (plugin, key) in targets {
             if self.pool.has_in_flight(&plugin) {
                 continue;
             }
             let supervisor = match self.pool.supervisors.get(&key) {
                 Some(supervisor) => Arc::clone(supervisor),
-                None => continue,
+                None => {
+                    dead_plugins.insert(plugin);
+                    continue;
+                }
             };
             let control = Arc::new(CallControl::new());
             let control_for_thread = Arc::clone(&control);
@@ -1021,7 +1028,7 @@ impl NativeProvider {
                                 let watcher = thread::Builder::new()
                                     .name(format!("crikey-native-cancel-{}", plugin_for_thread.0))
                                     .spawn(move || watch_control.watch_cancel());
-                                let result = worker.suggest_with_cancel_latched(&request_for_thread);
+                                let result = worker.suggest(&request_for_thread);
                                 control_for_thread.finish();
                                 if let Ok(watcher) = watcher {
                                     let _ = watcher.join();
@@ -1042,10 +1049,10 @@ impl NativeProvider {
                 Err(error) => {
                     self.pool.cancellation.unregister(generation_value, &plugin);
                     self.pool.record_dispatch_failure(
-                        plugin,
+                        plugin.clone(),
                         format!("native dispatch thread did not start: {error}"),
                     );
-
+                    dead_plugins.insert(plugin);
                     continue;
                 }
             };
@@ -1075,17 +1082,20 @@ impl NativeProvider {
             };
             let is_current = completion.generation == generation_value;
             self.pool.finish_call(completion.generation, &completion.plugin);
-            if is_current {
+            let plugin = completion.plugin.clone();
+            let failed = if is_current {
                 pending = pending.saturating_sub(1);
-                self.apply_dispatch_result(completion.plugin, completion.result, Some(&mut by_plugin));
+                self.apply_dispatch_result(completion.plugin, completion.result, Some(&mut by_plugin))
             } else {
-                self.apply_dispatch_result(completion.plugin, completion.result, None);
+                self.apply_dispatch_result(completion.plugin, completion.result, None)
+            };
+            if is_current && failed {
+                dead_plugins.insert(plugin);
             }
         }
 
-        by_plugin
+        (by_plugin, dead_plugins)
     }
-
     /// Retires every completion that has reached the channel. Results that
     /// arrive outside the presentation window are intentionally not rendered,
     /// but failures are still recorded and every dispatcher is joined.
@@ -1101,7 +1111,7 @@ impl NativeProvider {
         plugin: PluginId,
         result: Result<Suggestions, HostError>,
         output: Option<&mut BTreeMap<PluginId, Vec<Item>>>,
-    ) {
+    ) -> bool {
         match result {
             Ok(suggestions) if matches!(suggestions.state, crikey_native_host::BatchState::Failed) => {
                 let reason = suggestions
@@ -1110,6 +1120,7 @@ impl NativeProvider {
                     .filter(|message| !message.is_empty())
                     .unwrap_or_else(|| "the native plugin reported a failure".to_owned());
                 self.pool.record_dispatch_failure(plugin, reason);
+                false
             }
             Ok(suggestions) => {
                 if let Some(output) = output {
@@ -1125,9 +1136,16 @@ impl NativeProvider {
                     }
                     output.insert(plugin, items);
                 }
+                false
             }
             Err(error) => {
-                self.pool.record_dispatch_failure(plugin, error.to_string());
+                self.pool
+                    .record_dispatch_failure(plugin.clone(), error.to_string());
+                self.action_items
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .retain(|(owner, _), _| owner != &plugin);
+                true
             }
         }
     }
@@ -1160,7 +1178,7 @@ struct NativeRequestSlot {
 const ACTION_QUEUE_CAPACITY: usize = 8;
 const ACTION_COMPLETION_CAPACITY: usize = 64;
 const ACTION_IN_FLIGHT_CAPACITY: usize = 32;
-const ACTION_TIMEOUT_MS: u64 = 121_000;
+const ACTION_TIMEOUT_MS: u64 = NATIVE_CALL_TIMEOUT_MS;
 
 /// One admitted action handed to the native provider supervisor.
 #[derive(Debug)]
@@ -1200,6 +1218,28 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         action_id: &ActionId,
         argument: Option<&str>,
     ) -> crikey_core::Result<ActionRequestId> {
+        if item.plugin_id != *plugin {
+            return Err(crikey_core::CoreError::Invalid(
+                "selected native plugin result has stale ownership".to_owned(),
+            ));
+        }
+        let item_id = item.stable_id.clone();
+        let item = self
+            .items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&(plugin.clone(), item_id))
+            .cloned()
+            .ok_or_else(|| {
+                crikey_core::CoreError::Invalid(
+                    "selected native plugin result is no longer current".to_owned(),
+                )
+            })?;
+        if item.plugin_id != *plugin {
+            return Err(crikey_core::CoreError::Invalid(
+                "selected native plugin result has stale ownership".to_owned(),
+            ));
+        }
         let reserved = self
             .in_flight
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {

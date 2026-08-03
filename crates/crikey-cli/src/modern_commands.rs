@@ -38,8 +38,12 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crikey_core::{Item, PluginId};
 use crikey_package_manager::{resolve, EnvironmentInputs, EnvironmentStore, ImportPath, PackageIndex};
@@ -73,6 +77,73 @@ const SHUTDOWN_BUDGET_MS: u64 = 5_000;
 /// omitting `requires-python` is gated identically by `crikey dev` and by
 /// `crikey run`.
 const DEFAULT_REQUIRES_PYTHON: &str = ">=3.8";
+
+/// A private temporary directory used only for one developer-command run.
+///
+/// The package manager reuses a committed environment by path and does not
+/// re-verify its files. A predictable directory directly below the shared
+/// system temporary directory would therefore let another local process plant
+/// an environment before this command starts. The directory is created
+/// exclusively and restricted to the current user before it is handed to the
+/// package manager; dropping it removes the command's cache.
+struct PrivateTempDir {
+    path: PathBuf,
+}
+
+impl PrivateTempDir {
+    fn new(label: &str) -> Result<Self, String> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        for _ in 0..256 {
+            let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("crikey-dev-{label}-{pid}-{ordinal}"));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        let mut permissions = match fs::metadata(&path) {
+                            Ok(metadata) => metadata.permissions(),
+                            Err(error) => {
+                                let _ = fs::remove_dir_all(&path);
+                                return Err(format!(
+                                    "cannot inspect temporary directory `{}`: {error}",
+                                    path.display()
+                                ));
+                            }
+                        };
+                        permissions.set_mode(0o700);
+                        if let Err(error) = fs::set_permissions(&path, permissions) {
+                            let _ = fs::remove_dir_all(&path);
+                            return Err(format!(
+                                "cannot restrict temporary directory `{}`: {error}",
+                                path.display()
+                            ));
+                        }
+                    }
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot create private temporary directory `{}`: {error}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+        Err("could not allocate a unique private temporary directory".to_owned())
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Entry points
@@ -122,14 +193,18 @@ struct Options {
     cancel: bool,
 }
 
-/// `Ok(None)` means help was asked for. Help is honoured before validation: a
-/// developer asking how to invoke a command has not yet claimed the path is
-/// good, so `--help` alongside an unloadable plugin still explains the command.
+/// `Ok(None)` means help was asked for. Help is honoured before plugin
+/// validation: a known option beside a path that cannot be loaded still
+/// explains the command, while an unknown option is refused.
 fn parse_args(command: &str, args: &[String]) -> Result<Option<Options>, String> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        if let Some(argument) = unknown_help_argument(command, args) {
+            return Err(format!(
+                "`dev {command}` does not understand `{argument}`; see `--help` for valid options"
+            ));
+        }
         return Ok(None);
     }
-
     // `--cancel` is a `dev test` affordance: `dev run` drives exactly one query
     // and has nothing to cancel, so the flag is an unknown argument there.
     let allow_cancel = command == "test";
@@ -192,12 +267,41 @@ fn parse_args(command: &str, args: &[String]) -> Result<Option<Options>, String>
         None => return Err(format!("`dev {command}` needs `--plugin DIR`")),
     };
 
+    let index = match index {
+        Some(path) if path.is_empty() => {
+            return Err(format!("`dev {command} --index` was given an empty path"))
+        }
+        other => other,
+    };
+
     Ok(Some(Options {
         plugin,
         index,
         queries,
         cancel,
     }))
+}
+
+fn unknown_help_argument<'a>(command: &str, args: &'a [String]) -> Option<&'a str> {
+    let allow_cancel = command == "test";
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if matches!(argument, "-h" | "--help") {
+            index += 1;
+        } else if matches!(argument, "--plugin" | "--index" | "--query") {
+            index = index.saturating_add(2);
+        } else if argument.starts_with("--plugin=")
+            || argument.starts_with("--index=")
+            || argument.starts_with("--query=")
+            || (allow_cancel && argument == "--cancel")
+        {
+            index += 1;
+        } else {
+            return Some(argument);
+        }
+    }
+    None
 }
 
 fn refuse(command: &str, message: &str) -> ExitCode {
@@ -296,7 +400,8 @@ fn load_and_run(command: &str, options: &Options) -> Result<Report, String> {
         locked: lock.packages.clone(),
         native_build_options: Vec::new(),
     };
-    let store = EnvironmentStore::new(std::env::temp_dir().join("crikey-dev-modern-cache"));
+    let cache_root = PrivateTempDir::new("modern-cache")?;
+    let store = EnvironmentStore::new(cache_root.path().to_path_buf());
     let env = store
         .ensure(&inputs, &index)
         .map_err(|error| format!("could not materialise the plugin environment: {error}"))?;
@@ -425,10 +530,8 @@ fn build_index(index: Option<&str>) -> Result<PackageIndex, String> {
         Some(dir) if !dir.is_empty() => PackageIndex::from_dir(Path::new(dir))
             .map_err(|error| format!("cannot read package index `{dir}`: {error}")),
         _ => {
-            let empty = std::env::temp_dir().join("crikey-dev-modern-empty-index");
-            fs::create_dir_all(&empty)
-                .map_err(|error| format!("cannot prepare an empty package index: {error}"))?;
-            PackageIndex::from_dir(&empty)
+            let empty = PrivateTempDir::new("modern-empty-index")?;
+            PackageIndex::from_dir(empty.path())
                 .map_err(|error| format!("cannot load the empty package index: {error}"))
         }
     }
@@ -493,4 +596,41 @@ fn encode(value: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn developer_temp_directories_are_private_and_unique() {
+        let first = PrivateTempDir::new("test").expect("first private directory");
+        let second = PrivateTempDir::new("test").expect("second private directory");
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().is_dir());
+        assert!(second.path().is_dir());
+        #[cfg(unix)]
+        {
+            let first_mode = fs::metadata(first.path())
+                .expect("first directory metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            let second_mode = fs::metadata(second.path())
+                .expect("second directory metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(first_mode, 0o700);
+            assert_eq!(second_mode, 0o700);
+        }
+    }
+
+    #[test]
+    fn help_does_not_hide_unknown_modern_options_or_empty_indexes() {
+        let help = vec!["--help".to_owned(), "--unknown".to_owned()];
+        assert!(parse_args("test", &help).is_err());
+        let empty_index = vec!["--plugin".to_owned(), "plugin".to_owned(), "--index=".to_owned()];
+        assert!(parse_args("test", &empty_index).is_err());
+    }
 }

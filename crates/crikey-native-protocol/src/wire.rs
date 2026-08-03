@@ -5,6 +5,7 @@ use crate::ProtocolError;
 /// limit bounds input bytes, while this separate budget also bounds the
 /// number and capacity of decoded repeated fields.
 pub(crate) const DECODE_ALLOCATION_BUDGET: usize = 8 * 1024 * 1024;
+const MAX_DECODE_DEPTH: usize = 64;
 
 /// Conservative accounting for one repeated value or map node. It prevents
 /// a legal frame containing millions of empty repeated fields from forcing a
@@ -14,13 +15,27 @@ const DECODE_REPETITION_OVERHEAD: usize = 64;
 #[derive(Debug)]
 pub(crate) struct DecodeBudget {
     remaining: usize,
+    depth: usize,
 }
 
 impl DecodeBudget {
     pub(crate) fn new() -> Self {
         Self {
             remaining: DECODE_ALLOCATION_BUDGET,
+            depth: 0,
         }
+    }
+
+    pub(crate) fn enter_nested(&mut self) -> Result<(), ProtocolError> {
+        if self.depth >= MAX_DECODE_DEPTH {
+            return Err(ProtocolError::Malformed("message nesting is too deep".to_owned()));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    pub(crate) fn leave_nested(&mut self) {
+        self.depth -= 1;
     }
 
     fn charge(&mut self, amount: usize) -> Result<(), ProtocolError> {
@@ -34,7 +49,10 @@ impl DecodeBudget {
     }
 
     pub(crate) fn charge_map_entry(&mut self) -> Result<(), ProtocolError> {
-        self.charge(std::mem::size_of::<(String, String)>() + DECODE_REPETITION_OVERHEAD)
+        let amount = std::mem::size_of::<(String, String)>()
+            .checked_add(DECODE_REPETITION_OVERHEAD)
+            .ok_or_else(|| ProtocolError::Malformed("message decode allocation overflow".to_owned()))?;
+        self.charge(amount)
     }
 }
 
@@ -46,24 +64,30 @@ pub(crate) fn push_decoded<T>(
     budget: &mut DecodeBudget,
 ) -> Result<(), ProtocolError> {
     let growth = if values.len() == values.capacity() {
-        let target = if values.capacity() == 0 {
-            4
-        } else {
-            values
-                .capacity()
-                .saturating_mul(2)
-                .min(values.capacity().saturating_add(1024))
-        };
-        target.saturating_sub(values.capacity())
+        let target =
+            if values.capacity() == 0 {
+                4
+            } else {
+                let doubled = values.capacity().checked_mul(2).ok_or_else(|| {
+                    ProtocolError::Malformed("message decode allocation overflow".to_owned())
+                })?;
+                let limited = values.capacity().checked_add(1024).ok_or_else(|| {
+                    ProtocolError::Malformed("message decode allocation overflow".to_owned())
+                })?;
+                doubled.min(limited)
+            };
+        target
+            .checked_sub(values.capacity())
+            .ok_or_else(|| ProtocolError::Malformed("message decode allocation overflow".to_owned()))?
     } else {
         0
     };
-    let allocation = growth.saturating_mul(std::mem::size_of::<T>());
-    budget.charge(
-        allocation
-            .saturating_add(std::mem::size_of::<T>())
-            .saturating_add(DECODE_REPETITION_OVERHEAD),
-    )?;
+    let allocation = growth
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|value| value.checked_add(std::mem::size_of::<T>()))
+        .and_then(|value| value.checked_add(DECODE_REPETITION_OVERHEAD))
+        .ok_or_else(|| ProtocolError::Malformed("message decode allocation overflow".to_owned()))?;
+    budget.charge(allocation)?;
     if growth != 0 {
         values
             .try_reserve_exact(growth)
@@ -122,10 +146,13 @@ pub fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
 pub fn decode_varint(input: &[u8], cursor: &mut usize) -> Result<u64, ProtocolError> {
     let mut value = 0_u64;
     for index in 0..10 {
+        let position = *cursor;
         let byte = *input
-            .get(*cursor)
+            .get(position)
             .ok_or_else(|| ProtocolError::Malformed("truncated protobuf varint".to_owned()))?;
-        *cursor += 1;
+        *cursor = position
+            .checked_add(1)
+            .ok_or_else(|| ProtocolError::Malformed("protobuf cursor overflow".to_owned()))?;
         if index == 9 && (byte & 0xfe) != 0 {
             return Err(ProtocolError::Malformed(
                 "protobuf varint overflows u64".to_owned(),
@@ -188,8 +215,15 @@ impl UnknownFields {
             .checked_add(bytes.len())
             .ok_or_else(|| ProtocolError::Malformed("unknown fields are too large".to_owned()))?;
         if required > self.0.capacity() {
-            let target = self.0.capacity().saturating_mul(2).max(required);
-            let growth = target.saturating_sub(self.0.capacity());
+            let doubled = self
+                .0
+                .capacity()
+                .checked_mul(2)
+                .ok_or_else(|| ProtocolError::Malformed("unknown fields are too large".to_owned()))?;
+            let target = doubled.max(required);
+            let growth = target
+                .checked_sub(self.0.capacity())
+                .ok_or_else(|| ProtocolError::Malformed("unknown fields are too large".to_owned()))?;
             budget.charge(growth)?;
             self.0
                 .try_reserve_exact(growth)
@@ -207,12 +241,13 @@ pub(crate) struct Field<'a> {
     pub number: u32,
     pub wire_type: WireType,
     pub value: &'a [u8],
+    pub raw: &'a [u8],
     pub end: usize,
 }
-
 /// Reads one field without allocating. `cursor` is advanced only over a
 /// successfully validated field (or over a malformed field's prefix).
 pub(crate) fn read_field<'a>(input: &'a [u8], cursor: &mut usize) -> Result<Field<'a>, ProtocolError> {
+    let field_start = *cursor;
     let key = decode_varint(input, cursor)?;
     let number = key >> 3;
     if number == 0 || number > u64::from(u32::MAX) {
@@ -220,7 +255,12 @@ pub(crate) fn read_field<'a>(input: &'a [u8], cursor: &mut usize) -> Result<Fiel
             "invalid protobuf field number".to_owned(),
         ));
     }
-    let wire_type = WireType::from_bits((key & 7) as u8)?;
+    let field_number = u32::try_from(number)
+        .map_err(|_| ProtocolError::Malformed("invalid protobuf field number".to_owned()))?;
+    let wire_type = WireType::from_bits(
+        u8::try_from(key & 7)
+            .map_err(|_| ProtocolError::Malformed("invalid protobuf wire type".to_owned()))?,
+    )?;
     let value_start = *cursor;
     let value_end = match wire_type {
         WireType::Varint => {
@@ -252,9 +292,10 @@ pub(crate) fn read_field<'a>(input: &'a [u8], cursor: &mut usize) -> Result<Fiel
             let start = *cursor;
             *cursor = end;
             return Ok(Field {
-                number: number as u32,
+                number: field_number,
                 wire_type,
                 value: &input[start..end],
+                raw: &input[field_start..end],
                 end,
             });
         }
@@ -270,9 +311,10 @@ pub(crate) fn read_field<'a>(input: &'a [u8], cursor: &mut usize) -> Result<Fiel
         }
     };
     Ok(Field {
-        number: number as u32,
+        number: field_number,
         wire_type,
         value: &input[value_start..value_end],
+        raw: &input[field_start..value_end],
         end: value_end,
     })
 }
@@ -330,13 +372,19 @@ pub(crate) fn put_varint(field: u32, value: u64, out: &mut Vec<u8>) {
 
 pub(crate) fn put_string(field: u32, value: &str, out: &mut Vec<u8>) {
     encode_key(field, WireType::Length, out);
-    encode_varint(value.len() as u64, out);
+    encode_varint(
+        u64::try_from(value.len()).expect("a Rust string length always fits in u64"),
+        out,
+    );
     out.extend_from_slice(value.as_bytes());
 }
 
 pub(crate) fn put_bytes(field: u32, value: &[u8], out: &mut Vec<u8>) {
     encode_key(field, WireType::Length, out);
-    encode_varint(value.len() as u64, out);
+    encode_varint(
+        u64::try_from(value.len()).expect("a Rust slice length always fits in u64"),
+        out,
+    );
     out.extend_from_slice(value);
 }
 

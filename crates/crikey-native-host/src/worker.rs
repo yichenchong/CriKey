@@ -333,7 +333,7 @@ impl WorkerLink {
 
     fn join_reader(&self) {
         if let Some(handle) = lock_unpoisoned(&self.reader).take() {
-            let _ = handle.join();
+            join_bounded(handle, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
         }
         if let Some(handle) = lock_unpoisoned(&self.writer_thread).take() {
             join_bounded(handle, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
@@ -380,6 +380,7 @@ pub struct NativeWorker {
     exit: Option<ExitRecord>,
     diagnostics: StreamDiagnostics,
     next_request_id: u64,
+    call_succeeded: bool,
     failure_kind: Option<crikey_plugin_supervisor::FailureKind>,
     #[cfg(windows)]
     job_handle: Option<usize>,
@@ -414,8 +415,21 @@ impl NativeWorker {
         self.failure_kind.take()
     }
 
+    pub(crate) fn take_call_success(&mut self) -> bool {
+        std::mem::take(&mut self.call_succeeded)
+    }
+
     /// Launches a child and completes the authenticated handshake (spec 16.3, 16.6).
     pub fn spawn(spec: LaunchSpec, options: WorkerOptions) -> Result<Self, HostError> {
+        let plugin = spec.plugin.clone();
+        Self::spawn_inner(spec, options).map_err(|error| match error {
+            HostError::Spawn(detail) => HostError::Spawn(format!("plugin `{}`: {detail}", plugin.0)),
+            HostError::Handshake(detail) => HostError::Handshake(format!("plugin `{}`: {detail}", plugin.0)),
+            other => other,
+        })
+    }
+
+    fn spawn_inner(spec: LaunchSpec, options: WorkerOptions) -> Result<Self, HostError> {
         let token = session_token().map_err(HostError::Spawn)?;
         let connection_id = next_connection_id();
         let (endpoint, listener) = make_endpoint(options.transport, &token)?;
@@ -438,6 +452,8 @@ impl NativeWorker {
         add_restricted_environment(&mut command, &spec, &endpoint, &token);
         #[cfg(unix)]
         command.process_group(0);
+        #[cfg(target_os = "linux")]
+        configure_parent_death(&mut command).map_err(HostError::Spawn)?;
         configure_command(&mut command, &options).map_err(HostError::Spawn)?;
         let mut child = command
             .spawn()
@@ -446,19 +462,25 @@ impl NativeWorker {
         let job_handle = match create_job_for_child(&child, &options.limits) {
             Ok(handle) => Some(handle),
             Err(error) => {
-                terminate_child_tree(&mut child);
+                terminate_and_reap(&mut child);
                 return Err(HostError::Spawn(error));
             }
         };
         let stderr = match child.stderr.take() {
             Some(value) => value,
             None => {
-                terminate_child_tree(&mut child);
+                terminate_and_reap(&mut child);
                 return Err(HostError::Spawn("child stderr was not piped".to_owned()));
             }
         };
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
-        let stderr_reader = spawn_stderr_drain(stderr, Arc::clone(&stderr_tail));
+        let stderr_reader = match spawn_stderr_drain(stderr, Arc::clone(&stderr_tail)) {
+            Ok(handle) => handle,
+            Err(error) => {
+                terminate_and_reap(&mut child);
+                return Err(HostError::Spawn(format!("stderr drain thread: {error}")));
+            }
+        };
         let credits = Arc::new(AtomicI64::new(0));
         let (event_sender, event_receiver) = mpsc::sync_channel(READER_QUEUE_CAPACITY);
         let queued = Arc::new(AtomicUsize::new(0));
@@ -476,14 +498,14 @@ impl NativeWorker {
                 let stdin = match child.stdin.take() {
                     Some(value) => value,
                     None => {
-                        terminate_child_tree(&mut child);
+                        terminate_and_reap(&mut child);
                         return Err(HostError::Spawn("child stdin was not piped".to_owned()));
                     }
                 };
                 let stdout = match child.stdout.take() {
                     Some(value) => value,
                     None => {
-                        terminate_child_tree(&mut child);
+                        terminate_and_reap(&mut child);
                         return Err(HostError::Spawn("child stdout was not piped".to_owned()));
                     }
                 };
@@ -502,13 +524,18 @@ impl NativeWorker {
                 )
             }
             TransportKind::UnixSocket | TransportKind::NamedPipe => {
-                let listener =
-                    listener.ok_or_else(|| HostError::Spawn("native listener was not created".to_owned()))?;
+                let listener = match listener {
+                    Some(value) => value,
+                    None => {
+                        terminate_and_reap(&mut child);
+                        return Err(HostError::Spawn("native listener was not created".to_owned()));
+                    }
+                };
                 let transport = match listener.accept(Some(Duration::from_millis(options.startup_timeout_ms)))
                 {
                     Ok(value) => value,
                     Err(error) => {
-                        terminate_child_tree(&mut child);
+                        terminate_and_reap(&mut child);
                         return Err(HostError::Handshake(format!("plugin did not connect: {error:?}")));
                     }
                 };
@@ -569,11 +596,7 @@ impl NativeWorker {
             Ok(value) => value,
             Err(error) => {
                 link.close();
-                terminate_child_tree(&mut child);
-                wait_child_bounded(
-                    &mut child,
-                    Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS),
-                );
+                terminate_and_reap(&mut child);
                 join_bounded(stderr_reader, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
                 link.join_reader();
                 return Err(error);
@@ -592,6 +615,7 @@ impl NativeWorker {
             exit: None,
             diagnostics: StreamDiagnostics::default(),
             next_request_id: 1,
+            call_succeeded: false,
             failure_kind: None,
             #[cfg(windows)]
             job_handle,
@@ -644,6 +668,7 @@ impl NativeWorker {
                         || bytes > self.options.limits.max_bytes_per_query
                     {
                         self.truncate(request_id, 0)?;
+                        self.mark_call_succeeded();
                         return Ok(items);
                     }
                     let remaining = self.options.limits.max_catalog_items.saturating_sub(items.len());
@@ -656,6 +681,7 @@ impl NativeWorker {
                                 .map(|value| from_proto_item(&self.spec.plugin, value)),
                         );
                         self.truncate(request_id, 0)?;
+                        self.mark_call_succeeded();
                         return Ok(items);
                     }
                     items.extend(
@@ -673,6 +699,7 @@ impl NativeWorker {
                         });
                     }
                     if batch.done {
+                        self.mark_call_succeeded();
                         return Ok(items);
                     }
                 }
@@ -749,6 +776,7 @@ impl NativeWorker {
                     {
                         self.truncate(request_id, request.generation)?;
                         let terminal_batches = self.await_terminal(request_id, request.generation, end)?;
+                        self.mark_call_succeeded();
                         return Ok(Suggestions {
                             items,
                             state: BatchState::Final,
@@ -773,6 +801,7 @@ impl NativeWorker {
                         );
                         self.truncate(request_id, request.generation)?;
                         let terminal_batches = self.await_terminal(request_id, request.generation, end)?;
+                        self.mark_call_succeeded();
                         return Ok(Suggestions {
                             items,
                             state: BatchState::Final,
@@ -790,6 +819,7 @@ impl NativeWorker {
                     );
                     self.replenish_credit()?;
                     if let Some(error) = batch.error.as_ref() {
+                        self.mark_call_succeeded();
                         return Ok(Suggestions {
                             items,
                             state: BatchState::Failed,
@@ -802,6 +832,7 @@ impl NativeWorker {
                     match batch.state.as_i32() {
                         1 => {}
                         2 => {
+                            self.mark_call_succeeded();
                             return Ok(Suggestions {
                                 items,
                                 state: BatchState::Final,
@@ -813,6 +844,7 @@ impl NativeWorker {
                         }
                         3 => {
                             self.link.cancel_latched.store(false, Ordering::Release);
+                            self.mark_call_succeeded();
                             return Ok(Suggestions {
                                 items,
                                 state: BatchState::Cancelled,
@@ -829,6 +861,7 @@ impl NativeWorker {
                                     detail: String::new(),
                                 })
                             });
+                            self.mark_call_succeeded();
                             return Ok(Suggestions {
                                 items,
                                 state: BatchState::Failed,
@@ -891,18 +924,27 @@ impl NativeWorker {
         };
         match envelope.payload {
             Some(Payload::ExecuteResult(result)) => match result.outcome.as_i32() {
-                1 => Ok(ExecuteOutcome::Ok),
-                2 => Ok(ExecuteOutcome::Failed(
-                    result
-                        .error
-                        .as_ref()
-                        .map(plugin_error)
-                        .unwrap_or_else(|| PluginError {
-                            message: "plugin execution failed".to_owned(),
-                            detail: String::new(),
-                        }),
-                )),
-                3 => Ok(ExecuteOutcome::Unsupported),
+                1 => {
+                    self.mark_call_succeeded();
+                    Ok(ExecuteOutcome::Ok)
+                }
+                2 => {
+                    self.mark_call_succeeded();
+                    Ok(ExecuteOutcome::Failed(
+                        result
+                            .error
+                            .as_ref()
+                            .map(plugin_error)
+                            .unwrap_or_else(|| PluginError {
+                                message: "plugin execution failed".to_owned(),
+                                detail: String::new(),
+                            }),
+                    ))
+                }
+                3 => {
+                    self.mark_call_succeeded();
+                    Ok(ExecuteOutcome::Unsupported)
+                }
                 _ => Err(HostError::Protocol("unknown execute outcome".to_owned())),
             },
             Some(Payload::Error(error)) => Err(self.error_payload(error)),
@@ -931,13 +973,16 @@ impl NativeWorker {
             ReaderEvent::Failure(failure) => return Err(self.transport_error(failure)),
         };
         match envelope.payload {
-            Some(Payload::HealthReport(report)) if report.nonce == request_id => Ok(HealthSnapshot {
-                healthy: report.healthy,
-                memory_bytes: report.memory_bytes,
-                queue_depth: report.queue_depth,
-                in_flight: report.in_flight,
-                detail: report.detail,
-            }),
+            Some(Payload::HealthReport(report)) if report.nonce == request_id => {
+                self.mark_call_succeeded();
+                Ok(HealthSnapshot {
+                    healthy: report.healthy,
+                    memory_bytes: report.memory_bytes,
+                    queue_depth: report.queue_depth,
+                    in_flight: report.in_flight,
+                    detail: report.detail,
+                })
+            }
             Some(Payload::Error(error)) => Err(self.error_payload(error)),
             _ => Err(HostError::Protocol("unexpected health response".to_owned())),
         }
@@ -955,9 +1000,19 @@ impl NativeWorker {
         if self.exit.is_some() {
             return false;
         }
-        let status = self.child.as_mut().and_then(|child| child.try_wait().ok());
+        let status = match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(status) => status,
+                Err(_) => {
+                    self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::Crash);
+                    self.fail_and_reap(ExitKind::Crashed);
+                    return false;
+                }
+            },
+            None => return false,
+        };
         match status {
-            Some(Some(status)) => {
+            Some(status) => {
                 self.release_job();
                 self.join_stderr();
                 let kind = self.sticky_exit_kind(ExitKind::from_status(&status));
@@ -966,8 +1021,7 @@ impl NativeWorker {
                 self.link.close();
                 false
             }
-            Some(None) => true,
-            None => false,
+            None => true,
         }
     }
 
@@ -1120,7 +1174,12 @@ impl NativeWorker {
         }
     }
 
+    fn mark_call_succeeded(&mut self) {
+        self.call_succeeded = true;
+    }
+
     fn begin_request(&mut self, generation: u64) -> u64 {
+        self.call_succeeded = false;
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.saturating_add(1);
         self.link.set_current(request_id, generation);
@@ -1885,6 +1944,38 @@ fn add_restricted_environment(command: &mut Command, spec: &LaunchSpec, endpoint
     command.env("CRIKEY_PROTOCOL_VERSION", PROTOCOL_VERSION.to_string());
 }
 
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn configure_parent_death(command: &mut Command) -> Result<(), String> {
+    const PR_SET_PDEATHSIG: i32 = 1;
+    const SIGKILL: usize = 9;
+    let launcher_pid = std::process::id() as i32;
+    // SAFETY: these declarations match the Linux libc ABI and the closure
+    // executes in the child before exec, where no Rust allocation or locking
+    // is performed.
+    unsafe extern "C" {
+        fn getppid() -> i32;
+        fn prctl(option: i32, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> i32;
+    }
+    // SAFETY: `pre_exec` is deliberately used for the child-only parent-death
+    // setup; the closure captures only a copy of the launcher's pid.
+    unsafe {
+        command.pre_exec(move || {
+            if prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if getppid() != launcher_pid {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "launcher exited before plugin setup completed",
+                ));
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
 fn session_token() -> Result<String, String> {
     let mut bytes = [0_u8; 16];
     fill_csprng(&mut bytes)?;
@@ -2033,12 +2124,13 @@ fn reader_event_size(event: &ReaderEvent) -> usize {
 }
 
 fn join_bounded(handle: JoinHandle<()>, timeout: Duration) {
-    let (sender, receiver) = mpsc::sync_channel(0);
-    thread::spawn(move || {
+    let end = Instant::now().checked_add(timeout).unwrap_or_else(Instant::now);
+    while !handle.is_finished() && Instant::now() < end {
+        thread::yield_now();
+    }
+    if handle.is_finished() {
         let _ = handle.join();
-        let _ = sender.send(());
-    });
-    let _ = receiver.recv_timeout(timeout);
+    }
 }
 
 fn wait_child_bounded(child: &mut Child, end: Instant) -> Option<std::process::ExitStatus> {
@@ -2046,9 +2138,19 @@ fn wait_child_bounded(child: &mut Child, end: Instant) -> Option<std::process::E
         match child.try_wait() {
             Ok(Some(status)) => return Some(status),
             Ok(None) if Instant::now() < end => thread::sleep(Duration::from_millis(5)),
-            Ok(None) | Err(_) => return None,
+            Ok(None) => return None,
+            Err(_) if Instant::now() < end => thread::sleep(Duration::from_millis(5)),
+            Err(_) => return None,
         }
     }
+}
+
+fn terminate_and_reap(child: &mut Child) {
+    terminate_child_tree(child);
+    let _ = wait_child_bounded(
+        child,
+        Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS),
+    );
 }
 
 #[cfg(windows)]
@@ -2243,8 +2345,8 @@ impl StderrTail {
 fn spawn_stderr_drain(
     mut stderr: impl Read + Send + 'static,
     tail: Arc<Mutex<StderrTail>>,
-) -> JoinHandle<()> {
-    match thread::Builder::new()
+) -> Result<JoinHandle<()>, String> {
+    thread::Builder::new()
         .name("crikey-native-stderr".to_owned())
         .spawn(move || {
             let mut buffer = [0u8; 1024];
@@ -2254,10 +2356,8 @@ fn spawn_stderr_drain(
                     Ok(count) => lock_unpoisoned(&tail).push(&buffer[..count]),
                 }
             }
-        }) {
-        Ok(handle) => handle,
-        Err(_) => thread::spawn(|| {}),
-    }
+        })
+        .map_err(|error| error.to_string())
 }
 
 impl ExitKind {

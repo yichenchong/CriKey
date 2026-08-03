@@ -2,8 +2,8 @@
 //! (spec 11.5 - 11.7, 12.1, 12.5, 12.6; roadmap M1 "generation gating,
 //! owner-scoped dedup, limits").
 //!
-//! These tests are written before the implementation and pin the public API the
-//! M1 aggregator must expose:
+//! These tests pin the public API and observable behaviour of the M1
+//! aggregator:
 //!
 //! * `MemoryResultAggregator::new(ResultLimits)` builds an aggregator with no
 //!   active generation, so nothing can be merged before `begin_generation`.

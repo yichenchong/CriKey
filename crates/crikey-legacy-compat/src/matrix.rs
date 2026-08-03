@@ -191,6 +191,9 @@ pub enum MatrixError {
         field: &'static str,
     },
 
+    #[error("package `{id}` declares source `{url}`, but corpus sources must be https URLs")]
+    InvalidPackageSource { id: String, url: String },
+
     #[error(
         "{module}::{symbol} declares unknown status `{value}`; expected one of \
          full, behavioural-difference, windows-only, partial, unsupported, planned"
@@ -470,8 +473,8 @@ impl PluginCorpus {
             }
             let require = |value: &str, field: &'static str| -> Result<(), MatrixError> {
                 if value.is_empty() {
-                    // An unlicensed or unsourced reference can be neither
-                    // redistributed nor reproduced, so it is not a reference.
+                    // A missing required field means this is not a
+                    // reproducible, evidenced reference.
                     Err(MatrixError::EmptyPackageField {
                         index,
                         id: id.to_string(),
@@ -484,6 +487,12 @@ impl PluginCorpus {
 
             let source_url = row.source.trim();
             require(source_url, "source")?;
+            if !source_url.starts_with("https://") {
+                return Err(MatrixError::InvalidPackageSource {
+                    id: id.to_string(),
+                    url: source_url.to_string(),
+                });
+            }
             let revision = row.revision.trim();
             require(revision, "revision")?;
             let licence = row.licence.trim();
@@ -504,14 +513,15 @@ impl PluginCorpus {
                     value: classification.to_string(),
                 }
             })?;
-
+            let notes = row.notes.trim();
+            require(notes, "notes")?;
             entries.push(CorpusEntry {
                 id: id.to_string(),
                 source: source_url.to_string(),
                 revision: revision.to_string(),
                 licence: licence.to_string(),
                 classification,
-                notes: row.notes.trim().to_string(),
+                notes: notes.to_string(),
             });
         }
 

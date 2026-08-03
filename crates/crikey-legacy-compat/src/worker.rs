@@ -43,13 +43,14 @@
 //! retained stderr tail. A plugin cannot make the host allocate without limit,
 //! and an over-long line is a named protocol failure rather than growth.
 
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -164,6 +165,10 @@ const REAP_GRACE: Duration = Duration::from_millis(250);
 /// `std` has no wait-with-timeout, and the alternative — a blocking `wait` —
 /// would hand a hung child the power to block shutdown forever.
 const REAP_POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// Bound on frames waiting for the dedicated stdin writer. The queue is
+/// deliberately finite: a stuck child must apply backpressure, not let the
+/// host retain an unbounded stream of requests or control updates.
+const WRITE_QUEUE_CAPACITY: usize = 32;
 
 /// Default per-callback bound when the caller sets none (spec 9.6).
 const DEFAULT_CALL_TIMEOUT_MS: Millis = 10_000;
@@ -584,17 +589,82 @@ impl WorkerOptions {
 // The shared link
 // ---------------------------------------------------------------------------
 
+/// One frame waiting for the dedicated stdin writer. The writer owns the
+/// operating-system pipe, so no caller holds a lock across `write_all` or
+/// `flush`.
+#[derive(Debug)]
+struct WriteCommand {
+    encoded: String,
+    ack: Option<mpsc::SyncSender<io::Result<()>>>,
+}
+
+#[derive(Debug)]
+struct WriteQueueState {
+    closed: bool,
+    pending: VecDeque<WriteCommand>,
+}
+
+#[derive(Debug)]
+struct WriteQueue {
+    state: Mutex<WriteQueueState>,
+    wake: Condvar,
+}
+
+fn spawn_stdin_writer(mut stdin: ChildStdin, queue: Arc<WriteQueue>) {
+    thread::spawn(move || loop {
+        let command = {
+            let mut state = queue.state.lock().unwrap_or_else(|error| error.into_inner());
+            loop {
+                if let Some(command) = state.pending.pop_front() {
+                    break Some(command);
+                }
+                if state.closed {
+                    break None;
+                }
+                state = queue.wake.wait(state).unwrap_or_else(|error| error.into_inner());
+            }
+        };
+        let Some(command) = command else {
+            return;
+        };
+
+        let result = stdin
+            .write_all(command.encoded.as_bytes())
+            .and_then(|_| stdin.flush());
+        let error = result
+            .as_ref()
+            .err()
+            .map(|error| (error.kind(), error.to_string()));
+        if let Some(ack) = command.ack {
+            let reply = error.as_ref().map_or(Ok(()), |(kind, message)| {
+                Err(io::Error::new(*kind, message.clone()))
+            });
+            let _ = ack.send(reply);
+        }
+        let Some((kind, message)) = error else {
+            continue;
+        };
+
+        let pending = {
+            let mut state = queue.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.closed = true;
+            std::mem::take(&mut state.pending)
+        };
+        for command in pending {
+            if let Some(ack) = command.ack {
+                let _ = ack.send(Err(io::Error::new(kind, message.clone())));
+            }
+        }
+        return;
+    });
+}
+
 /// The parts of a worker that outlive the thread that owns it.
-///
-/// `stdin` is behind a mutex because two different threads write frames to it:
-/// whichever thread is inside [`LegacyWorker::call`], and whichever thread
-/// raises the termination flag. Both writes are a single small frame, so the
-/// lock is never held across a blocking read.
 #[derive(Debug)]
 struct WorkerLink {
     terminate: AtomicBool,
     next_id: AtomicU64,
-    stdin: Mutex<Option<ChildStdin>>,
+    queue: Arc<WriteQueue>,
 }
 
 impl WorkerLink {
@@ -604,38 +674,79 @@ impl WorkerLink {
         self.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
     }
 
-    fn write_frame(&self, frame: &Value) -> io::Result<()> {
-        // A poisoned mutex means another thread panicked mid-write. The frame
-        // stream may be truncated, which the peer reports as a protocol error;
-        // panicking again here would turn one plugin's fault into a host fault.
-        let mut guard = self.stdin.lock().unwrap_or_else(|error| error.into_inner());
-        Self::write_frame_locked(&mut guard, frame)
-    }
-
-    /// Writes one frame to an already-locked stdin. Split out so a caller that
-    /// must swap a flag and write the frame announcing it as one indivisible
-    /// step (see [`TerminateHandle::set`]) can hold the mutex across both.
-    fn write_frame_locked(guard: &mut Option<ChildStdin>, frame: &Value) -> io::Result<()> {
+    fn write_frame(&self, frame: &Value, budget: Duration) -> io::Result<()> {
         let mut encoded =
             serde_json::to_string(frame).expect("a frame built from owned JSON values serialises");
         encoded.push('\n');
-        match guard.as_mut() {
-            Some(stdin) => {
-                stdin.write_all(encoded.as_bytes())?;
-                stdin.flush()
-            }
-            None => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "the legacy worker's standard input is already closed",
+        let deadline = Instant::now().checked_add(budget).unwrap_or_else(Instant::now);
+        let (ack_sender, ack_receiver) = mpsc::sync_channel(1);
+        self.enqueue_until(
+            WriteCommand {
+                encoded,
+                ack: Some(ack_sender),
+            },
+            deadline,
+        )?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        match ack_receiver.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the legacy worker's stdin writer exceeded its bound",
             )),
+            Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the legacy worker's stdin writer stopped",
+            )),
+        }
+    }
+
+    /// Enqueues a frame without waiting for the writer. Shutdown uses this
+    /// path because closing stdin immediately after the enqueue is the fallback
+    /// if the child never reads the orderly control frame.
+    fn enqueue_without_wait(&self, frame: &Value) -> io::Result<()> {
+        let mut encoded =
+            serde_json::to_string(frame).expect("a frame built from owned JSON values serialises");
+        encoded.push('\n');
+        self.enqueue_until(WriteCommand { encoded, ack: None }, Instant::now())
+    }
+
+    fn enqueue_until(&self, command: WriteCommand, deadline: Instant) -> io::Result<()> {
+        let mut command = Some(command);
+        loop {
+            let mut state = self.queue.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "the legacy worker's standard input is already closed",
+                ));
+            }
+            if state.pending.len() < WRITE_QUEUE_CAPACITY {
+                state
+                    .pending
+                    .push_back(command.take().expect("command is present"));
+                self.queue.wake.notify_one();
+                return Ok(());
+            }
+            drop(state);
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the legacy worker's stdin queue is full",
+                ));
+            }
+            thread::sleep(REAP_POLL_INTERVAL);
         }
     }
 
     /// Closes the child's stdin, which is the second way to ask it to exit:
     /// end of file on stdin means "no more callbacks are coming".
     fn close_stdin(&self) {
-        let mut guard = self.stdin.lock().unwrap_or_else(|error| error.into_inner());
-        drop(guard.take());
+        let mut state = self.queue.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.closed = true;
+        self.queue.wake.notify_all();
     }
 }
 
@@ -671,18 +782,23 @@ impl TerminateHandle {
     }
 
     /// The host-side flag is authoritative even when the child is already gone,
-    /// so a failed write is deliberately ignored: the caller asked to change
+    /// so a failed enqueue is deliberately ignored: the caller asked to change
     /// host state, and a dead worker is reported by the call that discovers it.
     ///
-    /// The stdin mutex is acquired *before* the atomic swap and held across the
-    /// frame write, so two concurrent `set()` calls (the handle is `Clone` and
-    /// shared) can never swap in one order yet reach the child in the other:
-    /// whichever thread wins the lock both swaps and writes as one unit, so the
-    /// child's `Event` follows the host flag exactly (Finding 7, acceptance
-    /// 31.17).
+    /// The queue mutex is held only while swapping the flag and appending to a
+    /// bounded in-memory queue. The actual pipe write happens on the dedicated
+    /// writer thread, never while this lock is held.
     fn set(&self, raised: bool) {
-        let mut guard = self.link.stdin.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self
+            .link
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if self.link.terminate.swap(raised, Ordering::SeqCst) == raised {
+            return;
+        }
+        if state.closed || state.pending.len() >= WRITE_QUEUE_CAPACITY {
             return;
         }
 
@@ -690,14 +806,15 @@ impl TerminateHandle {
         // stdin reader thread applies this to a `threading.Event` while its
         // main thread is still inside the callback (acceptance 31.17).
         let id = self.link.next_id();
-        let _ = WorkerLink::write_frame_locked(
-            &mut guard,
-            &json!({
-                "id": id,
-                "callback": CONTROL_SET_TERMINATE,
-                "payload": { "terminate": raised },
-            }),
-        );
+        let mut encoded = serde_json::to_string(&json!({
+            "id": id,
+            "callback": CONTROL_SET_TERMINATE,
+            "payload": { "terminate": raised },
+        }))
+        .expect("a control frame built from owned JSON values serialises");
+        encoded.push('\n');
+        state.pending.push_back(WriteCommand { encoded, ack: None });
+        self.link.queue.wake.notify_one();
     }
 }
 
@@ -714,14 +831,17 @@ enum StdoutEvent {
     /// that emitted it has lost framing, and guessing where the next frame
     /// starts would invent data.
     Oversized { excerpt: String, bytes: usize },
+    /// The stream ended with bytes that were not terminated by a newline.
+    Partial { excerpt: String, bytes: usize },
     /// Reading the pipe itself failed.
     Failed(String),
 }
 
-/// Outcome of one bounded line read.
 #[derive(Debug)]
 enum LineRead {
     Frame,
+    /// The stream ended after a non-empty, unterminated line.
+    Partial(usize),
     Eof,
     Oversized(usize),
 }
@@ -741,12 +861,13 @@ fn read_frame_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<
         };
 
         if available.is_empty() {
-            // A final frame without its newline is still a frame; anything else
-            // at end of file is nothing at all.
+            // JSON-lines framing requires a newline terminator. A final
+            // fragment is not a frame: silently accepting it would turn a
+            // truncated response into a valid answer.
             return Ok(if line.is_empty() {
                 LineRead::Eof
             } else {
-                LineRead::Frame
+                LineRead::Partial(line.len())
             });
         }
 
@@ -774,7 +895,6 @@ fn read_frame_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<
         }
     }
 }
-
 fn spawn_stdout_reader(stdout: ChildStdout, sender: Sender<StdoutEvent>) {
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -792,6 +912,10 @@ fn spawn_stdout_reader(stdout: ChildStdout, sender: Sender<StdoutEvent>) {
                 // `recv` then answers `Disconnected`, which is the crash path.
                 Ok(LineRead::Eof) => return,
                 Ok(LineRead::Oversized(bytes)) => StdoutEvent::Oversized {
+                    excerpt: excerpt(&line),
+                    bytes,
+                },
+                Ok(LineRead::Partial(bytes)) => StdoutEvent::Partial {
                     excerpt: excerpt(&line),
                     bytes,
                 },
@@ -869,10 +993,27 @@ fn spawn_stderr_drain(stderr: ChildStderr, tail: Arc<Mutex<StderrTail>>) {
                     let text = String::from_utf8_lossy(strip_carriage_return(&line)).into_owned();
                     tail.lock().unwrap_or_else(|error| error.into_inner()).push(text);
                 }
+                Ok(LineRead::Partial(_)) => {
+                    let text = String::from_utf8_lossy(strip_carriage_return(&line)).into_owned();
+                    tail.lock().unwrap_or_else(|error| error.into_inner()).push(text);
+                    return;
+                }
+                Ok(LineRead::Oversized(bytes)) => {
+                    // Stderr is observational, so an over-long line does not
+                    // destroy framing. Record the truncation and continue
+                    // consuming the remainder; stopping here would let a
+                    // chatty plugin fill the stderr pipe and deadlock.
+                    tail.lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .push(format!(
+                            "[crikey: stderr line reached the {bytes}-byte \
+                             bound and was truncated]"
+                        ));
+                }
                 // Nothing more will arrive, or the log channel itself is
                 // broken. Either way the tail stops growing and the thread ends
                 // rather than spinning on a dead pipe.
-                Ok(LineRead::Eof | LineRead::Oversized(_)) | Err(_) => return,
+                Ok(LineRead::Eof) | Err(_) => return,
             }
         }
     });
@@ -997,6 +1138,14 @@ impl LegacyWorker {
         spawn_stdout_reader(stdout, sender);
         let tail = Arc::new(Mutex::new(StderrTail::default()));
         spawn_stderr_drain(stderr, Arc::clone(&tail));
+        let queue = Arc::new(WriteQueue {
+            state: Mutex::new(WriteQueueState {
+                closed: false,
+                pending: VecDeque::new(),
+            }),
+            wake: Condvar::new(),
+        });
+        spawn_stdin_writer(stdin, Arc::clone(&queue));
 
         let mut worker = Self {
             plugin: options.plugin.clone(),
@@ -1004,7 +1153,7 @@ impl LegacyWorker {
             link: Arc::new(WorkerLink {
                 terminate: AtomicBool::new(false),
                 next_id: AtomicU64::new(0),
-                stdin: Mutex::new(Some(stdin)),
+                queue,
             }),
             frames,
             stderr: tail,
@@ -1049,8 +1198,13 @@ impl LegacyWorker {
                 false
             }
             // A handle that cannot be asked is not a handle that can be
-            // trusted to be alive.
-            Some(Err(_)) | None => false,
+            // trusted to be alive; reap it rather than leaving a child
+            // undisposed.
+            Some(Err(_)) => {
+                let _ = self.reap();
+                false
+            }
+            None => false,
         }
     }
 
@@ -1076,10 +1230,20 @@ impl LegacyWorker {
 
         let id = self.link.next_id();
         let frame = encode_request(id, &request, self.link.terminate.load(Ordering::SeqCst));
-        if self.link.write_frame(&frame).is_err() {
-            // The only way a small write to a live child's stdin fails is that
-            // the child is not live. The crash is the failure worth reporting.
+        let write_started = Instant::now();
+        if let Err(error) = self
+            .link
+            .write_frame(&frame, Duration::from_millis(self.options.call_timeout_ms))
+        {
+            let waited_ms = millis(write_started.elapsed()).max(self.options.call_timeout_ms);
             let _ = self.reap();
+            if error.kind() == io::ErrorKind::TimedOut {
+                return Err(WorkerError::Timeout {
+                    plugin: self.plugin.clone(),
+                    callback,
+                    waited_ms,
+                });
+            }
             return Err(self.crashed(callback));
         }
 
@@ -1160,6 +1324,17 @@ impl LegacyWorker {
                         ),
                     });
                 }
+                Ok(StdoutEvent::Partial { excerpt, bytes }) => {
+                    let _ = self.reap();
+                    return Err(WorkerError::Protocol {
+                        plugin: self.plugin.clone(),
+                        callback,
+                        line: format!(
+                            "{excerpt} [crikey: stream ended with an unterminated \
+                             {bytes}-byte protocol line]"
+                        ),
+                    });
+                }
                 Ok(StdoutEvent::Failed(message)) => {
                     // The protocol channel itself broke. The child may still be
                     // alive, but it has no way left to answer, so it is stopped
@@ -1220,11 +1395,18 @@ impl LegacyWorker {
             return self.reaped;
         };
 
-        if matches!(child.try_wait(), Ok(None)) {
-            hard_kill(self.process_id, &mut child);
-            self.hard_stopped = true;
-        }
-        self.reaped = child.wait().ok();
+        let status = match child.try_wait() {
+            Ok(Some(status)) => Some(status),
+            Ok(None) | Err(_) => {
+                hard_kill(self.process_id, &mut child);
+                self.hard_stopped = true;
+                wait_bounded(&mut child, REAP_GRACE).or_else(|| {
+                    reap_in_background(child);
+                    None
+                })
+            }
+        };
+        self.reaped = status;
         self.reaped
     }
 
@@ -1245,7 +1427,7 @@ impl LegacyWorker {
         };
 
         let id = self.link.next_id();
-        let _ = self.link.write_frame(&json!({
+        let _ = self.link.enqueue_without_wait(&json!({
             "id": id,
             "callback": CONTROL_SHUTDOWN,
             "payload": {},
@@ -1275,25 +1457,24 @@ impl LegacyWorker {
                 Err(RecvTimeoutError::Timeout) => break,
             }
         }
-
         let status = if left_voluntarily {
             wait_bounded(&mut child, REAP_GRACE)
         } else {
             None
         };
-
         let status = match status {
             Some(status) => status,
             None => {
                 hard_kill(self.process_id, &mut child);
                 self.hard_stopped = true;
-                match child.wait() {
-                    Ok(status) => status,
-                    Err(_) => {
+                match wait_bounded(&mut child, REAP_GRACE) {
+                    Some(status) => status,
+                    None => {
+                        reap_in_background(child);
                         return WorkerExit {
                             code: None,
                             hard_stopped: true,
-                        }
+                        };
                     }
                 }
             }
@@ -1324,8 +1505,8 @@ impl Drop for LegacyWorker {
 /// signalling the group kills any grandchildren a plugin forked as well as the
 /// leader (spec 24.3). Off Unix `std::process` offers no portable group kill,
 /// so only the direct child is reached — an honest, documented limit rather
-/// than a false claim of tree-kill. The caller still `wait()`s the leader to
-/// reap it after this returns.
+/// than a false claim of tree-kill. The caller polls for a bounded grace period
+/// and hands any still-exiting child to a background reaper.
 fn hard_kill(process_id: u32, child: &mut Child) {
     #[cfg(unix)]
     kill_process_group(process_id);
@@ -1362,6 +1543,17 @@ fn kill_process_group(pgid: u32) {
     }
 }
 
+/// Continues reaping after the caller's bounded grace period expires. The
+/// background poll owns the child handle, so the worker never returns a live
+/// or zombie child while also blocking indefinitely in `wait()`.
+fn reap_in_background(mut child: Child) {
+    thread::spawn(move || loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(REAP_POLL_INTERVAL),
+        }
+    });
+}
 /// Waits for an exiting child's status, giving up after `budget`.
 ///
 /// Polled because `std` offers no wait-with-timeout, and the alternative — a

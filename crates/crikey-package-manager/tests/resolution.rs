@@ -18,6 +18,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+#[cfg(windows)]
+use std::os::windows::fs::symlink_dir;
+
 use crikey_package_manager::{resolve, Lockfile, PackageError, PackageIndex};
 
 #[derive(Debug)]
@@ -49,6 +54,16 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+#[cfg(unix)]
+fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    symlink(target, link)
+}
+
+#[cfg(windows)]
+fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    symlink_dir(target, link)
 }
 
 /// Writes `<root>/<name>-<version>/<name>/__init__.py`.
@@ -179,6 +194,69 @@ fn a_dependency_absent_from_the_index_is_a_resolution_error() {
     assert!(
         matches!(err, PackageError::Resolution(_)),
         "a missing wheel is a Resolution error, got {err:?}"
+    );
+}
+
+#[test]
+fn package_names_normalise_hyphens_underscores_dots_and_case() {
+    let scratch = Scratch::new("normalised-name");
+    let root = scratch.subdir("index");
+    write_wheel(&root, "My.Pkg", "1.0.0");
+    let index = PackageIndex::from_dir(&root).expect("index loads");
+
+    let lock = resolved(&index, "my_pkg==1.0.0");
+    assert_eq!(lock.packages.len(), 1);
+    assert_eq!(
+        lock.packages[0].name, "my-pkg",
+        "resolved names use one canonical spelling"
+    );
+}
+
+#[test]
+fn conflicting_requirements_for_one_normalised_name_are_rejected() {
+    let scratch = Scratch::new("conflict");
+    let index = multi_version_index(&scratch, "index");
+    let error = resolve(
+        ">=3.14",
+        &["acme>=2.0.0".to_owned(), "ACME<2.0.0".to_owned()],
+        &index,
+    )
+    .expect_err("one package cannot satisfy contradictory version ranges");
+    assert!(
+        matches!(error, PackageError::Resolution(_)),
+        "a version conflict is a Resolution error, got {error:?}"
+    );
+}
+
+#[test]
+fn package_index_rejects_a_symbolic_link_package_root() {
+    let scratch = Scratch::new("index-link-root");
+    let root = scratch.subdir("index");
+    let outside = scratch.subdir("outside");
+    write_wheel(&outside, "evil", "1.0.0");
+    link_dir(&outside, &root.join("evil-1.0.0")).expect("directory links are available for this platform");
+
+    let error = PackageIndex::from_dir(&root).expect_err("an index must not read outside its root");
+    assert!(
+        matches!(error, PackageError::MalformedIndex(_)),
+        "a linked package root is a malformed index, got {error:?}"
+    );
+}
+
+#[test]
+fn package_index_rejects_a_symbolic_link_cycle_inside_a_package() {
+    let scratch = Scratch::new("index-link-cycle");
+    let root = scratch.subdir("index");
+    let package = root.join("cycle-1.0.0");
+    let module = package.join("cycle");
+    fs::create_dir_all(&module).expect("package module is creatable");
+    fs::write(module.join("__init__.py"), b"__version__ = \"1.0.0\"\n").expect("module is writable");
+    link_dir(&package, &module.join("ancestor")).expect("directory links are available for this platform");
+
+    let error = PackageIndex::from_dir(&root).expect_err("a cyclic index tree must fail before recursion");
+    assert!(
+        matches!(error, PackageError::MalformedIndex(_)),
+        "a linked cycle is a malformed index, got {error:?}"
     );
 }
 

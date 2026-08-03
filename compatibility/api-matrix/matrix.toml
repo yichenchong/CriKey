@@ -172,22 +172,26 @@ status = "full"
 [[api]]
 module = "keypirinha"
 symbol = "Settings.get"
-status = "full"
+status = "behavioural-difference"
+notes = "Returns the literal value. Python configparser's extended interpolation (`${section:key}` and `${env:VARIABLE}`) is not implemented, so references that resolve in a legacy configuration remain unresolved text here."
 
 [[api]]
 module = "keypirinha"
 symbol = "Settings.get_bool"
-status = "full"
+status = "behavioural-difference"
+notes = "Coerces the stored value but does not perform Python configparser extended interpolation first; `${section:key}` and `${env:VARIABLE}` references therefore do not resolve before boolean parsing."
 
 [[api]]
 module = "keypirinha"
 symbol = "Settings.get_int"
-status = "full"
+status = "behavioural-difference"
+notes = "Coerces the stored value but does not perform Python configparser extended interpolation first; `${section:key}` and `${env:VARIABLE}` references therefore do not resolve before integer parsing."
 
 [[api]]
 module = "keypirinha"
 symbol = "Settings.get_float"
-status = "full"
+status = "behavioural-difference"
+notes = "Coerces the stored value but does not perform Python configparser extended interpolation first; `${section:key}` and `${env:VARIABLE}` references therefore do not resolve before float parsing."
 
 [[api]]
 module = "keypirinha"
@@ -370,7 +374,8 @@ status = "full"
 [[api]]
 module = "keypirinha"
 symbol = "Plugin.load_settings"
-status = "full"
+status = "behavioural-difference"
+notes = "Returns a Settings view over the package file, but the Rust reader does not implement Python configparser extended interpolation (`${section:key}` and `${env:VARIABLE}`); configuration values that rely on those references are therefore not equivalent."
 
 [[api]]
 module = "keypirinha"

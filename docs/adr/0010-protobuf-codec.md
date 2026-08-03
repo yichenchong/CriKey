@@ -47,5 +47,7 @@ round-trip so a newer peer never loses data talking to an older one.
   unknown-field retention.
 - **`prost` with hand-written derives.** Rejected: same lost-unknown-field
   behaviour, plus a dependency for what is a few hundred lines of varint code.
-- **Keep JSON lines (as the M4 Python worker uses).** Rejected by ADR-0004 on
-  size and parse cost for 500k-item catalog transfers; nothing has changed.
+- **Replace the native transport with JSON lines** (as the M4 Python worker
+  uses). Rejected for the native protocol by ADR-0004 on size and parse cost
+  for 500k-item catalog transfers; the modern and legacy Python workers keep
+  their separate JSON protocols.

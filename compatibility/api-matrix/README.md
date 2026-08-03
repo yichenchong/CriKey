@@ -40,6 +40,14 @@ Modules are limited to the four documented ones: `keypirinha`,
 internals (`_set_host`, `_clear_host`, `_install_stdout_guard`) are CriKey
 plumbing, not claimed legacy API, and are deliberately absent.
 
+## Configuration interpolation
+
+The settings rows are deliberately marked `behavioural-difference`. The Rust
+reader returns values as stored and does not implement Python
+`configparser`'s extended interpolation, including `${section:key}` and
+`${env:VARIABLE}` references. A plugin that relies on those references must
+resolve them itself or change its configuration.
+
 ## `symbol = "*"`
 
 A literal catch-all row for the rest of a module, not a glob. Storage and exact

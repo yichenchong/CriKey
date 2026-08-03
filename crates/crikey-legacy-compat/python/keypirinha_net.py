@@ -22,6 +22,9 @@ a legacy plugin handed an attacker-controlled URL must not be able to read the
 user's filesystem through what the plugin's author believed was a web request.
 """
 
+import math
+import socket
+import ssl
 import urllib.parse
 import urllib.request
 
@@ -122,9 +125,56 @@ def _validate_url(url):
                 parts.scheme, " and ".join(sorted(_ALLOWED_SCHEMES))
             ),
         )
-    if not parts.netloc:
+    if not parts.netloc or not parts.hostname:
         raise InvalidUrlError(url, "it names no host")
+    try:
+        parts.port
+    except ValueError as error:
+        raise InvalidUrlError(url, "its port is invalid: {}".format(error)) from None
     return url
+
+def _timeout_value(timeout):
+    """Returns a finite, positive timeout suitable for urllib."""
+    if timeout is None:
+        return DEFAULT_TIMEOUT
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError):
+        raise ValueError("timeout must be a finite positive number") from None
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("timeout must be a finite positive number")
+    return value
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follows only redirects that stay inside the supported URL schemes."""
+
+    handler_order = 400
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        _validate_url(redirected.full_url)
+        return redirected
+
+
+def _install_timeout(opener, timeout):
+    """Makes an opener apply a finite timeout when callers omit one."""
+    original_open = opener.open
+
+    def open_with_timeout(fullurl, *args, **kwargs):
+        positional = list(args)
+        if len(positional) >= 2:
+            if positional[1] is None or positional[1] is socket._GLOBAL_DEFAULT_TIMEOUT:
+                positional[1] = timeout
+        elif kwargs.get("timeout") in (None, socket._GLOBAL_DEFAULT_TIMEOUT):
+            kwargs["timeout"] = timeout
+        return original_open(fullurl, *positional, **kwargs)
+
+    opener.open = open_with_timeout
+    return opener
+
 
 
 class Request:
@@ -199,29 +249,57 @@ def build_request(url, headers=None, timeout=None, user_agent=None):
         agent = _DEFAULT_USER_AGENT()
     prepared[_USER_AGENT] = agent
 
+    request_timeout = _timeout_value(timeout)
     return Request(
         validated,
         prepared,
-        DEFAULT_TIMEOUT if timeout is None else timeout,
+        request_timeout,
         agent,
     )
 
 
-def build_urllib_opener(handlers=(), agent=None):
-    """A :class:`urllib.request.OpenerDirector` carrying the CriKey user agent.
+def build_urllib_opener(
+    proxies=None,
+    ssl_check_hostname=None,
+    extra_handlers=(),
+    extra_pre_handlers=(),
+    *,
+    agent=None,
+    handlers=None,
+):
+    """Builds an opener with an applied user agent, proxy and timeout policy.
 
-    Constructing an opener opens nothing: handlers are instantiated and the
-    default headers replaced, and no connection is made until the plugin calls
-    ``open()``. Returned as a real ``OpenerDirector`` rather than a wrapper so
-    unchanged plugins can use it exactly as they always have.
-
-    ``addheaders`` is *replaced* rather than appended to, because ``urllib``
-    installs its own ``Python-urllib/3.x`` agent there and leaving it in place
-    would send two ``User-Agent`` values or the wrong one.
+    ``proxies`` follows :class:`urllib.request.ProxyHandler`: ``None`` keeps
+    the process environment's proxy policy, while a mapping (including an
+    empty mapping) explicitly supplies the policy. ``extra_handlers`` and
+    ``extra_pre_handlers`` use the original Keypirinha names. ``handlers`` is
+    a keyword-only alias retained for the first M3 shim.
     """
-    opener = urllib.request.build_opener(*handlers)
+    if handlers is not None:
+        if extra_handlers:
+            raise TypeError("pass either handlers or extra_handlers, not both")
+        extra_handlers = handlers
+
+    own_handlers = [_SafeRedirectHandler()]
+    if proxies is not None:
+        own_handlers.insert(0, urllib.request.ProxyHandler(proxies))
+
+    if ssl_check_hostname is not None:
+        if not isinstance(ssl_check_hostname, bool):
+            raise TypeError("ssl_check_hostname must be a bool or None")
+        context = ssl.create_default_context()
+        if not ssl_check_hostname:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        https_handler = urllib.request.HTTPSHandler(context=context)
+        https_handler.handler_order = 400
+        own_handlers.append(https_handler)
+
+    opener = urllib.request.build_opener(
+        *tuple(extra_pre_handlers), *own_handlers, *tuple(extra_handlers)
+    )
     opener.addheaders = [(_USER_AGENT, user_agent() if agent is None else agent)]
-    return opener
+    return _install_timeout(opener, DEFAULT_TIMEOUT)
 
 
 # --------------------------------------------------------------------------

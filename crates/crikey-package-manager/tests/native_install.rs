@@ -393,6 +393,9 @@ fn verify_package_accepts_good_hash_rejects_wrong_hash_and_reports_corruption_as
     let verified = verify_package(&archive, Some(&report.hash)).expect("good package verifies");
     assert_report_metadata(&verified, &fixture, &archive);
 
+    let uppercase = report.hash.to_ascii_uppercase();
+    verify_package(&archive, Some(&uppercase)).expect("archive hash comparison accepts uppercase hex");
+
     let mut wrong_hash = report.hash.clone();
     wrong_hash.replace_range(0..1, if wrong_hash.starts_with('0') { "1" } else { "0" });
     let wrong = package_error(verify_package(&archive, Some(&wrong_hash)));

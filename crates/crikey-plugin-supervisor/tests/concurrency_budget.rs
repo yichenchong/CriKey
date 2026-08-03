@@ -7,14 +7,14 @@
 //! begin another unit of work must refuse once the declared budget is
 //! exhausted, and must say so.
 //!
-//! The admission seam in the current supervisor is
+//! The lifecycle seam in the current supervisor is
 //! `MemorySupervisor::mark_busy(&mut self, plugin: &PluginId) -> Result<()>`:
 //! it is the only call that moves a registered plugin from `Ready` into
 //! `Busy`, i.e. the point at which work begins. That signature is binary — one
-//! unit of work per plugin, no slot count — so it cannot by itself express the
-//! four budgets of spec 13.5. `ConcurrencyBudget` is the mechanism that
-//! supplies the counts, and the seam tests below drive it *in front of* the
-//! real `MemorySupervisor` so a refusal is shown to keep the plugin out of
+//! unit of work per plugin, no slot count — so it cannot itself express the
+//! four budgets of spec 13.5. `ConcurrencyBudget` is the separate admission
+//! gate that supplies those counts, and the seam tests below drive it *before*
+//! the real `MemorySupervisor` so a refusal is shown to keep the plugin out of
 //! `Busy` rather than being an isolated counter.
 //!
 //! Four properties drive the design:

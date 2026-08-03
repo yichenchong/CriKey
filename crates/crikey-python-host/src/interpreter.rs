@@ -26,8 +26,12 @@
 //! changing global state for unrelated work at the same time.
 
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::worker::HostError;
 use crate::RuntimeProfile;
@@ -59,12 +63,22 @@ const PROBE_DIAGNOSTIC_BYTES: usize = 512;
 /// bounded because a candidate that has not answered by then is not going to.
 const PROBE_SCAN_LINES: usize = 16;
 
+/// Maximum time spent probing one interpreter candidate.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound on waiting for a killed probe to be reaped.
+const PROBE_REAP_GRACE: Duration = Duration::from_millis(250);
+
+/// Bound on captured probe output. The reader keeps draining after this limit
+/// so a noisy candidate cannot deadlock on a full pipe.
+const PROBE_OUTPUT_BYTES: usize = 16 * 1024;
+
 /// A plugin's declared `requires-python` (spec 15.2, 19).
 ///
-/// A comma-joined PEP 440 subset of `==`, `>=`, `>`, `<`, `<=` clauses, e.g.
-/// `">=3.12"`. The gate is applied through [`PythonVersion`]'s derived
-/// ordering, so there is no second, hand-written comparison to disagree with
-/// the one that decides support.
+/// A comma-joined numeric release subset of `==`, `>=`, `>`, `<`, `<=`
+/// clauses, e.g. `">=3.12"`. Pre-release and suffixed values are rejected
+/// rather than guessed, because this host probes the stable
+/// `major.minor.patch` release reported by `sys.version_info`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequiresPython(pub String);
 
@@ -363,28 +377,81 @@ fn resolve(
 /// symlink to 3.12 and `python3` may be 3.6, so only the interpreter's own
 /// answer decides whether plugin code may run on it.
 fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, HostError> {
-    // The probe is a short-lived child that prints one line. It is not given a
-    // deadline because discovery has no clock in its signature; an interpreter
-    // that hangs on `sys.version_info` is beyond what the host can classify.
-    let output = Command::new(path)
+    let mut command = Command::new(path);
+    sanitize_python_environment(&mut command);
+    command
         .args(VERSION_PROBE_ARGS)
-        .output()
-        .map_err(|error| {
-            HostError::Interpreter(format!(
-                "the interpreter at {} could not be executed: {error}",
-                path.display()
-            ))
-        })?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 
-    let Some(found) = parse_reported_version(&output.stdout) else {
+    let mut child = command.spawn().map_err(|error| {
+        HostError::Interpreter(format!(
+            "the {source} interpreter candidate {} could not be executed: {error}",
+            path.display()
+        ))
+    })?;
+    let stdout = child.stdout.take().expect("probe stdout is piped");
+    let stderr = child.stderr.take().expect("probe stderr is piped");
+    let stdout_capture = Arc::new(Mutex::new(ProbeCapture::default()));
+    let stderr_capture = Arc::new(Mutex::new(ProbeCapture::default()));
+    let stdout_thread = spawn_probe_drain(stdout, Arc::clone(&stdout_capture));
+    let stderr_thread = spawn_probe_drain(stderr, Arc::clone(&stderr_capture));
+
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(None) | Err(_) => {
+                hard_kill_probe(child.id(), &mut child);
+                if let Some(status) = wait_probe_bounded(&mut child, PROBE_REAP_GRACE) {
+                    let _ = status;
+                } else {
+                    // SIGKILL normally makes the child reapable immediately.
+                    // If the kernel still withholds a status, finish the reap
+                    // away from the discovery caller rather than blocking it.
+                    reap_probe_in_background(child);
+                }
+                finish_probe_drain(stdout_thread, &stdout_capture);
+                finish_probe_drain(stderr_thread, &stderr_capture);
+                return Err(HostError::Interpreter(format!(
+                    "the {source} interpreter candidate {} did not answer its version probe \
+                     within {} seconds and was stopped",
+                    path.display(),
+                    PROBE_TIMEOUT.as_secs()
+                )));
+            }
+        }
+    };
+    finish_probe_drain(stdout_thread, &stdout_capture);
+    finish_probe_drain(stderr_thread, &stderr_capture);
+    let stdout = snapshot_probe(&stdout_capture);
+    let stderr = snapshot_probe(&stderr_capture);
+
+    if !status.success() {
         return Err(HostError::Interpreter(format!(
-            "the interpreter at {} did not report a version (exit {}): {}",
+            "the {source} interpreter candidate {} exited with {} (stdout: {}; stderr: {})",
             path.display(),
-            match output.status.code() {
-                Some(code) => code.to_string(),
-                None => "signalled".to_owned(),
-            },
-            excerpt(&output.stderr),
+            format_exit(status),
+            excerpt(&stdout),
+            excerpt(&stderr),
+        )));
+    }
+
+    let Some(found) = parse_reported_version(&stdout) else {
+        return Err(HostError::Interpreter(format!(
+            "the {source} interpreter candidate {} did not report a version (stdout: {}; \
+             stderr: {})",
+            path.display(),
+            excerpt(&stdout),
+            excerpt(&stderr),
         )));
     };
 
@@ -393,6 +460,114 @@ fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, HostErro
         version: found,
         source,
     })
+}
+
+#[derive(Debug, Default)]
+struct ProbeCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn spawn_probe_drain<R: Read + Send + 'static>(
+    mut reader: R,
+    capture: Arc<Mutex<ProbeCapture>>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
+            };
+            let mut output = capture.lock().unwrap_or_else(|error| error.into_inner());
+            let room = PROBE_OUTPUT_BYTES.saturating_sub(output.bytes.len());
+            if room > 0 {
+                output.bytes.extend_from_slice(&buffer[..count.min(room)]);
+            }
+            if count > room {
+                output.truncated = true;
+            }
+        }
+    })
+}
+
+fn finish_probe_drain(handle: JoinHandle<()>, capture: &Arc<Mutex<ProbeCapture>>) {
+    let deadline = Instant::now() + PROBE_REAP_GRACE;
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    if handle.is_finished() {
+        let _ = handle.join();
+    } else {
+        let _ = capture;
+    }
+}
+
+fn snapshot_probe(capture: &Arc<Mutex<ProbeCapture>>) -> Vec<u8> {
+    let output = capture.lock().unwrap_or_else(|error| error.into_inner());
+    output.bytes.clone()
+}
+
+fn wait_probe_bounded(child: &mut Child, budget: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
+fn reap_probe_in_background(mut child: Child) {
+    let _ = thread::spawn(move || loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => thread::sleep(Duration::from_millis(1)),
+        }
+    });
+}
+
+fn format_exit(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => code.to_string(),
+        None => "signalled".to_owned(),
+    }
+}
+
+/// Removes every interpreter-controlled inherited variable before a Python
+/// process is started. The worker adds back only the explicit values it owns.
+pub(crate) fn sanitize_python_environment(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().to_ascii_uppercase().starts_with("PYTHON") {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn hard_kill_probe(process_id: u32, child: &mut Child) {
+    #[cfg(unix)]
+    kill_probe_process_group(process_id);
+    #[cfg(not(unix))]
+    let _ = process_id;
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn kill_probe_process_group(process_id: u32) {
+    extern "C" {
+        fn killpg(pgrp: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    #[allow(
+        unsafe_code,
+        reason = "no safe std API kills a process group; args are a validated pgid and a constant signal"
+    )]
+    unsafe {
+        let _ = killpg(process_id as i32, SIGKILL);
+    }
 }
 
 /// First line of `stdout` that is a bare `major[.minor[.patch]]`.
@@ -413,14 +588,21 @@ fn parse_version(text: &str) -> Option<PythonVersion> {
     }
 
     let mut components = text.split('.');
-    let major = components.next()?.parse().ok()?;
-    let minor = components.next().map_or(Ok(0), str::parse).ok()?;
-    let patch = components.next().map_or(Ok(0), str::parse).ok()?;
+    let major = parse_component(components.next()?)?;
+    let minor = components.next().map_or(Some(0), parse_component)?;
+    let patch = components.next().map_or(Some(0), parse_component)?;
     if components.next().is_some() {
         return None;
     }
 
     Some(PythonVersion::new(major, minor, patch))
+}
+
+fn parse_component(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// A bounded, single-line rendering of a failed probe's diagnostic output.
@@ -446,4 +628,70 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable_file(path: &Path) -> bool {
     path.is_file()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::LazyLock;
+
+    #[test]
+    fn numeric_components_are_compared_as_numbers() {
+        assert!(parse_version("3.10").expect("3.10 parses") > parse_version("3.9").expect("3.9 parses"));
+        assert_eq!(parse_version("3.10"), Some(PythonVersion::new(3, 10, 0)));
+    }
+
+    #[test]
+    fn pre_release_suffixed_and_unexpected_reports_are_rejected() {
+        for report in [
+            b"3.12.0rc1\n".as_slice(),
+            b"3.12.0+vendor\n".as_slice(),
+            b"+3.12.0\n".as_slice(),
+            b"Python 3.12.0\n".as_slice(),
+            b"3.12.0.1\n".as_slice(),
+        ] {
+            assert_eq!(
+                parse_reported_version(report),
+                None,
+                "unexpected report {report:?}"
+            );
+        }
+        assert_eq!(
+            parse_reported_version(b"notice before answer\n3.12.0\n"),
+            Some(PythonVersion::new(3, 12, 0))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_python_environment_is_removed_before_starting_a_child() {
+        static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        let _guard = ENV_LOCK
+            .lock()
+            .expect("Python environment test lock is not poisoned");
+        let old_home = std::env::var_os("PYTHONHOME");
+        let old_path = std::env::var_os("PYTHONPATH");
+        std::env::set_var("PYTHONHOME", "/does/not/exist");
+        std::env::set_var("PYTHONPATH", "/hostile/path");
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("test -z \"$PYTHONHOME\" && test -z \"$PYTHONPATH\"");
+        sanitize_python_environment(&mut command);
+        let status = command.status().expect("shell probe starts");
+
+        match old_home {
+            Some(value) => std::env::set_var("PYTHONHOME", value),
+            None => std::env::remove_var("PYTHONHOME"),
+        }
+        match old_path {
+            Some(value) => std::env::set_var("PYTHONPATH", value),
+            None => std::env::remove_var("PYTHONPATH"),
+        }
+        assert!(
+            status.success(),
+            "sanitizing Python variables leaves no hostile startup values"
+        );
+    }
 }

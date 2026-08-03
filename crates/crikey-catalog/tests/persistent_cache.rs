@@ -32,7 +32,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crikey_catalog::{CacheError, CachedSlice, CatalogCache, FileCatalogCache, SCHEMA_VERSION};
+use crikey_catalog::{
+    CacheError, CachedSlice, CatalogCache, FileCatalogCache, MAX_ARCHIVE_BYTES, SCHEMA_VERSION,
+};
 use crikey_core::{
     Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, Generation, GenerationTracker, HitPolicy,
     Item, ItemId, PluginId,
@@ -723,6 +725,39 @@ fn plugin_ids_are_never_used_as_raw_paths() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn windows_device_names_are_encoded_as_safe_file_components() {
+    let root = TempRoot::new("windows-device-names");
+    let cache = FileCatalogCache::new(root.cache_dir());
+    let names = ["con", "con.", "prn", "aux", "nul", "com1", "lpt9"];
+
+    for (index, name) in names.iter().enumerate() {
+        let plugin = plugin_id(name);
+        store(&cache, &fixture_slice(&plugin, index as u64, 1, "DEVICE"));
+        assert_slice_eq(
+            &load(&cache, &plugin).expect("a reserved-name plugin slice must round trip"),
+            &fixture_slice(&plugin, index as u64, 1, "DEVICE"),
+            name,
+        );
+    }
+
+    for path in list_files(cache.root()) {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(
+            !names
+                .iter()
+                .any(|name| file_name.eq_ignore_ascii_case(&format!("{name}.slice"))),
+            "a Windows device name must never be used as a cache filename: {file_name}"
+        );
+    }
+    let mut expected: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    expected.sort();
+    assert_eq!(owners(&cache), expected);
+}
+
+#[test]
 fn storing_a_slice_again_replaces_the_previous_one_without_residue() {
     let root = TempRoot::new("replace");
     let cache_dir = root.cache_dir();
@@ -887,6 +922,68 @@ fn unknown_plugins_and_a_missing_root_read_as_misses() {
 }
 
 #[test]
+fn noncanonical_percent_escapes_are_not_listed_as_cached_owners() {
+    let root = TempRoot::new("canonical-name");
+    let cache_dir = root.cache_dir();
+    let cache = FileCatalogCache::new(cache_dir.clone());
+    let plugin = plugin_id("a");
+
+    store(&cache, &fixture_slice(&plugin, 1, 1, "CANONICAL"));
+    let canonical = cache_dir.join("a.slice");
+    let alias = cache_dir.join("%61.slice");
+    fs::copy(&canonical, &alias).expect("the alias fixture must be copyable");
+    fs::remove_file(&canonical).expect("the canonical fixture must be removable");
+
+    assert!(
+        owners(&cache).is_empty(),
+        "a noncanonical escaped filename must not masquerade as a cache owner"
+    );
+    assert!(
+        load(&cache, &plugin).is_none(),
+        "load_slice must use the canonical filename rather than accepting an alias"
+    );
+}
+
+#[test]
+fn an_archive_larger_than_the_read_bound_is_a_cache_miss() {
+    let root = TempRoot::new("archive-bound");
+    let cache_dir = root.cache_dir();
+    let cache = FileCatalogCache::new(cache_dir.clone());
+    let plugin = plugin_id("bounded.plugin");
+
+    store(&cache, &fixture_slice(&plugin, 1, 1, "BOUND"));
+    let path = cache_dir.join("bounded.plugin.slice");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("the stored archive must be writable");
+    file.set_len(MAX_ARCHIVE_BYTES + 1)
+        .expect("the filesystem must support extending the sparse fixture");
+
+    assert!(
+        load(&cache, &plugin).is_none(),
+        "a file larger than the bounded reader must be discarded before decoding"
+    );
+}
+
+#[test]
+fn an_unreadable_archive_reports_a_filesystem_error_without_panicking() {
+    let root = TempRoot::new("unreadable");
+    let cache_dir = root.cache_dir();
+    let cache = FileCatalogCache::new(cache_dir.clone());
+    let plugin = plugin_id("unreadable.plugin");
+    fs::create_dir_all(&cache_dir).expect("the cache root must be creatable");
+    fs::create_dir(cache_dir.join("unreadable.plugin.slice"))
+        .expect("the unreadable fixture directory must be creatable");
+
+    let result = cache.load_slice(&plugin);
+    assert!(
+        matches!(result, Err(CacheError::Io { .. })),
+        "a filesystem read failure must be reported as an I/O error, got {result:?}"
+    );
+}
+
+#[test]
 fn the_cache_is_usable_behind_a_trait_object() {
     let root = TempRoot::new("dyn-object");
     let plugin = plugin_id("com.example.dynamic");
@@ -956,6 +1053,16 @@ fn a_slice_with_the_wrong_header_bytes_is_discarded() {
         for byte in &mut bytes[..4] {
             *byte ^= 0xFF;
         }
+        write_bytes(&path, &bytes);
+    });
+}
+
+#[test]
+fn trailing_bytes_are_not_accepted_as_a_complete_archive() {
+    assert_damage_is_contained("trailing-bytes", |files: &[PathBuf]| {
+        let path = payload_file(files);
+        let mut bytes = read_bytes(&path);
+        bytes.push(0);
         write_bytes(&path, &bytes);
     });
 }

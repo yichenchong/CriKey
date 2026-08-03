@@ -152,6 +152,9 @@ struct Options {
 
 fn parse_args(args: &[String]) -> Result<Request, String> {
     if args.iter().any(|arg| matches!(arg.as_str(), "-h" | "--help")) {
+        if let Some(argument) = unknown_help_argument(args) {
+            return Err(format!("unrecognized developer command argument `{argument}`"));
+        }
         return Ok(Request::Help);
     }
 
@@ -229,6 +232,27 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
         interval_ms,
         repeat,
     }))
+}
+
+fn unknown_help_argument(args: &[String]) -> Option<&str> {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if matches!(argument, "-h" | "--help" | "--list-fixtures") {
+            index += 1;
+        } else if matches!(argument, "--fixture" | "--query" | "--interval-ms" | "--repeat") {
+            index = index.saturating_add(2);
+        } else if argument.starts_with("--fixture=")
+            || argument.starts_with("--query=")
+            || argument.starts_with("--interval-ms=")
+            || argument.starts_with("--repeat=")
+        {
+            index += 1;
+        } else {
+            return Some(argument);
+        }
+    }
+    None
 }
 
 fn required_value<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
@@ -512,7 +536,7 @@ fn simulate(options: &Options) -> Result<Simulation, String> {
                 plugin.policy(),
                 plugin.intake_policy(options.fixture),
             )
-            .map_err(|error| format!("fixture plugin registration failed: {error:?}"))?;
+            .map_err(|error| format!("fixture plugin registration failed: {error}"))?;
     }
 
     let keystrokes = workload(options)?;
@@ -639,7 +663,10 @@ fn settle(
             || tick.drain_report.dropped_obsolete != 0;
         trace.capture(pipeline)?;
         if !tick.errors.is_empty() {
-            return Err(format!("pipeline tick rejected fixture work: {:?}", tick.errors));
+            return Err(format!(
+                "pipeline tick rejected fixture work: {}",
+                pipeline_error_text(&tick.errors)
+            ));
         }
         schedule_results(fixture, tick.dispatches, scheduled)?;
         if !progressed {
@@ -649,6 +676,14 @@ fn settle(
     Err(format!(
         "the query pipeline did not settle within {SETTLE_ROUNDS} rounds at {now}ms"
     ))
+}
+
+fn pipeline_error_text(errors: &[PipelineError]) -> String {
+    errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn present_and_capture(
@@ -661,7 +696,10 @@ fn present_and_capture(
     trace.capture(pipeline)?;
     let errors = pipeline.take_errors();
     if !errors.is_empty() {
-        return Err(format!("pipeline presentation rejected fixture work: {errors:?}"));
+        return Err(format!(
+            "pipeline presentation rejected fixture work: {}",
+            pipeline_error_text(&errors)
+        ));
     }
     if let Some(view) = view {
         let frame = FrameObservation::capture(now, &view)?;
@@ -766,7 +804,7 @@ fn deliver_result(
             ..
         }) => {}
         Err(error) => {
-            return Err(format!("fixture result delivery failed: {error:?}"));
+            return Err(format!("fixture result delivery failed: {error}"));
         }
     }
 
@@ -1478,5 +1516,16 @@ fn cancel_reason(reason: CancelReason) -> &'static str {
         CancelReason::ProfileChanged => "profile-changed",
         CancelReason::Disabled => "disabled",
         CancelReason::Shutdown => "shutdown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_does_not_hide_unknown_developer_options() {
+        let args = vec!["--help".to_owned(), "--unknown".to_owned()];
+        assert!(parse_args(&args).is_err());
     }
 }

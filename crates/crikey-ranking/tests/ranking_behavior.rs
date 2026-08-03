@@ -836,3 +836,27 @@ fn ranker_history_disablement_reaches_the_trait_entry_point() {
         "an item with no history must score the same under either history policy"
     );
 }
+
+#[test]
+fn non_prefix_bound_covers_all_optional_signals() {
+    let r = ranker(true);
+    let candidate = item("candidate");
+    let bound = r.non_prefix_upper_bound(&candidate);
+    let actual = r.score_signals(RankingSignals {
+        match_quality: 0.72,
+        exact_prefix: false,
+        match_position: Some(0),
+        category_weight: 1.0,
+        plugin_score_hint: candidate.score_hint,
+        selection_frequency: u32::MAX,
+        selection_recency_secs: Some(0),
+        query_history: 1.0,
+        context_match: true,
+        user_preference: 1.0,
+    });
+
+    assert!(
+        actual <= bound,
+        "the advertised non-prefix upper bound {bound:?} must cover every optional ranking signal, got {actual:?}"
+    );
+}

@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -452,6 +453,50 @@ fn supervisor_records_startup_failures_in_the_matching_counter() {
     assert_eq!(health.timeouts, 0);
     assert_eq!(health.protocol_violations, 0);
 }
+#[test]
+fn startup_error_names_the_plugin_and_underlying_spawn_cause() {
+    let plugin = PluginId("named.native".to_owned());
+    let error = NativeWorker::spawn(
+        launch(
+            Path::new("/crikey-test-no-such-native-plugin"),
+            &plugin.0,
+            "echo",
+            &[],
+        ),
+        options(TransportKind::Stdio),
+    )
+    .expect_err("missing executable must fail at startup");
+    let detail = error.to_string();
+    assert!(
+        detail.contains("named.native"),
+        "startup error names plugin: {detail}"
+    );
+    assert!(
+        detail.contains("os error 2") || detail.contains("No such file") || detail.contains("not found"),
+        "startup error preserves the operating-system cause: {detail}"
+    );
+}
+
+#[test]
+fn shutdown_all_closes_the_supervisor_without_allowing_respawn() {
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+    let plugin = PluginId("closed.native".to_owned());
+    let spec = launch(
+        Path::new("/crikey-test-no-such-native-plugin"),
+        &plugin.0,
+        "echo",
+        &[],
+    );
+    supervisor
+        .register(spec.clone(), options(TransportKind::Stdio))
+        .expect("register plugin before shutdown");
+    supervisor.shutdown_all();
+    assert!(matches!(supervisor.worker(&plugin, 0), Err(HostError::Closed)));
+    assert!(matches!(
+        supervisor.register(spec, options(TransportKind::Stdio)),
+        Err(HostError::Closed)
+    ));
+}
 
 #[test]
 fn supervisor_records_timeout_failures_instead_of_crashes() {
@@ -541,6 +586,129 @@ fn supervisor_records_observed_host_resource_failures() {
     assert_eq!(health.crashes, 0);
     assert_eq!(health.timeouts, 0);
     assert_eq!(health.protocol_violations, 0);
+    supervisor.shutdown_all();
+}
+
+#[test]
+fn supervisor_resets_failure_streak_after_a_completed_request() {
+    let (plugin_binary, _) = conformance_binaries();
+    let plugin = PluginId("sequence.native".to_owned());
+    let sequence_file = std::env::temp_dir().join(format!(
+        "crikey-native-sequence-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let _ = fs::remove_file(&sequence_file);
+    let extra = [(
+        "CRIKEY_SEQUENCE_FILE".to_owned(),
+        sequence_file.display().to_string(),
+    )];
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig {
+        max_restarts: 3,
+        restart_window_ms: 60_000,
+        base_backoff_ms: 0,
+        max_backoff_ms: 0,
+        circuit: CircuitBreakerConfig {
+            failure_threshold: 2,
+            cooldown: Duration::from_secs(60),
+        },
+    });
+    supervisor
+        .register(
+            launch(&plugin_binary, &plugin.0, "sequence", &extra),
+            options(TransportKind::Stdio),
+        )
+        .expect("register sequence fixture");
+
+    {
+        let worker = supervisor
+            .worker(&plugin, 0)
+            .expect("first sequence worker starts");
+        assert!(matches!(
+            worker.suggest(&request("first-crash", 1)),
+            Err(HostError::Crashed { .. })
+        ));
+    }
+    {
+        let worker = supervisor
+            .worker(&plugin, 1)
+            .expect("sequence fixture restarts after first crash");
+        let result = worker
+            .suggest(&request("successful-recovery", 2))
+            .expect("second sequence process completes a request");
+        assert_eq!(result.state, BatchState::Final);
+    }
+    {
+        let worker = supervisor
+            .worker(&plugin, 1)
+            .expect("supervisor observes the completed recovery request");
+        let exit = worker.kill();
+        assert_eq!(exit.kind, ExitKind::Killed);
+    }
+    {
+        let worker = supervisor
+            .worker(&plugin, 2)
+            .expect("sequence fixture starts its third process");
+        assert!(matches!(
+            worker.suggest(&request("second-crash", 3)),
+            Err(HostError::Crashed { .. })
+        ));
+    }
+
+    assert_eq!(supervisor.health(&plugin).crashes, 2);
+    assert!(
+        !supervisor.is_suspended(&plugin, 2),
+        "a successful request between crashes resets the circuit streak"
+    );
+    assert_eq!(
+        supervisor
+            .snapshot(&plugin)
+            .expect("sequence plugin remains registered")
+            .circuit
+            .failure_streak,
+        1
+    );
+    supervisor.shutdown_all();
+    let _ = fs::remove_file(sequence_file);
+}
+#[test]
+fn supervisor_does_not_reset_failures_for_success_then_child_kill_cycles() {
+    let (plugin_binary, _) = conformance_binaries();
+    let plugin = PluginId("success-then-kill.native".to_owned());
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig {
+        max_restarts: 3,
+        restart_window_ms: 60_000,
+        base_backoff_ms: 0,
+        max_backoff_ms: 0,
+        circuit: CircuitBreakerConfig {
+            failure_threshold: 2,
+            cooldown: Duration::from_secs(60),
+        },
+    });
+    supervisor
+        .register(
+            launch(&plugin_binary, &plugin.0, "echo", &[]),
+            options(TransportKind::Stdio),
+        )
+        .expect("register success-then-kill fixture");
+
+    for now_ms in [0, 1] {
+        let worker = supervisor
+            .worker(&plugin, now_ms)
+            .expect("worker starts or restarts after the previous kill");
+        let result = worker
+            .suggest(&request("success-before-kill", now_ms))
+            .expect("echo request succeeds before the deliberate kill");
+        assert_eq!(result.state, BatchState::Final);
+        assert_eq!(worker.kill().kind, ExitKind::Killed);
+    }
+
+    let error = supervisor
+        .worker(&plugin, 2)
+        .expect_err("repeated child failures open the circuit");
+    assert!(matches!(error, HostError::ResourceLimit { .. }));
+    assert!(supervisor.is_suspended(&plugin, 2));
+    assert_eq!(supervisor.health(&plugin).crashes, 2);
     supervisor.shutdown_all();
 }
 

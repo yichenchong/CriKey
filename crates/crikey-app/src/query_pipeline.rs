@@ -10,7 +10,7 @@ use crikey_input_scheduler::{
     DispatchedRequest, Millis, PluginDiagnostics, PluginPolicy, QueryScheduler, QueryTraceEvent,
     SchedulerConfig, SchedulerDiagnostics, SchedulingProfile,
 };
-use crikey_plugin_model::{ConcurrencySection, Manifest};
+use crikey_plugin_model::{ConcurrencySection, Manifest, Runtime};
 use crikey_plugin_supervisor::{
     shared_budget_from_section, BudgetKind, CircuitBreakerConfig, MemorySupervisor, OwnedBudgetGuard,
     PluginBudgetHandle, PluginHealth, Supervisor,
@@ -75,7 +75,48 @@ pub enum PipelineError {
         generation: Generation,
         reason: RejectReason,
     },
+    /// The manifest names a runtime for which this build has no host.
+    UnsupportedRuntime {
+        plugin: PluginId,
+        runtime: Runtime,
+    },
 }
+
+impl std::fmt::Display for PipelineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyRegistered { plugin } => {
+                write!(formatter, "plugin `{}` is already registered", plugin.0)
+            }
+            Self::QueueRejected {
+                plugin,
+                generation,
+                reason,
+            } => write!(
+                formatter,
+                "result batch from plugin `{}` for generation {generation} was rejected: {reason:?}",
+                plugin.0
+            ),
+            Self::AggregatorRejected {
+                plugin,
+                generation,
+                reason,
+            } => write!(
+                formatter,
+                "result batch from plugin `{}` for generation {generation} was rejected by the aggregator: {reason:?}",
+                plugin.0
+            ),
+            Self::UnsupportedRuntime { plugin, runtime } => write!(
+                formatter,
+                "plugin `{}` declares unsupported runtime `{}`; this build deliberately refuses it because no host is available",
+                plugin.0,
+                runtime_name(*runtime)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PipelineError {}
 
 /// Work and diagnostics produced by one pipeline tick.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -276,6 +317,7 @@ impl QueryPipeline {
         if self.health_sync.contains_key(&plugin) {
             return Err(PipelineError::AlreadyRegistered { plugin });
         }
+        ensure_supported_runtime(&plugin, manifest.plugin.runtime)?;
         let policy = plugin_policy_from_manifest(manifest);
         let budget = resolved_budget_for_policy(&policy, &manifest.concurrency);
         self.register_plugin_with_budget(plugin, policy, self.default_intake_policy, budget.clone())?;
@@ -291,6 +333,10 @@ impl QueryPipeline {
         manifest: &Manifest,
         budget: PluginBudgetHandle,
     ) -> Result<(), PipelineError> {
+        if self.health_sync.contains_key(&plugin) {
+            return Err(PipelineError::AlreadyRegistered { plugin });
+        }
+        ensure_supported_runtime(&plugin, manifest.plugin.runtime)?;
         let policy = plugin_policy_from_manifest(manifest);
         self.register_plugin_with_budget(plugin, policy, self.default_intake_policy, budget)
     }
@@ -324,7 +370,8 @@ impl QueryPipeline {
         self.pending_errors.retain(|error| match error {
             PipelineError::AlreadyRegistered { plugin: owner }
             | PipelineError::QueueRejected { plugin: owner, .. }
-            | PipelineError::AggregatorRejected { plugin: owner, .. } => owner != plugin,
+            | PipelineError::AggregatorRejected { plugin: owner, .. }
+            | PipelineError::UnsupportedRuntime { plugin: owner, .. } => owner != plugin,
         });
 
         self.scheduler.unregister_plugin(plugin);
@@ -491,6 +538,34 @@ impl QueryPipeline {
             return CompletionOutcome::Accepted;
         }
         self.finish_completion(plugin, generation, now)
+    }
+    /// Aborts a request whose provider can no longer answer.
+    ///
+    /// This is the explicit death path for a provider. It retires the
+    /// scheduler request, any parked completion and the admitted suggestion
+    /// slot without advancing the current query generation. Repeating the
+    /// call after retirement is a harmless no-op.
+    pub fn abort_request(&mut self, plugin: &PluginId, generation: Generation, now: Millis) -> bool {
+        let key = (plugin.clone(), generation);
+        let had_request = self.active_requests.contains(&key)
+            || self.admitted.contains_key(&key)
+            || self.pending_completions.contains_key(&key)
+            || self.unresolved_cancellations.contains_key(&key);
+        if !had_request {
+            return false;
+        }
+
+        self.pending_completions.remove(&key);
+        self.pending_cancellations
+            .retain(|cancellation| &cancellation.plugin != plugin || cancellation.generation != generation);
+        let cancellation_pending = self.unresolved_cancellations.remove(&key).is_some();
+        let _ = self.finish_completion(plugin, generation, now);
+        if cancellation_pending {
+            self.supervisor
+                .record_cancellation(plugin, false, 1)
+                .expect("scheduler and supervisor plugin registries stay in lockstep");
+        }
+        true
     }
 
     /// Fair-drains intake, ranks the aggregated set and publishes at most one
@@ -763,6 +838,7 @@ impl QueryPipeline {
             let Some(diagnostics) = self.scheduler.plugin_diagnostics(plugin) else {
                 continue;
             };
+
             let synced = self
                 .health_sync
                 .get_mut(plugin)
@@ -804,6 +880,25 @@ fn resolved_budget_for_policy(policy: &PluginPolicy, concurrency: &ConcurrencySe
         None => scheduler_limit,
     });
     shared_budget_from_section(&resolved)
+}
+fn ensure_supported_runtime(plugin: &PluginId, runtime: Runtime) -> Result<(), PipelineError> {
+    if runtime == Runtime::Wasm {
+        return Err(PipelineError::UnsupportedRuntime {
+            plugin: plugin.clone(),
+            runtime,
+        });
+    }
+    Ok(())
+}
+
+fn runtime_name(runtime: Runtime) -> &'static str {
+    match runtime {
+        Runtime::LegacyPython => "legacy-python",
+        Runtime::Python => "python",
+        Runtime::Native => "native",
+        Runtime::Wasm => "wasm",
+        Runtime::Builtin => "builtin",
+    }
 }
 
 fn batch_completion(state: BatchState) -> BatchCompletion {

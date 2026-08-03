@@ -23,6 +23,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use crikey_package_manager::{
     resolve, EnvironmentInputs, EnvironmentStore, LockedPackage, Lockfile, PackageError, PackageIndex,
@@ -146,6 +148,17 @@ fn identical_inputs_yield_the_same_id_regardless_of_dependency_order() {
 }
 
 #[test]
+fn equivalent_package_name_and_hash_spellings_share_an_environment_id() {
+    let lower = inputs_for(vec![pkg("my-pkg", "1.0.0", &"a".repeat(64))]);
+    let upper = inputs_for(vec![pkg("My.Pkg", "1.0.0", &"A".repeat(64))]);
+    assert_eq!(
+        lower.environment_id(),
+        upper.environment_id(),
+        "normalised names and hexadecimal case must not create duplicate environments"
+    );
+}
+
+#[test]
 fn reordering_native_build_options_does_not_change_the_id() {
     let base = pkg("acme", "1.2.0", &"1".repeat(64));
 
@@ -253,10 +266,14 @@ fn a_second_ensure_with_the_same_inputs_reuses_the_environment() {
     let store = EnvironmentStore::new(scratch.subdir("cache"));
     let first = store.ensure(&inputs, &index).expect("first ensure materialises");
 
-    // A marker only survives if the second ensure does NOT re-materialise
-    // (which would wipe and rebuild the directory).
-    let marker = first.site_dir.join(".crikey-reuse-witness");
-    fs::write(&marker, b"witness").expect("marker is writable into the materialised env");
+    // Keep the package bytes unchanged but backdate a real package file. A
+    // second materialisation would replace it; successful reuse preserves it.
+    let module = first.site_dir.join("acme").join("__init__.py");
+    let witness_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    fs::File::open(&module)
+        .expect("the materialised module is readable")
+        .set_times(fs::FileTimes::new().set_modified(witness_time))
+        .expect("the materialised module timestamp is writable");
 
     let second = store
         .ensure(&inputs, &index)
@@ -267,9 +284,55 @@ fn a_second_ensure_with_the_same_inputs_reuses_the_environment() {
         "identical inputs resolve to the same site dir"
     );
     assert_eq!(first.id.0, second.id.0, "identical inputs share one id");
+    assert_eq!(
+        fs::metadata(&module)
+            .expect("the reused module remains present")
+            .modified()
+            .expect("the reused module timestamp is readable"),
+        witness_time,
+        "reuse must not re-materialise the package files"
+    );
+}
+
+#[test]
+fn ensure_rejects_tampering_inside_a_committed_environment() {
+    let scratch = Scratch::new("cached-tamper");
+    let (index, _lock, inputs) = resolved_env(&scratch, "1.2.0");
+    let store = EnvironmentStore::new(scratch.subdir("cache"));
+    let env = store.ensure(&inputs, &index).expect("first ensure materialises");
+
+    fs::write(
+        env.site_dir.join("acme").join("__init__.py"),
+        b"__version__ = \"tampered\"\n",
+    )
+    .expect("the committed module is writable for the regression setup");
+
+    let error = store
+        .ensure(&inputs, &index)
+        .expect_err("tampered committed code must not be silently reused");
     assert!(
-        marker.is_file(),
-        "reuse must not re-materialise: the in-dir marker must survive"
+        matches!(error, PackageError::HashMismatch(_)),
+        "cached-content tampering is a hard hash failure, got {error:?}"
+    );
+}
+
+#[test]
+fn ensure_reports_a_missing_source_package_separately_from_tampering() {
+    let scratch = Scratch::new("missing-source");
+    let index_root = scratch.subdir("index");
+    write_wheel(&index_root, "acme", "1.2.0");
+    let index = PackageIndex::from_dir(&index_root).expect("index loads");
+    let lock = resolve(">=3.14", &["acme==1.2.0".to_owned()], &index).expect("resolves");
+    let inputs = inputs_for(lock.packages);
+    let store = EnvironmentStore::new(scratch.subdir("cache"));
+
+    fs::remove_dir_all(index_root.join("acme-1.2.0")).expect("source package is removable");
+    let error = store
+        .ensure(&inputs, &index)
+        .expect_err("a missing source package cannot be verified");
+    assert!(
+        matches!(error, PackageError::SourceUnavailable(_)),
+        "a moved source is reported clearly, got {error:?}"
     );
 }
 
@@ -302,6 +365,42 @@ fn ensure_rejects_a_package_whose_hash_no_longer_matches_the_index() {
     );
 }
 
+#[test]
+fn ensure_recomputes_a_loaded_index_hash_before_using_source_bytes() {
+    let scratch = Scratch::new("stale-index");
+    let index_root = scratch.subdir("index");
+    write_wheel(&index_root, "acme", "1.2.0");
+    let index = PackageIndex::from_dir(&index_root).expect("index loads");
+    let lock = resolve(">=3.14", &["acme==1.2.0".to_owned()], &index).expect("resolves");
+    let inputs = inputs_for(lock.packages);
+
+    fs::write(
+        index_root.join("acme-1.2.0").join("acme").join("__init__.py"),
+        b"__version__ = \"tampered-after-index-load\"\n",
+    )
+    .expect("source package is rewritable");
+
+    let store = EnvironmentStore::new(scratch.subdir("cache"));
+    let error = store
+        .ensure(&inputs, &index)
+        .expect_err("a stale in-memory index hash must not authorize changed bytes");
+    assert!(
+        matches!(error, PackageError::HashMismatch(_)),
+        "changed source bytes are a hard hash failure, got {error:?}"
+    );
+}
+
+#[test]
+fn ensure_accepts_hex_hashes_with_different_case() {
+    let scratch = Scratch::new("hash-case");
+    let (index, _lock, mut inputs) = resolved_env(&scratch, "1.2.0");
+    inputs.locked[0].hash = inputs.locked[0].hash.to_ascii_uppercase();
+    let store = EnvironmentStore::new(scratch.subdir("cache"));
+
+    store
+        .ensure(&inputs, &index)
+        .expect("hex digest comparison is case-insensitive");
+}
 #[test]
 fn a_failed_ensure_leaves_no_partial_environment() {
     let scratch = Scratch::new("rollback");
@@ -518,4 +617,55 @@ fn ensure_writes_a_durable_lockfile_that_round_trips() {
         restored.packages[0].version, "1.2.0",
         "the durable lockfile pins the resolved version"
     );
+}
+
+#[test]
+fn ensure_rejects_a_durable_lockfile_that_disagrees_with_requested_dependencies() {
+    let scratch = Scratch::new("lockfile-mismatch");
+    let (index, _lock, inputs) = resolved_env(&scratch, "1.2.0");
+    let store = EnvironmentStore::new(scratch.subdir("cache"));
+    let env = store.ensure(&inputs, &index).expect("ensure materialises");
+    let lock_path = env
+        .site_dir
+        .parent()
+        .expect("the site dir lives inside the committed env dir")
+        .join("crikey-lock.toml");
+
+    let mut altered = Lockfile {
+        requires_python: inputs.python_version.clone(),
+        packages: inputs.locked.clone(),
+    };
+    altered.packages[0].hash = "0".repeat(64);
+    fs::write(&lock_path, altered.to_toml())
+        .expect("the durable lockfile is writable for the regression setup");
+
+    let error = store
+        .ensure(&inputs, &index)
+        .expect_err("a cached lockfile disagreeing with the request must be rejected");
+    assert!(
+        matches!(error, PackageError::HashMismatch(_)),
+        "a durable lockfile mismatch is a hard hash failure, got {error:?}"
+    );
+}
+
+#[test]
+fn concurrent_ensures_use_independent_staging_directories() {
+    let scratch = Scratch::new("concurrent");
+    let (index, _lock, inputs) = resolved_env(&scratch, "1.2.0");
+    let store = EnvironmentStore::new(scratch.subdir("cache"));
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let store = store.clone();
+            let index = index.clone();
+            let inputs = inputs.clone();
+            thread::spawn(move || store.ensure(&inputs, &index))
+        })
+        .collect();
+    for handle in handles {
+        handle
+            .join()
+            .expect("concurrent ensure worker does not panic")
+            .expect("concurrent ensures either share or verify one complete environment");
+    }
 }

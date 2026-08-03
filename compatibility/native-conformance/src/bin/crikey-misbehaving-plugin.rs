@@ -15,13 +15,13 @@ use std::time::Duration;
 
 use crikey_native_protocol::frame;
 use crikey_native_protocol::message::{
-    BatchState, CatalogBatch, Envelope, Handshake, Item, LifecycleAck, LifecycleKind, LogLevel,
-    LogRecord, Payload, ResultBatch,
+    BatchState, CatalogBatch, Envelope, Handshake, Item, LifecycleAck, LifecycleKind, LogLevel, LogRecord,
+    Payload, ResultBatch,
 };
 use crikey_native_protocol::transport::{self, Transport};
 use crikey_native_protocol::wire::UnknownFields;
 use crikey_native_protocol::{
-    Endpoint, ProtocolError, MAX_FRAME_BYTES, PROTOCOL_VERSION, ENV_ENDPOINT, ENV_SESSION_TOKEN,
+    Endpoint, ProtocolError, ENV_ENDPOINT, ENV_SESSION_TOKEN, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 
 const MODE_ENV: &str = "CRIKEY_CONFORMANCE_MODE";
@@ -36,6 +36,8 @@ enum Mode {
     Oversized,
     Flood,
     LogFlood,
+    StderrFlood,
+    PartialNoTerminal,
     ControlWitness,
     BadVersion(u32),
     BadToken,
@@ -59,12 +61,13 @@ fn selected_mode() -> String {
         .or_else(|| candidate(from_file()))
         .unwrap_or_else(|| "echo".to_owned())
 }
-
 fn parse_mode(spec: &str) -> Mode {
     match spec {
         "oversized" => Mode::Oversized,
         "flood" => Mode::Flood,
         "log-flood" => Mode::LogFlood,
+        "stderr-flood" => Mode::StderrFlood,
+        "partial-no-terminal" => Mode::PartialNoTerminal,
         "control-witness" => Mode::ControlWitness,
         "bad-token" => Mode::BadToken,
         "hang" => Mode::Hang,
@@ -216,6 +219,57 @@ fn log_flood(
         ))?;
     }
 }
+fn stderr_flood(
+    transport: &mut dyn Transport,
+    connection_id: u64,
+    request_id: u64,
+    generation: u64,
+) -> Result<(), ProtocolError> {
+    let message = vec![b'x'; LOG_MESSAGE_BYTES];
+    let mut stderr = io::stderr().lock();
+    for _ in 0..64 {
+        stderr
+            .write_all(&message)
+            .map_err(|error| ProtocolError::Io(error.to_string()))?;
+    }
+    stderr
+        .flush()
+        .map_err(|error| ProtocolError::Io(error.to_string()))?;
+    transport.send(&envelope(
+        connection_id,
+        request_id,
+        generation,
+        Payload::Results(ResultBatch {
+            state: BatchState::Final,
+            items: Vec::new(),
+            sequence: 0,
+            error: None,
+            unknown: UnknownFields::default(),
+        }),
+    ))
+}
+fn partial_no_terminal(
+    transport: &mut dyn Transport,
+    connection_id: u64,
+    request_id: u64,
+    generation: u64,
+) -> Result<(), ProtocolError> {
+    transport.send(&envelope(
+        connection_id,
+        request_id,
+        generation,
+        Payload::Results(ResultBatch {
+            state: BatchState::Partial,
+            items: Vec::new(),
+            sequence: 0,
+            error: None,
+            unknown: UnknownFields::default(),
+        }),
+    ))?;
+    loop {
+        thread::park();
+    }
+}
 
 fn control_item(index: usize, kind: &str) -> Item {
     Item {
@@ -333,9 +387,12 @@ fn write_oversized(endpoint: &Endpoint) -> Result<(), ProtocolError> {
         ));
     }
 
-    // Exercise the shared framing API for a valid empty frame on a sink, then
+    // Exercise the shared framing API for one valid frame on a sink, then
     // deliberately hand-roll only the invalid length prefix sent to the host.
-    frame::write_frame(&mut io::sink(), &[])?;
+    // The payload must be non-empty: the shared writer rejects a zero-length
+    // frame, and this call exists only to prove the fixture drives the real
+    // framing API rather than reimplementing it.
+    frame::write_frame(&mut io::sink(), &[0u8])?;
     let declared = u32::try_from(MAX_FRAME_BYTES.saturating_add(1))
         .map_err(|_| ProtocolError::Malformed("frame limit does not fit u32".to_owned()))?;
     let mut stdout = io::stdout().lock();
@@ -373,18 +430,14 @@ fn run() -> Result<(), ProtocolError> {
             Ok(())
         }
         Mode::LogFlood => log_flood(&mut *transport, connection_id, 0, 0),
-        Mode::Flood | Mode::ControlWitness | Mode::Hang => {
+        Mode::StderrFlood | Mode::PartialNoTerminal | Mode::Flood | Mode::ControlWitness | Mode::Hang => {
             loop_messages(&mut *transport, connection_id, mode)
         }
         Mode::BadVersion(_) | Mode::BadToken => Ok(()),
     }
 }
 
-fn loop_messages(
-    transport: &mut dyn Transport,
-    connection_id: u64,
-    mode: Mode,
-) -> Result<(), ProtocolError> {
+fn loop_messages(transport: &mut dyn Transport, connection_id: u64, mode: Mode) -> Result<(), ProtocolError> {
     loop {
         let incoming = transport.recv()?;
         let request_id = incoming.request_id;
@@ -398,6 +451,12 @@ fn loop_messages(
             }
             Some(Payload::Suggest(_)) => match &mode {
                 Mode::Flood => return flood(transport, connection_id, request_id, generation),
+                Mode::StderrFlood => {
+                    return stderr_flood(transport, connection_id, request_id, generation);
+                }
+                Mode::PartialNoTerminal => {
+                    return partial_no_terminal(transport, connection_id, request_id, generation);
+                }
                 Mode::ControlWitness => {
                     control_witness(transport, connection_id, request_id, generation)?;
                 }

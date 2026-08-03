@@ -86,7 +86,9 @@ const KEYSYM_CONTROL_L: u32 = 0xffe3;
 const KEYSYM_CAPS_LOCK: u32 = 0xffe5;
 const KEYSYM_ALT_L: u32 = 0xffe9;
 const KEYSYM_NUM_LOCK: u32 = 0xff7f;
+const KEYSYM_SCROLL_LOCK: u32 = 0xff14;
 const KEYSYM_SPACE: u32 = 0x0020;
+/// X11 keysym for the `F5` function key (`XK_F1` is `0xffbe`, so `F5` is four higher).
 const KEYSYM_F5: u32 = 0xffc2;
 
 /// The first chord: `Ctrl+Alt+Space`.
@@ -325,14 +327,14 @@ impl Keyboard {
         None
     }
 
-    /// The modifier bit this server puts NumLock on, or `None` when it has no
-    /// NumLock key at all.
+    /// The modifier bit this server puts a lock key on, or `None` when it has
+    /// no such key.
     ///
     /// Determined exactly the way `hotkeys.rs` determines it, because the point
     /// of the lock test is to exercise the permutation the backend actually
-    /// grabbed — assuming `Mod2Mask` would test a guess instead.
-    fn num_lock_mask(&self) -> Option<u32> {
-        let keycode = self.keycode_of(KEYSYM_NUM_LOCK)?;
+    /// grabbed — assuming a conventional modifier bit would test a guess.
+    fn lock_mask(&self, keysym: u32) -> Option<u32> {
+        let keycode = self.keycode_of(keysym)?;
         let modifiers = self
             .connection
             .get_modifier_mapping()
@@ -350,6 +352,14 @@ impl Keyboard {
             .position(|codes| codes.contains(&keycode))
             .map(|index| 1u32 << index)
             .filter(|mask| *mask != 0)
+    }
+
+    fn num_lock_mask(&self) -> Option<u32> {
+        self.lock_mask(KEYSYM_NUM_LOCK)
+    }
+
+    fn scroll_lock_mask(&self) -> Option<u32> {
+        self.lock_mask(KEYSYM_SCROLL_LOCK)
     }
 
     /// Sends one synthetic key event and waits for the server to acknowledge
@@ -532,17 +542,19 @@ fn the_delivered_binding_names_the_chord_that_was_actually_pressed() {
         canonical(CHORD_A),
         "pressing the first chord delivered the wrong registration"
     );
+    activations.expect_no_more(CHORD_A);
 }
 
 /// An active lock modifier does not defeat delivery.
 ///
-/// The backend grabs every combination of CapsLock and NumLock and strips those
-/// bits before matching, precisely so a user with CapsLock on does not lose the
-/// hotkey. Nothing else in the suite exercises those extra grabs: they could be
-/// taken against the wrong masks, or the stripping could be wrong, and every
-/// other test would stay green. NumLock's bit is looked up rather than assumed,
-/// the same way the backend looks it up, so this drives the permutation that
-/// was actually grabbed.
+/// The backend grabs every combination of CapsLock, NumLock and ScrollLock and
+/// strips those bits before matching, precisely so a user with any lock on does
+/// not lose the hotkey. Nothing else in the suite exercises those extra grabs:
+/// they could be taken against the wrong masks, or the stripping could be wrong,
+/// and every other test would stay green. Each lock's modifier bit is looked up
+/// rather than assumed, the same way the backend does it, so this drives the
+/// permutations that were actually grabbed.
+///
 #[test]
 fn a_chord_still_delivers_with_the_lock_modifiers_on() {
     let server = XvfbServer::start();
@@ -582,6 +594,16 @@ fn a_chord_still_delivers_with_the_lock_modifiers_on() {
         keyboard.tap(KEYSYM_NUM_LOCK);
     } else {
         keyboard.tap(KEYSYM_CAPS_LOCK);
+    }
+    if keyboard.scroll_lock_mask().is_some() {
+        keyboard.tap(KEYSYM_SCROLL_LOCK);
+        keyboard.chord(CHORD_A_KEYS);
+        assert_eq!(
+            activations.next("the chord with ScrollLock on"),
+            canonical(CHORD_A),
+            "the ScrollLock permutation is not delivered"
+        );
+        keyboard.tap(KEYSYM_SCROLL_LOCK);
     }
 
     // Back to no locks at all: the plain permutation still works, which is what

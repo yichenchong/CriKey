@@ -16,3 +16,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["crikey_sdk"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"_crikey_modern_worker.py" = "_crikey_modern_worker.py"

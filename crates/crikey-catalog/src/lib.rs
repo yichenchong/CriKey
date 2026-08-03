@@ -4,7 +4,8 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fmt, fs, io,
+    fmt, fs,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -339,6 +340,7 @@ impl PluginCatalog {
     /// outlive the item it describes nor lag a replacement of it.
     fn merge(&mut self, items: Vec<Item>) -> usize {
         let mut added = 0usize;
+        let mut dirty_prefixes = [false; ORDERED_PAIR_COUNT];
 
         for item in items {
             let entry = ItemIndex::new(&item);
@@ -349,10 +351,10 @@ impl PluginCatalog {
                 let old_prefix = prefix_pair(self.index[position].prepared_label().normalized());
                 if old_prefix != new_prefix {
                     if let Some(old_prefix) = old_prefix {
-                        self.prefix_postings[old_prefix].retain(|&member| member != position);
+                        dirty_prefixes[old_prefix] = true;
                     }
                     if let Some(new_prefix) = new_prefix {
-                        self.prefix_postings[new_prefix].push(position);
+                        dirty_prefixes[new_prefix] = true;
                     }
                 }
                 self.set_ordered_pair_postings(position, &old_pairs, false);
@@ -372,6 +374,26 @@ impl PluginCatalog {
                 self.items.push(item);
                 self.index.push(entry);
                 added += 1;
+            }
+        }
+
+        // Removing one position from a prefix vector with `retain` is linear
+        // in that vector. A batch replacing many items with the same prefix
+        // would therefore scan the same catalog slice once per item. Rebuild
+        // only the affected prefix buckets in one stable-order pass instead.
+        if dirty_prefixes.iter().any(|&dirty| dirty) {
+            for (posting, &dirty) in self.prefix_postings.iter_mut().zip(dirty_prefixes.iter()) {
+                if dirty {
+                    posting.clear();
+                }
+            }
+            for (position, entry) in self.index.iter().enumerate() {
+                let Some(prefix) = prefix_pair(entry.prepared_label().normalized()) else {
+                    continue;
+                };
+                if dirty_prefixes[prefix] {
+                    self.prefix_postings[prefix].push(position);
+                }
             }
         }
 
@@ -943,8 +965,8 @@ pub enum CacheError {
         /// Bytes a single path component may occupy.
         limit: usize,
     },
-    /// A field of the slice is longer than the archive's length prefixes can
-    /// address.
+    /// The encoded slice exceeds either a length-prefix or the bounded archive
+    /// size, so storing it would create a cache entry this reader must reject.
     SliceTooLarge {
         /// The owner whose slice could not be encoded.
         plugin: PluginId,
@@ -1060,6 +1082,13 @@ pub trait CatalogCache {
 
 const MAGIC_BYTES: usize = 8;
 const MAGIC: [u8; MAGIC_BYTES] = *b"CRIKYCAT";
+/// Largest archive the file-backed cache will read into memory.
+///
+/// Catalog slices are rebuildable, so a file larger than this bound is a
+/// hostile or foreign cache entry rather than a reason to risk an unbounded
+/// allocation during startup. The limit leaves room for the measured
+/// 500,000-item archive in ADR-0008 while keeping damaged-file reads bounded.
+pub const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const VERSION_BYTES: usize = 4;
 const PAYLOAD_LEN_BYTES: usize = 8;
 const CHECKSUM_BYTES: usize = 8;
@@ -1556,20 +1585,50 @@ const MAX_FILE_NAME_BYTES: usize = 255;
 fn is_literal(byte: u8) -> bool {
     byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
 }
+fn is_windows_reserved_id(id: &str) -> bool {
+    let id = id.trim_end_matches(['.', ' ']);
+    matches!(
+        id,
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
+}
 
 /// Escapes a plugin id into one path-safe component.
 ///
 /// Plugin ids are arbitrary manifest strings, so every byte outside the
-/// literal set becomes `%xx`. `/`, `\` and `.` runs therefore cannot address a
-/// directory, and the mapping is injective, which is what lets [`plugins`]
-/// recover exact owner ids from file names alone.
+/// literal set becomes `%xx`. Windows device names receive one additional
+/// escaped leading byte, because names such as `con.slice` are reserved even
+/// when they have an extension. The mapping remains injective, which is what
+/// lets [`plugins`] recover exact owner ids from file names alone.
 ///
 /// [`plugins`]: CatalogCache::plugins
 fn escape_plugin_id(plugin: &PluginId) -> String {
     let id = plugin.0.as_bytes();
+    let reserved = is_windows_reserved_id(&plugin.0);
     let mut name = String::with_capacity(id.len().saturating_add(SLICE_SUFFIX.len()));
-    for &byte in id {
-        if is_literal(byte) {
+    for (index, &byte) in id.iter().enumerate() {
+        if is_literal(byte) && !(reserved && index == 0) {
             name.push(char::from(byte));
         } else {
             name.push(char::from(ESCAPE));
@@ -1615,7 +1674,8 @@ fn plugin_from_file_name(name: &str) -> Option<PluginId> {
             return None;
         }
     }
-    String::from_utf8(id).ok().map(PluginId)
+    let plugin = PluginId(String::from_utf8(id).ok()?);
+    (escape_plugin_id(&plugin) == name).then_some(plugin)
 }
 
 static NEXT_TEMP_TICKET: AtomicU64 = AtomicU64::new(0);
@@ -1661,6 +1721,37 @@ impl FileCatalogCache {
         &self.root
     }
 }
+/// Reads one archive without allowing its on-disk length to control an
+/// unbounded allocation.
+///
+/// The extra byte read detects a file that grows after metadata inspection.
+/// Such a race is a cache miss just like an archive that was already too large;
+/// neither case is allowed to reach the decoder.
+fn read_archive(path: &Path) -> Result<Option<Vec<u8>>, CacheError> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CacheError::io(path, &error)),
+    };
+    let length = file
+        .metadata()
+        .map_err(|error| CacheError::io(path, &error))?
+        .len();
+    if length > MAX_ARCHIVE_BYTES {
+        return Ok(None);
+    }
+
+    let capacity = usize::try_from(length).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut limited = file.take(MAX_ARCHIVE_BYTES.saturating_add(1));
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|error| CacheError::io(path, &error))?;
+    if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
 
 impl CatalogCache for FileCatalogCache {
     fn load_slice(&self, plugin: &PluginId) -> Result<Option<CachedSlice>, CacheError> {
@@ -1670,10 +1761,8 @@ impl CatalogCache for FileCatalogCache {
         };
 
         let path = self.root.join(file_name);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(CacheError::io(&path, &error)),
+        let Some(bytes) = read_archive(&path)? else {
+            return Ok(None);
         };
 
         Ok(decode_archive(plugin, &bytes))
@@ -1690,6 +1779,11 @@ impl CatalogCache for FileCatalogCache {
         let archive = encode_archive(slice).map_err(|_| CacheError::SliceTooLarge {
             plugin: slice.plugin.clone(),
         })?;
+        if archive.len() as u64 > MAX_ARCHIVE_BYTES {
+            return Err(CacheError::SliceTooLarge {
+                plugin: slice.plugin.clone(),
+            });
+        }
 
         fs::create_dir_all(&self.root).map_err(|error| CacheError::io(&self.root, &error))?;
 

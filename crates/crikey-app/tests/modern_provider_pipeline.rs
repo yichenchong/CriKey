@@ -855,6 +855,15 @@ fn modern_action_submission_is_nonblocking_and_budgeted() {
     };
     let driver = ModernDriver::spawn(provider, pipeline, |_| {});
     let endpoint = driver.action_executor();
+    let mut wrong_owner = item.clone();
+    wrong_owner.plugin_id = modern_plugin("other");
+    let ownership_error = endpoint
+        .submit_plugin_action(&action_plugin, &wrong_owner, &ActionId("open".to_owned()), None)
+        .expect_err("an item attributed to another plugin must never be dispatched here");
+    assert!(
+        ownership_error.to_string().contains("stale ownership"),
+        "the provider must reject an item whose owner does not match the routed plugin: {ownership_error}",
+    );
 
     let started = std::time::Instant::now();
     let first = endpoint
@@ -889,6 +898,13 @@ fn modern_action_submission_is_nonblocking_and_budgeted() {
         .expect("the first request's completion must be attributed exactly");
     assert!(completion.outcome.is_ok(), "the plugin action should succeed");
     drop(driver);
+    let gone = endpoint
+        .submit_plugin_action(&action_plugin, &item, &ActionId("open".to_owned()), None)
+        .expect_err("an action submitted after the owning driver stops must be rejected");
+    assert!(
+        gone.to_string().contains("runtime stopped"),
+        "a gone plugin must report dispatch failure instead of silently dropping the action: {gone}",
+    );
 }
 
 #[test]

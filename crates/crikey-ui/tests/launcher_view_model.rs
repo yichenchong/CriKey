@@ -607,6 +607,19 @@ fn a_new_generation_resets_the_selection_to_the_first_row() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn the_zero_generation_sentinel_cannot_become_a_live_query() {
+    let mut view_model = LauncherViewModel::new();
+    view_model.activate();
+    let _ = expect_frame(&mut view_model);
+
+    view_model.begin_generation(Generation::ZERO);
+    expect_idle(&mut view_model);
+
+    view_model.publish(Generation::ZERO, rows(&["ghost"]), false);
+    expect_idle(&mut view_model);
+}
+
+#[test]
 fn publishing_before_the_first_generation_is_ignored() {
     let generation = fresh_generation();
     let mut view_model = LauncherViewModel::new();

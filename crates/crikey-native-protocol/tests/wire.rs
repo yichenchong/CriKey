@@ -883,6 +883,8 @@ fn envelope_oneof_tags_are_frozen() {
         }
         .encode();
         assert!(encoded.starts_with(&key), "payload key changed: {encoded:?}");
+        let decoded = message::Envelope::decode(&encoded).expect("each payload variant must decode");
+        assert_eq!(decoded.encode(), encoded, "payload round-trip changed bytes");
     }
 }
 
@@ -1094,4 +1096,132 @@ fn endpoint_specs_are_total_and_round_trip() {
             Err(ProtocolError::Malformed(_))
         ));
     }
+}
+
+#[test]
+fn singular_fields_and_map_entry_keys_reject_duplicates() {
+    let envelope = vec![0x08, 0x01, 0x08, 0x02];
+    let result = message::Envelope::decode(&envelope);
+    assert!(
+        matches!(&result, Err(ProtocolError::Malformed(message)) if message.contains("duplicate")),
+        "duplicate singular field was accepted: {result:?}"
+    );
+
+    let action = vec![0x12, 0x01, b'a', 0x12, 0x01, b'b'];
+    let result = message::Action::decode(&action);
+    assert!(
+        matches!(&result, Err(ProtocolError::Malformed(message)) if message.contains("duplicate")),
+        "duplicate singular field was accepted: {result:?}"
+    );
+
+    let item = [0x4a, 0x09, 0x0a, 0x01, b'k', 0x12, 0x01, b'v', 0x0a, 0x01, b'x'];
+    let result = message::Item::decode(&item);
+    assert!(
+        matches!(&result, Err(ProtocolError::Malformed(message)) if message.contains("duplicate")),
+        "duplicate map-entry field was accepted: {result:?}"
+    );
+}
+
+#[test]
+fn unknown_map_entry_fields_are_retained_as_raw_map_fields() {
+    let bytes = [0x4a, 0x08, 0x0a, 0x01, b'k', 0x12, 0x01, b'v', 0x18, 0x01];
+    let decoded = message::Item::decode(&bytes).expect("map entry with an unknown field decodes");
+    assert!(decoded.metadata.is_empty());
+    assert_eq!(decoded.encode(), bytes);
+}
+#[test]
+fn unsigned_and_signed_32_bit_fields_reject_truncating_values() {
+    let protocol_version = [0x08, 0x80, 0x80, 0x80, 0x80, 0x10];
+    assert!(matches!(
+        message::Handshake::decode(&protocol_version),
+        Err(ProtocolError::Malformed(message)) if message.contains("uint32")
+    ));
+
+    let score_hint = [0x40, 0x80, 0x80, 0x80, 0x80, 0x10];
+    assert!(matches!(
+        message::Item::decode(&score_hint),
+        Err(ProtocolError::Malformed(message)) if message.contains("int32")
+    ));
+
+    let enum_value = [0x08, 0x80, 0x80, 0x80, 0x80, 0x10];
+    assert!(matches!(
+        message::Lifecycle::decode(&enum_value),
+        Err(ProtocolError::Malformed(message)) if message.contains("int32")
+    ));
+}
+
+#[test]
+fn invalid_utf8_in_known_string_is_malformed_without_panic() {
+    let bytes = [0x12, 0x01, 0xff];
+    let result = catch_unwind(AssertUnwindSafe(|| message::Action::decode(&bytes)));
+    assert!(matches!(
+        result,
+        Ok(Err(ProtocolError::Malformed(message))) if message.contains("UTF-8")
+    ));
+}
+
+#[test]
+fn maximum_magnitude_integer_fields_round_trip() {
+    assert_round_trip(message::Handshake {
+        protocol_version: u32::MAX,
+        plugin_id: "plugin".to_owned(),
+        plugin_version: String::new(),
+        capabilities: Vec::new(),
+        session_token: String::new(),
+        plugin_name: String::new(),
+        sdk_version: String::new(),
+        unknown: unknown(),
+    });
+    assert_round_trip(message::HandshakeAck {
+        protocol_version: u32::MAX,
+        host_capabilities: Vec::new(),
+        host_version: String::new(),
+        accepted: false,
+        reject_reason: String::new(),
+        max_frame_bytes: u64::MAX,
+        initial_credits: u32::MAX,
+        unknown: unknown(),
+    });
+    assert_round_trip(message::Item {
+        stable_id: String::new(),
+        label: String::new(),
+        description: String::new(),
+        target: String::new(),
+        category: String::new(),
+        search_terms: Vec::new(),
+        icon_reference: String::new(),
+        score_hint: i32::MIN,
+        metadata: BTreeMap::new(),
+        actions: Vec::new(),
+        argument_policy: String::new(),
+        hit_policy: String::new(),
+        unknown: unknown(),
+    });
+    assert_round_trip(message::Item {
+        score_hint: i32::MAX,
+        ..message::Item {
+            stable_id: String::new(),
+            label: String::new(),
+            description: String::new(),
+            target: String::new(),
+            category: String::new(),
+            search_terms: Vec::new(),
+            icon_reference: String::new(),
+            score_hint: 0,
+            metadata: BTreeMap::new(),
+            actions: Vec::new(),
+            argument_policy: String::new(),
+            hit_policy: String::new(),
+            unknown: unknown(),
+        }
+    });
+    assert_round_trip(message::HealthReport {
+        nonce: u64::MAX,
+        healthy: true,
+        memory_bytes: u64::MAX,
+        queue_depth: u32::MAX,
+        in_flight: u32::MAX,
+        detail: "max".to_owned(),
+        unknown: unknown(),
+    });
 }

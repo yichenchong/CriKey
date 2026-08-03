@@ -66,9 +66,9 @@
 
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -247,6 +247,31 @@ pub enum PackageError {
         archive: PathBuf,
         /// Reader diagnostic, never empty.
         detail: String,
+    },
+
+    /// The archive contains no entries at all.
+    #[error("legacy package archive `{}` is empty", archive.display())]
+    EmptyArchive {
+        /// The archive as the caller named it.
+        archive: PathBuf,
+    },
+
+    /// An entry is a symbolic link rather than a regular file.
+    #[error("legacy package archive `{}` contains symbolic-link entry `{entry}`", archive.display())]
+    SymlinkEntry {
+        /// The archive as the caller named it.
+        archive: PathBuf,
+        /// The offending entry name, exactly as the archive declared it.
+        entry: String,
+    },
+
+    /// Two entries resolve to the same package-relative path.
+    #[error("legacy package archive `{}` contains duplicate entry name `{entry}`", archive.display())]
+    DuplicateEntryName {
+        /// The archive as the caller named it.
+        archive: PathBuf,
+        /// The duplicate name, normalized to the package-relative path.
+        entry: String,
     },
 
     /// An entry names a path outside the package root, or one that cannot be
@@ -499,7 +524,7 @@ impl PackageLoader {
         let id = package_id_of(path).ok_or_else(|| PackageError::NotAPackage {
             path: path.to_path_buf(),
         })?;
-
+        preflight_archive(path, self.limits.max_entries)?;
         let file = File::open(path).map_err(|error| PackageError::Io {
             path: path.to_path_buf(),
             error,
@@ -517,6 +542,11 @@ impl PackageLoader {
                 limit: self.limits.max_entries,
             });
         }
+        if archive.is_empty() {
+            return Err(PackageError::EmptyArchive {
+                archive: path.to_path_buf(),
+            });
+        }
 
         let plan = self.plan_archive(path, &mut archive)?;
         // Classification before extraction: an archive that is not a loadable
@@ -530,7 +560,7 @@ impl PackageLoader {
         })?;
         let directory = format!("{id}-{digest:0width$x}", width = DIGEST_HEX_WIDTH);
         let extracted = self.cache_root.join(&directory);
-        if !extracted.is_dir() {
+        if !is_real_directory(&extracted) {
             self.extract(path, &mut archive, &plan, &extracted)?;
             self.sweep_superseded(&id, &directory);
         }
@@ -561,6 +591,7 @@ impl PackageLoader {
         archive: &mut ZipArchive<ArchiveReader>,
     ) -> Result<Vec<PlannedEntry>, PackageError> {
         let mut planned: Vec<PlannedEntry> = Vec::new();
+        let mut seen_paths = BTreeSet::new();
         let mut total = 0u64;
 
         for index in 0..archive.len() {
@@ -588,6 +619,24 @@ impl PackageLoader {
                     entry: name.to_owned(),
                 });
             };
+            if !seen_paths.insert(relative.clone()) {
+                return Err(PackageError::DuplicateEntryName {
+                    archive: path.to_path_buf(),
+                    entry: relative.display().to_string(),
+                });
+            }
+
+            // A symlink entry would be materialized as a regular file holding
+            // its target, which is harmless but meaningless; refusing keeps
+            // the invariant that every reported path is a real file under the
+            // content root. Check this before ignoring directory entries so a
+            // symlink cannot hide behind a trailing slash.
+            if entry.is_symlink() {
+                return Err(PackageError::SymlinkEntry {
+                    archive: path.to_path_buf(),
+                    entry: name.to_owned(),
+                });
+            }
 
             // Directory entries carry no content and are not resources; their
             // parents are created on demand for the files that need them. They
@@ -595,17 +644,6 @@ impl PackageLoader {
             // declares `../` is one CriKey wants nothing to do with.
             if is_directory_entry(name) {
                 continue;
-            }
-
-            // A symlink entry would be materialized as a regular file holding
-            // its target, which is harmless but meaningless; refusing keeps
-            // the invariant that every reported path is a real file under the
-            // content root.
-            if entry.is_symlink() {
-                return Err(PackageError::UnsafeEntryPath {
-                    archive: path.to_path_buf(),
-                    entry: name.to_owned(),
-                });
             }
 
             let declared_size = entry.size();
@@ -667,13 +705,26 @@ impl PackageLoader {
             return Err(error);
         }
 
+        if let Ok(metadata) = fs::symlink_metadata(extracted) {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() || file_type.is_file() {
+                if let Err(error) = fs::remove_file(extracted) {
+                    let _ = fs::remove_dir_all(&staging);
+                    return Err(PackageError::Io {
+                        path: extracted.to_path_buf(),
+                        error,
+                    });
+                }
+            }
+        }
+
         match fs::rename(&staging, extracted) {
             Ok(()) => Ok(()),
             Err(error) => {
                 let _ = fs::remove_dir_all(&staging);
                 // Losing a race is not a failure: the directory name is the
                 // archive's content digest, so whoever won wrote these bytes.
-                if extracted.is_dir() {
+                if is_real_directory(extracted) {
                     Ok(())
                 } else {
                     Err(PackageError::Io {
@@ -783,6 +834,226 @@ impl PackageLoader {
             }
         }
     }
+}
+
+/// Checks central-directory names before the ZIP reader indexes them.
+///
+/// The `zip` reader keeps only one record when a central directory repeats an
+/// exact name, so this bounded pass rejects a duplicate before that loss.
+fn preflight_archive(path: &Path, max_entries: usize) -> Result<(), PackageError> {
+    let mut file = File::open(path).map_err(|error| PackageError::Io {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    let length = file
+        .metadata()
+        .map_err(|error| PackageError::Io {
+            path: path.to_path_buf(),
+            error,
+        })?
+        .len();
+    let tail_length = length.min(22 + u16::MAX as u64) as usize;
+    let mut tail = vec![0; tail_length];
+    file.seek(SeekFrom::Start(length - tail_length as u64))
+        .and_then(|_| file.read_exact(&mut tail))
+        .map_err(|error| PackageError::MalformedArchive {
+            archive: path.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+    let eocd = tail
+        .windows(4)
+        .enumerate()
+        .rev()
+        .find_map(|(offset, sig)| {
+            if sig != [0x50, 0x4b, 0x05, 0x06] || offset + 22 > tail.len() {
+                return None;
+            }
+            let comment = u16::from_le_bytes([tail[offset + 20], tail[offset + 21]]) as usize;
+            (offset + 22 + comment <= tail.len()).then_some(offset)
+        })
+        .ok_or_else(|| PackageError::MalformedArchive {
+            archive: path.to_path_buf(),
+            detail: "end-of-central-directory record was not found".to_owned(),
+        })?;
+    let eocd_absolute = length - tail_length as u64 + eocd as u64;
+    let disk = u16::from_le_bytes([tail[eocd + 4], tail[eocd + 5]]);
+    let central_disk = u16::from_le_bytes([tail[eocd + 6], tail[eocd + 7]]);
+    let entries_on_disk_16 = u16::from_le_bytes([tail[eocd + 8], tail[eocd + 9]]);
+    let entries_16 = u16::from_le_bytes([tail[eocd + 10], tail[eocd + 11]]);
+    let central_size_32 =
+        u32::from_le_bytes([tail[eocd + 12], tail[eocd + 13], tail[eocd + 14], tail[eocd + 15]]);
+    let central_offset_32 =
+        u32::from_le_bytes([tail[eocd + 16], tail[eocd + 17], tail[eocd + 18], tail[eocd + 19]]);
+    let (entries, central_size, central_offset, central_record) = if entries_on_disk_16 == u16::MAX
+        || entries_16 == u16::MAX
+        || central_size_32 == u32::MAX
+        || central_offset_32 == u32::MAX
+    {
+        let locator = eocd_absolute
+            .checked_sub(20)
+            .ok_or_else(|| PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: "ZIP64 locator is missing".to_owned(),
+            })?;
+        file.seek(SeekFrom::Start(locator))
+            .map_err(|error| PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+        let mut locator_bytes = [0u8; 20];
+        file.read_exact(&mut locator_bytes)
+            .map_err(|error| PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+        if locator_bytes[..4] != [0x50, 0x4b, 0x06, 0x07] {
+            return Err(PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: "ZIP64 locator signature is missing".to_owned(),
+            });
+        }
+        let zip64 = u64::from_le_bytes(locator_bytes[8..16].try_into().unwrap());
+        file.seek(SeekFrom::Start(zip64))
+            .map_err(|error| PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+        let mut record = [0u8; 56];
+        file.read_exact(&mut record)
+            .map_err(|error| PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+        if record[..4] != [0x50, 0x4b, 0x06, 0x06] {
+            return Err(PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: "ZIP64 end-of-central-directory signature is missing".to_owned(),
+            });
+        }
+        (
+            u64::from_le_bytes(record[32..40].try_into().unwrap()),
+            u64::from_le_bytes(record[40..48].try_into().unwrap()),
+            u64::from_le_bytes(record[48..56].try_into().unwrap()),
+            zip64,
+        )
+    } else {
+        (
+            entries_16 as u64,
+            central_size_32 as u64,
+            central_offset_32 as u64,
+            eocd_absolute,
+        )
+    };
+    if (disk != 0 && disk != u16::MAX)
+        || (central_disk != 0 && central_disk != u16::MAX)
+        || (entries_on_disk_16 != u16::MAX && entries_on_disk_16 as u64 != entries)
+    {
+        return Err(PackageError::MalformedArchive {
+            archive: path.to_path_buf(),
+            detail: "multi-disk ZIP archives are not supported".to_owned(),
+        });
+    }
+    if entries > max_entries as u64 {
+        return Err(PackageError::TooManyEntries {
+            path: path.to_path_buf(),
+            count: usize::try_from(entries).unwrap_or(usize::MAX),
+            limit: max_entries,
+        });
+    }
+    let archive_offset = central_record
+        .checked_sub(central_offset.checked_add(central_size).ok_or_else(|| {
+            PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: "central-directory bounds overflow".to_owned(),
+            }
+        })?)
+        .ok_or_else(|| PackageError::MalformedArchive {
+            archive: path.to_path_buf(),
+            detail: "central-directory offset is outside the archive".to_owned(),
+        })?;
+    let central_start =
+        archive_offset
+            .checked_add(central_offset)
+            .ok_or_else(|| PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: "central-directory bounds overflow".to_owned(),
+            })?;
+    let central_end =
+        central_start
+            .checked_add(central_size)
+            .ok_or_else(|| PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: "central-directory bounds overflow".to_owned(),
+            })?;
+    if central_end > length || central_end > eocd_absolute {
+        return Err(PackageError::MalformedArchive {
+            archive: path.to_path_buf(),
+            detail: "central directory extends beyond the archive".to_owned(),
+        });
+    }
+    file.seek(SeekFrom::Start(central_start))
+        .map_err(|error| PackageError::MalformedArchive {
+            archive: path.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+    let mut seen = BTreeSet::<Vec<u8>>::new();
+    for _ in 0..entries {
+        let mut header = [0u8; 46];
+        file.read_exact(&mut header)
+            .map_err(|error| PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+        if header[..4] != [0x50, 0x4b, 0x01, 0x02] {
+            return Err(PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: "central-directory entry signature is invalid".to_owned(),
+            });
+        }
+        let name_length = u16::from_le_bytes([header[28], header[29]]) as usize;
+        let extra_length = u64::from(u16::from_le_bytes([header[30], header[31]]));
+        let comment_length = u64::from(u16::from_le_bytes([header[32], header[33]]));
+        let mut name = vec![0; name_length];
+        file.read_exact(&mut name)
+            .map_err(|error| PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+        let after_name = file
+            .stream_position()
+            .map_err(|error| PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+        let after_entry = after_name
+            .checked_add(extra_length + comment_length)
+            .ok_or_else(|| PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: "central-directory entry bounds overflow".to_owned(),
+            })?;
+        if after_entry > central_end {
+            return Err(PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: "central-directory entry extends beyond its bounds".to_owned(),
+            });
+        }
+        if !seen.insert(name.clone()) {
+            if let Ok(name) = std::str::from_utf8(&name) {
+                if safe_relative_path(name).is_some() {
+                    return Err(PackageError::DuplicateEntryName {
+                        archive: path.to_path_buf(),
+                        entry: name.to_owned(),
+                    });
+                }
+            }
+        }
+        file.seek(SeekFrom::Start(after_entry))
+            .map_err(|error| PackageError::MalformedArchive {
+                archive: path.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+    }
+    Ok(())
 }
 
 /// A file entry that survived validation and is worth extracting.
@@ -966,7 +1237,7 @@ fn package_id_of(path: &Path) -> Option<String> {
 
 /// Whether a ZIP entry name denotes a directory rather than a file.
 fn is_directory_entry(name: &str) -> bool {
-    name.ends_with('/') || name.ends_with('\\')
+    name.ends_with('/')
 }
 
 /// Validates an archive entry name and returns the package-relative path it may
@@ -976,19 +1247,22 @@ fn is_directory_entry(name: &str) -> bool {
 /// extraction directory on *any* supported platform is refused rather than
 /// repaired, because a normalized hostile name is still a name an attacker
 /// chose, and the archive that carried it has already told us what it is.
+/// ZIP names use `/` as their only separator; a backslash is refused rather
+/// than normalized because accepting it would make a package differ by host.
 fn safe_relative_path(name: &str) -> Option<PathBuf> {
     if name.is_empty() || name.as_bytes().contains(&0) {
         return None;
     }
     // Rooted names are refused, never re-based: `/etc/passwd` silently
     // rewritten to `etc/passwd` would extract an attacker's file under a name
-    // nobody asked about.
-    if name.starts_with('/') || name.starts_with('\\') {
+    // nobody asked about. Backslashes are not ZIP separators and are refused
+    // before any platform-specific path interpretation can happen.
+    if name.starts_with('/') || name.contains('\\') {
         return None;
     }
 
     let mut relative = PathBuf::new();
-    for part in name.split(['/', '\\']) {
+    for part in name.split('/') {
         // `a//b` and `./a` are noise, not escapes.
         if part.is_empty() || part == "." {
             continue;
@@ -1081,6 +1355,17 @@ fn is_extraction_directory(name: &str, id: &str) -> bool {
     digest.len() == DIGEST_HEX_WIDTH && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Returns true only for an actual directory, never for a symlink to one.
+///
+/// The extraction path is content-addressed and may already exist, but a
+/// symlink planted at that name must not turn cache reuse into a read from
+/// outside the cache root.
+fn is_real_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+}
+
 /// A hidden, unique name for a directory that is on its way in or out.
 ///
 /// The leading dot keeps it out of the content-addressed namespace, so neither
@@ -1095,8 +1380,6 @@ fn scratch_name(kind: &str) -> String {
 
 /// Renders raw entry-name bytes readably without pretending they decode.
 fn escape_bytes(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
     let mut out = String::with_capacity(bytes.len());
     for &byte in bytes {
         if byte.is_ascii_graphic() || byte == b' ' {

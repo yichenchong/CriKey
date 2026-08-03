@@ -23,14 +23,14 @@ pub enum WorkerState {
     Failed,
 }
 
-/// Deadlines differ by runtime; legacy callbacks are never hard killed on the
-/// modern 500 ms budget (spec 9.6, 25.2, 25.3).
+/// Policy values for runtime-specific host deadlines. The supervisor stores
+/// lifecycle state and diagnostics; the worker host must enforce these values.
 #[derive(Debug, Clone, Copy)]
 pub struct Deadlines {
     pub soft: Duration,
-    /// Hard deadline after which an in-flight suggestion is failed.
+    /// Intended hard deadline after which an in-flight suggestion is failed.
     pub hard: Option<Duration>,
-    /// Watchdog for a genuinely hung worker, used for legacy recovery only.
+    /// Intended watchdog for a genuinely hung worker, used for legacy recovery.
     pub hung_worker: Duration,
 }
 

@@ -1,8 +1,10 @@
-# Built-in plugins
+# Built-in components
 
-First-party plugins shipped with CriKey. Built-ins use the `builtin` runtime
-and may run in-process under the restricted first-party component rules
-(spec 13.1). Third-party plugins never do.
+This directory is reserved for first-party built-in packages. It currently
+contains no plugin package files. The shipped application catalog is composed
+by `crikey-cli` and `crikey-app` rather than loaded from this directory, and it
+runs in the main process under first-party code rules.
 
-Planned built-ins: application catalog, filesystem navigation, calculator,
-URL/web search, clipboard history, CriKey control commands.
+Third-party plugins never run in the main process. Planned built-ins include:
+application catalog extensions, filesystem navigation, calculator, URL/web
+search, clipboard history, and CriKey control commands.

@@ -132,6 +132,8 @@
 //!     ) -> Result<(), PipelineError>;
 //!     pub fn complete(&mut self, plugin: &PluginId, generation: Generation, now: Millis)
 //!         -> CompletionOutcome;
+//!     /// Retires a request when its provider is known to be dead.
+//!     pub fn abort_request(&mut self, plugin: &PluginId, generation: Generation, now: Millis) -> bool;
 //!
 //!     /// Fair-drains, ranks and publishes at most one coalesced frame. Every
 //!     /// generation first publishes an empty frame, so old rows never persist.
@@ -169,6 +171,7 @@ use crikey_input_scheduler::{
     Millis, PluginPolicy, QueryTraceEvent, SchedulerConfig, SchedulingProfile,
 };
 use crikey_plugin_model::Manifest;
+use crikey_plugin_supervisor::BudgetKind;
 use crikey_ui::{ResultRow, ViewModel};
 
 // ---------------------------------------------------------------------------
@@ -2022,6 +2025,77 @@ fn rejected_finals_keep_completion_pending_until_a_corrected_merge_commits() {
         0,
         "the quota-corrected terminal commits and releases the callback"
     );
+}
+
+#[test]
+fn aborting_a_dead_provider_releases_a_parked_completion_and_budget_slot() {
+    let mut bounded = config();
+    bounded.limits.max_items_per_batch = 1;
+
+    let mut pipeline = QueryPipeline::new(bounded);
+    let plugin = plugin_id("dev.crikey.dead-provider");
+    pipeline
+        .register_plugin(plugin.clone(), immediate_policy())
+        .expect("plugin registers");
+
+    let generation = pipeline.keystroke("dead", START);
+    let _ = pipeline.present(START);
+    assert_eq!(pipeline.tick(START).dispatches.len(), 1);
+
+    let two = PluginScript::prompt(0, 2, 10);
+    pipeline
+        .deliver(
+            ResultBatch {
+                generation,
+                plugin: plugin.clone(),
+                state: BatchState::Final,
+                items: scripted_items(&plugin, generation, 0, &two),
+            },
+            START + 1,
+        )
+        .expect("transport admits a terminal batch the aggregator will refuse");
+    assert_eq!(
+        pipeline.complete(&plugin, generation, START + 1),
+        CompletionOutcome::Accepted,
+        "completion parks while the terminal batch awaits aggregation",
+    );
+    let rejected = pipeline.tick(START + 1);
+    assert_eq!(rejected.drain_report.merge_rejected.len(), 1);
+    assert_eq!(
+        pipeline.diagnostics().in_flight_requests,
+        1,
+        "a refused terminal still holds the request before the explicit death path",
+    );
+
+    let budget = pipeline
+        .plugin_budget(&plugin)
+        .expect("registered plugin keeps its shared budget")
+        .clone();
+    assert_eq!(budget.in_flight(BudgetKind::Suggestion), 1);
+    assert!(pipeline.abort_request(&plugin, generation, START + 2));
+    assert_eq!(
+        pipeline.diagnostics().in_flight_requests,
+        0,
+        "aborting a dead provider retires the scheduler request",
+    );
+    assert_eq!(
+        budget.in_flight(BudgetKind::Suggestion),
+        0,
+        "aborting a dead provider releases the shared suggestion slot",
+    );
+    assert!(
+        !pipeline.abort_request(&plugin, generation, START + 3),
+        "aborting an already retired request is an idempotent no-op",
+    );
+    assert_eq!(
+        pipeline.visible_generation(),
+        Some(generation),
+        "aborting does not require advancing the query generation",
+    );
+    let replacement = budget
+        .try_acquire_owned(BudgetKind::Suggestion)
+        .expect("the released slot can be admitted again");
+    drop(replacement);
 }
 
 #[test]

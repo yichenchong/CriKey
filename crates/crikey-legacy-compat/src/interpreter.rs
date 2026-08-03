@@ -23,8 +23,14 @@
 //! changing global state for unrelated work at the same time.
 
 use std::fmt;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crikey_python_host::RuntimeProfile;
 
@@ -64,6 +70,21 @@ const PROBE_DIAGNOSTIC_BYTES: usize = 512;
 /// More than one because an interpreter may emit a deprecation notice first;
 /// bounded because a candidate that has not answered by then is not going to.
 const PROBE_SCAN_LINES: usize = 16;
+
+/// Bound on a version probe. A candidate that never answers must not block
+/// startup or hold a discovery caller forever.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Polling interval for the bounded probe wait.
+const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Grace period after stopping a probe before its handle is handed to the
+/// background reaper.
+const PROBE_REAP_GRACE: Duration = Duration::from_millis(250);
+
+/// Retained bytes per probe pipe. The reader continues consuming after this
+/// cap so a noisy candidate cannot deadlock on a full pipe.
+const PROBE_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// A CPython `major.minor.patch` release.
 ///
@@ -275,27 +296,88 @@ pub fn discover_interpreter_in(
 /// symlink to 3.12 and `python3` may be 3.6, so only the interpreter's own
 /// answer decides whether plugin code may run on it.
 fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, WorkerError> {
-    // The probe is a short-lived child that prints one line. It is not given a
-    // deadline because discovery has no clock in its signature; an interpreter
-    // that hangs on `sys.version_info` is beyond what the host can classify.
-    let output = Command::new(path)
+    let mut child = Command::new(path)
         .args(VERSION_PROBE_ARGS)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| WorkerError::PythonUnavailable {
             path: Some(path.to_path_buf()),
             reason: format!("the interpreter could not be executed: {error}"),
         })?;
 
-    let Some(found) = parse_reported_version(&output.stdout) else {
+    let stdout = child.stdout.take().expect("probe stdout is piped");
+    let stderr = child.stderr.take().expect("probe stderr is piped");
+    let stdout = spawn_probe_reader(stdout);
+    let stderr = spawn_probe_reader(stderr);
+
+    let started = Instant::now();
+    let mut status = None;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(exit)) => {
+                status = Some(exit);
+                break;
+            }
+            Ok(None) if started.elapsed() >= PROBE_TIMEOUT => {
+                timed_out = true;
+                break;
+            }
+            Ok(None) => thread::sleep(PROBE_POLL_INTERVAL),
+            Err(_) => break,
+        }
+    }
+
+    if status.is_none() {
+        let _ = child.kill();
+        status = wait_probe_bounded(&mut child, PROBE_REAP_GRACE);
+        if status.is_none() {
+            reap_probe_in_background(child);
+        }
+    }
+
+    let stdout = receive_probe_output(stdout);
+    let stderr = receive_probe_output(stderr);
+    if timed_out {
         return Err(WorkerError::PythonUnavailable {
             path: Some(path.to_path_buf()),
             reason: format!(
-                "the interpreter did not report a version (exit {}): {}",
-                match output.status.code() {
-                    Some(code) => code.to_string(),
-                    None => "signalled".to_owned(),
-                },
-                excerpt(&output.stderr),
+                "the interpreter version probe exceeded {}ms and was stopped; stderr: {}",
+                PROBE_TIMEOUT.as_millis(),
+                excerpt(&stderr),
+            ),
+        });
+    }
+
+    let Some(status) = status else {
+        return Err(WorkerError::PythonUnavailable {
+            path: Some(path.to_path_buf()),
+            reason: format!(
+                "the interpreter version probe ended without an exit status: {}",
+                excerpt(&stderr),
+            ),
+        });
+    };
+    if !status.success() {
+        return Err(WorkerError::PythonUnavailable {
+            path: Some(path.to_path_buf()),
+            reason: format!(
+                "the interpreter version probe exited with {}: {}",
+                status
+                    .code()
+                    .map_or_else(|| "signalled".to_owned(), |code| code.to_string()),
+                excerpt(&stderr),
+            ),
+        });
+    }
+
+    let Some(found) = parse_reported_version(&stdout) else {
+        return Err(WorkerError::PythonUnavailable {
+            path: Some(path.to_path_buf()),
+            reason: format!(
+                "the interpreter did not report a version (exit 0): {}",
+                excerpt(&stderr),
             ),
         });
     };
@@ -313,6 +395,52 @@ fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, WorkerEr
         version: found,
         source,
     })
+}
+
+fn spawn_probe_reader<R: Read + Send + 'static>(mut reader: R) -> Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut retained = Vec::with_capacity(PROBE_OUTPUT_BYTES.min(8 * 1024));
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            if read == 0 {
+                break;
+            }
+            let room = PROBE_OUTPUT_BYTES.saturating_sub(retained.len());
+            retained.extend_from_slice(&buffer[..read.min(room)]);
+        }
+        let _ = sender.send(retained);
+    });
+    receiver
+}
+
+fn receive_probe_output(receiver: Receiver<Vec<u8>>) -> Vec<u8> {
+    receiver.recv_timeout(PROBE_REAP_GRACE).unwrap_or_default()
+}
+
+fn wait_probe_bounded(child: &mut Child, budget: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now().checked_add(budget).unwrap_or_else(Instant::now);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(PROBE_POLL_INTERVAL),
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
+fn reap_probe_in_background(mut child: Child) {
+    thread::spawn(move || loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(PROBE_POLL_INTERVAL),
+        }
+    });
 }
 
 /// First line of `stdout` that is a bare `major[.minor[.patch]]`.
@@ -356,8 +484,6 @@ fn excerpt(bytes: &[u8]) -> String {
 
 #[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
     std::fs::metadata(path)
         .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)

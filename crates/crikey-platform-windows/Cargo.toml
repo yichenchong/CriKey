@@ -32,8 +32,8 @@ features = [
     # Not for the registry itself: `SHELLEXECUTEINFOW` carries an `HKEY` field,
     # so the whole `ShellExecuteExW` surface is gated on this feature.
     "Win32_System_Registry",
-    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ]
 

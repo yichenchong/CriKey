@@ -7,13 +7,13 @@
 //! accidentally depend on it (spec 5.3).
 //!
 //! Implemented so far: application discovery over XDG desktop entries, and
-//! process launching for the entries it finds. The parser stops at what the
-//! core actually consumes -- group scoping, `Type`, the visibility keys and
-//! `Exec` -- so locale selection, action groups as separately launchable
-//! entries and recursive root layouts stay for a later milestone. Launching
-//! runs a program directly and stops there: URI opening needs a portal or a
-//! session handler this backend does not have, so it -- and everything else
-//! without an implementation -- keeps reporting itself unavailable (spec 18.2).
+//! process launching for the entries it finds. The parser covers group
+//! scoping, `Type`, visibility keys, `TryExec`, locale selection and `Exec`;
+//! action groups are not separately launchable entries and recursive root
+//! layouts stay for a later milestone. Launching runs a program directly and
+//! stops there: URI opening needs a portal or a session handler this backend
+//! does not have, so it -- and everything else without an implementation --
+//! keeps reporting itself unavailable (spec 18.2).
 //!
 //! Global shortcuts and window control are reported against the detected
 //! session rather than in the abstract, because on Linux they are optional
@@ -34,11 +34,13 @@ use std::fs;
 use std::io::Read;
 use std::mem;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock};
+use std::thread;
 
 use crikey_core::{CoreError, PlatformPath, Result};
 use crikey_platform::{
@@ -76,6 +78,8 @@ const FIELD_CODES: &[u8] = b"fFuUdDnNickvm";
 #[derive(Debug)]
 pub struct DesktopEntryScanner {
     roots: Vec<PathBuf>,
+    desktop_names: Vec<String>,
+    locale_candidates: Vec<String>,
 }
 
 impl DesktopEntryScanner {
@@ -91,10 +95,40 @@ impl DesktopEntryScanner {
     /// Records the roots to scan, highest precedence first.
     ///
     /// Construction touches no filesystem: every read happens inside
-    /// [`ApplicationDiscovery::discover`], so a scanner can be built before the
-    /// directories it names exist.
+    /// [`ApplicationDiscovery::discover`], so a scanner can be built before
+    /// the directories it names exist. The desktop and locale environment is
+    /// captured here so one rescan cannot observe a half-updated environment.
     pub fn new(roots: Vec<PathBuf>) -> Self {
-        Self { roots }
+        Self::with_environment(roots, current_desktop_names(), locale_candidates())
+    }
+
+    /// Records roots and an explicit desktop-name list.
+    ///
+    /// This is useful to embedders that already know which desktop session is
+    /// active and to tests that must not depend on the process environment.
+    pub fn with_desktop_names(roots: Vec<PathBuf>, desktop_names: Vec<String>) -> Self {
+        Self::with_environment(roots, desktop_names, locale_candidates())
+    }
+
+    /// Records roots and explicit desktop and locale context.
+    ///
+    /// The values use the same spellings as `XDG_CURRENT_DESKTOP` and the
+    /// locale environment variables. This constructor makes discovery
+    /// deterministic for callers that already have session metadata.
+    pub fn with_environment(
+        roots: Vec<PathBuf>,
+        desktop_names: Vec<String>,
+        locale_candidates: Vec<String>,
+    ) -> Self {
+        let mut expanded_locales = Vec::new();
+        for locale in locale_candidates {
+            locale_fallbacks(&locale, &mut expanded_locales);
+        }
+        Self {
+            roots,
+            desktop_names,
+            locale_candidates: expanded_locales,
+        }
     }
 }
 
@@ -127,13 +161,16 @@ impl ApplicationDiscovery for DesktopEntryScanner {
                 if claimed.contains(&id) {
                     continue;
                 }
-                let Some(contents) = read_entry(&root.join(&id)) else {
+                let path = root.join(&id);
+                let Some(contents) = read_entry(&path) else {
                     // Unreadable, or not a plain entry file at all: leave the
                     // id unclaimed so a later root may still supply it.
                     continue;
                 };
 
-                if let Some(application) = parse_entry(&contents, &id) {
+                if let Some(application) =
+                    parse_entry(&contents, &id, &self.desktop_names, &self.locale_candidates)
+                {
                     discovered.push(application);
                 }
                 // The id is spent even when the entry yielded nothing: a user
@@ -156,17 +193,7 @@ impl ApplicationDiscovery for DesktopEntryScanner {
 /// an `Exec` line's `"My Documents"` has to reach the program as one argument
 /// and not as two.
 #[derive(Debug, Default)]
-pub struct CommandLauncher {
-    /// Handles of children that were spawned and never waited for.
-    ///
-    /// A process that has exited but whose parent has not collected its status
-    /// stays a zombie holding a pid, and a launcher lives for a whole desktop
-    /// session: without this the pid table fills with every application the
-    /// user ever started. Waiting is out of the question, so the handles are
-    /// kept and swept without blocking on the next launch, which bounds the
-    /// list by the number of launched applications still running.
-    running: Mutex<Vec<Child>>,
-}
+pub struct CommandLauncher;
 
 impl CommandLauncher {
     /// A launcher holding no children yet.
@@ -174,20 +201,7 @@ impl CommandLauncher {
     /// Construction starts nothing: every process appears inside
     /// [`ProcessLauncher::launch`].
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Records `child`, first dropping the handles of children that already
-    /// exited.
-    ///
-    /// `try_wait` reports only the children the kernel already has a status
-    /// for and returns immediately for the rest, so the sweep never delays the
-    /// launch that triggered it. A handle whose wait errored is dropped too:
-    /// there is no status left to collect from it.
-    fn keep(&self, child: Child) {
-        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-        running.retain_mut(|spawned| matches!(spawned.try_wait(), Ok(None)));
-        running.push(child);
+        Self
     }
 }
 
@@ -200,9 +214,10 @@ impl ProcessLauncher for CommandLauncher {
     /// passed individually: spaces, quotes and empty strings inside one
     /// argument reach the program as written.
     ///
-    /// Nothing is waited for. A launcher must be usable again the instant the
-    /// application it started is on its way, and an application outlives the
-    /// launcher that started it.
+    /// The caller does not wait for the child. A launcher must be usable again
+    /// the instant the application it started is on its way, and an application
+    /// outlives the launcher that started it; a private waiter still reaps the
+    /// child when it exits.
     ///
     /// Standard streams are detached and the child enters a new process group.
     /// A terminal interrupt sent to CriKey's foreground group therefore does
@@ -216,13 +231,20 @@ impl ProcessLauncher for CommandLauncher {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
-        let child = command.spawn().map_err(|error| {
+        let mut child = command.spawn().map_err(|error| {
             // Both halves matter to whoever reads this: which target was
             // tried, and what the kernel said about it.
             CoreError::Invalid(format!("cannot launch {}: {error}", target.display()))
         })?;
 
-        self.keep(child);
+        // Keep the child owned by a waiter until it exits. Dropping a Child
+        // without waiting would leave an exited process as a zombie while the
+        // launcher remains alive; waiting in this detached thread reaps it
+        // without delaying the caller or tying the child to the launcher
+        // object's lifetime.
+        let _ = thread::spawn(move || {
+            let _ = child.wait();
+        });
         Ok(())
     }
 
@@ -542,20 +564,31 @@ fn read_entry(path: &Path) -> Option<Vec<u8>> {
 /// Reads the `[Desktop Entry]` group of one file into a discovery result.
 ///
 /// `None` means "nothing a launcher can show or run": another `Type`, no name,
-/// no runnable `Exec`, or an author set `NoDisplay`/`Hidden`. Malformed lines
-/// are skipped rather than aborting the parse, because one junk line in a
-/// vendor file must not delete a working application. Parsing is byte oriented
-/// so a file that is not valid UTF-8 degrades to replacement characters in the
-/// display strings instead of being rejected, while the target keeps its exact
-/// bytes (spec 18.3).
-fn parse_entry(contents: &[u8], id: &OsStr) -> Option<DiscoveredApplication> {
+/// no runnable `Exec`, a failed `TryExec`, an entry hidden by the current
+/// desktop, or an author set `NoDisplay`/`Hidden`. Malformed lines are skipped
+/// rather than aborting the parse, because one junk line in a vendor file must
+/// not delete a working application. The desktop-entry specification requires
+/// the complete file to be UTF-8, so a non-UTF-8 candidate is ignored instead
+/// of being converted into a different application name.
+fn parse_entry(
+    contents: &[u8],
+    id: &OsStr,
+    desktop_names: &[String],
+    locale_candidates: &[String],
+) -> Option<DiscoveredApplication> {
+    std::str::from_utf8(contents).ok()?;
+
     let mut inside = false;
     let mut kind = None;
     let mut name = None;
+    let mut localized_names = Vec::new();
     let mut exec = None;
+    let mut try_exec = None;
     let mut icon = None;
     let mut no_display = None;
     let mut hidden = None;
+    let mut only_show_in = None;
+    let mut not_show_in = None;
 
     for line in contents.split(|byte| *byte == b'\n') {
         let line = trim(line);
@@ -584,15 +617,24 @@ fn parse_entry(contents: &[u8], id: &OsStr) -> Option<DiscoveredApplication> {
         };
 
         // Duplicate keys are invalid in the format; keeping the first sighting
-        // makes the choice deterministic. Locale variants such as `Name[xx]`
-        // are a different key and are deliberately out of contract.
+        // makes the choice deterministic. Localized Name keys are collected
+        // separately so the active locale can override the base Name.
         match key {
             b"Type" => keep_first(&mut kind, value),
             b"Name" => keep_first(&mut name, value),
+            key if localized_name_locale(key).is_some() => {
+                let locale = localized_name_locale(key)?;
+                if !localized_names.iter().any(|(known, _)| *known == locale) {
+                    localized_names.push((locale, value));
+                }
+            }
             b"Exec" => keep_first(&mut exec, value),
+            b"TryExec" => keep_first(&mut try_exec, value),
             b"Icon" => keep_first(&mut icon, value),
             b"NoDisplay" => keep_first(&mut no_display, value),
             b"Hidden" => keep_first(&mut hidden, value),
+            b"OnlyShowIn" => keep_first(&mut only_show_in, value),
+            b"NotShowIn" => keep_first(&mut not_show_in, value),
             _ => {}
         }
     }
@@ -605,8 +647,19 @@ fn parse_entry(contents: &[u8], id: &OsStr) -> Option<DiscoveredApplication> {
     if is_true(no_display) || is_true(hidden) {
         return None;
     }
+    if !desktop_visibility(only_show_in, not_show_in, desktop_names) {
+        return None;
+    }
+    if let Some(try_exec) = try_exec {
+        if !try_exec_is_available(try_exec) {
+            return None;
+        }
+    }
 
-    let name = name.filter(|name| !name.is_empty())?;
+    let name = select_name(name, &localized_names, locale_candidates)?;
+    if name.is_empty() {
+        return None;
+    }
     let (target, arguments) = exec_command(exec?)?;
 
     Some(DiscoveredApplication {
@@ -618,6 +671,121 @@ fn parse_entry(contents: &[u8], id: &OsStr) -> Option<DiscoveredApplication> {
         // desktop (`gtk-launch`, `.desktop` references) uses for this entry.
         platform_id: Some(id.to_string_lossy().into_owned()),
     })
+}
+
+/// The desktop names advertised by the current session.
+fn current_desktop_names() -> Vec<String> {
+    env::var("XDG_CURRENT_DESKTOP")
+        .ok()
+        .into_iter()
+        .flat_map(|value| value.split(':').map(str::to_owned).collect::<Vec<_>>())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Locale spellings to try, in the same order as the desktop environment.
+fn locale_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    for key in ["LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"] {
+        let Some(value) = env::var(key).ok().filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let values = if key == "LANGUAGE" {
+            value.split(':').collect::<Vec<_>>()
+        } else {
+            vec![value.as_str()]
+        };
+        for value in values {
+            locale_fallbacks(value, &mut candidates);
+        }
+        if !candidates.is_empty() {
+            break;
+        }
+    }
+    candidates
+}
+
+fn locale_fallbacks(value: &str, candidates: &mut Vec<String>) {
+    let mut add = |candidate: &str| {
+        if !candidate.is_empty() && !candidates.iter().any(|known| known == candidate) {
+            candidates.push(candidate.to_owned());
+        }
+    };
+    add(value);
+    let without_modifier = value.split_once('@').map_or(value, |(base, _)| base);
+    add(without_modifier);
+    let without_codeset = without_modifier
+        .split_once('.')
+        .map_or(without_modifier, |(base, _)| base);
+    add(without_codeset);
+    if let Some((language, _country)) = without_codeset.split_once('_') {
+        add(language);
+    }
+}
+
+fn localized_name_locale(key: &[u8]) -> Option<&[u8]> {
+    key.strip_prefix(b"Name[")?
+        .strip_suffix(b"]")
+        .filter(|locale| !locale.is_empty())
+}
+
+fn select_name<'a>(
+    base: Option<&'a [u8]>,
+    localized: &[(&'a [u8], &'a [u8])],
+    candidates: &[String],
+) -> Option<&'a [u8]> {
+    for candidate in candidates {
+        if let Some((_, value)) = localized
+            .iter()
+            .find(|(locale, _)| *locale == candidate.as_bytes())
+            .copied()
+        {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    base
+}
+
+fn desktop_visibility(
+    only_show_in: Option<&[u8]>,
+    not_show_in: Option<&[u8]>,
+    desktop_names: &[String],
+) -> bool {
+    let matches = |value: &[u8]| {
+        value
+            .split(|byte| *byte == b';')
+            .map(trim)
+            .filter(|entry| !entry.is_empty())
+            .any(|entry| desktop_names.iter().any(|desktop| entry == desktop.as_bytes()))
+    };
+
+    if let Some(only_show_in) = only_show_in {
+        if !matches(only_show_in) {
+            return false;
+        }
+    }
+    !not_show_in.is_some_and(matches)
+}
+
+fn try_exec_is_available(value: &[u8]) -> bool {
+    let command = PathBuf::from(OsString::from(text(value)));
+    if command.as_os_str().is_empty() {
+        return false;
+    }
+    if command.is_absolute() {
+        return is_executable_file(&command);
+    }
+
+    env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+        .any(|directory| is_executable_file(&directory.join(&command)))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 /// Splits an `Exec` value into the program and the argument vector

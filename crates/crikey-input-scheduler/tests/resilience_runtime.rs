@@ -1514,3 +1514,65 @@ fn the_query_trace_records_every_spec_26_4_category() {
     );
     assert_eq!(scheduler.diagnostics().trace_events_dropped, 0);
 }
+
+#[test]
+fn cancellation_notifications_drop_oldest_at_the_bound() {
+    let legacy = plugin("legacy.cancel-queue");
+    let mut exact = QueryScheduler::new(SchedulerConfig {
+        request_queue_capacity: 2,
+        ..roomy_config()
+    });
+    exact.register_plugin(legacy.clone(), PluginPolicy::legacy_strict());
+
+    let first = exact.submit_query("one", 0);
+    assert_eq!(exact.tick(0).len(), 1);
+    let second = exact.submit_query("two", 1);
+    assert!(exact.tick(1).is_empty());
+    assert_eq!(exact.complete(&legacy, first, 2), CompletionOutcome::Stale);
+    assert_eq!(exact.tick(2).len(), 1);
+    let third = exact.submit_query("three", 3);
+    assert!(exact.tick(3).is_empty());
+
+    assert_eq!(exact.pending(&legacy), Some(third));
+    let retained_at_capacity = exact.drain_cancellations();
+    assert_eq!(
+        retained_at_capacity
+            .iter()
+            .map(|cancellation| cancellation.generation)
+            .collect::<Vec<_>>(),
+        vec![first, second],
+        "filling exactly to capacity must retain every cancellation"
+    );
+    assert_eq!(exact.diagnostics().dropped_cancellation_notifications, 0);
+
+    let mut overflowing = QueryScheduler::new(SchedulerConfig {
+        request_queue_capacity: 2,
+        ..roomy_config()
+    });
+    overflowing.register_plugin(legacy.clone(), PluginPolicy::legacy_strict());
+    let first = overflowing.submit_query("one", 0);
+    assert_eq!(overflowing.tick(0).len(), 1);
+    let second = overflowing.submit_query("two", 1);
+    assert!(overflowing.tick(1).is_empty());
+    assert_eq!(overflowing.complete(&legacy, first, 2), CompletionOutcome::Stale);
+    assert_eq!(overflowing.tick(2).len(), 1);
+    let third = overflowing.submit_query("three", 3);
+    assert!(overflowing.tick(3).is_empty());
+    assert_eq!(overflowing.complete(&legacy, second, 4), CompletionOutcome::Stale);
+    assert_eq!(overflowing.tick(4).len(), 1);
+    let fourth = overflowing.submit_query("four", 5);
+    assert!(overflowing.tick(5).is_empty());
+
+    let retained_after_overflow = overflowing.drain_cancellations();
+    assert_eq!(
+        retained_after_overflow
+            .iter()
+            .map(|cancellation| cancellation.generation)
+            .collect::<Vec<_>>(),
+        vec![second, third],
+        "overflow keeps the newest notifications and evicts the oldest"
+    );
+    assert_eq!(overflowing.diagnostics().dropped_cancellation_notifications, 1);
+    assert!(!overflowing.diagnostics().counters_saturated());
+    assert_eq!(overflowing.pending(&legacy), Some(fourth));
+}

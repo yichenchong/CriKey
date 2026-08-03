@@ -18,12 +18,13 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use windows::core::{w, Error, HRESULT, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{E_INVALIDARG, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -40,8 +41,8 @@ use super::{HandlerSlot, HotkeyRegistration};
 /// Window class of the message-only window. Registered once per process.
 const CLASS_NAME: PCWSTR = w!("CriKeyHotkeyMessageWindow");
 
-/// Marshalled `RegisterHotKey`. `lParam` points at the caller's
-/// [`HotkeyRegistration`].
+/// Marshalled `RegisterHotKey`. `wParam` carries the reserved registration id,
+/// which the hotkey thread uses to retrieve the owned registration record.
 const WM_CRIKEY_REGISTER: u32 = WM_APP;
 
 /// Marshalled `UnregisterHotKey`. `wParam` carries the registration id.
@@ -61,6 +62,10 @@ struct ThreadState {
     /// can name the accelerator that fired without reaching back across the
     /// thread boundary.
     bindings: HashMap<i32, HotkeyBinding>,
+    /// Registrations waiting for the synchronous register message. The window
+    /// procedure removes a record by id before calling Win32, so it never
+    /// trusts message memory as a registration object.
+    pending: Arc<Mutex<HashMap<i32, HotkeyRegistration>>>,
 }
 
 thread_local! {
@@ -83,10 +88,10 @@ unsafe impl Send for WindowHandle {}
 // SAFETY: as above; `SendMessageW` and `PostMessageW` are the only uses and are
 // both thread safe.
 unsafe impl Sync for WindowHandle {}
-
 /// The hotkey thread and the door into it.
 pub(super) struct MessageThread {
     window: WindowHandle,
+    pending: Arc<Mutex<HashMap<i32, HotkeyRegistration>>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -108,10 +113,12 @@ impl MessageThread {
     /// the first thing a launcher does after building the backend is register
     /// its activation shortcut.
     pub(super) fn start(handler: Arc<HandlerSlot>) -> Result<Self> {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let thread_pending = Arc::clone(&pending);
         let (ready, started) = mpsc::sync_channel::<std::result::Result<WindowHandle, String>>(1);
         let join = thread::Builder::new()
             .name("crikey-hotkeys".to_owned())
-            .spawn(move || run(handler, &ready))
+            .spawn(move || run(handler, &ready, thread_pending))
             .map_err(|error| {
                 CoreError::Invalid(format!("the Windows hotkey thread could not start: {error}"))
             })?;
@@ -119,6 +126,7 @@ impl MessageThread {
         match started.recv() {
             Ok(Ok(window)) => Ok(Self {
                 window,
+                pending,
                 join: Some(join),
             }),
             Ok(Err(reason)) => {
@@ -136,18 +144,30 @@ impl MessageThread {
 
     /// Registers one reserved id on the hotkey thread.
     pub(super) fn register(&self, registration: &HotkeyRegistration) -> Result<()> {
-        // SAFETY of the pointer below: `SendMessageW` does not return until the
-        // window procedure has, so the borrow outlives every read of it, and
-        // `HotkeyRegistration` is `Sync`, so sharing it across the two threads
-        // for that window is sound.
-        let pointer = LPARAM(std::ptr::from_ref(registration) as isize);
-        self.send(
+        let id = registration.id();
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            if pending.insert(id, registration.clone()).is_some() {
+                return Err(CoreError::Invalid(format!(
+                    "hotkey registration {id} is already being registered"
+                )));
+            }
+        }
+
+        let result = self.send(
             WM_CRIKEY_REGISTER,
-            WPARAM(0),
-            pointer,
+            WPARAM(id as usize),
+            LPARAM(0),
             registration.accelerator(),
             "register",
-        )
+        );
+        if result.is_err() {
+            self.pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
+        }
+        result
     }
 
     /// Releases one id on the hotkey thread.
@@ -199,23 +219,42 @@ impl MessageThread {
 
 impl Drop for MessageThread {
     fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         // `WM_CLOSE` reaches `DefWindowProcW`, which destroys the window;
         // `WM_DESTROY` then releases every registration and posts `WM_QUIT`,
-        // which ends the loop. Posting rather than sending keeps `Drop` off the
-        // hook if the thread is momentarily busy.
+        // which ends the loop. Posting rather than sending keeps the common
+        // drop path off the hook if it is momentarily busy.
         // SAFETY: the handle is still ours; nothing else can have destroyed it.
         let posted = unsafe { PostMessageW(Some(self.window.0), WM_CLOSE, WPARAM(0), LPARAM(0)) };
-        // A failed post means the thread may never see a reason to stop, so the
-        // handle is dropped instead: detaching beats hanging a dropping
-        // launcher on a thread that will not exit.
-        if let (Ok(()), Some(join)) = (posted, self.join.take()) {
+        if posted.is_err() {
+            // An exhausted queue can reject the asynchronous post even while
+            // the window is alive. A synchronous fallback makes shutdown
+            // deterministic; if the window is already gone this returns
+            // immediately and the join below observes the exited thread.
+            // SAFETY: the handle is still ours and the message carries no
+            // borrowed data.
+            unsafe {
+                let _ = SendMessageW(self.window.0, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+        }
+
+        // Never detach a live hotkey thread. Detaching here would leave the
+        // thread's registrations owned by a window nobody can reach again.
+        if let Some(join) = self.join.take() {
             let _ = join.join();
         }
     }
 }
 
 /// The hotkey thread body.
-fn run(handler: Arc<HandlerSlot>, ready: &SyncSender<std::result::Result<WindowHandle, String>>) {
+fn run(
+    handler: Arc<HandlerSlot>,
+    ready: &SyncSender<std::result::Result<WindowHandle, String>>,
+    pending: Arc<Mutex<HashMap<i32, HotkeyRegistration>>>,
+) {
     let window = match create_window() {
         Ok(window) => window,
         Err(reason) => {
@@ -228,6 +267,7 @@ fn run(handler: Arc<HandlerSlot>, ready: &SyncSender<std::result::Result<WindowH
         *state.borrow_mut() = Some(ThreadState {
             handler,
             bindings: HashMap::new(),
+            pending,
         });
     });
 
@@ -252,6 +292,15 @@ fn run(handler: Arc<HandlerSlot>, ready: &SyncSender<std::result::Result<WindowH
         unsafe { DispatchMessageW(&message) };
     }
 
+    // A `GetMessageW` error does not deliver `WM_DESTROY`, so clean up here as
+    // well as in the normal window-destruction path. This keeps registrations
+    // from surviving a message-queue failure.
+    release_all(window);
+    // SAFETY: this is still the thread that created the window. If normal
+    // shutdown already destroyed it, Win32 simply reports failure.
+    unsafe {
+        let _ = DestroyWindow(window);
+    }
     STATE.with(|state| state.borrow_mut().take());
 }
 
@@ -324,10 +373,23 @@ fn create_window() -> std::result::Result<HWND, String> {
 unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match message {
         WM_CRIKEY_REGISTER => {
-            // SAFETY: the sender blocks in `SendMessageW` until this returns,
-            // so the registration it pointed at is still borrowed and alive.
-            let registration = unsafe { &*(lparam.0 as *const HotkeyRegistration) };
-            bind(window, registration)
+            let id = wparam.0 as i32;
+            let registration = STATE.with(|state| {
+                let state = state.borrow();
+                let Some(state) = state.as_ref() else {
+                    return None;
+                };
+                let registration = state
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&id);
+                registration
+            });
+            match registration {
+                Some(registration) => bind(window, &registration),
+                None => LRESULT(E_INVALIDARG.0 as isize),
+            }
         }
         WM_CRIKEY_UNREGISTER => unbind(window, wparam.0 as i32),
         WM_HOTKEY => {
@@ -376,14 +438,16 @@ fn bind(window: HWND, registration: &HotkeyRegistration) -> LRESULT {
         Err(error) => LRESULT(error.code().0 as isize),
     }
 }
-
-/// `UnregisterHotKey` and the matching table entry.
 fn unbind(window: HWND, id: i32) -> LRESULT {
-    STATE.with(|state| {
-        if let Some(state) = state.borrow_mut().as_mut() {
-            state.bindings.remove(&id);
-        }
+    let known = STATE.with(|state| {
+        state
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|state| state.bindings.remove(&id).is_some())
     });
+    if !known {
+        return LRESULT(E_INVALIDARG.0 as isize);
+    }
 
     // SAFETY: called on the registering thread, as Win32 requires.
     match unsafe { UnregisterHotKey(Some(window), id) } {
@@ -391,13 +455,12 @@ fn unbind(window: HWND, id: i32) -> LRESULT {
         Err(error) => LRESULT(error.code().0 as isize),
     }
 }
-
 /// Hands one activation to the installed handler.
 fn activate(id: i32) {
     // Both the handler and the binding are cloned out before the call, so
     // neither the `RefCell` nor the handler lock is held while foreign code
     // runs -- a handler that pumps messages, or that reconfigures the service,
-    // must not deadlock or panic the message thread.
+    // must not deadlock the message thread.
     let call = STATE.with(|state| {
         let state = state.borrow();
         let state = state.as_ref()?;
@@ -406,7 +469,10 @@ fn activate(id: i32) {
     });
 
     if let Some((handler, binding)) = call {
-        (**handler)(&binding);
+        // The callback is application code running from an `extern "system"`
+        // window procedure. Letting a panic unwind through that ABI would
+        // terminate or violate the thread's cleanup path, so contain it here.
+        let _ = catch_unwind(AssertUnwindSafe(|| (**handler)(&binding)));
     }
 }
 

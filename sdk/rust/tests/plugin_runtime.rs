@@ -112,6 +112,7 @@ enum SuggestMode {
     Cancel,
     CancelIgnored,
     Log,
+    Panic,
     FailOnce,
 }
 
@@ -204,6 +205,7 @@ impl Plugin for RuntimePlugin {
                 context.log(LogLevel::Info, "sdk runtime log");
                 sink.finish()
             }
+            SuggestMode::Panic => panic!("intentional suggest panic"),
             SuggestMode::FailOnce => {
                 self.calls += 1;
                 if self.calls == 1 {
@@ -832,6 +834,54 @@ fn suggest_error_emits_failed_batch_and_keeps_the_loop_alive() {
     join.join()
         .expect("serve thread did not panic")
         .expect("plugin failure should not kill the serving loop");
+}
+
+#[test]
+fn suggest_panic_is_reported_as_failed_batch_and_worker_stays_alive() {
+    let (mut host, plugin_transport) = protocol::transport::pair();
+    let join = thread::spawn(move || {
+        let mut plugin = RuntimePlugin::new(SuggestMode::Panic);
+        serve_on(&mut plugin, plugin_transport, explicit_config())
+    });
+    complete_handshake(&mut host, 8);
+    host.send(&envelope(
+        200,
+        201,
+        Payload::Suggest(SuggestRequest {
+            text: "panic".to_owned(),
+            normalized_text: "panic".to_owned(),
+            selected_item_id: String::new(),
+            max_items: 10,
+            max_batches: 10,
+            unknown: UnknownFields::default(),
+        }),
+    ))
+    .expect("panic request");
+    let failed = host.recv().expect("panic failure batch");
+    let batch = match failed.payload {
+        Some(Payload::Results(batch)) => batch,
+        other => panic!("expected failed result batch, got {other:?}"),
+    };
+    assert_eq!(batch.state.as_i32(), 4);
+    assert!(
+        batch
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("intentional suggest panic")),
+        "panic detail should reach the host: {batch:?}"
+    );
+    host.send(&envelope(
+        0,
+        0,
+        Payload::Shutdown(Shutdown {
+            immediate: false,
+            unknown: UnknownFields::default(),
+        }),
+    ))
+    .expect("shutdown frame after panic");
+    join.join()
+        .expect("serve thread did not panic")
+        .expect("a callback panic must not kill the serving loop");
 }
 
 #[test]

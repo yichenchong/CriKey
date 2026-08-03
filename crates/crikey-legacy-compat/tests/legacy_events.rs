@@ -995,3 +995,108 @@ fn an_empty_flag_set_is_never_delivered_as_a_callback() {
         "spec 14.6: only the non-empty event reached the plugin"
     );
 }
+
+#[test]
+fn an_out_of_order_raw_notification_keeps_the_burst_deadline_bounded_by_its_earliest_timestamp() {
+    let plugin = plugin("legacy.out-of-order");
+    let mut coalescer = coalescer(&[&plugin]);
+
+    coalescer.note_raw_filesystem(
+        raw(
+            WatchScope::Desktop,
+            "/desktop/late-first",
+            RawFilesystemKind::Modified,
+        ),
+        1_000,
+    );
+    coalescer.note_raw_filesystem(
+        raw(
+            WatchScope::Desktop,
+            "/desktop/early-second",
+            RawFilesystemKind::Modified,
+        ),
+        0,
+    );
+
+    assert_eq!(
+        coalescer.next_wakeup(),
+        Some(200),
+        "spec 18.7: maximum wait is measured from the earliest timestamp in a burst, \
+         even when watcher notifications arrive out of order",
+    );
+    assert!(
+        coalescer.tick(199).is_empty(),
+        "the bounded deadline has not elapsed yet",
+    );
+    assert_eq!(
+        shape(&coalescer.tick(200)),
+        vec![(
+            "legacy.out-of-order",
+            LegacyCallback::OnEvents,
+            LegacyEventFlags::DESKTOP | LegacyEventFlags::FILESYSTEM,
+            200,
+        )],
+        "the out-of-order burst still translates once",
+    );
+}
+
+#[test]
+fn a_duplicate_begin_callback_cannot_replace_the_callback_already_in_flight() {
+    let plugin = plugin("legacy.duplicate-callback");
+    let mut coalescer = coalescer(&[&plugin]);
+
+    coalescer.begin_callback(&plugin, LegacyCallback::OnSuggest, 10);
+    coalescer.begin_callback(&plugin, LegacyCallback::OnCatalog, 20);
+
+    assert_eq!(
+        coalescer.in_flight(&plugin),
+        Some((LegacyCallback::OnSuggest, 10)),
+        "spec 13.4: a duplicate start must not forget which callback is still running",
+    );
+
+    coalescer.post_event(&plugin, LegacyEventFlags::APP_CONFIG, 21);
+    assert!(
+        coalescer.tick(21).is_empty(),
+        "spec 13.4: replacing the in-flight record would allow event interleaving",
+    );
+    coalescer.end_callback(&plugin, CallbackOutcome::Completed, 30);
+    assert_eq!(
+        shape(&coalescer.tick(30)),
+        vec![(
+            "legacy.duplicate-callback",
+            LegacyCallback::OnEvents,
+            LegacyEventFlags::APP_CONFIG,
+            30,
+        )],
+        "the pending event becomes deliverable after the original callback ends",
+    );
+}
+
+#[test]
+fn unregistering_a_plugin_discards_queued_events_before_the_next_tick() {
+    let plugin = plugin("legacy.unsubscribed");
+    let mut coalescer = coalescer(&[&plugin]);
+
+    coalescer.post_event(&plugin, LegacyEventFlags::APP_CONFIG, 0);
+    coalescer.note_deactivated(&plugin, 0);
+    coalescer.note_raw_filesystem(
+        raw(
+            WatchScope::Desktop,
+            "/desktop/unsubscribed",
+            RawFilesystemKind::Modified,
+        ),
+        0,
+    );
+    coalescer.unregister_plugin(&plugin);
+
+    assert!(
+        coalescer.tick(1_000).is_empty(),
+        "spec 13.3/14.6: an unloaded plugin must not receive queued semantic or lifecycle events",
+    );
+
+    coalescer.register_plugin(plugin.clone());
+    assert!(
+        coalescer.tick(1_000).is_empty(),
+        "re-registering the same id must not resurrect events queued before unsubscription",
+    );
+}

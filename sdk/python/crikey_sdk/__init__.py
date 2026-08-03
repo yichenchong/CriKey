@@ -23,5 +23,6 @@ __all__ = [
     "SuggestContext",
     "WorkerContext",
     "plugin_defined_category",
+    "__version__",
 ]
 __version__ = "0.1.0"

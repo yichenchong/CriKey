@@ -8,6 +8,10 @@
 //! CPython's `configparser` decides: Keypirinha is built on `configparser`, and
 //! the input is real files authored against that behaviour.
 //!
+//! Known gap: Keypirinha enables `configparser.ExtendedInterpolation`, but
+//! this raw layer intentionally keeps `${section:key}` and `${env:NAME}`
+//! references literal. Resolving them needs explicit policy for missing names,
+//! environment access and reference cycles; callers must not assume expansion.
 //! Rules this module holds, each defended by `tests/legacy_configuration.rs`:
 //!
 //! 1. Section and key lookup folds *ASCII* case only. Locale-dependent Unicode
@@ -21,8 +25,9 @@
 //!    truncating those at a `#` would silently corrupt working packages.
 //!    Quotes are plain value text; `unquote=True` is layered on top by the
 //!    Python shim, not here.
-//! 4. Indentation is the sole continuation marker, so an indented line that
-//!    looks like `key = value` or like `[section]` is value text.
+//! 4. Leading whitespace before a new key or section is accepted. When a key
+//!    is pending, only indentation deeper than that key's indentation continues
+//!    its value; an equally indented line starts new syntax.
 //! 5. A repeated key takes the last value at its first position; a repeated
 //!    header merges into the section it names.
 //! 6. Every typed accessor is a required read. A plugin default belongs in the
@@ -39,18 +44,19 @@
 //! size is bounded by the input text: each section name, key and value is
 //! copied exactly once and nothing else accumulates.
 
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
-
 use thiserror::Error;
 
 /// Every boolean spelling a legacy `.ini` may use, matched ASCII-case-
 /// insensitively.
 ///
-/// This is exactly `configparser.BOOLEAN_STATES`, so a package that writes
-/// `on`/`off` keeps working. Nothing outside this table coerces: an unlisted
-/// spelling is a typed rejection, never a silent `false` (rule 6).
-const BOOLEAN_SPELLINGS: [(&str, bool); 8] = [
+/// The first eight are `configparser.BOOLEAN_STATES`; the remaining spellings
+/// mirror the original Keypirinha Settings API. Nothing outside this table
+/// coerces: an unlisted spelling is a typed rejection, never a silent `false`
+/// (rule 6).
+const BOOLEAN_SPELLINGS: [(&str, bool); 16] = [
     ("yes", true),
     ("no", false),
     ("true", true),
@@ -59,6 +65,14 @@ const BOOLEAN_SPELLINGS: [(&str, bool); 8] = [
     ("0", false),
     ("on", true),
     ("off", false),
+    ("y", true),
+    ("n", false),
+    ("t", true),
+    ("f", false),
+    ("enable", true),
+    ("enabled", true),
+    ("disable", false),
+    ("disabled", false),
 ];
 
 /// A failure to read a legacy configuration file or one of its settings.
@@ -76,8 +90,7 @@ pub enum SettingsError {
     /// pair, nor an indented continuation of a pending value.
     ///
     /// `line` is 1-based. `content` is the line verbatim, indentation included,
-    /// because leading whitespace is the sole continuation marker and is
-    /// therefore part of the diagnosis.
+    /// so a malformed indented syntax line can be corrected exactly as written.
     #[error("line {line}: not a comment, a [section] header or a key/value pair: {content}")]
     MalformedLine { line: usize, content: String },
 
@@ -92,15 +105,18 @@ pub enum SettingsError {
     Missing { section: String, key: String },
 
     /// A value that is not one of the documented boolean spellings.
-    #[error("[{section}] {key}: `{value}` is not one of yes/no, true/false, 1/0, on/off")]
+    #[error(
+        "[{section}] {key}: `{value}` is not one of yes/no, true/false, 1/0, on/off, y/n, t/f, enable/enabled, disable/disabled"
+    )]
     InvalidBool {
         section: String,
         key: String,
         value: String,
     },
 
-    /// A value that is not a decimal integer, or that does not fit the 64-bit
-    /// range the accessor asked for. Never wrapped, never saturated.
+    /// A value that is not a base-zero decimal, hexadecimal, octal or binary
+    /// integer, or that does not fit the 64-bit range the accessor asked for.
+    /// Never wrapped, never saturated.
     #[error("[{section}] {key}: `{value}` is not an integer in the supported range")]
     InvalidInteger {
         section: String,
@@ -170,11 +186,14 @@ impl LegacySettings {
 
         let mut parsed = LegacySettings::default();
         let mut section: Option<usize> = None;
-        // The entry an indented line would continue. Cleared by a blank line,
-        // by a header and by a new pair, but never by a comment: comments are
-        // stripped before continuations are joined (rule 3), so one written
-        // inside a continuation block drops out without ending the value.
-        let mut pending: Option<(usize, usize)> = None;
+        // The entry an indented line would continue, plus the indentation at
+        // which its option started. A continuation must be deeper than that
+        // baseline, matching ConfigParser's indentation rule. Cleared by a
+        // blank line, by a header and by a new pair, but never by a comment:
+        // comments are stripped before continuations are joined (rule 3), so
+        // one written inside a continuation block drops out without ending
+        // the value.
+        let mut pending: Option<(usize, usize, usize)> = None;
 
         for (offset, raw) in body.split('\n').enumerate() {
             let number = offset + 1;
@@ -192,15 +211,24 @@ impl LegacySettings {
             }
 
             if line.starts_with(char::is_whitespace) {
-                let Some((owner, slot)) = pending else {
-                    return Err(malformed(number, line));
-                };
-                // Continuations are trimmed, so indentation depth never leaks
-                // into a value, and interior newlines survive verbatim.
-                let value = &mut parsed.sections[owner].entries[slot].value;
-                value.push('\n');
-                value.push_str(trimmed);
-                continue;
+                let indent = line
+                    .chars()
+                    .take_while(|character| character.is_whitespace())
+                    .count();
+                if let Some((owner, slot, baseline)) = pending {
+                    if indent > baseline {
+                        // Continuations are trimmed, so indentation depth never
+                        // leaks into a value, and interior newlines survive
+                        // verbatim.
+                        let value = &mut parsed.sections[owner].entries[slot].value;
+                        value.push('\n');
+                        value.push_str(trimmed);
+                        continue;
+                    }
+                }
+                // ConfigParser permits indentation before a new option or
+                // section header. If it is not deeper than a pending option,
+                // fall through and parse the trimmed line as ordinary syntax.
             }
 
             pending = None;
@@ -241,7 +269,13 @@ impl LegacySettings {
             let target = &mut parsed.sections[owner];
             let slot = target.slot(key);
             target.entries[slot].value = value.to_owned();
-            pending = Some((owner, slot));
+            pending = Some((
+                owner,
+                slot,
+                line.chars()
+                    .take_while(|character| character.is_whitespace())
+                    .count(),
+            ));
         }
 
         Ok(parsed)
@@ -351,25 +385,46 @@ impl LegacySettings {
         })
     }
 
-    /// A required signed decimal integer. Out of range is a rejection, so a
-    /// value that overflows is never wrapped or saturated into a plausible one.
+    /// A required signed integer using Python's `int(value, base=0)` grammar:
+    /// decimal, hexadecimal (`0x`), octal (`0o`) and binary (`0b`), with an
+    /// optional sign and surrounding whitespace already removed by the parser.
+    /// Out of range is a rejection, so an overflowing value is never wrapped
+    /// or saturated into a plausible one.
     pub fn get_int(&self, section: &str, key: &str) -> Result<i64, SettingsError> {
-        // The parser already trimmed both ends, so the accessor rejects only
-        // text that genuinely is not an integer.
         let value = self.required(section, key)?;
-        value
-            .parse::<i64>()
-            .map_err(|_| invalid_integer(section, key, value))
+        let Some((negative, magnitude)) = parse_base_zero(value) else {
+            return Err(invalid_integer(section, key, value));
+        };
+        let parsed = if negative {
+            if magnitude == 1_u64 << 63 {
+                i64::MIN
+            } else {
+                let Ok(magnitude) = i64::try_from(magnitude) else {
+                    return Err(invalid_integer(section, key, value));
+                };
+                -magnitude
+            }
+        } else {
+            let Ok(magnitude) = i64::try_from(magnitude) else {
+                return Err(invalid_integer(section, key, value));
+            };
+            magnitude
+        };
+        Ok(parsed)
     }
 
-    /// A required unsigned decimal integer. A negative value is a rejection
-    /// even though `get_int` would accept the same text: the caller asked for
-    /// an unsigned setting and wrapping it would invent a huge limit.
+    /// A required unsigned integer using the same base-zero grammar as
+    /// [`Self::get_int`]. A negative value is a rejection rather than a wrapped
+    /// `u64`, because wrapping would invent a huge limit.
     pub fn get_uint(&self, section: &str, key: &str) -> Result<u64, SettingsError> {
         let value = self.required(section, key)?;
-        value
-            .parse::<u64>()
-            .map_err(|_| invalid_integer(section, key, value))
+        let Some((negative, magnitude)) = parse_base_zero(value) else {
+            return Err(invalid_integer(section, key, value));
+        };
+        if negative {
+            return Err(invalid_integer(section, key, value));
+        }
+        Ok(magnitude)
     }
 
     /// A required multi-line value as trimmed, non-empty entries.
@@ -476,6 +531,79 @@ impl Section {
     }
 }
 
+/// Parses the lexical grammar of Python's `int(text, base=0)` for values that
+/// fit a `u64` magnitude. The caller applies the requested signedness and
+/// range, so overflow is rejected instead of silently clamped.
+fn parse_base_zero(value: &str) -> Option<(bool, u64)> {
+    let (negative, unsigned) = match value.strip_prefix(['+', '-']) {
+        Some(rest) => (value.starts_with('-'), rest),
+        None => (false, value),
+    };
+    if unsigned.is_empty() {
+        return None;
+    }
+
+    let (radix, mut digits, prefixed) = if let Some(rest) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+    {
+        (16, rest, true)
+    } else if let Some(rest) = unsigned
+        .strip_prefix("0o")
+        .or_else(|| unsigned.strip_prefix("0O"))
+    {
+        (8, rest, true)
+    } else if let Some(rest) = unsigned
+        .strip_prefix("0b")
+        .or_else(|| unsigned.strip_prefix("0B"))
+    {
+        (2, rest, true)
+    } else {
+        (10, unsigned, false)
+    };
+
+    // Python permits one underscore immediately after a radix prefix, but no
+    // other leading underscore.
+    if prefixed && digits.starts_with('_') {
+        digits = &digits[1..];
+    }
+    if digits.is_empty() {
+        return None;
+    }
+
+    let mut previous_was_digit = false;
+    let mut saw_digit = false;
+    let mut has_underscore = false;
+    for character in digits.chars() {
+        if character == '_' {
+            previous_was_digit.then_some(())?;
+            previous_was_digit = false;
+            has_underscore = true;
+            continue;
+        }
+        character.to_digit(radix)?;
+        previous_was_digit = true;
+        saw_digit = true;
+    }
+    if !saw_digit || !previous_was_digit {
+        return None;
+    }
+
+    let normalized = if has_underscore {
+        Cow::Owned(digits.replace('_', ""))
+    } else {
+        Cow::Borrowed(digits)
+    };
+
+    // Base-zero decimal accepts zero-only spellings (`00`, `0_0`) but rejects
+    // a non-zero decimal with a redundant leading zero (`010`).
+    if radix == 10 && normalized.starts_with('0') && normalized.chars().any(|character| character != '0') {
+        return None;
+    }
+
+    let magnitude = u64::from_str_radix(&normalized, radix).ok()?;
+    Some((negative, magnitude))
+}
 /// One key and its value.
 #[derive(Debug, Clone)]
 struct Entry {

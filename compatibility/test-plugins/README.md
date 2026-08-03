@@ -17,15 +17,17 @@ packages are absent is worse than no suite, because it is green.
 
 ## Layout
 
-A package is a directory. Its id is the directory name, verbatim, and its main
-plugin module is the top-level `.py` file whose stem equals that id (spec 14.3).
+A package is a directory. Its id is the directory name, verbatim. The loader
+chooses the top-level `.py` file whose stem equals that id when one exists; if
+not, it chooses the first top-level module in deterministic order (spec 14.3).
 There is no manifest: a directory with no top-level module is not an empty
 package, it is a broken one, and the loader refuses it by name.
 
-The ids are hyphenated, so the module stems are too — `well-behaved.py` is not a
-valid Python identifier and the worker loads it through
-`importlib.util.spec_from_file_location` against the package-relative path
-rather than through the normal import finder.
+The ids are hyphenated, so some module stems are too — `well-behaved.py` is not
+a valid Python identifier. The worker loads such a file through
+`importlib.util.spec_from_file_location` against the package-relative path and
+uses the declared package id separately, so the sanitized import key does not
+change the package identity.
 
 Every `.py` file is an importable package-local module; everything else, `.ini`
 configuration included, is a package resource. Two packages carry a resource in

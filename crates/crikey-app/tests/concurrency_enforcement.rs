@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use crikey_app::{PipelineConfig, QueryPipeline};
+use crikey_app::{PipelineConfig, PipelineError, QueryPipeline};
 use crikey_core::PluginId;
 use crikey_input_scheduler::Millis;
 use crikey_plugin_model::Manifest;
@@ -93,6 +93,17 @@ max-concurrent-requests = 2
 
 [concurrency]
 max-suggestion-requests = 0
+"#;
+
+const WASM_MANIFEST: &str = r#"
+manifest-version = 1
+
+[plugin]
+id = "dev.crikey.wasm"
+name = "Wasm"
+version = "1.0.0"
+runtime = "wasm"
+entrypoint = "plugin.wasm"
 "#;
 
 fn register(pipeline: &mut QueryPipeline, text: &str) -> PluginId {
@@ -317,4 +328,42 @@ fn a_declared_limit_of_zero_admits_no_suggestion_request_at_all() {
         0,
         "the neighbour of a zero-budget plugin is never throttled"
     );
+}
+
+#[test]
+fn unsupported_wasm_registration_is_explicit_and_leaves_no_pipeline_state() {
+    let manifest = Manifest::parse(WASM_MANIFEST).expect("wasm fixture must be well-formed");
+    let plugin = PluginId(manifest.plugin.id.clone());
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+
+    let error = pipeline
+        .register_manifest(&manifest)
+        .expect_err("this build has no wasm host and must refuse registration");
+    assert!(matches!(
+        &error,
+        PipelineError::UnsupportedRuntime {
+            plugin: owner,
+            runtime: crikey_plugin_model::Runtime::Wasm,
+        } if owner == &plugin
+    ));
+    let message = error.to_string();
+    assert!(
+        message.contains(&plugin.0),
+        "refusal must name the plugin: {message}"
+    );
+    assert!(
+        message.contains("wasm"),
+        "refusal must name the runtime: {message}"
+    );
+    assert!(
+        message.contains("deliberately refuses"),
+        "refusal must explain that this build has no host: {message}"
+    );
+    assert!(pipeline.plugin_budget(&plugin).is_none());
+    assert!(pipeline.plugin_diagnostics(&plugin).is_none());
+    assert_eq!(pipeline.diagnostics().in_flight_requests, 0);
+
+    pipeline
+        .register_plugin(plugin.clone(), crikey_input_scheduler::PluginPolicy::modern())
+        .expect("a refused runtime must leave the id available for a supported registration");
 }

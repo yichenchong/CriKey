@@ -79,8 +79,9 @@ impl Debouncer {
     /// Records a query change and reports the resulting dispatch decision.
     pub fn on_query(&mut self, now: Millis, generation: Generation, query_len: usize) -> Dispatch {
         if query_len < self.policy.minimum_query_length {
-            self.pending = None;
-            self.burst_started = None;
+            // Leaving relevance must re-arm the leading edge for the next admissible
+            // query, not merely discard the pending generation.
+            self.reset();
             return Dispatch::Idle;
         }
 
@@ -119,7 +120,12 @@ impl Debouncer {
         if trailing_ready || max_wait_ready {
             self.dispatch(now)
         } else {
-            Dispatch::At(self.last_change.saturating_add(self.policy.debounce_ms))
+            let trailing_at = self.last_change.saturating_add(self.policy.debounce_ms);
+            let deadline = match (self.policy.maximum_wait_ms, self.burst_started) {
+                (Some(max_wait), Some(start)) => trailing_at.min(start.saturating_add(max_wait)),
+                _ => trailing_at,
+            };
+            Dispatch::At(deadline)
         }
     }
 
@@ -196,7 +202,6 @@ mod tests {
         // Typing never paused for 50 ms, but the maximum wait forces dispatch.
         assert_eq!(d.on_timer(130), Dispatch::Now(latest));
     }
-
     #[test]
     fn minimum_query_length_gates_dispatch() {
         let policy = DebouncePolicy {
@@ -206,5 +211,44 @@ mod tests {
         let mut d = Debouncer::new(policy);
         assert_eq!(d.on_query(0, gen(1), 1), Dispatch::Idle);
         assert_eq!(d.on_query(5, gen(2), 2), Dispatch::Now(gen(2)));
+    }
+
+    #[test]
+    fn gating_resets_relevance_for_the_next_leading_query() {
+        let policy = DebouncePolicy {
+            minimum_query_length: 2,
+            ..Default::default()
+        };
+        let mut d = Debouncer::new(policy);
+        let first = gen(1);
+        assert_eq!(d.on_query(0, first, 2), Dispatch::Now(first));
+        assert_eq!(d.on_query(10, gen(2), 1), Dispatch::Idle);
+
+        let next = gen(3);
+        assert_eq!(
+            d.on_query(20, next, 2),
+            Dispatch::Now(next),
+            "a query becoming relevant again must take the leading edge"
+        );
+    }
+
+    #[test]
+    fn maximum_wait_deadline_is_not_lost_when_timer_wakes_early() {
+        let policy = DebouncePolicy {
+            debounce_ms: 100,
+            maximum_wait_ms: Some(50),
+            leading_edge: false,
+            trailing_edge: true,
+            minimum_query_length: 0,
+        };
+        let mut d = Debouncer::new(policy);
+        let latest = gen(1);
+        assert_eq!(d.on_query(0, latest, 1), Dispatch::At(50));
+        assert_eq!(
+            d.on_timer(25),
+            Dispatch::At(50),
+            "an early wake-up must preserve the earlier maximum-wait deadline"
+        );
+        assert_eq!(d.on_timer(50), Dispatch::Now(latest));
     }
 }

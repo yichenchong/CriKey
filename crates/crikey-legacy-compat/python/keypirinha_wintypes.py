@@ -38,7 +38,7 @@ The honest guard, and the only one that works, is :func:`is_available`::
 """
 
 import sys
-
+import uuid
 import keypirinha as _keypirinha
 
 __all__ = (
@@ -139,9 +139,26 @@ def _resolve(symbol):
                 (_GUID_FIELDS[3], ctypes.c_ubyte * 8),
             ]
 
+            def __init__(self, value):
+                super().__init__()
+                if isinstance(value, GUID):
+                    ctypes.memmove(
+                        ctypes.addressof(self),
+                        ctypes.addressof(value),
+                        ctypes.sizeof(self),
+                    )
+                    return
+                parsed = value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+                self.Data1, self.Data2, self.Data3 = parsed.fields[:3]
+                self.Data4[0] = parsed.clock_seq_hi_variant
+                self.Data4[1] = parsed.clock_seq_low
+                for index in range(2, 8):
+                    self.Data4[index] = (parsed.node >> ((7 - index) * 8)) & 0xFF
+
             def __repr__(self):
-                return "GUID({:08X}-{:04X}-{:04X})".format(
-                    self.Data1, self.Data2, self.Data3
+                tail = "".join("{:02X}".format(part) for part in self.Data4)
+                return "GUID({:08X}-{:04X}-{:04X}-{})".format(
+                    self.Data1, self.Data2, self.Data3, tail
                 )
 
         return GUID
@@ -151,19 +168,19 @@ def _resolve(symbol):
 
     raise WindowsOnlyError(symbol)
 
+def _declare_func(dll, name, ret=None, arg=None, args=None):
+    """Binds `name` in `dll` with an explicit ctypes prototype.
 
-def _declare_func(dll, name, ret=None, arg=None):
-    """Binds `name` in `dll` with an explicit prototype.
-
-    Declaring ``restype`` and ``argtypes`` is not optional politeness: without
-    them ``ctypes`` guesses ``int`` for the return value and applies default
-    argument conversions, which silently truncates every pointer and 64-bit
-    handle that crosses the boundary.
+    ``args`` is the original Keypirinha keyword; ``arg`` is retained as the
+    first M3 shim's spelling. Supplying both is ambiguous and rejected.
     """
+    if arg is not None and args is not None:
+        raise TypeError("pass either arg or args, not both")
     func = getattr(dll, name)
     func.restype = ret
-    if arg is not None:
-        func.argtypes = tuple(arg)
+    argtypes = args if args is not None else arg
+    if argtypes is not None:
+        func.argtypes = tuple(argtypes)
     return func
 
 

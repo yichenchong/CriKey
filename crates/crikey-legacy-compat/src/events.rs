@@ -488,8 +488,10 @@ impl RawBurst {
         counters: &mut CoalescerDiagnostics,
     ) {
         self.flags.insert(flags);
-        // `max` rather than plain assignment: a watcher may report slightly out
-        // of order, and the window must never shrink below an armed one.
+        // Keep both ends of the burst ordered: watcher delivery can arrive
+        // slightly out of order, and the maximum-wait deadline is measured from
+        // the earliest notification rather than whichever one arrived first.
+        self.first_at = self.first_at.min(at);
         self.last_at = self.last_at.max(at);
 
         // Path- and event-type coalescing (spec 18.7): an identical notification
@@ -654,9 +656,15 @@ impl EventCoalescer {
     /// Records that the host started a callback it did not get from `tick` -
     /// `on_suggest`, `on_catalog`, `on_execute` and friends. Events must not
     /// interleave with it (spec 13.4).
+    ///
+    /// A duplicate start is ignored. The first callback is still running, so
+    /// replacing its record would let a later `end_callback` clear the wrong
+    /// callback and release events too early.
     pub fn begin_callback(&mut self, plugin: &PluginId, callback: LegacyCallback, at: Millis) {
         if let Some(slot) = self.plugins.get_mut(plugin) {
-            slot.in_flight = Some(InFlight::new(callback, at));
+            if slot.in_flight.is_none() {
+                slot.in_flight = Some(InFlight::new(callback, at));
+            }
         }
     }
 

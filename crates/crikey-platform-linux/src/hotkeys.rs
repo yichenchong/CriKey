@@ -23,10 +23,10 @@
 //!
 //! X reports the *exact* modifier state in a `KeyPress`, and a grab matches only
 //! the mask it was taken with. Grabbing `Ctrl+Alt+Space` once would leave the
-//! chord dead whenever CapsLock or NumLock happened to be on. The grab is
-//! therefore taken for every combination of those two lock bits, while
-//! [`x11_binding`] still reports the base mask: the lock bits are an artefact of
-//! how X matches, not part of what the user bound.
+//! chord dead whenever CapsLock, NumLock or ScrollLock happened to be on. The
+//! grab is therefore taken for every combination of those three lock bits,
+//! while [`x11_binding`] still reports the base mask: the lock bits are an
+//! artefact of how X matches, not part of what the user bound.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -141,7 +141,8 @@ const KEYSYM_ZERO: u32 = 0x0030;
 const KEYSYM_F1: u32 = 0xffbe;
 /// `XK_Num_Lock`, looked up to find whichever modifier the server puts it on.
 const KEYSYM_NUM_LOCK: u32 = 0xff7f;
-
+/// `XK_Scroll_Lock`, looked up for the same reason as NumLock.
+const KEYSYM_SCROLL_LOCK: u32 = 0xff14;
 /// The keysym name and value a canonical key name stands for, or `None` when
 /// this backend has no keysym for it.
 ///
@@ -211,6 +212,8 @@ fn keysym_of(accelerator: &Accelerator) -> Result<(&'static str, u32)> {
 #[derive(Debug, Clone)]
 struct Grab {
     keycode: Keycode,
+    /// The keysym whose keycode must be resolved again after a mapping change.
+    keysym: u32,
     /// The base mask, without lock bits: what a stripped `KeyPress` state
     /// equals.
     mask: u32,
@@ -240,6 +243,8 @@ struct Shared {
     /// return `Ok(())` having made no X request at all -- a hotkey the launcher
     /// believes is live and that nothing can ever deliver.
     failed: AtomicBool,
+    /// Current lock-bit permutations, refreshed with the keyboard mapping.
+    lock_permutations: Mutex<Vec<u32>>,
     /// The X server time of the last key press this reader saw, shared with the
     /// window service so that `_NET_ACTIVE_WINDOW` can carry a real
     /// user-activity timestamp instead of `CurrentTime`.
@@ -275,8 +280,6 @@ pub struct X11HotkeyService {
     /// The throwaway window the shutdown `ClientMessage` is addressed to.
     wake_window: Window,
     wake_atom: u32,
-    /// Lock-bit combinations every grab is taken for.
-    lock_permutations: Vec<u32>,
     shared: Arc<Shared>,
     reader: Option<JoinHandle<()>>,
 }
@@ -336,16 +339,16 @@ impl X11HotkeyService {
             handler: Mutex::new(None),
             stopping: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            lock_permutations: Mutex::new(lock_permutations),
             user_time,
         });
-        let reader = spawn_reader(Arc::clone(&connection), Arc::clone(&shared), &lock_permutations);
+        let reader = spawn_reader(Arc::clone(&connection), root, Arc::clone(&shared));
 
         Ok(Self {
             connection,
             root,
             wake_window,
             wake_atom,
-            lock_permutations,
             shared,
             reader: Some(reader),
         })
@@ -366,26 +369,11 @@ impl X11HotkeyService {
     /// whatever key used to carry the symbol.
     fn keycode_for(&self, keysym_name: &str, keysym_value: u32) -> Result<Keycode> {
         let (first, mapping) = keyboard_mapping(&self.connection)?;
-        let per_keycode = usize::from(mapping.keysyms_per_keycode);
-        if per_keycode == 0 {
-            return Err(CoreError::Invalid(
-                "the X server reports an empty keyboard mapping".to_owned(),
-            ));
-        }
-
-        // A column is a shift level, so the lowest column carrying the symbol
-        // is the plainest way to press it.
-        for column in 0..per_keycode {
-            for (index, symbols) in mapping.keysyms.chunks(per_keycode).enumerate() {
-                if symbols.get(column) == Some(&keysym_value) {
-                    return Ok(first.saturating_add(index as u8));
-                }
-            }
-        }
-
-        Err(CoreError::Invalid(format!(
-            "the X server's keyboard mapping has no key for keysym {keysym_name}"
-        )))
+        keycode_from_mapping(first, &mapping, keysym_value).ok_or_else(|| {
+            CoreError::Invalid(format!(
+                "the X server's keyboard mapping has no key for keysym {keysym_name}"
+            ))
+        })
     }
 
     /// Takes the grab for every lock permutation, undoing the ones already
@@ -468,6 +456,28 @@ fn keyboard_mapping(
     Ok((first, mapping))
 }
 
+fn keycode_from_mapping(
+    first: Keycode,
+    mapping: &x11rb::protocol::xproto::GetKeyboardMappingReply,
+    keysym_value: u32,
+) -> Option<Keycode> {
+    let per_keycode = usize::from(mapping.keysyms_per_keycode);
+    if per_keycode == 0 {
+        return None;
+    }
+
+    // A column is a shift level, so the lowest column carrying the symbol is
+    // the plainest way to press it.
+    for column in 0..per_keycode {
+        for (index, symbols) in mapping.keysyms.chunks(per_keycode).enumerate() {
+            if symbols.get(column) == Some(&keysym_value) {
+                return Some(first.saturating_add(index as u8));
+            }
+        }
+    }
+    None
+}
+
 /// Creates the window and atom the shutdown `ClientMessage` travels on.
 ///
 /// The window is `InputOnly` and never mapped: it exists only to be addressed,
@@ -504,15 +514,7 @@ fn create_wake_target(connection: &RustConnection, root: Window) -> Result<(Wind
 }
 
 /// Starts the thread that turns `KeyPress` events into handler calls.
-fn spawn_reader(
-    connection: Arc<RustConnection>,
-    shared: Arc<Shared>,
-    lock_permutations: &[u32],
-) -> JoinHandle<()> {
-    // Whatever the lock bits are on this server, they are never part of a
-    // binding, so they are stripped before a press is matched.
-    let lock_bits = lock_permutations.iter().fold(0, |bits, mask| bits | mask);
-
+fn spawn_reader(connection: Arc<RustConnection>, root: Window, shared: Arc<Shared>) -> JoinHandle<()> {
     std::thread::spawn(move || loop {
         let Ok(event) = connection.wait_for_event() else {
             // The connection is gone; there is nothing left to read, and every
@@ -524,10 +526,27 @@ fn spawn_reader(
         };
         match event {
             Event::ClientMessage(_) if shared.stopping.load(Ordering::Acquire) => return,
+            Event::MappingNotify(_) => {
+                let new_lock_permutations = match lock_permutations(&connection) {
+                    Ok(permutations) => permutations,
+                    Err(_) => {
+                        shared.failed.store(true, Ordering::Release);
+                        return;
+                    }
+                };
+                if refresh_grabs(&connection, root, &shared, &new_lock_permutations).is_err() {
+                    shared.failed.store(true, Ordering::Release);
+                    return;
+                }
+                *lock(&shared.lock_permutations) = new_lock_permutations;
+            }
             Event::KeyPress(press) => {
                 // The only real user action this process ever observes, and so
                 // the timestamp EWMH wants on an activation request.
                 shared.user_time.store(press.time, Ordering::Relaxed);
+                let lock_bits = lock(&shared.lock_permutations)
+                    .iter()
+                    .fold(0, |bits, mask| bits | mask);
                 let state = u32::from(u16::from(press.state)) & !lock_bits & BINDING_MASK;
                 let activated = lock(&shared.registrations)
                     .iter()
@@ -546,40 +565,138 @@ fn spawn_reader(
     })
 }
 
+/// Re-resolves and re-grabs every registration after an X11 mapping change.
+///
+/// X11 grabs keycodes, not keysyms. A layout switch can therefore leave a
+/// registration attached to the old physical key even though the symbol now
+/// has a different keycode. Releasing and taking the masks again keeps the
+/// user-visible accelerator tied to its keysym.
+fn refresh_grabs(
+    connection: &RustConnection,
+    root: Window,
+    shared: &Shared,
+    lock_permutations: &[u32],
+) -> Result<()> {
+    let (first, mapping) = keyboard_mapping(connection)?;
+    let mut registrations = lock(&shared.registrations);
+
+    for grab in registrations.values_mut() {
+        let old_keycode = grab.keycode;
+        let old_masks = grab.grabbed.clone();
+        let keycode = keycode_from_mapping(first, &mapping, grab.keysym).ok_or_else(|| {
+            CoreError::Invalid("the X server's new keyboard mapping has no registered keysym".to_owned())
+        })?;
+        let masks = lock_permutations
+            .iter()
+            .map(|locks| grab.mask | locks)
+            .collect::<Vec<_>>();
+        if old_keycode == keycode && old_masks == masks {
+            continue;
+        }
+
+        // Add the new grabs before releasing old ones. MappingNotify can
+        // arrive while a user is pressing a key; dropping the old grab
+        // first creates a window in which that press is silently lost.
+        let mut taken = Vec::new();
+        for mask in &masks {
+            if keycode == old_keycode && old_masks.contains(mask) {
+                continue;
+            }
+            let result = connection
+                .grab_key(
+                    false,
+                    root,
+                    ModMask::from(*mask as u16),
+                    keycode,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                )
+                .map_err(|error| invalid("grabbing a hotkey after keyboard mapping changed", error))
+                .and_then(|cookie| {
+                    cookie
+                        .check()
+                        .map_err(|error| invalid("grabbing a hotkey after keyboard mapping changed", error))
+                });
+            if let Err(error) = result {
+                for taken_mask in taken {
+                    if let Ok(cookie) = connection.ungrab_key(keycode, root, ModMask::from(taken_mask as u16))
+                    {
+                        let _ = cookie.check();
+                    }
+                }
+                return Err(error);
+            }
+            taken.push(*mask);
+        }
+
+        for mask in &old_masks {
+            if keycode == old_keycode && masks.contains(mask) {
+                continue;
+            }
+            connection
+                .ungrab_key(old_keycode, root, ModMask::from(*mask as u16))
+                .map_err(|error| invalid("releasing a hotkey after keyboard mapping changed", error))?
+                .check()
+                .map_err(|error| invalid("releasing a hotkey after keyboard mapping changed", error))?;
+        }
+        grab.keycode = keycode;
+        grab.grabbed = masks;
+    }
+    Ok(())
+}
 /// The lock-modifier combinations a grab is taken for.
 ///
-/// CapsLock is always `LockMask`; NumLock is wherever the server's modifier map
-/// puts it, so it is looked up rather than assumed. A server with no NumLock key
-/// yields just the two CapsLock states.
+/// CapsLock is always `LockMask`; NumLock and ScrollLock are wherever the
+/// server's modifier map puts them, so they are looked up rather than assumed.
+/// A server without one of those keys simply omits that bit from the
+/// permutations.
 fn lock_permutations(connection: &RustConnection) -> Result<Vec<u32>> {
     let (first, mapping) = keyboard_mapping(connection)?;
     let per_keycode = usize::from(mapping.keysyms_per_keycode).max(1);
-    let num_lock_keycode = mapping
-        .keysyms
-        .chunks(per_keycode)
-        .position(|symbols| symbols.contains(&KEYSYM_NUM_LOCK))
-        .map(|index| first.saturating_add(index as u8));
-
-    let mut permutations = vec![0, MOD_LOCK];
-    let Some(keycode) = num_lock_keycode else {
-        return Ok(permutations);
+    let keycode_for = |keysym| {
+        mapping
+            .keysyms
+            .chunks(per_keycode)
+            .position(|symbols| symbols.contains(&keysym))
+            .map(|index| first.saturating_add(index as u8))
     };
+    let lock_keycodes = [KEYSYM_NUM_LOCK, KEYSYM_SCROLL_LOCK]
+        .into_iter()
+        .filter_map(keycode_for)
+        .collect::<Vec<_>>();
 
-    let modifiers = connection
-        .get_modifier_mapping()
-        .map_err(|error| invalid("asking X for the modifier mapping", error))?
-        .reply()
-        .map_err(|error| invalid("asking X for the modifier mapping", error))?;
-    let per_modifier = usize::from(modifiers.keycodes_per_modifier()).max(1);
-    let num_lock_mask = modifiers
-        .keycodes
-        .chunks(per_modifier)
-        .position(|codes| codes.contains(&keycode))
-        .map_or(0u32, |index| 1 << index);
+    let mut lock_masks = vec![MOD_LOCK];
+    if !lock_keycodes.is_empty() {
+        let modifiers = connection
+            .get_modifier_mapping()
+            .map_err(|error| invalid("asking X for the modifier mapping", error))?
+            .reply()
+            .map_err(|error| invalid("asking X for the modifier mapping", error))?;
+        let per_modifier = usize::from(modifiers.keycodes_per_modifier()).max(1);
+        for keycode in lock_keycodes {
+            let mask = modifiers
+                .keycodes
+                .chunks(per_modifier)
+                .position(|codes| codes.contains(&keycode))
+                .map_or(0u32, |index| 1 << index);
+            if mask != 0 && !lock_masks.contains(&mask) {
+                lock_masks.push(mask);
+            }
+        }
+    }
 
-    if num_lock_mask != 0 {
-        permutations.push(num_lock_mask);
-        permutations.push(num_lock_mask | MOD_LOCK);
+    let mut permutations = vec![0u32];
+    for lock_mask in lock_masks {
+        let previous = permutations.clone();
+        let additions = previous
+            .into_iter()
+            .map(|mask| mask | lock_mask)
+            .collect::<Vec<_>>();
+        for mask in additions {
+            if !permutations.contains(&mask) {
+                permutations.push(mask);
+            }
+        }
     }
     Ok(permutations)
 }
@@ -614,10 +731,12 @@ impl HotkeyService for X11HotkeyService {
 
         let (name, value) = keysym_of(&accelerator)?;
         let mask = modifier_mask(accelerator.modifiers());
+        let lock_permutations = lock(&self.shared.lock_permutations).clone();
         let grab = Grab {
             keycode: self.keycode_for(name, value)?,
+            keysym: value,
             mask,
-            grabbed: self.lock_permutations.iter().map(|locks| mask | locks).collect(),
+            grabbed: lock_permutations.iter().map(|locks| mask | locks).collect(),
         };
 
         self.grab(&grab)?;

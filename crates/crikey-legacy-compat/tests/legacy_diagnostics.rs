@@ -1069,3 +1069,37 @@ fn one_plugins_findings_never_appear_under_another_plugins_id() {
          beside it"
     );
 }
+
+#[test]
+fn a_zero_warning_cap_retains_only_one_bounded_overflow_record() {
+    let owner = plugin("legacy.example.zero-cap");
+    let mut diagnostics = LegacyDiagnostics::with_limits(DiagnosticLimits {
+        max_warnings_per_plugin: 0,
+        ..DiagnosticLimits::default()
+    });
+
+    for index in 0..10 {
+        assert_eq!(
+            diagnostics.observe_import(
+                &owner,
+                &format!("missing.module.{index}"),
+                missing("not installed"),
+            ),
+            Recorded::Dropped,
+            "a zero cap must drop every distinct finding",
+        );
+    }
+
+    assert_eq!(
+        diagnostics.total_warnings(),
+        1,
+        "the bounded overflow notice is the only retained record at a zero cap",
+    );
+    let records = diagnostics.warnings_for(&owner);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].warning.code(), OVERFLOW_CODE);
+    match &records[0].warning.issue {
+        CompatibilityIssue::DiagnosticsOverflow { dropped } => assert_eq!(*dropped, 10),
+        other => panic!("zero-cap overflow carried {other:?}"),
+    }
+}

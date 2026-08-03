@@ -38,6 +38,8 @@
 //! bounds are the worker's startup and per-call budgets, which are values
 //! passed in rather than clocks read here.
 
+use crikey_core::{ArgumentPolicy, Generation, HitPolicy, Item, ItemId, PluginId};
+use crikey_input_scheduler::{Millis, SchedulingProfile};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
@@ -45,17 +47,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crikey_core::{ArgumentPolicy, Generation, HitPolicy, Item, ItemId, PluginId};
-use crikey_input_scheduler::{Millis, SchedulingProfile};
 use crikey_legacy_compat::{
     discover_interpreter, CallbackObservation, CompatibilityMatrix, CompatibilityReport, Delivery,
     DiagnosticLimits, ImportOutcome, InstanceId, Interpreter, LegacyCallback, LegacyDeadlines,
-    LegacyDiagnostics, LegacyOutcome, LegacyPackage, LegacyRequest, LegacyRequestKind, LegacyResponse,
-    LegacyRuntime, LegacyTraceEvent, LegacyWorker, LegacyWorkerHandle, PackageLoader, PluginClassification,
-    PluginCorpus, TerminationReason, WorkerError, WorkerOptions, MINIMUM_SUPPORTED_PYTHON, WORKER_ENTRY_FILE,
+    LegacyDiagnostics, LegacyInstanceState, LegacyOutcome, LegacyPackage, LegacyRequest, LegacyRequestKind,
+    LegacyResponse, LegacyRuntime, LegacyTraceEvent, LegacyWorker, LegacyWorkerHandle, PackageLoader,
+    PluginClassification, PluginCorpus, TerminationReason, WorkerError, WorkerOptions,
+    MINIMUM_SUPPORTED_PYTHON, WORKER_ENTRY_FILE,
 };
 use crikey_python_host::RuntimeProfile;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// A completed run that found nothing wrong.
 const EX_OK: u8 = 0;
@@ -96,10 +100,71 @@ const WINDOWS_ONLY_MODULE: &str = "keypirinha_wintypes";
 /// third-party content of unknown provenance, so the scan is bounded by
 /// construction; modules past the cap are not scanned.
 const MAX_SCANNED_MODULES: usize = 512;
+
 /// Largest module the scan reads, in bytes. A larger file is skipped rather
 /// than buffered: an import statement lives in the first few lines, and a
 /// developer command must not be a way to make CriKey hold an arbitrary file.
 const MAX_SCANNED_MODULE_BYTES: u64 = 1 << 20;
+
+/// A private extraction root for one developer-command invocation.
+///
+/// `PackageLoader` trusts an already extracted content-addressed directory, so
+/// a fixed directory below the shared temporary root would let another local
+/// process plant files under the digest that this command is about to use.
+struct PrivatePackageCache {
+    path: PathBuf,
+}
+
+impl PrivatePackageCache {
+    fn new() -> Result<Self, String> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        for _ in 0..256 {
+            let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("crikey-dev-legacy-{pid}-{ordinal}"));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        let mut permissions = match fs::metadata(&path) {
+                            Ok(metadata) => metadata.permissions(),
+                            Err(error) => {
+                                let _ = fs::remove_dir_all(&path);
+                                return Err(format!(
+                                    "cannot inspect temporary package cache `{}`: {error}",
+                                    path.display()
+                                ));
+                            }
+                        };
+                        permissions.set_mode(0o700);
+                        if let Err(error) = fs::set_permissions(&path, permissions) {
+                            let _ = fs::remove_dir_all(&path);
+                            return Err(format!(
+                                "cannot restrict temporary package cache `{}`: {error}",
+                                path.display()
+                            ));
+                        }
+                    }
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot create private temporary package cache `{}`: {error}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+        Err("could not allocate a unique private temporary package cache".to_owned())
+    }
+}
+
+impl Drop for PrivatePackageCache {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The conformance suite
@@ -206,7 +271,7 @@ pub(crate) fn test_legacy_compat(args: &[String]) -> ExitCode {
         Err(message) => return refuse(command, &message),
     };
 
-    let (package, interpreter) = match open_package(command, &package_path) {
+    let (package, interpreter, _cache) = match open_package(command, &package_path) {
         Ok(opened) => opened,
         Err(refusal) => return refusal,
     };
@@ -347,7 +412,7 @@ pub(crate) fn inspect_catalog(args: &[String]) -> ExitCode {
         Err(message) => return refuse(command, &message),
     };
 
-    let (package, interpreter) = match open_package(command, &package_path) {
+    let (package, interpreter, _cache) = match open_package(command, &package_path) {
         Ok(opened) => opened,
         Err(refusal) => return refusal,
     };
@@ -454,12 +519,17 @@ opened, so this works on a host with no display.";
 
 /// Parses a `--package PATH` argument list.
 ///
-/// `Ok(None)` means help was asked for. Help is honoured *before* anything is
-/// validated: `--help` alongside a package that could not be loaded must still
-/// explain the command rather than refuse the package, because a developer
-/// asking how to invoke a command has not yet claimed the path is good.
+/// `Ok(None)` means help was asked for. Help is honoured before package
+/// validation: a known `--package PATH` beside a path that could not be loaded
+/// still explains the command, while an unknown option is refused.
 fn parse_package_args(command: &str, args: &[String]) -> Result<Option<String>, String> {
     if wants_help(args) {
+        if let Some(argument) = unknown_help_argument(args) {
+            return Err(format!(
+                "`dev {command}` does not understand `{argument}`; the package is named with \
+                 `--package PATH`"
+            ));
+        }
         return Ok(None);
     }
 
@@ -499,6 +569,14 @@ fn parse_package_args(command: &str, args: &[String]) -> Result<Option<String>, 
 /// `Ok(true)` to run, `Ok(false)` for help.
 fn parse_no_arguments(command: &str, args: &[String]) -> Result<bool, String> {
     if wants_help(args) {
+        if let Some(unexpected) = args
+            .iter()
+            .find(|argument| !matches!(argument.as_str(), "-h" | "--help"))
+        {
+            return Err(format!(
+                "`dev {command}` does not understand `{unexpected}`; it takes no arguments"
+            ));
+        }
         return Ok(false);
     }
     match args.first() {
@@ -509,6 +587,23 @@ fn parse_no_arguments(command: &str, args: &[String]) -> Result<bool, String> {
              `{unexpected}` was given"
         )),
     }
+}
+
+fn unknown_help_argument(args: &[String]) -> Option<&str> {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if matches!(argument, "-h" | "--help") {
+            index += 1;
+        } else if argument == "--package" {
+            index = index.saturating_add(2);
+        } else if argument.starts_with("--package=") {
+            index += 1;
+        } else {
+            return Some(argument);
+        }
+    }
+    None
 }
 
 fn wants_help(args: &[String]) -> bool {
@@ -568,8 +663,18 @@ fn report_help(command: &str) -> String {
 /// Every refusal repeats the path exactly as the caller wrote it: a refusal that
 /// cannot be traced back to its input is one a script cannot act on (spec 26.2),
 /// and a missing path must never be a panic.
-fn open_package(command: &str, path: &str) -> Result<(LegacyPackage, Interpreter), ExitCode> {
-    let loader = PackageLoader::new(std::env::temp_dir().join("crikey-dev-legacy-packages"));
+fn open_package(
+    command: &str,
+    path: &str,
+) -> Result<(LegacyPackage, Interpreter, PrivatePackageCache), ExitCode> {
+    let cache = match PrivatePackageCache::new() {
+        Ok(cache) => cache,
+        Err(error) => {
+            eprintln!("crikey: dev {command}: cannot prepare the package cache: {error}");
+            return Err(ExitCode::from(EX_SOFTWARE));
+        }
+    };
+    let loader = PackageLoader::new(cache.path.clone());
     let package = match loader.load(Path::new(path)) {
         Ok(package) => package,
         Err(error) => {
@@ -590,7 +695,7 @@ fn open_package(command: &str, path: &str) -> Result<(LegacyPackage, Interpreter
         }
     };
 
-    Ok((package, interpreter))
+    Ok((package, interpreter, cache))
 }
 
 fn plugin_of(package: &LegacyPackage) -> PluginId {
@@ -1003,7 +1108,7 @@ impl LegacyWorkerHandle for SuiteWorker {
             self.log
                 .borrow_mut()
                 .errors
-                .push(format!("{:?} was dispatched after shutdown", request.callback()));
+                .push(format!("{} was dispatched after shutdown", request.callback()));
             return Ok(());
         };
         match worker.call(request.clone()) {
@@ -1015,7 +1120,7 @@ impl LegacyWorkerHandle for SuiteWorker {
                 self.log
                     .borrow_mut()
                     .errors
-                    .push(format!("{:?} failed: {error}", request.callback()));
+                    .push(format!("{} failed: {error}", request.callback()));
                 Err(error)
             }
         }
@@ -1078,6 +1183,42 @@ impl ConformanceRun {
             undocumented: Vec::new(),
         }
     }
+}
+
+fn instance_state_summary(state: Option<&LegacyInstanceState>) -> String {
+    let Some(state) = state else {
+        return "no live plugin instance".to_owned();
+    };
+    format!(
+        "instance={}, pending_depth={}, running_generation={}, pending_generation={}",
+        state.instance.0,
+        state.pending_depth,
+        state
+            .running
+            .map_or_else(|| "none".to_owned(), |generation| generation.get().to_string()),
+        state
+            .pending
+            .map_or_else(|| "none".to_owned(), |generation| generation.get().to_string()),
+    )
+}
+
+fn delivery_summary(deliveries: &[Delivery]) -> String {
+    let stale = deliveries
+        .iter()
+        .filter(|delivery| matches!(delivery, Delivery::RejectedStale { .. }))
+        .count();
+    let obsolete = deliveries
+        .iter()
+        .filter(|delivery| matches!(delivery, Delivery::RejectedObsoleteInstance { .. }))
+        .count();
+    let ignored = deliveries
+        .iter()
+        .filter(|delivery| matches!(delivery, Delivery::Ignored))
+        .count();
+    format!(
+        "{} delivery(ies): stale_rejected={stale}, obsolete_instance_rejected={obsolete}, ignored={ignored}",
+        deliveries.len()
+    )
 }
 
 /// Runs the whole conformance timeline and returns one result per rule.
@@ -1152,7 +1293,7 @@ fn run_conformance(package: &LegacyPackage, interpreter: &Interpreter) -> Confor
     let mut rebuilds_accepted = 0_usize;
     for at_ms in [T_CATALOG_FIRST, T_CATALOG_SECOND] {
         if let Err(error) = runtime.catalog_rebuild(&plugin, at_ms) {
-            driver.note(format!("catalog_rebuild at {at_ms} was refused: {error:?}"));
+            driver.note(format!("catalog_rebuild at {at_ms} was refused: {error}"));
             continue;
         }
         runtime.tick(at_ms);
@@ -1278,7 +1419,7 @@ fn run_conformance(package: &LegacyPackage, interpreter: &Interpreter) -> Confor
                 let item_id = ItemId(identity);
                 match runtime.select_item(&item_id, T_SELECT) {
                     Err(error) => {
-                        Check::fail(format!("selecting the plugin's own item was refused: {error:?}"))
+                        Check::fail(format!("selecting the plugin's own item was refused: {error}"))
                     }
                     Ok(generation) => {
                         runtime.tick(T_SELECT);
@@ -1349,7 +1490,8 @@ fn run_conformance(package: &LegacyPackage, interpreter: &Interpreter) -> Confor
                 .to_owned(),
             format!(
                 "two callbacks were allowed to overlap on one legacy instance, or the pending \
-                 queue grew past one: {busy_state:?} (spec 14.5, acceptance 31.16)"
+                 queue grew past one: {} (spec 14.5, acceptance 31.16)",
+                instance_state_summary(busy_state.as_ref())
             ),
         ),
     );
@@ -1367,8 +1509,9 @@ fn run_conformance(package: &LegacyPackage, interpreter: &Interpreter) -> Confor
                 .to_owned(),
             format!(
                 "obsolete undispatched work was not replaced: {replaced} replacement(s) recorded \
-                 and the retained request was {retained:?} rather than the newest \
-                 (spec 8.4, 8.8, 14.5)"
+                 and the retained request was {} rather than the newest \
+                 (spec 8.4, 8.8, 14.5)",
+                retained.map_or_else(|| "none".to_owned(), |generation| generation.get().to_string())
             ),
         ),
     );
@@ -1388,8 +1531,9 @@ fn run_conformance(package: &LegacyPackage, interpreter: &Interpreter) -> Confor
              however long after the fact it arrived, and changed nothing displayed"
                 .to_owned(),
             format!(
-                "a superseded generation's answer was not rejected: {late:?} ({counted_stale} \
-                 counted) (spec 8.5, acceptance 31.7)"
+                "a superseded generation's answer was not rejected: {} ({counted_stale} counted) \
+                 (spec 8.5, acceptance 31.7)",
+                delivery_summary(&late)
             ),
         ),
     );
@@ -1464,7 +1608,7 @@ fn run_conformance(package: &LegacyPackage, interpreter: &Interpreter) -> Confor
             driver.dispatched_at(T_ORPHAN_BUILD).len()
         }
         Err(error) => {
-            driver.note(format!("the final catalog_rebuild was refused: {error:?}"));
+            driver.note(format!("the final catalog_rebuild was refused: {error}"));
             0
         }
     };
@@ -1486,9 +1630,13 @@ fn run_conformance(package: &LegacyPackage, interpreter: &Interpreter) -> Confor
              leaving the live catalog unmutated"
                 .to_owned(),
             format!(
-                "a superseded instance's catalog was not rejected: reload gave {replacement:?} \
-                 and the delivery was {orphan_delivery:?} ({counted_rejections} counted) \
-                 (spec 14.8)"
+                "a superseded instance's catalog was not rejected: reload outcome was {} and \
+                 the delivery was {} ({counted_rejections} counted) (spec 14.8)",
+                replacement
+                    .as_ref()
+                    .map(|instance| format!("instance {}", instance.0))
+                    .unwrap_or_else(|error| format!("error: {error}")),
+                delivery_summary(&orphan_delivery)
             ),
         ),
     );
@@ -2153,5 +2301,40 @@ mod tests {
             !portable.contains_key(WIN32_CHECK),
             "a package that names no Win32 entry point has nothing to report about one"
         );
+    }
+
+    #[test]
+    fn help_does_not_hide_unknown_legacy_options() {
+        let args = vec!["--help".to_owned(), "--unknown".to_owned()];
+        assert!(parse_package_args("inspect-catalog", &args).is_err());
+        assert!(parse_no_arguments("compatibility-report", &args).is_err());
+    }
+
+    #[test]
+    fn legacy_package_cache_is_private_and_unique() {
+        let first = PrivatePackageCache::new().expect("first private cache");
+        let second = PrivatePackageCache::new().expect("second private cache");
+        assert_ne!(first.path, second.path);
+        assert!(first.path.is_dir());
+        assert!(second.path.is_dir());
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::metadata(&first.path)
+                    .expect("first cache metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&second.path)
+                    .expect("second cache metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
     }
 }

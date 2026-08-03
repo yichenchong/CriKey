@@ -93,6 +93,7 @@ impl Default for PluginPolicy {
 /// Bounds and fairness budgets for a scheduler instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerConfig {
+    /// Bound on pending requests and undrained cancellation notifications.
     pub request_queue_capacity: usize,
     pub result_queue_capacity: usize,
     pub per_plugin_dispatch_budget: usize,
@@ -269,17 +270,29 @@ pub struct SchedulerDiagnostics {
     pub coalesced_requests: u64,
     pub dropped_obsolete_requests: u64,
     pub cancelled_requests: u64,
+    /// Cancellation notifications evicted because the host did not drain them
+    /// before the bounded queue filled.
+    pub dropped_cancellation_notifications: u64,
     pub rejected_stale_results: u64,
     pub rejected_plugin_queue_full: u64,
     pub rejected_global_queue_full: u64,
     pub dispatched_requests: u64,
     pub trace_events_dropped: u64,
+    /// Whether any stored cumulative diagnostic counter reached its saturation
+    /// ceiling. Saturated values are lower bounds, not exact totals.
+    pub counters_saturated: bool,
 }
 
 impl SchedulerDiagnostics {
     pub fn rejected_requests(&self) -> u64 {
         self.rejected_plugin_queue_full
             .saturating_add(self.rejected_global_queue_full)
+    }
+
+    /// Whether any stored cumulative diagnostic counter reached its saturation
+    /// ceiling. Saturated values are lower bounds, not exact totals.
+    pub fn counters_saturated(&self) -> bool {
+        self.counters_saturated
     }
 
     pub fn discarded_requests(&self) -> u64 {
@@ -646,7 +659,11 @@ impl QueryScheduler {
                     }
                 };
 
-                self.diagnostics.dispatched_requests = self.diagnostics.dispatched_requests.saturating_add(1);
+                add_diagnostic_counter(
+                    &mut self.diagnostics.dispatched_requests,
+                    1,
+                    &mut self.diagnostics.counters_saturated,
+                );
                 self.push_trace(QueryTraceEvent::Dispatched {
                     at: now,
                     plugin: plugin.clone(),
@@ -723,6 +740,13 @@ impl QueryScheduler {
         true
     }
 
+    /// Drains cancellation notifications in oldest-to-newest order.
+    ///
+    /// The returned list is bounded by the request-queue capacity and may be
+    /// incomplete if the host waited too long to drain it. Callers must check
+    /// [`SchedulerDiagnostics::dropped_cancellation_notifications`] (and
+    /// [`SchedulerDiagnostics::counters_saturated`]) before treating it as a
+    /// complete reconciliation.
     pub fn drain_cancellations(&mut self) -> Vec<CancelledRequest> {
         std::mem::take(&mut self.cancellations)
     }
@@ -761,8 +785,11 @@ impl QueryScheduler {
                 .any(|request| request.generation == generation && request.cancel_reason.is_none())
         });
         if !current || !usable {
-            self.diagnostics.rejected_stale_results =
-                self.diagnostics.rejected_stale_results.saturating_add(1);
+            add_diagnostic_counter(
+                &mut self.diagnostics.rejected_stale_results,
+                1,
+                &mut self.diagnostics.counters_saturated,
+            );
             if let Some(state) = self.plugins.get_mut(plugin) {
                 state.diagnostics.rejected_stale_results =
                     state.diagnostics.rejected_stale_results.saturating_add(1);
@@ -927,7 +954,7 @@ impl QueryScheduler {
             let state = self.plugins.get_mut(plugin).expect("registered plugin");
             let was_relevant = state.relevant;
             state.relevant = true;
-            if state.policy.profile == SchedulingProfile::LegacyStrict {
+            if !state.policy.profile.allows_time_debounce() {
                 let decision = if let Some(running) = state.in_flight.first() {
                     LegacyDispatch::QueuedBehindRunning {
                         obsolete: running.generation,
@@ -992,8 +1019,11 @@ impl QueryScheduler {
             QueuePolicy::RejectNewest => false,
         };
         if self.total_queued() >= self.config.request_queue_capacity && !can_reuse_slot {
-            self.diagnostics.rejected_global_queue_full =
-                self.diagnostics.rejected_global_queue_full.saturating_add(1);
+            add_diagnostic_counter(
+                &mut self.diagnostics.rejected_global_queue_full,
+                1,
+                &mut self.diagnostics.counters_saturated,
+            );
             if let Some(state) = self.plugins.get_mut(plugin) {
                 state.diagnostics.rejected_queue_full =
                     state.diagnostics.rejected_queue_full.saturating_add(1);
@@ -1007,8 +1037,11 @@ impl QueryScheduler {
             return;
         }
         if queue_capacity == 0 || (queue_policy == QueuePolicy::RejectNewest && queue_len >= queue_capacity) {
-            self.diagnostics.rejected_plugin_queue_full =
-                self.diagnostics.rejected_plugin_queue_full.saturating_add(1);
+            add_diagnostic_counter(
+                &mut self.diagnostics.rejected_plugin_queue_full,
+                1,
+                &mut self.diagnostics.counters_saturated,
+            );
             if let Some(state) = self.plugins.get_mut(plugin) {
                 state.diagnostics.rejected_queue_full =
                     state.diagnostics.rejected_queue_full.saturating_add(1);
@@ -1060,7 +1093,11 @@ impl QueryScheduler {
         };
 
         if let Some(old) = superseded {
-            self.diagnostics.coalesced_requests = self.diagnostics.coalesced_requests.saturating_add(1);
+            add_diagnostic_counter(
+                &mut self.diagnostics.coalesced_requests,
+                1,
+                &mut self.diagnostics.counters_saturated,
+            );
             if let Some(state) = self.plugins.get_mut(plugin) {
                 state.diagnostics.coalesced_requests = state.diagnostics.coalesced_requests.saturating_add(1);
             }
@@ -1075,8 +1112,11 @@ impl QueryScheduler {
             }
         }
         if let Some(old) = evicted {
-            self.diagnostics.dropped_obsolete_requests =
-                self.diagnostics.dropped_obsolete_requests.saturating_add(1);
+            add_diagnostic_counter(
+                &mut self.diagnostics.dropped_obsolete_requests,
+                1,
+                &mut self.diagnostics.counters_saturated,
+            );
             if let Some(state) = self.plugins.get_mut(plugin) {
                 state.diagnostics.dropped_obsolete_requests =
                     state.diagnostics.dropped_obsolete_requests.saturating_add(1);
@@ -1154,9 +1194,23 @@ impl QueryScheduler {
             return;
         }
 
-        self.diagnostics.cancelled_requests = self.diagnostics.cancelled_requests.saturating_add(1);
+        add_diagnostic_counter(
+            &mut self.diagnostics.cancelled_requests,
+            1,
+            &mut self.diagnostics.counters_saturated,
+        );
         if let Some(state) = self.plugins.get_mut(plugin) {
             state.diagnostics.cancelled_requests = state.diagnostics.cancelled_requests.saturating_add(1);
+        }
+        if self.cancellations.len() == self.config.request_queue_capacity {
+            // Keep the newest notices: the caller can reconcile from the
+            // current scheduler state after observing the drop counter.
+            self.cancellations.remove(0);
+            add_diagnostic_counter(
+                &mut self.diagnostics.dropped_cancellation_notifications,
+                1,
+                &mut self.diagnostics.counters_saturated,
+            );
         }
         self.cancellations.push(CancelledRequest {
             plugin: plugin.clone(),
@@ -1205,8 +1259,11 @@ impl QueryScheduler {
             };
 
             let dropped = u64::try_from(obsolete.len()).unwrap_or(u64::MAX);
-            self.diagnostics.dropped_obsolete_requests =
-                self.diagnostics.dropped_obsolete_requests.saturating_add(dropped);
+            add_diagnostic_counter(
+                &mut self.diagnostics.dropped_obsolete_requests,
+                dropped,
+                &mut self.diagnostics.counters_saturated,
+            );
             for generation in obsolete {
                 self.push_trace(QueryTraceEvent::RequestDropped {
                     at: now,
@@ -1251,14 +1308,30 @@ impl QueryScheduler {
 
     fn push_trace(&mut self, event: QueryTraceEvent) {
         if self.config.trace_capacity == 0 {
-            self.diagnostics.trace_events_dropped = self.diagnostics.trace_events_dropped.saturating_add(1);
+            add_diagnostic_counter(
+                &mut self.diagnostics.trace_events_dropped,
+                1,
+                &mut self.diagnostics.counters_saturated,
+            );
             return;
         }
         if self.trace.len() == self.config.trace_capacity {
             self.trace.remove(0);
-            self.diagnostics.trace_events_dropped = self.diagnostics.trace_events_dropped.saturating_add(1);
+            add_diagnostic_counter(
+                &mut self.diagnostics.trace_events_dropped,
+                1,
+                &mut self.diagnostics.counters_saturated,
+            );
         }
         self.trace.push(event);
+    }
+}
+
+fn add_diagnostic_counter(counter: &mut u64, amount: u64, saturated: &mut bool) {
+    let previous = *counter;
+    *counter = counter.saturating_add(amount);
+    if previous != u64::MAX && *counter == u64::MAX {
+        *saturated = true;
     }
 }
 
@@ -1287,12 +1360,8 @@ fn normalize_policy(policy: &mut PluginPolicy) {
     if !policy.debounce.leading_edge && !policy.debounce.trailing_edge {
         policy.debounce.trailing_edge = true;
     }
-    let debounce_ms = policy.debounce.debounce_ms;
-    if debounce_ms == 0 {
-        policy.debounce.maximum_wait_ms = None;
-    } else if let Some(maximum_wait) = &mut policy.debounce.maximum_wait_ms {
-        *maximum_wait = (*maximum_wait).max(debounce_ms);
-    }
+    // A maximum wait is an upper bound and may intentionally be shorter than
+    // the quiet period; preserve it so the deadline logic can honor it.
     policy.activation.prefixes.retain_mut(|prefix| {
         *prefix = prefix.trim().to_lowercase();
         !prefix.is_empty()

@@ -143,6 +143,7 @@ pub struct QueueDiagnostics {
     events_dropped: usize,
     peak_batches: usize,
     peak_items: usize,
+    counters_saturated: bool,
 }
 
 impl Default for QueueDiagnostics {
@@ -159,6 +160,7 @@ impl Default for QueueDiagnostics {
             resumes: 0,
             peak_batches: 0,
             peak_items: 0,
+            counters_saturated: false,
         }
     }
 }
@@ -208,6 +210,14 @@ impl QueueDiagnostics {
     pub fn peak_items(&self) -> usize {
         self.peak_items
     }
+
+    /// Whether any cumulative counter reached `usize::MAX`.
+    ///
+    /// Saturated values remain at `usize::MAX`; callers must treat them as
+    /// lower bounds rather than exact totals when this is true.
+    pub fn counters_saturated(&self) -> bool {
+        self.counters_saturated
+    }
 }
 
 fn queue_reject_index(reason: QueueReject) -> usize {
@@ -220,6 +230,15 @@ fn queue_reject_index(reason: QueueReject) -> usize {
         QueueReject::BoundaryFull => 5,
         QueueReject::Disconnected => 6,
     }
+}
+
+fn add_counter(counter: &mut usize, amount: usize, saturated: &mut bool) {
+    let Some(value) = counter.checked_add(amount) else {
+        *counter = usize::MAX;
+        *saturated = true;
+        return;
+    };
+    *counter = value;
 }
 
 fn merge_reject_index(reason: RejectReason) -> usize {
@@ -329,12 +348,21 @@ impl InboundResultQueue {
 
         self.total_batches = self.total_batches.saturating_sub(queue.entries.len());
         self.total_items = self.total_items.saturating_sub(queue.items);
-        self.order.retain(|registered| registered != plugin);
-        self.drain_cursor = if self.order.is_empty() {
-            0
-        } else {
-            self.drain_cursor.min(self.order.len() - 1)
-        };
+        if let Some(removed_index) = self.order.iter().position(|registered| registered == plugin) {
+            self.order.remove(removed_index);
+            if self.order.is_empty() {
+                self.drain_cursor = 0;
+            } else {
+                // Keep the cursor pointing at the same logical next plugin.
+                // If the removed plugin was before it, its index shifts left;
+                // if it was the cursor itself, the successor now occupies
+                // that index.
+                if removed_index < self.drain_cursor {
+                    self.drain_cursor -= 1;
+                }
+                self.drain_cursor %= self.order.len();
+            }
+        }
         self.events.retain(|event| &event.plugin != plugin);
         true
     }
@@ -504,7 +532,11 @@ impl InboundResultQueue {
         }
         self.total_batches += 1;
         self.total_items += item_count;
-        self.diagnostics.admitted = self.diagnostics.admitted.saturating_add(1);
+        add_counter(
+            &mut self.diagnostics.admitted,
+            1,
+            &mut self.diagnostics.counters_saturated,
+        );
         self.diagnostics.peak_batches = self.diagnostics.peak_batches.max(self.total_batches);
         self.diagnostics.peak_items = self.diagnostics.peak_items.max(self.total_items);
         self.push_event(QueueEvent {
@@ -597,7 +629,11 @@ impl InboundResultQueue {
                             state,
                             items: next_items,
                         });
-                        self.diagnostics.merged = self.diagnostics.merged.saturating_add(1);
+                        add_counter(
+                            &mut self.diagnostics.merged,
+                            1,
+                            &mut self.diagnostics.counters_saturated,
+                        );
                         self.push_event(QueueEvent {
                             at_ms,
                             plugin: plugin.clone(),
@@ -618,8 +654,11 @@ impl InboundResultQueue {
                         }
                         report.merge_rejected.push((plugin.clone(), reason));
                         let slot = merge_reject_index(reason);
-                        self.diagnostics.merge_rejected[slot] =
-                            self.diagnostics.merge_rejected[slot].saturating_add(1);
+                        add_counter(
+                            &mut self.diagnostics.merge_rejected[slot],
+                            1,
+                            &mut self.diagnostics.counters_saturated,
+                        );
                         self.push_event(QueueEvent {
                             at_ms,
                             plugin: plugin.clone(),
@@ -710,7 +749,11 @@ impl InboundResultQueue {
         let item_count = entry.inbound.batch.items.len();
         self.total_batches -= 1;
         self.total_items -= item_count;
-        self.diagnostics.evicted_oldest = self.diagnostics.evicted_oldest.saturating_add(1);
+        add_counter(
+            &mut self.diagnostics.evicted_oldest,
+            1,
+            &mut self.diagnostics.counters_saturated,
+        );
         self.push_event(QueueEvent {
             at_ms,
             plugin: plugin.clone(),
@@ -718,7 +761,6 @@ impl InboundResultQueue {
             kind: QueueEventKind::EvictedOldest { items: item_count },
         });
     }
-
     fn reclaim_obsolete(&mut self, at_ms: u64) -> usize {
         let active = self.active;
         let mut records: Vec<(PluginId, Generation, usize, usize)> = Vec::new();
@@ -765,7 +807,11 @@ impl InboundResultQueue {
             }
         }
 
-        self.diagnostics.dropped_obsolete = self.diagnostics.dropped_obsolete.saturating_add(total_dropped);
+        add_counter(
+            &mut self.diagnostics.dropped_obsolete,
+            total_dropped,
+            &mut self.diagnostics.counters_saturated,
+        );
         for (plugin, generation, batches, items) in records {
             self.push_event(QueueEvent {
                 at_ms,
@@ -780,12 +826,20 @@ impl InboundResultQueue {
     fn push_event(&mut self, event: QueueEvent) {
         let capacity = self.limits.capacity_batches;
         if capacity == 0 {
-            self.diagnostics.events_dropped = self.diagnostics.events_dropped.saturating_add(1);
+            add_counter(
+                &mut self.diagnostics.events_dropped,
+                1,
+                &mut self.diagnostics.counters_saturated,
+            );
             return;
         }
         if self.events.len() >= capacity {
             self.events.pop_front();
-            self.diagnostics.events_dropped = self.diagnostics.events_dropped.saturating_add(1);
+            add_counter(
+                &mut self.diagnostics.events_dropped,
+                1,
+                &mut self.diagnostics.counters_saturated,
+            );
         }
         self.events.push_back(event);
     }
@@ -798,7 +852,11 @@ impl InboundResultQueue {
         reason: QueueReject,
     ) -> QueueReject {
         let slot = queue_reject_index(reason);
-        self.diagnostics.rejected[slot] = self.diagnostics.rejected[slot].saturating_add(1);
+        add_counter(
+            &mut self.diagnostics.rejected[slot],
+            1,
+            &mut self.diagnostics.counters_saturated,
+        );
         self.push_event(QueueEvent {
             at_ms,
             plugin,
@@ -817,7 +875,11 @@ impl InboundResultQueue {
             return;
         }
         queue.state = ProducerState::Paused;
-        self.diagnostics.pauses = self.diagnostics.pauses.saturating_add(1);
+        add_counter(
+            &mut self.diagnostics.pauses,
+            1,
+            &mut self.diagnostics.counters_saturated,
+        );
         self.push_event(QueueEvent {
             at_ms,
             plugin: plugin.clone(),
@@ -849,11 +911,19 @@ impl InboundResultQueue {
             .state = state;
         let kind = match state {
             ProducerState::Paused => {
-                self.diagnostics.pauses = self.diagnostics.pauses.saturating_add(1);
+                add_counter(
+                    &mut self.diagnostics.pauses,
+                    1,
+                    &mut self.diagnostics.counters_saturated,
+                );
                 QueueEventKind::ProducerPaused
             }
             ProducerState::Running => {
-                self.diagnostics.resumes = self.diagnostics.resumes.saturating_add(1);
+                add_counter(
+                    &mut self.diagnostics.resumes,
+                    1,
+                    &mut self.diagnostics.counters_saturated,
+                );
                 QueueEventKind::ProducerResumed
             }
             ProducerState::Disconnected => unreachable!("disconnect is not a watermark transition"),
@@ -876,4 +946,22 @@ fn normalize_policy(mut policy: IntakePolicy) -> IntakePolicy {
 
 fn exceeds(current: usize, additional: usize, limit: usize) -> bool {
     additional > limit.saturating_sub(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturated_cumulative_counter_is_reported_as_a_lower_bound() {
+        let mut diagnostics = QueueDiagnostics {
+            admitted: usize::MAX,
+            ..QueueDiagnostics::default()
+        };
+
+        add_counter(&mut diagnostics.admitted, 1, &mut diagnostics.counters_saturated);
+
+        assert_eq!(diagnostics.admitted(), usize::MAX);
+        assert!(diagnostics.counters_saturated());
+    }
 }

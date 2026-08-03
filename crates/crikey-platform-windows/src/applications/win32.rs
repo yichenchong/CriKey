@@ -10,7 +10,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{c_void, OsString};
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 use windows::core::{Interface, GUID, PCWSTR, PWSTR};
@@ -19,8 +19,8 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Shell::{
     BHID_EnumItems, FOLDERID_AppsFolder, FOLDERID_CommonStartMenu, FOLDERID_StartMenu, IEnumShellItems,
-    IShellItem, IShellLinkW, SHGetKnownFolderItem, SHGetKnownFolderPath, ShellLink, KF_FLAG_DEFAULT,
-    SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
+    IShellItem, IShellLinkW, SHGetKnownFolderItem, SHGetKnownFolderPath, SHGetNameFromIDList, ShellLink,
+    KF_FLAG_DEFAULT, SIGDN_FILESYSPATH, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
 };
 
 use crikey_core::{PlatformPath, Result};
@@ -30,13 +30,16 @@ use crate::win32::{refused, wide, Apartment};
 
 use super::{split_arguments, ApplicationSet, Shortcut, StartMenuDiscovery};
 
-/// How much room one shell string gets.
+/// How much room one shell string gets, in UTF-16 code units.
 ///
-/// `IShellLinkW` writes into a caller buffer and truncates rather than asking
-/// for more, so the size is a real limit. `MAX_PATH` is the documented floor
-/// and `INFOTIPSIZE` (1024) bounds an argument string; this is comfortably past
-/// both, which is what it costs to keep long-path targets intact.
-const SHELL_TEXT_CAPACITY: usize = 4096;
+/// `IShellLinkW` reports a character count rather than a byte count. The API
+/// documents `MAX_PATH` as its normal return limit, but newer shell paths can
+/// be longer; this room lets implementations that do return an extended name
+/// do so without a caller-side truncation.
+const SHELL_TEXT_CAPACITY: usize = 32_768;
+
+/// The historical `MAX_PATH` size, including its terminating NUL.
+const HISTORICAL_MAX_PATH_CHARS: usize = 260;
 
 /// The moniker that names a packaged application to the shell.
 ///
@@ -121,12 +124,21 @@ fn resolve(shortcut: &Shortcut, text: &mut [u16]) -> Option<DiscoveredApplicatio
     // it is stored and fails at launch, where the user can see why.
     // SAFETY: the slice is a live buffer the call writes into; a null
     // `WIN32_FIND_DATAW` pointer is documented as "no extra information".
-    let target = read_shell_text(text, |slot| unsafe {
+    let direct_target = read_shell_text(text, |slot| unsafe {
         link.GetPath(slot, std::ptr::null_mut(), 0)
-    })?;
-    if target.is_empty() {
-        return None;
-    }
+    })
+    .filter(|target| !target.is_empty());
+
+    // Microsoft documents `IShellLinkW::GetPath` as returning at most
+    // `MAX_PATH` characters. Prefer the PIDL-to-shell-name path whenever the
+    // direct result reaches that boundary; it has no caller-sized buffer and
+    // preserves extended-length targets when the shell can provide one.
+    let target = match direct_target.as_ref() {
+        Some(target) if target.as_os_str().encode_wide().count() < HISTORICAL_MAX_PATH_CHARS - 1 => {
+            direct_target
+        }
+        _ => resolve_id_list(&link).or(direct_target),
+    }?;
 
     // SAFETY: as above.
     let arguments = read_shell_text(text, |slot| unsafe { link.GetArguments(slot) })
@@ -150,6 +162,31 @@ fn resolve(shortcut: &Shortcut, text: &mut [u16]) -> Option<DiscoveredApplicatio
         // AppUserModelID: only packaged applications below carry one.
         platform_id: None,
     })
+}
+/// Retrieves a link target through its item identifier list.
+///
+/// `IShellLinkW::GetPath` has a documented `MAX_PATH` return ceiling. The
+/// identifier-list route lets the shell allocate the display name itself,
+/// which is the only route available here for an extended-length filesystem
+/// target. The PIDL and returned name are both task-allocator owned and are
+/// released on every path.
+fn resolve_id_list(link: &IShellLinkW) -> Option<OsString> {
+    // SAFETY: `link` is a live shell-link interface in the active apartment.
+    let pidl = unsafe { link.GetIDList() }.ok()?;
+    if pidl.is_null() {
+        return None;
+    }
+
+    // SAFETY: `pidl` came from `GetIDList` and remains valid until released
+    // below; the shell writes a task-allocated output pointer.
+    let name = unsafe { SHGetNameFromIDList(pidl, SIGDN_FILESYSPATH) };
+    // SAFETY: Shell link PIDLs are allocated by the COM task allocator.
+    unsafe { CoTaskMemFree(Some(pidl as *const c_void)) };
+
+    // SAFETY: the returned pointer is task-allocator owned and NUL-terminated.
+    let name = name.ok()?;
+    // SAFETY: `take_shell_string` copies and releases that returned pointer.
+    Some(unsafe { take_shell_string(name) })
 }
 
 /// The `path,index` form Windows uses to name one icon inside a file.
@@ -245,15 +282,21 @@ fn packaged_application(item: &IShellItem) -> Option<DiscoveredApplication> {
 ///
 /// The buffer is cleared first because several of these methods report success
 /// without writing anything -- `IShellLinkW::GetPath` returns `S_FALSE` for a
-/// link with no path -- and reading the previous shortcut's bytes back out of a
-/// reused buffer would attach one program's path to another's name.
+/// link with no path -- and reading the previous shortcut's bytes back out of
+/// a reused buffer would attach one program's path to another's name.
+///
+/// A missing terminator means the shell filled the entire buffer. Treating that
+/// as a successful string would pass a truncated path to the launcher, which is
+/// worse than dropping one entry. The capacity is large enough for the
+/// extended-length Windows path limit, so this is only a malformed or
+/// unsupported result.
 fn read_shell_text(
     text: &mut [u16],
     read: impl FnOnce(&mut [u16]) -> windows::core::Result<()>,
 ) -> Option<OsString> {
     text.fill(0);
     read(text).ok()?;
-    let length = text.iter().position(|unit| *unit == 0).unwrap_or(text.len());
+    let length = text.iter().position(|unit| *unit == 0)?;
     Some(OsString::from_wide(&text[..length]))
 }
 

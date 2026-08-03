@@ -67,7 +67,7 @@ fn resolved_policy(runtime: &str, sections: &str) -> QueryPolicy {
 #[track_caller]
 fn assert_invalid(error: &ManifestError, expected_field: &str, expected: PolicyProblem) {
     match error {
-        ManifestError::InvalidQueryPolicy { field, problem } => {
+        ManifestError::InvalidQueryPolicy { field, problem, .. } => {
             assert_eq!(
                 (*field, *problem),
                 (expected_field, expected),
@@ -175,6 +175,28 @@ fn explicit_zero_debounce_differs_from_an_absent_debounce() {
         NATIVE_LOCAL_BAND.contains(&inherited.query_policy().debounce_ms),
         "an absent debounce must inherit the spec 25.4 native band"
     );
+}
+
+/// A maximum wait only has meaning when a debounce period can postpone work.
+/// Accepting it with an explicit zero debounce would silently discard the
+/// declaration at policy resolution.
+#[test]
+fn a_maximum_wait_requires_a_nonzero_debounce() {
+    let error = reject("native", "[query]\ndebounce-ms = 0\nmaximum-wait-ms = 50\n");
+    assert_invalid(&error, "query.maximum-wait-ms", PolicyProblem::Contradictory);
+    let rendered = error.to_string();
+    for expected in [
+        "crikey.toml",
+        "query.debounce-ms",
+        "query.maximum-wait-ms",
+        "cannot be combined",
+        "dispatches immediately",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "contradiction must explain {expected:?}, got: {rendered}"
+        );
+    }
 }
 
 /// `minimum-query-length = 0` is a deliberate "gate on nothing"; absence leaves
@@ -489,7 +511,7 @@ fn a_maximum_wait_equal_to_the_debounce_period_is_accepted() {
 fn refusing_both_edges_is_contradictory() {
     let error = reject("native", "[query]\nleading-edge = false\ntrailing-edge = false\n");
     match &error {
-        ManifestError::InvalidQueryPolicy { field, problem } => {
+        ManifestError::InvalidQueryPolicy { field, problem, .. } => {
             assert_eq!(*problem, PolicyProblem::Contradictory);
             assert!(
                 matches!(*field, "query.leading-edge" | "query.trailing-edge"),
@@ -570,6 +592,39 @@ fn a_maximum_wait_beyond_the_ceiling_is_out_of_range() {
         ),
     );
     assert_invalid(&error, "query.maximum-wait-ms", PolicyProblem::OutOfRange);
+}
+
+/// A legacy-strict host ignores modern scheduling semantics, but it must not
+/// accept malformed numeric declarations that could hide a typo in a manifest.
+#[test]
+fn legacy_strict_still_rejects_out_of_range_numeric_declarations() {
+    for (body, field) in [
+        (
+            &format!("[query]\ndebounce-ms = {}\n", MAX_DEBOUNCE_MS + 1),
+            "query.debounce-ms",
+        ),
+        (
+            &format!("[query]\nmaximum-wait-ms = {}\n", MAX_DEBOUNCE_MS + 1),
+            "query.maximum-wait-ms",
+        ),
+        (
+            &format!(
+                "[query]\nmax-concurrent-requests = {}\n",
+                MAX_CONCURRENT_REQUESTS + 1
+            ),
+            "query.max-concurrent-requests",
+        ),
+        (
+            &format!(
+                "[activation]\nminimum-query-length = {}\n",
+                MAX_MINIMUM_QUERY_LENGTH + 1
+            ),
+            "activation.minimum-query-length",
+        ),
+    ] {
+        let error = reject("legacy-python", body);
+        assert_invalid(&error, field, PolicyProblem::OutOfRange);
+    }
 }
 
 /// Zero concurrent requests means the plugin can never be asked anything,
@@ -740,4 +795,86 @@ fn a_plugin_without_declared_gates_sees_every_long_enough_query() {
     assert!(policy.admits("anything at all"));
     assert!(!policy.admits("a"));
     assert!(!policy.admits(""));
+}
+
+// ---------------------------------------------------------------------------
+// Manifest shape and permission strictness
+// ---------------------------------------------------------------------------
+
+/// A missing required top-level field is a load error that identifies both the
+/// manifest dialect's filename and the missing field.
+#[test]
+fn a_missing_manifest_version_names_the_field_and_manifest_file() {
+    let error = Manifest::parse(
+        "[plugin]\n\
+         id = \"dev.example.missing-version\"\n\
+         name = \"Missing Version\"\n\
+         version = \"1.0.0\"\n\
+         runtime = \"native\"\n\
+         entrypoint = \"bin/plugin\"\n",
+    )
+    .expect_err("manifest-version is required");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("crikey.toml"),
+        "the error must name the manifest file, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("manifest-version"),
+        "the error must name the missing field, got: {rendered}"
+    );
+}
+
+/// TOML syntax alone does not establish the manifest shape. A scalar
+/// `plugin` value must fail deserialization instead of being accepted as an
+/// empty/default section.
+#[test]
+fn a_valid_toml_manifest_with_the_wrong_plugin_shape_is_rejected() {
+    let error = Manifest::parse("manifest-version = 1\nplugin = \"not-a-table\"\n")
+        .expect_err("a scalar plugin value is not a manifest section");
+    assert!(
+        matches!(error, ManifestError::Parse(_)),
+        "wrong-shape TOML must be a parse error, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("plugin"),
+        "the wrong-shape error must identify plugin, got: {error}"
+    );
+}
+
+/// Permission enums are closed: a value unknown to the loader must not be
+/// accepted and then treated as a weaker or stronger known permission.
+#[test]
+fn an_unknown_permission_value_is_rejected() {
+    let error = reject("native", "[permissions]\nclipboard = \"execute\"\n");
+    assert!(
+        matches!(error, ManifestError::Parse(_)),
+        "an unknown permission must be a parse error, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("execute"),
+        "the error must identify the unknown permission value, got: {error}"
+    );
+}
+
+/// Every omitted permission is restrictive at the declaration layer. Runtime
+/// hosts still have to enforce these values before privileged operations.
+#[test]
+fn omitted_permissions_default_to_restrictive_values() {
+    let permissions = parse("native", "").permissions;
+    assert!(permissions.filesystem.is_empty());
+    assert!(!permissions.network);
+    assert!(!permissions.network_listener);
+    assert_eq!(
+        permissions.clipboard,
+        crikey_plugin_model::ClipboardPermission::None
+    );
+    assert!(!permissions.process);
+    assert!(!permissions.window_enumeration);
+    assert!(!permissions.window_control);
+    assert!(!permissions.notifications);
+    assert!(!permissions.secrets);
+    assert!(!permissions.environment);
+    assert!(!permissions.native_library_loading);
+    assert!(!permissions.background_execution);
 }

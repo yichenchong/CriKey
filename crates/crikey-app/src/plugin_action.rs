@@ -5,7 +5,7 @@
 //! dispatch therefore cannot fall through to a sibling runtime or reinterpret
 //! a stale owner as another plugin.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -120,10 +120,14 @@ impl PluginActionRouter {
         I: IntoIterator<Item = PluginId>,
     {
         let plugins = plugins.into_iter().collect::<Vec<_>>();
+        let mut unique = BTreeSet::new();
         if plugins.is_empty() {
             return Ok(());
         }
-        if plugins.iter().any(|plugin| self.providers.contains_key(plugin)) {
+        if plugins
+            .iter()
+            .any(|plugin| !unique.insert(plugin) || self.providers.contains_key(plugin))
+        {
             return Err(CoreError::Invalid(
                 "plugin action provider is already registered".to_owned(),
             ));
@@ -142,6 +146,12 @@ impl PluginActionRouter {
         action_id: &ActionId,
         argument: Option<&str>,
     ) -> CoreResult<ActionRequestId> {
+        if item.plugin_id != *plugin {
+            return Err(CoreError::Invalid(format!(
+                "plugin action item is owned by `{}`, not `{}`",
+                item.plugin_id.0, plugin.0
+            )));
+        }
         self.providers
             .get(plugin)
             .ok_or_else(|| CoreError::Invalid(format!("no action runtime owns plugin `{}`", plugin.0)))?
@@ -151,7 +161,7 @@ impl PluginActionRouter {
     /// Drains all terminal action outcomes without waiting for a plugin.
     pub fn poll(&self) -> Vec<PluginActionCompletion> {
         let mut completions = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = BTreeSet::new();
         for executor in self.providers.values() {
             let key = Arc::as_ptr(executor) as *const () as usize;
             if seen.insert(key) {

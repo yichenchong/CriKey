@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::environment::MaterializedEnvironment;
-
+use crate::PackageError;
 /// The assembled import path, in spec order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportPath {
@@ -35,8 +35,22 @@ impl ImportPath {
     }
 
     /// Join the entries with the OS path-list separator (never a global site).
-    pub fn to_pythonpath(&self) -> OsString {
-        std::env::join_paths(&self.entries)
-            .expect("assembled import-path entries contain no path-list separator")
+    ///
+    /// A path-list value has no portable escaping for a separator embedded in
+    /// one component, so reject that component instead of panicking or silently
+    /// changing the path seen by Python.
+    pub fn to_pythonpath(&self) -> Result<OsString, PackageError> {
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        for entry in &self.entries {
+            if entry.to_string_lossy().contains(separator) {
+                return Err(PackageError::InvalidImportPath(format!(
+                    "path component {:?} contains the path-list separator `{separator}`",
+                    entry
+                )));
+            }
+        }
+        std::env::join_paths(&self.entries).map_err(|error| {
+            PackageError::InvalidImportPath(format!("could not encode import path: {error}"))
+        })
     }
 }

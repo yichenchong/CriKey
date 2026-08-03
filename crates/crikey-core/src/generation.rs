@@ -54,8 +54,31 @@ impl GenerationTracker {
     }
 
     /// Allocates the generation for a new query state.
+    ///
+    /// There is no safe successor to `u64::MAX`. Rather than wrapping to zero
+    /// (which would make old results look current), exhaustion fails closed
+    /// with a clear panic.
     pub fn advance(&self) -> Generation {
-        Generation(self.current.fetch_add(1, Ordering::AcqRel) + 1)
+        let previous = self
+            .current
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .expect("query generation counter exhausted at u64::MAX");
+        Generation(previous + 1)
+    }
+
+    /// Checks that work belongs to the currently visible generation.
+    pub fn ensure_current(&self, generation: Generation) -> crate::Result<()> {
+        let current = self.current();
+        if generation == current {
+            Ok(())
+        } else {
+            Err(crate::CoreError::StaleGeneration {
+                got: generation.get(),
+                current: current.get(),
+            })
+        }
     }
 
     pub fn current(&self) -> Generation {
@@ -94,5 +117,29 @@ mod tests {
         let new = tracker.advance();
         assert!(tracker.is_stale(old));
         assert!(tracker.is_current(new));
+    }
+
+    #[test]
+    fn stale_generation_returns_the_typed_error() {
+        let tracker = GenerationTracker::new();
+        let old = tracker.advance();
+        let current = tracker.advance();
+
+        assert!(matches!(
+            tracker.ensure_current(old),
+            Err(crate::CoreError::StaleGeneration { got, current: seen })
+                if got == old.get() && seen == current.get()
+        ));
+        assert!(tracker.ensure_current(current).is_ok());
+    }
+
+    #[test]
+    fn generation_exhaustion_does_not_wrap_to_zero() {
+        let tracker = GenerationTracker::new();
+        tracker.current.store(u64::MAX, Ordering::Relaxed);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tracker.advance()));
+        assert!(result.is_err(), "overflow must fail closed");
+        assert_eq!(tracker.current(), Generation::from_raw(u64::MAX));
     }
 }

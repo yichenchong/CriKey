@@ -14,6 +14,9 @@ fn map_io(error: io::Error) -> ProtocolError {
 
 /// Writes a 4-byte big-endian length prefix followed by one bounded payload.
 pub fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> Result<(), ProtocolError> {
+    if payload.is_empty() {
+        return Err(ProtocolError::Malformed("zero-length frame".to_owned()));
+    }
     if payload.len() > MAX_FRAME_BYTES {
         return Err(ProtocolError::FrameTooLarge(payload.len()));
     }
@@ -39,16 +42,36 @@ pub fn read_frame<R: Read>(reader: &mut R, buffer: &mut Vec<u8>) -> Result<(), P
                     "truncated frame length prefix".to_owned(),
                 ))
             }
-            Ok(count) => read += count,
+            Ok(count) => {
+                let remaining = prefix
+                    .len()
+                    .checked_sub(read)
+                    .ok_or_else(|| ProtocolError::Malformed("frame prefix offset overflow".to_owned()))?;
+                if count > remaining {
+                    return Err(ProtocolError::Malformed(
+                        "reader returned too many prefix bytes".to_owned(),
+                    ));
+                }
+                read = read
+                    .checked_add(count)
+                    .ok_or_else(|| ProtocolError::Malformed("frame prefix offset overflow".to_owned()))?;
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(map_io(error)),
         }
     }
 
-    let length = u32::from_be_bytes(prefix) as usize;
+    let length = usize::try_from(u32::from_be_bytes(prefix))
+        .map_err(|_| ProtocolError::Malformed("frame length does not fit this platform".to_owned()))?;
+    if length == 0 {
+        return Err(ProtocolError::Malformed("zero-length frame".to_owned()));
+    }
     if length > MAX_FRAME_BYTES {
         return Err(ProtocolError::FrameTooLarge(length));
     }
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| ProtocolError::Malformed("frame allocation failed".to_owned()))?;
     buffer.resize(length, 0);
     let mut offset = 0_usize;
     while offset < length {
@@ -57,7 +80,20 @@ pub fn read_frame<R: Read>(reader: &mut R, buffer: &mut Vec<u8>) -> Result<(), P
                 buffer.clear();
                 return Err(ProtocolError::Malformed("truncated frame body".to_owned()));
             }
-            Ok(count) => offset += count,
+            Ok(count) => {
+                let remaining = length
+                    .checked_sub(offset)
+                    .ok_or_else(|| ProtocolError::Malformed("frame body offset overflow".to_owned()))?;
+                if count > remaining {
+                    buffer.clear();
+                    return Err(ProtocolError::Malformed(
+                        "reader returned too many body bytes".to_owned(),
+                    ));
+                }
+                offset = offset
+                    .checked_add(count)
+                    .ok_or_else(|| ProtocolError::Malformed("frame body offset overflow".to_owned()))?;
+            }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
                 buffer.clear();

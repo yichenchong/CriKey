@@ -38,9 +38,11 @@
 //! directory; these tests pin the property, not the mechanism.
 //!
 //! Refusal is the security surface. An archive is hostile input: it arrives
-//! from the internet and its entry names are attacker-controlled. Three
-//! refusals below are load-bearing, and each asserts the filesystem afterwards
-//! rather than trusting the returned `Err`:
+//! from the internet and its entry names are attacker-controlled. The tests
+//! cover path escapes and absolute names, backslash separators, symbolic
+//! links, duplicate names, invalid UTF-8, empty archives, entry-count limits,
+//! and decompressed-size caps. Each asserts the filesystem afterwards rather
+//! than trusting the returned `Err`:
 //!
 //! 1. No entry escapes the extraction directory (`../escape.py`).
 //! 2. No entry name that is not valid UTF-8 is lossily decoded into a path.
@@ -71,6 +73,9 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 
 use crikey_legacy_compat::{
     LegacyPackage, PackageError, PackageId, PackageLimits, PackageLoader, PackageModule, PackageRoot,
@@ -359,7 +364,7 @@ fn archive_from_directory(source: &Path, archive: &Path) {
 /// the test would pass for the wrong reason.
 #[derive(Debug, Default)]
 struct RawZip {
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
+    entries: Vec<(Vec<u8>, Vec<u8>, u32)>,
 }
 
 impl RawZip {
@@ -371,7 +376,15 @@ impl RawZip {
     const DOS_DATE: u16 = 0x0021;
 
     fn push(&mut self, name: impl Into<Vec<u8>>, data: impl Into<Vec<u8>>) -> &mut Self {
-        self.entries.push((name.into(), data.into()));
+        self.entries.push((name.into(), data.into(), 0));
+        self
+    }
+
+    fn push_symlink(&mut self, name: impl Into<Vec<u8>>, target: impl Into<Vec<u8>>) -> &mut Self {
+        // Unix mode S_IFLNK | 0777, stored in the high half of the central
+        // directory's external-attributes field.
+        self.entries
+            .push((name.into(), target.into(), (0o120777u32) << 16));
         self
     }
 
@@ -379,7 +392,7 @@ impl RawZip {
         let mut body = Vec::new();
         let mut central = Vec::new();
 
-        for (name, data) in &self.entries {
+        for (name, data, external_attributes) in &self.entries {
             let crc = crc32(data);
             let offset = body.len() as u32;
             let size = data.len() as u32;
@@ -399,7 +412,7 @@ impl RawZip {
             body.extend_from_slice(data);
 
             central.extend_from_slice(&0x0201_4b50u32.to_le_bytes()); // central header signature
-            central.extend_from_slice(&20u16.to_le_bytes()); // version made by
+            central.extend_from_slice(&((3u16 << 8) | 20).to_le_bytes()); // Unix version made by
             central.extend_from_slice(&20u16.to_le_bytes()); // version needed
             central.extend_from_slice(&Self::UTF8_NAME_FLAG.to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes()); // method: stored
@@ -413,7 +426,7 @@ impl RawZip {
             central.extend_from_slice(&0u16.to_le_bytes()); // comment length
             central.extend_from_slice(&0u16.to_le_bytes()); // disk number start
             central.extend_from_slice(&0u16.to_le_bytes()); // internal attributes
-            central.extend_from_slice(&0u32.to_le_bytes()); // external attributes
+            central.extend_from_slice(&external_attributes.to_le_bytes()); // external attributes
             central.extend_from_slice(&offset.to_le_bytes());
             central.extend_from_slice(name);
         }
@@ -894,6 +907,47 @@ fn repeated_loads_of_the_same_archive_reuse_the_extraction_without_duplicating_e
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_content_addressed_cache_path_is_not_reused() {
+    let tree = TempTree::new("cache-symlink");
+    let staging = tree.root("staging");
+    let archive_path = tree.root("archived").join(archive_file_name("cached"));
+    let package_dir = build_directory_package(
+        &staging,
+        "cached",
+        &[("cached.py", b"import keypirinha\n"), ("data.txt", b"package\n")],
+    );
+    archive_from_directory(&package_dir, &archive_path);
+
+    let loader = PackageLoader::new(tree.cache_root());
+    let first = load_ok(&loader, &archive_path);
+    let extracted = first.root.content_root().to_path_buf();
+    fs::remove_dir_all(&extracted).expect("the first extraction must be a real directory");
+
+    let outside = tree.path().join("outside");
+    write_file(&outside.join("sentinel.txt"), b"outside\n");
+    symlink(&outside, &extracted).expect("the hostile cache symlink must be creatable");
+
+    let second = load_ok(&loader, &archive_path);
+    let metadata = fs::symlink_metadata(second.root.content_root())
+        .expect("the loader must leave a cache directory at the expected path");
+    assert!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "a symlink at the content-addressed path must not be accepted as an extraction"
+    );
+    assert_eq!(
+        fs::read(second.root.content_root().join("data.txt")).ok(),
+        Some(b"package\n".to_vec()),
+        "cache reuse must serve the archive's bytes, not the target of a planted symlink"
+    );
+    assert_eq!(
+        fs::read(outside.join("sentinel.txt")).ok(),
+        Some(b"outside\n".to_vec()),
+        "re-extraction must not write through a cache symlink"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Discovery over multiple roots
 // ---------------------------------------------------------------------------
@@ -1116,13 +1170,71 @@ fn an_archive_entry_that_escapes_the_package_root_is_refused_and_writes_nothing(
 }
 
 #[test]
+fn absolute_and_backslash_entry_names_are_refused_before_extraction() {
+    for (label, hostile_name) in [
+        ("absolute-entry", "/outside.py"),
+        ("backslash-entry", "lib\\outside.py"),
+    ] {
+        let tree = TempTree::new(label);
+        let archive_path = tree.root("archived").join(archive_file_name(label));
+
+        let mut archive = RawZip::default();
+        archive
+            .push("valid.py", &b"import keypirinha\n"[..])
+            .push(hostile_name, &b"HOSTILE = True\n"[..]);
+        archive.write_to(&archive_path);
+
+        let cache_root = tree.cache_root();
+        let loader = PackageLoader::new(cache_root.clone());
+        let error = load_err(&loader, &archive_path);
+        let PackageError::UnsafeEntryPath { entry, .. } = &error else {
+            panic!("entry name {hostile_name:?} must be refused as UnsafeEntryPath, got {error:?}");
+        };
+        assert_eq!(
+            entry, hostile_name,
+            "the refusal must preserve the declared hostile entry name"
+        );
+        assert!(
+            relative_files(&cache_root).is_empty(),
+            "unsafe entry {hostile_name:?} must be rejected before extraction"
+        );
+    }
+}
+
+#[test]
+fn symbolic_link_archive_entries_are_refused_before_extraction() {
+    let tree = TempTree::new("symlink-entry");
+    let archive_path = tree.root("archived").join(archive_file_name("symlink"));
+
+    let mut archive = RawZip::default();
+    archive
+        .push("symlink.py", &b"import keypirinha\n"[..])
+        .push_symlink("linked.py", &b"../outside.py"[..]);
+    archive.write_to(&archive_path);
+
+    let cache_root = tree.cache_root();
+    let loader = PackageLoader::new(cache_root.clone());
+    let error = load_err(&loader, &archive_path);
+    let PackageError::SymlinkEntry { entry, .. } = &error else {
+        panic!("symbolic-link entries must be refused as SymlinkEntry, got {error:?}");
+    };
+    assert_eq!(entry, "linked.py");
+    assert!(
+        relative_files(&cache_root).is_empty(),
+        "a symbolic-link refusal must happen before extraction"
+    );
+}
+
+#[test]
 fn an_empty_or_non_zip_keypirinha_package_file_is_refused_as_a_malformed_archive() {
     let tree = TempTree::new("malformed-archive");
     let root = tree.root("archived");
 
     let empty = root.join(archive_file_name("empty"));
+    let valid_empty = root.join(archive_file_name("valid-empty"));
     let not_zip = root.join(archive_file_name("nonzip"));
     write_file(&empty, b"");
+    RawZip::default().write_to(&valid_empty);
     write_file(
         &not_zip,
         b"#!/usr/bin/env python3\nprint('definitely not a zip container')\n",
@@ -1150,6 +1262,16 @@ fn an_empty_or_non_zip_keypirinha_package_file_is_refused_as_a_malformed_archive
         );
         assert_error_names(&error, &file_name_of(path));
     }
+
+    let error = load_err(&loader, &valid_empty);
+    let PackageError::EmptyArchive { archive } = &error else {
+        panic!("a valid ZIP with no entries must be refused as EmptyArchive, got {error:?}");
+    };
+    assert_eq!(
+        archive, &valid_empty,
+        "the empty-archive refusal must name the archive"
+    );
+    assert_error_names(&error, &file_name_of(&valid_empty));
 
     let discovered = discover_ok(&loader, &[root]);
     assert!(
@@ -1299,5 +1421,95 @@ fn an_entry_larger_than_the_documented_size_cap_is_refused_rather_than_truncated
         vec![Path::new("big.txt")],
         "the same archive loads cleanly under the default caps, proving the refusal was the cap and \
          not a malformed fixture"
+    );
+}
+#[test]
+fn duplicate_archive_entry_names_are_refused_before_extraction() {
+    let tree = TempTree::new("duplicate-entry");
+    let archive_path = tree.root("archived").join(archive_file_name("duplicate"));
+
+    let mut archive = RawZip::default();
+    archive
+        .push("duplicate.py", &b"FIRST = True\n"[..])
+        .push("duplicate.py", &b"SECOND = True\n"[..]);
+    archive.write_to(&archive_path);
+
+    let cache_root = tree.cache_root();
+    let loader = PackageLoader::new(cache_root.clone());
+    let error = load_err(&loader, &archive_path);
+    let PackageError::DuplicateEntryName { archive, entry } = &error else {
+        panic!("duplicate ZIP entry names must be refused as DuplicateEntryName, got {error:?}");
+    };
+    assert_eq!(archive, &archive_path);
+    assert_eq!(entry, "duplicate.py");
+    assert!(
+        relative_files(&cache_root).is_empty(),
+        "a duplicate-entry refusal must happen before extraction, found {:?}",
+        relative_files(&cache_root)
+    );
+}
+
+#[test]
+fn an_archive_with_too_many_entries_is_refused_before_extraction() {
+    let tree = TempTree::new("too-many-entries");
+    let archive_path = tree.root("archived").join(archive_file_name("many"));
+
+    let mut archive = RawZip::default();
+    archive
+        .push("many.py", &b"import keypirinha\n"[..])
+        .push("resource.txt", &b"resource\n"[..]);
+    archive.write_to(&archive_path);
+
+    let cache_root = tree.cache_root();
+    let loader = PackageLoader::with_limits(
+        cache_root.clone(),
+        PackageLimits {
+            max_entries: 1,
+            ..PackageLimits::default()
+        },
+    );
+    let error = load_err(&loader, &archive_path);
+    let PackageError::TooManyEntries { path, count, limit } = &error else {
+        panic!("an archive over the entry-count cap must be refused as TooManyEntries, got {error:?}");
+    };
+    assert_eq!(path, &archive_path);
+    assert_eq!(*count, 2);
+    assert_eq!(*limit, 1);
+    assert!(
+        relative_files(&cache_root).is_empty(),
+        "an entry-count refusal must happen before extraction"
+    );
+}
+
+#[test]
+fn archive_total_uncompressed_size_is_bounded_before_extraction() {
+    let tree = TempTree::new("total-size");
+    let archive_path = tree.root("archived").join(archive_file_name("total"));
+
+    let mut archive = RawZip::default();
+    archive
+        .push("total.py", &b"12345678"[..])
+        .push("data.bin", &b"abcdefgh"[..]);
+    archive.write_to(&archive_path);
+
+    let cache_root = tree.cache_root();
+    let loader = PackageLoader::with_limits(
+        cache_root.clone(),
+        PackageLimits {
+            max_entry_bytes: 8,
+            max_total_bytes: 10,
+            ..PackageLimits::default()
+        },
+    );
+    let error = load_err(&loader, &archive_path);
+    let PackageError::PackageTooLarge { archive, size, limit } = &error else {
+        panic!("an archive over the total-size cap must be refused as PackageTooLarge, got {error:?}");
+    };
+    assert_eq!(archive, &archive_path);
+    assert_eq!(*size, 16);
+    assert_eq!(*limit, 10);
+    assert!(
+        relative_files(&cache_root).is_empty(),
+        "a total-size refusal must happen before extraction"
     );
 }

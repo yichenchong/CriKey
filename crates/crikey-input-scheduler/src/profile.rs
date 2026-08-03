@@ -25,8 +25,11 @@ impl SchedulingProfile {
     }
 
     /// Whether dynamic suggestion results may be cached across requests.
+    ///
+    /// `legacy-optimized` is an explicit opt-in, so it may enable caching;
+    /// unchanged `legacy-strict` plugins may not.
     pub fn allows_dynamic_result_cache(self) -> bool {
-        matches!(self, SchedulingProfile::Modern)
+        !matches!(self, SchedulingProfile::LegacyStrict)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -35,5 +38,18 @@ impl SchedulingProfile {
             SchedulingProfile::LegacyOptimized => "legacy-optimized",
             SchedulingProfile::Modern => "modern",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_optimized_allows_opt_in_dynamic_cache() {
+        assert!(
+            SchedulingProfile::LegacyOptimized.allows_dynamic_result_cache(),
+            "legacy-optimized is the explicit profile that permits dynamic caching"
+        );
     }
 }

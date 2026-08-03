@@ -25,6 +25,11 @@
 
 #![cfg(target_os = "macos")]
 
+use crikey_core::{CoreError, PlatformPath, Result};
+use crikey_platform::{
+    bundle_display_name, parse_info_plist, ApplicationDiscovery, Capability, CapabilityState,
+    DiscoveredApplication, ProcessLauncher,
+};
 use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -34,13 +39,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-
-use crikey_core::{CoreError, PlatformPath, Result};
-use crikey_platform::{
-    bundle_display_name, parse_info_plist, ApplicationDiscovery, Capability, CapabilityState,
-    DiscoveredApplication, ProcessLauncher,
-};
 
 /// The suffix a bundle directory carries, as bytes: a directory name is not
 /// required to be UTF-8, and the check has to happen before any conversion.
@@ -320,15 +320,28 @@ impl ProcessLauncher for OpenLauncher {
 /// ends the moment `open` does.
 ///
 /// If the thread cannot be created -- the process is out of memory or at its
-/// thread limit -- the handle is dropped and that one child stays uncollected
-/// until CriKey exits. The launch itself already succeeded, so it is not turned
-/// into an error.
-fn reap(mut child: Child) {
-    let _ = thread::Builder::new()
+/// thread limit -- the child is waited for synchronously as a last resort.
+/// `open` normally exits within milliseconds, and this fallback closes the
+/// process handle rather than leaving a zombie behind. The launch itself
+/// already succeeded, so a reaper-thread failure is not turned into an error.
+fn reap(child: Child) {
+    let child = Arc::new(Mutex::new(Some(child)));
+    let reaper_child = Arc::clone(&child);
+    if thread::Builder::new()
         .name("crikey-open-reaper".to_owned())
         .spawn(move || {
+            let child = reaper_child.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(mut child) = child {
+                let _ = child.wait();
+            }
+        })
+        .is_err()
+    {
+        let child = child.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(mut child) = child {
             let _ = child.wait();
-        });
+        }
+    }
 }
 
 /// A path spelled so `open` reads it as an operand and not as an option.

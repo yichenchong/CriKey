@@ -186,12 +186,9 @@ impl Manifest {
             return Err(invalid("plugin.scheduling-profile", PolicyProblem::Contradictory));
         }
 
-        // Modern declarations are retained for diagnostics but have no semantic
-        // force under the strict compatibility profile.
-        if profile == SchedulingProfile::LegacyStrict {
-            return Ok(());
-        }
-
+        // Numeric declarations are validated even when legacy-strict ignores
+        // their modern scheduling semantics. Otherwise a typo can be accepted
+        // and hidden behind the compatibility profile.
         if self
             .query
             .debounce_ms
@@ -226,6 +223,21 @@ impl Manifest {
                 PolicyProblem::OutOfRange,
             ));
         }
+
+        // Modern declarations are retained for diagnostics but have no
+        // semantic force under the strict compatibility profile.
+        if profile == SchedulingProfile::LegacyStrict {
+            return Ok(());
+        }
+
+        if self.query.debounce_ms == Some(0) && self.query.maximum_wait_ms.is_some() {
+            return Err(invalid_with_detail(
+                "query.maximum-wait-ms",
+                PolicyProblem::Contradictory,
+                "query.maximum-wait-ms cannot be combined with query.debounce-ms = 0 because zero debounce dispatches immediately",
+            ));
+        }
+
         if self.query.network_backed == Some(true) && !self.permissions.network {
             return Err(invalid("query.network-backed", PolicyProblem::NotPermitted));
         }
@@ -275,7 +287,18 @@ fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
         .get(..prefix.len())
         .is_some_and(|leading| leading.eq_ignore_ascii_case(prefix.as_bytes()))
 }
-
 fn invalid(field: &'static str, problem: PolicyProblem) -> ManifestError {
-    ManifestError::InvalidQueryPolicy { field, problem }
+    invalid_with_detail(field, problem, None)
+}
+
+fn invalid_with_detail(
+    field: &'static str,
+    problem: PolicyProblem,
+    detail: impl Into<Option<&'static str>>,
+) -> ManifestError {
+    ManifestError::InvalidQueryPolicy {
+        field,
+        problem,
+        detail: detail.into(),
+    }
 }

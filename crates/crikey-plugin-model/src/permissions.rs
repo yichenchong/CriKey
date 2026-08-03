@@ -1,5 +1,8 @@
 //! Declared plugin permissions (spec 20).
 //!
+//! These values record what a manifest requests. They do not, by themselves,
+//! provide operating-system or host-mediated enforcement; the runtime host
+//! must check a permission before performing its privileged operation.
 //! The UI must not claim a plugin is sandboxed where the operating system does
 //! not actually enforce it.
 

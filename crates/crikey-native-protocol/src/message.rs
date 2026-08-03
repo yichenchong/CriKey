@@ -10,12 +10,57 @@ use crate::wire::{
     decode_bytes, decode_field_varint, decode_string, expect_wire, push_decoded, put_bytes, put_message,
     put_string, put_varint, read_field, DecodeBudget, WireType,
 };
-use crate::{Message, ProtocolError};
+use crate::{Message, ProtocolError, MAX_FRAME_BYTES};
 
 trait DecodeWithBudget: Sized {
     fn decode_with_budget(bytes: &[u8], budget: &mut DecodeBudget) -> Result<Self, ProtocolError>;
 }
 
+fn ensure_message_size(bytes: &[u8]) -> Result<(), ProtocolError> {
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge(bytes.len()));
+    }
+    Ok(())
+}
+
+fn mark_singular(seen: &mut u64, field_number: u32) -> Result<(), ProtocolError> {
+    let bit = 1_u64
+        .checked_shl(field_number)
+        .ok_or_else(|| ProtocolError::Malformed("known field number is too large".to_owned()))?;
+    if *seen & bit != 0 {
+        return Err(ProtocolError::Malformed(format!(
+            "duplicate singular field {field_number}"
+        )));
+    }
+    *seen |= bit;
+    Ok(())
+}
+
+fn decode_u32(field: crate::wire::Field<'_>) -> Result<u32, ProtocolError> {
+    let raw = decode_field_varint(field)?;
+    u32::try_from(raw).map_err(|_| ProtocolError::Malformed("uint32 value overflows".to_owned()))
+}
+
+fn decode_i32(field: crate::wire::Field<'_>) -> Result<i32, ProtocolError> {
+    let raw = decode_field_varint(field)?;
+    let bits = if raw <= u64::from(u32::MAX) || raw >> 32 == u64::from(u32::MAX) {
+        u32::try_from(raw & u64::from(u32::MAX))
+            .map_err(|_| ProtocolError::Malformed("int32 value overflows".to_owned()))?
+    } else {
+        return Err(ProtocolError::Malformed("int32 value overflows".to_owned()));
+    };
+    Ok(i32::from_ne_bytes(bits.to_ne_bytes()))
+}
+
+fn encode_enum(field: u32, value: i32, out: &mut Vec<u8>) {
+    if value != 0 {
+        put_varint(
+            field,
+            u64::try_from(value).expect("protocol enum values are non-negative"),
+            out,
+        );
+    }
+}
 macro_rules! proto_enum {
     ($name:ident, $default:ident, $( $variant:ident = $value:expr ),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,27 +161,38 @@ fn nested<M: DecodeWithBudget>(
     budget: &mut DecodeBudget,
 ) -> Result<M, ProtocolError> {
     expect_wire(field, WireType::Length)?;
-    M::decode_with_budget(field.value, budget)
+    budget.enter_nested()?;
+    let result = M::decode_with_budget(field.value, budget);
+    budget.leave_nested();
+    result
 }
 
 fn map_entry(
     field: crate::wire::Field<'_>,
     budget: &mut DecodeBudget,
-) -> Result<(String, String), ProtocolError> {
+) -> Result<(String, String, bool), ProtocolError> {
     expect_wire(field, WireType::Length)?;
     let bytes = field.value;
     let mut cursor = 0;
     let mut key = String::new();
     let mut value = String::new();
+    let mut seen = 0_u64;
+    let mut has_unknown = false;
     while cursor < bytes.len() {
         let field = read_field(bytes, &mut cursor)?;
         match field.number {
-            1 => key = decode_string(field, budget)?,
-            2 => value = decode_string(field, budget)?,
-            _ => {}
+            1 => {
+                mark_singular(&mut seen, 1)?;
+                key = decode_string(field, budget)?;
+            }
+            2 => {
+                mark_singular(&mut seen, 2)?;
+                value = decode_string(field, budget)?;
+            }
+            _ => has_unknown = true,
         }
     }
-    Ok((key, value))
+    Ok((key, value, has_unknown))
 }
 
 fn insert_map(
@@ -273,6 +329,7 @@ impl Message for Envelope {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        ensure_message_size(bytes)?;
         let mut budget = DecodeBudget::new();
         Self::decode_with_budget(bytes, &mut budget)
     }
@@ -289,9 +346,39 @@ impl DecodeWithBudget for Envelope {
             unknown: UnknownFields::default(),
         };
         let mut cursor = 0;
+        let mut seen = 0_u64;
         while cursor < bytes.len() {
             let start = cursor;
             let field = read_field(bytes, &mut cursor)?;
+            if matches!(
+                field.number,
+                1 | 2
+                    | 3
+                    | 4
+                    | 10
+                    | 11
+                    | 12
+                    | 13
+                    | 14
+                    | 15
+                    | 16
+                    | 17
+                    | 18
+                    | 19
+                    | 20
+                    | 21
+                    | 22
+                    | 23
+                    | 24
+                    | 25
+                    | 26
+                    | 27
+                    | 28
+                    | 29
+                    | 30
+            ) {
+                mark_singular(&mut seen, field.number)?;
+            }
             match field.number {
                 1 => value.connection_id = decode_field_varint(field)?,
                 2 => value.request_id = decode_field_varint(field)?,
@@ -325,8 +412,17 @@ impl DecodeWithBudget for Envelope {
     }
 }
 
+macro_rules! field_is_repeated {
+    ($number:expr; []) => {
+        false
+    };
+    ($number:expr; [$($repeated:literal),+ $(,)?]) => {
+        matches!($number, $($repeated)|+)
+    };
+}
+
 macro_rules! impl_simple {
-    ($type:ident { $( $field_name:ident : $fty:ty = $default:expr ),* $(,)? } encode($this:ident, $out:ident) { $( $enc:tt )* } decode($value:ident, $field:ident, $budget:ident) { $( $number:literal => $body:expr, )* }) => {
+    ($type:ident { $( $field_name:ident : $fty:ty = $default:expr ),* $(,)? } repeated $repeated:tt encode($this:ident, $out:ident) { $( $enc:tt )* } decode($value:ident, $field:ident, $budget:ident) { $( $number:literal => $body:expr, )* }) => {
         #[derive(Debug, Clone, PartialEq, Eq)]
         pub struct $type { $( pub $field_name: $fty, )* pub unknown: UnknownFields }
         impl Message for $type {
@@ -337,6 +433,7 @@ macro_rules! impl_simple {
                 finish($out, &$this.unknown)
             }
             fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
+                ensure_message_size(bytes)?;
                 let mut budget = DecodeBudget::new();
                 Self::decode_with_budget(bytes, &mut budget)
             }
@@ -348,11 +445,17 @@ macro_rules! impl_simple {
             ) -> Result<Self, ProtocolError> {
                 let mut $value = Self { $( $field_name: $default, )* unknown: UnknownFields::default() };
                 let mut cursor = 0;
+                let mut seen = 0_u64;
                 while cursor < bytes.len() {
                     let start = cursor;
                     let $field = read_field(bytes, &mut cursor)?;
                     match $field.number {
-                        $( $number => $body, )*
+                        $( $number => {
+                            if !field_is_repeated!($field.number; $repeated) {
+                                mark_singular(&mut seen, $field.number)?;
+                            }
+                            $body
+                        },)*
                         _ => unknown(bytes, start, $field.end, &mut $value.unknown, $budget)?,
                     }
                 }
@@ -370,7 +473,7 @@ impl_simple!(Handshake {
     session_token: String = String::new(),
     plugin_name: String = String::new(),
     sdk_version: String = String::new()
-} encode(this, out) {
+} repeated [4] encode(this, out) {
     if this.protocol_version != 0 { put_varint(1, u64::from(this.protocol_version), &mut out); }
     if !this.plugin_id.is_empty() { put_string(2, &this.plugin_id, &mut out); }
     if !this.plugin_version.is_empty() { put_string(3, &this.plugin_version, &mut out); }
@@ -379,7 +482,7 @@ impl_simple!(Handshake {
     if !this.plugin_name.is_empty() { put_string(6, &this.plugin_name, &mut out); }
     if !this.sdk_version.is_empty() { put_string(7, &this.sdk_version, &mut out); }
 } decode(value, field, budget) {
-    1 => value.protocol_version = decode_field_varint(field)? as u32,
+    1 => value.protocol_version = decode_u32(field)?,
     2 => value.plugin_id = decode_string(field, budget)?,
     3 => value.plugin_version = decode_string(field, budget)?,
     4 => push_decoded(&mut value.capabilities, decode_string(field, budget)?, budget)?,
@@ -396,7 +499,7 @@ impl_simple!(HandshakeAck {
     reject_reason: String = String::new(),
     max_frame_bytes: u64 = 0,
     initial_credits: u32 = 0
-} encode(this, out) {
+} repeated [2] encode(this, out) {
     if this.protocol_version != 0 { put_varint(1, u64::from(this.protocol_version), &mut out); }
     for value in &this.host_capabilities { put_string(2, value, &mut out); }
     if !this.host_version.is_empty() { put_string(3, &this.host_version, &mut out); }
@@ -405,40 +508,40 @@ impl_simple!(HandshakeAck {
     if this.max_frame_bytes != 0 { put_varint(6, this.max_frame_bytes, &mut out); }
     if this.initial_credits != 0 { put_varint(7, u64::from(this.initial_credits), &mut out); }
 } decode(value, field, budget) {
-    1 => value.protocol_version = decode_field_varint(field)? as u32,
+    1 => value.protocol_version = decode_u32(field)?,
     2 => push_decoded(&mut value.host_capabilities, decode_string(field, budget)?, budget)?,
     3 => value.host_version = decode_string(field, budget)?,
     4 => value.accepted = decode_field_varint(field)? != 0,
     5 => value.reject_reason = decode_string(field, budget)?,
     6 => value.max_frame_bytes = decode_field_varint(field)?,
-    7 => value.initial_credits = decode_field_varint(field)? as u32,
+    7 => value.initial_credits = decode_u32(field)?,
 });
 
 impl_simple!(Lifecycle {
     kind: LifecycleKind = LifecycleKind::KindUnspecified
-} encode(this, out) {
-    if this.kind.as_i32() != 0 { put_varint(1, this.kind.as_i32() as u64, &mut out); }
+} repeated [] encode(this, out) {
+    if this.kind.as_i32() != 0 { encode_enum(1, this.kind.as_i32(), &mut out); }
 } decode(value, field, budget) {
-    1 => value.kind = LifecycleKind::from_i32(decode_field_varint(field)? as i32),
+    1 => value.kind = LifecycleKind::from_i32(decode_i32(field)?),
 });
 
 impl_simple!(LifecycleAck {
     kind: LifecycleKind = LifecycleKind::KindUnspecified,
     ok: bool = false,
     error: Option<StructuredError> = None
-} encode(this, out) {
-    if this.kind.as_i32() != 0 { put_varint(1, this.kind.as_i32() as u64, &mut out); }
+} repeated [] encode(this, out) {
+    if this.kind.as_i32() != 0 { encode_enum(1, this.kind.as_i32(), &mut out); }
     if this.ok { put_varint(2, 1, &mut out); }
     if let Some(error) = &this.error { put_message(3, error, &mut out); }
 } decode(value, field, budget) {
-    1 => value.kind = LifecycleKind::from_i32(decode_field_varint(field)? as i32),
+    1 => value.kind = LifecycleKind::from_i32(decode_i32(field)?),
     2 => value.ok = decode_field_varint(field)? != 0,
     3 => value.error = Some(nested(field, budget)?),
 });
 
 impl_simple!(CatalogRequest {
     max_items: u64 = 0
-} encode(this, out) {
+} repeated [] encode(this, out) {
     if this.max_items != 0 { put_varint(1, this.max_items, &mut out); }
 } decode(value, field, budget) {
     1 => value.max_items = decode_field_varint(field)?,
@@ -449,7 +552,7 @@ impl_simple!(CatalogBatch {
     done: bool = false,
     sequence: u64 = 0,
     error: Option<StructuredError> = None
-} encode(this, out) {
+} repeated [1] encode(this, out) {
     for item in &this.items { put_message(1, item, &mut out); }
     if this.done { put_varint(2, 1, &mut out); }
     if this.sequence != 0 { put_varint(3, this.sequence, &mut out); }
@@ -467,7 +570,7 @@ impl_simple!(SuggestRequest {
     selected_item_id: String = String::new(),
     max_items: u64 = 0,
     max_batches: u64 = 0
-} encode(this, out) {
+} repeated [] encode(this, out) {
     if !this.text.is_empty() { put_string(1, &this.text, &mut out); }
     if !this.normalized_text.is_empty() { put_string(2, &this.normalized_text, &mut out); }
     if !this.selected_item_id.is_empty() { put_string(3, &this.selected_item_id, &mut out); }
@@ -488,7 +591,7 @@ impl_simple!(Action {
     icon_reference: String = String::new(),
     execution_policy: String = String::new(),
     applicable_categories: Vec<String> = Vec::new()
-} encode(this, out) {
+} repeated [6] encode(this, out) {
     if !this.action_id.is_empty() { put_string(1, &this.action_id, &mut out); }
     if !this.label.is_empty() { put_string(2, &this.label, &mut out); }
     if !this.description.is_empty() { put_string(3, &this.description, &mut out); }
@@ -517,7 +620,7 @@ impl_simple!(Item {
     actions: Vec<Action> = Vec::new(),
     argument_policy: String = String::new(),
     hit_policy: String = String::new()
-} encode(this, out) {
+} repeated [6, 9, 10] encode(this, out) {
     if !this.stable_id.is_empty() { put_string(1, &this.stable_id, &mut out); }
     if !this.label.is_empty() { put_string(2, &this.label, &mut out); }
     if !this.description.is_empty() { put_string(3, &this.description, &mut out); }
@@ -525,7 +628,13 @@ impl_simple!(Item {
     if !this.category.is_empty() { put_string(5, &this.category, &mut out); }
     for value in &this.search_terms { put_string(6, value, &mut out); }
     if !this.icon_reference.is_empty() { put_string(7, &this.icon_reference, &mut out); }
-    if this.score_hint != 0 { put_varint(8, this.score_hint as i64 as u64, &mut out); }
+    if this.score_hint != 0 {
+        put_varint(
+            8,
+            u64::from_ne_bytes(i64::from(this.score_hint).to_ne_bytes()),
+            &mut out,
+        );
+    }
     for (key, value) in &this.metadata { put_map(9, key, value, &mut out); }
     for action in &this.actions { put_message(10, action, &mut out); }
     if !this.argument_policy.is_empty() { put_string(11, &this.argument_policy, &mut out); }
@@ -538,8 +647,15 @@ impl_simple!(Item {
     5 => value.category = decode_string(field, budget)?,
     6 => push_decoded(&mut value.search_terms, decode_string(field, budget)?, budget)?,
     7 => value.icon_reference = decode_string(field, budget)?,
-    8 => value.score_hint = decode_field_varint(field)? as i32,
-    9 => { let (key, map_value) = map_entry(field, budget)?; insert_map(&mut value.metadata, key, map_value, budget)?; },
+    8 => value.score_hint = decode_i32(field)?,
+    9 => {
+        let (key, map_value, has_unknown) = map_entry(field, budget)?;
+        if has_unknown {
+            value.unknown.push_raw_bounded(field.raw, budget)?;
+        } else {
+            insert_map(&mut value.metadata, key, map_value, budget)?;
+        }
+    },
     10 => push_decoded(&mut value.actions, nested(field, budget)?, budget)?,
     11 => value.argument_policy = decode_string(field, budget)?,
     12 => value.hit_policy = decode_string(field, budget)?,
@@ -550,13 +666,13 @@ impl_simple!(ResultBatch {
     items: Vec<Item> = Vec::new(),
     sequence: u64 = 0,
     error: Option<StructuredError> = None
-} encode(this, out) {
-    if this.state.as_i32() != 0 { put_varint(1, this.state.as_i32() as u64, &mut out); }
+} repeated [2] encode(this, out) {
+    if this.state.as_i32() != 0 { encode_enum(1, this.state.as_i32(), &mut out); }
     for item in &this.items { put_message(2, item, &mut out); }
     if this.sequence != 0 { put_varint(3, this.sequence, &mut out); }
     if let Some(error) = &this.error { put_message(4, error, &mut out); }
 } decode(value, field, budget) {
-    1 => value.state = BatchState::from_i32(decode_field_varint(field)? as i32),
+    1 => value.state = BatchState::from_i32(decode_i32(field)?),
     2 => push_decoded(&mut value.items, nested(field, budget)?, budget)?,
     3 => value.sequence = decode_field_varint(field)?,
     4 => value.error = Some(nested(field, budget)?),
@@ -564,7 +680,7 @@ impl_simple!(ResultBatch {
 
 impl_simple!(Cancel {
     reason: String = String::new()
-} encode(this, out) {
+} repeated [] encode(this, out) {
     if !this.reason.is_empty() { put_string(1, &this.reason, &mut out); }
 } decode(value, field, budget) {
     1 => value.reason = decode_string(field, budget)?,
@@ -574,7 +690,7 @@ impl_simple!(ExecuteRequest {
     item_id: String = String::new(),
     action_id: String = String::new(),
     argument: String = String::new()
-} encode(this, out) {
+} repeated [] encode(this, out) {
     if !this.item_id.is_empty() { put_string(1, &this.item_id, &mut out); }
     if !this.action_id.is_empty() { put_string(2, &this.action_id, &mut out); }
     if !this.argument.is_empty() { put_string(3, &this.argument, &mut out); }
@@ -587,22 +703,29 @@ impl_simple!(ExecuteRequest {
 impl_simple!(ExecuteResult {
     outcome: ExecuteOutcomeCode = ExecuteOutcomeCode::OutcomeUnspecified,
     error: Option<StructuredError> = None
-} encode(this, out) {
-    if this.outcome.as_i32() != 0 { put_varint(1, this.outcome.as_i32() as u64, &mut out); }
+} repeated [] encode(this, out) {
+    if this.outcome.as_i32() != 0 { encode_enum(1, this.outcome.as_i32(), &mut out); }
     if let Some(error) = &this.error { put_message(2, error, &mut out); }
 } decode(value, field, budget) {
-    1 => value.outcome = ExecuteOutcomeCode::from_i32(decode_field_varint(field)? as i32),
+    1 => value.outcome = ExecuteOutcomeCode::from_i32(decode_i32(field)?),
     2 => value.error = Some(nested(field, budget)?),
 });
 
 impl_simple!(ConfigurationChange {
     values: BTreeMap<String, String> = BTreeMap::new(),
     complete: bool = false
-} encode(this, out) {
+} repeated [1] encode(this, out) {
     for (key, value) in &this.values { put_map(1, key, value, &mut out); }
     if this.complete { put_varint(2, 1, &mut out); }
 } decode(value, field, budget) {
-    1 => { let (key, map_value) = map_entry(field, budget)?; insert_map(&mut value.values, key, map_value, budget)?; },
+    1 => {
+        let (key, map_value, has_unknown) = map_entry(field, budget)?;
+        if has_unknown {
+            value.unknown.push_raw_bounded(field.raw, budget)?;
+        } else {
+            insert_map(&mut value.values, key, map_value, budget)?;
+        }
+    },
     2 => value.complete = decode_field_varint(field)? != 0,
 });
 
@@ -610,24 +733,31 @@ impl_simple!(Event {
     kind: EventKind = EventKind::KindUnspecified,
     attributes: BTreeMap<String, String> = BTreeMap::new(),
     flags: u64 = 0
-} encode(this, out) {
-    if this.kind.as_i32() != 0 { put_varint(1, this.kind.as_i32() as u64, &mut out); }
+} repeated [2] encode(this, out) {
+    if this.kind.as_i32() != 0 { encode_enum(1, this.kind.as_i32(), &mut out); }
     for (key, value) in &this.attributes { put_map(2, key, value, &mut out); }
     if this.flags != 0 { put_varint(3, this.flags, &mut out); }
 } decode(value, field, budget) {
-    1 => value.kind = EventKind::from_i32(decode_field_varint(field)? as i32),
-    2 => { let (key, map_value) = map_entry(field, budget)?; insert_map(&mut value.attributes, key, map_value, budget)?; },
+    1 => value.kind = EventKind::from_i32(decode_i32(field)?),
+    2 => {
+        let (key, map_value, has_unknown) = map_entry(field, budget)?;
+        if has_unknown {
+            value.unknown.push_raw_bounded(field.raw, budget)?;
+        } else {
+            insert_map(&mut value.attributes, key, map_value, budget)?;
+        }
+    },
     3 => value.flags = decode_field_varint(field)?,
 });
 
 impl_simple!(ResourceRequest {
     kind: ResourceKind = ResourceKind::KindUnspecified,
     reference: String = String::new()
-} encode(this, out) {
-    if this.kind.as_i32() != 0 { put_varint(1, this.kind.as_i32() as u64, &mut out); }
+} repeated [] encode(this, out) {
+    if this.kind.as_i32() != 0 { encode_enum(1, this.kind.as_i32(), &mut out); }
     if !this.reference.is_empty() { put_string(2, &this.reference, &mut out); }
 } decode(value, field, budget) {
-    1 => value.kind = ResourceKind::from_i32(decode_field_varint(field)? as i32),
+    1 => value.kind = ResourceKind::from_i32(decode_i32(field)?),
     2 => value.reference = decode_string(field, budget)?,
 });
 
@@ -637,7 +767,7 @@ impl_simple!(ResourceResponse {
     content: Vec<u8> = Vec::new(),
     media_type: String = String::new(),
     error: Option<StructuredError> = None
-} encode(this, out) {
+} repeated [] encode(this, out) {
     if !this.reference.is_empty() { put_string(1, &this.reference, &mut out); }
     if this.found { put_varint(2, 1, &mut out); }
     if !this.content.is_empty() { put_bytes(3, &this.content, &mut out); }
@@ -655,19 +785,19 @@ impl_simple!(LogRecord {
     level: LogLevel = LogLevel::LevelUnspecified,
     message: String = String::new(),
     timestamp_ms: u64 = 0
-} encode(this, out) {
-    if this.level.as_i32() != 0 { put_varint(1, this.level.as_i32() as u64, &mut out); }
+} repeated [] encode(this, out) {
+    if this.level.as_i32() != 0 { encode_enum(1, this.level.as_i32(), &mut out); }
     if !this.message.is_empty() { put_string(2, &this.message, &mut out); }
     if this.timestamp_ms != 0 { put_varint(3, this.timestamp_ms, &mut out); }
 } decode(value, field, budget) {
-    1 => value.level = LogLevel::from_i32(decode_field_varint(field)? as i32),
+    1 => value.level = LogLevel::from_i32(decode_i32(field)?),
     2 => value.message = decode_string(field, budget)?,
     3 => value.timestamp_ms = decode_field_varint(field)?,
 });
 
 impl_simple!(HealthCheck {
     nonce: u64 = 0
-} encode(this, out) {
+} repeated [] encode(this, out) {
     if this.nonce != 0 { put_varint(1, this.nonce, &mut out); }
 } decode(value, field, budget) {
     1 => value.nonce = decode_field_varint(field)?,
@@ -680,7 +810,7 @@ impl_simple!(HealthReport {
     queue_depth: u32 = 0,
     in_flight: u32 = 0,
     detail: String = String::new()
-} encode(this, out) {
+} repeated [] encode(this, out) {
     if this.nonce != 0 { put_varint(1, this.nonce, &mut out); }
     if this.healthy { put_varint(2, 1, &mut out); }
     if this.memory_bytes != 0 { put_varint(3, this.memory_bytes, &mut out); }
@@ -691,8 +821,8 @@ impl_simple!(HealthReport {
     1 => value.nonce = decode_field_varint(field)?,
     2 => value.healthy = decode_field_varint(field)? != 0,
     3 => value.memory_bytes = decode_field_varint(field)?,
-    4 => value.queue_depth = decode_field_varint(field)? as u32,
-    5 => value.in_flight = decode_field_varint(field)? as u32,
+    4 => value.queue_depth = decode_u32(field)?,
+    5 => value.in_flight = decode_u32(field)?,
     6 => value.detail = decode_string(field, budget)?,
 });
 
@@ -701,13 +831,13 @@ impl_simple!(StructuredError {
     message: String = String::new(),
     detail: String = String::new(),
     request_id: u64 = 0
-} encode(this, out) {
-    if this.code.as_i32() != 0 { put_varint(1, this.code.as_i32() as u64, &mut out); }
+} repeated [] encode(this, out) {
+    if this.code.as_i32() != 0 { encode_enum(1, this.code.as_i32(), &mut out); }
     if !this.message.is_empty() { put_string(2, &this.message, &mut out); }
     if !this.detail.is_empty() { put_string(3, &this.detail, &mut out); }
     if this.request_id != 0 { put_varint(4, this.request_id, &mut out); }
 } decode(value, field, budget) {
-    1 => value.code = ErrorCode::from_i32(decode_field_varint(field)? as i32),
+    1 => value.code = ErrorCode::from_i32(decode_i32(field)?),
     2 => value.message = decode_string(field, budget)?,
     3 => value.detail = decode_string(field, budget)?,
     4 => value.request_id = decode_field_varint(field)?,
@@ -716,17 +846,17 @@ impl_simple!(StructuredError {
 impl_simple!(FlowControl {
     credits: u32 = 0,
     paused: bool = false
-} encode(this, out) {
+} repeated [] encode(this, out) {
     if this.credits != 0 { put_varint(1, u64::from(this.credits), &mut out); }
     if this.paused { put_varint(2, 1, &mut out); }
 } decode(value, field, budget) {
-    1 => value.credits = decode_field_varint(field)? as u32,
+    1 => value.credits = decode_u32(field)?,
     2 => value.paused = decode_field_varint(field)? != 0,
 });
 
 impl_simple!(Shutdown {
     immediate: bool = false
-} encode(this, out) {
+} repeated [] encode(this, out) {
     if this.immediate { put_varint(1, 1, &mut out); }
 } decode(value, field, budget) {
     1 => value.immediate = decode_field_varint(field)? != 0,

@@ -370,7 +370,10 @@ fn oversized_frame_is_a_protocol_error_and_protocol_violation_exit() {
     let error = worker
         .suggest(&request("oversized", 1))
         .expect_err("an oversized declared frame is rejected before body read");
-    assert!(matches!(error, HostError::Protocol(_)));
+    assert!(
+        matches!(error, HostError::Protocol(_)),
+        "unexpected oversized-frame error: {error:?}"
+    );
     assert!(!worker.is_alive());
     let exit = worker.shutdown();
     assert_eq!(exit.kind, ExitKind::ProtocolViolation);
@@ -459,6 +462,41 @@ fn uncredited_log_flood_never_exceeds_the_reader_queue_bound() {
         "raw uncredited logs must drive the bounded queue to, never past, capacity"
     );
     let _exit = worker.kill();
+}
+#[test]
+fn a_large_stderr_write_does_not_deadlock_a_result_response() {
+    let (_, misbehaving) = conformance_binaries();
+    let mut worker = NativeWorker::spawn(
+        launch(&misbehaving, "misbehaving.stderr-flood", "stderr-flood"),
+        options_with_limits(TransportKind::Stdio, ResourceLimits::default(), 2_000),
+    )
+    .expect("stderr-flood fixture completes startup handshake");
+    let suggestions = worker
+        .suggest(&request("stderr", 1))
+        .expect("stderr is drained concurrently with protocol stdout");
+    assert_eq!(suggestions.state, BatchState::Final);
+    let exit = worker.shutdown();
+    assert_eq!(exit.kind, ExitKind::Clean);
+    assert!(exit.stderr_tail.len() <= STDERR_TAIL_BYTES);
+}
+#[test]
+fn a_partial_stream_without_a_terminal_batch_hits_the_call_deadline() {
+    let (_, misbehaving) = conformance_binaries();
+    let mut worker = NativeWorker::spawn(
+        launch(
+            &misbehaving,
+            "misbehaving.partial-no-terminal",
+            "partial-no-terminal",
+        ),
+        options_with_limits(TransportKind::Stdio, ResourceLimits::default(), 100),
+    )
+    .expect("partial-no-terminal fixture completes startup handshake");
+    let error = worker
+        .suggest(&request("unterminated", 1))
+        .expect_err("a stream without a terminal batch must not hang");
+    assert!(matches!(error, HostError::Timeout { .. }));
+    assert!(!worker.is_alive());
+    assert_eq!(worker.shutdown().kind, ExitKind::Killed);
 }
 
 #[test]

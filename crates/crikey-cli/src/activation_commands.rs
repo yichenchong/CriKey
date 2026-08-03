@@ -114,11 +114,15 @@ enum Request {
 fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut cycles = DEFAULT_CYCLES;
     let mut vsync = true;
+    let mut help = false;
     let mut remaining = args.iter();
 
     while let Some(arg) = remaining.next() {
         let (option, value) = match arg.as_str() {
-            "-h" | "--help" => return Ok(Request::Usage),
+            "-h" | "--help" => {
+                help = true;
+                continue;
+            }
             "--cycles" => (
                 "--cycles",
                 remaining.next().ok_or("`--cycles` needs a value")?.as_str(),
@@ -160,6 +164,9 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
         }
     }
 
+    if help {
+        return Ok(Request::Usage);
+    }
     if cycles == 0 {
         return Err("`--cycles` must be at least 1: zero activations measure nothing".to_owned());
     }
@@ -576,5 +583,11 @@ mod tests {
         let lines = report_lines(1, true, &snapshot);
         assert!(lines.contains("measured_span=request_activation..first_present"));
         assert!(lines.contains("excludes=hotkey_delivery,scanout"));
+    }
+
+    #[test]
+    fn help_does_not_hide_unknown_activation_options() {
+        let args = vec!["--help".to_owned(), "--unknown".to_owned()];
+        assert!(parse_args(&args).is_err());
     }
 }

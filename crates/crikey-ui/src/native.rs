@@ -44,8 +44,8 @@ pub struct NativeLauncherConfig {
     /// Drives both `with_transparent` on the window and the surface's
     /// compositing mode, so the two cannot disagree. The shipped theme is
     /// currently opaque, but that is a theming decision rather than a renderer
-    /// invariant: a translucent launcher is enabled here, not by editing the
-    /// surface configuration.
+    /// invariant: a translucent launcher backdrop is enabled here, not by
+    /// editing the surface configuration.
     pub transparent: bool,
     /// How the surface paces presentation.
     ///
@@ -221,11 +221,20 @@ pub fn create_launcher_context() -> egui::Context {
 /// values. This function does not retain a query, selection, or action state;
 /// the supplied [`ViewModel`] remains the sole frame state.
 pub fn build_launcher_frame(context: &egui::Context, input: RawInput, model: &ViewModel) -> NativeUiFrame {
+    build_launcher_frame_with_transparency(context, input, model, false)
+}
+
+fn build_launcher_frame_with_transparency(
+    context: &egui::Context,
+    input: RawInput,
+    model: &ViewModel,
+    transparent: bool,
+) -> NativeUiFrame {
     let mut commands = Vec::new();
     let output = context.run(input, |context| {
         // `Context::run` may repeat a pass after a discard request. Preserve
         // input work from every pass, then collapse identical repeats.
-        draw_launcher(context, model, &mut commands);
+        draw_launcher(context, model, &mut commands, transparent);
     });
     commands.dedup();
     NativeUiFrame { output, commands }
@@ -243,18 +252,16 @@ enum NativeEvent {
 }
 
 struct EventProxy {
-    inner: Mutex<EventLoopProxy<NativeEvent>>,
+    inner: EventLoopProxy<NativeEvent>,
 }
 
 impl EventProxy {
     fn new(inner: EventLoopProxy<NativeEvent>) -> Self {
-        Self {
-            inner: Mutex::new(inner),
-        }
+        Self { inner }
     }
 
     fn send(&self, event: NativeEvent) -> Result<(), RendererError> {
-        lock_recover(&self.inner)
+        self.inner
             .send_event(event)
             .map_err(|_| RendererError::EventLoopClosed)
     }
@@ -374,6 +381,12 @@ impl SharedState {
         if mailbox.wake_session == Some(session) {
             mailbox.wake_session = None;
         }
+    }
+
+    fn clear_all_frames(&self) {
+        let mut mailbox = lock_recover(&self.frames);
+        mailbox.latest = None;
+        mailbox.wake_session = None;
     }
 }
 
@@ -524,6 +537,7 @@ impl NativeLauncherHandle {
     /// Requests a normal event-loop shutdown.
     pub fn request_exit(&self) -> Result<(), RendererError> {
         self.shared.lifecycle.fetch_and(!VISIBLE_BIT, Ordering::AcqRel);
+        self.shared.clear_all_frames();
         self.proxy.send(NativeEvent::Exit)
     }
 
@@ -666,8 +680,8 @@ where
             pending_activation: None,
             modifiers: ModifiersState::default(),
             next_repaint: None,
-            on_event,
             consecutive_surface_retries: 0,
+            on_event,
             terminal_error: None,
             exiting: false,
         }
@@ -678,6 +692,7 @@ where
             self.terminal_error = Some(error);
         }
         self.shared.lifecycle.fetch_and(!VISIBLE_BIT, Ordering::AcqRel);
+        self.shared.clear_all_frames();
         self.exiting = true;
         event_loop.exit();
     }
@@ -874,6 +889,7 @@ where
             NativeEvent::Exit => {
                 self.exiting = true;
                 self.active_session = None;
+                self.shared.clear_all_frames();
                 self.hide();
                 event_loop.exit();
             }
@@ -958,6 +974,7 @@ where
 
 struct GraphicsState {
     window: Arc<Window>,
+    transparent: bool,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -971,9 +988,8 @@ struct GraphicsState {
 ///
 /// This is deliberately *not* a judgement about how the launcher should look.
 /// `transparent` is whatever [`NativeLauncherConfig`] asked for, and the same
-/// flag drives `with_transparent` on the window, so the surface and the window
-/// can never disagree: a translucent theme is a configuration change, not a
-/// renderer change.
+/// flag drives `with_transparent` on the window and the renderer's transparent
+/// canvas, so the surface, window and frame cannot disagree.
 ///
 /// egui produces premultiplied colours, so a transparent window wants
 /// [`CompositeAlphaMode::PreMultiplied`] and an opaque one wants
@@ -1108,9 +1124,9 @@ impl GraphicsState {
             Some(device.limits().max_texture_dimension_2d as usize),
         );
         let renderer = Renderer::new(&device, format, None, 1, false);
-
         Ok(Self {
             window,
+            transparent,
             surface,
             device,
             queue,
@@ -1147,7 +1163,8 @@ impl GraphicsState {
 
     fn draw(&mut self, model: &ViewModel) -> Result<DrawResult, RendererError> {
         let input = self.egui_state.take_egui_input(self.window.as_ref());
-        let NativeUiFrame { output, commands } = build_launcher_frame(&self.egui_context, input, model);
+        let NativeUiFrame { output, commands } =
+            build_launcher_frame_with_transparency(&self.egui_context, input, model, self.transparent);
         let egui::FullOutput {
             platform_output,
             textures_delta,
@@ -1211,7 +1228,7 @@ impl GraphicsState {
             self.renderer
                 .update_buffers(&self.device, &self.queue, &mut encoder, &paint_jobs, &screen);
         {
-            let color = clear_color();
+            let color = clear_color(self.transparent);
             let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("crikey launcher render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1287,12 +1304,25 @@ fn translate_keyboard(
     }
 }
 
-fn draw_launcher(context: &egui::Context, model: &ViewModel, commands: &mut Vec<UiCommand>) {
+fn canvas_fill(colors: theme::Palette, transparent: bool) -> egui::Color32 {
+    if transparent {
+        egui::Color32::TRANSPARENT
+    } else {
+        colors.canvas
+    }
+}
+
+fn draw_launcher(
+    context: &egui::Context,
+    model: &ViewModel,
+    commands: &mut Vec<UiCommand>,
+    transparent: bool,
+) {
     let colors = theme::palette();
     egui::CentralPanel::default()
         .frame(
             Frame::default()
-                .fill(colors.canvas)
+                .fill(canvas_fill(colors, transparent))
                 .inner_margin(Margin::same(theme::SPACE_4)),
         )
         .show(context, |ui| {
@@ -1449,6 +1479,14 @@ fn draw_result_row(
         });
 }
 
+fn display_label(row: &ResultRow) -> &str {
+    if row.label.is_empty() {
+        "(unnamed result)"
+    } else {
+        &row.label
+    }
+}
+
 fn highlighted_label(row: &ResultRow, colors: theme::Palette) -> LayoutJob {
     let regular = TextFormat {
         font_id: FontId::new(theme::TEXT_LABEL, FontFamily::Proportional),
@@ -1461,6 +1499,11 @@ fn highlighted_label(row: &ResultRow, colors: theme::Palette) -> LayoutJob {
         ..Default::default()
     };
     let mut job = LayoutJob::default();
+    if row.label.is_empty() {
+        job.append(display_label(row), 0.0, regular);
+        return job;
+    }
+
     let mut cursor = 0;
     for &(start, end) in &row.highlights {
         if start < cursor || start >= end {
@@ -1499,7 +1542,7 @@ fn draw_actions(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
                         .strong()
                         .color(colors.text),
                 );
-                ui.label(RichText::new(&row.label).small().color(colors.text_muted));
+                ui.label(RichText::new(display_label(row)).small().color(colors.text_muted));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new("Esc to close").small().color(colors.text_muted));
                 });
@@ -1555,14 +1598,18 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, colors: theme::Palette) {
     });
 }
 
-fn clear_color() -> wgpu::Color {
+fn clear_color(transparent: bool) -> wgpu::Color {
     let [red, green, blue, alpha] = theme::palette().canvas.to_array();
     const BYTE_MAX: f64 = u8::MAX as f64;
     wgpu::Color {
         r: f64::from(red) / BYTE_MAX,
         g: f64::from(green) / BYTE_MAX,
         b: f64::from(blue) / BYTE_MAX,
-        a: f64::from(alpha) / BYTE_MAX,
+        a: if transparent {
+            0.0
+        } else {
+            f64::from(alpha) / BYTE_MAX
+        },
     }
 }
 
@@ -1570,6 +1617,61 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+mod transparency_tests {
+    use super::*;
+
+    #[test]
+    fn frame_builder_uses_the_selected_canvas_fill() {
+        fn contains_fill(shape: &egui::Shape, fill: egui::Color32) -> bool {
+            match shape {
+                egui::Shape::Rect(rect) => rect.fill == fill,
+                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| contains_fill(shape, fill)),
+                _ => false,
+            }
+        }
+
+        let model = ViewModel {
+            generation: crikey_core::Generation::ZERO,
+            query: String::new(),
+            rows: Arc::default(),
+            selected: 0,
+            pending_plugins: false,
+            actions_open: false,
+        };
+        let input = RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(720.0, 520.0),
+            )),
+            ..Default::default()
+        };
+
+        let opaque =
+            build_launcher_frame_with_transparency(&create_launcher_context(), input.clone(), &model, false);
+        let transparent =
+            build_launcher_frame_with_transparency(&create_launcher_context(), input, &model, true);
+        let colors = theme::palette();
+
+        assert!(opaque
+            .output
+            .shapes
+            .iter()
+            .any(|clipped| contains_fill(&clipped.shape, colors.canvas)));
+        assert!(transparent
+            .output
+            .shapes
+            .iter()
+            .any(|clipped| contains_fill(&clipped.shape, egui::Color32::TRANSPARENT)));
+    }
+
+    #[test]
+    fn clear_color_tracks_the_selected_alpha_mode() {
+        assert_eq!(clear_color(false).a, 1.0);
+        assert_eq!(clear_color(true).a, 0.0);
     }
 }
 
@@ -1599,6 +1701,75 @@ mod lifecycle_tests {
         state.restore_visible(first);
 
         assert!(state.is_visible_session(second));
+    }
+}
+
+#[test]
+fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
+    let state = SharedState::default();
+    {
+        let mut mailbox = lock_recover(&state.frames);
+        mailbox.latest = Some(PendingFrame {
+            session: 1,
+            model: ViewModel {
+                generation: crikey_core::Generation::ZERO,
+                query: String::new(),
+                rows: Arc::default(),
+                selected: 0,
+                pending_plugins: false,
+                actions_open: false,
+            },
+        });
+        mailbox.wake_session = Some(1);
+    }
+
+    state.clear_all_frames();
+
+    let mailbox = lock_recover(&state.frames);
+    assert!(mailbox.latest.is_none());
+    assert!(mailbox.wake_session.is_none());
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_result_label_gets_a_visible_fallback() {
+        let row = ResultRow {
+            item: crikey_core::ItemId("untitled".to_owned()),
+            label: String::new(),
+            description: String::new(),
+            icon_reference: None,
+            category: String::new(),
+            plugin_name: String::new(),
+            highlights: Vec::new(),
+            argument_hint: None,
+            status: None,
+            default_action: None,
+            alternate_actions: Vec::new(),
+        };
+
+        assert_eq!(highlighted_label(&row, theme::palette()).text, "(unnamed result)");
+    }
+
+    #[test]
+    fn a_highlight_range_inside_a_utf8_character_is_ignored_safely() {
+        let row = ResultRow {
+            item: crikey_core::ItemId("cafe".to_owned()),
+            label: "café".to_owned(),
+            description: String::new(),
+            icon_reference: None,
+            category: String::new(),
+            plugin_name: String::new(),
+            highlights: vec![(4, 5)],
+            argument_hint: None,
+            status: None,
+            default_action: None,
+            alternate_actions: Vec::new(),
+        };
+
+        assert_eq!(highlighted_label(&row, theme::palette()).text, "café");
     }
 }
 

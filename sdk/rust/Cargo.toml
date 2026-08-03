@@ -14,3 +14,4 @@ workspace = true
 [dependencies]
 crikey-core.workspace = true
 crikey-native-protocol.workspace = true
+crikey-plugin-model.workspace = true

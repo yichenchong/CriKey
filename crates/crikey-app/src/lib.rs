@@ -43,7 +43,6 @@ use crikey_core::{
     ActionId, ArgumentPolicy, ExecutionPolicy, Generation, GenerationTracker, Item, ItemId, PluginId,
     Result as CoreResult,
 };
-use crikey_input_scheduler::SchedulingProfile;
 use crikey_platform::{
     application_arguments, application_items, decode_target, APPLICATION_LAUNCH_ACTION_ID,
 };
@@ -137,7 +136,6 @@ pub struct App {
     backend: Backend,
     generations: GenerationTracker,
     limits: ResultLimits,
-    default_legacy_profile: SchedulingProfile,
     stage: StartupStage,
     eager_startup_complete: bool,
 }
@@ -154,7 +152,6 @@ impl App {
             backend: Backend::new(),
             generations: GenerationTracker::new(),
             limits: ResultLimits::default(),
-            default_legacy_profile: SchedulingProfile::LegacyStrict,
             stage: StartupStage::WindowAndHotkey,
             eager_startup_complete: false,
         }
@@ -177,10 +174,6 @@ impl App {
 
     pub fn limits(&self) -> &ResultLimits {
         &self.limits
-    }
-
-    pub fn default_legacy_profile(&self) -> SchedulingProfile {
-        self.default_legacy_profile
     }
 
     /// Returns the milestone currently awaiting acknowledgement.
@@ -356,6 +349,15 @@ type PositionCache = HashMap<PluginId, Vec<usize>>;
 struct CandidateCache {
     normalized: String,
     by_owner: PositionCache,
+}
+
+#[derive(Clone)]
+struct CatalogCacheHandle(Arc<dyn CatalogCache + Send + Sync>);
+
+impl std::fmt::Debug for CatalogCacheHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CatalogCacheHandle(..)")
+    }
 }
 
 /// Work performed by the most recently accepted local query.
@@ -577,6 +579,8 @@ pub struct SearchService {
     matcher: DefaultMatcher,
     ranker: DefaultRanker,
     results: Vec<SearchHit>,
+    catalog_cache: Option<CatalogCacheHandle>,
+    cache_error: Option<CacheError>,
     last_query_stats: SearchStats,
     candidate_cache: Option<CandidateCache>,
     non_prefix_upper: HashMap<PluginId, Score>,
@@ -597,11 +601,24 @@ impl SearchService {
             matcher: DefaultMatcher::default(),
             ranker: DefaultRanker::default(),
             results: Vec::new(),
+            catalog_cache: None,
+            cache_error: None,
             last_query_stats: SearchStats::default(),
             candidate_cache: None,
             non_prefix_upper: HashMap::new(),
             plugin_actions: None,
         }
+    }
+
+    /// Attaches the persistent catalog cache used for completed publications.
+    pub fn set_catalog_cache(&mut self, cache: Arc<dyn CatalogCache + Send + Sync>) {
+        self.catalog_cache = Some(CatalogCacheHandle(cache));
+        self.cache_error = None;
+    }
+
+    /// The most recent non-fatal cache write failure, if any.
+    pub fn catalog_cache_error(&self) -> Option<&CacheError> {
+        self.cache_error.as_ref()
     }
 
     /// The startup milestone currently awaiting acknowledgement.
@@ -710,6 +727,19 @@ impl SearchService {
             }
             (0, Err(_)) | (_, Ok(_)) => {}
             (_, Err(at)) => self.owners.insert(at, plugin.clone()),
+        }
+        if retained > 0 {
+            if let Some(cache) = &self.catalog_cache {
+                let slice = CachedSlice {
+                    plugin: plugin.clone(),
+                    instance,
+                    generation: Generation::ZERO,
+                    items: self.catalog.items(plugin).to_vec(),
+                };
+                if let Err(error) = cache.0.store_slice(&slice) {
+                    self.cache_error = Some(error);
+                }
+            }
         }
         Ok(retained)
     }
@@ -1206,9 +1236,9 @@ compile_error!(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, fs, sync::Mutex};
 
-    use crikey_catalog::CatalogError;
+    use crikey_catalog::{CatalogCache, CatalogError, FileCatalogCache};
     use crikey_core::{ArgumentPolicy, Category, HitPolicy};
 
     use super::*;
@@ -1216,6 +1246,32 @@ mod tests {
     const OWNER: &str = "dev.crikey.app-tests";
     const OTHER: &str = "dev.crikey.app-tests.other";
 
+    #[derive(Debug, Default)]
+    struct RecordingCache {
+        writes: Mutex<Vec<CachedSlice>>,
+    }
+
+    impl CatalogCache for RecordingCache {
+        fn load_slice(&self, _plugin: &PluginId) -> Result<Option<CachedSlice>, CacheError> {
+            Ok(None)
+        }
+
+        fn store_slice(&self, slice: &CachedSlice) -> Result<(), CacheError> {
+            self.writes
+                .lock()
+                .expect("recording cache lock")
+                .push(slice.clone());
+            Ok(())
+        }
+
+        fn invalidate(&self, _plugin: &PluginId) -> Result<(), CacheError> {
+            Ok(())
+        }
+
+        fn plugins(&self) -> Result<Vec<PluginId>, CacheError> {
+            Ok(Vec::new())
+        }
+    }
     fn plugin(id: &str) -> PluginId {
         PluginId(id.to_owned())
     }
@@ -1268,14 +1324,6 @@ mod tests {
         }
         assert_eq!(service.stage(), StartupStage::RequiredWorkers);
         service
-    }
-
-    #[test]
-    fn unchanged_legacy_plugins_default_to_legacy_strict() {
-        assert_eq!(
-            App::new().default_legacy_profile(),
-            SchedulingProfile::LegacyStrict
-        );
     }
 
     #[test]
@@ -1366,5 +1414,54 @@ mod tests {
             "a publisher that claims the instance may publish over a refused slice"
         );
         assert_eq!(service.catalog.plugin_len(&owner), 1);
+    }
+    #[test]
+    fn cache_persists_only_a_nonempty_successful_catalog() {
+        let cache = Arc::new(RecordingCache::default());
+        let mut service = accepting(ResultLimits::default());
+        service.set_catalog_cache(cache.clone());
+
+        let owner = plugin(OWNER);
+        assert_eq!(
+            service.replace_catalog(&owner, 1, vec![burning("a", OWNER)]),
+            Ok(1)
+        );
+        assert_eq!(cache.writes.lock().expect("recording cache lock").len(), 1);
+        assert_eq!(
+            cache.writes.lock().expect("recording cache lock")[0].items.len(),
+            1
+        );
+
+        assert_eq!(service.replace_catalog(&owner, 2, Vec::new()), Ok(0));
+        assert_eq!(
+            cache.writes.lock().expect("recording cache lock").len(),
+            1,
+            "an empty rebuild must not overwrite a known-good cached slice"
+        );
+    }
+    #[test]
+    fn file_cache_round_trips_a_published_catalog_between_services() {
+        let root = std::env::temp_dir().join(format!("crikey-app-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cache = Arc::new(FileCatalogCache::new(root.clone()));
+        let owner = plugin(OWNER);
+
+        let mut writer = accepting(ResultLimits::default());
+        writer.set_catalog_cache(cache.clone());
+        assert_eq!(
+            writer.replace_catalog(&owner, 1, vec![burning("a", OWNER)]),
+            Ok(1)
+        );
+
+        let mut reader = accepting(ResultLimits::default());
+        reader.set_catalog_cache(cache.clone());
+        let loaded = reader
+            .load_persisted_catalog(cache.as_ref())
+            .expect("the next service can load the completed slice");
+        assert_eq!(loaded.items, 1);
+        assert_eq!(loaded.skipped, 0);
+        assert_eq!(reader.catalog.plugin_len(&owner), 1);
+
+        fs::remove_dir_all(root).expect("remove the round-trip cache");
     }
 }

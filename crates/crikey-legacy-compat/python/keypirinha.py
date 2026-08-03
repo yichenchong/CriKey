@@ -21,6 +21,7 @@ as a typed :class:`HostUnavailableError` naming the operation, never as an
     load_resource(plugin, name) -> bytes
     package_full_path(plugin) -> str
     package_cache_path(plugin, create) -> str
+    package_full_name(plugin) -> str
 
 Publication is deliberately fire-and-forget: :meth:`Plugin.set_suggestions`
 and :meth:`Plugin.set_catalog` hand the host *one complete list* per call and
@@ -396,6 +397,14 @@ class Action:
 _UNSET = object()
 
 
+def _strip_setting(raw):
+    """Strips whitespace and one matching quote pair from a setting value."""
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1].strip()
+    return value
+
+
 class Settings:
     """Read-only view over one plugin's configuration.
 
@@ -446,22 +455,35 @@ class Settings:
         entries = self._entries(section)
         return entries is not None and _fold(key) in entries
 
-    def get(self, key, section=None, fallback=None):
-        """The raw string value, or `fallback` when the key is absent."""
+    def get(self, key, section=None, fallback=None, unquote=False):
+        """The raw string value, or `fallback` when the key is absent.
+
+        When `unquote` is true, one matching pair of surrounding single or
+        double quotes is removed before returning the value.
+        """
         entries = self._entries(section)
         if entries is None:
             return fallback
         found = entries.get(_fold(key))
-        return fallback if found is None else found[1]
+        if found is None:
+            return fallback
+        return _strip_setting(found[1]) if unquote else found[1]
 
-    def _coerce(self, key, section, fallback, convert, expected):
-        raw = self.get(key, section)
+    def _coerce(
+        self, key, section, fallback, convert, expected, minimum=None, maximum=None
+    ):
+        raw = self.get(key, section, unquote=True)
         if raw is None:
             # A missing key is not a coercion failure. With no fallback the
             # answer is the same "not configured" that `get` reports.
             return None if fallback is _UNSET else fallback
         try:
-            return convert(raw)
+            value = convert(raw)
+            if minimum is not None and value < minimum:
+                return minimum
+            if maximum is not None and value > maximum:
+                return maximum
+            return value
         except (TypeError, ValueError):
             if fallback is not _UNSET:
                 # An unchanged plugin that supplied a fallback asked to keep
@@ -478,19 +500,35 @@ class Settings:
                 ),
             ) from None
 
-    def get_int(self, key, section=None, fallback=_UNSET):
+    def get_int(self, key, section=None, fallback=_UNSET, min=None, max=None):
         return self._coerce(
-            key, section, fallback, lambda raw: int(raw.strip(), 10), "an integer"
+            key,
+            section,
+            fallback,
+            lambda raw: int(raw, 0),
+            "an integer",
+            minimum=min,
+            maximum=max,
         )
 
-    def get_float(self, key, section=None, fallback=_UNSET):
+    def get_float(self, key, section=None, fallback=_UNSET, min=None, max=None):
         return self._coerce(
-            key, section, fallback, lambda raw: float(raw.strip()), "a number"
+            key,
+            section,
+            fallback,
+            float,
+            "a number",
+            minimum=min,
+            maximum=max,
         )
 
     def get_bool(self, key, section=None, fallback=_UNSET):
         return self._coerce(
-            key, section, fallback, _parse_bool, "a boolean (yes/no, true/false, on/off, 1/0)"
+            key,
+            section,
+            fallback,
+            _parse_bool,
+            "a boolean (yes/no, true/false, on/off, enable/disable, 1/0)",
         )
 
     def __repr__(self):
@@ -498,8 +536,8 @@ class Settings:
 
 
 #: Every boolean spelling the documented Keypirinha configuration accepts.
-_TRUE_WORDS = frozenset(("1", "yes", "true", "on", "y", "t"))
-_FALSE_WORDS = frozenset(("0", "no", "false", "off", "n", "f"))
+_TRUE_WORDS = frozenset(("1", "yes", "true", "on", "y", "t", "enable", "enabled"))
+_FALSE_WORDS = frozenset(("0", "no", "false", "off", "n", "f", "disable", "disabled"))
 
 
 def _parse_bool(raw):
@@ -612,6 +650,16 @@ def _install_stdout_guard(replacement=None):
     global _PROTOCOL_STDOUT
     if _PROTOCOL_STDOUT is None:
         _PROTOCOL_STDOUT = sys.stdout
+        reconfigure = getattr(_PROTOCOL_STDOUT, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(
+                encoding="utf-8",
+                errors="strict",
+                newline="\n",
+                write_through=True,
+            )
+        elif getattr(_PROTOCOL_STDOUT, "encoding", "utf-8").lower().replace("-", "") != "utf8":
+            raise ValueError("the protocol stdout stream cannot be configured as UTF-8")
         sys.stdout = sys.stderr if replacement is None else replacement
     return _PROTOCOL_STDOUT
 
@@ -662,12 +710,18 @@ class Plugin:
         return type(self).__name__
 
     def package_full_name(self):
-        """Name of the legacy package this plugin was loaded from.
+        """Name of the declared legacy package this plugin was loaded from.
 
-        Derived from the defining module because a legacy plugin carries no
-        identifier of its own: the worker imports the package's main module
-        under the package's own name, so the two agree by construction.
+        The worker imports a main module under a sanitized Python name because
+        package identifiers may contain hyphens. When the worker host is
+        present, ask it for the declared identifier instead of attempting to
+        reverse that lossy sanitisation. Outside a worker, the module-derived
+        fallback keeps developer-mode plugins useful.
         """
+        host = _HOST
+        capability = getattr(host, "package_full_name", None) if host is not None else None
+        if callable(capability):
+            return capability(self)
         return type(self).__module__.partition(".")[0]
 
     # -- lifecycle callbacks -----------------------------------------------

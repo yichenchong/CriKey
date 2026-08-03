@@ -234,6 +234,27 @@ fn hostile_worker(dir: &Path, name: &str, version: &str, reply: &str) -> PathBuf
     )
 }
 
+/// As [`hostile_worker`], but exits immediately after writing a non-newline-
+/// terminated response. The host must report the buffered fragment instead of
+/// treating end of stream as an empty response.
+#[cfg(unix)]
+fn hostile_worker_unterminated(dir: &Path, name: &str, version: &str, reply: &str) -> PathBuf {
+    executable(
+        &dir.join(name),
+        &format!(
+            "#!/bin/sh\n\
+             case \"$*\" in\n\
+             *{entry}*) ;;\n\
+             *) echo '{version}'; exit 0 ;;\n\
+             esac\n\
+             printf '{{\"ready\":true,\"pid\":%d,\"protocol\":1}}\\n' \"$$\"\n\
+             read -r _request\n\
+             printf '%s' '{reply}'\n",
+            entry = WORKER_ENTRY_FILE,
+        ),
+    )
+}
+
 #[cfg(unix)]
 fn executable(path: &Path, script: &str) -> PathBuf {
     fs::write(path, script).expect("stand-in interpreter is writable");
@@ -1544,8 +1565,32 @@ class Fixture(kp.Plugin):
 #[cfg(unix)]
 fn protocol_failure(label: &str, reply: &str) -> WorkerError {
     let scratch = Scratch::new(label);
+
     let interpreter_dir = scratch.subdir("bin");
     let fake = hostile_worker(&interpreter_dir, "python3", "3.11.4", reply);
+    let package = legacy_package(&scratch, "hostilefixture", &source(PID_WITNESS));
+
+    let interpreter =
+        discover_interpreter_in(&RuntimeProfile::External(fake), &DiscoveryEnvironment::empty())
+            .expect("the stand-in reports a supported version and so passes discovery");
+
+    let mut worker = LegacyWorker::spawn(&interpreter, &package, options("legacy.hostile"))
+        .expect("the stand-in completes the startup handshake, so the worker spawns");
+
+    let error = call_err(
+        &mut worker,
+        request("legacy.hostile", 1, LegacyRequestKind::Catalog),
+    );
+
+    let _ = worker.shutdown();
+    error
+}
+
+#[cfg(unix)]
+fn protocol_failure_unterminated(label: &str, reply: &str) -> WorkerError {
+    let scratch = Scratch::new(label);
+    let interpreter_dir = scratch.subdir("bin");
+    let fake = hostile_worker_unterminated(&interpreter_dir, "python3", "3.11.4", reply);
     let package = legacy_package(&scratch, "hostilefixture", &source(PID_WITNESS));
 
     let interpreter =
@@ -1588,6 +1633,27 @@ fn a_malformed_line_on_the_protocol_channel_is_reported_as_a_protocol_error() {
         error.to_string().contains("legacy.hostile"),
         "the message names the plugin concerned, got {error}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_partial_final_protocol_line_is_reported_instead_of_dropped() {
+    let error = protocol_failure_unterminated("protocol-partial", "partial-json");
+
+    match &error {
+        WorkerError::Protocol { plugin, line, .. } => {
+            assert_eq!(plugin, &PluginId("legacy.hostile".to_owned()));
+            assert!(
+                line.contains("partial-json"),
+                "the unterminated payload remains visible in the diagnostic: {line}"
+            );
+            assert!(
+                line.contains("unterminated"),
+                "the diagnostic identifies end-of-stream framing: {line}"
+            );
+        }
+        other => panic!("an unterminated line is a Protocol error, got {other:?}"),
+    }
 }
 
 #[cfg(unix)]

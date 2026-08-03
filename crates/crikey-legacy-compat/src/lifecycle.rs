@@ -619,6 +619,9 @@ struct Instance {
     /// The one-time `on_start` this instance owes, not yet given a timestamp.
     queued_start: bool,
     started: bool,
+    /// An initialization failure permanently excludes this instance. A reload
+    /// or re-registration creates a fresh instance and may try again.
+    disabled: bool,
     running: Option<RunningWork>,
     /// At most one undispatched suggestion request (spec 8.8).
     pending: Option<PendingWork>,
@@ -636,6 +639,7 @@ impl Instance {
             cache_policy: cache_policy_of(profile, compatibility),
             queued_start: true,
             started: false,
+            disabled: false,
             running: None,
             pending: None,
             pending_catalog: false,
@@ -644,9 +648,10 @@ impl Instance {
     }
 
     /// A queued-but-undispatched `on_start` counts as busy: nothing may run
-    /// before one-time initialization (spec 14.8).
+    /// before one-time initialization (spec 14.8). A failed initialization is
+    /// not busy work; it is an excluded instance and never runs again.
     fn busy(&self) -> bool {
-        self.running.is_some() || self.queued_start
+        !self.disabled && (self.running.is_some() || self.queued_start)
     }
 
     fn pending_depth(&self) -> usize {
@@ -734,6 +739,7 @@ pub struct LegacyRuntime<W> {
     visible: Vec<Item>,
     visible_generation: Generation,
     shut_down: bool,
+    shutdown_report: Option<ShutdownReport>,
 }
 
 impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
@@ -754,6 +760,7 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
             visible: Vec::new(),
             visible_generation: Generation::ZERO,
             shut_down: false,
+            shutdown_report: None,
         }
     }
 
@@ -775,6 +782,44 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
             compatibility,
         } = registration;
         let id = self.mint_instance();
+
+        // Registration is also the instance-supersession path used by package
+        // reloads. Drop work that has not crossed the boundary, and raise the
+        // cooperative flag on work that has. This method has no timestamp, so
+        // zero is the registration-time origin.
+        let termination = self.plugins.get_mut(&plugin).and_then(|record| {
+            let running = record.instance.running.as_mut()?;
+            if running.termination_requested {
+                return None;
+            }
+            running.termination_requested = true;
+            record.diagnostics.terminations_requested += 1;
+            Some((record.instance.id, running.generation))
+        });
+        if let Some((instance, generation)) = termination {
+            let _ = self.worker.request_termination(
+                0,
+                &plugin,
+                instance,
+                generation,
+                TerminationReason::InstanceSuperseded,
+            );
+            push_trace(
+                &mut self.trace,
+                &mut self.trace_dropped,
+                LegacyTraceEvent::TerminationRequested {
+                    at_ms: 0,
+                    plugin: plugin.clone(),
+                    generation,
+                    reason: TerminationReason::InstanceSuperseded,
+                },
+            );
+        }
+
+        if let Some(previous) = self.plugins.get(&plugin).map(|record| record.instance.id) {
+            self.outbox.retain(|request| request.instance != previous);
+        }
+
         let instance = Instance::new(id, profile, compatibility);
         match self.plugins.get_mut(&plugin) {
             Some(record) => {
@@ -816,7 +861,7 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
         }
         let generation = self.mint_generation();
         self.query = text.to_owned();
-        self.begin_generation(generation);
+        self.begin_generation(generation, at_ms);
 
         match self.selected.clone() {
             Some((owner, item)) => {
@@ -833,7 +878,16 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
                 self.intake_suggest(&owner, at_ms, generation, text, Some(&item));
             }
             None => {
-                let recipients = self.order.clone();
+                let recipients = self
+                    .order
+                    .iter()
+                    .filter(|plugin| {
+                        self.plugins
+                            .get(*plugin)
+                            .is_some_and(|record| !record.instance.disabled)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
                 push_trace(
                     &mut self.trace,
                     &mut self.trace_dropped,
@@ -863,7 +917,11 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
             .find(|candidate| &candidate.stable_id == item)
             .map(|candidate| candidate.plugin_id.clone())
             .ok_or_else(|| LegacyRuntimeError::UnknownItem(item.clone()))?;
-        if !self.plugins.contains_key(&owner) {
+        if self
+            .plugins
+            .get(&owner)
+            .is_none_or(|record| record.instance.disabled)
+        {
             return Err(LegacyRuntimeError::UnknownPlugin(owner));
         }
 
@@ -872,7 +930,7 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
         self.query = String::new();
         self.selected = Some((owner.clone(), item.clone()));
         let generation = self.mint_generation();
-        self.begin_generation(generation);
+        self.begin_generation(generation, at_ms);
         push_trace(
             &mut self.trace,
             &mut self.trace_dropped,
@@ -902,6 +960,9 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
         let Some(record) = self.plugins.get_mut(plugin) else {
             return Err(LegacyRuntimeError::UnknownPlugin(plugin.clone()));
         };
+        if record.instance.disabled {
+            return Ok(());
+        }
         record.diagnostics.catalog_rebuilds += 1;
         self.enqueue(plugin, at_ms, Generation::ZERO, WorkKind::Catalog);
         Ok(())
@@ -987,7 +1048,7 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
                 continue;
             };
             let instance = &mut record.instance;
-            if !instance.queued_start || instance.running.is_some() {
+            if instance.disabled || !instance.queued_start || instance.running.is_some() {
                 continue;
             }
             instance.queued_start = false;
@@ -1070,6 +1131,11 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
                     if let Some(record) = self.plugins.get_mut(&request.plugin) {
                         record.diagnostics.dispatch_failures += 1;
                         record.instance.running = None;
+                        if callback == LegacyCallback::OnStart {
+                            record.instance.disabled = true;
+                            record.instance.pending = None;
+                            record.instance.pending_catalog = false;
+                        }
                     }
                     push_trace(
                         &mut self.trace,
@@ -1208,8 +1274,19 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
         if running.termination_requested {
             record.diagnostics.late_answers_after_termination_request += 1;
         }
+        let initialization_failed = running.callback == LegacyCallback::OnStart
+            && matches!(&response.outcome, LegacyOutcome::Failed(_));
         if running.callback == LegacyCallback::OnStart {
-            record.instance.started = true;
+            if initialization_failed {
+                // A plugin that cannot complete on_start is excluded. Keeping
+                // it registered but allowing later callbacks would violate
+                // initialization-before-use and leave a half-live instance.
+                record.instance.disabled = true;
+                record.instance.pending = None;
+                record.instance.pending_catalog = false;
+            } else {
+                record.instance.started = true;
+            }
         }
 
         let current = self.current_generation;
@@ -1437,6 +1514,9 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
     /// Cooperative teardown, bounded by [`LegacyDeadlines::teardown_ms`] even
     /// when no plugin cooperates (spec 9.6, 14.8). After this, `tick` is empty.
     pub fn shutdown(&mut self, at_ms: Millis) -> ShutdownReport {
+        if let Some(report) = self.shutdown_report {
+            return report;
+        }
         let mut abandoned = 0usize;
         let plugins = self.order.clone();
         for plugin in &plugins {
@@ -1497,12 +1577,14 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
                 abandoned,
             },
         );
-        ShutdownReport {
+        let report = ShutdownReport {
             requested_at_ms: at_ms,
             completed_at_ms,
             instances,
             abandoned,
-        }
+        };
+        self.shutdown_report = Some(report);
+        report
     }
 
     // -- internals ----------------------------------------------------------
@@ -1520,10 +1602,60 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
     /// A new query generation displays nothing until somebody answers it: the
     /// previous generation's items are not what the user asked for any more,
     /// and replaying them is the caching that spec 14.9 refuses by default.
-    fn begin_generation(&mut self, generation: Generation) {
+    fn begin_generation(&mut self, generation: Generation, at_ms: Millis) {
         self.current_generation = generation;
         self.visible_generation = generation;
         self.visible.clear();
+
+        let mut replaced = Vec::new();
+        let mut terminations = Vec::new();
+        for (plugin, record) in &mut self.plugins {
+            if let Some(pending) = record.instance.pending.take() {
+                record.diagnostics.replaced += 1;
+                replaced.push((plugin.clone(), pending.generation));
+            }
+
+            let Some(running) = record.instance.running.as_mut() else {
+                continue;
+            };
+            if running.callback == LegacyCallback::OnSuggest && !running.termination_requested {
+                running.termination_requested = true;
+                record.diagnostics.terminations_requested += 1;
+                terminations.push((plugin.clone(), record.instance.id, running.generation));
+            }
+        }
+
+        for (plugin, discarded) in replaced {
+            push_trace(
+                &mut self.trace,
+                &mut self.trace_dropped,
+                LegacyTraceEvent::Replaced {
+                    at_ms,
+                    plugin,
+                    discarded,
+                    retained: generation,
+                },
+            );
+        }
+        for (plugin, instance, obsolete_generation) in terminations {
+            let _ = self.worker.request_termination(
+                at_ms,
+                &plugin,
+                instance,
+                obsolete_generation,
+                TerminationReason::QuerySuperseded,
+            );
+            push_trace(
+                &mut self.trace,
+                &mut self.trace_dropped,
+                LegacyTraceEvent::TerminationRequested {
+                    at_ms,
+                    plugin,
+                    generation: obsolete_generation,
+                    reason: TerminationReason::QuerySuperseded,
+                },
+            );
+        }
     }
 
     /// Intake for one suggestion request against one plugin: dynamic cache
@@ -1548,6 +1680,7 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
         }
         let replay = match self.plugins.get(plugin) {
             None => return,
+            Some(record) if record.instance.disabled => return,
             Some(record) => match &record.instance.last_answer {
                 Some(answer) if answer.key == key => {
                     if record.instance.cache_policy.permits_caching() {
@@ -1693,46 +1826,6 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
                         },
                     );
                 }
-
-                // Only *query* work is made obsolete by a query change. A
-                // keystroke does not make an in-flight `on_catalog()` obsolete
-                // (spec 9.2 lists the reasons; a rebuild is none of them), and
-                // work already obsolete is not re-terminated once per keystroke.
-                let terminate = record.instance.running.as_mut().and_then(|running| {
-                    let supersedes =
-                        running.callback == LegacyCallback::OnSuggest && !running.termination_requested;
-                    if supersedes {
-                        running.termination_requested = true;
-                        Some(running.generation)
-                    } else {
-                        None
-                    }
-                });
-                if let Some(obsolete_generation) = terminate {
-                    let instance_id = record.instance.id;
-                    record.diagnostics.terminations_requested += 1;
-                    // Discarded deliberately: raising the flag is advisory
-                    // (spec 9.2). A worker that cannot take it is unreachable,
-                    // and the deadline ladder in `tick` is what reports that —
-                    // failing the keystroke here would be strictly worse.
-                    let _ = self.worker.request_termination(
-                        at_ms,
-                        plugin,
-                        instance_id,
-                        obsolete_generation,
-                        TerminationReason::QuerySuperseded,
-                    );
-                    push_trace(
-                        &mut self.trace,
-                        &mut self.trace_dropped,
-                        LegacyTraceEvent::TerminationRequested {
-                            at_ms,
-                            plugin: plugin.clone(),
-                            generation: obsolete_generation,
-                            reason: TerminationReason::QuerySuperseded,
-                        },
-                    );
-                }
             }
         }
 
@@ -1761,6 +1854,11 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
         };
         let instance = &mut record.instance;
         if instance.running.is_some() {
+            return;
+        }
+        if instance.disabled {
+            instance.pending = None;
+            instance.pending_catalog = false;
             return;
         }
 

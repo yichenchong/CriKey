@@ -20,12 +20,13 @@ source         = "https://github.com/prayzzz/keypirinha-epoch" # required, https
 revision       = "ea2177868d078bf614e1c7a841f95a2aee5111bd"    # required, 40 hex chars
 licence        = "MIT"                                         # required
 classification = "works-unchanged"                             # required
-notes          = "evidence for the classification"
+notes          = "evidence for the classification"              # required, non-empty
 ```
 
 `revision` is a full 40-character commit hash. Tags and branch names move, so a
-result pinned to one cannot be reproduced. `licence` is mandatory: a reference
-whose licence is unknown can be neither redistributed nor reproduced.
+result pinned to one cannot be reproduced. `source` must be an `https://` URL to
+the upstream repository, and `licence` and `notes` are mandatory. A reference
+without evidence is not a classification.
 
 | `classification` | meaning |
 | --- | --- |

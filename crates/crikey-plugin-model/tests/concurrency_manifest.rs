@@ -9,9 +9,11 @@
 //!
 //! Two properties drive the design, mirroring `manifest_scheduling.rs`:
 //!
-//! * Absent is not zero. An omitted budget is "unlimited" (the host decides);
-//!   `= 0` is a deliberate "never permitted". Collapsing the two would either
-//!   mute a plugin or uncap it, so both survive parsing as distinct `Option`s.
+//! * An omitted budget is not a zero declaration and is not unlimited. It is
+//!   `None` at the declaration layer so the enforcement layer can apply its
+//!   bounded host default. An explicit `= 0` is a deliberate "never
+//!   permitted" declaration. Collapsing the two would either mute a plugin or
+//!   uncap it, so both survive parsing as distinct `Option`s.
 //! * A budget the host silently ignores is worse than no budget at all, so a
 //!   misspelled key inside `[concurrency]` is a hard rejection rather than a
 //!   field that quietly stays `None`.

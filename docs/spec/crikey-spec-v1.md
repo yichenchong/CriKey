@@ -1,8 +1,14 @@
 # CriKey Technical Specification
 
+This document is the normative target for the v1 architecture. It describes
+required behavior, including future components; the implementation status of
+each delivery phase is tracked separately in [`docs/ROADMAP.md`](../ROADMAP.md).
+
 ## 1. Product Definition
 
-CriKey shall be a fast, keyboard-driven application launcher comparable in interaction model to Keypirinha while providing a modern, cross-platform, extensible architecture.
+CriKey shall be a fast, keyboard-driven application launcher with an
+established launcher-style interaction model and a modern, cross-platform,
+extensible architecture.
 
 CriKey shall support:
 
@@ -729,6 +735,10 @@ The result aggregator shall be able to rerank incrementally as new batches arriv
 
 Incremental reranking shall preserve selection stability where practical.
 
+Current v1 status: `MemoryResultAggregator` preserves first-acceptance order and
+replaces enrichment items in place; it does not yet rerank plugin batches.
+`SearchService` applies the default ranker on the local catalog path.
+
 ### 11.6 Result-list stability
 
 The UI shall reduce disruptive result movement through one or more of:
@@ -779,6 +789,11 @@ CriKey may transport that publication internally in bounded chunks, but shall pr
 - Association with the plugin instance.
 - Association with the current query.
 - Replacement semantics of the suggestion list.
+
+Current v1 status: the compatibility matrix classifies legacy matching and
+sorting as partial. The plugin-suggestion path does not host-match or apply a
+legacy sort policy; decoded legacy items have a tied score hint, so their
+published order is retained. This limitation is not present on catalog search.
 
 ### 12.3 Backpressure
 
@@ -1053,6 +1068,10 @@ A plugin manifest, compatibility record, or user override may select:
 
 Plugins requiring incompatible Python versions shall execute in separate processes.
 
+The current implementation exposes explicit runtime-profile selection, but does
+not yet map every plugin's declared Python requirement to a profile
+automatically; see the M3 verification limit in the roadmap.
+
 ### 14.12 Compatibility limitations
 
 CriKey is not required to support unchanged plugins that rely on:
@@ -1209,7 +1228,9 @@ The protocol shall be transport-independent.
 
 ### 16.3 Protocol format
 
-The first implementation should use a versioned binary schema such as Protocol Buffers.
+The native v1 implementation uses a versioned Protocol Buffers (proto3) schema
+and the hand-written codec selected by ADR-0010; it does not require generated
+bindings or `protoc`.
 
 The protocol shall support unknown fields and additive evolution.
 
@@ -1607,16 +1628,24 @@ Plugins shall be able to request:
 - Native library loading.
 - Persistent background execution.
 
-### 20.2 Enforcement
+### 20.2 Enforcement (target behavior; not implemented in the current release)
 
-Permission enforcement shall depend on runtime:
+The following is the intended design, not a description of the current
+permission implementation:
 
 - Host-mediated APIs shall enforce permissions directly.
-- Native subprocess plugins shall be restricted using available operating-system sandboxing where practical.
+- Native subprocess plugins shall be restricted using available operating-system
+  sandboxing where practical.
 - Modern Python subprocesses shall use equivalent sandboxing where practical.
-- Legacy plugins shall be treated as trusted legacy code unless explicitly restricted.
+- Legacy plugins shall be treated as trusted legacy code unless explicitly
+  restricted.
 
-The UI shall not claim that a native plugin is fully sandboxed where the operating system does not provide effective enforcement.
+At present, manifest permission fields are recorded as plugin requests, but
+they are not enforced at the host-mediated API boundaries. A third-party
+plugin must therefore not be treated as sandboxed because it declares
+permissions in its manifest. The UI shall not claim that a native plugin is
+fully sandboxed where the operating system does not provide effective
+enforcement.
 
 ---
 
@@ -2049,7 +2078,12 @@ Each plugin shall be classified as:
 
 ## 28. Command-Line Tools
 
-The project shall provide a command-line interface supporting commands equivalent to:
+The project shall provide a command-line interface supporting commands
+equivalent to:
+
+This is the target command contract, not a claim that every command is
+implemented in the current milestone. An unavailable command must report that
+state rather than pretending to complete the operation.
 
 ```text
 crikey run

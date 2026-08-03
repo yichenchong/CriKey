@@ -10,6 +10,7 @@
 
 #![cfg(target_os = "windows")]
 
+use crikey_platform::Accelerator;
 use crikey_platform_windows::HotkeyCode;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VK_0, VK_9, VK_A, VK_BACK, VK_DELETE, VK_DOWN,
@@ -58,21 +59,59 @@ const _: () = {
 /// The `const` items above pin the constants; this pins the function that is
 /// supposed to produce them.
 #[test]
-fn the_mapping_produces_the_metadata_values() {
-    use crikey_platform::Accelerator;
-
+fn the_mapping_produces_every_metadata_value() {
     let virtual_key = |text: &str| {
         HotkeyCode::from_accelerator(&Accelerator::parse(text).expect("fixture parses"))
             .expect("fixture maps")
             .virtual_key()
     };
 
-    assert_eq!(virtual_key("Ctrl+Space"), VK_SPACE.0);
-    assert_eq!(virtual_key("Ctrl+Enter"), VK_RETURN.0);
-    assert_eq!(virtual_key("Ctrl+PageUp"), VK_PRIOR.0);
-    assert_eq!(virtual_key("Ctrl+PageDown"), VK_NEXT.0);
-    assert_eq!(virtual_key("Ctrl+Backspace"), VK_BACK.0);
-    assert_eq!(virtual_key("Ctrl+A"), VK_A.0);
-    assert_eq!(virtual_key("Ctrl+9"), VK_9.0);
-    assert_eq!(virtual_key("Ctrl+F12"), VK_F12.0);
+    let named = [
+        ("Space", VK_SPACE.0),
+        ("Enter", VK_RETURN.0),
+        ("Tab", VK_TAB.0),
+        ("Escape", VK_ESCAPE.0),
+        ("Backspace", VK_BACK.0),
+        ("Delete", VK_DELETE.0),
+        ("Insert", VK_INSERT.0),
+        ("Home", VK_HOME.0),
+        ("End", VK_END.0),
+        ("PageUp", VK_PRIOR.0),
+        ("PageDown", VK_NEXT.0),
+        ("Up", VK_UP.0),
+        ("Down", VK_DOWN.0),
+        ("Left", VK_LEFT.0),
+        ("Right", VK_RIGHT.0),
+    ];
+    for (key, expected) in named {
+        assert_eq!(
+            virtual_key(&format!("Ctrl+{key}")),
+            expected,
+            "{key} maps incorrectly"
+        );
+    }
+
+    for expected in b'A'..=b'Z' {
+        let key = char::from(expected);
+        assert_eq!(
+            virtual_key(&format!("Ctrl+{key}")),
+            u16::from(expected),
+            "{key} maps incorrectly"
+        );
+    }
+    for expected in b'0'..=b'9' {
+        let key = char::from(expected);
+        assert_eq!(
+            virtual_key(&format!("Ctrl+{key}")),
+            u16::from(expected),
+            "{key} maps incorrectly"
+        );
+    }
+    for number in 1..=24u16 {
+        assert_eq!(
+            virtual_key(&format!("Ctrl+F{number}")),
+            VK_F1.0 + number - 1,
+            "F{number} maps incorrectly"
+        );
+    }
 }

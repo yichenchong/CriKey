@@ -604,7 +604,7 @@ fn validate_integrity(package: &LoadedPackage) -> Result<(), PackageError> {
             .get(&name)
             .ok_or_else(|| PackageError::HashMismatch(format!("{LOCK_MEMBER} has no digest for {name}")))?;
         let actual = sha256_hex(&package.members[&name].bytes);
-        if !is_hex_sha256(expected) || expected != &actual {
+        if !is_hex_sha256(expected) || !expected.eq_ignore_ascii_case(&actual) {
             return Err(PackageError::HashMismatch(format!(
                 "digest mismatch for archive member {name}"
             )));
@@ -760,8 +760,5 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn is_hex_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

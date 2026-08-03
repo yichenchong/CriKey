@@ -14,17 +14,50 @@ pub use scheduling::{
     MAX_MINIMUM_QUERY_LENGTH,
 };
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ManifestError {
-    #[error("failed to parse crikey.toml: {0}")]
-    Parse(#[from] toml::de::Error),
-    #[error("unsupported manifest-version {0}")]
+    Parse(toml::de::Error),
     UnsupportedVersion(u32),
-    #[error("invalid query policy field {field}: {problem:?}")]
     InvalidQueryPolicy {
         field: &'static str,
         problem: PolicyProblem,
+        detail: Option<&'static str>,
     },
-    #[error("no entrypoint for {os}-{arch}")]
-    NoEntrypoint { os: String, arch: String },
+    NoEntrypoint {
+        os: String,
+        arch: String,
+    },
+}
+
+impl std::fmt::Display for ManifestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(error) => write!(formatter, "failed to parse crikey.toml: {error}"),
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported manifest-version {version}")
+            }
+            Self::InvalidQueryPolicy {
+                detail: Some(detail), ..
+            } => write!(formatter, "invalid crikey.toml query policy: {detail}"),
+            Self::InvalidQueryPolicy { field, problem, .. } => {
+                write!(formatter, "invalid query policy field {field}: {problem:?}")
+            }
+            Self::NoEntrypoint { os, arch } => write!(formatter, "no entrypoint for {os}-{arch}"),
+        }
+    }
+}
+
+impl std::error::Error for ManifestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Parse(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<toml::de::Error> for ManifestError {
+    fn from(error: toml::de::Error) -> Self {
+        Self::Parse(error)
+    }
 }

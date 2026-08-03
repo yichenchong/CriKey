@@ -78,3 +78,33 @@ fn malformed_toml_is_a_package_error_not_a_panic() {
     // The variant is unimportant; that it is a typed PackageError is the point.
     let _: PackageError = err;
 }
+
+#[test]
+fn a_newer_lockfile_format_is_rejected_instead_of_being_partially_read() {
+    let newer = format!(
+        "format_version = 2\nrequires_python = \">=3.12\"\n\n[[package]]\nname = \"acme\"\nversion = \"1.0.0\"\nhash = \"{}\"\n",
+        "a".repeat(64)
+    );
+    let error = Lockfile::from_toml(&newer).expect_err("unknown newer format markers must not be ignored");
+    assert!(
+        matches!(error, PackageError::Resolution(_)),
+        "a newer lockfile format is a typed parse error, got {error:?}"
+    );
+}
+
+#[test]
+fn a_lockfile_package_must_carry_a_valid_digest() {
+    let missing = r#"
+requires_python = ">=3.12"
+
+[[package]]
+name = "acme"
+version = "1.0.0"
+hash = ""
+"#;
+    let error = Lockfile::from_toml(missing).expect_err("an empty digest must not bypass verification");
+    assert!(
+        matches!(error, PackageError::HashMismatch(_)),
+        "missing digests are hard hash failures, got {error:?}"
+    );
+}

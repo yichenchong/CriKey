@@ -239,49 +239,45 @@ pub(crate) fn decode_item(plugin: &PluginId, value: &Value) -> Option<Item> {
     let label = object.get("label")?.as_str()?.to_owned();
     let target = object.get("target")?.as_str()?.to_owned();
 
-    let category = object
-        .get("category")
-        .and_then(Value::as_str)
-        .map(decode_category)
-        .unwrap_or_else(|| Category::PluginDefined(String::from("plugin-defined")));
+    let category = match object.get("category") {
+        None => Category::PluginDefined(String::from("plugin-defined")),
+        Some(value) => decode_category(value.as_str()?),
+    };
+    let description = match object.get("description") {
+        None => String::new(),
+        Some(value) => value.as_str()?.to_owned(),
+    };
+    let icon_reference = match object.get("icon_reference") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_str()?.to_owned()),
+    };
+    let argument_policy = match object.get("argument_policy") {
+        None => ArgumentPolicy::default(),
+        Some(value) => decode_argument_policy(value.as_str()?),
+    };
+    let hit_policy = match object.get("hit_policy") {
+        None => HitPolicy::default(),
+        Some(value) => decode_hit_policy(value.as_str()?),
+    };
+    let score_hint = match object.get("score_hint") {
+        None => 0,
+        Some(value) => i32::try_from(value.as_i64()?).ok()?,
+    };
 
     Some(Item {
         stable_id,
         plugin_id: plugin.clone(),
         category,
         label,
-        description: object
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        description,
         target,
-        search_terms: decode_strings(object.get("search_terms")),
-        icon_reference: object
-            .get("icon_reference")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        // Absent means "the plugin did not declare one", which takes the
-        // conservative default: inventing a policy could let an item accept
-        // arguments it was meant to forbid. A plugin that DOES declare one
-        // (spec 10.1) now has its value carried instead of discarded.
-        argument_policy: object
-            .get("argument_policy")
-            .and_then(Value::as_str)
-            .map(decode_argument_policy)
-            .unwrap_or_default(),
-        hit_policy: object
-            .get("hit_policy")
-            .and_then(Value::as_str)
-            .map(decode_hit_policy)
-            .unwrap_or_default(),
-        score_hint: object
-            .get("score_hint")
-            .and_then(Value::as_i64)
-            .and_then(|hint| i32::try_from(hint).ok())
-            .unwrap_or(0),
-        metadata: decode_metadata(object.get("metadata")),
-        actions: decode_actions(object.get("actions")),
+        search_terms: decode_strings(object.get("search_terms"))?,
+        icon_reference,
+        argument_policy,
+        hit_policy,
+        score_hint,
+        metadata: decode_metadata(object.get("metadata"))?,
+        actions: decode_actions(object.get("actions"))?,
     })
 }
 
@@ -331,14 +327,14 @@ pub(crate) fn hit_policy_name(policy: HitPolicy) -> &'static str {
     }
 }
 
-/// Decodes an item's actions. A missing or malformed `actions` field yields no
-/// actions rather than failing the whole item: an item without actions is still
-/// a valid item.
-fn decode_actions(value: Option<&Value>) -> Vec<Action> {
-    let Some(entries) = value.and_then(Value::as_array) else {
-        return Vec::new();
+/// Decodes an item's actions. A missing field keeps the historical empty
+/// default, but a present field must be a complete array of valid actions.
+fn decode_actions(value: Option<&Value>) -> Option<Vec<Action>> {
+    let Some(value) = value else {
+        return Some(Vec::new());
     };
-    entries.iter().filter_map(decode_action).collect()
+    let entries = value.as_array()?;
+    entries.iter().map(decode_action).collect()
 }
 
 /// The full §10.4 action, including the applicable-category set and execution
@@ -346,27 +342,28 @@ fn decode_actions(value: Option<&Value>) -> Vec<Action> {
 /// historical defaults, so plugins written before they existed are unaffected.
 fn decode_action(value: &Value) -> Option<Action> {
     let object = value.as_object()?;
+    let description = match object.get("description") {
+        None => String::new(),
+        Some(value) => value.as_str()?.to_owned(),
+    };
+    let icon_reference = match object.get("icon_reference") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_str()?.to_owned()),
+    };
+    let execution_policy = match object.get("execution_policy") {
+        None => ExecutionPolicy::default(),
+        Some(value) => decode_execution_policy(value.as_str()?),
+    };
     Some(Action {
         action_id: ActionId(object.get("action_id")?.as_str()?.to_owned()),
         label: object.get("label")?.as_str()?.to_owned(),
-        description: object
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        applicable_categories: decode_strings(object.get("applicable_categories"))
+        description,
+        applicable_categories: decode_strings(object.get("applicable_categories"))?
             .iter()
             .map(|tag| Category::from_wire_tag(tag))
             .collect(),
-        icon_reference: object
-            .get("icon_reference")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        execution_policy: object
-            .get("execution_policy")
-            .and_then(Value::as_str)
-            .map(decode_execution_policy)
-            .unwrap_or_default(),
+        icon_reference,
+        execution_policy,
     })
 }
 
@@ -388,25 +385,29 @@ pub(crate) fn execution_policy_name(policy: ExecutionPolicy) -> &'static str {
     }
 }
 
-/// A JSON array of strings, dropping any non-string entries.
-fn decode_strings(value: Option<&Value>) -> Vec<String> {
-    let Some(entries) = value.and_then(Value::as_array) else {
-        return Vec::new();
+/// A JSON array of strings. A missing field is the empty default; a present
+/// field is invalid if any entry is not a string.
+fn decode_strings(value: Option<&Value>) -> Option<Vec<String>> {
+    let Some(value) = value else {
+        return Some(Vec::new());
     };
+    let entries = value.as_array()?;
     entries
         .iter()
-        .filter_map(|entry| entry.as_str().map(str::to_owned))
+        .map(|entry| entry.as_str().map(str::to_owned))
         .collect()
 }
 
-/// A JSON object of string → string, dropping any non-string values.
-fn decode_metadata(value: Option<&Value>) -> std::collections::BTreeMap<String, String> {
-    let Some(object) = value.and_then(Value::as_object) else {
-        return std::collections::BTreeMap::new();
+/// A JSON object of string → string. A missing field is the empty default; a
+/// present field is invalid if any value is not a string.
+fn decode_metadata(value: Option<&Value>) -> Option<std::collections::BTreeMap<String, String>> {
+    let Some(value) = value else {
+        return Some(std::collections::BTreeMap::new());
     };
+    let object = value.as_object()?;
     object
         .iter()
-        .filter_map(|(key, val)| val.as_str().map(|text| (key.clone(), text.to_owned())))
+        .map(|(key, val)| Some((key.clone(), val.as_str()?.to_owned())))
         .collect()
 }
 
@@ -418,17 +419,15 @@ fn decode_metadata(value: Option<&Value>) -> std::collections::BTreeMap<String, 
 ///
 /// Mirrors the legacy worker: at most [`MAX_LOG_LINES`] lines, each at most
 /// [`MAX_LOG_LINE_BYTES`], and a synthetic trailer when either bound clamps.
-pub(crate) fn decode_log(frame: &Map<String, Value>) -> Vec<String> {
-    let Some(entries) = frame.get("log").and_then(Value::as_array) else {
-        return Vec::new();
-    };
+/// A present log field must be an array of strings; malformed entries are a
+/// protocol error rather than silently disappearing.
+pub(crate) fn decode_log(frame: &Map<String, Value>) -> Option<Vec<String>> {
+    let entries = frame.get("log")?.as_array()?;
 
     let mut log: Vec<String> = Vec::new();
     let mut dropped = 0usize;
     for entry in entries {
-        let Some(text) = entry.as_str() else {
-            continue;
-        };
+        let text = entry.as_str()?;
         if log.len() >= MAX_LOG_LINES {
             dropped += 1;
             continue;
@@ -444,7 +443,7 @@ pub(crate) fn decode_log(frame: &Map<String, Value>) -> Vec<String> {
              {MAX_LOG_LINES}]"
         ));
     }
-    log
+    Some(log)
 }
 
 fn clamp_log_line(text: &str) -> String {
@@ -554,6 +553,32 @@ mod tests {
         assert_eq!(
             decode_category("documents"),
             Category::PluginDefined("documents".to_owned())
+        );
+    }
+
+    #[test]
+    fn malformed_nested_item_and_log_fields_are_rejected() {
+        let plugin = PluginId("dev.example.modern".to_owned());
+        let item = json!({
+            "stable_id": "stable",
+            "label": "Label",
+            "target": "/target",
+            "actions": [{
+                "action_id": "open",
+                "label": "Open",
+                "applicable_categories": ["application", 7]
+            }]
+        });
+        assert!(
+            decode_item(&plugin, &item).is_none(),
+            "a malformed nested action must invalidate the whole item"
+        );
+
+        let mut frame = Map::new();
+        frame.insert("log".to_owned(), json!(["valid", 7]));
+        assert!(
+            decode_log(&frame).is_none(),
+            "a malformed log entry must not be silently dropped"
         );
     }
 }

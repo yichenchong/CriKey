@@ -7,9 +7,13 @@ use crate::{harness::TestHarness, SdkError};
 /// Summary of repeated in-process query measurements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BenchReport {
+    /// Number of measurement iterations.
     pub iterations: usize,
+    /// Median iteration duration in microseconds.
     pub p50_us: u64,
+    /// 95th-percentile iteration duration in microseconds.
     pub p95_us: u64,
+    /// Total items returned over all query calls.
     pub items: usize,
 }
 

@@ -15,4 +15,3 @@ workspace = true
 crikey-core.workspace = true
 serde.workspace = true
 toml.workspace = true
-thiserror.workspace = true

@@ -46,6 +46,7 @@ use crikey_core::{Item, PluginId};
 use crikey_package_manager::ImportPath;
 use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
 
+use crate::interpreter::sanitize_python_environment;
 use crate::protocol::{
     self, encode_background_admit, encode_background_cancel, encode_background_refuse, encode_build_catalog,
     encode_execute, encode_handshake, encode_set_cancel, encode_shutdown, encode_suggest,
@@ -828,8 +829,13 @@ impl ModernWorker {
                 sdk.display()
             )));
         }
+        let pythonpath = options
+            .import_path
+            .to_pythonpath()
+            .map_err(|error| HostError::Spawn(format!("the plugin import path is invalid: {error}")))?;
 
         let mut command = Command::new(interpreter.path());
+        sanitize_python_environment(&mut command);
         command
             .arg(WORKER_ISOLATION_FLAG)
             .arg(&entry)
@@ -839,7 +845,7 @@ impl ModernWorker {
             // The child reaches its plugin, managed deps and the SDK through
             // `PYTHONPATH` alone, which is why the isolation flag can only be
             // `-S`. Global site-packages is never on it (spec 15.4).
-            .env("PYTHONPATH", options.import_path.to_pythonpath())
+            .env("PYTHONPATH", pythonpath)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             // Unbuffered, because a buffered reply frame is one the host waits
             // for until a deadline it never should have reached.
@@ -956,22 +962,35 @@ impl ModernWorker {
             let line = self.recv_frame_until(deadline)?;
             let frame = self.expect_frame(&line, id, KIND_CATALOG_BATCH)?;
 
+            let Some(done) = frame.get("done").and_then(Value::as_bool) else {
+                return Err(self.protocol_error(&line));
+            };
+            if protocol::decode_log(&frame).is_none() {
+                return Err(self.protocol_error(&line));
+            }
+
             // A terminal frame carrying an `error` object is a load-time catalog
             // fault (pinned decision 2): the plugin raised in `build_catalog`.
             // The worker itself is healthy and stays alive; the provider records
             // the plugin unavailable.
             if frame_has_error(&frame) {
-                let error = decode_plugin_error(&frame);
+                let Some(error) = decode_plugin_error(&frame) else {
+                    return Err(self.protocol_error(&line));
+                };
+                if !done {
+                    return Err(self.protocol_error(&line));
+                }
                 return Err(HostError::PluginFailed {
                     plugin: self.plugin.clone(),
                     detail: join_detail(error),
                 });
             }
 
-            match protocol::decode_items(&self.plugin, &frame) {
-                Some(mut batch) => items.append(&mut batch),
-                None => return Err(self.protocol_error(&line)),
-            }
+            let Some(mut batch) = protocol::decode_items(&self.plugin, &frame) else {
+                return Err(self.protocol_error(&line));
+            };
+            items.append(&mut batch);
+
             if items.len() > MAX_CALL_ITEMS {
                 return Err(self.overflow(format!(
                     "build_catalog streamed more than {MAX_CALL_ITEMS} items and was stopped"
@@ -985,7 +1004,7 @@ impl ModernWorker {
                 )));
             }
 
-            if frame.get("done").and_then(Value::as_bool) == Some(true) {
+            if done {
                 return Ok(items);
             }
         }
@@ -1044,7 +1063,13 @@ impl ModernWorker {
         loop {
             let line = self.recv_frame_until(deadline)?;
             let frame = self.expect_frame(&line, id, KIND_RESULT_BATCH)?;
-
+            if let Some(generation) = frame.get("generation").and_then(Value::as_u64) {
+                if generation != request.generation {
+                    return Err(self.protocol_error(&line));
+                }
+            } else if frame.get("generation").is_some() {
+                return Err(self.protocol_error(&line));
+            }
             match protocol::decode_items(&self.plugin, &frame) {
                 Some(mut batch) => items.append(&mut batch),
                 None => return Err(self.protocol_error(&line)),
@@ -1061,33 +1086,50 @@ impl ModernWorker {
                     "suggest streamed more than {MAX_CALL_LOG_BYTES} log bytes and was stopped"
                 )));
             }
-            log.append(&mut protocol::decode_log(&frame));
+            let Some(mut batch_log) = protocol::decode_log(&frame) else {
+                return Err(self.protocol_error(&line));
+            };
+            log.append(&mut batch_log);
 
             match frame.get("state").and_then(Value::as_str) {
-                Some("partial") => continue,
+                Some("partial") => {
+                    if frame_has_error(&frame) {
+                        return Err(self.protocol_error(&line));
+                    }
+                    continue;
+                }
                 Some("final") => {
+                    if frame_has_error(&frame) {
+                        return Err(self.protocol_error(&line));
+                    }
                     return Ok(Suggestions {
                         items,
                         state: BatchState::Final,
                         log,
                         error: None,
-                    })
+                    });
                 }
                 Some("cancelled") => {
+                    if frame_has_error(&frame) {
+                        return Err(self.protocol_error(&line));
+                    }
                     return Ok(Suggestions {
                         items,
                         state: BatchState::Cancelled,
                         log,
                         error: None,
-                    })
+                    });
                 }
                 Some("failed") => {
+                    let Some(error) = decode_plugin_error(&frame) else {
+                        return Err(self.protocol_error(&line));
+                    };
                     return Ok(Suggestions {
                         items,
                         state: BatchState::Failed,
                         log,
-                        error: Some(decode_plugin_error(&frame)),
-                    })
+                        error: Some(error),
+                    });
                 }
                 _ => return Err(self.protocol_error(&line)),
             }
@@ -1120,10 +1162,23 @@ impl ModernWorker {
 
         let line = self.recv_frame(self.options.call_timeout_ms)?;
         let frame = self.expect_frame(&line, id, KIND_EXECUTE_RESULT)?;
+        if protocol::decode_log(&frame).is_none() {
+            return Err(self.protocol_error(&line));
+        }
 
         match frame.get("status").and_then(Value::as_str) {
-            Some("ok") => Ok(ExecuteOutcome::Ok),
-            Some("failed") => Ok(ExecuteOutcome::Failed(decode_plugin_error(&frame))),
+            Some("ok") => {
+                if frame_has_error(&frame) {
+                    return Err(self.protocol_error(&line));
+                }
+                Ok(ExecuteOutcome::Ok)
+            }
+            Some("failed") => {
+                let Some(error) = decode_plugin_error(&frame) else {
+                    return Err(self.protocol_error(&line));
+                };
+                Ok(ExecuteOutcome::Failed(error))
+            }
             _ => Err(self.protocol_error(&line)),
         }
     }
@@ -1289,11 +1344,19 @@ impl ModernWorker {
             return self.reaped;
         };
 
-        if matches!(child.try_wait(), Ok(None)) {
-            hard_kill(self.process_id, &mut child);
-            self.hard_stopped = true;
-        }
-        self.reaped = child.wait().ok();
+        let status = match child.try_wait() {
+            Ok(Some(status)) => Some(status),
+            Ok(None) | Err(_) => {
+                hard_kill(self.process_id, &mut child);
+                self.hard_stopped = true;
+                let status = wait_bounded(&mut child, REAP_GRACE);
+                if status.is_none() {
+                    reap_in_background(child);
+                }
+                status
+            }
+        };
+        self.reaped = status;
         self.reaped
     }
 
@@ -1302,6 +1365,7 @@ impl ModernWorker {
         self.alive = false;
         self.background.reap();
         if let Some(status) = self.reaped {
+            self.drain_stderr();
             return WorkerExit {
                 code: status.code(),
                 hard_stopped: self.hard_stopped,
@@ -1309,6 +1373,7 @@ impl ModernWorker {
         }
 
         let Some(mut child) = self.child.take() else {
+            self.drain_stderr();
             return WorkerExit {
                 code: None,
                 hard_stopped: self.hard_stopped,
@@ -1346,7 +1411,7 @@ impl ModernWorker {
         let status = if left_voluntarily {
             wait_bounded(&mut child, REAP_GRACE)
         } else {
-            None
+            wait_bounded(&mut child, Duration::ZERO)
         };
 
         let status = match status {
@@ -1354,19 +1419,20 @@ impl ModernWorker {
             None => {
                 hard_kill(self.process_id, &mut child);
                 self.hard_stopped = true;
-                match child.wait() {
-                    Ok(status) => status,
-                    Err(_) => {
-                        return WorkerExit {
-                            code: None,
-                            hard_stopped: true,
-                        }
-                    }
-                }
+                let Some(status) = wait_bounded(&mut child, REAP_GRACE) else {
+                    reap_in_background(child);
+                    self.drain_stderr();
+                    return WorkerExit {
+                        code: None,
+                        hard_stopped: true,
+                    };
+                };
+                status
             }
         };
 
         self.reaped = Some(status);
+        self.drain_stderr();
         WorkerExit {
             code: status.code(),
             hard_stopped: self.hard_stopped,
@@ -1383,6 +1449,7 @@ impl Drop for ModernWorker {
         if self.child.is_some() {
             let _ = self.reap();
         }
+        self.drain_stderr();
     }
 }
 
@@ -1404,22 +1471,14 @@ fn bounded_excerpt(line: &str) -> String {
 
 /// Reads a reply frame's `error` object into a [`PluginError`].
 ///
-/// A missing or malformed error still yields a `PluginError` rather than
-/// failing: a `failed` reply promises the plugin raised, and the least we owe a
-/// caller is an (empty) structured error rather than a transport failure.
-fn decode_plugin_error(frame: &Map<String, Value>) -> PluginError {
-    let error = frame.get("error").and_then(Value::as_object);
-    let field = |name: &str| {
-        error
-            .and_then(|object| object.get(name))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned()
-    };
-    PluginError {
-        message: field("message"),
-        traceback: field("traceback"),
-    }
+/// A missing or malformed error is a protocol failure. A failed reply promises
+/// a structured exception, and accepting an empty substitute would hide a
+/// broken or hostile worker response.
+fn decode_plugin_error(frame: &Map<String, Value>) -> Option<PluginError> {
+    let error = frame.get("error")?.as_object()?;
+    let message = error.get("message")?.as_str()?.to_owned();
+    let traceback = error.get("traceback")?.as_str()?.to_owned();
+    Some(PluginError { message, traceback })
 }
 
 /// Whether a reply frame carries a present (non-null) `error` object.
@@ -1503,6 +1562,16 @@ fn kill_process_group(pgid: u32) {
     unsafe {
         let _ = killpg(pgid as i32, SIGKILL);
     }
+}
+/// Finishes a killed child's reap without blocking the caller. `try_wait`
+/// reaps an exited child, so this loop has no unbounded blocking wait.
+fn reap_in_background(mut child: Child) {
+    let _ = thread::spawn(move || loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => thread::sleep(REAP_POLL_INTERVAL),
+        }
+    });
 }
 
 /// Waits for an exiting child's status, giving up after `budget`.

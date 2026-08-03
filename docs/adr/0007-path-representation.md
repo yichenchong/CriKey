@@ -12,21 +12,19 @@ concerns and must not share a representation.
 
 ## Decision
 
-- Internally, paths are `PlatformPath`, a newtype over `OsString`. Identity
-  comparisons, hashing and catalog keys use it directly.
-- Display uses an explicitly lossy rendering, never fed back into identity.
-- Across IPC, paths are transported as raw bytes plus an encoding tag: WTF-8 for
-  Windows-origin paths, raw bytes for Unix. The SDKs expose a path type that
-  round-trips those bytes rather than a plain string.
-- Any conversion to `String` in host code is a deliberate, reviewed act.
-
-## Consequences
-
-- Files with non-UTF-8 names remain launchable and indexable.
-- Plugin SDKs carry a path type instead of using their language's string type,
-  which is friction for plugin authors — mitigated with helpers that make the
-  lossy conversion explicit and obvious.
-- Catalog serialization stores bytes, not strings.
+- Platform discovery and launch APIs use `PlatformPath`, a newtype over
+  `OsString`. Identity comparisons and backend launch calls use it directly.
+- Core catalog items intentionally carry a `String` target field. The platform
+  layer encodes a native target into that field with `encode_target`, using a
+  readable form for valid UTF-8 and a platform tag plus escapes for units that
+  UTF-8 cannot represent. `decode_target` reconstructs the native path before
+  launch and rejects a foreign-platform tag instead of guessing.
+- Catalog archives and plugin IPC therefore carry the encoded target string,
+  not an `OsString` or a raw byte buffer. A caller must use the platform
+  conversion helpers when putting a native path into an item; display text
+  must never be fed back into identity or launch.
+- SDK target fields remain strings because they carry logical plugin targets;
+  native application paths use the host's encoded representation.
 
 ## Alternatives
 

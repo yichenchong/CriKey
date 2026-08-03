@@ -1,6 +1,7 @@
 # ADR-0004: Plugin IPC transport and encoding
 
-Status: Accepted
+Status: Accepted — encoding mechanism amended by ADR-0010; proto3 wire and
+transport decisions remain accepted
 Spec: §16.2–16.5, §12.3, §12.4
 
 ## Context
@@ -12,9 +13,10 @@ not cost one IPC round trip per candidate.
 
 ## Decision
 
-- **Encoding**: Protocol Buffers (proto3), schema in `sdk/protocol/crikey/v1/`,
-  generated with `prost` on the host side. Additive evolution only; unknown
-  fields round-trip; tags are never renumbered or reused.
+- **Encoding**: Protocol Buffers (proto3) wire format, schema in
+  `sdk/protocol/crikey/v1/`. The native host uses the hand-written codec
+  selected by ADR-0010. Evolution is additive only; unknown fields round-trip;
+  tags are never renumbered or reused.
 - **Framing**: length-delimited messages with a hard `MAX_FRAME_BYTES` cap
   (8 MiB). An oversized frame is a protocol violation and disconnects the plugin.
 - **Transport**: Windows named pipes, Unix domain sockets, and stdio for
@@ -29,8 +31,8 @@ not cost one IPC round trip per candidate.
   and a socket, which is the point of §4.3.
 - Schema-first development means the wire contract is reviewable independently
   of either side's implementation.
-- Codegen adds a build-time dependency; the generated bindings are committed for
-  the SDK so plugin authors do not need `protoc`.
+- The hand-written native codec avoids a `protoc` or `prost` build dependency;
+  the Rust SDK carries the protocol implementation needed by plugin authors.
 
 ## Alternatives
 

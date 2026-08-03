@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use crikey_core::{CoreError, Result};
 use crikey_plugin_sdk::{
-    serve, CatalogSink, ExecuteRequest, ItemBuilder, Plugin, PluginContext, Query, ServeConfig,
-    SdkError, SuggestionSink,
+    serve, CatalogSink, ExecuteRequest, ItemBuilder, Plugin, PluginContext, Query, SdkError, ServeConfig,
+    SuggestionSink,
 };
 
 const MODE_ENV: &str = "CRIKEY_CONFORMANCE_MODE";
@@ -37,6 +37,7 @@ enum Mode {
     CrashOnSuggest,
     CrashOnStart,
     FailSuggest,
+    Sequence,
 }
 
 fn candidate(value: Option<String>) -> Option<String> {
@@ -65,6 +66,7 @@ fn parse_mode(spec: &str) -> Mode {
         "crash-on-suggest" => Mode::CrashOnSuggest,
         "crash-on-start" => Mode::CrashOnStart,
         "fail-suggest" => Mode::FailSuggest,
+        "sequence" => Mode::Sequence,
         _ if spec.starts_with("stream:") => Mode::Stream(
             spec.strip_prefix("stream:")
                 .and_then(|value| value.parse::<usize>().ok())
@@ -85,6 +87,21 @@ fn parse_mode(spec: &str) -> Mode {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0),
         ),
+        _ => Mode::Echo,
+    }
+}
+
+fn sequence_stage() -> Mode {
+    let path = env::var_os("CRIKEY_SEQUENCE_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::temp_dir().join(format!("crikey-sequence-{}", std::process::id())));
+    let count = fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let _ = fs::write(&path, count.saturating_add(1).to_string());
+    match count {
+        0 | 2 => Mode::CrashOnSuggest,
         _ => Mode::Echo,
     }
 }
@@ -207,10 +224,7 @@ impl ConformancePlugin {
                     if pid_first && index == 0 {
                         pid_item()
                     } else {
-                        result_item(
-                            format!("stream-{index}"),
-                            format!("{} #{index}", query.text),
-                        )
+                        result_item(format!("stream-{index}"), format!("{} #{index}", query.text))
                     }
                 })
                 .collect();
@@ -276,7 +290,10 @@ impl ConformancePlugin {
         thread::sleep(Duration::from_millis(milliseconds));
         emit_final(
             sink,
-            vec![result_item("ignore-cancel-1", format!("{} (ignored)", query.text))],
+            vec![result_item(
+                "ignore-cancel-1",
+                format!("{} (ignored)", query.text),
+            )],
         )
     }
 }
@@ -301,11 +318,7 @@ impl Plugin for ConformancePlugin {
         Ok(())
     }
 
-    fn build_catalog(
-        &mut self,
-        _context: &dyn PluginContext,
-        sink: &mut dyn CatalogSink,
-    ) -> Result<()> {
+    fn build_catalog(&mut self, _context: &dyn PluginContext, sink: &mut dyn CatalogSink) -> Result<()> {
         if let Mode::Stream(count) = self.mode.clone() {
             let mut batch = Vec::with_capacity(16);
             for catalog_item in catalog_stream_items(count) {
@@ -341,15 +354,12 @@ impl Plugin for ConformancePlugin {
             Mode::Acceptance => self.suggest_acceptance(query, context, sink),
             Mode::Stream(count) => self.suggest_stream(query, count, false, sink),
             Mode::Slow(milliseconds) => self.suggest_slow(query, milliseconds, context, sink),
-            Mode::SlowWitness(milliseconds) => {
-                self.suggest_slow_witness(query, milliseconds, context, sink)
-            }
-            Mode::IgnoreCancel(milliseconds) => {
-                self.suggest_ignore_cancel(query, milliseconds, sink)
-            }
+            Mode::SlowWitness(milliseconds) => self.suggest_slow_witness(query, milliseconds, context, sink),
+            Mode::IgnoreCancel(milliseconds) => self.suggest_ignore_cancel(query, milliseconds, sink),
             Mode::CrashOnSuggest => crash("crash-on-suggest requested"),
             Mode::CrashOnStart => Err(invalid("crash-on-start should not receive suggest")),
             Mode::FailSuggest => Err(invalid("conformance fail-suggest requested")),
+            Mode::Sequence => Err(invalid("sequence mode must be resolved before serving")),
         }
     }
 
@@ -363,7 +373,10 @@ impl Plugin for ConformancePlugin {
 }
 
 fn run() -> Result<(), SdkError> {
-    let mode = parse_mode(&selected_mode());
+    let mode = match parse_mode(&selected_mode()) {
+        Mode::Sequence => sequence_stage(),
+        mode => mode,
+    };
     let configured_id = if matches!(mode, Mode::SameId) {
         SHARED_PLUGIN_ID
     } else {

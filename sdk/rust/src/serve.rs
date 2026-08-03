@@ -4,14 +4,22 @@
 //! cooperative cancellation: a plugin may be polling its context while it is
 //! not currently inside a sink call, so a blocking transport read cannot be
 //! allowed to starve the cancellation signal.
+//!
+//! Plugin callbacks are invoked behind an unwind boundary.  A callback panic is
+//! reported as a failed request and the serving loop remains available for
+//! later requests; a panic during startup or orderly shutdown is returned as an
+//! SDK error because the plugin cannot safely continue in either state.  This
+//! applies to the normal unwinding panic strategy; a plugin built with
+//! `panic = "abort"` still terminates the process by design.
 
 use std::collections::VecDeque;
 use std::env;
 use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crikey_core::{ActionId, CoreError, Item, ItemId, PluginId, Result};
 use crikey_native_protocol::message::{
@@ -29,19 +37,42 @@ use crate::{
 /// is busy.  A full queue deliberately blocks the reader, which pauses IPC
 /// reads rather than allowing unbounded memory growth (spec 12.4).
 const READER_QUEUE_CAPACITY: usize = 64;
+/// Maximum time spent waiting for a handshake acknowledgement. Individual
+/// read timeouts are polling events, not a protocol failure.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LOG_RECORDS_PER_REQUEST: u32 = 256;
 const MAX_LOG_BYTES_PER_REQUEST: usize = 64 * 1024;
 const MAX_LOG_MESSAGE_BYTES: usize = 8 * 1024;
 
+fn invoke_callback<T>(callback: impl FnOnce() -> Result<T>) -> std::result::Result<Result<T>, String> {
+    catch_unwind(AssertUnwindSafe(callback)).map_err(|panic| {
+        let detail = if let Some(message) = panic.downcast_ref::<&str>() {
+            (*message).to_owned()
+        } else if let Some(message) = panic.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "callback panicked with a non-string payload".to_owned()
+        };
+        format!("plugin callback panicked: {detail}")
+    })
+}
+
 /// Connection and identity values advertised by a plugin (spec 16.3, 16.6).
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
+    /// Stable plugin identity advertised during handshake.
     pub plugin_id: String,
+    /// Human-readable plugin name.
     pub plugin_name: String,
+    /// Plugin release version.
     pub plugin_version: String,
+    /// SDK version advertised during handshake.
     pub sdk_version: String,
+    /// Protocol capabilities this plugin implements.
     pub capabilities: Capabilities,
+    /// Endpoint to connect, or `None` to read it from the environment.
     pub endpoint: Option<Endpoint>,
+    /// Session token supplied by the host.
     pub session_token: Option<String>,
 }
 
@@ -105,11 +136,17 @@ impl ServeConfig {
 /// Identity returned by [`crate::harness::TestHarness::handshake`].
 #[derive(Debug, Clone)]
 pub struct HandshakeInfo {
+    /// Plugin identity received from the handshake.
     pub plugin_id: String,
+    /// Human-readable plugin name.
     pub plugin_name: String,
+    /// Plugin release version.
     pub plugin_version: String,
+    /// SDK version advertised by the plugin.
     pub sdk_version: String,
+    /// Negotiated protocol version.
     pub protocol_version: u32,
+    /// Capabilities advertised by the plugin.
     pub capabilities: Capabilities,
 }
 
@@ -185,9 +222,16 @@ pub fn serve_on(
         0,
     );
 
-    if let Err(error) = plugin.start(&context) {
-        stop_reader(&reader_stop, reader);
-        return Err(SdkError::Protocol(format!("plugin start failed: {error}")));
+    match invoke_callback(|| plugin.start(&context)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            stop_reader(&reader_stop, reader);
+            return Err(SdkError::Protocol(format!("plugin start failed: {error}")));
+        }
+        Err(detail) => {
+            stop_reader(&reader_stop, reader);
+            return Err(SdkError::Protocol(format!("plugin start failed: {detail}")));
+        }
     }
     if let Some(error) = context.take_log_error() {
         stop_reader(&reader_stop, reader);
@@ -237,7 +281,19 @@ fn handshake(
             unknown: Default::default(),
         },
     )?;
-    let response = transport.recv().map_err(SdkError::from)?;
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let response = loop {
+        match transport.recv() {
+            Ok(response) => break response,
+            Err(ProtocolError::Timeout) if Instant::now() < deadline => continue,
+            Err(ProtocolError::Timeout) => {
+                return Err(SdkError::Transport(
+                    "handshake acknowledgement timed out".to_owned(),
+                ));
+            }
+            Err(error) => return Err(SdkError::from(error)),
+        }
+    };
     let connection_id = response.connection_id;
     let ack = match response.payload {
         Some(Payload::HandshakeAck(ack)) => ack,
@@ -375,6 +431,7 @@ fn spawn_reader(
                 ReaderTransport::Shared(transport) => match transport.lock() {
                     Ok(mut locked) => locked.recv(),
                     Err(_) => {
+                        cancellation.cancel((0, 0));
                         let _ = sender.send(ReadEvent::Failed(Box::new(SdkError::Transport(
                             "transport lock poisoned".to_owned(),
                         ))));
@@ -395,10 +452,12 @@ fn spawn_reader(
                 }
                 Err(ProtocolError::Timeout) => continue,
                 Err(ProtocolError::Closed) => {
+                    cancellation.cancel((0, 0));
                     let _ = sender.send(ReadEvent::Closed);
                     break;
                 }
                 Err(error) => {
+                    cancellation.cancel((0, 0));
                     let _ = sender.send(ReadEvent::Failed(Box::new(SdkError::from(error))));
                     break;
                 }
@@ -464,12 +523,18 @@ impl RuntimeInput {
         }
     }
 
-    fn stash(&mut self, envelope: Envelope) {
+    fn stash(&mut self, envelope: Envelope) -> std::result::Result<(), SdkError> {
+        if self.pending.len() >= READER_QUEUE_CAPACITY {
+            return Err(SdkError::Protocol(
+                "input queue exhausted while waiting for flow control".to_owned(),
+            ));
+        }
         self.pending.push_back(envelope);
+        Ok(())
     }
-    fn mark_shutdown(&mut self, envelope: Envelope) {
+
+    fn mark_shutdown(&mut self) {
         self.shutdown = true;
-        self.stash(envelope);
     }
 }
 
@@ -532,7 +597,11 @@ impl CancellationState {
             generation: key.1,
         };
         if let Ok(mut active) = self.active.lock() {
-            if active.current == Some(key) || (key.request_id == 0 && key.generation == 0) {
+            if key.request_id == 0 && key.generation == 0 {
+                if active.current.is_some() {
+                    active.cancelled = true;
+                }
+            } else if active.current == Some(key) {
                 active.cancelled = true;
             } else if active.pending.len() < 256 {
                 active.pending.push_back(key);
@@ -718,15 +787,33 @@ fn serve_requests(
         let deadline_ms = envelope.deadline_ms;
         let payload = match envelope.payload {
             Some(payload) => payload,
-            None => continue,
+            None => {
+                send_error(
+                    transport,
+                    context.connection_id,
+                    request_id,
+                    generation,
+                    "request payload is missing",
+                )?;
+                continue;
+            }
         };
         let request_context = context.for_request(request_id, generation);
         match payload {
             Payload::Shutdown(_) => {
-                let _in_flight = metrics.enter();
-                plugin
-                    .stop(&request_context)
-                    .map_err(|error| SdkError::Protocol(format!("plugin stop failed: {error}")))?;
+                let callback = {
+                    let _in_flight = metrics.enter();
+                    invoke_callback(|| plugin.stop(&request_context))
+                };
+                match callback {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        return Err(SdkError::Protocol(format!("plugin stop failed: {error}")));
+                    }
+                    Err(detail) => {
+                        return Err(SdkError::Protocol(format!("plugin stop failed: {detail}")));
+                    }
+                }
                 if let Some(error) = request_context.take_log_error() {
                     return Err(error);
                 }
@@ -781,12 +868,17 @@ fn serve_requests(
             Payload::Configuration(configuration) => {
                 let callback_result = {
                     let _in_flight = metrics.enter();
-                    plugin.on_configuration(&configuration.values, &request_context)
+                    invoke_callback(|| plugin.on_configuration(&configuration.values, &request_context))
                 };
                 if let Some(error) = request_context.take_log_error() {
                     return Err(error);
                 }
-                if let Err(error) = callback_result {
+                let callback_error = match callback_result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(detail) => Some(detail),
+                };
+                if let Some(error) = callback_error {
                     send_error(
                         transport,
                         request_context.connection_id,
@@ -804,12 +896,17 @@ fn serve_requests(
                 };
                 let callback_result = {
                     let _in_flight = metrics.enter();
-                    plugin.on_event(&plugin_event, &request_context)
+                    invoke_callback(|| plugin.on_event(&plugin_event, &request_context))
                 };
                 if let Some(error) = request_context.take_log_error() {
                     return Err(error);
                 }
-                if let Err(error) = callback_result {
+                let callback_error = match callback_result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(detail) => Some(detail),
+                };
+                if let Some(error) = callback_error {
                     send_error(
                         transport,
                         request_context.connection_id,
@@ -822,17 +919,18 @@ fn serve_requests(
             Payload::Lifecycle(lifecycle) => {
                 let callback = {
                     let _in_flight = metrics.enter();
-                    match lifecycle.kind.as_i32() {
+                    invoke_callback(|| match lifecycle.kind.as_i32() {
                         1 => plugin.start(&request_context),
                         2 => plugin.stop(&request_context),
                         3 => plugin.on_activated(&request_context),
                         4 => plugin.on_deactivated(&request_context),
                         _ => Err(CoreError::Invalid("unsupported lifecycle kind".to_owned())),
-                    }
+                    })
                 };
                 let (ok, error) = match callback {
-                    Ok(()) => (true, None),
-                    Err(error) => (false, Some(structured_error(&error.to_string(), request_id))),
+                    Ok(Ok(())) => (true, None),
+                    Ok(Err(error)) => (false, Some(structured_error(&error.to_string(), request_id))),
+                    Err(detail) => (false, Some(structured_error(&detail, request_id))),
                 };
                 if let Some(log_error) = request_context.take_log_error() {
                     return Err(log_error);
@@ -880,17 +978,29 @@ fn serve_requests(
                 )?;
             }
             _ => {
-                return Err(SdkError::Protocol(format!(
-                    "unsupported request payload {}",
-                    payload.kind()
-                )));
+                send_error(
+                    transport,
+                    request_context.connection_id,
+                    request_id,
+                    generation,
+                    &format!("unsupported request payload {}", payload.kind()),
+                )?;
             }
         }
         if input.shutdown {
-            let _in_flight = metrics.enter();
-            plugin
-                .stop(&request_context)
-                .map_err(|error| SdkError::Protocol(format!("plugin stop failed: {error}")))?;
+            let callback = {
+                let _in_flight = metrics.enter();
+                invoke_callback(|| plugin.stop(&request_context))
+            };
+            match callback {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(SdkError::Protocol(format!("plugin stop failed: {error}")));
+                }
+                Err(detail) => {
+                    return Err(SdkError::Protocol(format!("plugin stop failed: {detail}")));
+                }
+            }
             if let Some(error) = request_context.take_log_error() {
                 return Err(error);
             }
@@ -950,7 +1060,7 @@ fn handle_suggest(
     );
     let callback_result = {
         let _in_flight = metrics.enter();
-        plugin.suggest(query, context, &mut sink)
+        invoke_callback(|| plugin.suggest(query, context, &mut sink))
     };
     if sink.shutdown_received() {
         cancellation.end();
@@ -958,6 +1068,11 @@ fn handle_suggest(
     }
     let cancelled_error = sink.take_cancelled_error();
     let observed = cancellation.was_observed();
+    let callback_error = match callback_result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(detail) => Some(detail),
+    };
     let result = if let Some(error) = sink.take_transport_error() {
         Err(error)
     } else if sink.terminal_sent() {
@@ -968,8 +1083,8 @@ fn handle_suggest(
     } else if cancelled_error {
         sink.finish_final()
             .map_err(|error| SdkError::Protocol(format!("ignored cancellation could not finish: {error}")))
-    } else if let Err(error) = callback_result {
-        sink.finish_failed(&error.to_string()).map_err(|finish_error| {
+    } else if let Some(error) = callback_error {
+        sink.finish_failed(&error).map_err(|finish_error| {
             SdkError::Protocol(format!("failed suggestion could not finish: {finish_error}"))
         })
     } else {
@@ -1014,18 +1129,23 @@ fn handle_catalog(
     );
     let callback_result = {
         let _in_flight = metrics.enter();
-        plugin.build_catalog(context, &mut sink)
+        invoke_callback(|| plugin.build_catalog(context, &mut sink))
     };
     if sink.shutdown_received() {
         cancellation.end();
         return Ok(());
     }
+    let callback_error = match callback_result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(detail) => Some(detail),
+    };
     let result = if let Some(error) = sink.take_transport_error() {
         Err(error)
     } else if sink.terminal_sent() {
         Ok(())
     } else {
-        sink.finish(callback_result.err().map(|error| error.to_string()))
+        sink.finish(callback_error)
             .map_err(|error| SdkError::Protocol(format!("catalog could not finish: {error}")))
     };
     let shutdown = sink.shutdown_received();
@@ -1062,13 +1182,17 @@ fn handle_execute(
     };
     let callback = {
         let _in_flight = metrics.enter();
-        plugin.execute(plugin_request, context)
+        invoke_callback(|| plugin.execute(plugin_request, context))
     };
     let (outcome, error) = match callback {
-        Ok(()) => (ExecuteOutcomeCode::from_i32(1), None),
-        Err(error) => (
+        Ok(Ok(())) => (ExecuteOutcomeCode::from_i32(1), None),
+        Ok(Err(error)) => (
             ExecuteOutcomeCode::from_i32(2),
             Some(structured_error(&error.to_string(), request_id)),
+        ),
+        Err(detail) => (
+            ExecuteOutcomeCode::from_i32(2),
+            Some(structured_error(&detail, request_id)),
         ),
     };
     send_envelope(
@@ -1198,10 +1322,15 @@ impl<'a> SuggestionSinkImpl<'a> {
                         .cancel((envelope.request_id, envelope.generation));
                 }
                 Some(Payload::Shutdown(_)) => {
-                    self.input.mark_shutdown(envelope);
+                    self.input.mark_shutdown();
                     return Err(CoreError::Cancelled);
                 }
-                _ => self.input.stash(envelope),
+                _ => {
+                    self.input.stash(envelope).map_err(|error| {
+                        self.transport_error = Some(error.clone());
+                        CoreError::Invalid(error.to_string())
+                    })?;
+                }
             }
             if self.input.shutdown {
                 return Err(CoreError::Cancelled);
@@ -1392,13 +1521,20 @@ impl<'a> CatalogSinkImpl<'a> {
                 Some(Payload::Cancel(_)) => {
                     self.cancellation
                         .cancel((envelope.request_id, envelope.generation));
-                    return Err(CoreError::Cancelled);
+                    if self.cancellation.cancellation_flag() {
+                        return Err(CoreError::Cancelled);
+                    }
                 }
                 Some(Payload::Shutdown(_)) => {
-                    self.input.mark_shutdown(envelope);
+                    self.input.mark_shutdown();
                     return Err(CoreError::Cancelled);
                 }
-                _ => self.input.stash(envelope),
+                _ => {
+                    self.input.stash(envelope).map_err(|error| {
+                        self.transport_error = Some(error.clone());
+                        CoreError::Invalid(error.to_string())
+                    })?;
+                }
             }
             if self.input.shutdown {
                 return Err(CoreError::Cancelled);

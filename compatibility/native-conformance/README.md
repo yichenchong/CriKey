@@ -22,8 +22,11 @@ Mode selection is identical in both binaries: `CRIKEY_CONFORMANCE_MODE`, then
 |  | `crash-on-suggest` | Aborts inside `suggest`. |
 |  | `crash-on-start` | Aborts from `start`. |
 |  | `fail-suggest` | Returns a plugin error from `suggest`. |
+|  | `sequence` | Uses `CRIKEY_SEQUENCE_FILE` as a launch-count file: the first and third processes abort in `suggest`, while the second behaves like `echo`. |
 | `crikey-misbehaving-plugin` | `oversized` | Writes a frame length above `MAX_FRAME_BYTES`. |
 |  | `flood` | Sends result batches without respecting host credits. |
+|  | `stderr-flood` | Writes several MiB to standard error before sending a final result. |
+|  | `partial-no-terminal` | Sends one partial result batch and never sends a terminal batch. |
 |  | `log-flood` | After the handshake and a suggest request, continuously sends large log records without consuming result credit. |
 |  | `control-witness` | Triggers truncation, records Cancel/FlowControl/Shutdown arrival order, and reports the order in terminal result items. |
 |  | `bad-version:<v>` | Handshakes with protocol version `v`. |

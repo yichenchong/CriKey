@@ -38,26 +38,31 @@ impl ItemBuilder {
         }
     }
 
+    /// Sets the launch target.
     pub fn target(mut self, target: impl Into<String>) -> Self {
         self.target = target.into();
         self
     }
 
+    /// Sets the display description.
     pub fn description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
         self
     }
 
+    /// Sets the item category.
     pub fn category(mut self, category: Category) -> Self {
         self.category = category;
         self
     }
 
+    /// Sets the ranker's score hint.
     pub fn score_hint(mut self, score_hint: i32) -> Self {
         self.score_hint = score_hint;
         self
     }
 
+    /// Adds one searchable term.
     pub fn search_term(mut self, search_term: impl Into<String>) -> Self {
         self.search_terms.push(search_term.into());
         self
@@ -69,11 +74,13 @@ impl ItemBuilder {
         self
     }
 
+    /// Adds one action.
     pub fn action(mut self, action: Action) -> Self {
         self.actions.push(action);
         self
     }
 
+    /// Sets the icon reference.
     pub fn icon(mut self, icon_reference: impl Into<String>) -> Self {
         self.icon_reference = Some(icon_reference.into());
         self
@@ -111,6 +118,7 @@ pub struct ActionBuilder {
 }
 
 impl ActionBuilder {
+    /// Starts an action with a stable identifier and display label.
     pub fn new(action_id: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             action_id: action_id.into(),
@@ -122,11 +130,13 @@ impl ActionBuilder {
         }
     }
 
+    /// Sets the action description.
     pub fn description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
         self
     }
 
+    /// Sets the action icon reference.
     pub fn icon(mut self, icon_reference: impl Into<String>) -> Self {
         self.icon_reference = Some(icon_reference.into());
         self
@@ -146,6 +156,7 @@ impl ActionBuilder {
         self
     }
 
+    /// Consumes the builder and produces the core action.
     pub fn build(self) -> Action {
         Action {
             action_id: ActionId(self.action_id),

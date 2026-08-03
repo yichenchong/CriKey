@@ -20,16 +20,24 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     let Some(command) = args.first().map(String::as_str) else {
         return refuse("`package` needs build, verify, inspect or migrate-keypirinha");
     };
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+
+    if command == "-h" || command == "--help" {
+        if args.len() == 1 {
+            print!("{}", package_help());
+            return ExitCode::from(EX_OK);
+        }
+        return refuse("`package --help` takes no additional arguments");
+    }
+
+    if args[1..].iter().any(|arg| arg == "-h" || arg == "--help") {
+        if let Err(message) = validate_help_args(command, &args[1..]) {
+            return refuse(&message);
+        }
         print_help(command);
-        return if matches!(command, "build" | "verify" | "inspect" | "migrate-keypirinha") {
-            if command == "migrate-keypirinha" {
-                ExitCode::from(EX_UNAVAILABLE)
-            } else {
-                ExitCode::from(EX_OK)
-            }
+        return if command == "migrate-keypirinha" {
+            ExitCode::from(EX_UNAVAILABLE)
         } else {
-            ExitCode::from(EX_USAGE)
+            ExitCode::from(EX_OK)
         };
     }
 
@@ -40,6 +48,46 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         "migrate-keypirinha" => ExitCode::from(EX_UNAVAILABLE),
         other => refuse(&format!("unknown package subcommand `{other}`")),
     }
+}
+
+fn validate_help_args(command: &str, args: &[String]) -> Result<(), String> {
+    let mut position = 0;
+    while position < args.len() {
+        let argument = args[position].as_str();
+        if argument == "-h" || argument == "--help" {
+            position += 1;
+            continue;
+        }
+        let consumes_value = match command {
+            "build" => {
+                matches!(argument, "--plugin" | "--out")
+                    || argument.starts_with("--plugin=")
+                    || argument.starts_with("--out=")
+            }
+            "verify" => {
+                matches!(argument, "--package" | "--expect-hash")
+                    || argument.starts_with("--package=")
+                    || argument.starts_with("--expect-hash=")
+            }
+            "inspect" => matches!(argument, "--package") || argument.starts_with("--package="),
+            "migrate-keypirinha" => false,
+            _ => return Err(format!("unknown package subcommand `{command}`")),
+        };
+        if consumes_value {
+            if argument == "--plugin"
+                || argument == "--out"
+                || argument == "--package"
+                || argument == "--expect-hash"
+            {
+                position = position.saturating_add(2);
+            } else {
+                position += 1;
+            }
+        } else {
+            return Err(format!("package command does not understand `{argument}`"));
+        }
+    }
+    Ok(())
 }
 
 fn build(args: &[String]) -> ExitCode {
@@ -140,6 +188,9 @@ fn parse_flags(
             if inspect_mode {
                 return Err("`package inspect` accepts `--package`, not `--plugin`".to_owned());
             }
+            if value.is_empty() {
+                return Err("`package build --plugin` was given an empty path".to_owned());
+            }
             *plugin_or_package = Some(PathBuf::from(value));
             position += 1;
         } else if argument == "--plugin" {
@@ -149,11 +200,17 @@ fn parse_flags(
             let value = args
                 .get(position + 1)
                 .ok_or_else(|| "`package build` needs a path after `--plugin`".to_owned())?;
+            if value.is_empty() {
+                return Err("`package build --plugin` was given an empty path".to_owned());
+            }
             *plugin_or_package = Some(PathBuf::from(value));
             position += 2;
         } else if let Some(value) = argument.strip_prefix("--package=") {
             if !inspect_mode {
                 return Err("`package build` accepts `--plugin`, not `--package`".to_owned());
+            }
+            if value.is_empty() {
+                return Err("`package inspect --package` was given an empty path".to_owned());
             }
             *plugin_or_package = Some(PathBuf::from(value));
             position += 1;
@@ -164,11 +221,17 @@ fn parse_flags(
             let value = args
                 .get(position + 1)
                 .ok_or_else(|| "the package command needs a path after `--package`".to_owned())?;
+            if value.is_empty() {
+                return Err("`package inspect --package` was given an empty path".to_owned());
+            }
             *plugin_or_package = Some(PathBuf::from(value));
             position += 2;
         } else if let Some(value) = argument.strip_prefix("--out=") {
             if inspect_mode {
                 return Err("`package inspect` does not accept `--out`".to_owned());
+            }
+            if value.is_empty() {
+                return Err("`package build --out` was given an empty path".to_owned());
             }
             *output = Some(PathBuf::from(value));
             position += 1;
@@ -179,6 +242,9 @@ fn parse_flags(
             let value = args
                 .get(position + 1)
                 .ok_or_else(|| "`package build` needs a path after `--out`".to_owned())?;
+            if value.is_empty() {
+                return Err("`package build --out` was given an empty path".to_owned());
+            }
             *output = Some(PathBuf::from(value));
             position += 2;
         } else {
@@ -197,21 +263,33 @@ fn parse_verify_flags(
     while position < args.len() {
         let argument = args[position].as_str();
         if let Some(value) = argument.strip_prefix("--package=") {
+            if value.is_empty() {
+                return Err("`package verify --package` was given an empty path".to_owned());
+            }
             *package = Some(PathBuf::from(value));
             position += 1;
         } else if argument == "--package" {
             let value = args
                 .get(position + 1)
                 .ok_or_else(|| "`package verify` needs a path after `--package`".to_owned())?;
+            if value.is_empty() {
+                return Err("`package verify --package` was given an empty path".to_owned());
+            }
             *package = Some(PathBuf::from(value));
             position += 2;
         } else if let Some(value) = argument.strip_prefix("--expect-hash=") {
+            if value.is_empty() {
+                return Err("`package verify --expect-hash` was given an empty value".to_owned());
+            }
             *expected_hash = Some(PathBuf::from(value));
             position += 1;
         } else if argument == "--expect-hash" {
             let value = args
                 .get(position + 1)
                 .ok_or_else(|| "`package verify` needs HEX after `--expect-hash`".to_owned())?;
+            if value.is_empty() {
+                return Err("`package verify --expect-hash` was given an empty value".to_owned());
+            }
             *expected_hash = Some(PathBuf::from(value));
             position += 2;
         } else {
@@ -270,20 +348,43 @@ fn refuse(message: &str) -> ExitCode {
 
 fn print_help(command: &str) {
     match command {
-        "build" => {
-            print!("crikey package build\n\nUSAGE:\n    crikey package build --plugin DIR [--out FILE]\n")
-        }
-        "verify" => print!(
-            "crikey package verify\n\nUSAGE:\n    crikey package verify --package FILE [--expect-hash HEX]\n"
+        "build" => print!(
+            "crikey package build\n\n\
+             USAGE:\n    crikey package build --plugin DIR [--out FILE]\n\n\
+             OPTIONS:\n    --plugin DIR   Native plugin directory to package.\n\
+                 --out FILE     Archive to write (defaults beside the plugin).\n\
+                 -h, --help     Print this message without building.\n"
         ),
-        "inspect" => print!("crikey package inspect\n\nUSAGE:\n    crikey package inspect --package FILE\n"),
-        "migrate-keypirinha" => eprintln!("crikey: `package migrate-keypirinha` is not implemented"),
+        "verify" => print!(
+            "crikey package verify\n\n\
+             USAGE:\n    crikey package verify --package FILE [--expect-hash HEX]\n\n\
+             OPTIONS:\n    --package FILE       Archive to verify.\n\
+                 --expect-hash HEX  Expected SHA-256 hash.\n\
+                 -h, --help          Print this message without verifying.\n"
+        ),
+        "inspect" => print!(
+            "crikey package inspect\n\n\
+             USAGE:\n    crikey package inspect --package FILE\n\n\
+             OPTIONS:\n    --package FILE  Archive to inspect.\n\
+                 -h, --help      Print this message without inspecting.\n"
+        ),
+        "migrate-keypirinha" => {
+            eprintln!("crikey: `package migrate-keypirinha` is not implemented")
+        }
         _ => print!("{}", package_help()),
     }
 }
 
 fn package_help() -> &'static str {
-    "crikey package build|verify|inspect\n\nUSAGE:\n    crikey package build --plugin DIR [--out FILE]\n    crikey package verify --package FILE [--expect-hash HEX]\n    crikey package inspect --package FILE\n    crikey package migrate-keypirinha\n"
+    "crikey package - package native plugins\n\n\
+USAGE:\n\
+    crikey package build --plugin DIR [--out FILE]\n\
+    crikey package verify --package FILE [--expect-hash HEX]\n\
+    crikey package inspect --package FILE\n\
+    crikey package migrate-keypirinha\n\
+\n\
+OPTIONS:\n\
+    -h, --help  Print this message\n"
 }
 
 #[cfg(test)]
@@ -293,5 +394,37 @@ mod tests {
     #[test]
     fn package_encoding_matches_frozen_spelling() {
         assert_eq!(encode("space % and ="), "space%20%25%20and%20%3D");
+    }
+
+    #[test]
+    fn help_does_not_hide_unknown_package_options() {
+        let args = vec!["--help".to_owned(), "--unknown".to_owned()];
+        assert!(validate_help_args("build", &args).is_err());
+    }
+
+    #[test]
+    fn empty_output_and_hash_values_are_rejected() {
+        let mut plugin = None;
+        let mut output = None;
+        assert!(parse_flags(
+            &["--plugin".to_owned(), "plugin".to_owned(), "--out=".to_owned()],
+            &mut plugin,
+            &mut output,
+            false,
+        )
+        .is_err());
+
+        let mut package = None;
+        let mut expected_hash = None;
+        assert!(parse_verify_flags(
+            &[
+                "--package".to_owned(),
+                "package".to_owned(),
+                "--expect-hash=".to_owned()
+            ],
+            &mut package,
+            &mut expected_hash,
+        )
+        .is_err());
     }
 }

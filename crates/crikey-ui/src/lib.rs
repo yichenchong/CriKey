@@ -229,14 +229,18 @@ impl LauncherViewModel {
 
     /// Makes `generation` the active one and marks results outstanding.
     ///
-    /// Only a generation strictly newer than every generation this launcher has
-    /// ever begun is accepted, so results can never be reordered across
-    /// generations and a generation retired in an earlier session can never
-    /// come back (spec 6.5). The rows keep showing the previous generation's
-    /// results until its first publish arrives: editing the query must never
-    /// flicker the list empty.
+    /// `Generation::ZERO` is the core sentinel for "no query has begun", so it
+    /// is never a live target. Only a generation strictly newer than every
+    /// generation this launcher has ever begun is accepted, so results can
+    /// never be reordered across generations and a generation retired in an
+    /// earlier session can never come back (spec 6.5). The rows keep showing
+    /// the previous generation's results until its first publish arrives:
+    /// editing the query must never flicker the list empty.
     pub fn begin_generation(&mut self, generation: Generation) {
-        if !self.visible || self.floor.is_some_and(|floor| generation <= floor) {
+        if !self.visible
+            || generation == Generation::ZERO
+            || self.floor.is_some_and(|floor| generation <= floor)
+        {
             return;
         }
 

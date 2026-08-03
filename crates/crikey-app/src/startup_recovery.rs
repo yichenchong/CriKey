@@ -143,13 +143,16 @@ impl StartupJournal {
     }
 
     /// Records that this launch reached a usable state, clearing the failure
-    /// run.
+    /// run and closing its admission. A later startup in the same process must
+    /// decide its mode from the reset count rather than replaying this launch's
+    /// old verdict.
     ///
     /// A reset rather than a decrement: safe mode is about *consecutive*
     /// failures, so one successful boot must take a looping install straight
     /// back out of it.
     pub fn mark_ready(&mut self) {
         self.consecutive_failures = 0;
+        self.admitted = None;
     }
 
     /// Records that this launch shut down deliberately, so no plugin is blamed
@@ -229,13 +232,19 @@ pub fn admitted_plugin_roots(mode: &StartupMode, roots: &[PathBuf]) -> Vec<PathB
 static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Reads at most [`StartupJournal::MAX_BYTES`] from `path`, or `None` if the
-/// file is absent, unreadable, not UTF-8, or larger than that.
+/// file is absent, non-regular, unreadable, not UTF-8, or larger than that.
 ///
 /// The ceiling is applied to the *reader*, not to a stat of the path: a size
 /// read before the open is a guess about a file another process may still be
-/// growing, and character devices and fifos report no size at all. Taking the
-/// reader bounds the allocation whatever the path turns out to be.
+/// growing. Non-regular files are rejected before opening, so a directory or
+/// named pipe cannot block startup while the recovery reader waits for input.
+/// Taking the reader bounds the allocation whatever a regular file's contents
+/// turn out to be.
 fn read_bounded(path: &Path) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
     let file = fs::File::open(path).ok()?;
     let mut text = String::new();
     let read = file

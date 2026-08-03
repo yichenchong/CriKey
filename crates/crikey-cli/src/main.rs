@@ -15,6 +15,7 @@ use crikey_app::{
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
 };
+use crikey_catalog::{CatalogCache, FileCatalogCache};
 use crikey_core::{Generation, Item, PluginId};
 use crikey_input_scheduler::{
     ActivationPolicy, DebouncePolicy, PluginPolicy, QueuePolicy, SchedulingProfile,
@@ -36,15 +37,17 @@ USAGE:
     crikey <COMMAND> [ARGS]
 
 COMMANDS:
-    run                             Start the launcher
-    plugin list|install|remove|enable|disable|doctor|scheduling-profile
-    dev   run|test|benchmark|measure-activation|trace-query|simulate-typing|inspect-protocol
-    dev   test-legacy-compat|inspect-catalog|compatibility-report
-    package build|verify|inspect|migrate-keypirinha
+    run                             Start the launcher (use `crikey run --help`)
+    plugin                          Plugin management (not available yet)
+    dev                             Developer commands (use `crikey dev --help`)
+    package                         Package commands (use `crikey package --help`)
     version                         Print version information
     help                            Print this message
-";
 
+TOP-LEVEL OPTIONS:
+    -h, --help                      Print this message
+    -V, --version                   Print version information
+";
 /// Queries the reported percentiles are drawn from, and results each retains.
 ///
 /// Fixed rather than exposed as options: two percentiles only compare when both
@@ -57,14 +60,66 @@ const APPLICATION_CATALOG_PLUGIN: &str = "builtin.crikey.applications";
 #[cfg(windows)]
 const DEFAULT_ACTIVATION_HOTKEY: &str = "Ctrl+Alt+Space";
 
+const RUN_USAGE: &str = "\
+crikey run - start the launcher
+
+USAGE:
+    crikey run
+    crikey run --help
+
+OPTIONS:
+    -h, --help                      Print this message without starting the launcher
+";
+
+const DEV_USAGE: &str = "\
+crikey dev - run a developer command
+
+USAGE:
+    crikey dev <COMMAND> [ARGS]
+
+COMMANDS:
+    run                             Run one modern Python plugin query
+    test                            Run modern Python plugin queries
+    benchmark                       Measure the catalog path
+    trace-query                     Trace deterministic query scheduling
+    simulate-typing                Simulate deterministic typing
+    test-legacy-compat              Test one legacy package
+    inspect-catalog                 Inspect one legacy package catalog
+    compatibility-report            Report compatibility data files
+    inspect-protocol                Inspect one native plugin protocol
+    measure-activation              Measure warm activation
+
+OPTIONS:
+    -h, --help                      Print this message
+";
+
+const VERSION_USAGE: &str = "\
+crikey version - print version information
+
+USAGE:
+    crikey version
+";
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    dispatch(&args)
+}
+
+fn dispatch(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
-        None | Some("help") | Some("-h") | Some("--help") => {
+        None => {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Some("version") | Some("-V") | Some("--version") => {
+        Some("help") if args.len() == 1 => {
+            print!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some("-h" | "--help") if args.len() == 1 => {
+            print!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some("version") if args.len() == 1 => {
             println!(
                 "crikey {} ({} backend)",
                 env!("CARGO_PKG_VERSION"),
@@ -72,11 +127,30 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        Some("version") if args.len() == 2 && matches!(args[1].as_str(), "-h" | "--help") => {
+            print!("{VERSION_USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some("run") => {
+            if args.len() == 2 && matches!(args[1].as_str(), "-h" | "--help") {
+                print!("{RUN_USAGE}");
+                ExitCode::SUCCESS
+            } else {
+                run_launcher(&args[1..])
+            }
+        }
+        Some("help") => {
+            eprintln!("crikey: `help` takes no arguments\n\n{USAGE}");
+            ExitCode::from(64)
+        }
+        Some("version") => {
+            eprintln!("crikey: `version` accepts only `--help`\n\n{VERSION_USAGE}");
+            ExitCode::from(64)
+        }
         Some("dev") => dev(&args[1..]),
-        Some("run") => run_launcher(&args[1..]),
         Some("package") => package_commands::run(&args[1..]),
         Some("plugin") => {
-            eprintln!("crikey: `plugin` is not implemented yet");
+            eprintln!("crikey: `plugin` is not available yet");
             ExitCode::from(69) // EX_UNAVAILABLE
         }
         Some(other) => {
@@ -106,6 +180,22 @@ fn run_native_launcher() -> Result<(), String> {
     let launcher = NativeLauncher::new(NativeLauncherConfig::default()).map_err(|error| error.to_string())?;
     let render_handle = launcher.handle();
     let mut search = SearchService::new(App::new());
+    let catalog_cache_root = catalog_cache_root()?;
+    let catalog_cache: Arc<dyn CatalogCache + Send + Sync> =
+        Arc::new(FileCatalogCache::new(catalog_cache_root));
+    search.set_catalog_cache(Arc::clone(&catalog_cache));
+    let loaded_catalog = search
+        .load_persisted_catalog(catalog_cache.as_ref())
+        .map_err(|error| format!("cannot load persisted catalog cache: {error}"))?;
+    if loaded_catalog.skipped > 0 {
+        eprintln!(
+            "crikey: skipped {} unreadable persisted catalog slice(s)",
+            loaded_catalog.skipped
+        );
+    }
+    if let Some(error) = search.catalog_cache_error() {
+        eprintln!("crikey: catalog cache error during startup load: {error}");
+    }
 
     #[cfg(windows)]
     let has_activation_source = {
@@ -134,6 +224,9 @@ fn run_native_launcher() -> Result<(), String> {
     search
         .replace_catalog(&owner, 1, applications)
         .map_err(|error| format!("application catalog was rejected: {error}"))?;
+    if let Some(error) = search.catalog_cache_error() {
+        eprintln!("crikey: application catalog cache write failed: {error}");
+    }
     search
         .complete_stage(StartupStage::PersistedCatalog)
         .map_err(|error| error.to_string())?;
@@ -147,7 +240,7 @@ fn run_native_launcher() -> Result<(), String> {
     query_pipeline
         .register_plugin(owner.clone(), application_provider_policy())
         .map_err(|error| {
-            format!("cannot register the application provider with the query pipeline: {error:?}")
+            format!("cannot register the application provider with the query pipeline: {error}")
         })?;
 
     // Legacy plugins join the live query path here, not only the `crikey dev`
@@ -208,10 +301,11 @@ fn run_native_launcher() -> Result<(), String> {
     // boot that still spawns a legacy or modern interpreter would defeat 24.2.
     let mut active_plugins = vec![owner.clone()];
     let mut legacy_pipeline = QueryPipeline::new(PipelineConfig::default());
+    let legacy_cache_root = legacy_cache_root()?;
     let legacy_provider = LegacyProvider::load(
         &mut legacy_pipeline,
         &admitted_plugin_roots(&startup_mode, &legacy_package_roots()),
-        std::env::temp_dir().join("crikey-legacy-packages"),
+        legacy_cache_root,
         LegacyDeadlines::default(),
     );
     for entry in legacy_provider.unavailable() {
@@ -255,7 +349,8 @@ fn run_native_launcher() -> Result<(), String> {
         modern_index_root(),
         cache_root,
     );
-    for plugin in modern_provider.plugins().to_vec() {
+    let modern_plugins = modern_provider.plugins().to_vec();
+    for plugin in modern_plugins {
         if let Err(error) = modern_provider.request_catalog_build(&plugin, 1, crikey_core::Generation::ZERO) {
             eprintln!("crikey: modern catalog request refused for {}: {error}", plugin.0);
         }
@@ -284,7 +379,8 @@ fn run_native_launcher() -> Result<(), String> {
         &mut native_pipeline,
         &admitted_plugin_roots(&startup_mode, &native_plugin_roots()),
     );
-    for plugin in native_provider.plugins().to_vec() {
+    let native_plugins = native_provider.plugins().to_vec();
+    for plugin in native_plugins {
         if let Err(error) = native_provider.request_catalog_build(&plugin, 1, crikey_core::Generation::ZERO) {
             eprintln!("crikey: native catalog request refused for {}: {error}", plugin.0);
         }
@@ -701,6 +797,7 @@ impl StartupLedger {
 /// `NativeLauncherHandle::request_activation` only QUEUES an event. The window
 /// and GPU are created afterwards, from the event loop's `resumed`, and a
 /// failure there is terminal: the renderer clears its visible bit and exits,
+///
 /// which drops the queued activation before any `NativeLauncherEvent` is
 /// dispatched. So no event reaching this callback is the observable signature
 /// of a renderer that never started, and the first event that does reach it is
@@ -720,6 +817,37 @@ where
         ledger.borrow_mut().mark_renderer_running();
         deliver(event);
     }
+}
+/// The persistent search-catalog cache root, read from
+/// `CRIKEY_CATALOG_CACHE_ROOT`.
+///
+/// Unset defaults to a private per-user cache directory, never a shared
+/// temporary directory. The cache contains plugin-supplied catalog data and
+/// is therefore treated as a trust boundary just like the managed environment
+/// and Legacy Compatibility Layer caches.
+fn catalog_cache_root() -> Result<std::path::PathBuf, String> {
+    if let Some(value) = std::env::var_os("CRIKEY_CATALOG_CACHE_ROOT").filter(|value| !value.is_empty()) {
+        let path = std::path::PathBuf::from(value);
+        create_private_dir(&path)?;
+        return Ok(path);
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })
+        .ok_or_else(|| {
+            "cannot determine a per-user cache directory for the search catalog: set \
+             CRIKEY_CATALOG_CACHE_ROOT, XDG_CACHE_HOME or HOME (refusing to use a \
+             world-writable shared temporary directory as a trust root)"
+                .to_owned()
+        })?;
+    let path = base.join("crikey").join("catalog");
+    create_private_dir(&path)?;
+    Ok(path)
 }
 
 /// The managed-environment cache root, read from `CRIKEY_MODERN_CACHE_ROOT`.
@@ -756,16 +884,45 @@ fn modern_cache_root() -> Result<std::path::PathBuf, String> {
     create_private_dir(&dir)?;
     Ok(dir)
 }
+/// The legacy archive extraction root, read from `CRIKEY_LEGACY_CACHE_ROOT`.
+///
+/// The loader trusts an existing content-addressed extraction directory, so a
+/// shared temporary directory would let another local process plant plugin
+/// files before the child interpreter imports them. The default is per-user
+/// and restricted to this account, just like the modern environment cache.
+fn legacy_cache_root() -> Result<std::path::PathBuf, String> {
+    if let Some(value) = std::env::var_os("CRIKEY_LEGACY_CACHE_ROOT").filter(|value| !value.is_empty()) {
+        let path = std::path::PathBuf::from(value);
+        create_private_dir(&path)?;
+        return Ok(path);
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })
+        .ok_or_else(|| {
+            "cannot determine a per-user cache directory for legacy packages: set \
+             CRIKEY_LEGACY_CACHE_ROOT, XDG_CACHE_HOME or HOME (refusing to use a \
+             world-writable shared temporary directory as a trust root)"
+                .to_owned()
+        })?;
+    let path = base.join("crikey").join("legacy");
+    create_private_dir(&path)?;
+    Ok(path)
+}
 
 /// Creates `dir` (and parents) as a private, per-user directory. On unix the
-/// leaf is forced to `0700` so the managed-environment cache a later import
-/// trusts by path can never be world- or group-writable (spec 15.4). If the
-/// directory already exists but is not ours, forcing the mode fails and the
-/// caller refuses rather than trust it.
+/// leaf is forced to `0700` so a cache later imported by path can never be
+/// world- or group-writable. If the directory already exists but is not ours,
+/// forcing the mode fails and the caller refuses rather than trust it.
 fn create_private_dir(dir: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|error| {
         format!(
-            "cannot create modern cache directory `{}`: {error}",
+            "cannot create private cache directory `{}`: {error}",
             dir.display()
         )
     })?;
@@ -774,7 +931,7 @@ fn create_private_dir(dir: &std::path::Path) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|error| {
             format!(
-                "cannot secure modern cache directory `{}`: {error}",
+                "cannot secure private cache directory `{}`: {error}",
                 dir.display()
             )
         })?;
@@ -1016,6 +1173,10 @@ fn drive_application_provider(
 /// Routes a `crikey dev` invocation.
 fn dev(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
+        Some("-h" | "--help") if args.len() == 1 => {
+            print!("{DEV_USAGE}");
+            ExitCode::SUCCESS
+        }
         Some("benchmark") => benchmark(&args[1..]),
         Some("run") => modern_commands::run(&args[1..]),
         Some("test") => modern_commands::test(&args[1..]),
@@ -1027,11 +1188,11 @@ fn dev(args: &[String]) -> ExitCode {
         Some("inspect-protocol") => native_commands::inspect_protocol(&args[1..]),
         Some("measure-activation") => activation_commands::measure_activation(&args[1..]),
         Some(other) => {
-            eprintln!("crikey: unknown dev subcommand `{other}`\n\n{USAGE}");
+            eprintln!("crikey: unknown dev subcommand `{other}`\n\n{DEV_USAGE}");
             ExitCode::from(64) // EX_USAGE
         }
         None => {
-            eprintln!("crikey: `dev` needs a subcommand\n\n{USAGE}");
+            eprintln!("crikey: `dev` needs a subcommand\n\n{DEV_USAGE}");
             ExitCode::from(64) // EX_USAGE
         }
     }
@@ -1085,11 +1246,15 @@ enum Request {
 /// other tool does.
 fn parse_benchmark_args(args: &[String]) -> Result<Request, String> {
     let mut items = STRESS_CATALOG_SIZE;
+    let mut help = false;
     let mut remaining = args.iter();
 
     while let Some(arg) = remaining.next() {
         let value = match arg.as_str() {
-            "-h" | "--help" => return Ok(Request::Usage),
+            "-h" | "--help" => {
+                help = true;
+                continue;
+            }
             "--items" => remaining.next().ok_or("`--items` needs a value")?.as_str(),
             other => other
                 .strip_prefix("--items=")
@@ -1100,6 +1265,9 @@ fn parse_benchmark_args(args: &[String]) -> Result<Request, String> {
             .map_err(|_| format!("`--items` needs a whole number of items, got `{value}`"))?;
     }
 
+    if help {
+        return Ok(Request::Usage);
+    }
     if items == 0 {
         return Err("`--items` must be at least 1: an empty catalog measures nothing".to_owned());
     }
@@ -1285,6 +1453,20 @@ mod tests {
     }
 
     #[test]
+    fn top_level_help_rejects_unknown_extra_arguments() {
+        assert_ne!(dispatch(&args(&["help", "--unknown"])), ExitCode::SUCCESS);
+        assert_ne!(dispatch(&args(&["version", "--unknown"])), ExitCode::SUCCESS);
+        assert_ne!(dispatch(&args(&["--help", "--unknown"])), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn command_help_is_available_without_starting_work() {
+        assert_eq!(dispatch(&args(&["run", "--help"])), ExitCode::SUCCESS);
+        assert_eq!(dispatch(&args(&["dev", "--help"])), ExitCode::SUCCESS);
+        assert_eq!(dispatch(&args(&["package", "--help"])), ExitCode::SUCCESS);
+    }
+
+    #[test]
     fn the_benchmark_defaults_to_the_stress_scale_catalog() {
         assert_eq!(
             parse_benchmark_args(&args(&[])),
@@ -1317,6 +1499,10 @@ mod tests {
         assert_eq!(
             parse_benchmark_args(&args(&["--items=0", "-h"])),
             Ok(Request::Usage)
+        );
+        assert!(
+            parse_benchmark_args(&args(&["--help", "--unknown"])).is_err(),
+            "help must not hide an unknown benchmark option"
         );
     }
 

@@ -40,6 +40,7 @@ constant that names each one.
 """
 
 import importlib.util
+import io
 import json
 import os
 import queue
@@ -57,6 +58,9 @@ import traceback
 # --------------------------------------------------------------------------
 
 import keypirinha
+import keypirinha_net
+import keypirinha_util
+import keypirinha_wintypes
 
 #: The process's real stderr, kept before `sys.stderr` is rebound. Every
 #: captured line is mirrored here as it is written, so a developer watching the
@@ -466,6 +470,10 @@ class _Host:
     def package_full_path(self, plugin):
         return self._root
 
+    def package_full_name(self, plugin):
+        """Returns the package identifier declared by the host."""
+        return self._package_id
+
     def package_cache_path(self, plugin, create):
         if create:
             try:
@@ -487,8 +495,8 @@ class _Host:
         *optional* host capability, and unchanged plugins guard it with the
         compatibility layer's own error family (spec 14.12).
         """
-        root = os.path.abspath(self._root)
-        candidate = os.path.abspath(os.path.join(root, name))
+        root = os.path.realpath(self._root)
+        candidate = os.path.realpath(os.path.join(root, name))
         if candidate != root and not candidate.startswith(root + os.sep):
             # A resource name is package-relative by definition. Following one
             # out of the package would let a package read arbitrary files
@@ -556,31 +564,33 @@ def _parse_ini(path):
     """
     sections = {}
     entries = 0
-    consumed = 0
     current = keypirinha.Settings.DEFAULT_SECTION
 
     try:
-        # `utf-8-sig` because a byte-order mark on the first section header
-        # would otherwise become part of that section's name.
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
-            for raw in handle:
-                consumed += len(raw)
-                if consumed > _MAX_SETTINGS_BYTES or entries >= _MAX_SETTINGS_ENTRIES:
-                    break
-                line = raw.strip()
-                if not line or line[0] in ";#":
-                    continue
-                if line[0] == "[" and line.endswith("]"):
-                    current = line[1:-1].strip()
-                    continue
-                separator = "=" if "=" in line else (":" if ":" in line else None)
-                if separator is None:
-                    continue
-                key, _, value = line.partition(separator)
-                sections.setdefault(current, {}).setdefault(key.strip(), value.strip())
-                entries += 1
+        # Read a bounded byte slice before decoding. Iterating a text file can
+        # buffer a very long line past the nominal limit, and counting decoded
+        # characters is not a byte bound for UTF-8 input.
+        with open(path, "rb") as handle:
+            raw_bytes = handle.read(_MAX_SETTINGS_BYTES)
     except OSError:
         return sections
+
+    text = raw_bytes.decode("utf-8-sig", errors="replace")
+    for raw in io.StringIO(text):
+        if entries >= _MAX_SETTINGS_ENTRIES:
+            break
+        line = raw.strip()
+        if not line or line[0] in ";#":
+            continue
+        if line[0] == "[" and line.endswith("]"):
+            current = line[1:-1].strip()
+            continue
+        separator = "=" if "=" in line else (":" if ":" in line else None)
+        if separator is None:
+            continue
+        key, _, value = line.partition(separator)
+        sections.setdefault(current, {}).setdefault(key.strip(), value.strip())
+        entries += 1
 
     return sections
 
@@ -615,16 +625,9 @@ def _load_plugin():
     relative = os.environ.get(ENV_MAIN_MODULE_PATH) or "{}.py".format(main_module)
     path = os.path.join(root, relative)
 
-    # Pre-import the sibling shim modules before the package root leads
-    # sys.path, so a package shipping its own `keypirinha_util.py` (or _net /
-    # _wintypes) cannot shadow the shim once its root sits at sys.path[0] and
-    # the plugin triggers the lazy import (Finding 6, spec 14.2). `keypirinha`
-    # itself is already cached by the entry pre-import. These are safe to load
-    # on every platform (each documents unconditional, side-effect-free import)
-    # and NON-shim package-local imports still resolve against the root below.
-    import keypirinha_util
-    import keypirinha_net
-    import keypirinha_wintypes
+    # The shim siblings were imported at module scope, before the package root
+    # leads sys.path, so a package shipping a same-named module cannot shadow
+    # the compatibility surface when the plugin triggers its lazy import.
 
     # The package root leads sys.path so a package-local `import helpers`
     # resolves to the package's own module and never to a same-named module
@@ -976,8 +979,16 @@ def _read_stdin(stream, pending, terminate):
             continue
 
         if frame.get("callback") == _CALLBACK_SET_TERMINATE:
-            wanted = (frame.get("payload") or {}).get("terminate", True)
-            if wanted:
+            payload = frame.get("payload")
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                _REAL_STDERR.write(
+                    "[err][crikey] set_terminate payload was not an object; ignored\n"
+                )
+                _REAL_STDERR.flush()
+                continue
+            if payload.get("terminate", True):
                 terminate.set()
             else:
                 terminate.clear()

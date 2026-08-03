@@ -46,16 +46,34 @@ fn item(stable_id: impl Into<String>, label: impl Into<String>) -> Item {
 struct HarnessPlugin {
     executed: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    fail_start: bool,
 }
 
 impl HarnessPlugin {
     fn new(executed: Arc<AtomicBool>, stopped: Arc<AtomicBool>) -> Self {
-        Self { executed, stopped }
+        Self {
+            executed,
+            stopped,
+            fail_start: false,
+        }
+    }
+
+    fn failing_start() -> Self {
+        Self {
+            executed: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            fail_start: true,
+        }
     }
 }
 
 impl Plugin for HarnessPlugin {
     fn start(&mut self, _context: &dyn PluginContext) -> Result<()> {
+        if self.fail_start {
+            return Err(crikey_core::CoreError::Invalid(
+                "fixture startup failure".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -126,8 +144,23 @@ fn test_harness_drives_handshake_catalog_suggest_execute_and_shutdown() {
         .expect("execute request");
     assert!(executed.load(Ordering::SeqCst));
 
-    harness.shutdown();
+    harness.shutdown().expect("plugin shutdown");
     assert!(stopped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn test_harness_reports_a_plugin_start_failure_before_returning() {
+    let error = match TestHarness::start(HarnessPlugin::failing_start(), config()) {
+        Ok(_) => panic!("a plugin that fails during start must not produce a harness"),
+        Err(error) => error,
+    };
+    match error {
+        SdkError::Protocol(detail) => assert!(
+            detail.contains("fixture startup failure"),
+            "startup error should preserve the plugin detail: {detail}"
+        ),
+        other => panic!("startup failure returned the wrong error: {other:?}"),
+    }
 }
 
 #[test]
@@ -147,7 +180,7 @@ fn test_harness_cancel_latch_produces_cancelled_then_plain_suggest_clears_it() {
     assert_eq!(final_result.state, BatchStateKind::Final);
     assert_eq!(final_result.items.len(), 2);
 
-    harness.shutdown();
+    harness.shutdown().expect("plugin shutdown");
     assert!(stopped.load(Ordering::SeqCst));
 }
 
@@ -163,7 +196,7 @@ fn bench_measure_reports_requested_iterations_and_all_driven_items() {
     assert_eq!(report.items, 8, "four requests each returned two items");
     assert!(report.p50_us <= report.p95_us, "percentiles must be monotonic");
 
-    harness.shutdown();
+    harness.shutdown().expect("plugin shutdown");
     assert!(stopped.load(Ordering::SeqCst));
 }
 

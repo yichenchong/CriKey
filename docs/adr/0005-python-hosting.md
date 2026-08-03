@@ -15,14 +15,19 @@ CriKey down, and Python must never execute on the UI thread.
 CPython runs only in supervised worker processes. The host embeds no
 interpreter: there is no PyO3 interpreter in the main process, ever.
 
-- A worker is launched per runtime profile (`LegacyCompatibility`, `Bundled`,
-  `External(path)`) and per content-addressed dependency environment.
-- Plugins whose locked environments match may share a worker; plugins with
-  unstable native extensions get a dedicated one.
+- A worker is keyed by runtime profile, interpreter, content-addressed
+  dependency environment, entrypoint, and plugin source path. Identical keys
+  may share a process; distinct source paths or entrypoints receive separate
+  workers because the protocol has no per-call plugin routing.
+- The environment store may reuse a materialized dependency environment, but
+  that reuse does not imply that unrelated plugin processes share an address
+  space. Plugins with unstable native extensions still receive a dedicated
+  worker.
 - The import path is assembled explicitly: plugin source, packaged modules,
   managed dependencies, CriKey SDK, standard library. System-wide
   `site-packages` is excluded by default.
-- Workers speak the same v1 protocol as native plugins (ADR-0004); the legacy
+- Native workers speak the native v1 proto3 protocol. Modern and legacy Python
+  workers use their own bounded newline-delimited JSON protocols; the legacy
   worker additionally hosts the Keypirinha-compatible shim modules.
 
 ## Consequences
@@ -30,10 +35,11 @@ interpreter: there is no PyO3 interpreter in the main process, ever.
 - Interpreter segfaults, C-extension crashes and version conflicts are contained
   in a worker; recovery is a restart (§31.10, §31.20).
 - No GIL interacts with the UI or the query hot path.
-- Per-worker process and startup cost is real: mitigated by lazy start, warm
-  pooling per profile, and serving cached catalog results while workers boot.
-- Any host API a plugin needs must be exposed as a protocol message, which is
-  also what makes permission enforcement possible (§20.2).
+- Per-worker process and startup cost is real: mitigated by lazy start, reuse
+  for identical worker keys, and serving cached catalog results while workers
+  boot.
+- Any host API a plugin needs must be exposed as a protocol message, which
+  provides the boundary at which permission enforcement can be added.
 
 ## Alternatives
 

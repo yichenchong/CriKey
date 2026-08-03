@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 crikey-app.workspace = true
 crikey-benchmarks.workspace = true
+crikey-catalog.workspace = true
 crikey-core.workspace = true
 crikey-input-scheduler.workspace = true
 # The M3 developer commands (`dev test-legacy-compat`, `dev inspect-catalog`,

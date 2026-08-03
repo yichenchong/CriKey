@@ -19,8 +19,12 @@
 //! decided here, once, and defended by a test. Where CPython's `configparser`
 //! (what Keypirinha itself is built on) has an established answer, that answer
 //! wins, because the input is real Keypirinha `.ini` files written against
-//! that behaviour.
+//! that behaviour. Extended interpolation is a documented gap in this raw
+//! reader: `${section:key}` and `${env:NAME}` stay literal until a caller
+//! supplies an explicit resolver.
 //!
+//! Reference-resolution policy (missing names, environment access and cycles)
+//! is intentionally not guessed here.
 //! 1. **Case sensitivity.** Section names and key names are matched
 //!    *ASCII*-case-insensitively; values are never case folded. The first
 //!    spelling seen in the file is the canonical one and is what `sections()`
@@ -40,13 +44,13 @@
 //! 3. **Delimiters.** `=` and `:` both separate a key from its value and the
 //!    *first* occurrence wins, matching `configparser`'s default delimiters.
 //!    Key and value are each trimmed of surrounding whitespace.
-//! 4. **Continuations.** Leading whitespace is the sole continuation marker.
-//!    Any indented line, while a key/value pair is pending, is appended to
-//!    that value as a new line - even if it looks like `key = value` or like
-//!    `[section]`. Continuation lines are trimmed, so indentation depth never
-//!    leaks into a value, and interior newlines are preserved. A blank line
-//!    (empty or all whitespace) terminates the pending value; a comment line
-//!    inside a continuation block is dropped without terminating it.
+//! 4. **Continuations.** Leading whitespace before a new key or section is
+//!    accepted. If a key/value pair is pending, only indentation deeper than
+//!    that option's indentation continues its value; an equally indented line
+//!    starts new syntax. Continuation lines are trimmed, so indentation depth
+//!    never leaks into a value, and interior newlines are preserved. A blank
+//!    line (empty or all whitespace) terminates the pending value; a comment
+//!    line inside a continuation block is dropped without terminating it.
 //! 5. **Duplicates.** A repeated key inside one section keeps its first
 //!    position and first spelling and takes the *last* value. A repeated
 //!    section header merges into the existing section instead of truncating
@@ -762,8 +766,8 @@ fn get_bool_accepts_the_documented_spellings_case_insensitively() {
 fn get_bool_rejects_an_undocumented_spelling_and_names_the_section_and_key() {
     let parsed = settings(&[
         "[flags]",
-        "maybe = y",
-        "wordy = enabled",
+        "maybe = maybe",
+        "wordy = enabledish",
         "numeric = 2",
         "blank =",
     ]);
@@ -800,12 +804,18 @@ fn get_bool_rejects_an_undocumented_spelling_and_names_the_section_and_key() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn get_int_parses_signed_decimal_integers_at_the_edges_of_the_range() {
+fn get_int_parses_base_zero_integers_at_the_edges_of_the_range() {
     let parsed = settings(&[
         "[limits]",
         "zero = 0",
+        "zero_padded = 00",
         "positive = +7",
         "negative = -3",
+        "hex = 0x10",
+        "hex_underscore = 0x_10",
+        "octal = 0o20",
+        "binary = 0b10000",
+        "decimal_underscore = 1_000",
         "max = 9223372036854775807",
         "min = -9223372036854775808",
         "padded =   42  ",
@@ -813,29 +823,39 @@ fn get_int_parses_signed_decimal_integers_at_the_edges_of_the_range() {
 
     assert_eq!(parsed.get_int("limits", "zero"), Ok(0), "0 must parse");
     assert_eq!(
+        parsed.get_int("limits", "zero_padded"),
+        Ok(0),
+        "zero-only decimal spellings are accepted by Python base-zero parsing",
+    );
+    assert_eq!(
         parsed.get_int("limits", "positive"),
         Ok(7),
-        "an explicit '+' sign must be accepted"
+        "an explicit '+' sign must be accepted",
     );
     assert_eq!(
         parsed.get_int("limits", "negative"),
         Ok(-3),
-        "a negative signed integer must be accepted"
+        "a negative signed integer must be accepted",
     );
+    assert_eq!(parsed.get_int("limits", "hex"), Ok(16));
+    assert_eq!(parsed.get_int("limits", "hex_underscore"), Ok(16));
+    assert_eq!(parsed.get_int("limits", "octal"), Ok(16));
+    assert_eq!(parsed.get_int("limits", "binary"), Ok(16));
+    assert_eq!(parsed.get_int("limits", "decimal_underscore"), Ok(1_000));
     assert_eq!(
         parsed.get_int("limits", "max"),
         Ok(i64::MAX),
-        "the largest representable value must parse"
+        "the largest representable value must parse",
     );
     assert_eq!(
         parsed.get_int("limits", "min"),
         Ok(i64::MIN),
-        "the smallest representable value must parse"
+        "the smallest representable value must parse",
     );
     assert_eq!(
         parsed.get_int("limits", "padded"),
         Ok(42),
-        "surrounding whitespace is trimmed by the parser, not rejected by the accessor"
+        "surrounding whitespace is trimmed by the parser, not rejected by the accessor",
     );
 }
 
@@ -844,18 +864,18 @@ fn get_int_rejects_a_non_numeric_value_with_a_typed_error_instead_of_zero() {
     let parsed = settings(&[
         "[limits]",
         "word = abc",
-        "hex = 0x10",
+        "leading_zero = 010",
         "fractional = 1.5",
         "suffixed = 12 items",
         "blank =",
     ]);
 
-    for key in ["word", "hex", "fractional", "suffixed", "blank"] {
+    for key in ["word", "leading_zero", "fractional", "suffixed", "blank"] {
         let result = parsed.get_int("limits", key);
         assert_ne!(
             result,
             Ok(0),
-            "a non-numeric value must never be silently coerced to zero (key {key:?})"
+            "a non-numeric value must never be silently coerced to zero (key {key:?})",
         );
         let err = result.expect_err("a non-numeric value must be a typed error");
         let expected_value = parsed.get("limits", key).expect("fixture key must exist");
@@ -868,7 +888,7 @@ fn get_int_rejects_a_non_numeric_value_with_a_typed_error_instead_of_zero() {
                 assert_eq!(
                     (section.as_str(), got_key.as_str(), value.as_str()),
                     ("limits", key, expected_value),
-                    "an invalid integer must name its section, key and offending value"
+                    "an invalid integer must name its section, key and offending value",
                 );
             }
             other => panic!("expected SettingsError::InvalidInteger, got {other:?}"),
@@ -908,30 +928,36 @@ fn get_uint_rejects_a_negative_value_while_get_int_still_accepts_it() {
         "[limits]",
         "negative = -1",
         "zero = 0",
+        "hex = 0xff",
+        "octal = 0o20",
+        "binary = 0b10000",
         "large = 18446744073709551615",
     ]);
 
     assert_eq!(
         parsed.get_int("limits", "negative"),
         Ok(-1),
-        "the same text is a valid signed integer, so the rejection below is about the type asked for"
+        "the same text is a valid signed integer, so the rejection below is about the type asked for",
     );
     let err = parsed
         .get_uint("limits", "negative")
         .expect_err("a negative value must be rejected by an unsigned accessor, never wrapped");
     assert!(
         matches!(err, SettingsError::InvalidInteger { .. }),
-        "a negative unsigned value must be an InvalidInteger, got {err:?}"
+        "a negative unsigned value must be an InvalidInteger, got {err:?}",
     );
     assert_eq!(
         parsed.get_uint("limits", "zero"),
         Ok(0),
-        "zero is a valid unsigned value"
+        "zero is a valid unsigned value",
     );
+    assert_eq!(parsed.get_uint("limits", "hex"), Ok(255));
+    assert_eq!(parsed.get_uint("limits", "octal"), Ok(16));
+    assert_eq!(parsed.get_uint("limits", "binary"), Ok(16));
     assert_eq!(
         parsed.get_uint("limits", "large"),
         Ok(u64::MAX),
-        "the largest representable unsigned value must parse"
+        "the largest representable unsigned value must parse",
     );
 }
 
@@ -1147,8 +1173,13 @@ fn an_invalid_section_header_is_rejected_with_its_line_number() {
 }
 
 #[test]
-fn an_indented_line_with_no_pending_value_is_rejected_with_its_line_number() {
-    expect_malformed(&parse_failure(&["[main]", "    orphan = 1"]), 2, "orphan");
+fn indented_syntax_without_a_pending_value_is_parsed_or_rejected_by_its_shape() {
+    let parsed = settings(&["[main]", "    orphan = 1"]);
+    assert_eq!(
+        parsed.get("main", "orphan"),
+        Some("1"),
+        "configparser accepts indentation before a valid key/value pair",
+    );
     expect_malformed(&parse_failure(&["    orphan", "[main]"]), 1, "orphan");
 }
 
@@ -1335,4 +1366,37 @@ fn load_file_propagates_a_parse_error_with_its_line_number() {
     let err = LegacySettings::load_file(&path).expect_err("a malformed configuration file must fail to load");
 
     expect_malformed(&err, 3, "this line is broken");
+}
+
+#[test]
+fn get_bool_accepts_all_spellings_used_by_the_original_settings_view() {
+    let parsed = settings(&[
+        "[main]",
+        "truth_y = y",
+        "truth_t = T",
+        "truth_enable = enable",
+        "truth_enabled = ENABLED",
+        "false_n = n",
+        "false_f = F",
+        "false_disable = disable",
+        "false_disabled = DISABLED",
+    ]);
+
+    assert_eq!(parsed.get_bool("main", "truth_y"), Ok(true));
+    assert_eq!(parsed.get_bool("main", "truth_t"), Ok(true));
+    assert_eq!(parsed.get_bool("main", "truth_enable"), Ok(true));
+    assert_eq!(parsed.get_bool("main", "truth_enabled"), Ok(true));
+    assert_eq!(parsed.get_bool("main", "false_n"), Ok(false));
+    assert_eq!(parsed.get_bool("main", "false_f"), Ok(false));
+    assert_eq!(parsed.get_bool("main", "false_disable"), Ok(false));
+    assert_eq!(parsed.get_bool("main", "false_disabled"), Ok(false));
+}
+
+#[test]
+fn indentation_before_a_new_pair_or_header_is_accepted_like_configparser() {
+    let parsed = settings(&["[main]", "  first = one", "  [secondary]", "\tsecond: two"]);
+
+    assert_eq!(parsed.sections(), vec!["main", "secondary"]);
+    assert_eq!(parsed.get("main", "first"), Some("one"));
+    assert_eq!(parsed.get("secondary", "second"), Some("two"));
 }

@@ -544,6 +544,21 @@ t.emit("plugin_id_is_str", isinstance(plugin.id, str))
 t.emit("plugin_id_nonempty", len(plugin.id) > 0)
 t.emit("friendly_name", plugin.friendly_name())
 
+class DeclaredHost:
+    def package_full_name(self, plugin):
+        return "well-behaved"
+
+
+class HyphenPackagePlugin(kp.Plugin):
+    pass
+
+
+kp._set_host(DeclaredHost())
+declared = HyphenPackagePlugin()
+t.emit("declared_package_name", declared.package_full_name())
+t.emit("declared_plugin_id", declared.id)
+kp._clear_host()
+
 # Default callbacks exist and are inert: an unchanged legacy plugin that
 # overrides only one of them must not explode on the others.
 plugin.on_start()
@@ -594,6 +609,16 @@ t.done()
         "friendly_name",
         "SurfacePlugin",
         "keypirinha.Plugin.friendly_name() must default to the plugin class name",
+    );
+    run.expect_eq(
+        "declared_package_name",
+        "well-behaved",
+        "Plugin.package_full_name must use the host's declared identifier, not a sanitized module name",
+    );
+    run.expect_eq(
+        "declared_plugin_id",
+        "well-behaved.HyphenPackagePlugin",
+        "Plugin.id must incorporate the declared package identifier",
     );
     run.expect(
         "default_callbacks_inert",
@@ -1460,6 +1485,24 @@ t.emit("get_float", settings.get_float("ratio"))
 t.emit("get_int_missing_fallback", settings.get_int("nope", fallback=42))
 t.emit("get_bool_missing_fallback", settings.get_bool("nope", fallback=True))
 
+typed = kp.Settings(
+    {
+        "DEFAULT": {
+            "enable": "enabled",
+            "disable": "disabled",
+            "hex": "'0x10'",
+            "low": "-2",
+            "high": "99",
+        }
+    }
+)
+t.emit("get_bool_enabled", typed.get_bool("enable"))
+t.emit("get_bool_disabled", typed.get_bool("disable"))
+t.emit("get_quoted", typed.get("hex", unquote=True))
+t.emit("get_hex", typed.get_int("hex"))
+t.emit("get_low_clamped", typed.get_int("low", min=0))
+t.emit("get_high_clamped", typed.get_int("high", max=10))
+
 
 def coercion_failure(call):
     try:
@@ -1602,6 +1645,35 @@ t.done()
     run.expect(
         "get_bool_missing_fallback",
         "get_bool must return the fallback for a missing key",
+    );
+    run.expect("get_bool_enabled", "get_bool must accept `enabled` as true");
+    run.expect_eq(
+        "get_bool_disabled",
+        "False",
+        "get_bool must accept `disabled` as false",
+    );
+    run.expect_eq(
+        "get_quoted",
+        "0x10",
+        "get(..., unquote=True) must remove matching surrounding quotes",
+    );
+    assert_eq!(
+        run.int("get_hex"),
+        16,
+        "get_int must parse hexadecimal values with base zero\n{}",
+        run.describe()
+    );
+    assert_eq!(
+        run.int("get_low_clamped"),
+        0,
+        "get_int must clamp below-minimum values\n{}",
+        run.describe()
+    );
+    assert_eq!(
+        run.int("get_high_clamped"),
+        10,
+        "get_int must clamp above-maximum values\n{}",
+        run.describe()
     );
     assert!(
         run.field("bad_int").starts_with("SettingsError:"),
@@ -1860,6 +1932,18 @@ check("adjacent_quoted", kpu.cmdline_split('a"b c"d'), ["ab cd"])
 
 # Quoting is the inverse. Arguments are quoted only when they must be.
 check("quote_plain", kpu.cmdline_quote("plain"), "plain")
+check("quote_force", kpu.cmdline_quote("plain", True), Q + "plain" + Q)
+check("quote_force_tuple", kpu.cmdline_quote(("a", "b"), True),
+      Q + "a" + Q + " " + Q + "b" + Q)
+
+type_failures = []
+for bad in ({}, ["ok", 1]):
+    try:
+        kpu.cmdline_quote(bad)
+    except TypeError:
+        continue
+    type_failures.append(repr(bad))
+t.emit("type_failures", ";".join(type_failures) or "<none>")
 check("quote_space", kpu.cmdline_quote("has space"), Q + "has space" + Q)
 check("quote_tab", kpu.cmdline_quote("has" + TAB + "tab"), Q + "has" + TAB + "tab" + Q)
 check("quote_empty", kpu.cmdline_quote(""), Q + Q)
@@ -1913,6 +1997,11 @@ t.done()
          string functions unchanged plugins depend on. Mismatches: {}\n{}",
         run.field("exact_failures"),
         run.describe()
+    );
+    run.expect_eq(
+        "type_failures",
+        "<none>",
+        "cmdline_quote must reject non-string arguments instead of iterating or coercing them",
     );
     assert_eq!(
         run.int("roundtrip_cases"),
@@ -1995,6 +2084,7 @@ fn keypirinha_util_scans_directories_with_documented_flag_and_depth_semantics() 
     let root = scratch.mkdir("tree");
     scratch.write("tree/alpha.txt", "a");
     scratch.write("tree/beta.log", "b");
+    scratch.write("tree/.hidden.txt", "hidden");
     scratch.write("tree/sub/gamma.txt", "c");
     scratch.write("tree/sub/deep/delta.txt", "d");
 
@@ -2009,6 +2099,7 @@ import _kptest as t
 ROOT = os.environ["CRIKEY_TEST_SCAN_ROOT"]
 FILES = kpu.ScanFlags.FILES
 FOLDERS = kpu.ScanFlags.FOLDERS
+HIDDEN = kpu.ScanFlags.HIDDEN
 RECURSIVE = kpu.ScanFlags.RECURSIVE
 
 
@@ -2019,6 +2110,9 @@ def scan(*args, **kwargs):
 t.emit("files_only", scan("*", FILES))
 t.emit("folders_only", scan("*", FOLDERS))
 t.emit("default_flags", scan())
+t.emit("hidden_default", scan("*.txt", FILES))
+t.emit("hidden_included", scan("*.txt", FILES | HIDDEN))
+t.emit("max_level_without_flag", scan("*.txt", FILES, 1))
 t.emit("pattern_filtered", scan("*.txt", FILES))
 t.emit("recursive_txt", scan("*.txt", FILES | RECURSIVE))
 t.emit("recursive_depth_limited", scan("*.txt", FILES | RECURSIVE, 1))
@@ -2057,6 +2151,21 @@ t.done()
         "alpha.txt;beta.log;sub",
         "scan_directory must default to ScanFlags.DEFAULT (files and folders) and pattern `*`, \
          non-recursively",
+    );
+    run.expect_eq(
+        "hidden_default",
+        "alpha.txt",
+        "hidden entries must stay excluded unless ScanFlags.HIDDEN is set",
+    );
+    run.expect_eq(
+        "hidden_included",
+        ".hidden.txt;alpha.txt",
+        "ScanFlags.HIDDEN must include dot-hidden entries",
+    );
+    run.expect_eq(
+        "max_level_without_flag",
+        "alpha.txt;sub/gamma.txt",
+        "max_level must control recursion without a private RECURSIVE flag",
     );
     run.expect_eq(
         "pattern_filtered",
@@ -2410,6 +2519,93 @@ t.done()
     run.expect(
         "opener_has_user_agent",
         "the opener must carry the CriKey user agent in addheaders",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `keypirinha_net` policy (spec 14.2, 14.12)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn keypirinha_net_applies_proxy_agent_timeout_and_redirect_policy() {
+    let scratch = TempDir::new("net-policy");
+    let run = run_ok(
+        &scratch,
+        r##"
+import urllib.request
+
+import keypirinha_net as kpnet
+import _kptest as t
+
+
+class Response:
+    code = 200
+    msg = "OK"
+
+    def info(self):
+        return {}
+
+    def geturl(self):
+        return "http://example.invalid/"
+
+
+class Probe(urllib.request.BaseHandler):
+    handler_order = 100
+
+    def http_open(self, request):
+        t.emit("applied_timeout", request.timeout)
+        return Response()
+
+
+opener = kpnet.build_urllib_opener(
+    proxies={"http": "http://proxy.invalid:8080"},
+    extra_handlers=(Probe(),),
+    agent="Custom/9",
+)
+t.emit("proxy_applied", any(
+    isinstance(handler, urllib.request.ProxyHandler)
+    and handler.proxies.get("http") == "http://proxy.invalid:8080"
+    for handler in opener.handlers
+))
+t.emit("agent_applied", opener.addheaders == [("User-Agent", "Custom/9")])
+t.emit("probe_response", opener.open("http://example.invalid/").code)
+
+request = urllib.request.Request("http://example.invalid/")
+try:
+    kpnet._SafeRedirectHandler().redirect_request(
+        request, None, 302, "Found", {}, "file:///etc/passwd"
+    )
+except kpnet.InvalidUrlError:
+    t.emit("unsafe_redirect_rejected", True)
+else:
+    t.emit("unsafe_redirect_rejected", False)
+
+t.done()
+"##,
+        &[],
+    );
+
+    run.expect_eq(
+        "applied_timeout",
+        "10.0",
+        "the opener must apply DEFAULT_TIMEOUT when open() receives no timeout",
+    );
+    run.expect(
+        "proxy_applied",
+        "a supplied proxy mapping must reach urllib's ProxyHandler",
+    );
+    run.expect(
+        "agent_applied",
+        "an explicit agent must replace urllib's default addheaders",
+    );
+    run.expect_eq(
+        "probe_response",
+        "200",
+        "the timeout probe must complete without performing network I/O",
+    );
+    run.expect(
+        "unsafe_redirect_rejected",
+        "redirects leaving http(s) must be rejected instead of reaching file://",
     );
 }
 
@@ -2770,7 +2966,12 @@ report = [
 sys.stderr.write("\n".join(report) + "\n")
 sys.stderr.flush()
 "##,
-        &[],
+        &[
+            ("PYTHONIOENCODING", "ascii"),
+            ("PYTHONUTF8", "0"),
+            ("PYTHONCOERCECLOCALE", "0"),
+            ("LC_ALL", "C"),
+        ],
     );
 
     assert!(

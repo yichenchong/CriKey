@@ -5,6 +5,7 @@
 //! (path-sorted) digest of that tree, so it is stable across independent loads
 //! and sensitive to every byte of every module.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -25,20 +26,26 @@ pub(crate) struct IndexedPackage {
 pub struct PackageIndex {
     packages: Vec<IndexedPackage>,
 }
-
 impl PackageIndex {
     /// Load the index from a directory of `<name>-<version>/` wheel dirs.
     pub fn from_dir(root: &Path) -> Result<PackageIndex, PackageError> {
         let mut packages = Vec::new();
+        let mut identities = BTreeSet::new();
         // Sort directory entries so the load order is itself deterministic.
         let mut entries: Vec<PathBuf> = std::fs::read_dir(root)?
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .collect();
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<_, _>>()?;
         entries.sort();
 
         for path in entries {
-            if !path.is_dir() {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(PackageError::MalformedIndex(format!(
+                    "symbolic links are not allowed in package indexes: {}",
+                    path.display()
+                )));
+            }
+            if !metadata.is_dir() {
                 continue;
             }
             let dir_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -47,10 +54,19 @@ impl PackageIndex {
             };
             // `<name>-<version>`: split on the LAST hyphen so package names may
             // themselves contain hyphens while the version tail stays intact.
-            let (name, version) = match dir_name.rsplit_once('-') {
-                Some((n, v)) if !n.is_empty() && !v.is_empty() => (n.to_owned(), v.to_owned()),
+            let (raw_name, version) = match dir_name.rsplit_once('-') {
+                Some((n, v)) if !n.is_empty() && !v.is_empty() => (n, v.to_owned()),
                 _ => continue,
             };
+            let name = normalize_name(raw_name);
+            if name.is_empty() {
+                continue;
+            }
+            if !identities.insert((name.clone(), version.clone())) {
+                return Err(PackageError::Resolution(format!(
+                    "duplicate indexed package `{name}=={version}` after name normalisation"
+                )));
+            }
             let hash = tree_hash(&path)?;
             packages.push(IndexedPackage {
                 name,
@@ -65,21 +81,22 @@ impl PackageIndex {
 
     /// All indexed versions of `name`.
     pub(crate) fn versions<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a IndexedPackage> + 'a {
-        let name = name.to_string();
-        self.packages.iter().filter(move |p| p.name == name)
+        let normalized = normalize_name(name);
+        self.packages.iter().filter(move |p| p.name == normalized)
     }
 
     /// The indexed wheel matching an exact `(name, version)`, if present.
     pub(crate) fn get(&self, name: &str, version: &str) -> Option<&IndexedPackage> {
+        let normalized = normalize_name(name);
         self.packages
             .iter()
-            .find(|p| p.name == name && p.version == version)
+            .find(|p| p.name == normalized && p.version == version)
     }
 }
 
 /// The deterministic content hash of a module tree: SHA-256 over every file's
 /// relative path and bytes, walked in path-sorted order.
-fn tree_hash(root: &Path) -> Result<String, PackageError> {
+pub(crate) fn tree_hash(root: &Path) -> Result<String, PackageError> {
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     collect_files(root, root, &mut files)?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -101,9 +118,16 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> R
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(PackageError::MalformedIndex(format!(
+                "symbolic links are not allowed in package indexes: {}",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
             collect_files(base, &path, out)?;
-        } else {
+        } else if metadata.is_file() {
             // A relative path with forward slashes: stable across platforms so
             // the same tree hashes identically everywhere.
             let rel = path
@@ -114,6 +138,11 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> R
                 .collect::<Vec<_>>()
                 .join("/");
             out.push((rel, path));
+        } else {
+            return Err(PackageError::MalformedIndex(format!(
+                "unsupported package index entry: {}",
+                path.display()
+            )));
         }
     }
     Ok(())
@@ -127,4 +156,25 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
         s.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
     }
     s
+}
+/// Canonical PEP 503 spelling for a package name.
+pub(crate) fn normalize_name(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut pending_separator = false;
+    for byte in name.bytes() {
+        if matches!(byte, b'-' | b'_' | b'.') {
+            pending_separator = true;
+            continue;
+        }
+        if pending_separator && !normalized.is_empty() {
+            normalized.push('-');
+        }
+        normalized.push(byte.to_ascii_lowercase() as char);
+        pending_separator = false;
+    }
+    normalized
+}
+
+pub(crate) fn is_hex_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Iterable, Protocol
+from typing import Any, Awaitable, Callable, Coroutine, Iterable, Protocol
 
 
 @dataclass(frozen=True)
@@ -81,12 +81,14 @@ class SuggestContext(Protocol):
 
     def log(self, message: str) -> None: ...
 
-    def spawn(self, coro: Awaitable[object]) -> object:
+    def spawn(self, coro: Coroutine[Any, Any, object]) -> object:
         """Registers a background coroutine (spec 15.8).
 
-        A registered task is awaited to completion at the end of the callback;
-        an un-registered raw pending task is cancelled and reported instead of
-        being left running.
+        In the worker process, the host admits or refuses the coroutine and
+        runs an admitted task independently of the foreground callback. The
+        local SDK fallback retains it and awaits it at callback end. In either
+        mode, an unregistered raw pending task is cancelled and reported
+        instead of being left running.
         """
 
 
@@ -94,19 +96,23 @@ class Plugin:
     """Base class for modern Python plugins.
 
     Every callback is optional. Synchronous and ``async`` implementations are
-    both supported; ``async`` callbacks run on the worker's event loop.
+    both supported; asynchronous callbacks run on the worker's event loop.
     """
 
-    def start(self) -> None: ...
+    def start(self) -> None | Awaitable[None]: ...
 
-    def build_catalog(self) -> Iterable[Item]:
+    def build_catalog(self) -> Iterable[Item] | Awaitable[Iterable[Item]] | None:
         return ()
 
-    def suggest(self, query: Query, context: SuggestContext) -> None: ...
+    def suggest(
+        self, query: Query, context: SuggestContext
+    ) -> None | Awaitable[None]: ...
 
-    def execute(self, item: Item, action_id: str | None, argument: str | None) -> None: ...
+    def execute(
+        self, item: Item, action_id: str | None, argument: str | None
+    ) -> None | Awaitable[None]: ...
 
-    def stop(self) -> None: ...
+    def stop(self) -> None | Awaitable[None]: ...
 
 
 class WorkerContext:
@@ -136,14 +142,14 @@ class WorkerContext:
         sink: Callable[[Item], None],
         logger: Callable[[str], None],
         loop: asyncio.AbstractEventLoop | None = None,
-        spawn_background: Callable[[Awaitable[object]], object] | None = None,
+        spawn_background: Callable[[Coroutine[Any, Any, object]], object] | None = None,
     ) -> None:
         self._is_cancelled = is_cancelled
         self._sink = sink
         self._logger = logger
         self._loop = loop
         self._spawn_background = spawn_background
-        self.registered_tasks: list[object] = []
+        self.registered_tasks: list[asyncio.Task[object]] = []
 
     @property
     def cancelled(self) -> bool:
@@ -155,7 +161,7 @@ class WorkerContext:
     def log(self, message: str) -> None:
         self._logger(str(message))
 
-    def spawn(self, coro: Awaitable[object]) -> object:
+    def spawn(self, coro: Coroutine[Any, Any, object]) -> object:
         if not asyncio.iscoroutine(coro):
             raise TypeError("context.spawn(coro) expects a coroutine")
         if self._spawn_background is not None:

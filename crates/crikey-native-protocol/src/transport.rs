@@ -5,7 +5,7 @@
 //! verification of that arm requires Windows.
 
 use std::io::{self, Cursor, Read, Write};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(unix)]
@@ -164,9 +164,11 @@ impl Transport for IoTransport {
     }
 }
 
+const PAIR_QUEUE_CAPACITY: usize = 64;
+
 #[derive(Debug)]
 struct PairSide {
-    sender: Option<Sender<Vec<u8>>>,
+    sender: Option<SyncSender<Vec<u8>>>,
     receiver: Arc<Mutex<Receiver<Vec<u8>>>>,
     read_timeout: Option<Duration>,
 }
@@ -175,7 +177,14 @@ impl Transport for PairSide {
     fn send(&mut self, envelope: &Envelope) -> Result<(), ProtocolError> {
         let sender = self.sender.as_ref().ok_or(ProtocolError::Closed)?;
         let payload = envelope.encode();
-        let mut framed = Vec::with_capacity(payload.len().saturating_add(4));
+        if payload.len() > crate::MAX_FRAME_BYTES {
+            return Err(ProtocolError::FrameTooLarge(payload.len()));
+        }
+        let capacity = payload
+            .len()
+            .checked_add(4)
+            .ok_or(ProtocolError::FrameTooLarge(payload.len()))?;
+        let mut framed = Vec::with_capacity(capacity);
         frame::write_frame(&mut framed, &payload)?;
         sender.send(framed).map_err(|_| ProtocolError::Closed)
     }
@@ -221,8 +230,8 @@ impl Transport for PairSide {
 
 /// In-memory duplex pair used by SDK harnesses and deterministic tests.
 pub fn pair() -> (Box<dyn Transport>, Box<dyn Transport>) {
-    let (left_sender, left_receiver) = mpsc::channel();
-    let (right_sender, right_receiver) = mpsc::channel();
+    let (left_sender, left_receiver) = mpsc::sync_channel(PAIR_QUEUE_CAPACITY);
+    let (right_sender, right_receiver) = mpsc::sync_channel(PAIR_QUEUE_CAPACITY);
     let left = PairSide {
         sender: Some(left_sender),
         receiver: Arc::new(Mutex::new(right_receiver)),
@@ -274,19 +283,22 @@ impl Listener {
             ListenerKind::Unix(listener) => {
                 if let Some(timeout) = timeout {
                     listener.set_nonblocking(true).map_err(map_io)?;
-                    let deadline = Instant::now().checked_add(timeout);
-                    loop {
+                    let started = Instant::now();
+                    let accepted = loop {
                         match listener.accept() {
-                            Ok((stream, _)) => return Ok(Box::new(IoTransport::new(IoStream::Unix(stream)))),
+                            Ok(value) => break Ok(value),
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                if deadline.is_some_and(|at| Instant::now() >= at) {
-                                    return Err(ProtocolError::Timeout);
+                                if started.elapsed() >= timeout {
+                                    break Err(ProtocolError::Timeout);
                                 }
                                 std::thread::sleep(Duration::from_millis(1));
                             }
-                            Err(error) => return Err(map_io(error)),
+                            Err(error) => break Err(map_io(error)),
                         }
-                    }
+                    };
+                    listener.set_nonblocking(false).map_err(map_io)?;
+                    let (stream, _) = accepted?;
+                    return Ok(Box::new(IoTransport::new(IoStream::Unix(stream))));
                 }
                 let (stream, _) = listener.accept().map_err(map_io)?;
                 Ok(Box::new(IoTransport::new(IoStream::Unix(stream))))

@@ -102,6 +102,22 @@ windows = { version = "0.61", default-features = false }
 unsafe_code = "warn"
 missing_debug_implementations = "warn"
 
+# Dev and test builds link roughly sixty separate test binaries across this
+# workspace, several of which statically link wgpu, winit and egui. Under
+# Cargo's defaults (full DWARF debug info plus incremental artefacts) the
+# `target/debug` directory produced by CI's own
+# `cargo test --workspace --all-targets` grew past 50 GB and exhausted the
+# disk. Workspace crates keep file/line tables so panic backtraces still name
+# a source location; third-party dependencies, which dominate the byte count
+# and are not the code under test, are stripped of debug info entirely.
+# `[profile.test]` inherits these settings from `[profile.dev]`.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = 0
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

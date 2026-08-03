@@ -42,6 +42,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use crikey_core::{
     Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, PluginId,
 };
@@ -53,6 +56,8 @@ use crikey_python_host::{
     ModernWorker, PluginError, RequiresPython, RuntimeProfile, SuggestRequest, Suggestions, WorkerExit,
     WorkerOptions, MAX_FRAME_BYTES, MAX_LOG_LINE_BYTES, WORKER_ENTRY_FILE,
 };
+#[cfg(unix)]
+use crikey_python_host::{discover_interpreter_in, DiscoveryEnvironment};
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -110,6 +115,30 @@ impl Scratch {
     }
 }
 
+#[cfg(unix)]
+fn generation_mismatch_shim(scratch: &Scratch) -> PathBuf {
+    let path = scratch.join("generation-mismatch-python");
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+if [ "$1" = "-c" ]; then
+    printf '3.12.0\n'
+    exit 0
+fi
+while IFS= read -r line; do
+    case "$line" in
+        *'"kind":"handshake"'*) printf '%s\n' '{"id":1,"kind":"handshake_ack","protocol_version":1}' ;;
+        *'"kind":"suggest"'*) printf '%s\n' '{"id":2,"kind":"result_batch","generation":999,"state":"final","items":[],"log":[],"error":null}' ;;
+        *'"kind":"shutdown"'*) exit 0 ;;
+    esac
+done
+"#,
+    )
+    .expect("generation mismatch shim is writable");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("generation mismatch shim is executable");
+    path
+}
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
@@ -442,6 +471,40 @@ fn the_sdk_root_ships_the_modern_worker_entry() {
         "the modern worker entry {WORKER_ENTRY_FILE} must ship in {}",
         sdk_root().display()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_present_mismatched_result_generation_is_rejected_as_protocol_error() {
+    let scratch = Scratch::new("generation-mismatch");
+    let shim = generation_mismatch_shim(&scratch);
+    let interpreter = discover_interpreter_in(
+        &RuntimeProfile::External(shim),
+        &RequiresPython(">=3.8".to_owned()),
+        &DiscoveryEnvironment::empty(),
+    )
+    .expect("the protocol shim reports a supported interpreter");
+    let options = WorkerOptions::new(
+        PluginId("modern.generation-mismatch".to_owned()),
+        "unused:Fixture",
+        ImportPath {
+            entries: vec![sdk_root()],
+        },
+    )
+    .with_startup_timeout_ms(1_000)
+    .with_call_timeout_ms(1_000)
+    .with_shutdown_timeout_ms(1_000);
+    let mut worker = ModernWorker::spawn(&interpreter, options).expect("the protocol shim handshakes");
+
+    let error = worker
+        .suggest(&suggest_request("query"))
+        .expect_err("a result for another generation is a protocol error");
+    assert!(
+        matches!(error, HostError::Protocol(_)),
+        "a mismatched generation is rejected as HostError::Protocol, got {error:?}"
+    );
+    assert!(!worker.is_alive(), "a mismatched generation stops the worker");
+    worker.shutdown();
 }
 
 // ---------------------------------------------------------------------------

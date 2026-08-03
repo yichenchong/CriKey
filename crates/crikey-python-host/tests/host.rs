@@ -55,6 +55,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use crikey_core::PluginId;
 use crikey_package_manager::{
@@ -488,6 +490,61 @@ fn an_interpreter_that_does_not_satisfy_requires_python_is_rejected_not_silently
         }
         other => panic!("an unsatisfying interpreter is UnsatisfiedRequiresPython, got {other:?}"),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn discovery_rejects_a_candidate_that_prints_a_version_but_exits_with_failure() {
+    let scratch = Scratch::new("probe-failed");
+    let path = scratch.join("failed-python");
+    fs::write(&path, "#!/bin/sh\nprintf '3.12.0\\n'\nexit 7\n").expect("probe fixture is writable");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("probe fixture is executable");
+
+    let error = discover_interpreter_in(
+        &RuntimeProfile::External(path.clone()),
+        &RequiresPython(">=3.8".to_owned()),
+        &DiscoveryEnvironment::empty(),
+    )
+    .expect_err("a failed version probe cannot select the interpreter");
+    match error {
+        HostError::Interpreter(message) => {
+            assert!(
+                message.contains("exited"),
+                "the failure names the exit: {message}"
+            );
+            assert!(
+                message.contains(path.to_string_lossy().as_ref()),
+                "the failure names the candidate that was tried: {message}"
+            );
+        }
+        other => panic!("a failed version probe is an interpreter error, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn discovery_stops_a_candidate_that_hangs_during_the_version_probe() {
+    let scratch = Scratch::new("probe-timeout");
+    let path = scratch.join("hung-python");
+    fs::write(&path, "#!/bin/sh\nsleep 30\n").expect("probe fixture is writable");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("probe fixture is executable");
+
+    let started = Instant::now();
+    let error = discover_interpreter_in(
+        &RuntimeProfile::External(path),
+        &RequiresPython(">=3.8".to_owned()),
+        &DiscoveryEnvironment::empty(),
+    )
+    .expect_err("a version probe that does not answer is stopped");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a hung version probe is bounded, elapsed {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(&error, HostError::Interpreter(message) if message.contains("within")),
+        "the timeout is reported as an interpreter error, got {error:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

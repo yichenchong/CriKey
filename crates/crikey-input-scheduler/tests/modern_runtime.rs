@@ -1563,3 +1563,23 @@ fn a_full_typing_session_never_dispatches_a_superseded_generation() {
         "superseded in-flight work must be visible as cancellations"
     );
 }
+
+#[test]
+fn maximum_wait_shorter_than_debounce_still_fires_at_the_maximum() {
+    let search = plugin("dev.crikey.short-maximum");
+    let mut scheduler = scheduler();
+    scheduler.register_plugin(search.clone(), modern(100, Some(20), false, true));
+
+    let generation = scheduler.submit_query("query", 0);
+    assert!(scheduler.tick(0).is_empty());
+    assert_eq!(
+        scheduler.next_wakeup(),
+        Some(20),
+        "the configured maximum wait must not be widened to the debounce interval"
+    );
+    assert!(scheduler.tick(19).is_empty());
+    assert_eq!(
+        shape(&scheduler.tick(20)),
+        vec![("dev.crikey.short-maximum", generation.get(), "query", 20)]
+    );
+}

@@ -65,13 +65,46 @@ _MAX_SCAN_RESULTS = 100_000
 _MAX_CLIPBOARD_CHARS = 1 << 20
 
 #: Characters that force :func:`cmdline_quote` to quote an argument. A bare
-#: backslash is *not* one of them: `C:\\dir` needs no quoting and quoting it
-#: would break plugins that compare the result against a literal.
+#  backslash is *not* one of them: `C:\\dir` needs no quoting and quoting it
+#  would break plugins that compare the result against a literal.
 _MUST_QUOTE = (" ", "\t", '"')
 
 _BACKSLASH = "\\"
 _QUOTE = '"'
 
+
+def _quote_one(argument, force_quote):
+    """Quotes one validated command-line argument."""
+    if force_quote or not argument or any(char in argument for char in _MUST_QUOTE):
+        out = [_QUOTE]
+        index = 0
+        length = len(argument)
+        while index < length:
+            if argument[index] == _BACKSLASH:
+                run = 0
+                while index < length and argument[index] == _BACKSLASH:
+                    run += 1
+                    index += 1
+                if index == length:
+                    # Trailing backslashes sit immediately before the closing
+                    # quote we are about to append, so they must be doubled or
+                    # that quote would be read as escaped.
+                    out.append(_BACKSLASH * (2 * run))
+                elif argument[index] == _QUOTE:
+                    out.append(_BACKSLASH * (2 * run + 1))
+                    out.append(_QUOTE)
+                    index += 1
+                else:
+                    out.append(_BACKSLASH * run)
+                continue
+
+            char = argument[index]
+            out.append(_BACKSLASH + _QUOTE if char == _QUOTE else char)
+            index += 1
+
+        out.append(_QUOTE)
+        return "".join(out)
+    return argument
 
 # --------------------------------------------------------------------------
 # Honest unavailability (spec 14.12, 26.2)
@@ -187,52 +220,26 @@ def cmdline_split(cmdline):
     return arguments
 
 
-def cmdline_quote(argument):
-    """The inverse of :func:`cmdline_split`.
+def cmdline_quote(arg_or_list, force_quote=False):
+    """Joins and quotes arguments using ``CommandLineToArgvW`` rules.
 
-    Accepts one argument or a sequence of them; a sequence is joined with
-    single spaces. ``cmdline_split(cmdline_quote(args)) == args`` holds for
-    every argument vector, including empty strings, embedded quotes and
-    trailing backslashes — that round trip, not the exact spelling, is the
-    contract.
-
-    Quotes are added only when they are *needed*, because a plugin that
-    compares a built command line against a literal would break otherwise.
+    ``arg_or_list`` accepts one string, or a list/tuple of strings. The
+    optional ``force_quote`` flag requests quoting even when an argument has
+    no whitespace or embedded quote. That flag is part of the documented
+    API: callers use it when a command-line consumer requires every argument
+    to be delimited.
     """
-    if not isinstance(argument, str):
-        return " ".join(cmdline_quote(item) for item in argument)
+    if isinstance(arg_or_list, str):
+        arguments = [arg_or_list]
+    elif isinstance(arg_or_list, (list, tuple)):
+        arguments = list(arg_or_list)
+    else:
+        raise TypeError("invalid args type")
 
-    if argument and not any(char in argument for char in _MUST_QUOTE):
-        return argument
-
-    out = [_QUOTE]
-    index = 0
-    length = len(argument)
-    while index < length:
-        if argument[index] == _BACKSLASH:
-            run = 0
-            while index < length and argument[index] == _BACKSLASH:
-                run += 1
-                index += 1
-            if index == length:
-                # Trailing backslashes sit immediately before the closing
-                # quote we are about to append, so they must be doubled or
-                # that quote would be read as escaped.
-                out.append(_BACKSLASH * (2 * run))
-            elif argument[index] == _QUOTE:
-                out.append(_BACKSLASH * (2 * run + 1))
-                out.append(_QUOTE)
-                index += 1
-            else:
-                out.append(_BACKSLASH * run)
-            continue
-
-        char = argument[index]
-        out.append(_BACKSLASH + _QUOTE if char == _QUOTE else char)
-        index += 1
-
-    out.append(_QUOTE)
-    return "".join(out)
+    for argument in arguments:
+        if not isinstance(argument, str):
+            raise TypeError("arguments must be strings")
+    return " ".join(_quote_one(argument, force_quote) for argument in arguments)
 
 
 # --------------------------------------------------------------------------
@@ -307,49 +314,36 @@ def expand_variables(text, custom_vars=None, environ=None):
 
 
 class ScanFlags(enum.IntFlag):
-    """What :func:`scan_directory` should report and how far it should walk."""
+    """The flags accepted by :func:`scan_directory`.
 
-    FILES = 0x1
-    FOLDERS = 0x2
+    ``DIRS`` is the spelling used by the original API; ``FOLDERS`` and
+    ``RECURSIVE`` are retained as compatibility extensions used by CriKey
+    packages that adopted the first M3 shim.
+    """
 
-    #: Descend below the base directory. Bounded by ``max_level``.
-    RECURSIVE = 0x4
+    FILES = 0x01
+    DIRS = 0x02
+    FOLDERS = DIRS
+    HIDDEN = 0x04
+    CASE_SENSITIVE = 0x08
+    ABORT_ON_ERROR = 0x10
+    RECURSIVE = 0x20
+    DEFAULT = FILES | DIRS
 
-    #: Everything directly inside the base directory.
-    DEFAULT = 0x3
 
+def scan_directory(base_dir, name_patterns="*", flags=ScanFlags.DEFAULT, max_level=0):
+    """Walks `base_dir` and returns matching paths relative to it.
 
-def scan_directory(
-    base_dir,
-    name_patterns="*",
-    flags=ScanFlags.DEFAULT,
-    max_level=-1,
-    max_entries=_MAX_SCAN_RESULTS,
-):
-    """Lists entries under `base_dir` matching `name_patterns`.
+    Matching uses the entry name, not the complete relative path. `max_level`
+    follows the documented convention: zero scans only the immediate contents,
+    one also scans the contents of immediate subdirectories, and a negative
+    value is unlimited. The M3-only ``RECURSIVE`` flag remains accepted and
+    means unlimited depth when ``max_level`` is left at zero.
 
-    `name_patterns` is one glob or a sequence of them, matched against the
-    entry *name* only — never against the whole path, so ``*.txt`` finds
-    ``sub/deep/notes.txt`` on a recursive scan.
-
-    Results are **relative to `base_dir`**, joined with the host path
-    separator, and sorted. Relative because a plugin joins them straight back
-    onto the base it passed in; sorted because a plugin's own output is a
-    catalog, and an unordered catalog reorders itself between runs for no
-    reason the user can see.
-
-    `max_level` bounds recursion: ``-1`` is unlimited, ``0`` never descends,
-    and ``n`` descends into directories at most ``n`` levels below the base.
-    Entries directly inside `base_dir` are level 0, so ``max_level=1`` reaches
-    ``sub/child`` but not ``sub/deep/child``.
-
-    A directory that cannot be read is skipped rather than fatal: a plugin
-    scanning a tree it does not fully own must still get the part it can see.
-
-    At most `max_entries` entries are retained. On overflow the scan stops and
-    one line naming the truncation is written to the plugin log channel — a
-    truncated listing that says so beats an out-of-memory kill of the worker,
-    and beats a truncated listing that lies.
+    Missing or unreadable roots raise ``OSError``. An unreadable descendant is
+    skipped unless ``ABORT_ON_ERROR`` is set, matching the original helper's
+    error contract. Results are capped to protect the worker from an
+    accidentally unbounded filesystem walk.
     """
     patterns = (
         (name_patterns,) if isinstance(name_patterns, str) else tuple(name_patterns)
@@ -358,8 +352,18 @@ def scan_directory(
         patterns = ("*",)
 
     want_files = bool(flags & ScanFlags.FILES)
-    want_folders = bool(flags & ScanFlags.FOLDERS)
-    recursive = bool(flags & ScanFlags.RECURSIVE)
+    want_folders = bool(flags & ScanFlags.DIRS)
+    case_sensitive = bool(flags & ScanFlags.CASE_SENSITIVE)
+    abort_on_error = bool(flags & ScanFlags.ABORT_ON_ERROR)
+    recursive_flag = bool(flags & ScanFlags.RECURSIVE)
+    if recursive_flag and max_level == 0:
+        max_level = -1
+
+    def matches(name):
+        if case_sensitive:
+            return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+        folded_name = name.casefold()
+        return any(fnmatch.fnmatchcase(folded_name, pattern.casefold()) for pattern in patterns)
 
     results = []
     truncated = False
@@ -370,27 +374,41 @@ def scan_directory(
         absolute = os.path.join(base_dir, relative_dir) if relative_dir else base_dir
         try:
             with os.scandir(absolute) as entries:
-                children = sorted((entry.name, entry.is_dir()) for entry in entries)
+                children = []
+                for entry in entries:
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        if abort_on_error:
+                            raise
+                        continue
+                    children.append((entry.name, is_dir))
         except OSError:
+            if not relative_dir or abort_on_error:
+                raise
             continue
 
-        for name, is_dir in children:
+        for name, is_dir in sorted(children):
+            if not (flags & ScanFlags.HIDDEN) and name.startswith("."):
+                continue
             relative = os.path.join(relative_dir, name) if relative_dir else name
 
             if (is_dir and want_folders) or (not is_dir and want_files):
-                if any(fnmatch.fnmatch(name, pattern) for pattern in patterns):
-                    if len(results) >= max_entries:
+                if matches(name):
+                    if len(results) >= _MAX_SCAN_RESULTS:
                         truncated = True
                         break
                     results.append(relative)
 
-            if is_dir and recursive and (max_level < 0 or depth < max_level):
+            if is_dir and (recursive_flag or max_level != 0) and (
+                max_level < 0 or depth < max_level
+            ):
                 pending.append((relative, depth + 1))
 
     if truncated:
         sys.stderr.write(
             "[warn][keypirinha_util] scan_directory({!r}) stopped at the {} entry cap; "
-            "the returned list is truncated\n".format(base_dir, max_entries)
+            "the returned list is truncated\n".format(base_dir, _MAX_SCAN_RESULTS)
         )
         sys.stderr.flush()
 

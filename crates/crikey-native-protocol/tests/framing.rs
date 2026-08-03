@@ -1,6 +1,6 @@
 //! Red-first tests for length-delimited native protocol frames (spec 12.4).
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 use crikey_native_protocol::{
     frame::{read_frame, write_frame},
@@ -95,4 +95,46 @@ fn frame_reader_clears_previous_payload_before_reading() {
     let result = read_frame(&mut eof, &mut buffer);
     assert!(matches!(result, Err(ProtocolError::Closed)));
     assert!(buffer.is_empty(), "EOF left a stale frame payload");
+}
+
+#[test]
+fn zero_length_frame_is_malformed() {
+    let mut reader = Cursor::new(0_u32.to_be_bytes());
+    let mut buffer = Vec::new();
+    assert!(matches!(
+        read_frame(&mut reader, &mut buffer),
+        Err(ProtocolError::Malformed(message)) if message.contains("zero-length")
+    ));
+    assert!(buffer.is_empty());
+}
+
+#[test]
+fn writer_rejects_zero_length_frame() {
+    let mut output = Vec::new();
+    assert!(matches!(
+        write_frame(&mut output, &[]),
+        Err(ProtocolError::Malformed(message)) if message.contains("zero-length")
+    ));
+    assert!(output.is_empty());
+}
+
+struct OneByteReader(Cursor<Vec<u8>>);
+
+impl Read for OneByteReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.0.read(&mut bytes[..1])
+    }
+}
+
+#[test]
+fn frame_reader_resumes_partial_prefix_and_body_reads() {
+    let mut encoded = Vec::new();
+    write_frame(&mut encoded, b"partial reads are safe").expect("frame write");
+    let mut reader = OneByteReader(Cursor::new(encoded));
+    let mut decoded = Vec::new();
+    read_frame(&mut reader, &mut decoded).expect("partial reads must be resumed");
+    assert_eq!(decoded, b"partial reads are safe");
 }

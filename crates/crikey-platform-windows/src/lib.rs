@@ -38,9 +38,10 @@ mod win32;
 
 use std::path::PathBuf;
 
-use crikey_platform::{ApplicationDiscovery, Capability, CapabilityState, HotkeyService, ProcessLauncher};
-
 pub use applications::{split_arguments, ApplicationSet, Shortcut, StartMenuDiscovery};
+#[cfg(not(target_os = "windows"))]
+use crikey_core::CoreError;
+use crikey_platform::{ApplicationDiscovery, Capability, CapabilityState, HotkeyService, ProcessLauncher};
 pub use hotkeys::{HotkeyCode, HotkeyRegistration, HotkeyRegistrations, WindowsHotkeys};
 pub use process::{quote_arguments, ShellLauncher};
 
@@ -146,9 +147,7 @@ impl Default for WindowsBackend {
 /// `action` completes "the Windows backend cannot ...", so it reads as a verb
 /// phrase: `"discover applications"`, `"register a global hotkey"`.
 #[cfg(not(target_os = "windows"))]
-fn off_target(action: &str) -> crikey_core::CoreError {
-    use crikey_core::CoreError;
-
+fn off_target(action: &str) -> CoreError {
     CoreError::Invalid(format!(
         "the Windows backend cannot {action}: this build does not target Windows"
     ))

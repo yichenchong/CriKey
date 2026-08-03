@@ -3,8 +3,8 @@
 //! M1 holds exactly one query generation on screen. [`MemoryResultAggregator`]
 //! merges every batch tagged with that generation into a single retained list:
 //! deduplicated by `(PluginId, ItemId)`, ordered by first acceptance, bounded by
-//! safety limits of spec 11.7, and published to the UI as at most one coalesced
-//! whole-list snapshot.
+//! safety limits of spec 11.7, and published to the UI as coalesced whole-list
+//! snapshots subject to the configured per-frame update budget.
 //!
 //! No ranking score reaches this boundary yet, so the aggregator never sorts.
 //! Incremental reranking (spec 11.5) layers on top of this order later; until

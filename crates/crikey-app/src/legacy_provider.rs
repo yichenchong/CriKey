@@ -50,7 +50,7 @@
 //! diagnostic. None of them aborts discovery, wedges the pipeline, or takes down
 //! the process.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -108,11 +108,18 @@ pub struct LegacyWorkerPool {
     workers: BTreeMap<PluginId, LegacyWorker>,
     replies: VecDeque<LegacyResponse>,
     failures: Vec<(PluginId, String)>,
+    dead: BTreeSet<PluginId>,
 }
 
 impl LegacyWorkerPool {
     fn insert(&mut self, plugin: PluginId, worker: LegacyWorker) {
         self.workers.insert(plugin, worker);
+    }
+
+    fn record_failure(&mut self, plugin: PluginId, reason: String) {
+        if self.dead.insert(plugin.clone()) {
+            self.failures.push((plugin, reason));
+        }
     }
 
     /// Removes every reply the workers have produced since the last drain. Taken
@@ -126,29 +133,29 @@ impl LegacyWorkerPool {
 impl LegacyWorkerHandle for LegacyWorkerPool {
     fn dispatch(&mut self, _at_ms: Millis, request: &LegacyRequest) -> Result<(), WorkerError> {
         let Some(worker) = self.workers.get_mut(&request.plugin) else {
-            // Only registered plugins are ever dispatched, and each has a
-            // worker, so this is a should-never-happen guarded by an
-            // attributable error rather than a silent success that would wedge
-            // the instance waiting for a reply that can never come.
-            return Err(WorkerError::Io {
+            let error = WorkerError::Io {
                 plugin: Some(request.plugin.clone()),
                 operation: format!("dispatching {:?} to a legacy worker", request.callback()),
                 message: "no live worker is registered for this plugin".to_owned(),
-            });
+            };
+            self.record_failure(request.plugin.clone(), error.to_string());
+            return Err(error);
         };
         // The callback genuinely runs in the child process here (spec 4.2).
-        match worker.call(request.clone()) {
+        let result = worker.call(request.clone());
+        if let Err(error) = &result {
+            // A crashed or unresponsive worker is contained: the runtime
+            // frees the instance on this `Err`, and the failure is recorded
+            // once so a diagnostic can name the plugin (spec 24.1, 26.2).
+            self.workers.remove(&request.plugin);
+            self.record_failure(request.plugin.clone(), error.to_string());
+        }
+        match result {
             Ok(response) => {
                 self.replies.push_back(response);
                 Ok(())
             }
-            Err(error) => {
-                // A crashed or unresponsive worker is contained: the runtime
-                // frees the instance on this `Err`, and the failure is recorded
-                // so a diagnostic can name the plugin (spec 24.1, 26.2).
-                self.failures.push((request.plugin.clone(), error.to_string()));
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -389,41 +396,36 @@ impl LegacyProvider {
         now: Millis,
     ) -> Option<ViewModel> {
         let generation = pipeline.keystroke(query, now);
-        let mut suggestions = self.collect_suggestions(query, now);
+        let (mut suggestions, dead_plugins) = self.collect_suggestions(query, now);
 
         let tick = pipeline.tick(now);
-        let tick_succeeded = tick.errors.is_empty();
         for cancellation in tick.cancellations {
             let _ = pipeline.complete(&cancellation.plugin, cancellation.generation, now);
         }
 
-        let mut delivered = true;
         for request in tick.dispatches {
             if request.generation != generation {
                 let _ = pipeline.complete(&request.plugin, request.generation, now);
                 continue;
             }
+            if dead_plugins.contains(&request.plugin) {
+                let _ = pipeline.abort_request(&request.plugin, request.generation, now);
+                continue;
+            }
             let items = suggestions.remove(&request.plugin).unwrap_or_default();
-            let admitted = pipeline
-                .deliver(
-                    ResultBatch {
-                        generation: request.generation,
-                        plugin: request.plugin.clone(),
-                        state: BatchState::Final,
-                        items,
-                    },
-                    now,
-                )
-                .is_ok();
-            delivered &= admitted;
+            let _ = pipeline.deliver(
+                ResultBatch {
+                    generation: request.generation,
+                    plugin: request.plugin.clone(),
+                    state: BatchState::Final,
+                    items,
+                },
+                now,
+            );
             let _ = pipeline.complete(&request.plugin, request.generation, now);
         }
 
         let frame = pipeline.present(now);
-        let presentation_succeeded = pipeline.take_errors().is_empty();
-        if !tick_succeeded || !delivered || !presentation_succeeded {
-            return None;
-        }
         frame.filter(|frame| frame.generation == generation)
     }
 
@@ -434,7 +436,11 @@ impl LegacyProvider {
 
     /// Runs the legacy runtime for one query and groups the resulting visible
     /// items by their owning plugin.
-    fn collect_suggestions(&mut self, query: &str, now: Millis) -> BTreeMap<PluginId, Vec<Item>> {
+    fn collect_suggestions(
+        &mut self,
+        query: &str,
+        now: Millis,
+    ) -> (BTreeMap<PluginId, Vec<Item>>, BTreeSet<PluginId>) {
         // A plain query with nothing selected broadcasts to every loaded legacy
         // plugin (spec 14.5): no length floor, no prefix or keyword gating, no
         // debounce (acceptance 31.14, 31.15).
@@ -449,7 +455,7 @@ impl LegacyProvider {
                 .or_default()
                 .push(item.clone());
         }
-        by_plugin
+        (by_plugin, self.runtime.worker().dead.clone())
     }
 
     /// Feeds every buffered child reply back into the runtime at `now`.

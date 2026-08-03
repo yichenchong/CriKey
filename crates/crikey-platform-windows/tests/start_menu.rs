@@ -20,7 +20,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+#[cfg(not(target_os = "windows"))]
+use crikey_core::CoreError;
 use crikey_core::PlatformPath;
+#[cfg(not(target_os = "windows"))]
+use crikey_platform::ApplicationDiscovery;
 use crikey_platform::DiscoveredApplication;
 use crikey_platform_windows::{split_arguments, ApplicationSet, StartMenuDiscovery};
 
@@ -401,9 +405,6 @@ fn an_unterminated_quote_yields_the_rest_of_the_string() {
 #[cfg(not(target_os = "windows"))]
 #[test]
 fn off_target_discovery_refuses_instead_of_reporting_nothing() {
-    use crikey_core::CoreError;
-    use crikey_platform::ApplicationDiscovery;
-
     // An empty list would read as "this machine has no applications", which is
     // a different and much worse answer than "this build cannot look".
     let scratch = Scratch::new();

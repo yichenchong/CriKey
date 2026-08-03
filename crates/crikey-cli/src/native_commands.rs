@@ -117,6 +117,11 @@ pub(crate) fn inspect_protocol(args: &[String]) -> ExitCode {
 
 fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        if let Some(argument) = unknown_help_argument(args) {
+            return Err(format!(
+                "`dev inspect-protocol` does not understand `{argument}`; see `--help` for valid options"
+            ));
+        }
         return Ok(None);
     }
 
@@ -193,6 +198,27 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         trace,
         environment,
     }))
+}
+
+fn unknown_help_argument(args: &[String]) -> Option<&str> {
+    let mut position = 0;
+    while position < args.len() {
+        let argument = args[position].as_str();
+        if matches!(argument, "-h" | "--help" | "--cancel" | "--trace") {
+            position += 1;
+        } else if matches!(argument, "--plugin" | "--transport" | "--query" | "--env") {
+            position = position.saturating_add(2);
+        } else if argument.starts_with("--plugin=")
+            || argument.starts_with("--transport=")
+            || argument.starts_with("--query=")
+            || argument.starts_with("--env=")
+        {
+            position += 1;
+        } else {
+            return Some(argument);
+        }
+    }
+    None
 }
 
 fn parse_transport(value: &str) -> Result<&'static str, String> {
@@ -690,5 +716,11 @@ mod tests {
     #[test]
     fn encoding_matches_frozen_spelling() {
         assert_eq!(encode("space % and ="), "space%20%25%20and%20%3D");
+    }
+
+    #[test]
+    fn help_does_not_hide_unknown_protocol_options() {
+        let args = vec!["--help".to_owned(), "--unknown".to_owned()];
+        assert!(parse_args(&args).is_err());
     }
 }
