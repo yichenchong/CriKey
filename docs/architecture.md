@@ -2,7 +2,8 @@
 
 Companion to [`docs/spec/crikey-spec-v1.md`](spec/crikey-spec-v1.md) §5. This
 document describes how the specification's logical components map onto crates,
-processes and threads.
+processes and threads. For the mechanics of building and testing the tree, see
+[`docs/development.md`](development.md).
 
 ## Processes
 

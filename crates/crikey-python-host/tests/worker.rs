@@ -117,9 +117,17 @@ impl Scratch {
 
 #[cfg(unix)]
 fn generation_mismatch_shim(scratch: &Scratch) -> PathBuf {
+    // Written to a sibling temporary name and renamed into place. Writing the
+    // final path directly is racy: these tests run in parallel threads in one
+    // process, so when any thread spawns a child the fork inherits every open
+    // descriptor, including another thread's write handle to a shim it has just
+    // created. The kernel then refuses to execute that shim with `ETXTBSY`
+    // ("Text file busy") because a writer still holds it open. A rename
+    // publishes the finished file under a name no writer ever held.
     let path = scratch.join("generation-mismatch-python");
+    let staging = path.with_extension("staging");
     fs::write(
-        &path,
+        &staging,
         r#"#!/bin/sh
 if [ "$1" = "-c" ]; then
     printf '3.12.0\n'
@@ -135,8 +143,9 @@ done
 "#,
     )
     .expect("generation mismatch shim is writable");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))
         .expect("generation mismatch shim is executable");
+    fs::rename(&staging, &path).expect("generation mismatch shim is published atomically");
     path
 }
 impl Drop for Scratch {

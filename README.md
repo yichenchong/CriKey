@@ -41,6 +41,7 @@ sdk/protocol   Versioned IPC schema shared by all out-of-process plugins
 compatibility/ Legacy API matrix, synthetic test plugins, real-plugin corpus
 plugins/       First-party built-in plugins
 benchmarks/    Synthetic workloads and performance harnesses
+scripts/       Developer maintenance scripts
 docs/          Specification, architecture, ADRs, roadmap
 packaging/     Per-platform distribution artefacts
 ```
@@ -51,6 +52,53 @@ packaging/     Per-platform distribution artefacts
 cargo test --workspace --all-targets
 cargo run -p crikey-cli -- version
 ```
+
+### Disk use, and why it matters here
+
+`cargo test --workspace --all-targets` links roughly a hundred separate test
+executables, several of which statically link the graphics, windowing and
+clipboard libraries. Two things follow, and both have bitten this project.
+
+First, the development profile in the root `Cargo.toml` deliberately keeps
+debug information small: workspace crates get line tables only, and
+dependencies get none. Under Cargo's defaults the same command produced over
+45 GB and exhausted a development machine's disk. With these settings the whole
+test set is about 2 GB. Do not "restore" full debug information across the
+workspace without measuring what it costs.
+
+Second, Cargo never removes superseded build output. Each time a source file
+changes, the previous artefacts stay on disk under their old content hash, so a
+long editing session accumulates them. One session left 306 test executables in
+`target/debug/deps` for a workspace that has about 98, including eight stale
+copies of the main binary. To reclaim that:
+
+```sh
+scripts/prune-build-cache.sh            # prune if target/debug exceeds 5 GB
+scripts/prune-build-cache.sh --dry-run  # report only
+scripts/prune-build-cache.sh --force    # prune regardless of size
+```
+
+It deletes only `target/debug`, so the cost is one rebuild. Release output,
+cross-compilation directories and the out-of-tree plugin fixture are left
+alone, because they are expensive to rebuild and are not rewritten on every
+edit. It refuses to run while a build is in progress.
+
+To have it happen without being asked, install the timer described in
+[docs/development.md](docs/development.md).
+
+### Python
+
+The Python software development kit and the legacy compatibility shim are
+driven by real interpreters during tests. Use a virtual environment rather than
+a system-wide interpreter:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m compileall -q sdk/python crates/crikey-legacy-compat/python
+```
+
+`.venv/` is ignored by git. Set `CRIKEY_PYTHON` to point the interpreter
+discovery at a specific binary.
 
 ## Design invariants
 

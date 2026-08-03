@@ -255,11 +255,23 @@ fn hostile_worker_unterminated(dir: &Path, name: &str, version: &str, reply: &st
     )
 }
 
+/// Creates an executable stand-in interpreter at `path`.
+///
+/// The script is written to a sibling temporary name, made executable, and only
+/// then renamed into place. Writing `path` directly is racy: these tests run in
+/// parallel threads in one process, so when any thread spawns a child the fork
+/// inherits every open descriptor, including another thread's write handle to a
+/// script it has just created. The kernel then refuses to execute that script
+/// with `ETXTBSY` ("Text file busy") because a writer still holds it open, and
+/// discovery fails for a stand-in that is perfectly valid. A rename publishes
+/// the finished file under a name no writer ever held, so the window is gone.
 #[cfg(unix)]
 fn executable(path: &Path, script: &str) -> PathBuf {
-    fs::write(path, script).expect("stand-in interpreter is writable");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+    let staging = path.with_extension("staging");
+    fs::write(&staging, script).expect("stand-in interpreter is writable");
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))
         .expect("stand-in interpreter is made executable");
+    fs::rename(&staging, path).expect("stand-in interpreter is published atomically");
     path.to_path_buf()
 }
 

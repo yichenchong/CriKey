@@ -170,15 +170,29 @@ fn sdk_dir() -> PathBuf {
 /// and what version it read — is asserted directly.
 #[cfg(unix)]
 fn version_shim(dir: &Path, name: &str, version: &str) -> PathBuf {
-    let path = dir.join(name);
-    fs::write(
-        &path,
-        format!("#!/bin/sh\n# stand-in interpreter\necho '{version}'\n"),
+    write_executable(
+        &dir.join(name),
+        &format!("#!/bin/sh\n# stand-in interpreter\necho '{version}'\n"),
     )
-    .expect("stand-in interpreter is writable");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-        .expect("stand-in interpreter is made executable");
-    path
+}
+
+/// Publishes an executable shim at `path`, atomically.
+///
+/// The script is written to a sibling temporary name, made executable, and only
+/// then renamed into place. Writing `path` directly is racy: these tests run in
+/// parallel threads in one process, so when any thread spawns a child the fork
+/// inherits every open descriptor, including another thread's write handle to a
+/// shim it has just created. The kernel then refuses to execute that shim with
+/// `ETXTBSY` ("Text file busy") because a writer still holds it open, and
+/// discovery fails for a shim that is perfectly valid. A rename publishes the
+/// finished file under a name no writer ever held, closing the window.
+#[cfg(unix)]
+fn write_executable(path: &Path, script: &str) -> PathBuf {
+    let staging = path.with_extension("staging");
+    fs::write(&staging, script).expect("shim is writable");
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).expect("shim is made executable");
+    fs::rename(&staging, path).expect("shim is published atomically");
+    path.to_path_buf()
 }
 
 // ---------------------------------------------------------------------------
@@ -496,9 +510,10 @@ fn an_interpreter_that_does_not_satisfy_requires_python_is_rejected_not_silently
 #[test]
 fn discovery_rejects_a_candidate_that_prints_a_version_but_exits_with_failure() {
     let scratch = Scratch::new("probe-failed");
-    let path = scratch.join("failed-python");
-    fs::write(&path, "#!/bin/sh\nprintf '3.12.0\\n'\nexit 7\n").expect("probe fixture is writable");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("probe fixture is executable");
+    let path = write_executable(
+        &scratch.join("failed-python"),
+        "#!/bin/sh\nprintf '3.12.0\\n'\nexit 7\n",
+    );
 
     let error = discover_interpreter_in(
         &RuntimeProfile::External(path.clone()),
@@ -525,9 +540,7 @@ fn discovery_rejects_a_candidate_that_prints_a_version_but_exits_with_failure() 
 #[test]
 fn discovery_stops_a_candidate_that_hangs_during_the_version_probe() {
     let scratch = Scratch::new("probe-timeout");
-    let path = scratch.join("hung-python");
-    fs::write(&path, "#!/bin/sh\nsleep 30\n").expect("probe fixture is writable");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("probe fixture is executable");
+    let path = write_executable(&scratch.join("hung-python"), "#!/bin/sh\nsleep 30\n");
 
     let started = Instant::now();
     let error = discover_interpreter_in(
