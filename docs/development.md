@@ -121,22 +121,29 @@ nothing. Measuring the directory that actually gets deleted also removes any
 need for hysteresis: a healthy full build is about 2 GB, so the default only
 fires once stale artefacts have roughly doubled it.
 
-It deletes `target/debug` wholesale when over the threshold. That is
+It clears everything inside `target/debug` when over the threshold. That is
 deliberately blunt: removing individual files by age risks deleting something
-Cargo still considers current, whereas removing the profile directory is always
-safe and costs only a rebuild. It leaves alone `target/release`, the
-cross-compilation directories such as `target/x86_64-pc-windows-msvc`, and
+Cargo still considers current, whereas emptying the profile is always safe and
+costs only a rebuild. It leaves alone `target/release`, the cross-compilation
+directories such as `target/x86_64-pc-windows-msvc`, and
 `target/native-conformance` (the out-of-tree plugin fixture), because those are
 expensive to regenerate and are not rewritten on every edit.
 
 To avoid deleting artefacts out from under a live compiler, it takes Cargo's own
 exclusive build lock on `target/debug/.cargo-lock` and holds it across the
-removal. That is genuine mutual exclusion, not a guess: a build either completed
-before the script started, or it waits for the lock. Checking for running
-`cargo` processes instead would be a race, because a build can start between the
-check and the removal. Two honest caveats: if `flock` is not installed, or the
-lock file does not exist because this profile has never been built, the script
-falls back to a process check that is advisory only.
+removal, creating that file first if it does not exist, which is exactly what
+Cargo itself does. That is genuine mutual exclusion, not a guess: a build either
+completed before the script started, or it waits for the lock. Checking for
+running `cargo` processes instead would be a race, because a build can start
+between the check and the removal.
+
+One consequence is worth knowing if you ever modify the script: it must not
+delete `.cargo-lock` itself. Doing so would leave it holding a lock on an
+unlinked file while a newly started Cargo creates a fresh lock file and builds
+happily alongside the deletion. That is why the removal skips that one entry
+rather than deleting the directory outright. The only remaining caveat is that
+if `flock` is not installed the script falls back to a process check, which is
+advisory only.
 
 ### Running it automatically
 

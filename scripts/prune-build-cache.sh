@@ -18,11 +18,12 @@
 #
 # WHAT IT DOES
 #
-# If `target/debug` is larger than the threshold, it deletes that whole
-# development profile directory (`target/debug`). That is deliberately blunt:
-# deleting individual files by age risks removing something Cargo still
-# considers current, whereas deleting the profile wholesale is always safe.
-# The only cost is one rebuild.
+# If `target/debug` is larger than the threshold, it empties that development
+# profile, deleting everything inside it except the Cargo lock file it holds
+# (see the lock comment further down for why that one entry must survive). That
+# is deliberately blunt: deleting individual files by age risks removing
+# something Cargo still considers current, whereas emptying the profile is
+# always safe. The only cost is one rebuild.
 #
 # Deliberately NOT touched:
 #   * `target/release`

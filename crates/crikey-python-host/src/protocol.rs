@@ -22,8 +22,12 @@ use crate::worker::SuggestRequest;
 
 /// The frame schema this host speaks. Echoed by the child's handshake.
 ///
-/// One number for every CriKey transport, so a native and a modern worker can
-/// never silently diverge: this is exactly the native protocol's version.
+/// Deliberately the same number the native protocol uses, so one version bump
+/// is visible across every CriKey transport. Note what this does and does not
+/// buy: it keeps the version in step, but it is a shared constant, not a
+/// structural guarantee. This transport is newline-delimited JSON and shares no
+/// message definitions with the native protobuf schema, so the two shapes can
+/// still drift apart and only their respective tests will catch it.
 pub const PROTOCOL_VERSION: u32 = crikey_native_protocol::PROTOCOL_VERSION;
 
 /// Ceiling on one protocol line, in bytes.

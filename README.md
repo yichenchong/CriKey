@@ -72,7 +72,7 @@ See [docs/architecture.md](docs/architecture.md) for the component map and
 crates/        Rust workspace: core, scheduler, hosts, platform backends, CLI
 sdk/rust       Official Rust SDK for native plugins
 sdk/python     Official Python SDK for modern plugins
-sdk/protocol   Versioned IPC schema shared by all out-of-process plugins
+sdk/protocol   Versioned IPC schema for native plugins (not modern Python)
 compatibility/ Legacy API matrix, synthetic test plugins, real-plugin corpus
 plugins/       First-party built-in plugins
 benchmarks/    Synthetic workloads and performance harnesses
@@ -113,7 +113,7 @@ scripts/prune-build-cache.sh --dry-run  # report only
 scripts/prune-build-cache.sh --force    # prune regardless of size
 ```
 
-It deletes only `target/debug`, so the cost is one rebuild. Release output,
+It empties only `target/debug`, so the cost is one rebuild. Release output,
 cross-compilation directories and the out-of-tree plugin fixture are left
 alone, because they are expensive to rebuild and are not rewritten on every
 edit. It takes Cargo's own build lock and holds it while it works, so it will

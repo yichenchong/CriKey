@@ -253,9 +253,9 @@ catalog-error diagnostics, and distinct same-environment plugins. A live
 and macOS runtime behavior is not verified on this host; their compile checks
 are tracked under M6.
 
-Native-code permission and native package builds remain deferred to M5 (§15.5);
-M4's package manager accepts only the local verified package material required
-by modern Python plugins.
+Native-code permission and native package builds were deferred from M4 to M5
+(§15.5), which is now complete. M4's own package manager accepts only the local
+verified package material required by modern Python plugins.
 
 ### M5 — Native plugins (§30 Phase 5) — L — done
 
