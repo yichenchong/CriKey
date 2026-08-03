@@ -703,6 +703,26 @@ impl QueryScheduler {
         self.invalidate_plugin(plugin, reason, now, true)
     }
 
+    /// Removes a plugin registration without emitting cancellation
+    /// diagnostics. This is the rollback edge for a provider that registered
+    /// its query policy before a worker could start; all queued and in-flight
+    /// requests are discarded with the registration itself.
+    pub fn unregister_plugin(&mut self, plugin: &PluginId) -> bool {
+        if self.plugins.remove(plugin).is_none() {
+            return false;
+        }
+
+        self.plugin_order.retain(|registered| registered != plugin);
+        self.round_robin_cursor = if self.plugin_order.is_empty() {
+            0
+        } else {
+            self.round_robin_cursor.min(self.plugin_order.len() - 1)
+        };
+        self.cancellations
+            .retain(|cancellation| &cancellation.plugin != plugin);
+        true
+    }
+
     pub fn drain_cancellations(&mut self) -> Vec<CancelledRequest> {
         std::mem::take(&mut self.cancellations)
     }

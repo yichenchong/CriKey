@@ -63,6 +63,8 @@ use crikey_legacy_compat::{
     LegacyResponse, LegacyRuntime, LegacyWorker, LegacyWorkerHandle, PackageLoader, TerminationReason,
     WorkerError, WorkerOptions, WORKER_ENTRY_FILE,
 };
+use crikey_plugin_model::ConcurrencySection;
+use crikey_plugin_supervisor::{shared_budget_from_section, PluginBudgetHandle};
 use crikey_python_host::RuntimeProfile;
 use crikey_ui::{ResultRow, ViewModel};
 
@@ -205,6 +207,7 @@ impl LegacyWorkerHandle for LegacyWorkerPool {
 pub struct LegacyProvider {
     runtime: LegacyRuntime<LegacyWorkerPool>,
     plugins: Vec<PluginId>,
+    budgets: BTreeMap<PluginId, PluginBudgetHandle>,
     unavailable: Vec<LegacyUnavailable>,
 }
 
@@ -229,6 +232,7 @@ impl LegacyProvider {
         let mut provider = Self {
             runtime: LegacyRuntime::new(LegacyWorkerPool::default(), deadlines),
             plugins: Vec::new(),
+            budgets: BTreeMap::new(),
             unavailable: Vec::new(),
         };
 
@@ -296,6 +300,11 @@ impl LegacyProvider {
         package: &LegacyPackage,
     ) {
         let plugin = plugin_of(package);
+        // Legacy manifests use the strict host policy; its independent
+        // concurrency declaration defaults to one suggestion slot. Create the
+        // provider-owned handle before starting the worker, then pass the same
+        // Arc into the pipeline registration.
+        let budget = shared_budget_from_section(&ConcurrencySection::default());
         let options = WorkerOptions::new(plugin.clone(), shim.to_path_buf())
             .with_startup_timeout_ms(STARTUP_BUDGET_MS)
             .with_call_timeout_ms(CALL_BUDGET_MS);
@@ -315,7 +324,11 @@ impl LegacyProvider {
         // Reuse the pipeline's own `legacy-strict` policy rather than inventing
         // a second scheduling path: this is exactly what the pipeline derives
         // for a resolved legacy manifest (spec 7.1, 14.5).
-        if let Err(error) = pipeline.register_plugin(plugin.clone(), PluginPolicy::legacy_strict()) {
+        if let Err(error) = pipeline.register_plugin_with_budget_default_intake(
+            plugin.clone(),
+            PluginPolicy::legacy_strict(),
+            budget.clone(),
+        ) {
             self.unavailable.push(LegacyUnavailable {
                 package: package.id.to_string(),
                 plugin: Some(plugin),
@@ -329,12 +342,18 @@ impl LegacyProvider {
 
         self.runtime.worker_mut().insert(plugin.clone(), worker);
         self.runtime.register(plugin.clone(), package.id.clone());
+        self.budgets.insert(plugin.clone(), budget);
         self.plugins.push(plugin);
     }
 
     /// The legacy plugins that loaded and are being served through the pipeline.
     pub fn plugins(&self) -> &[PluginId] {
         &self.plugins
+    }
+
+    /// Returns the shared budget retained for a loaded legacy plugin.
+    pub fn plugin_budget(&self, plugin: &PluginId) -> Option<&PluginBudgetHandle> {
+        self.budgets.get(plugin)
     }
 
     /// Packages that could not be served, each with an attributable reason.

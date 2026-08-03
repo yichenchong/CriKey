@@ -48,8 +48,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
 
-use crikey_app::{ModernDriver, ModernProvider, PipelineConfig, QueryPipeline};
-use crikey_core::{Generation, PluginId};
+use crikey_app::{
+    CatalogBuildResult, ModernDriver, ModernProvider, PipelineConfig, PluginActionRouter, QueryPipeline,
+};
+use crikey_core::{
+    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, Generation, HitPolicy, Item, ItemId,
+    PluginId,
+};
+use crikey_plugin_supervisor::BudgetKind;
 use crikey_python_host::{discover_interpreter, RequiresPython, RuntimeProfile};
 use crikey_ui::ViewModel;
 
@@ -143,6 +149,39 @@ class Healthy(Plugin):
         context.emit(
             Item(stable_id=\"healthy-1\", label=\"report \" + query.text, target=\"report\")
         )
+";
+
+/// Builds one catalog item through the provider's out-of-band catalog worker.
+const CATALOG_SOURCE: &str = "\
+from crikey_sdk.plugin import Item, Plugin
+
+
+class Catalog(Plugin):
+    def build_catalog(self):
+        return [Item(stable_id=\"catalog-1\", label=\"Catalog item\", target=\"target\")]
+";
+
+/// A deliberately slow plugin action. The callback sleeps in its child
+/// interpreter so the endpoint's submission path must remain visibly quick.
+const ACTION_SOURCE: &str = "\
+import time
+
+from crikey_sdk.plugin import Action, Item, Plugin
+
+
+class ActionPlugin(Plugin):
+    def suggest(self, query, context):
+        context.emit(
+            Item(
+                stable_id=\"action-1\",
+                label=\"Action\",
+                target=\"target\",
+                actions=[Action(action_id=\"open\", label=\"Open\", execution_policy=\"plugin\")],
+            )
+        )
+
+    def execute(self, item, action_id, argument):
+        time.sleep(0.2)
 ";
 
 /// A plugin whose callback kills its interpreter outright (contract §31.10):
@@ -695,5 +734,204 @@ fn modern_driver_refuses_a_superseded_generation() {
         "only the newer generation is presented; saw {generations:?}",
     );
 
+    drop(driver);
+}
+
+#[test]
+fn modern_catalog_build_uses_and_releases_the_catalog_budget() {
+    require_modern_interpreter();
+
+    let scratch = Scratch::new("catalog-budget");
+    let plugins_root = scratch.subdir("plugins");
+    write_modern_plugin(
+        &plugins_root,
+        "catalog",
+        "catalog_plugin",
+        "Catalog",
+        CATALOG_SOURCE,
+    );
+
+    let catalog_plugin = modern_plugin("catalog");
+    let index_root = scratch.subdir("index");
+    let cache_root = scratch.join("cache");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    assert!(
+        provider.plugins().contains(&catalog_plugin),
+        "the catalog plugin must load; unavailable: {:?}",
+        provider.unavailable()
+    );
+
+    let request_id = provider
+        .request_catalog_build(&catalog_plugin, 7, Generation::from_raw(3))
+        .expect("the loaded plugin's catalog request is admitted");
+    assert!(request_id > 0);
+
+    let mut results = None;
+    for _ in 0..2_000 {
+        let ready = provider.take_catalog_results();
+        if !ready.is_empty() {
+            results = Some(ready);
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    let result = results
+        .expect("the bounded catalog worker must produce an observable result")
+        .into_iter()
+        .next()
+        .expect("one request produces one result");
+    match result {
+        CatalogBuildResult::Complete(build) => {
+            assert_eq!(build.plugin, catalog_plugin);
+            assert_eq!(build.instance, 7);
+            assert_eq!(build.generation, Generation::from_raw(3));
+            assert_eq!(build.items.len(), 1);
+            assert_eq!(build.items[0].stable_id.0, "catalog-1");
+        }
+        other => panic!("catalog request failed unexpectedly: {other:?}"),
+    }
+
+    assert_eq!(
+        pipeline
+            .plugin_budget(&catalog_plugin)
+            .expect("the plugin remains registered")
+            .in_flight(BudgetKind::Catalog),
+        0,
+        "catalog completion must release the shared catalog slot"
+    );
+    provider.shutdown(0);
+}
+
+#[test]
+fn modern_action_submission_is_nonblocking_and_budgeted() {
+    require_modern_interpreter();
+
+    let scratch = Scratch::new("action-budget");
+    let plugins_root = scratch.subdir("plugins");
+    write_modern_plugin(
+        &plugins_root,
+        "action",
+        "action_plugin",
+        "ActionPlugin",
+        ACTION_SOURCE,
+    );
+
+    let action_plugin = modern_plugin("action");
+    let index_root = scratch.subdir("index");
+    let cache_root = scratch.join("cache");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    assert!(
+        provider.plugins().contains(&action_plugin),
+        "the action plugin must load; unavailable: {:?}",
+        provider.unavailable()
+    );
+    provider
+        .drive_query(&mut pipeline, "action", 17)
+        .expect("the action item must cross the live suggestion path");
+
+    let item = Item {
+        stable_id: ItemId("action-1".to_owned()),
+        plugin_id: action_plugin.clone(),
+        category: Category::PluginDefined("plugin-defined".to_owned()),
+        label: "Action".to_owned(),
+        description: String::new(),
+        target: "target".to_owned(),
+        search_terms: Vec::new(),
+        icon_reference: None,
+        argument_policy: ArgumentPolicy::Forbidden,
+        hit_policy: HitPolicy::Recorded,
+        score_hint: 0,
+        metadata: std::collections::BTreeMap::new(),
+        actions: vec![Action {
+            action_id: ActionId("open".to_owned()),
+            label: "Open".to_owned(),
+            description: String::new(),
+            applicable_categories: Vec::new(),
+            icon_reference: None,
+            execution_policy: ExecutionPolicy::Plugin,
+        }],
+    };
+    let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+    let endpoint = driver.action_executor();
+
+    let started = std::time::Instant::now();
+    let first = endpoint
+        .submit_plugin_action(&action_plugin, &item, &ActionId("open".to_owned()), None)
+        .expect("the first action is admitted");
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "action submission must not wait for the slow child callback"
+    );
+
+    let refused = endpoint
+        .submit_plugin_action(&action_plugin, &item, &ActionId("open".to_owned()), None)
+        .expect_err("the shared action budget must refuse concurrent work");
+    assert!(
+        refused.to_string().contains("action budget"),
+        "refusal must identify the action budget: {refused}"
+    );
+
+    let mut completions = None;
+    for _ in 0..2_000 {
+        let ready = endpoint.poll_plugin_actions();
+        if !ready.is_empty() {
+            completions = Some(ready);
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    let completion = completions
+        .expect("the slow action must eventually produce a terminal completion")
+        .into_iter()
+        .find(|completion| completion.request_id == first)
+        .expect("the first request's completion must be attributed exactly");
+    assert!(completion.outcome.is_ok(), "the plugin action should succeed");
+    drop(driver);
+}
+
+#[test]
+fn modern_router_rejects_duplicate_stable_ids_across_plugin_owners() {
+    require_modern_interpreter();
+
+    let scratch = Scratch::new("duplicate-action-id");
+    let plugins_root = scratch.subdir("plugins");
+    write_modern_plugin(
+        &plugins_root,
+        "alpha",
+        "alpha_action",
+        "ActionPlugin",
+        ACTION_SOURCE,
+    );
+    write_modern_plugin(
+        &plugins_root,
+        "beta",
+        "beta_action",
+        "ActionPlugin",
+        ACTION_SOURCE,
+    );
+
+    let index_root = scratch.subdir("index");
+    let cache_root = scratch.join("cache");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    assert_eq!(provider.plugins().len(), 2);
+    provider
+        .drive_query(&mut pipeline, "action", 17)
+        .expect("both duplicate-id plugins must publish their current snapshots");
+
+    let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+    let mut router = PluginActionRouter::default();
+    router
+        .register(driver.plugins(), driver.action_executor())
+        .expect("the router registers each modern owner exactly once");
+    let error = router
+        .submit_by_item_id(&ItemId("action-1".to_owned()), &ActionId("open".to_owned()), None)
+        .expect_err("a stable id shared by two owners must not be routed arbitrarily");
+    assert!(
+        error.to_string().contains("ambiguous ownership"),
+        "duplicate stable ids must be rejected explicitly: {error}"
+    );
     drop(driver);
 }

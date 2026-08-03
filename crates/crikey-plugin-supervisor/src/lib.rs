@@ -3,8 +3,9 @@
 mod concurrency;
 
 pub use concurrency::{
-    BudgetGuard, BudgetKind, ConcurrencyBudget, OwnedBudgetGuard, DEFAULT_ACTION_BUDGET,
-    DEFAULT_BACKGROUND_BUDGET, DEFAULT_CATALOG_BUDGET, DEFAULT_SUGGESTION_BUDGET,
+    shared_budget_from_section, BudgetGuard, BudgetKind, ConcurrencyBudget, OwnedBudgetGuard,
+    PluginBudgetHandle, DEFAULT_ACTION_BUDGET, DEFAULT_BACKGROUND_BUDGET, DEFAULT_CATALOG_BUDGET,
+    DEFAULT_SUGGESTION_BUDGET,
 };
 
 use std::{collections::HashMap, fmt, time::Duration};
@@ -246,6 +247,15 @@ impl MemorySupervisor {
 
         self.plugins.insert(plugin.clone(), PluginRecord::default());
         Ok(())
+    }
+
+    /// Removes a registration during provider startup rollback.
+    ///
+    /// No failure or cancellation is recorded: the plugin never became a
+    /// live runtime, so retaining a diagnostic record would make a later
+    /// registration inherit stale health.
+    pub fn unregister(&mut self, plugin: &PluginId) -> bool {
+        self.plugins.remove(plugin).is_some()
     }
 
     pub fn mark_ready(&mut self, plugin: &PluginId) -> Result<()> {

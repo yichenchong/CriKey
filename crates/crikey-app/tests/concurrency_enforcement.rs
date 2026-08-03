@@ -9,13 +9,11 @@
 //!
 //! # What is enforced today
 //!
-//! Suggestion requests are the only kind with a live dispatch site in this
-//! workspace: `QueryPipeline::tick` mints them and all three providers consume
-//! them. There is no plugin-owned action dispatch (`SearchService::execute`
-//! refuses non-host-mediated actions outright), no background-task scheduler
-//! and no modern/native catalog-build call, so the action, background and
-//! catalog budgets are resolved and observable but have nothing to gate yet.
-//! Each of these tests is about the kind that does exist.
+//! Suggestion requests are exercised below at the live `QueryPipeline::tick`
+//! seam. Action, background and catalog dispatches use the same shared handle
+//! at their provider/runtime seams; their focused lifecycle tests live beside
+//! those providers. Each test here stays focused on suggestion admission and
+//! retirement.
 //!
 //! # Why the refusal must be observable
 //!
@@ -23,6 +21,8 @@
 //! from "broken". Every test below asserts the refusal reached
 //! `QueryPipeline::health(...).concurrency_refusals`, not merely that the
 //! request vanished.
+
+use std::sync::Arc;
 
 use crikey_app::{PipelineConfig, QueryPipeline};
 use crikey_core::PluginId;
@@ -114,6 +114,70 @@ fn dispatched(pipeline: &mut QueryPipeline, now: Millis) -> Vec<PluginId> {
 
 fn refusals(pipeline: &QueryPipeline, plugin: &PluginId) -> u64 {
     pipeline.health(plugin).concurrency_refusals
+}
+
+/// The provider and pipeline must observe one occupancy counter rather than
+/// independently admitting the same plugin. Holding a provider clone before
+/// `tick` forces the query path to refuse and records that refusal.
+#[test]
+fn provider_and_pipeline_budget_clones_share_suggestion_admission() {
+    let manifest = Manifest::parse(CAPPED_MANIFEST).expect("fixture manifest parses");
+    let plugin = PluginId(manifest.plugin.id.clone());
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider_handle = pipeline
+        .register_namespaced_manifest(plugin.clone(), &manifest)
+        .expect("fixture plugin registers once");
+    let pipeline_handle = pipeline
+        .plugin_budget(&plugin)
+        .expect("registered plugin has a budget")
+        .clone();
+
+    assert!(Arc::ptr_eq(&provider_handle, &pipeline_handle));
+    let held = provider_handle
+        .try_acquire_owned(BudgetKind::Suggestion)
+        .expect("the provider clone admits the first unit");
+    assert_eq!(
+        pipeline_handle.in_flight(BudgetKind::Suggestion),
+        1,
+        "the pipeline clone must observe provider occupancy"
+    );
+
+    pipeline.keystroke("a", 0);
+    assert!(
+        dispatched(&mut pipeline, 0).is_empty(),
+        "the occupied shared slot must refuse the suggestion"
+    );
+    assert_eq!(refusals(&pipeline, &plugin), 1);
+    drop(held);
+    assert_eq!(pipeline_handle.in_flight(BudgetKind::Suggestion), 0);
+}
+
+/// A failed runtime start must remove the query registration entirely, so a
+/// later load of the same plugin id does not inherit stale scheduler or health
+/// state.
+#[test]
+fn unregister_plugin_drops_registration_and_allows_clean_reload() {
+    let manifest = Manifest::parse(CAPPED_MANIFEST).expect("fixture manifest parses");
+    let plugin = PluginId(manifest.plugin.id.clone());
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let handle = pipeline
+        .register_namespaced_manifest(plugin.clone(), &manifest)
+        .expect("fixture plugin registers once");
+    let held = handle
+        .try_acquire_owned(BudgetKind::Suggestion)
+        .expect("the provider clone admits a unit");
+
+    assert!(pipeline.unregister_plugin(&plugin));
+    assert!(pipeline.plugin_budget(&plugin).is_none());
+    assert!(pipeline.plugin_diagnostics(&plugin).is_none());
+    assert_eq!(pipeline.diagnostics().in_flight_requests, 0);
+    drop(held);
+
+    let replacement = pipeline
+        .register_namespaced_manifest(plugin.clone(), &manifest)
+        .expect("the removed plugin can be registered cleanly");
+    assert!(!Arc::ptr_eq(&handle, &replacement));
+    assert_eq!(pipeline.health(&plugin).concurrency_refusals, 0);
 }
 
 /// The blocking finding: a declared limit must bind live dispatch.

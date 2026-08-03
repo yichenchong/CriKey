@@ -319,6 +319,26 @@ impl InboundResultQueue {
         self.plugins.insert(plugin, PluginQueue::new(policy));
     }
 
+    /// Removes a producer and drops any resident batches it owned. Provider
+    /// registration uses this as a rollback when a worker fails to start after
+    /// its pipeline policy was installed.
+    pub fn unregister(&mut self, plugin: &PluginId) -> bool {
+        let Some(queue) = self.plugins.remove(plugin) else {
+            return false;
+        };
+
+        self.total_batches = self.total_batches.saturating_sub(queue.entries.len());
+        self.total_items = self.total_items.saturating_sub(queue.items);
+        self.order.retain(|registered| registered != plugin);
+        self.drain_cursor = if self.order.is_empty() {
+            0
+        } else {
+            self.drain_cursor.min(self.order.len() - 1)
+        };
+        self.events.retain(|event| &event.plugin != plugin);
+        true
+    }
+
     /// Selects the sole generation admissible at the boundary. Resident work
     /// is deliberately left in place for lazy reclamation.
     pub fn begin_generation(&mut self, generation: Generation) {

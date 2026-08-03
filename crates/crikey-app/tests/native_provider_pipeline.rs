@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use crikey_app::{NativeDriver, NativeProvider, PipelineConfig, QueryPipeline};
-use crikey_core::{Generation, PluginId};
+use crikey_app::{NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, QueryPipeline};
+use crikey_core::{ActionId, Generation, ItemId, PluginId};
 use crikey_ui::ViewModel;
 
 /// Collection window for tests whose subject is that a worker's rows reach the
@@ -356,6 +356,37 @@ fn native_distinct_source_dirs_use_their_own_workers() {
     );
 
     provider.shutdown(180);
+}
+
+#[test]
+fn native_router_rejects_duplicate_stable_ids_across_plugin_owners() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("duplicate-action-id");
+    let plugins_root = scratch.subdir("plugins");
+    write_native_plugin(&plugins_root, "alpha", &conformance, "same-id");
+    write_native_plugin(&plugins_root, "beta", &conformance, "same-id");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider =
+        NativeProvider::load_with_collection_window(&mut pipeline, &[plugins_root], ROW_DELIVERY_WINDOW);
+    assert_eq!(provider.plugins().len(), 2);
+    provider
+        .drive_query(&mut pipeline, "duplicate", 17)
+        .expect("both duplicate-id plugins must publish their current snapshots");
+
+    let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| {}));
+    let mut router = PluginActionRouter::default();
+    router
+        .register(driver.plugins(), driver.action_executor())
+        .expect("the router registers each native owner exactly once");
+    let error = router
+        .submit_by_item_id(&ItemId("echo-1".to_owned()), &ActionId("open".to_owned()), None)
+        .expect_err("a stable id shared by two owners must not be routed arbitrarily");
+    assert!(
+        error.to_string().contains("ambiguous ownership"),
+        "duplicate stable ids must be rejected explicitly: {error}"
+    );
+    drop(driver);
 }
 
 #[test]

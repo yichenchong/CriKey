@@ -46,6 +46,8 @@ use crikey_core::{
     Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, PluginId,
 };
 use crikey_package_manager::ImportPath;
+use crikey_plugin_model::ConcurrencySection;
+use crikey_plugin_supervisor::{shared_budget_from_section, BudgetKind};
 use crikey_python_host::{
     discover_interpreter, sdk_root, BatchState, CancelHandle, ExecuteOutcome, HostError, Interpreter,
     ModernWorker, PluginError, RequiresPython, RuntimeProfile, SuggestRequest, Suggestions, WorkerExit,
@@ -339,6 +341,28 @@ class Fixture(Plugin):
                 pass
             return
         context.emit(Item(stable_id="after-cancel", label="after", target="after"))
+"#;
+/// Registers three independent coroutines from one synchronous suggestion.
+/// The host budget admits one and refuses two; the admitted task sleeps long
+/// enough that a second suggestion proves it does not hold the foreground call.
+const BACKGROUND_TASKS: &str = r#"
+import asyncio
+
+from crikey_sdk.plugin import Item, Plugin
+
+
+class Fixture(Plugin):
+    def suggest(self, query, context):
+        async def background(index):
+            with open(query.text + ".start-" + str(index), "w") as handle:
+                handle.write("started")
+            await asyncio.sleep(30)
+            with open(query.text + ".done-" + str(index), "w") as handle:
+                handle.write("done")
+
+        for index in range(3):
+            context.spawn(background(index))
+        context.emit(Item(stable_id="foreground", label="foreground", target="foreground"))
 "#;
 
 /// Streams partial suggestion batches without end and never returns a terminal
@@ -746,6 +770,65 @@ fn a_cancel_handle_raised_from_another_thread_makes_a_cooperative_plugin_return_
         "the reused worker ran ITS OWN code on the follow-up"
     );
 
+    worker.shutdown();
+}
+// ---------------------------------------------------------------------------
+// Host-managed background dispatch (spec 13.5, 15.8)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn background_registration_is_budgeted_and_cancellation_releases_the_guard() {
+    let scratch = Scratch::new("background");
+    let dir = write_plugin(&scratch, "background", BACKGROUND_TASKS);
+    let section = ConcurrencySection {
+        max_background_tasks: Some(1),
+        ..ConcurrencySection::default()
+    };
+    let budget = shared_budget_from_section(&section);
+    let mut worker = ModernWorker::spawn(
+        &host_interpreter(),
+        options("modern.background", &dir).with_shared_budget(budget.clone()),
+    )
+    .expect("a loadable plugin spawns with a shared background budget");
+
+    let first = worker
+        .suggest(&suggest_request(&scratch.join("work").to_string_lossy()))
+        .expect("foreground suggestion is not held by a slow background task");
+    assert_eq!(first.state, BatchState::Final);
+    assert_eq!(
+        first.items.first().map(|item| item.stable_id.0.as_str()),
+        Some("foreground")
+    );
+
+    assert!(
+        wait_until(RESPONSE_LIMIT, || {
+            worker.background_diagnostics().registered >= 3
+        }),
+        "the host observes every child registration"
+    );
+    let diagnostics = worker.background_diagnostics();
+    assert_eq!(diagnostics.admitted, 1, "one task owns the declared slot");
+    assert_eq!(diagnostics.refused, 2, "over-limit tasks are visibly refused");
+    assert_eq!(
+        budget.in_flight(BudgetKind::Background),
+        1,
+        "the admitted task holds the shared Arc-owned guard"
+    );
+
+    // A second foreground call completes while the admitted task sleeps. This
+    // would block for the task duration if callback-end draining were retained.
+    let second = worker
+        .suggest(&suggest_request("second"))
+        .expect("a slow background task does not delay suggestion delivery");
+    assert_eq!(second.state, BatchState::Final);
+
+    worker.cancel_background_tasks();
+    assert!(
+        wait_until(RESPONSE_LIMIT, || {
+            budget.in_flight(BudgetKind::Background) == 0
+        }),
+        "cancellation releases every host guard"
+    );
     worker.shutdown();
 }
 

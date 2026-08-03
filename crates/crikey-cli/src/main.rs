@@ -8,9 +8,9 @@ mod native_commands;
 mod package_commands;
 
 use crikey_app::{
-    admitted_plugin_roots, App, BatchState, LegacyDriver, LegacyProvider, ModernDriver, ModernProvider,
-    NativeDriver, NativeProvider, PipelineConfig, QueryPipeline, ResultBatch, SearchService, StartupJournal,
-    StartupMode, StartupStage,
+    admitted_plugin_roots, ActionSubmission, App, BatchState, LegacyDriver, LegacyProvider, ModernDriver,
+    ModernProvider, NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, QueryPipeline,
+    ResultBatch, SearchService, StartupJournal, StartupMode, StartupStage,
 };
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
@@ -26,6 +26,7 @@ use crikey_ui::{
 use std::cell::RefCell;
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 const USAGE: &str = "\
@@ -248,12 +249,17 @@ fn run_native_launcher() -> Result<(), String> {
     // the process (contract §8), so no load failure here is fatal to the launch.
     let mut modern_pipeline = QueryPipeline::new(PipelineConfig::default());
     let cache_root = modern_cache_root()?;
-    let modern_provider = ModernProvider::load(
+    let mut modern_provider = ModernProvider::load(
         &mut modern_pipeline,
         &admitted_plugin_roots(&startup_mode, &modern_plugin_roots()),
         modern_index_root(),
         cache_root,
     );
+    for plugin in modern_provider.plugins().to_vec() {
+        if let Err(error) = modern_provider.request_catalog_build(&plugin, 1, crikey_core::Generation::ZERO) {
+            eprintln!("crikey: modern catalog request refused for {}: {error}", plugin.0);
+        }
+    }
     for entry in modern_provider.unavailable() {
         eprintln!(
             "crikey: modern plugin unavailable ({}): {}",
@@ -274,10 +280,15 @@ fn run_native_launcher() -> Result<(), String> {
     // and modern providers. Discovery is intentionally empty unless the
     // operator names native package roots (spec 16.1, 16.6).
     let mut native_pipeline = QueryPipeline::new(PipelineConfig::default());
-    let native_provider = NativeProvider::load(
+    let mut native_provider = NativeProvider::load(
         &mut native_pipeline,
         &admitted_plugin_roots(&startup_mode, &native_plugin_roots()),
     );
+    for plugin in native_provider.plugins().to_vec() {
+        if let Err(error) = native_provider.request_catalog_build(&plugin, 1, crikey_core::Generation::ZERO) {
+            eprintln!("crikey: native catalog request refused for {}: {error}", plugin.0);
+        }
+    }
     for entry in native_provider.unavailable() {
         eprintln!(
             "crikey: native plugin unavailable ({}): {}",
@@ -294,6 +305,18 @@ fn run_native_launcher() -> Result<(), String> {
             let _ = native_publish_handle.submit_frame(frame);
         }),
     );
+    // Plugin-owned actions use the same exact-owner endpoints and budget
+    // handles retained by the provider drivers. Registering this router before
+    // the event loop makes `crikey run` execute selected modern/native actions
+    // instead of falling through to host launch handling.
+    let mut action_router = PluginActionRouter::default();
+    action_router
+        .register(modern_driver.plugins(), modern_driver.action_executor())
+        .map_err(|error| format!("cannot register modern action runtime: {error}"))?;
+    action_router
+        .register(native_driver.plugins(), native_driver.action_executor())
+        .map_err(|error| format!("cannot register native action runtime: {error}"))?;
+    search.set_plugin_action_router(Arc::new(action_router));
     let query_clock = Instant::now();
 
     let activation_handle = render_handle.clone();
@@ -309,6 +332,20 @@ fn run_native_launcher() -> Result<(), String> {
     let outcome = launcher
         .run(ready_on_first_event(Rc::clone(&ledger), move |event| {
             // Fold any legacy rows the supervisor produced since the last turn
+            for completion in search.poll_action_completions() {
+                let message = match completion.outcome {
+                    Ok(()) => format!(
+                        "Action completed: {} / {}",
+                        completion.plugin.0, completion.action_id.0
+                    ),
+                    Err(error) => format!(
+                        "Action failed ({} / {}): {error}",
+                        completion.plugin.0, completion.action_id.0
+                    ),
+                };
+                eprintln!("crikey: {message}");
+                view_model.set_selected_status(message);
+            }
             // into the retained view model, so a later navigation keystroke
             // keeps them. `publish` refuses a superseded or retired generation,
             // so a late answer can never land under a newer one.
@@ -344,6 +381,35 @@ fn run_native_launcher() -> Result<(), String> {
                     outcome.pending_plugins,
                 );
                 view_model.publish(outcome.generation, retained.merged(), retained.pending());
+            }
+            // Catalog outcomes use the same SearchService instance/owner
+            // publication edge as persisted slices. Obsolete and failed
+            // results are observable but can never replace live state.
+            for result in modern_driver.take_catalog_results() {
+                match result {
+                    crikey_app::CatalogBuildResult::Complete(build) => {
+                        if let Err(error) = build.publish(&mut search) {
+                            eprintln!("crikey: modern catalog publication refused: {error}");
+                        }
+                    }
+                    crikey_app::CatalogBuildResult::Failed { reason, .. } => {
+                        eprintln!("crikey: modern catalog build failed: {reason}");
+                    }
+                    crikey_app::CatalogBuildResult::Obsolete(_) => {}
+                }
+            }
+            for result in native_driver.take_catalog_results() {
+                match result {
+                    crikey_app::CatalogBuildResult::Complete(build) => {
+                        if let Err(error) = build.publish(&mut search) {
+                            eprintln!("crikey: native catalog publication refused: {error}");
+                        }
+                    }
+                    crikey_app::CatalogBuildResult::Failed { reason, .. } => {
+                        eprintln!("crikey: native catalog build failed: {reason}");
+                    }
+                    crikey_app::CatalogBuildResult::Obsolete(_) => {}
+                }
             }
 
             let (command_session, effect) = match event {
@@ -445,7 +511,7 @@ fn run_native_launcher() -> Result<(), String> {
                     }
                 }
                 Some(UiEffect::Execute { item, action }) => match search.execute(&item, &action) {
-                    Ok(()) => {
+                    Ok(ActionSubmission::Completed) => {
                         view_model.dismiss();
                         if let Some(session) = command_session {
                             let _ = render_handle.request_hide_session(session);
@@ -453,6 +519,14 @@ fn run_native_launcher() -> Result<(), String> {
                         if !has_activation_source {
                             let _ = render_handle.request_exit();
                         }
+                    }
+                    Ok(ActionSubmission::Pending(request_id)) => {
+                        let message = format!(
+                            "Action pending ({} / request {})",
+                            request_id.plugin.0, request_id.sequence
+                        );
+                        view_model.set_selected_status(message.clone());
+                        eprintln!("crikey: {message}");
                     }
                     Err(error) => {
                         let message = format!("Launch failed: {error}");

@@ -24,9 +24,9 @@ pub use protocol::{
     MAX_FRAME_BYTES, MAX_LOG_LINES, MAX_LOG_LINE_BYTES, MAX_STDERR_TAIL_BYTES, PROTOCOL_VERSION,
 };
 pub use worker::{
-    BatchState, CancelHandle, ExecuteOutcome, HostError, ModernWorker, PluginError, SuggestRequest,
-    Suggestions, WorkerExit, WorkerOptions, ENV_ENTRYPOINT, ENV_PLUGIN_ID, ENV_PROTOCOL_VERSION, ENV_SDK_DIR,
-    WORKER_ENTRY_FILE, WORKER_ISOLATION_FLAG,
+    BackgroundDiagnostics, BatchState, CancelHandle, ExecuteOutcome, HostError, ModernWorker, PluginError,
+    SuggestRequest, Suggestions, WorkerExit, WorkerOptions, ENV_ENTRYPOINT, ENV_PLUGIN_ID,
+    ENV_PROTOCOL_VERSION, ENV_SDK_DIR, WORKER_ENTRY_FILE, WORKER_ISOLATION_FLAG,
 };
 
 /// Managed-environment types owned by `crikey-package-manager` (spec 15.3,

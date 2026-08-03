@@ -12,8 +12,8 @@ use crikey_input_scheduler::{
 };
 use crikey_plugin_model::{ConcurrencySection, Manifest};
 use crikey_plugin_supervisor::{
-    BudgetKind, CircuitBreakerConfig, ConcurrencyBudget, MemorySupervisor, OwnedBudgetGuard, PluginHealth,
-    Supervisor,
+    shared_budget_from_section, BudgetKind, CircuitBreakerConfig, MemorySupervisor, OwnedBudgetGuard,
+    PluginBudgetHandle, PluginHealth, Supervisor,
 };
 use crikey_result_aggregator::{
     BatchPriority, BatchState, DrainBudget, DrainReport, InboundBatch, InboundResultQueue, IntakePolicy,
@@ -110,7 +110,7 @@ pub struct QueryPipeline {
     /// One admission gate per registered plugin, resolved from its
     /// `[concurrency]` declaration (spec 13.5). Shared behind an `Arc` so a
     /// caller can hold the same gate a dispatch site consults.
-    budgets: HashMap<PluginId, Arc<ConcurrencyBudget>>,
+    budgets: HashMap<PluginId, PluginBudgetHandle>,
     /// Slots held by dispatched-but-unretired work, released in
     /// [`Self::finish_completion`] — the pipeline's single retirement edge.
     admitted: HashMap<(PluginId, Generation), OwnedBudgetGuard>,
@@ -188,14 +188,10 @@ impl QueryPipeline {
     /// Registers a plugin together with the `[concurrency]` declaration that
     /// bounds its simultaneous work (spec 13.5).
     ///
-    /// The suggestion budget has two authors. `[query] max-concurrent-requests`
-    /// already bounds simultaneous suggestion dispatch in the scheduler, and
-    /// `[concurrency] max-suggestion-requests` bounds it here. Neither may be
-    /// exceeded, so the effective limit is the smaller of the two; a manifest
-    /// that mentions only `[query]` keeps exactly the limit it asked for
-    /// instead of being silently narrowed to the host default. The other three
-    /// kinds have no second author and resolve through
-    /// [`ConcurrencyBudget::from_section`] alone.
+    /// This convenience path resolves and owns a budget for callers that do
+    /// not have a provider runtime owner. Production providers use
+    /// [`Self::register_namespaced_manifest`], which returns the exact handle
+    /// retained by the pipeline so the runtime can clone it.
     pub fn register_plugin_with_concurrency(
         &mut self,
         plugin: PluginId,
@@ -206,13 +202,25 @@ impl QueryPipeline {
         if self.health_sync.contains_key(&plugin) {
             return Err(PipelineError::AlreadyRegistered { plugin });
         }
+        let budget = resolved_budget_for_policy(&policy, concurrency);
+        self.register_plugin_with_budget(plugin, policy, intake_policy, budget)
+    }
 
-        let scheduler_limit = u32::try_from(policy.max_concurrent_requests).unwrap_or(u32::MAX);
-        let mut resolved = concurrency.clone();
-        resolved.max_suggestion_requests = Some(match resolved.max_suggestion_requests {
-            Some(declared) => declared.min(scheduler_limit),
-            None => scheduler_limit,
-        });
+    /// Registers a plugin against an already-resolved shared budget handle.
+    ///
+    /// The handle is the ownership boundary for all four §13.5 kinds. The
+    /// pipeline stores this exact `Arc`; dispatch owners must clone the handle
+    /// rather than resolve another budget from the manifest.
+    pub fn register_plugin_with_budget(
+        &mut self,
+        plugin: PluginId,
+        policy: PluginPolicy,
+        intake_policy: IntakePolicy,
+        budget: PluginBudgetHandle,
+    ) -> Result<(), PipelineError> {
+        if self.health_sync.contains_key(&plugin) {
+            return Err(PipelineError::AlreadyRegistered { plugin });
+        }
 
         self.supervisor
             .register(&plugin)
@@ -220,12 +228,20 @@ impl QueryPipeline {
         self.scheduler.register_plugin(plugin.clone(), policy);
         self.intake.register(plugin.clone(), intake_policy);
         self.health_sync.insert(plugin.clone(), HealthSync::default());
-        self.budgets.insert(
-            plugin.clone(),
-            Arc::new(ConcurrencyBudget::from_section(&resolved)),
-        );
+        self.budgets.insert(plugin.clone(), budget);
         self.registered.push(plugin);
         Ok(())
+    }
+
+    /// Registers against the pipeline's default bounded intake policy while
+    /// preserving an explicit provider-owned budget handle.
+    pub fn register_plugin_with_budget_default_intake(
+        &mut self,
+        plugin: PluginId,
+        policy: PluginPolicy,
+        budget: PluginBudgetHandle,
+    ) -> Result<(), PipelineError> {
+        self.register_plugin_with_budget(plugin, policy, self.default_intake_policy, budget)
     }
 
     pub fn register_manifest(&mut self, manifest: &Manifest) -> Result<PluginId, PipelineError> {
@@ -234,23 +250,90 @@ impl QueryPipeline {
         Ok(plugin)
     }
 
+    /// Registers a manifest against a provider-created shared budget.
+    pub fn register_manifest_with_budget(
+        &mut self,
+        manifest: &Manifest,
+        budget: PluginBudgetHandle,
+    ) -> Result<PluginId, PipelineError> {
+        let plugin = PluginId(manifest.plugin.id.clone());
+        self.register_namespaced_manifest_with_budget(plugin.clone(), manifest, budget)?;
+        Ok(plugin)
+    }
+
     /// [`Self::register_manifest`] for a provider that namespaces the plugin
     /// id it exposes (`native.*`, `modern.*`). The scheduling policy and the
     /// concurrency budget still come from the manifest, so a namespacing
-    /// provider cannot accidentally drop the author's `[concurrency]`
-    /// declaration on the floor.
+    /// provider cannot accidentally drop the author's declaration.
+    ///
+    /// The returned handle is the same `Arc` stored by this pipeline. A
+    /// provider retains it and passes clones to every non-query dispatch seam.
     pub fn register_namespaced_manifest(
         &mut self,
         plugin: PluginId,
         manifest: &Manifest,
+    ) -> Result<PluginBudgetHandle, PipelineError> {
+        if self.health_sync.contains_key(&plugin) {
+            return Err(PipelineError::AlreadyRegistered { plugin });
+        }
+        let policy = plugin_policy_from_manifest(manifest);
+        let budget = resolved_budget_for_policy(&policy, &manifest.concurrency);
+        self.register_plugin_with_budget(plugin, policy, self.default_intake_policy, budget.clone())?;
+        Ok(budget)
+    }
+
+    /// Registers a namespaced manifest against an already-created shared
+    /// budget. Use this when the provider creates the handle before starting
+    /// its worker; no budget is reconstructed here.
+    pub fn register_namespaced_manifest_with_budget(
+        &mut self,
+        plugin: PluginId,
+        manifest: &Manifest,
+        budget: PluginBudgetHandle,
     ) -> Result<(), PipelineError> {
         let policy = plugin_policy_from_manifest(manifest);
-        self.register_plugin_with_concurrency(
-            plugin,
-            policy,
-            self.default_intake_policy,
-            &manifest.concurrency,
-        )
+        self.register_plugin_with_budget(plugin, policy, self.default_intake_policy, budget)
+    }
+
+    /// Rolls back a plugin registration whose runtime failed to start.
+    ///
+    /// This is intentionally a hard removal, not a disable: no scheduler,
+    /// intake, supervisor or budget state survives to become a ghost
+    /// registration, and any admitted guards are dropped at this edge.
+    pub fn unregister_plugin(&mut self, plugin: &PluginId) -> bool {
+        if !self.health_sync.contains_key(plugin) {
+            return false;
+        }
+
+        let admitted = self
+            .admitted
+            .keys()
+            .filter(|(owner, _)| owner == plugin)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in admitted {
+            self.admitted.remove(&key);
+        }
+
+        self.active_requests.retain(|(owner, _)| owner != plugin);
+        self.unresolved_cancellations
+            .retain(|(owner, _), _| owner != plugin);
+        self.pending_completions.retain(|(owner, _), _| owner != plugin);
+        self.pending_cancellations
+            .retain(|cancellation| &cancellation.plugin != plugin);
+        self.pending_errors.retain(|error| match error {
+            PipelineError::AlreadyRegistered { plugin: owner }
+            | PipelineError::QueueRejected { plugin: owner, .. }
+            | PipelineError::AggregatorRejected { plugin: owner, .. } => owner != plugin,
+        });
+
+        self.scheduler.unregister_plugin(plugin);
+        self.intake.unregister(plugin);
+        self.supervisor.unregister(plugin);
+        self.health_sync.remove(plugin);
+        self.budgets.remove(plugin);
+        self.registered.retain(|registered| registered != plugin);
+        true
     }
 
     /// Mints and opens a generation. Worker dispatch remains exclusively a
@@ -482,7 +565,7 @@ impl QueryPipeline {
     /// Exposed so a dispatch site outside the pipeline can consult the same
     /// gate, and so operators can read per-kind `refusals` and live
     /// `in_flight` occupancy alongside [`Self::health`].
-    pub fn plugin_budget(&self, plugin: &PluginId) -> Option<&Arc<ConcurrencyBudget>> {
+    pub fn plugin_budget(&self, plugin: &PluginId) -> Option<&PluginBudgetHandle> {
         self.budgets.get(plugin)
     }
 
@@ -711,6 +794,16 @@ impl QueryPipeline {
             }
         }
     }
+}
+
+fn resolved_budget_for_policy(policy: &PluginPolicy, concurrency: &ConcurrencySection) -> PluginBudgetHandle {
+    let scheduler_limit = u32::try_from(policy.max_concurrent_requests).unwrap_or(u32::MAX);
+    let mut resolved = concurrency.clone();
+    resolved.max_suggestion_requests = Some(match resolved.max_suggestion_requests {
+        Some(declared) => declared.min(scheduler_limit),
+        None => scheduler_limit,
+    });
+    shared_budget_from_section(&resolved)
 }
 
 fn batch_completion(state: BatchState) -> BatchCompletion {

@@ -71,13 +71,24 @@ ENV_PLUGIN_ID = "CRIKEY_MODERN_PLUGIN_ID"
 ENV_ENTRYPOINT = "CRIKEY_MODERN_ENTRYPOINT"
 ENV_PROTOCOL_VERSION = "CRIKEY_MODERN_PROTOCOL_VERSION"
 
-#: Control frame: no ``id``, written from the host on a separate thread while a
-#: call may be in flight (mirrors legacy ``set_terminate``).
 _KIND_SET_CANCEL = "set_cancel"
+KIND_BACKGROUND_ADMIT = "background_admit"
+KIND_BACKGROUND_REFUSE = "background_refuse"
+KIND_BACKGROUND_CANCEL = "background_cancel"
 _KIND_SHUTDOWN = "shutdown"
+
+# Worker → host lifecycle events. These are additive frames under the
+# negotiated protocol version; their payload is bounded to one task id and a
+# short status/error string.
+KIND_BACKGROUND_REGISTER = "background_register"
+KIND_BACKGROUND_COMPLETE = "background_complete"
 
 #: Sentinel the reader thread queues on end of stdin.
 _EOF = object()
+
+#: Maximum number of requests retained while the main callback is occupied.
+#: The reader blocks at this bound instead of growing an unbounded queue.
+_PENDING_QUEUE_CAPACITY = 64
 
 
 # --------------------------------------------------------------------------
@@ -98,6 +109,7 @@ class _LogCapture:
 
     def __init__(self, mirror):
         self._mirror = mirror
+        self._lock = threading.RLock()
         self._lines = []
         self._partial = []
         self._partial_bytes = 0
@@ -105,8 +117,11 @@ class _LogCapture:
         self._dropped = 0
 
     # -- stream protocol ---------------------------------------------------
-
     def write(self, text):
+        with self._lock:
+            return self._write_unlocked(text)
+
+    def _write_unlocked(self, text):
         if not isinstance(text, str):
             text = str(text)
         try:
@@ -125,12 +140,12 @@ class _LogCapture:
             self._commit()
             start = newline + 1
         return len(text)
-
     def flush(self):
-        try:
-            self._mirror.flush()
-        except (OSError, ValueError):
-            pass
+        with self._lock:
+            try:
+                self._mirror.flush()
+            except (OSError, ValueError):
+                pass
 
     def writable(self):
         return True
@@ -203,11 +218,12 @@ class _LogCapture:
 
     def reset(self):
         """Starts a fresh per-request record, discarding anything pending."""
-        self._lines = []
-        self._partial = []
-        self._partial_bytes = 0
-        self._truncated = False
-        self._dropped = 0
+        with self._lock:
+            self._lines = []
+            self._partial = []
+            self._partial_bytes = 0
+            self._truncated = False
+            self._dropped = 0
 
     def take(self):
         """The lines written since :meth:`reset`, and starts a new record.
@@ -216,17 +232,18 @@ class _LogCapture:
         plugin's ``sys.stdout.write("no newline")`` is output it produced and
         wants to see, and holding it back would attribute it to a later request.
         """
-        if self._partial:
-            self._commit()
-        lines = self._lines
-        if self._dropped:
-            lines.append(
-                "[warn][crikey] {} further log line(s) dropped at the {} line "
-                "per-request cap".format(self._dropped, _MAX_LOG_LINES)
-            )
-        self._lines = []
-        self._dropped = 0
-        return lines
+        with self._lock:
+            if self._partial:
+                self._commit()
+            lines = self._lines
+            if self._dropped:
+                lines.append(
+                    "[warn][crikey] {} further log line(s) dropped at the {} line "
+                    "per-request cap".format(self._dropped, _MAX_LOG_LINES)
+                )
+            self._lines = []
+            self._dropped = 0
+            return lines
 
 
 #: The single capture, installed before the plugin module is imported.
@@ -322,6 +339,11 @@ def _item_from_wire(payload):
 # Frames
 # --------------------------------------------------------------------------
 
+# Background completion frames can be emitted from the host-managed asyncio
+# loop while a foreground callback is writing its result. Serialise writes so
+# one JSON line can never be interleaved with another.
+_EMIT_LOCK = threading.Lock()
+
 
 def _encode(frame):
     """One frame as its wire line.
@@ -353,8 +375,9 @@ def _emit(frame):
             "[err][crikey] a reply frame could not be serialised: {}".format(error)
         ]
         line = _encode(trimmed)
-    _PROTOCOL.write(line)
-    _PROTOCOL.flush()
+    with _EMIT_LOCK:
+        _PROTOCOL.write(line)
+        _PROTOCOL.flush()
 
 
 # --------------------------------------------------------------------------
@@ -391,26 +414,70 @@ def _load_plugin(entrypoint):
     return plugin_class()
 
 
+class _BackgroundTask:
+    __slots__ = (
+        "task_id",
+        "coro",
+        "decision",
+        "admission_event",
+        "future",
+        "cancel_requested",
+    )
+
+    def __init__(self, task_id, coro):
+        self.task_id = task_id
+        self.coro = coro
+        # ``None`` means the Rust host has not answered registration yet;
+        # ``True``/``False`` are the sole start/refuse decisions.
+        self.decision = None
+        self.admission_event = None
+        self.future = None
+        self.cancel_requested = False
+
+
 # --------------------------------------------------------------------------
 # The worker
 # --------------------------------------------------------------------------
 
 
 class _Worker:
-    """Owns the plugin, the asyncio loop and the cancellation flag."""
+    """Owns the plugin, foreground callback loop and background task loop."""
 
     def __init__(self, plugin):
         self._plugin = plugin
         # The cancel flag is set/cleared ONLY by the control-reader thread on a
-        # `set_cancel` frame and read LIVE by SuggestContext.cancelled. It is
-        # never cleared implicitly at request-start: a cancel that arrives just
-        # before a callback begins must not be lost (host latches identically).
+        # `set_cancel` frame and read LIVE by SuggestContext.cancelled.
         self._cancel = threading.Event()
-        # A per-worker asyncio loop (spec 15.8). Async callbacks are driven on it
-        # via ``run_until_complete``; it is not otherwise running between calls,
-        # so no task can progress once a callback and its cleanup have finished.
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+
+        # Background coroutines run on a continuously serviced loop in a
+        # separate thread. Foreground callback execution therefore never waits
+        # for a slow admitted task, while registration/admission remains on the
+        # same process boundary as the callback that requested it.
+        self._background_loop = asyncio.new_event_loop()
+        self._background_tasks = {}
+        self._background_running = set()
+        self._background_lock = threading.Lock()
+        self._next_background_id = 0
+        self._background_thread = threading.Thread(
+            target=self._run_background_loop,
+            name="crikey-modern-background",
+            daemon=True,
+        )
+        self._background_thread.start()
+
+    def _run_background_loop(self):
+        asyncio.set_event_loop(self._background_loop)
+        self._background_loop.run_forever()
+        pending = asyncio.all_tasks(self._background_loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            self._background_loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+        self._background_loop.close()
 
     # -- control ----------------------------------------------------------
 
@@ -419,6 +486,113 @@ class _Worker:
             self._cancel.set()
         else:
             self._cancel.clear()
+
+    def handle_background_control(self, frame):
+        kind = frame.get("kind")
+        if kind in (KIND_BACKGROUND_ADMIT, KIND_BACKGROUND_REFUSE):
+            task_id = frame.get("task_id")
+            if not isinstance(task_id, int) or isinstance(task_id, bool):
+                return
+            with self._background_lock:
+                task = self._background_tasks.get(task_id)
+                if task is None:
+                    return
+                task.decision = kind == KIND_BACKGROUND_ADMIT
+                event = task.admission_event
+            if event is not None:
+                self._background_loop.call_soon_threadsafe(event.set)
+            return
+
+        if kind != KIND_BACKGROUND_CANCEL:
+            return
+        task_id = frame.get("task_id")
+        with self._background_lock:
+            tasks = (
+                list(self._background_tasks.values())
+                if task_id is None
+                else [self._background_tasks.get(task_id)]
+            )
+            for task in tasks:
+                if task is not None:
+                    task.cancel_requested = True
+        for task in tasks:
+            if task is not None and task.future is not None:
+                task.future.cancel()
+
+    def _register_background(self, coro):
+        self._next_background_id += 1
+        task_id = self._next_background_id
+        task = _BackgroundTask(task_id, coro)
+        with self._background_lock:
+            self._background_tasks[task_id] = task
+        # Registration is emitted before scheduling the coroutine. The wrapper
+        # cannot pass its admission gate until the Rust host answers.
+        _emit({"kind": KIND_BACKGROUND_REGISTER, "task_id": task_id})
+        task.future = asyncio.run_coroutine_threadsafe(
+            self._run_background(task),
+            self._background_loop,
+        )
+        with self._background_lock:
+            if task.cancel_requested:
+                task.future.cancel()
+        return task.future
+
+    async def _run_background(self, task):
+        current = asyncio.current_task()
+        with self._background_lock:
+            self._background_running.add(current)
+        status = "ok"
+        error = None
+        try:
+            task.admission_event = asyncio.Event()
+            with self._background_lock:
+                admitted = task.decision
+            if admitted is None:
+                await task.admission_event.wait()
+                with self._background_lock:
+                    admitted = task.decision
+            if not admitted:
+                status = "refused"
+                task.coro.close()
+            else:
+                await task.coro
+        except asyncio.CancelledError:
+            status = "cancelled"
+        except BaseException as caught:  # noqa: BLE001 -- plugin task boundary
+            status = "failed"
+            error = {"message": str(caught), "traceback": traceback.format_exc()}
+        finally:
+            with self._background_lock:
+                known = set(self._background_running)
+            leftovers = [
+                pending
+                for pending in asyncio.all_tasks(self._background_loop)
+                if pending is not current and pending not in known and not pending.done()
+            ]
+            if leftovers:
+                for pending in leftovers:
+                    pending.cancel()
+                await asyncio.gather(*leftovers, return_exceptions=True)
+            with self._background_lock:
+                self._background_running.discard(current)
+                self._background_tasks.pop(task.task_id, None)
+            frame = {
+                "kind": KIND_BACKGROUND_COMPLETE,
+                "task_id": task.task_id,
+                "status": status,
+            }
+            if error is not None:
+                frame["error"] = error
+            _emit(frame)
+
+    def stop_background(self):
+        with self._background_lock:
+            tasks = list(self._background_tasks.values())
+        for task in tasks:
+            if task.future is not None:
+                task.future.cancel()
+        self._background_loop.call_soon_threadsafe(self._background_loop.stop)
+        self._background_thread.join(timeout=1.0)
 
     # -- dispatch ---------------------------------------------------------
 
@@ -444,7 +618,12 @@ class _Worker:
                 "id": frame.get("id"),
                 "kind": "handshake_ack",
                 "protocol_version": _PROTOCOL_VERSION,
-                "capabilities": ["suggest", "build_catalog", "execute"],
+                "capabilities": [
+                    "suggest",
+                    "build_catalog",
+                    "execute",
+                    "background-tasks",
+                ],
             }
         )
 
@@ -505,7 +684,13 @@ class _Worker:
                 self._emit_batch(request_id, "partial", buffer, [])
                 buffer.clear()
 
-        context = WorkerContext(self._cancel.is_set, sink, _CAPTURE.line, self._loop)
+        context = WorkerContext(
+            self._cancel.is_set,
+            sink,
+            _CAPTURE.line,
+            self._loop,
+            self._register_background,
+        )
 
         try:
             result = self._plugin.suggest(query, context)
@@ -543,13 +728,18 @@ class _Worker:
         from crikey_sdk import WorkerContext
 
         request_id = frame.get("id")
-        _CAPTURE.reset()
         buffer = []
 
         def sink(item):
             buffer.append(_item_to_wire(item))
 
-        context = WorkerContext(self._cancel.is_set, sink, _CAPTURE.line, self._loop)
+        context = WorkerContext(
+            self._cancel.is_set,
+            sink,
+            _CAPTURE.line,
+            self._loop,
+            self._register_background,
+        )
 
         try:
             produced = self._plugin.build_catalog()
@@ -604,7 +794,13 @@ class _Worker:
         item = _item_from_wire(frame.get("item") or {})
         action_id = frame.get("action_id")
         argument = frame.get("argument")
-        context = WorkerContext(self._cancel.is_set, lambda _item: None, _CAPTURE.line, self._loop)
+        context = WorkerContext(
+            self._cancel.is_set,
+            lambda _item: None,
+            _CAPTURE.line,
+            self._loop,
+            self._register_background,
+        )
 
         try:
             result = self._plugin.execute(item, action_id, argument)
@@ -672,6 +868,13 @@ def _read_stdin(stream, pending, worker):
         if frame.get("kind") == _KIND_SET_CANCEL:
             worker.set_cancel(bool(frame.get("cancelled", True)))
             continue
+        if frame.get("kind") in (
+            KIND_BACKGROUND_ADMIT,
+            KIND_BACKGROUND_REFUSE,
+            KIND_BACKGROUND_CANCEL,
+        ):
+            worker.handle_background_control(frame)
+            continue
 
         pending.put(frame)
 
@@ -702,10 +905,6 @@ def main():
         if hasattr(plugin, "start"):
             plugin.start()
     except BaseException as error:  # noqa: BLE001
-        # A plugin that cannot even load is a spawn-time failure: report it on
-        # the real stderr (the host's crash tail) and exit non-zero. No frame is
-        # written -- the handshake never happened, so there is no id to echo, and
-        # the host's spawn sees the child die before the ack and returns Err.
         _REAL_STDERR.write(
             "[err][crikey] failed to load modern plugin from entrypoint {!r}: {}\n{}".format(
                 entrypoint, error, traceback.format_exc()
@@ -715,7 +914,7 @@ def main():
         return 1
 
     worker = _Worker(plugin)
-    pending = queue.Queue()
+    pending = queue.Queue(maxsize=_PENDING_QUEUE_CAPACITY)
     reader = threading.Thread(
         target=_read_stdin,
         args=(sys.stdin, pending, worker),
@@ -727,10 +926,12 @@ def main():
     while True:
         frame = pending.get()
         if frame is _EOF:
+            worker.stop_background()
             return 0
         if frame.get("kind") == _KIND_SHUTDOWN:
             # No reply: the host drops stdin as it asks, and writing to a stdout
             # it has stopped reading risks a BrokenPipeError.
+            worker.stop_background()
             return 0
         worker.serve(frame)
 

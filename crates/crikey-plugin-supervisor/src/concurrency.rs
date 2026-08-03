@@ -54,6 +54,23 @@ pub const DEFAULT_BACKGROUND_BUDGET: u32 = 1;
 /// Effective catalog-task limit when the manifest declares none.
 pub const DEFAULT_CATALOG_BUDGET: u32 = 1;
 
+/// Shareable admission handle for one loaded plugin runtime.
+///
+/// A handle is created once while a manifest is registered and then cloned by
+/// every dispatch owner (query, action, background and catalog). Keeping the
+/// alias public makes that ownership edge explicit without exposing another
+/// budget implementation that could drift from [`ConcurrencyBudget`].
+pub type PluginBudgetHandle = Arc<ConcurrencyBudget>;
+
+/// Constructs the one shared budget handle resolved from a manifest section.
+///
+/// This is the preferred constructor for a registration owner. Tests that
+/// exercise the value type directly may continue to use
+/// [`ConcurrencyBudget::from_section`].
+pub fn shared_budget_from_section(section: &ConcurrencySection) -> PluginBudgetHandle {
+    Arc::new(ConcurrencyBudget::from_section(section))
+}
+
 /// Shared admission gate for one plugin's worker pool.
 ///
 /// Every method takes `&self` so the dispatch threads of a single plugin can

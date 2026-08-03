@@ -39,26 +39,33 @@
 //! is refused at the pipeline's intake boundary rather than shown out of order
 //! (acceptance 31.7).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use crikey_core::{Generation, Item, PluginId};
+use crikey_core::{ActionId, ArgumentPolicy, ExecutionPolicy, Generation, Item, ItemId, PluginId};
 use crikey_input_scheduler::Millis;
 use crikey_package_manager::{
     resolve, EnvironmentInputs, EnvironmentStore, ImportPath, PackageError, PackageIndex,
 };
 use crikey_plugin_model::{Manifest, Runtime};
+use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
 use crikey_python_host::{
-    discover_interpreter, sdk_root, BatchState as WorkerBatchState, ModernWorker, RequiresPython,
-    RuntimeProfile, SuggestRequest, WorkerOptions, WORKER_ENTRY_FILE,
+    discover_interpreter, sdk_root, BatchState as WorkerBatchState, ExecuteOutcome, Interpreter,
+    ModernWorker, RequiresPython, RuntimeProfile, SuggestRequest, WorkerOptions, WORKER_ENTRY_FILE,
 };
 use crikey_ui::{ResultRow, ViewModel};
 
-use crate::{BatchState, QueryPipeline, ResultBatch};
+use crate::{
+    ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError, ObsoleteCatalogBuild,
+    PluginActionCompletion, QueryPipeline, ResultBatch,
+};
 
 /// Bound on the startup handshake with a child interpreter, in milliseconds.
 /// A liveness guard: a worker that never answers becomes a recorded unavailable
@@ -104,12 +111,109 @@ pub struct ModernUnavailable {
     pub reason: String,
 }
 
-/// One loaded modern plugin: its host identity and the shared-worker key that
-/// dispatches its `suggest` calls.
+/// One loaded modern plugin: its host identity, query worker key and the
+/// immutable recipe used to start an independent catalog worker.
 #[derive(Debug, Clone)]
 struct LoadedPlugin {
     plugin: PluginId,
     key: WorkerKey,
+    interpreter: Interpreter,
+    worker_options: WorkerOptions,
+    budget: PluginBudgetHandle,
+}
+
+/// Maximum number of catalog tasks retained before the host drains results.
+///
+/// Admission counts active and completed-but-undrained tasks together, so the
+/// synchronous result channel cannot back up behind a hidden UI.
+const CATALOG_RESULT_CAPACITY: usize = 64;
+
+/// One catalog build running away from the query worker.
+#[derive(Debug)]
+struct ModernCatalogTask {
+    join: Option<JoinHandle<()>>,
+}
+
+/// Bounded catalog request/result mailbox.
+///
+/// Admission bounds the number of task threads and retained results. Each
+/// admitted task emits at most one result, so a synchronous channel of the
+/// same capacity never blocks a worker that is completing a legal task.
+#[derive(Debug)]
+struct ModernCatalogDispatcher {
+    result_tx: SyncSender<(u64, CatalogBuildResult)>,
+    result_rx: Receiver<(u64, CatalogBuildResult)>,
+    tasks: BTreeMap<u64, ModernCatalogTask>,
+    latest: BTreeMap<PluginId, u64>,
+    next_id: u64,
+}
+
+impl Default for ModernCatalogDispatcher {
+    fn default() -> Self {
+        let (result_tx, result_rx) = mpsc::sync_channel(CATALOG_RESULT_CAPACITY);
+        Self {
+            result_tx,
+            result_rx,
+            tasks: BTreeMap::new(),
+            latest: BTreeMap::new(),
+            next_id: 0,
+        }
+    }
+}
+
+impl ModernCatalogDispatcher {
+    fn next_id(&mut self) -> u64 {
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.next_id
+    }
+
+    fn insert(&mut self, id: u64, plugin: PluginId, join: JoinHandle<()>) {
+        self.latest.insert(plugin.clone(), id);
+        self.tasks.insert(id, ModernCatalogTask { join: Some(join) });
+    }
+
+    fn take(&mut self) -> Vec<CatalogBuildResult> {
+        let mut ready = Vec::new();
+        while let Ok((id, result)) = self.result_rx.try_recv() {
+            let Some(mut task) = self.tasks.remove(&id) else {
+                continue;
+            };
+            if let Some(join) = task.join.take() {
+                let _ = join.join();
+            }
+            // `latest` is the newest request ever issued for this plugin,
+            // not merely the newest still-running task. Keeping it after its
+            // completion ensures an older task that retires later remains
+            // explicitly obsolete.
+
+            let result = match result {
+                CatalogBuildResult::Complete(build)
+                    if self.latest.get(&build.plugin).is_some_and(|latest| *latest != id) =>
+                {
+                    CatalogBuildResult::Obsolete(ObsoleteCatalogBuild {
+                        plugin: build.plugin,
+                        instance: build.instance,
+                        generation: build.generation,
+                    })
+                }
+                other => other,
+            };
+            ready.push(result);
+        }
+        ready
+    }
+
+    fn shutdown(&mut self) -> Vec<CatalogBuildResult> {
+        for task in self.tasks.values_mut() {
+            if let Some(join) = task.join.take() {
+                let _ = join.join();
+            }
+        }
+        let results = self.take();
+        self.latest.clear();
+        self.tasks.clear();
+        results
+    }
 }
 
 /// Owns one child process per shared worker key and records every runtime
@@ -158,8 +262,12 @@ impl ModernWorkerPool {
 pub struct ModernProvider {
     pool: ModernWorkerPool,
     loaded: Vec<LoadedPlugin>,
+    catalog: ModernCatalogDispatcher,
     plugins: Vec<PluginId>,
     unavailable: Vec<ModernUnavailable>,
+    /// Current async suggestion snapshots keyed by the owning plugin and item
+    /// id. Stable item ids are only unique within an owner.
+    action_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
 }
 
 impl ModernProvider {
@@ -180,8 +288,10 @@ impl ModernProvider {
         let mut provider = Self {
             pool: ModernWorkerPool::default(),
             loaded: Vec::new(),
+            catalog: ModernCatalogDispatcher::default(),
             plugins: Vec::new(),
             unavailable: Vec::new(),
+            action_items: Arc::new(Mutex::new(BTreeMap::new())),
         };
 
         // The worker shim must be on disk before any child can speak the
@@ -381,48 +491,53 @@ impl ModernProvider {
             dir.to_string_lossy().into_owned(),
         );
 
+        let worker_options = WorkerOptions::new(plugin.clone(), entrypoint, import_path)
+            .with_startup_timeout_ms(STARTUP_BUDGET_MS)
+            .with_call_timeout_ms(CALL_BUDGET_MS)
+            .with_shutdown_timeout_ms(SHUTDOWN_BUDGET_MS);
+
+        // Register first so the pipeline creates the one shared per-plugin
+        // budget before any worker runtime is admitted. The exact handle is
+        // retained in `LoadedPlugin` and reused by every dispatch seam.
+        let budget = match pipeline.register_namespaced_manifest(plugin.clone(), &manifest) {
+            Ok(budget) => budget,
+            Err(error) => {
+                self.record_unavailable(
+                    package,
+                    Some(plugin),
+                    format!("the query pipeline refused the modern plugin: {error:?}"),
+                );
+                return;
+            }
+        };
+        let worker_options = worker_options.with_shared_budget(budget.clone());
+
         // Spawn a worker for this (environment, entrypoint) if none is live yet;
         // a truly identical plugin already loaded reuses it.
         if !self.pool.workers.contains_key(&key) {
-            let options = WorkerOptions::new(plugin.clone(), entrypoint, import_path)
-                .with_startup_timeout_ms(STARTUP_BUDGET_MS)
-                .with_call_timeout_ms(CALL_BUDGET_MS)
-                .with_shutdown_timeout_ms(SHUTDOWN_BUDGET_MS);
-            let worker = match ModernWorker::spawn(&interpreter, options) {
+            let worker = match ModernWorker::spawn(&interpreter, worker_options.clone()) {
                 Ok(worker) => worker,
                 Err(error) => {
                     self.record_unavailable(
                         package,
-                        Some(plugin),
+                        Some(plugin.clone()),
                         format!("the modern worker did not start: {error}"),
                     );
+                    let _ = pipeline.unregister_plugin(&plugin);
                     return;
                 }
             };
             self.pool.workers.insert(key.clone(), worker);
         }
 
-        // Register with the pipeline under the manifest-derived modern policy so
-        // host debouncing, gating and concurrency budgets are the pipeline's
-        // own, not a second path.
-        if let Err(error) = pipeline.register_namespaced_manifest(plugin.clone(), &manifest) {
-            self.record_unavailable(
-                package,
-                Some(plugin),
-                format!("the query pipeline refused the modern plugin: {error:?}"),
-            );
-            // Reap the worker rather than leak a child for a plugin the pipeline
-            // will never dispatch — unless another loaded plugin shares it.
-            if !self.loaded.iter().any(|loaded| loaded.key == key) {
-                if let Some(worker) = self.pool.workers.remove(&key) {
-                    let _ = worker.shutdown();
-                }
-            }
-            return;
-        }
-
         self.plugins.push(plugin.clone());
-        self.loaded.push(LoadedPlugin { plugin, key });
+        self.loaded.push(LoadedPlugin {
+            plugin,
+            key,
+            interpreter,
+            worker_options,
+            budget,
+        });
     }
 
     fn record_unavailable(&mut self, package: String, plugin: Option<PluginId>, reason: String) {
@@ -448,6 +563,221 @@ impl ModernProvider {
     /// Distinct from [`Self::unavailable`], which is load-time only.
     pub fn dispatch_failures(&self) -> &[(PluginId, String)] {
         &self.pool.failures
+    }
+
+    /// Starts one bounded catalog rebuild for an exactly owned plugin.
+    ///
+    /// The request is independent of the query worker: it starts a fresh
+    /// supervised interpreter from the immutable load recipe, so a slow
+    /// catalog cannot hold the worker that serves suggestions. Admission uses
+    /// the exact budget handle returned when the plugin was registered.
+    pub fn request_catalog_build(
+        &mut self,
+        plugin: &PluginId,
+        instance: u64,
+        generation: Generation,
+    ) -> Result<u64, CatalogDispatchError> {
+        let loaded = self
+            .loaded
+            .iter()
+            .find(|loaded| &loaded.plugin == plugin)
+            .ok_or_else(|| CatalogDispatchError::UnknownPlugin {
+                plugin: plugin.clone(),
+            })?;
+        let budget = Arc::clone(&loaded.budget);
+        let interpreter = loaded.interpreter.clone();
+        let worker_options = loaded.worker_options.clone();
+        if self.catalog.tasks.len() >= CATALOG_RESULT_CAPACITY {
+            return Err(CatalogDispatchError::QueueFull {
+                plugin: plugin.clone(),
+            });
+        }
+
+        let guard = budget.try_acquire_owned(BudgetKind::Catalog).ok_or_else(|| {
+            CatalogDispatchError::BudgetRefused {
+                plugin: plugin.clone(),
+            }
+        })?;
+        let request_id = self.catalog.next_id();
+        let sender = self.catalog.result_tx.clone();
+        let plugin_for_thread = plugin.clone();
+        let thread_plugin = plugin.clone();
+        let join = thread::Builder::new()
+            .name(format!("crikey-modern-catalog-{}", plugin.0))
+            .spawn(move || {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let mut worker = ModernWorker::spawn(&interpreter, worker_options)
+                        .map_err(|error| error.to_string())?;
+                    let result = worker.build_catalog().map_err(|error| error.to_string());
+                    let _ = worker.shutdown();
+                    result
+                }));
+                let completion = match result {
+                    Ok(Ok(mut items)) => {
+                        for item in &mut items {
+                            item.plugin_id = plugin_for_thread.clone();
+                        }
+                        CatalogBuildResult::Complete(crate::CatalogBuild {
+                            plugin: plugin_for_thread,
+                            instance,
+                            generation,
+                            items,
+                        })
+                    }
+                    Ok(Err(reason)) => CatalogBuildResult::Failed {
+                        plugin: thread_plugin.clone(),
+                        instance,
+                        generation,
+                        reason: format!("modern catalog build failed: {reason}"),
+                    },
+                    Err(_) => CatalogBuildResult::Failed {
+                        plugin: thread_plugin,
+                        instance,
+                        generation,
+                        reason: "modern catalog worker panicked".to_owned(),
+                    },
+                };
+                let _ = sender.send((request_id, completion));
+                drop(guard);
+            })
+            .map_err(|error| CatalogDispatchError::ThreadSpawn {
+                plugin: plugin.clone(),
+                reason: error.to_string(),
+            })?;
+        self.catalog.insert(request_id, plugin.clone(), join);
+        Ok(request_id)
+    }
+
+    /// Retires completed catalog tasks and returns their tagged outcomes.
+    ///
+    /// A completion from an older request for the same plugin is returned as
+    /// [`CatalogBuildResult::Obsolete`] and must not be published. Failed
+    /// workers are retained in the normal runtime diagnostics stream.
+    pub fn take_catalog_results(&mut self) -> Vec<CatalogBuildResult> {
+        let results = self.catalog.take();
+        for result in &results {
+            if let CatalogBuildResult::Failed { plugin, reason, .. } = result {
+                self.pool.record_dispatch_failure(plugin.clone(), reason.clone());
+            }
+        }
+        results
+    }
+
+    /// Clones the provider-owned action budget handles for the asynchronous
+    /// driver endpoint. Each clone points at the exact `Arc` retained in the
+    /// corresponding loaded plugin record and in the query pipeline.
+    fn action_budgets(&self) -> BTreeMap<PluginId, PluginBudgetHandle> {
+        self.loaded
+            .iter()
+            .map(|loaded| (loaded.plugin.clone(), Arc::clone(&loaded.budget)))
+            .collect()
+    }
+
+    /// Validates and executes one admitted plugin action on its owning worker.
+    ///
+    /// The request owns the action guard. Keeping it in this function until
+    /// the worker outcome is converted to `CoreResult` covers failures,
+    /// cancellation, timeout and panic/unwind paths.
+    fn execute_action_request(&mut self, request: ModernActionRequest) -> crikey_core::Result<()> {
+        let _guard = request.guard;
+        let plugin = request.plugin;
+        let loaded = self
+            .loaded
+            .iter()
+            .find(|loaded| loaded.plugin == plugin)
+            .ok_or_else(|| {
+                crikey_core::CoreError::Invalid(format!(
+                    "modern action owner `{}` is no longer loaded",
+                    plugin.0
+                ))
+            })?;
+        if request.item.plugin_id != plugin {
+            return Err(crikey_core::CoreError::Invalid(format!(
+                "modern action item `{}` is owned by `{}`, not `{}`",
+                request.item.stable_id.0, request.item.plugin_id.0, plugin.0
+            )));
+        }
+        let action = request
+            .item
+            .actions
+            .iter()
+            .find(|action| action.action_id == request.action_id)
+            .ok_or_else(|| {
+                crikey_core::CoreError::Invalid("selected action is no longer available".to_owned())
+            })?;
+        if action.execution_policy != ExecutionPolicy::Plugin {
+            return Err(crikey_core::CoreError::Invalid(
+                "modern action request is not plugin-owned".to_owned(),
+            ));
+        }
+        if !action.applicable_categories.is_empty()
+            && !action.applicable_categories.contains(&request.item.category)
+        {
+            return Err(crikey_core::CoreError::Invalid(
+                "modern action is not applicable to the selected item category".to_owned(),
+            ));
+        }
+        match request.item.argument_policy {
+            ArgumentPolicy::Forbidden if request.argument.is_some() => {
+                return Err(crikey_core::CoreError::Invalid(
+                    "modern action item forbids arguments".to_owned(),
+                ));
+            }
+            ArgumentPolicy::Required if request.argument.as_deref().is_none_or(str::is_empty) => {
+                return Err(crikey_core::CoreError::Invalid(
+                    "modern action item requires an argument".to_owned(),
+                ));
+            }
+            ArgumentPolicy::Optional | ArgumentPolicy::Forbidden | ArgumentPolicy::Required => {}
+        }
+
+        let key = loaded.key.clone();
+        let worker = self.pool.workers.get_mut(&key).ok_or_else(|| {
+            crikey_core::CoreError::Invalid(format!("modern worker for `{}` is unavailable", plugin.0))
+        })?;
+        if !worker.is_alive() {
+            self.pool
+                .record_dispatch_failure(plugin.clone(), "modern worker is no longer alive".to_owned());
+            return Err(crikey_core::CoreError::Invalid(format!(
+                "modern action worker for `{}` is unavailable",
+                plugin.0
+            )));
+        }
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            worker.execute(
+                &request.item,
+                Some(&request.action_id.0),
+                request.argument.as_deref(),
+            )
+        }));
+        match outcome {
+            Ok(Ok(ExecuteOutcome::Ok)) => Ok(()),
+            Ok(Ok(ExecuteOutcome::Failed(error))) => {
+                let reason = format!("modern plugin action failed: {}", error.message);
+                self.pool.record_dispatch_failure(plugin.clone(), reason.clone());
+                Err(crikey_core::CoreError::Invalid(format!(
+                    "modern plugin `{}` action failed: {reason}",
+                    plugin.0
+                )))
+            }
+            Ok(Err(error)) => {
+                let reason = error.to_string();
+                self.pool.record_dispatch_failure(plugin.clone(), reason.clone());
+                Err(crikey_core::CoreError::Invalid(format!(
+                    "modern plugin `{}` action failed: {reason}",
+                    plugin.0
+                )))
+            }
+            Err(_) => {
+                self.pool
+                    .record_dispatch_failure(plugin.clone(), "modern action worker panicked".to_owned());
+                Err(crikey_core::CoreError::Invalid(format!(
+                    "modern plugin `{}` action worker panicked",
+                    plugin.0
+                )))
+            }
+        }
     }
 
     /// Drives one query end to end and returns the pipeline frame it produced.
@@ -531,6 +861,11 @@ impl ModernProvider {
 
     /// Cooperative teardown of every modern worker (spec 24.3).
     pub fn shutdown(&mut self, _now: Millis) {
+        for result in self.catalog.shutdown() {
+            if let CatalogBuildResult::Failed { plugin, reason, .. } = result {
+                self.pool.record_dispatch_failure(plugin, reason);
+            }
+        }
         for (_, worker) in std::mem::take(&mut self.pool.workers) {
             // Best effort: the child is reaped on drop even if orderly shutdown
             // reports an error, so no worker is leaked.
@@ -549,7 +884,10 @@ impl ModernProvider {
             normalized: query.to_owned(),
             selected_item_id: None,
         };
-
+        self.action_items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         // Snapshot the loaded set so the pool can be mutated while iterating.
         let targets: Vec<(PluginId, WorkerKey)> = self
             .loaded
@@ -596,6 +934,10 @@ impl ModernProvider {
                     // reported.
                     for item in &mut items {
                         item.plugin_id = plugin.clone();
+                        self.action_items
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .insert((plugin.clone(), item.stable_id.clone()), item.clone());
                     }
                     by_plugin.insert(plugin, items);
                 }
@@ -638,6 +980,205 @@ struct ModernRequestSlot {
     stop: bool,
 }
 
+const ACTION_QUEUE_CAPACITY: usize = 8;
+const ACTION_COMPLETION_CAPACITY: usize = 64;
+const ACTION_IN_FLIGHT_CAPACITY: usize = 32;
+const ACTION_TIMEOUT_MS: u64 = CALL_BUDGET_MS;
+
+/// One admitted action handed to the modern provider supervisor.
+#[derive(Debug)]
+struct ModernActionRequest {
+    request_id: ActionRequestId,
+    plugin: PluginId,
+    item: Item,
+    action_id: ActionId,
+    argument: Option<String>,
+    guard: OwnedBudgetGuard,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+enum ModernWork {
+    Query(ModernJob),
+    Action(Box<ModernActionRequest>),
+}
+
+/// Bounded action endpoint retained by the live modern driver.
+#[derive(Debug)]
+struct ModernActionEndpoint {
+    sender: SyncSender<ModernActionRequest>,
+    completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
+    budgets: BTreeMap<PluginId, PluginBudgetHandle>,
+    items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    pending: Arc<Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>>,
+    in_flight: Arc<AtomicUsize>,
+    next_id: Arc<AtomicU64>,
+    mailbox: Arc<(Mutex<ModernRequestSlot>, Condvar)>,
+}
+
+impl crate::PluginActionExecutor for ModernActionEndpoint {
+    fn submit_plugin_action(
+        &self,
+        plugin: &PluginId,
+        item: &Item,
+        action_id: &ActionId,
+        argument: Option<&str>,
+    ) -> crikey_core::Result<ActionRequestId> {
+        let reserved = self
+            .in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < ACTION_IN_FLIGHT_CAPACITY).then_some(current + 1)
+            })
+            .is_ok();
+        if !reserved {
+            return Err(crikey_core::CoreError::Invalid(
+                "modern action mailbox is full".to_owned(),
+            ));
+        }
+        let budget = match self.budgets.get(plugin) {
+            Some(budget) => budget,
+            None => {
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                return Err(crikey_core::CoreError::Invalid(format!(
+                    "no modern action runtime owns plugin `{}`",
+                    plugin.0
+                )));
+            }
+        };
+        let guard = match budget.try_acquire_owned(BudgetKind::Action) {
+            Some(guard) => guard,
+            None => {
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                return Err(crikey_core::CoreError::Invalid(format!(
+                    "modern plugin `{}` action budget is full",
+                    plugin.0
+                )));
+            }
+        };
+        let sequence = self
+            .next_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.wrapping_add(1).max(1))
+            })
+            .unwrap_or(1);
+        let request_id = ActionRequestId {
+            plugin: plugin.clone(),
+            sequence,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(request_id.clone(), Arc::clone(&cancelled));
+        let request = ModernActionRequest {
+            request_id: request_id.clone(),
+            plugin: plugin.clone(),
+            item: item.clone(),
+            action_id: action_id.clone(),
+            argument: argument.map(str::to_owned),
+            guard,
+            deadline: Instant::now() + Duration::from_millis(ACTION_TIMEOUT_MS),
+            cancelled,
+        };
+        if let Err(error) = self.sender.try_send(request) {
+            self.pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&request_id);
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            return Err(match error {
+                mpsc::TrySendError::Full(_) => crikey_core::CoreError::Invalid(format!(
+                    "modern plugin `{}` action queue is full",
+                    plugin.0
+                )),
+                mpsc::TrySendError::Disconnected(_) => crikey_core::CoreError::Invalid(format!(
+                    "modern plugin `{}` action runtime stopped",
+                    plugin.0
+                )),
+            });
+        }
+        self.mailbox.1.notify_one();
+        Ok(request_id)
+    }
+
+    fn poll_plugin_actions(&self) -> Vec<PluginActionCompletion> {
+        let mut completions = Vec::new();
+        let mut mailbox = self.completions.lock().unwrap_or_else(|error| error.into_inner());
+        while completions.len() < ACTION_COMPLETION_CAPACITY {
+            let Some(completion) = mailbox.pop_front() else {
+                break;
+            };
+            self.pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&completion.request_id);
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            completions.push(completion);
+        }
+        completions
+    }
+
+    fn cancel_plugin_action(&self, request_id: &ActionRequestId) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(request_id)
+            .is_some_and(|cancelled| {
+                cancelled.store(true, Ordering::Release);
+                true
+            })
+    }
+
+    fn owns_item(&self, plugin: &PluginId, item_id: &ItemId) -> bool {
+        self.items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .any(|((owner, id), _)| owner == plugin && id == item_id)
+    }
+
+    fn submit_plugin_action_by_id(
+        &self,
+        plugin: &PluginId,
+        item_id: &ItemId,
+        action_id: &ActionId,
+        argument: Option<&str>,
+    ) -> crikey_core::Result<ActionRequestId> {
+        let item = self
+            .items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .find(|((owner, id), _)| owner == plugin && id == item_id)
+            .map(|(_, item)| item.clone())
+            .ok_or_else(|| {
+                crikey_core::CoreError::Invalid(
+                    "selected modern plugin result is no longer current".to_owned(),
+                )
+            })?;
+        if item.plugin_id != *plugin {
+            return Err(crikey_core::CoreError::Invalid(
+                "selected modern plugin result has stale ownership".to_owned(),
+            ));
+        }
+        self.submit_plugin_action(plugin, &item, action_id, argument)
+    }
+}
+fn enqueue_modern_completion(
+    mailbox: &Mutex<VecDeque<PluginActionCompletion>>,
+    completion: PluginActionCompletion,
+) {
+    let mut mailbox = mailbox.lock().unwrap_or_else(|error| error.into_inner());
+    if mailbox.len() >= ACTION_COMPLETION_CAPACITY {
+        eprintln!(
+            "crikey: modern action completion mailbox overflow for {} / {}",
+            completion.plugin.0, completion.action_id.0
+        );
+        return;
+    }
+    mailbox.push_back(completion);
+}
+
 /// Drives [`ModernProvider::drive_query`] on a dedicated supervisor thread so
 /// the user-interface thread never blocks on a child interpreter (spec 6.5;
 /// acceptance 31.1, 31.8).
@@ -661,6 +1202,8 @@ struct ModernRequestSlot {
 #[derive(Debug)]
 pub struct ModernDriver {
     mailbox: Arc<(Mutex<ModernRequestSlot>, Condvar)>,
+    action_endpoint: Arc<ModernActionEndpoint>,
+    catalog_results: Arc<Mutex<Vec<CatalogBuildResult>>>,
     outcome: Arc<Mutex<Option<ViewModel>>>,
     /// Search generation the UI last submitted. The supervisor re-reads it
     /// before publishing and drops any answer that is no longer current.
@@ -690,34 +1233,116 @@ impl ModernDriver {
             Condvar::new(),
         ));
         let outcome = Arc::new(Mutex::new(None));
+        let catalog_results = Arc::new(Mutex::new(Vec::new()));
+        let (action_sender, action_receiver) = mpsc::sync_channel(ACTION_QUEUE_CAPACITY);
+        let completion_mailbox = Arc::new(Mutex::new(VecDeque::with_capacity(ACTION_COMPLETION_CAPACITY)));
+        let action_endpoint = Arc::new(ModernActionEndpoint {
+            sender: action_sender,
+            completions: Arc::clone(&completion_mailbox),
+            budgets: provider.action_budgets(),
+            items: Arc::clone(&provider.action_items),
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            next_id: Arc::new(AtomicU64::new(0)),
+            mailbox: Arc::clone(&mailbox),
+        });
         let current = Arc::new(AtomicU64::new(0));
 
         let thread_mailbox = Arc::clone(&mailbox);
+        let thread_catalog_results = Arc::clone(&catalog_results);
         let thread_outcome = Arc::clone(&outcome);
         let thread_current = Arc::clone(&current);
+        let thread_completion_mailbox = Arc::clone(&completion_mailbox);
         let spawned = std::thread::Builder::new()
             .name("crikey-modern".to_owned())
             .spawn(move || {
                 let (lock, cvar) = &*thread_mailbox;
                 let mut last_now: Millis = 0;
                 loop {
-                    let job = {
+                    for result in provider.take_catalog_results() {
+                        thread_catalog_results
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .push(result);
+                    }
+                    let work = {
                         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
                         loop {
                             if slot.stop {
-                                // Cooperative teardown of every child before the
-                                // thread exits, so no worker is leaked (spec
-                                // 24.3); dropping `provider` reaps whatever an
-                                // orderly shutdown could not.
+                                while let Ok(request) = action_receiver.try_recv() {
+                                    let completion = PluginActionCompletion {
+                                        request_id: request.request_id.clone(),
+                                        plugin: request.plugin.clone(),
+                                        item_id: request.item.stable_id.clone(),
+                                        action_id: request.action_id.clone(),
+                                        outcome: Err(crikey_core::CoreError::Cancelled),
+                                    };
+                                    enqueue_modern_completion(&thread_completion_mailbox, completion);
+                                }
                                 drop(slot);
                                 provider.shutdown(last_now);
                                 return;
                             }
-                            if let Some(job) = slot.job.take() {
-                                break job;
+                            if let Ok(request) = action_receiver.try_recv() {
+                                break ModernWork::Action(Box::new(request));
                             }
-                            slot = cvar.wait(slot).unwrap_or_else(|error| error.into_inner());
+                            if let Some(job) = slot.job.take() {
+                                break ModernWork::Query(job);
+                            }
+                            slot = cvar
+                                .wait_timeout(slot, Duration::from_millis(10))
+                                .unwrap_or_else(|error| error.into_inner())
+                                .0;
                         }
+                    };
+
+                    let job = match work {
+                        ModernWork::Action(request) => {
+                            let request_id = request.request_id.clone();
+                            let plugin = request.plugin.clone();
+                            let item_id = request.item.stable_id.clone();
+                            let action_id = request.action_id.clone();
+                            let deadline = request.deadline;
+                            let cancelled = Arc::clone(&request.cancelled);
+                            let result = if cancelled.load(Ordering::Acquire) {
+                                Err(crikey_core::CoreError::Cancelled)
+                            } else if Instant::now() >= deadline {
+                                Err(crikey_core::CoreError::Invalid(format!(
+                                    "modern plugin `{}` action timed out before execution",
+                                    plugin.0
+                                )))
+                            } else {
+                                match catch_unwind(AssertUnwindSafe(|| {
+                                    provider.execute_action_request(*request)
+                                })) {
+                                    Ok(result) => result,
+                                    Err(_) => Err(crikey_core::CoreError::Invalid(format!(
+                                        "modern plugin `{}` action worker panicked",
+                                        plugin.0
+                                    ))),
+                                }
+                            };
+                            let result = if cancelled.load(Ordering::Acquire) {
+                                Err(crikey_core::CoreError::Cancelled)
+                            } else if Instant::now() >= deadline {
+                                Err(crikey_core::CoreError::Invalid(format!(
+                                    "modern plugin `{}` action timed out",
+                                    plugin.0
+                                )))
+                            } else {
+                                result
+                            };
+                            let completion = PluginActionCompletion {
+                                request_id,
+                                plugin,
+                                item_id,
+                                action_id,
+                                outcome: result,
+                            };
+                            enqueue_modern_completion(&thread_completion_mailbox, completion);
+                            continue;
+                        }
+                        ModernWork::Query(job) => job,
                     };
                     last_now = job.now;
 
@@ -765,6 +1390,8 @@ impl ModernDriver {
         match spawned {
             Ok(worker) => Self {
                 mailbox,
+                action_endpoint,
+                catalog_results,
                 outcome,
                 current,
                 has_plugins,
@@ -772,6 +1399,8 @@ impl ModernDriver {
             },
             Err(_) => Self {
                 mailbox,
+                action_endpoint,
+                catalog_results,
                 outcome,
                 current,
                 has_plugins: false,
@@ -827,6 +1456,29 @@ impl ModernDriver {
     /// Whether any modern plugin loaded and is being served by the supervisor.
     pub fn has_plugins(&self) -> bool {
         self.has_plugins
+    }
+
+    /// Takes bounded catalog outcomes collected by the provider supervisor.
+    /// Complete results remain instance/generation tagged for the caller's
+    /// stale-safe catalog publication path.
+    pub fn take_catalog_results(&self) -> Vec<CatalogBuildResult> {
+        std::mem::take(
+            &mut *self
+                .catalog_results
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+    }
+
+    /// Returns the exact plugin ids owned by this driver's action endpoint.
+    pub fn plugins(&self) -> Vec<PluginId> {
+        self.action_endpoint.budgets.keys().cloned().collect()
+    }
+
+    /// Returns the bounded action endpoint sharing this driver's per-plugin
+    /// budget handles.
+    pub fn action_executor(&self) -> Arc<dyn crate::PluginActionExecutor> {
+        self.action_endpoint.clone()
     }
 }
 

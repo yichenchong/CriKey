@@ -32,23 +32,26 @@
 //! ([`WorkerOptions`]). A plugin cannot make the host allocate without limit or
 //! wait forever, and an over-long line is a named protocol failure.
 
+use serde_json::{Map, Value};
+use std::collections::{hash_map::Entry, HashMap};
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use serde_json::{Map, Value};
-
 use crikey_core::{Item, PluginId};
 use crikey_package_manager::ImportPath;
+use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
 
 use crate::protocol::{
-    self, encode_build_catalog, encode_execute, encode_handshake, encode_set_cancel, encode_shutdown,
-    encode_suggest, floor_char_boundary, KIND_CATALOG_BATCH, KIND_EXECUTE_RESULT, KIND_HANDSHAKE_ACK,
-    KIND_RESULT_BATCH, MAX_FRAME_BYTES, MAX_STDERR_TAIL_BYTES, PROTOCOL_EXCERPT_BYTES, PROTOCOL_VERSION,
+    self, encode_background_admit, encode_background_cancel, encode_background_refuse, encode_build_catalog,
+    encode_execute, encode_handshake, encode_set_cancel, encode_shutdown, encode_suggest,
+    floor_char_boundary, KIND_BACKGROUND_COMPLETE, KIND_BACKGROUND_REGISTER, KIND_CATALOG_BATCH,
+    KIND_EXECUTE_RESULT, KIND_HANDSHAKE_ACK, KIND_RESULT_BATCH, MAX_FRAME_BYTES, MAX_STDERR_TAIL_BYTES,
+    PROTOCOL_EXCERPT_BYTES, PROTOCOL_VERSION,
 };
 use crate::Interpreter;
 
@@ -281,6 +284,9 @@ pub struct WorkerOptions {
     pub entrypoint: String,
     /// The assembled import path handed to the child (spec 15.4).
     pub import_path: ImportPath,
+    /// The one shared per-plugin budget owner. Background registration refuses
+    /// work when this is absent rather than silently bypassing §13.5.
+    pub shared_budget: Option<PluginBudgetHandle>,
     /// Bound on the startup handshake, in milliseconds.
     pub startup_timeout_ms: u64,
     /// Bound on every call, in milliseconds (spec 9.6).
@@ -296,6 +302,7 @@ impl WorkerOptions {
             plugin,
             entrypoint: entrypoint.into(),
             import_path,
+            shared_budget: None,
             startup_timeout_ms: DEFAULT_STARTUP_TIMEOUT_MS,
             call_timeout_ms: DEFAULT_CALL_TIMEOUT_MS,
             shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
@@ -314,9 +321,16 @@ impl WorkerOptions {
         self
     }
 
-    /// Bounds an orderly shutdown before the child is hard-stopped.
+    /// Bounds an orderly shutdown before a hard stop.
     pub fn with_shutdown_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.shutdown_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Attaches the shared per-plugin budget owner used by every dispatch
+    /// category, including child-registered background tasks.
+    pub fn with_shared_budget(mut self, budget: PluginBudgetHandle) -> Self {
+        self.shared_budget = Some(budget);
         self
     }
 }
@@ -368,6 +382,155 @@ impl WorkerLink {
     fn close_stdin(&self) {
         let mut guard = self.stdin.lock().unwrap_or_else(|error| error.into_inner());
         drop(guard.take());
+    }
+}
+/// Bounded operator-visible counters for child-registered background work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackgroundDiagnostics {
+    pub registered: u64,
+    pub admitted: u64,
+    pub refused: u64,
+    pub completed: u64,
+    pub cancelled: u64,
+    pub failed: u64,
+    pub unknown_completions: u64,
+}
+
+#[derive(Debug, Default)]
+struct BackgroundCounters {
+    registered: u64,
+    admitted: u64,
+    refused: u64,
+    completed: u64,
+    cancelled: u64,
+    failed: u64,
+    unknown_completions: u64,
+}
+
+#[derive(Debug)]
+struct BackgroundState {
+    budget: Option<PluginBudgetHandle>,
+    guards: Mutex<HashMap<u64, OwnedBudgetGuard>>,
+    counters: Mutex<BackgroundCounters>,
+    closed: AtomicBool,
+}
+
+impl BackgroundState {
+    fn new(budget: Option<PluginBudgetHandle>) -> Self {
+        Self {
+            budget,
+            guards: Mutex::new(HashMap::new()),
+            counters: Mutex::new(BackgroundCounters::default()),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn diagnostics(&self) -> BackgroundDiagnostics {
+        let counters = self.counters.lock().unwrap_or_else(|error| error.into_inner());
+        BackgroundDiagnostics {
+            registered: counters.registered,
+            admitted: counters.admitted,
+            refused: counters.refused,
+            completed: counters.completed,
+            cancelled: counters.cancelled,
+            failed: counters.failed,
+            unknown_completions: counters.unknown_completions,
+        }
+    }
+
+    fn register(&self, task_id: u64, link: &WorkerLink) -> io::Result<()> {
+        {
+            let mut counters = self.counters.lock().unwrap_or_else(|error| error.into_inner());
+            counters.registered = counters.registered.saturating_add(1);
+        }
+        let refused_reason = if self.closed.load(Ordering::Acquire) {
+            Some("background dispatch is shutting down")
+        } else if self.budget.is_none() {
+            Some("no shared per-plugin background budget was supplied")
+        } else {
+            None
+        };
+
+        if let Some(reason) = refused_reason {
+            self.refuse();
+            return link.write_frame(&encode_background_refuse(task_id, reason));
+        }
+
+        let budget = self.budget.as_ref().expect("checked above");
+        let Some(guard) = budget.try_acquire_owned(BudgetKind::Background) else {
+            self.refuse();
+            return link.write_frame(&encode_background_refuse(
+                task_id,
+                "max-background-tasks budget is full",
+            ));
+        };
+
+        let duplicate = {
+            let mut guards = self.guards.lock().unwrap_or_else(|error| error.into_inner());
+            match guards.entry(task_id) {
+                Entry::Vacant(slot) => {
+                    slot.insert(guard);
+                    false
+                }
+                Entry::Occupied(_) => {
+                    drop(guard);
+                    true
+                }
+            }
+        };
+        if duplicate {
+            self.refuse();
+            return link.write_frame(&encode_background_refuse(task_id, "duplicate background task id"));
+        }
+
+        {
+            let mut counters = self.counters.lock().unwrap_or_else(|error| error.into_inner());
+            counters.admitted = counters.admitted.saturating_add(1);
+        }
+        if let Err(error) = link.write_frame(&encode_background_admit(task_id)) {
+            self.guards
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&task_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn refuse(&self) {
+        let mut counters = self.counters.lock().unwrap_or_else(|error| error.into_inner());
+        counters.refused = counters.refused.saturating_add(1);
+    }
+
+    fn complete(&self, task_id: u64, status: &str) -> bool {
+        let removed = self
+            .guards
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&task_id)
+            .is_some();
+        let mut counters = self.counters.lock().unwrap_or_else(|error| error.into_inner());
+        if !removed {
+            counters.unknown_completions = counters.unknown_completions.saturating_add(1);
+        }
+        match status {
+            "cancelled" => counters.cancelled = counters.cancelled.saturating_add(1),
+            "failed" => counters.failed = counters.failed.saturating_add(1),
+            _ => counters.completed = counters.completed.saturating_add(1),
+        }
+        removed
+    }
+
+    fn release_all(&self) {
+        self.guards
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    fn reap(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.release_all();
     }
 }
 
@@ -474,7 +637,12 @@ fn read_frame_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<
     }
 }
 
-fn spawn_stdout_reader(stdout: ChildStdout, sender: Sender<StdoutEvent>) {
+fn spawn_stdout_reader(
+    stdout: ChildStdout,
+    sender: SyncSender<StdoutEvent>,
+    link: Arc<WorkerLink>,
+    background: Arc<BackgroundState>,
+) {
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut line: Vec<u8> = Vec::new();
@@ -482,13 +650,13 @@ fn spawn_stdout_reader(stdout: ChildStdout, sender: Sender<StdoutEvent>) {
             line.clear();
             let event = match read_frame_line(&mut reader, &mut line) {
                 Ok(LineRead::Frame) => {
-                    // Lossy on purpose: a frame that is not valid UTF-8 is not a
-                    // frame, and it must reach the decoder to be reported as the
-                    // protocol error it is rather than silently dropped.
-                    StdoutEvent::Frame(String::from_utf8_lossy(strip_carriage_return(&line)).into_owned())
+                    let text = String::from_utf8_lossy(strip_carriage_return(&line)).into_owned();
+                    match handle_background_frame(&text, &link, &background) {
+                        Ok(true) => continue,
+                        Ok(false) => StdoutEvent::Frame(text),
+                        Err(error) => StdoutEvent::Failed(error),
+                    }
                 }
-                // Dropping the sender is how end of file reaches the caller:
-                // `recv` then answers `Disconnected`, which is the crash path.
                 Ok(LineRead::Eof) => return,
                 Ok(LineRead::Oversized(bytes)) => StdoutEvent::Oversized {
                     excerpt: excerpt(&line),
@@ -503,6 +671,45 @@ fn spawn_stdout_reader(stdout: ChildStdout, sender: Sender<StdoutEvent>) {
             }
         }
     });
+}
+
+/// Handles lifecycle frames independently of foreground request replies. This
+/// is what lets a background completion release its Arc-owned guard while the
+/// worker is idle and lets registration receive an admission immediately while
+/// a synchronous callback is still running.
+fn handle_background_frame(
+    line: &str,
+    link: &WorkerLink,
+    background: &BackgroundState,
+) -> Result<bool, String> {
+    let Some(frame) = parse_object(line) else {
+        return Ok(false);
+    };
+    match frame.get("kind").and_then(Value::as_str) {
+        Some(KIND_BACKGROUND_REGISTER) => {
+            let Some(task_id) = frame.get("task_id").and_then(Value::as_u64) else {
+                return Err("background_register missing task_id".to_owned());
+            };
+            background
+                .register(task_id, link)
+                .map_err(|error| format!("background admission reply failed: {error}"))?;
+            Ok(true)
+        }
+        Some(KIND_BACKGROUND_COMPLETE) => {
+            let Some(task_id) = frame.get("task_id").and_then(Value::as_u64) else {
+                return Err("background_complete missing task_id".to_owned());
+            };
+            let Some(status) = frame.get("status").and_then(Value::as_str) else {
+                return Err("background_complete missing status".to_owned());
+            };
+            if !matches!(status, "ok" | "cancelled" | "failed" | "refused") {
+                return Err(format!("background_complete has unknown status {status:?}"));
+            }
+            background.complete(task_id, status);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn strip_carriage_return(line: &[u8]) -> &[u8] {
@@ -594,6 +801,7 @@ pub struct ModernWorker {
     options: WorkerOptions,
     link: Arc<WorkerLink>,
     frames: Receiver<StdoutEvent>,
+    background: Arc<BackgroundState>,
     stderr: Arc<Mutex<StderrTail>>,
     stderr_thread: Option<JoinHandle<()>>,
     child: Option<Child>,
@@ -662,19 +870,22 @@ impl ModernWorker {
         let stdout = child.stdout.take().expect("worker stdout is piped");
         let stderr = child.stderr.take().expect("worker stderr is piped");
 
-        let (sender, frames) = mpsc::channel();
-        spawn_stdout_reader(stdout, sender);
+        let (sender, frames) = mpsc::sync_channel(128);
+        let link = Arc::new(WorkerLink {
+            next_id: AtomicU64::new(0),
+            stdin: Mutex::new(Some(stdin)),
+        });
+        let background = Arc::new(BackgroundState::new(options.shared_budget.clone()));
+        spawn_stdout_reader(stdout, sender, Arc::clone(&link), Arc::clone(&background));
         let tail = Arc::new(Mutex::new(StderrTail::default()));
         let stderr_thread = spawn_stderr_drain(stderr, Arc::clone(&tail));
 
         let mut worker = Self {
             plugin: options.plugin.clone(),
             options,
-            link: Arc::new(WorkerLink {
-                next_id: AtomicU64::new(0),
-                stdin: Mutex::new(Some(stdin)),
-            }),
+            link,
             frames,
+            background,
             stderr: tail,
             stderr_thread: Some(stderr_thread),
             child: Some(child),
@@ -701,6 +912,20 @@ impl ModernWorker {
         self.alive
     }
 
+    /// Returns bounded lifecycle counters for host-managed background work.
+    pub fn background_diagnostics(&self) -> BackgroundDiagnostics {
+        self.background.diagnostics()
+    }
+
+    /// Cancels all admitted background tasks and releases their host guards.
+    ///
+    /// The child receives the cancellation request as a control frame; the
+    /// host drops every guard immediately because cancellation is a terminal
+    /// dispatch path even if the child is about to crash or is unresponsive.
+    pub fn cancel_background_tasks(&self) {
+        let _ = self.link.write_frame(&encode_background_cancel(None));
+        self.background.release_all();
+    }
     /// A handle that cancels this worker's in-flight call from another thread.
     pub fn cancel_handle(&self) -> CancelHandle {
         CancelHandle {
@@ -1009,6 +1234,7 @@ impl ModernWorker {
     /// finish so a crash diagnostic is complete.
     fn fail_and_reap(&mut self) {
         self.alive = false;
+        self.background.reap();
         let _ = self.reap();
         self.drain_stderr();
     }
@@ -1057,8 +1283,8 @@ impl ModernWorker {
 
     /// Ends the child, killing it only if it is still alive.
     fn reap(&mut self) -> Option<ExitStatus> {
+        self.background.reap();
         self.link.close_stdin();
-
         let Some(mut child) = self.child.take() else {
             return self.reaped;
         };
@@ -1074,7 +1300,7 @@ impl ModernWorker {
     /// Asks the child to exit cooperatively, then makes sure it did.
     fn stop_child(&mut self) -> WorkerExit {
         self.alive = false;
-
+        self.background.reap();
         if let Some(status) = self.reaped {
             return WorkerExit {
                 code: status.code(),
@@ -1153,6 +1379,7 @@ impl ModernWorker {
 /// listening (spec 24.3).
 impl Drop for ModernWorker {
     fn drop(&mut self) {
+        self.background.reap();
         if self.child.is_some() {
             let _ = self.reap();
         }

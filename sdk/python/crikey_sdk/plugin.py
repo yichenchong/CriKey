@@ -112,14 +112,23 @@ class Plugin:
 class WorkerContext:
     """The concrete :class:`SuggestContext` the modern worker supplies.
 
-    The worker owns result batching, log capture and the asyncio loop; this
-    object is the thin, plugin-facing surface over them. ``cancelled`` reads the
+    The host owns result batching and log capture. ``cancelled`` reads the
     control-frame event set by the worker's daemon reader thread; ``emit`` and
-    ``log`` funnel into worker-provided sinks; ``spawn`` registers a coroutine
-    the worker awaits at callback end (spec 15.8).
+    ``log`` funnel into worker-provided sinks. ``spawn`` is a host-visible
+    registration point: the worker sends the coroutine's task id to the Rust
+    host, which admits it against the shared per-plugin background budget
+    before the coroutine can run. A worker without that registration callback
+    retains the small local-loop fallback for SDK embedding tests.
     """
 
-    __slots__ = ("_is_cancelled", "_sink", "_logger", "_loop", "registered_tasks")
+    __slots__ = (
+        "_is_cancelled",
+        "_sink",
+        "_logger",
+        "_loop",
+        "_spawn_background",
+        "registered_tasks",
+    )
 
     def __init__(
         self,
@@ -127,11 +136,13 @@ class WorkerContext:
         sink: Callable[[Item], None],
         logger: Callable[[str], None],
         loop: asyncio.AbstractEventLoop | None = None,
+        spawn_background: Callable[[Awaitable[object]], object] | None = None,
     ) -> None:
         self._is_cancelled = is_cancelled
         self._sink = sink
         self._logger = logger
         self._loop = loop
+        self._spawn_background = spawn_background
         self.registered_tasks: list[object] = []
 
     @property
@@ -147,7 +158,13 @@ class WorkerContext:
     def spawn(self, coro: Awaitable[object]) -> object:
         if not asyncio.iscoroutine(coro):
             raise TypeError("context.spawn(coro) expects a coroutine")
-        # A synchronous suggest/execute has no running loop, so
+        if self._spawn_background is not None:
+            # Registration and host admission happen before the worker starts
+            # this coroutine. It is deliberately not appended to
+            # ``registered_tasks``: host-managed tasks outlive the synchronous
+            # callback and must not be awaited at callback end.
+            return self._spawn_background(coro)
+        # A synchronous suggest has no running loop, so
         # ``asyncio.get_running_loop()`` would raise and abort the whole
         # request. Fall back to the worker's loop (the sync-drain branch in the
         # worker runs it) or, absent one, a private loop kept for this context.

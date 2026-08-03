@@ -51,15 +51,20 @@
 //!   and (on failure) `error {message, traceback}` surfaced as
 //!   `Suggestions::error`.
 //! * The SDK context surface: `SuggestContext.emit`, `.log`, `.cancelled` and
-//!   the documented `context.spawn(coro)` task registration (§5, §15.8), plus
-//!   captured `print` landing in the reply `log`.
+//!   the documented `context.spawn(coro)` host-managed background task
+//!   registration (§5, §15.8), plus captured `print` landing in the reply
+//!   `log`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread::{sleep, yield_now};
+use std::time::{Duration, Instant};
 
 use crikey_core::{Item, ItemId, PluginId};
 use crikey_package_manager::{EnvironmentId, ImportPath, MaterializedEnvironment};
+use crikey_plugin_model::ConcurrencySection;
+use crikey_plugin_supervisor::shared_budget_from_section;
 use crikey_python_host::{
     discover_interpreter, BatchState, Interpreter, ModernWorker, RequiresPython, RuntimeProfile,
     SuggestRequest, Suggestions, WorkerOptions,
@@ -176,7 +181,8 @@ fn spawn_worker(plugin_id: &str, entrypoint: &str, plugin_source: &Path, site_di
     };
     let import_path: ImportPath = ImportPath::assemble(plugin_source, &[], &env, &sdk_python_dir());
 
-    let mut options = WorkerOptions::new(PluginId(plugin_id.to_owned()), entrypoint.to_owned(), import_path);
+    let mut options = WorkerOptions::new(PluginId(plugin_id.to_owned()), entrypoint.to_owned(), import_path)
+        .with_shared_budget(shared_budget_from_section(&ConcurrencySection::default()));
     options.startup_timeout_ms = STARTUP_BUDGET_MS;
     options.call_timeout_ms = CALL_BUDGET_MS;
     options.shutdown_timeout_ms = SHUTDOWN_BUDGET_MS;
@@ -699,9 +705,10 @@ class Impl(Plugin):
 #[test]
 fn an_unregistered_background_task_is_cancelled_and_reported_while_a_spawned_task_completes() {
     // §15.8: unbounded background work is refused. A task created via the
-    // documented `context.spawn` is awaited to completion; a raw un-registered
-    // pending task is cancelled at callback end and reported in the log, never
-    // left running to leak into a later request.
+    // documented `context.spawn` is admitted and runs on the host-managed
+    // background loop; a raw un-registered pending task is cancelled at
+    // callback end and reported in the log, never left running to leak into a
+    // later request.
     let scratch = Scratch::new("background");
     let src = scratch.subdir("source");
     write_file(&src.join("bg.py"), BACKGROUND_PLUGIN);
@@ -732,8 +739,9 @@ fn an_unregistered_background_task_is_cancelled_and_reported_while_a_spawned_tas
         "the cancelled background task is reported in the log, got {orphan_log:?}"
     );
 
-    // The registered task: awaited, so its side effect DOES happen and nothing
-    // is reported as cancelled.
+    // The registered task is host-managed and therefore is not awaited by the
+    // foreground callback. Wait only for its terminal lifecycle frame; this
+    // is a bounded observation of the worker protocol, not a callback sleep.
     let spawned = suggest(&mut worker, "spawn");
     assert!(
         matches!(spawned.state, BatchState::Final),
@@ -741,10 +749,17 @@ fn an_unregistered_background_task_is_cancelled_and_reported_while_a_spawned_tas
         spawned.state
     );
     assert_eq!(spawned.items[0].label, "made-spawn");
-    let spawned_log = joined_log(&spawned);
-    assert!(
-        spawned_log.contains("spawned-done"),
-        "a task registered via context.spawn is awaited to completion, got log {spawned_log:?}"
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while worker.background_diagnostics().completed < 1 && Instant::now() < deadline {
+        yield_now();
+        sleep(Duration::from_millis(1));
+    }
+    let diagnostics = worker.background_diagnostics();
+    assert_eq!(diagnostics.registered, 1);
+    assert_eq!(diagnostics.admitted, 1);
+    assert_eq!(
+        diagnostics.completed, 1,
+        "the admitted context.spawn task must reach a terminal completion: {diagnostics:?}"
     );
 
     // The orphan really was killed: a later request never sees its side effect

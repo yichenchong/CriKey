@@ -70,8 +70,20 @@ pub(crate) const KIND_SUGGEST: &str = "suggest";
 pub(crate) const KIND_EXECUTE: &str = "execute";
 /// Host → worker: raise or lower the cooperative cancellation flag. No `id`.
 pub(crate) const KIND_SET_CANCEL: &str = "set_cancel";
+/// Host → worker: admit one registered background task.
+pub(crate) const KIND_BACKGROUND_ADMIT: &str = "background_admit";
+/// Host → worker: refuse one registered background task.
+pub(crate) const KIND_BACKGROUND_REFUSE: &str = "background_refuse";
+/// Host → worker: cancel one registered background task, or all tasks when
+/// `task_id` is omitted.
+pub(crate) const KIND_BACKGROUND_CANCEL: &str = "background_cancel";
 /// Host → worker: ask the child to exit.
 pub(crate) const KIND_SHUTDOWN: &str = "shutdown";
+
+/// Worker → host: announces one background task before it starts.
+pub(crate) const KIND_BACKGROUND_REGISTER: &str = "background_register";
+/// Worker → host: reports one background task's terminal state.
+pub(crate) const KIND_BACKGROUND_COMPLETE: &str = "background_complete";
 
 /// Worker → host: acknowledges the handshake.
 pub(crate) const KIND_HANDSHAKE_ACK: &str = "handshake_ack";
@@ -123,6 +135,28 @@ pub(crate) fn encode_execute(id: u64, item: &Item, action_id: Option<&str>, argu
 /// written from a separate thread while a call is in flight.
 pub(crate) fn encode_set_cancel(cancelled: bool) -> Value {
     json!({ "kind": KIND_SET_CANCEL, "cancelled": cancelled })
+}
+
+/// `{"kind":"background_admit","task_id":<id>}` — host admission for one
+/// child-registered task.
+pub(crate) fn encode_background_admit(task_id: u64) -> Value {
+    json!({ "kind": KIND_BACKGROUND_ADMIT, "task_id": task_id })
+}
+
+/// `{"kind":"background_refuse","task_id":<id>,"reason":<text>}` — bounded,
+/// observable refusal when the shared host budget has no slot.
+pub(crate) fn encode_background_refuse(task_id: u64, reason: &str) -> Value {
+    json!({
+        "kind": KIND_BACKGROUND_REFUSE,
+        "task_id": task_id,
+        "reason": reason,
+    })
+}
+
+/// `{"kind":"background_cancel","task_id":<id>|null}` — cancellation for one
+/// task or all tasks on shutdown/restart.
+pub(crate) fn encode_background_cancel(task_id: Option<u64>) -> Value {
+    json!({ "kind": KIND_BACKGROUND_CANCEL, "task_id": task_id })
 }
 
 /// `{"id","kind":"shutdown"}`

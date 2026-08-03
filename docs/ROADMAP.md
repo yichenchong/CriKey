@@ -307,11 +307,12 @@ round-trip.
 
 Verification limits, honestly: the Windows named-pipe transport, job-object
 limits and `DuplicateHandle` cloning are compile-verified only — this host
-cannot run them. Those, plus §24.2 startup recovery and safe mode and §13.5
-per-plugin concurrency budgets, are carried to M6 with no code pretending
-otherwise; the M6 table below records what each still owes. The §24.4 OS
-resource limits are distinct from §13.5 and are implemented and reported per
-platform.
+cannot run them. §24.2 startup recovery and safe mode were carried to M6 and
+are now implemented and covered there. The §13.5 per-plugin concurrency
+registry is enforced at every implemented lifecycle seam: suggestions,
+plugin actions, Python host-managed background tasks, and native/modern
+catalog builds. The §24.4 OS resource limits are distinct from §13.5 and are
+implemented and reported per platform.
 
 ### M6 — Additional platforms (§30 Phase 6) — L — implementation complete, closure gated on Windows and macOS runtime verification
 
@@ -338,9 +339,16 @@ verified. What landed:
   detected and answered separately. Window control reports `Partial` under X11,
   not `Available`: `capability()` is a pure function of the session and cannot
   see the window-manager gate `window_service()` applies at runtime.
-- **macOS backend (§18.5).** Bundle discovery and Launch Services opening,
-  wired into `App` — the macOS arms previously returned a hard-coded
-  "unavailable" error, so the backend was unreachable.
+- **§13.5 per-plugin concurrency budgets.** One shared `Arc`-owned registry
+  is created from each manifest and passed through the live provider seam.
+  Query admission uses `Suggestion`; modern and native plugin actions use
+  `Action`; Python child background registration uses `Background`; and
+  modern/native catalog dispatch uses `Catalog`. Each path has bounded
+  admission, refusal diagnostics, and guard release on completion,
+  cancellation, worker failure, or shutdown. Action snapshots retain
+  `(PluginId, ItemId)` ownership, so equal stable ids from distinct plugins
+  are rejected as ambiguous rather than routed to whichever snapshot arrived
+  last.
 - **§24.2 startup recovery and safe mode.** A journal records the plugins active
   at each attempt and enters safe mode after repeated failure. Safe mode gates
   all three third-party runtimes (legacy, modern Python, native), and readiness
@@ -379,7 +387,6 @@ Still owed, each needing a runtime this host does not have:
 | M1 | Win32 hotkey, Start Menu / packaged-app discovery, `.lnk` COM resolution, `ShellExecuteExW` launch | Executed in an interactive Windows desktop session. The 60 tests in `crates/crikey-platform-windows/tests/` pin mapping and bookkeeping only and deliberately do not make these calls |
 | M1 | Warm activation < 30 ms p95 (§31.1) | Measured **end to end on Win32**, from global-hotkey delivery to the presented frame, on hardware with a real GPU and compositor. `crikey dev measure-activation` is a diagnostic component only: its span starts at `request_activation`, and a software rasteriser cannot settle the budget |
 | M5 | Windows named-pipe transport, job-object limits, `DuplicateHandle` cloning | Compile-verified only; needs a Windows runtime |
-| M6 | §13.5 action, background and catalog concurrency budgets | The registry is enforced on the live suggestion dispatch seam (`QueryPipeline::tick`), and refusals are observable through `PluginHealth::concurrency_refusals`. The other three kinds have **no dispatch site in the runtime to gate**: plugin-owned action execution is refused outright, and no background-task or modern/native catalog-build scheduler exists. They resolve to effective limits and are NOT claimed as enforced |
 | M6 | macOS backend runtime behaviour | Compile-verified only; `crikey-platform-macos` is `#![cfg(target_os = "macos")]` and cannot run here. The pure bundle parsing it depends on is tested cross-platform in `crikey-platform` |
 
 Exit criteria: full test suite green on all three CI runners — **not yet

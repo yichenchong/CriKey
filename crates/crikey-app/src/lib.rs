@@ -12,6 +12,7 @@
 mod legacy_provider;
 mod modern_provider;
 mod native_provider;
+mod plugin_action;
 mod query_pipeline;
 mod startup_recovery;
 
@@ -23,12 +24,16 @@ pub use crikey_result_aggregator::{
 pub use legacy_provider::{LegacyDriver, LegacyProvider, LegacyUnavailable, LegacyWorkerPool};
 pub use modern_provider::{ModernDriver, ModernProvider, ModernUnavailable};
 pub use native_provider::{NativeDriver, NativeProvider, NativeUnavailable};
+pub use plugin_action::{
+    ActionRequestId, ActionSubmission, PluginActionCompletion, PluginActionExecutor, PluginActionRouter,
+};
 pub use query_pipeline::{PipelineConfig, PipelineError, PipelineTick, QueryPipeline};
 pub use startup_recovery::{admitted_plugin_roots, StartupJournal, StartupMode, SAFE_MODE_AFTER_FAILURES};
 
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap},
+    sync::Arc,
 };
 
 use crikey_catalog::{
@@ -478,6 +483,78 @@ pub struct CatalogLoad {
     /// stage 2 could still rebuild the difference.
     pub skipped: usize,
 }
+/// A catalog produced by a provider worker and authorized for one plugin
+/// instance. Providers attach the instance and source generation before
+/// publishing; [`SearchService::replace_catalog`] remains the sole live
+/// catalog publication edge and rejects stale instances.
+#[derive(Debug)]
+pub struct CatalogBuild {
+    pub plugin: PluginId,
+    pub instance: u64,
+    pub generation: Generation,
+    pub items: Vec<Item>,
+}
+
+/// A catalog request that completed without publishing because it was
+/// superseded by a newer request for the same plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObsoleteCatalogBuild {
+    pub plugin: PluginId,
+    pub instance: u64,
+    pub generation: Generation,
+}
+
+/// Result of one bounded provider catalog task.
+#[derive(Debug)]
+pub enum CatalogBuildResult {
+    Complete(CatalogBuild),
+    Failed {
+        plugin: PluginId,
+        instance: u64,
+        generation: Generation,
+        reason: String,
+    },
+    Obsolete(ObsoleteCatalogBuild),
+}
+
+/// Why a provider refused a catalog-build request before starting a worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogDispatchError {
+    UnknownPlugin { plugin: PluginId },
+    BudgetRefused { plugin: PluginId },
+    QueueFull { plugin: PluginId },
+    ThreadSpawn { plugin: PluginId, reason: String },
+}
+
+impl std::fmt::Display for CatalogDispatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPlugin { plugin } => write!(formatter, "unknown plugin {}", plugin.0),
+            Self::BudgetRefused { plugin } => {
+                write!(formatter, "catalog budget is full for plugin {}", plugin.0)
+            }
+            Self::QueueFull { plugin } => {
+                write!(formatter, "catalog result queue is full for plugin {}", plugin.0)
+            }
+            Self::ThreadSpawn { plugin, reason } => {
+                write!(
+                    formatter,
+                    "catalog worker for plugin {} could not start: {reason}",
+                    plugin.0
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CatalogDispatchError {}
+
+impl CatalogBuild {
+    /// Publishes through the existing owner/instance-safe catalog edge.
+    pub fn publish(self, search: &mut SearchService) -> Result<usize, CatalogError> {
+        search.replace_catalog(&self.plugin, self.instance, self.items)
+    }
+}
 
 /// The catalog, query engine, ranker and aggregator as one behaviour.
 ///
@@ -503,6 +580,8 @@ pub struct SearchService {
     last_query_stats: SearchStats,
     candidate_cache: Option<CandidateCache>,
     non_prefix_upper: HashMap<PluginId, Score>,
+    /// Exact-owner runtime endpoints for plugin-owned actions.
+    plugin_actions: Option<Arc<PluginActionRouter>>,
 }
 
 impl SearchService {
@@ -521,6 +600,7 @@ impl SearchService {
             last_query_stats: SearchStats::default(),
             candidate_cache: None,
             non_prefix_upper: HashMap::new(),
+            plugin_actions: None,
         }
     }
 
@@ -802,19 +882,49 @@ impl SearchService {
             .collect()
     }
 
+    /// Installs the exact-owner plugin action endpoints retained by the live
+    /// provider drivers.
+    ///
+    /// The router is configured after providers have loaded and before the UI
+    /// event loop starts. It contains the same budget handles those providers
+    /// use; `SearchService` never constructs or looks up a second budget.
+    pub fn set_plugin_action_router(&mut self, router: Arc<PluginActionRouter>) {
+        self.plugin_actions = Some(router);
+    }
+
+    /// Executes an action from the currently presented result set without an
+    /// additional user argument.
+    pub fn execute(&self, item_id: &ItemId, action_id: &ActionId) -> CoreResult<ActionSubmission> {
+        self.execute_with_argument(item_id, action_id, None)
+    }
+
     /// Executes an action from the currently presented result set.
     ///
-    /// Host-mediated application launches are routed through the selected
-    /// platform backend. Plugin-owned actions remain outside the M1 runtime and
-    /// fail explicitly instead of becoming a silent Enter key.
-    pub fn execute(&self, item_id: &ItemId, action_id: &ActionId) -> CoreResult<()> {
-        let hit = self
-            .results
-            .iter()
-            .find(|hit| &hit.item.stable_id == item_id)
-            .ok_or_else(|| {
-                crikey_core::CoreError::Invalid("selected result is no longer current".to_owned())
-            })?;
+    /// Selection is authoritative only for the current ranked result set:
+    /// stale item/action ids, category-inapplicable actions, and argument
+    /// policy violations are refused before any provider or platform call.
+    /// Plugin actions then route by the item's exact owner and remain
+    /// independent of query generations.
+    pub fn execute_with_argument(
+        &self,
+        item_id: &ItemId,
+        action_id: &ActionId,
+        argument: Option<&str>,
+    ) -> CoreResult<ActionSubmission> {
+        let Some(hit) = self.results.iter().find(|hit| &hit.item.stable_id == item_id) else {
+            // Modern/native rows are presented through their asynchronous
+            // drivers rather than this synchronous built-in result cache.
+            // Their exact-owner endpoint retains the current item snapshot,
+            // performs the same policy checks, and rejects stale ids.
+            return self
+                .plugin_actions
+                .as_ref()
+                .ok_or_else(|| {
+                    crikey_core::CoreError::Invalid("selected result is no longer current".to_owned())
+                })?
+                .submit_by_item_id(item_id, action_id, argument)
+                .map(ActionSubmission::Pending);
+        };
         let action = hit
             .item
             .actions
@@ -823,18 +933,70 @@ impl SearchService {
             .ok_or_else(|| {
                 crikey_core::CoreError::Invalid("selected action is no longer available".to_owned())
             })?;
-        if action.execution_policy != ExecutionPolicy::HostMediated {
-            return Err(crikey_core::CoreError::Invalid(
-                "plugin-owned action execution is not wired in the M1 runtime".to_owned(),
-            ));
-        }
-        if action.action_id.0 != APPLICATION_LAUNCH_ACTION_ID {
+
+        if !action.applicable_categories.is_empty()
+            && !action.applicable_categories.contains(&hit.item.category)
+        {
             return Err(crikey_core::CoreError::Invalid(format!(
-                "unsupported host-mediated action {:?}",
-                action.action_id.0
+                "action `{}` is not applicable to item category `{}`",
+                action.action_id.0,
+                hit.item.category.as_str()
             )));
         }
-        self.app.launch_application(&hit.item)
+        match hit.item.argument_policy {
+            ArgumentPolicy::Forbidden if argument.is_some() => {
+                return Err(crikey_core::CoreError::Invalid(
+                    "this item does not accept an argument".to_owned(),
+                ));
+            }
+            ArgumentPolicy::Required if argument.is_none_or(str::is_empty) => {
+                return Err(crikey_core::CoreError::Invalid(
+                    "this item requires an argument".to_owned(),
+                ));
+            }
+            ArgumentPolicy::Optional | ArgumentPolicy::Forbidden | ArgumentPolicy::Required => {}
+        }
+
+        match action.execution_policy {
+            ExecutionPolicy::HostMediated => {
+                if argument.is_some() {
+                    return Err(crikey_core::CoreError::Invalid(
+                        "host-mediated actions do not accept an argument".to_owned(),
+                    ));
+                }
+                if action.action_id.0 != APPLICATION_LAUNCH_ACTION_ID {
+                    return Err(crikey_core::CoreError::Invalid(format!(
+                        "unsupported host-mediated action {:?}",
+                        action.action_id.0
+                    )));
+                }
+                self.app
+                    .launch_application(&hit.item)
+                    .map(|()| ActionSubmission::Completed)
+            }
+            ExecutionPolicy::Plugin => self
+                .plugin_actions
+                .as_ref()
+                .ok_or_else(|| {
+                    crikey_core::CoreError::Invalid("plugin-owned action runtime is unavailable".to_owned())
+                })?
+                .submit(&hit.item.plugin_id, &hit.item, action_id, argument)
+                .map(ActionSubmission::Pending),
+        }
+    }
+
+    /// Drains terminal plugin-action outcomes without waiting on any provider.
+    pub fn poll_action_completions(&self) -> Vec<PluginActionCompletion> {
+        self.plugin_actions
+            .as_ref()
+            .map_or_else(Vec::new, |router| router.poll())
+    }
+
+    /// Requests cancellation of one admitted plugin action.
+    pub fn cancel_action(&self, request_id: &ActionRequestId) -> bool {
+        self.plugin_actions
+            .as_ref()
+            .is_some_and(|router| router.cancel(request_id))
     }
 
     /// Work performed by the most recently accepted query.
