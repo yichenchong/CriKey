@@ -5,9 +5,10 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime},
 };
 
 use crikey_core::{
@@ -298,7 +299,8 @@ struct PluginCatalog {
     postings: [Vec<u64>; DEDICATED_BITS as usize],
     /// Items whose searchable text contains each ordered character pair.
     ordered_pair_postings: Vec<Vec<u64>>,
-    /// Stable positions grouped by the label's first two folded characters.
+    /// Stable positions grouped by the label's first two folded dedicated
+    /// characters (the fast path used for ASCII prefixes).
     prefix_postings: Vec<Vec<usize>>,
 }
 
@@ -505,13 +507,27 @@ impl PluginCatalog {
         candidates
     }
     fn visit_prefix<'a>(&'a self, token: &str, mut visit: impl FnMut(usize, &'a Item, &'a PreparedLabel)) {
-        let Some(prefix) = prefix_pair(token) else {
+        if token.is_empty() {
             return;
-        };
-        for &position in &self.prefix_postings[prefix] {
-            let Some((item, entry)) = self.items.get(position).zip(self.index.get(position)) else {
-                continue;
-            };
+        }
+
+        if let Some(prefix) = prefix_pair(token) {
+            for &position in &self.prefix_postings[prefix] {
+                let Some((item, entry)) = self.items.get(position).zip(self.index.get(position)) else {
+                    continue;
+                };
+                if entry.prepared_label().normalized().starts_with(token) {
+                    visit(position, item, entry.prepared_label());
+                }
+            }
+            return;
+        }
+
+        // The compact prefix postings only cover two dedicated ASCII
+        // characters. Unicode prefixes, one-character prefixes, and prefixes
+        // beginning with a shared-bucket character use a complete scan so the
+        // optimization never changes the result set.
+        for (position, (item, entry)) in self.items.iter().zip(&self.index).enumerate() {
             if entry.prepared_label().normalized().starts_with(token) {
                 visit(position, item, entry.prepared_label());
             }
@@ -965,6 +981,12 @@ pub enum CacheError {
         /// Bytes a single path component may occupy.
         limit: usize,
     },
+    /// A slice contains an item owned by a different plugin and cannot be
+    /// persisted as one owner's archive.
+    InvalidSliceOwner {
+        /// The owner named by the invalid slice.
+        plugin: PluginId,
+    },
     /// The encoded slice exceeds either a length-prefix or the bounded archive
     /// size, so storing it would create a cache entry this reader must reject.
     SliceTooLarge {
@@ -997,6 +1019,11 @@ impl fmt::Display for CacheError {
             } => write!(
                 f,
                 "plugin id {id:?} escapes to {encoded_bytes} bytes, past the {limit} byte file name limit",
+                id = plugin.0
+            ),
+            CacheError::InvalidSliceOwner { plugin } => write!(
+                f,
+                "catalog slice for {id:?} contains an item owned by another plugin",
                 id = plugin.0
             ),
             CacheError::SliceTooLarge { plugin } => write!(
@@ -1586,9 +1613,12 @@ fn is_literal(byte: u8) -> bool {
     byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
 }
 fn is_windows_reserved_id(id: &str) -> bool {
-    let id = id.trim_end_matches(['.', ' ']);
+    let stem = id
+        .split_once('.')
+        .map_or(id, |(stem, _)| stem)
+        .trim_end_matches(['.', ' ']);
     matches!(
-        id,
+        stem,
         "con"
             | "prn"
             | "aux"
@@ -1691,6 +1721,41 @@ fn temp_file_name() -> String {
     format!("{TEMP_PREFIX}{pid}-{ticket}{TEMP_SUFFIX}")
 }
 
+/// Abandoned scratch files are safe to reclaim after this generous interval:
+/// a live write is bounded by the archive limit and should finish well before
+/// one hour, while a crash leaves the file permanently unchanged.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Best-effort cleanup for scratch files left by an interrupted writer.
+///
+/// Errors are ignored deliberately. Reclamation must never turn a valid cache
+/// write into a cache failure, and the age check keeps a live writer's file
+/// out of the normal path.
+fn remove_stale_temps(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(TEMP_PREFIX) || !name.ends_with(TEMP_SUFFIX) {
+            continue;
+        }
+        let Ok(modified) = fs::symlink_metadata(&path).and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age >= STALE_TEMP_AGE {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // file backed cache
 // ---------------------------------------------------------------------------
@@ -1776,6 +1841,11 @@ impl CatalogCache for FileCatalogCache {
                 limit: MAX_FILE_NAME_BYTES,
             });
         };
+        if slice.items.iter().any(|item| item.plugin_id != slice.plugin) {
+            return Err(CacheError::InvalidSliceOwner {
+                plugin: slice.plugin.clone(),
+            });
+        }
         let archive = encode_archive(slice).map_err(|_| CacheError::SliceTooLarge {
             plugin: slice.plugin.clone(),
         })?;
@@ -1786,14 +1856,28 @@ impl CatalogCache for FileCatalogCache {
         }
 
         fs::create_dir_all(&self.root).map_err(|error| CacheError::io(&self.root, &error))?;
+        remove_stale_temps(&self.root);
+        // Exclusive creation prevents a stale scratch name or a symlink from
+        // redirecting the archive write outside this cache root.
 
-        // Write beside the slice and rename over it: a reader either sees the
-        // previous archive or the new one, and a failure leaves no scratch file.
-        let temp = self.root.join(temp_file_name());
-        if let Err(error) = fs::write(&temp, &archive) {
-            let _ = fs::remove_file(&temp);
-            return Err(CacheError::io(&temp, &error));
-        }
+        let temp = loop {
+            let candidate = self.root.join(temp_file_name());
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(mut file) => {
+                    if let Err(error) = file.write_all(&archive) {
+                        let _ = fs::remove_file(&candidate);
+                        return Err(CacheError::io(&candidate, &error));
+                    }
+                    break candidate;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(CacheError::io(&candidate, &error)),
+            }
+        };
         let path = self.root.join(file_name);
         if let Err(error) = fs::rename(&temp, &path) {
             let _ = fs::remove_file(&temp);
@@ -1825,12 +1909,15 @@ impl CatalogCache for FileCatalogCache {
         let mut plugins = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|error| CacheError::io(&self.root, &error))?;
-            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                continue;
-            }
             let Some(owner) = entry.file_name().to_str().and_then(plugin_from_file_name) else {
                 continue;
             };
+            let file_type = entry
+                .file_type()
+                .map_err(|error| CacheError::io(&entry.path(), &error))?;
+            if !file_type.is_file() {
+                continue;
+            }
             plugins.push(owner);
         }
 

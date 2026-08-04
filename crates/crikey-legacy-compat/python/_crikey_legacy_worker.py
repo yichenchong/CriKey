@@ -67,6 +67,22 @@ import keypirinha_wintypes
 #: child sees plugin output live and the host's stderr ring stays useful for
 #: the crash tail.
 _REAL_STDERR = sys.stderr
+# Keep every text boundary explicit. The Rust host supplies these settings in
+# the normal launch path, but the worker is also executable directly during
+# diagnostics and must not silently adopt a platform locale.
+def _configure_utf8(stream, errors):
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        reconfigure(encoding="utf-8", errors=errors)
+        return
+    encoding = getattr(stream, "encoding", "utf-8") or "utf-8"
+    if encoding.lower().replace("-", "") != "utf8":
+        raise ValueError("the worker stream cannot be configured as UTF-8")
+
+
+_configure_utf8(sys.stdin, "strict")
+_configure_utf8(_REAL_STDERR, "backslashreplace")
+
 
 # --------------------------------------------------------------------------
 # Wire protocol constants (agreed with `src/worker.rs`; version 1)
@@ -119,6 +135,11 @@ _MAX_SETTINGS_BYTES = 1 << 20
 _MAX_SETTINGS_ENTRIES = 4096
 _MAX_RESOURCE_BYTES = 32 << 20
 
+#: Sentinel the reader thread queues when it has reached an input protocol
+#: error. The main thread exits non-zero so the host reports a broken peer
+#: promptly instead of waiting for a callback timeout.
+_PROTOCOL_ERROR = object()
+
 #: Sentinel the reader thread queues on end of stdin.
 _EOF = object()
 
@@ -144,6 +165,7 @@ class _LogCapture:
 
     def __init__(self, mirror):
         self._mirror = mirror
+        self._lock = threading.RLock()
         self._lines = []
         self._partial = []
         self._partial_chars = 0
@@ -154,28 +176,30 @@ class _LogCapture:
     def write(self, text):
         if not isinstance(text, str):
             text = str(text)
-        try:
-            self._mirror.write(text)
-        except (OSError, ValueError):
-            # A closed or broken stderr must not turn plugin chatter into a
-            # plugin failure: the capture is the record that matters.
-            pass
-        start = 0
-        while True:
-            newline = text.find("\n", start)
-            if newline == -1:
-                self._extend(text[start:])
-                break
-            self._extend(text[start:newline])
-            self._commit()
-            start = newline + 1
+        with self._lock:
+            try:
+                self._mirror.write(text)
+            except (OSError, ValueError):
+                # A closed or broken stderr must not turn plugin chatter into a
+                # plugin failure: the capture is the record that matters.
+                pass
+            start = 0
+            while True:
+                newline = text.find("\n", start)
+                if newline == -1:
+                    self._extend(text[start:])
+                    break
+                self._extend(text[start:newline])
+                self._commit()
+                start = newline + 1
         return len(text)
 
     def flush(self):
-        try:
-            self._mirror.flush()
-        except (OSError, ValueError):
-            pass
+        with self._lock:
+            try:
+                self._mirror.flush()
+            except (OSError, ValueError):
+                pass
 
     def writable(self):
         return True
@@ -220,10 +244,11 @@ class _LogCapture:
 
     def reset(self):
         """Starts a fresh per-request record, discarding anything pending."""
-        self._lines = []
-        self._partial = []
-        self._partial_chars = 0
-        self._dropped = 0
+        with self._lock:
+            self._lines = []
+            self._partial = []
+            self._partial_chars = 0
+            self._dropped = 0
 
     def take(self):
         """The lines written since :meth:`reset`, and starts a new record.
@@ -233,17 +258,18 @@ class _LogCapture:
         wants to see, and holding it back until some later request happened to
         write a newline would attribute it to the wrong callback.
         """
-        if self._partial:
-            self._commit()
-        lines = self._lines
-        if self._dropped:
-            lines.append(
-                "[warn][crikey] {} further log line(s) dropped at the {} line "
-                "per-request cap".format(self._dropped, _MAX_LOG_LINES)
-            )
-        self._lines = []
-        self._dropped = 0
-        return lines
+        with self._lock:
+            if self._partial:
+                self._commit()
+            lines = self._lines
+            if self._dropped:
+                lines.append(
+                    "[warn][crikey] {} further log line(s) dropped at the {} line "
+                    "per-request cap".format(self._dropped, _MAX_LOG_LINES)
+                )
+            self._lines = []
+            self._dropped = 0
+            return lines
 
 
 #: The protocol channel: the process's real stdout, taken away from plugin code
@@ -326,6 +352,24 @@ _WIRE_TO_HIT_HINT = {
 }
 
 
+def _category_from_wire(value):
+    """Decodes built-in and plugin-defined category spellings."""
+    folded = value.lower() if isinstance(value, str) else ""
+    known = _WIRE_TO_CATEGORY.get(folded)
+    if known is not None:
+        return known
+    prefix = "legacy-user-"
+    if folded.startswith(prefix):
+        try:
+            numeric = int(folded[len(prefix) :], 10)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if numeric >= int(_CATEGORY.USER_BASE):
+                return numeric
+    return int(_CATEGORY.USER_BASE)
+
+
 def _category_to_wire(value):
     """The wire spelling of a category, preserving plugin-defined ones.
 
@@ -369,10 +413,7 @@ def _item_from_wire(payload):
     hint = payload.get("args_hint")
     hit = payload.get("hit_hint")
     return keypirinha.CatalogItem(
-        category=_WIRE_TO_CATEGORY.get(
-            category.lower() if isinstance(category, str) else "",
-            int(_CATEGORY.USER_BASE),
-        ),
+        category=_category_from_wire(category),
         label=payload.get("label", ""),
         short_desc=payload.get("short_desc", ""),
         target=payload.get("target", ""),
@@ -548,23 +589,29 @@ class _Host:
 def _parse_ini(path):
     """Parses a Keypirinha-style configuration file.
 
-    Hand-rolled rather than delegated to :mod:`configparser` for two reasons
-    that both bite in practice: ``configparser`` performs ``%`` interpolation,
-    and a legacy configuration value is routinely a Windows path or a literal
-    percentage (``50% = half``) that interpolation would mangle or reject; and
-    its ``DEFAULT`` section has inheritance semantics the Keypirinha format
-    does not have.
-
-    Keys and sections are stored with their first-seen spelling.
-    :class:`keypirinha.Settings` does the ASCII-case-insensitive folding, so
-    exactly one component decides what "the same key" means.
-
-    Bounded by :data:`_MAX_SETTINGS_BYTES` and :data:`_MAX_SETTINGS_ENTRIES`;
-    past either, parsing stops and what was read is returned.
+    Repeated names use the last value while retaining the first spelling, and
+    indented continuation lines retain their embedded newline. Those are
+    ``configparser`` behaviours that legacy packages rely on.
     """
     sections = {}
     entries = 0
     current = keypirinha.Settings.DEFAULT_SECTION
+    pending_key = None
+
+    def section_spelling(name):
+        folded = keypirinha._fold(name)
+        for existing in sections:
+            if keypirinha._fold(existing) == folded:
+                return existing
+        sections[name] = {}
+        return name
+
+    def key_spelling(section, name):
+        folded = keypirinha._fold(name)
+        for existing in sections[section]:
+            if keypirinha._fold(existing) == folded:
+                return existing
+        return name
 
     try:
         # Read a bounded byte slice before decoding. Iterating a text file can
@@ -579,17 +626,44 @@ def _parse_ini(path):
     for raw in io.StringIO(text):
         if entries >= _MAX_SETTINGS_ENTRIES:
             break
-        line = raw.strip()
-        if not line or line[0] in ";#":
+        raw_line = raw.rstrip("\r\n")
+        line = raw_line.strip()
+        if not line:
+            pending_key = None
             continue
+        if line[0] in ";#":
+            pending_key = None
+            continue
+
+        # A continuation is identified before parsing separators: a value may
+        # itself contain '=' or ':', and configparser treats an indented line
+        # as part of the preceding key regardless of those characters.
+        if raw_line[:1].isspace() and pending_key is not None:
+            sections[current][pending_key] += "\n" + line
+            continue
+
         if line[0] == "[" and line.endswith("]"):
-            current = line[1:-1].strip()
+            current = section_spelling(line[1:-1].strip())
+            pending_key = None
             continue
-        separator = "=" if "=" in line else (":" if ":" in line else None)
-        if separator is None:
+
+        delimiters = []
+        for symbol in ("=", ":"):
+            index = line.find(symbol)
+            if index >= 0:
+                delimiters.append((index, symbol))
+        if not delimiters:
+            pending_key = None
             continue
+        separator = min(delimiters)[1]
         key, _, value = line.partition(separator)
-        sections.setdefault(current, {}).setdefault(key.strip(), value.strip())
+        key = key.strip()
+        if not key:
+            pending_key = None
+            continue
+        current = section_spelling(current)
+        pending_key = key_spelling(current, key)
+        sections[current][pending_key] = value.strip()
         entries += 1
 
     return sections
@@ -781,16 +855,23 @@ class _UnknownCallback(Exception):
 def _encode(frame):
     """One frame as its wire line.
 
-    ``ensure_ascii=False`` keeps non-ASCII labels readable rather than
-    expanding them into escapes, and JSON escaping is what makes a label
-    containing a newline safe on a line-delimited channel: the newline becomes
-    ``\\n`` and one frame stays one line.
+    JSON escapes non-ASCII text as well as control characters. That keeps the
+    protocol valid even when a plugin supplies a lone UTF-16 surrogate, which
+    cannot be written to a strict UTF-8 stream directly. Non-finite floats are
+    rejected because ``NaN`` and ``Infinity`` are not JSON accepted by the Rust
+    decoder.
 
     ``default=repr`` is a guard, not a feature: a plugin may put anything at
-    all in an item's data bag, and a ``TypeError`` while serialising a frame
-    would cost the request its only response.
+    all in an item's data bag, and a serialization failure must still become a
+    response frame.
     """
-    return json.dumps(frame, ensure_ascii=False, separators=(",", ":"), default=repr) + "\n"
+    return json.dumps(
+        frame,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        default=repr,
+    ) + "\n"
 
 
 def _failure(request_id, callback, log, polls, kind, exception_type, message, tb):
@@ -819,7 +900,7 @@ def _emit(frame):
     """
     try:
         line = _encode(frame)
-    except (TypeError, ValueError) as error:
+    except BaseException as error:
         line = _encode(
             _failure(
                 frame.get("id"),
@@ -951,9 +1032,24 @@ def _read_stdin(stream, pending, terminate):
     that callback is still on the stack. Queuing it behind the in-flight
     request would make cooperative termination unobservable by construction.
     """
+
+    def protocol_error(message):
+        try:
+            _REAL_STDERR.write("[err][crikey] {}\n".format(message))
+            _REAL_STDERR.flush()
+        except (OSError, ValueError):
+            pass
+        pending.put(_PROTOCOL_ERROR)
+
     while True:
         try:
-            line = stream.readline()
+            # The size limit is applied while reading, rather than after an
+            # unbounded ``readline()``, so a hostile peer cannot make the child
+            # retain an arbitrarily large unterminated line.
+            line = stream.readline(_MAX_FRAME_BYTES + 1)
+        except UnicodeDecodeError:
+            protocol_error("request line was not valid UTF-8")
+            return
         except (OSError, ValueError):
             # A closed stdin is end of input, not a failure: the host drops
             # the pipe to ask for shutdown.
@@ -963,31 +1059,42 @@ def _read_stdin(stream, pending, terminate):
             pending.put(_EOF)
             return
 
+        try:
+            line_bytes = len(line.encode("utf-8"))
+        except UnicodeError:
+            protocol_error("request line was not valid UTF-8")
+            return
+        if line_bytes > _MAX_FRAME_BYTES:
+            protocol_error(
+                "request line exceeded the {} byte protocol frame bound".format(
+                    _MAX_FRAME_BYTES
+                )
+            )
+            return
+
         stripped = line.strip()
         if not stripped:
-            continue
+            protocol_error("empty request line")
+            return
 
         try:
             frame = json.loads(stripped)
-        except ValueError:
-            _REAL_STDERR.write("[err][crikey] undecodable request line ignored\n")
-            _REAL_STDERR.flush()
-            continue
+        except Exception as error:
+            protocol_error(
+                "undecodable request line: {}".format(type(error).__name__)
+            )
+            return
         if not isinstance(frame, dict):
-            _REAL_STDERR.write("[err][crikey] request line was not an object; ignored\n")
-            _REAL_STDERR.flush()
-            continue
+            protocol_error("request line was not an object")
+            return
 
         if frame.get("callback") == _CALLBACK_SET_TERMINATE:
             payload = frame.get("payload")
             if payload is None:
                 payload = {}
             if not isinstance(payload, dict):
-                _REAL_STDERR.write(
-                    "[err][crikey] set_terminate payload was not an object; ignored\n"
-                )
-                _REAL_STDERR.flush()
-                continue
+                protocol_error("set_terminate payload was not an object")
+                return
             if payload.get("terminate", True):
                 terminate.set()
             else:
@@ -999,12 +1106,11 @@ def _read_stdin(stream, pending, terminate):
 
 def main():
     """Runs the worker until shutdown, end of stdin, or process death.
-
     Returns the process exit status. ``0`` for every orderly end: a shutdown
     request, and end of stdin — the host drops the pipe immediately after
     asking, so the two are the same event arriving in either order, and a
-    non-zero status for either would be reported to the user as a crashed
-    plugin.
+    non-zero status for an input protocol error so the host reports a broken
+    peer promptly instead of waiting for a callback timeout.
     """
     # The handshake is the first line on stdout, unconditionally, before the
     # plugin module is located: the host waits for it, and any work done first
@@ -1031,6 +1137,8 @@ def main():
         frame = pending.get()
         if frame is _EOF:
             return 0
+        if frame is _PROTOCOL_ERROR:
+            return 1
         if frame.get("callback") == _CALLBACK_SHUTDOWN:
             # No reply. The host drops stdin as it asks, and writing to a
             # stdout it has stopped reading risks a `BrokenPipeError` that

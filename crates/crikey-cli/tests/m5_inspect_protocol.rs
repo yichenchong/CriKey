@@ -708,6 +708,13 @@ fn misbehaving_fixtures_report_named_non_conformance_instead_of_crashing() {
             "non-conformant",
             "{mode} verdict{run}"
         );
+        if mode == "bad-version:2" {
+            assert_eq!(
+                field(&report, "protocol", &run),
+                "unknown",
+                "a rejected handshake must not claim the host protocol version{run}"
+            );
+        }
         assert_eq!(
             check_named(&records, check, &run).need("result", &run),
             "fail",

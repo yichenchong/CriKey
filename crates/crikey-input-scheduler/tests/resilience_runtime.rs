@@ -1576,3 +1576,33 @@ fn cancellation_notifications_drop_oldest_at_the_bound() {
     assert!(!overflowing.diagnostics().counters_saturated());
     assert_eq!(overflowing.pending(&legacy), Some(fourth));
 }
+
+#[test]
+fn failed_batch_can_be_retired_without_leaking_a_concurrency_slot() {
+    let modern = plugin("modern.failure-slot");
+    let mut scheduler = QueryScheduler::new(roomy_config());
+    scheduler.register_plugin(
+        modern.clone(),
+        PluginPolicy {
+            max_concurrent_requests: 1,
+            ..modern_prompt()
+        },
+    );
+
+    let failed = scheduler.submit_query("first", 0);
+    assert_eq!(scheduler.tick(0).len(), 1);
+    assert_eq!(
+        scheduler.record_result_batch(&modern, failed, 0, BatchCompletion::Failed, 5),
+        BatchAdmission::Accepted
+    );
+    assert_eq!(scheduler.in_flight(&modern), 1);
+    assert_eq!(
+        scheduler.complete(&modern, failed, 5),
+        CompletionOutcome::Accepted,
+        "the provider's failure path must still retire the scheduler request"
+    );
+    assert_eq!(scheduler.in_flight(&modern), 0);
+
+    let resumed = scheduler.submit_query("second", 6);
+    assert_eq!(scheduler.tick(6)[0].generation, resumed);
+}

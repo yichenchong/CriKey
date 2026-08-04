@@ -352,6 +352,40 @@ fn suspension_occurs_at_the_configured_threshold_and_is_plugin_scoped() {
     assert_zero_health(&supervisor, &healthy);
 }
 
+/// Repeated startup failures must count toward the same circuit as crashes
+/// rather than permitting an immediate restart forever. Once the configured
+/// streak is reached, the supervisor suspends the plugin and records the
+/// cooldown boundary.
+#[test]
+fn repeated_startup_failures_eventually_suspend_the_plugin() {
+    let mut supervisor = supervisor(3, Duration::from_secs(5));
+    let worker = plugin("dev.crikey.startup-loop");
+    supervisor.register(&worker).expect("registration succeeds");
+
+    supervisor.start(&worker).expect("initial startup begins");
+    for timestamp in 1..=3 {
+        supervisor
+            .record_failure(&worker, FailureKind::Startup, Duration::from_secs(timestamp))
+            .expect("startup failure is recorded");
+        if timestamp != 3 {
+            supervisor
+                .restart(&worker)
+                .expect("failed startup can be retried");
+        }
+    }
+    assert_eq!(supervisor.state(&worker), WorkerState::Suspended);
+    assert_eq!(
+        supervisor.circuit_diagnostics(&worker),
+        CircuitDiagnostics {
+            failure_streak: 3,
+            last_failure: Some(FailureKind::Startup),
+            last_failure_at: Some(Duration::from_secs(3)),
+            retry_at: Some(Duration::from_secs(8)),
+        }
+    );
+    assert_eq!(supervisor.health(&worker).startup_failures, 3);
+}
+
 #[test]
 fn cooldown_uses_the_failure_timestamp_and_recovers_at_the_exact_boundary() {
     let cooldown = Duration::from_secs(5);

@@ -6,8 +6,10 @@
 //! exit status and stdout out — and deliberately reach into no workspace library
 //! type. The plugin, its `crikey.toml` manifest and (where a dependency is
 //! involved) an offline package index are all synthesised in temp directories at
-//! test time; nothing is committed. `python3` (CPython 3.14) is spawned for
-//! real, and the binary discovers the SDK from the repo `sdk/python` dir.
+//! test time; nothing is committed. A CPython interpreter is selected by the
+//! documented discovery order (`CRIKEY_PYTHON`, configured profile, then
+//! `python3` on the path), and the binary discovers the SDK from the repo
+//! `sdk/python` dir.
 //!
 //! # The output contract (identical to `dev test-legacy-compat`)
 //!
@@ -318,14 +320,19 @@ struct Scratch {
 impl Scratch {
     fn new(label: &str) -> Self {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "crikey-m4-cli-{pid}-{ordinal}-{label}",
-            pid = std::process::id(),
-            ordinal = NEXT.fetch_add(1, Ordering::Relaxed),
-        ));
-        fs::create_dir_all(&path)
-            .unwrap_or_else(|error| panic!("could not create {}: {error}", path.display()));
-        Self { path }
+        for _ in 0..256 {
+            let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "crikey-m4-cli-{pid}-{ordinal}-{label}",
+                pid = std::process::id(),
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self { path },
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create {}: {error}", path.display()),
+            }
+        }
+        panic!("could not allocate a unique scratch directory for {label}");
     }
 
     fn subdir(&self, name: &str) -> PathBuf {
@@ -790,6 +797,10 @@ fn an_unusable_argument_list_is_refused_with_usage_status() {
         vec!["dev", "run", "--plugin"],
         vec!["dev", "run", "--plugin", ""],
         vec!["dev", "run", "--query", "foo"],
+        vec!["dev", "test", "--plugin", "--query", "foo"],
+        vec!["dev", "test", "--plugin", &plugin, "--query", "--unknown"],
+        vec!["dev", "test", "--plugin", &plugin, "--plugin=second"],
+        vec!["dev", "test", "--plugin", &plugin, "--help", "--query"],
     ];
 
     for args in rejected {

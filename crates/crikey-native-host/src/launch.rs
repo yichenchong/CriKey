@@ -275,6 +275,8 @@ pub(crate) fn configure_command(command: &mut Command, options: &WorkerOptions) 
 mod unix {
     use std::io;
     use std::os::raw::c_int;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::unix::process::CommandExt;
     use std::process::Command;
 
     use super::ResourceLimits;
@@ -305,7 +307,6 @@ mod unix {
                 // no allocation, locking, or Rust I/O.
                 #[allow(unsafe_code)]
                 unsafe {
-                    use std::os::unix::process::CommandExt;
                     command.pre_exec(move || apply_limits(limits));
                 }
             }

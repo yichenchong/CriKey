@@ -23,10 +23,6 @@ use crikey_platform::{ApplicationDiscovery, DiscoveredApplication};
 #[cfg(target_os = "windows")]
 mod win32;
 
-/// The extension a Start Menu entry needs before it is offered to the shell
-/// link object. Compared case insensitively: the filesystem is.
-const SHORTCUT_EXTENSION: &str = "lnk";
-
 /// One `.lnk` the Start Menu walk found.
 ///
 /// The shortcut is not resolved yet: this is the file, plus the name a user
@@ -195,12 +191,11 @@ fn start_menu_roots() -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// `name.lnk` and nothing else: not `name.lnk.bak`, not a bare `lnk`.
+/// `name.lnk` and nothing else: not `.lnk`, `name.lnk.bak`, or a bare `lnk`.
 fn is_shortcut(name: &OsStr) -> bool {
-    Path::new(name)
-        .extension()
-        .and_then(OsStr::to_str)
-        .is_some_and(|extension| extension.eq_ignore_ascii_case(SHORTCUT_EXTENSION))
+    const SUFFIX: &[u8] = b".lnk";
+    let bytes = name.as_encoded_bytes();
+    bytes.len() > SUFFIX.len() && bytes[bytes.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
 }
 
 /// The display name of a shortcut file: its stem, rendered for humans.
@@ -231,9 +226,9 @@ fn shortcut_name(name: &OsStr) -> String {
 ///
 /// Comparison is case insensitive because Windows paths are: `C:\Windows\`
 /// and `c:\windows\` name one directory, and a launcher that listed both would
-/// be listing the same program twice. It is also lossy, which a dedup key can
-/// afford and the retained [`PlatformPath`] cannot: the key is thrown away, the
-/// target is kept exactly as the shell reported it (spec 18.3, ADR-0007).
+/// be listing the same program twice. The key keeps the target's native units
+/// losslessly before folding case, so two paths that differ only by an invalid
+/// UTF-16 code unit are not accidentally collapsed by replacement characters.
 #[derive(Debug, Default)]
 pub struct ApplicationSet {
     applications: Vec<DiscoveredApplication>,
@@ -273,9 +268,9 @@ impl ApplicationSet {
     }
 }
 
-/// The case-folded rendering two targets are considered the same by.
+/// The lossless, case-folded rendering two Windows targets are compared by.
 fn target_key(target: &PlatformPath) -> String {
-    target.as_os_str().to_string_lossy().to_lowercase()
+    crikey_platform::encode_target(target).to_lowercase()
 }
 
 // ---------------------------------------------------------------------------

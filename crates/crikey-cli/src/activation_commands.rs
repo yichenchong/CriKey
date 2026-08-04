@@ -123,13 +123,10 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
                 help = true;
                 continue;
             }
-            "--cycles" => (
-                "--cycles",
-                remaining.next().ok_or("`--cycles` needs a value")?.as_str(),
-            ),
+            "--cycles" => ("--cycles", required_value(&mut remaining, "--cycles")?),
             "--present-mode" => (
                 "--present-mode",
-                remaining.next().ok_or("`--present-mode` needs a value")?.as_str(),
+                required_value(&mut remaining, "--present-mode")?,
             ),
             other => {
                 if let Some(value) = other.strip_prefix("--cycles=") {
@@ -171,6 +168,19 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
         return Err("`--cycles` must be at least 1: zero activations measure nothing".to_owned());
     }
     Ok(Request::Run { cycles, vsync })
+}
+
+fn required_value<'a>(remaining: &mut std::slice::Iter<'a, String>, option: &str) -> Result<&'a str, String> {
+    let value = remaining
+        .next()
+        .map(String::as_str)
+        .ok_or_else(|| format!("`{option}` needs a value"))?;
+    if value.starts_with('-') {
+        return Err(format!(
+            "`{option}` needs a value, got flag-like argument `{value}`"
+        ));
+    }
+    Ok(value)
 }
 
 /// One frame to present. Content is irrelevant to the timing; what matters is
@@ -424,7 +434,8 @@ fn report_lines(requested_cycles: usize, vsync: bool, snapshot: &ActivationLaten
 /// failure of the §25.1 target rather than of the harness. Both are reported as
 /// non-zero exits so a scripted run cannot record a pass it did not earn.
 fn verdict(requested_cycles: usize, snapshot: &ActivationLatencySnapshot) -> Option<String> {
-    if snapshot.total_samples < requested_cycles as u64 {
+    let requested_samples = u64::try_from(requested_cycles).unwrap_or(u64::MAX);
+    if snapshot.total_samples < requested_samples {
         return Some(format!(
             "only {taken} warm samples were recorded for {requested_cycles} requested cycles",
             taken = snapshot.total_samples
@@ -589,5 +600,10 @@ mod tests {
     fn help_does_not_hide_unknown_activation_options() {
         let args = vec!["--help".to_owned(), "--unknown".to_owned()];
         assert!(parse_args(&args).is_err());
+    }
+    #[test]
+    fn separate_option_values_cannot_consume_the_next_flag() {
+        assert!(parse_args(&["--cycles".to_owned(), "--present-mode".to_owned()]).is_err());
+        assert!(parse_args(&["--present-mode".to_owned(), "--help".to_owned()]).is_err());
     }
 }

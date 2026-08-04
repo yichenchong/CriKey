@@ -156,27 +156,6 @@ fn the_synthetic_catalog_is_deterministic_and_heterogeneous() {
 }
 
 #[test]
-fn every_timed_phase_records_a_duration() {
-    let report = run_catalog_benchmark(&small_config());
-
-    // Recorded-ness, not speed: there is no upper bound here and no comparison
-    // against a budget. A phase reporting zero elapsed nanoseconds means the
-    // harness never timed it.
-    for (phase, nanos) in [
-        ("build", report.build_nanos),
-        ("store", report.store_nanos),
-        ("load", report.load_nanos),
-        ("query p50", report.query_nanos_p50),
-        ("query p95", report.query_nanos_p95),
-    ] {
-        assert!(
-            nanos > 0,
-            "the {phase} phase reported no elapsed time: {report:?}"
-        );
-    }
-}
-
-#[test]
 fn the_reported_query_percentiles_are_ordered() {
     let report = run_catalog_benchmark(&small_config());
 

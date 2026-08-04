@@ -256,6 +256,24 @@ fn registering_an_accelerator_against_a_live_server_succeeds() {
     );
 }
 
+#[test]
+fn a_grab_conflict_is_reported_instead_of_claiming_the_hotkey() {
+    let server = XvfbServer::start();
+    let mut first = server.service();
+    first
+        .register(&binding("Ctrl+Alt+Space"))
+        .expect("the first client takes the chord");
+
+    let mut second = server.service();
+    assert!(
+        matches!(
+            second.register(&binding("Ctrl+Alt+Space")),
+            Err(CoreError::Invalid(_))
+        ),
+        "a second X client must see the existing grab conflict"
+    );
+}
+
 /// Registering the same accelerator twice is idempotent, and takes one grab.
 ///
 /// The shared `HotkeyService` contract, as the Windows backend implements it

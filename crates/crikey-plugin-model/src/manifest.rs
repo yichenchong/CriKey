@@ -63,7 +63,13 @@ impl Manifest {
         self.plugin
             .entrypoint
             .get(&key)
-            .or_else(|| self.plugin.entrypoint.get("any"))
+            .filter(|entrypoint| !entrypoint.trim().is_empty())
+            .or_else(|| {
+                self.plugin
+                    .entrypoint
+                    .get("any")
+                    .filter(|entrypoint| !entrypoint.trim().is_empty())
+            })
             .map(String::as_str)
             .ok_or_else(|| ManifestError::NoEntrypoint {
                 os: os.into(),
@@ -155,7 +161,7 @@ fn normalize_oversized_query_integers(text: &str) -> Option<(String, OversizedQu
 
 fn oversized_decimal(text: &str) -> Option<u64> {
     let digits = text.strip_prefix('+').unwrap_or(text);
-    if digits.is_empty() {
+    if digits.is_empty() || (digits.len() > 1 && digits.starts_with('0')) {
         return None;
     }
 

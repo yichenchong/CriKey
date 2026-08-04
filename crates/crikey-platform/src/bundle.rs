@@ -73,11 +73,25 @@ pub fn parse_info_plist(xml: &str) -> Option<AppBundle> {
     }
     const ROOT: usize = 0;
     let dict = direct_child(&events, ROOT, "dict")?;
+    let mut after_dict = skip_element(&events, dict);
+    while matches!(
+        events.get(after_dict),
+        Some(Event::Text(text) | Event::Cdata(text)) if text.trim().is_empty()
+    ) {
+        after_dict += 1;
+    }
+    if !matches!(events.get(after_dict), Some(Event::End("plist"))) {
+        return None;
+    }
 
     let mut display_name = None;
     let mut name = None;
     let mut bundle_id = None;
     let mut executable = None;
+    let mut display_name_seen = false;
+    let mut name_seen = false;
+    let mut bundle_id_seen = false;
+    let mut executable_seen = false;
 
     let mut index = dict + 1;
     while index < events.len() {
@@ -87,30 +101,35 @@ pub fn parse_info_plist(xml: &str) -> Option<AppBundle> {
                 name: "key",
                 empty: false,
             } => {
-                let key = element_text(&events, index);
+                let key = element_text(&events, index)?;
                 index = skip_element(&events, index);
                 // Whitespace between the key and its value is ordinary
-                // formatting; anything else ends the pair.
-                while matches!(events.get(index), Some(Event::Text(_) | Event::Cdata(_))) {
+                // formatting; any other text makes the dictionary malformed.
+                while matches!(
+                    events.get(index),
+                    Some(Event::Text(text) | Event::Cdata(text)) if text.trim().is_empty()
+                ) {
                     index += 1;
                 }
                 let Some(Event::Start { name: tag, empty }) = events.get(index).copied() else {
-                    break;
+                    return None;
                 };
                 // Only a string element carries a value; every other type is
                 // skipped whole, leaving the field absent.
-                let value = (tag == "string").then(|| {
+                let value = if tag == "string" {
                     if empty {
-                        String::new()
+                        Some(String::new())
                     } else {
                         element_text(&events, index)
                     }
-                });
-                let slot = match key.as_str() {
-                    DISPLAY_NAME_KEY => &mut display_name,
-                    BUNDLE_NAME_KEY => &mut name,
-                    IDENTIFIER_KEY => &mut bundle_id,
-                    EXECUTABLE_KEY => &mut executable,
+                } else {
+                    None
+                };
+                let (slot, seen) = match key.as_str() {
+                    DISPLAY_NAME_KEY => (&mut display_name, &mut display_name_seen),
+                    BUNDLE_NAME_KEY => (&mut name, &mut name_seen),
+                    IDENTIFIER_KEY => (&mut bundle_id, &mut bundle_id_seen),
+                    EXECUTABLE_KEY => (&mut executable, &mut executable_seen),
                     _ => {
                         index = skip_element(&events, index);
                         continue;
@@ -118,7 +137,11 @@ pub fn parse_info_plist(xml: &str) -> Option<AppBundle> {
                 };
                 // A duplicate key is malformed input; the first spelling wins
                 // so the result does not depend on how far the parser read.
-                if slot.is_none() {
+                // Track that first spelling separately from the optional
+                // value: an empty or non-string first value must not let a
+                // later duplicate silently replace it.
+                if !*seen {
+                    *seen = true;
                     *slot = value.filter(|value| !value.is_empty());
                 }
                 index = skip_element(&events, index);
@@ -372,32 +395,40 @@ fn skip_element(events: &[Event<'_>], start: usize) -> usize {
     events.len()
 }
 
-/// The index of the first direct child of `parent` named `name`.
+/// The first direct child of `parent`, if it has the requested name.
+///
+/// A plist root has exactly one payload element.  Skipping only formatting
+/// text here prevents a decoy dictionary after another element from becoming
+/// the document's payload.
 fn direct_child(events: &[Event<'_>], parent: usize, name: &str) -> Option<usize> {
     let mut index = parent + 1;
     while index < events.len() {
         match events[index] {
             Event::End(_) => return None,
-            Event::Start { name: tag, .. } if tag == name => return Some(index),
-            Event::Start { .. } => index = skip_element(events, index),
-            _ => index += 1,
+            Event::Text(text) | Event::Cdata(text) if text.trim().is_empty() => index += 1,
+            Event::Start { name: tag, .. } => return (tag == name).then_some(index),
+            Event::Text(_) | Event::Cdata(_) => return None,
         }
     }
     None
 }
 
 /// The character data of the element starting at `start`, entities expanded.
-fn element_text(events: &[Event<'_>], start: usize) -> String {
+///
+/// A plist scalar cannot contain another element. Rejecting nested markup here
+/// prevents malformed `<string>` or `<key>` values from being silently flattened
+/// into a different, valid-looking string.
+fn element_text(events: &[Event<'_>], start: usize) -> Option<String> {
     let end = skip_element(events, start);
     let mut text = String::new();
-    for event in &events[start + 1..end] {
+    for event in &events[start + 1..end - 1] {
         match event {
             Event::Text(run) => push_decoded(&mut text, run),
             Event::Cdata(run) => text.push_str(run),
-            _ => {}
+            Event::Start { .. } | Event::End(_) => return None,
         }
     }
-    text
+    Some(text)
 }
 
 /// The longest entity body this subset can decode, counted in bytes between

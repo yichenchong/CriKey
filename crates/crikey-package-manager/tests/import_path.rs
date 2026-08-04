@@ -64,6 +64,31 @@ fn assemble_with_no_packaged_modules_still_keeps_source_env_sdk_in_order() {
 }
 
 #[test]
+fn assemble_omits_duplicate_paths_without_changing_precedence_order() {
+    let shared = PathBuf::from("/plugins/shared");
+    let managed = env("/cache/env/site");
+    let import_path = ImportPath::assemble(
+        &shared,
+        &[
+            shared.clone(),
+            managed.site_dir.clone(),
+            PathBuf::from("/plugins/other"),
+        ],
+        &managed,
+        Path::new("/opt/crikey/sdk"),
+    );
+    assert_eq!(
+        import_path.entries,
+        vec![
+            shared,
+            managed.site_dir,
+            PathBuf::from("/plugins/other"),
+            PathBuf::from("/opt/crikey/sdk"),
+        ]
+    );
+}
+
+#[test]
 fn to_pythonpath_joins_entries_with_the_os_path_list_separator() {
     let plugin_source = Path::new("/plugins/acme/src");
     let packaged = vec![PathBuf::from("/plugins/acme/vendored")];
@@ -135,4 +160,18 @@ fn to_pythonpath_reports_a_component_containing_the_platform_separator() {
         }
         other => panic!("separator failure must be InvalidImportPath, got {other:?}"),
     }
+}
+
+#[test]
+fn to_pythonpath_rejects_empty_components_instead_of_importing_the_current_directory() {
+    let import_path = ImportPath {
+        entries: vec![PathBuf::new()],
+    };
+    let error = import_path
+        .to_pythonpath()
+        .expect_err("an empty component would expose the process current directory");
+    assert!(
+        matches!(error, PackageError::InvalidImportPath(_)),
+        "empty components are invalid import paths, got {error:?}"
+    );
 }

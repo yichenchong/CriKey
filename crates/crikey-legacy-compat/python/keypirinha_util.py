@@ -29,6 +29,8 @@ nothing here performs network I/O.
 """
 
 import enum
+import ctypes
+
 import fnmatch
 import os
 import shutil
@@ -63,6 +65,9 @@ _MAX_SCAN_RESULTS = 100_000
 #: clipboard is a user-visible, fixed-purpose channel, not a data pipe, and an
 #: unbounded write here would be an unbounded subprocess argument.
 _MAX_CLIPBOARD_CHARS = 1 << 20
+
+#: Maximum time a desktop helper may keep the worker blocked.
+_HELPER_TIMEOUT_SECONDS = 10.0
 
 #: Characters that force :func:`cmdline_quote` to quote an argument. A bare
 #  backslash is *not* one of them: `C:\\dir` needs no quoting and quoting it
@@ -471,7 +476,8 @@ def _run_helper(operation, argv, stdin_text=None, capture=False):
 
     Explicit return-code checking rather than ``check=True``: a
     ``CalledProcessError`` escaping from here is an exception a plugin's
-    ``except OSError`` misses and its bare ``except`` misattributes.
+    ``except OSError`` misses and its bare ``except`` misattributes. A finite
+    timeout keeps a wedged clipboard or browser helper from pinning the worker.
     """
     try:
         completed = subprocess.run(
@@ -480,8 +486,18 @@ def _run_helper(operation, argv, stdin_text=None, capture=False):
             stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_HELPER_TIMEOUT_SECONDS,
             check=False,
         )
+    except subprocess.TimeoutExpired:
+        raise UnavailableError(
+            operation,
+            "the desktop helper {!r} exceeded the {} second timeout".format(
+                argv[0], _HELPER_TIMEOUT_SECONDS
+            ),
+        ) from None
     except OSError as error:
         raise UnavailableError(
             operation,
@@ -497,6 +513,8 @@ def _run_helper(operation, argv, stdin_text=None, capture=False):
 
 def set_clipboard(text):
     """Replaces the desktop clipboard's text content."""
+    if not isinstance(text, str):
+        raise TypeError("clipboard text must be a string")
     _require_desktop("set_clipboard")
     if len(text) > _MAX_CLIPBOARD_CHARS:
         raise UnavailableError(
@@ -633,8 +651,6 @@ _SE_ERROR_CEILING = 32
 
 
 def _win32():
-    import ctypes
-
     return ctypes
 
 
@@ -643,24 +659,51 @@ def _win32_set_clipboard(text):
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+    user32.OpenClipboard.argtypes = (ctypes.c_void_p,)
+    user32.OpenClipboard.restype = ctypes.c_int
+    user32.EmptyClipboard.argtypes = ()
+    user32.EmptyClipboard.restype = ctypes.c_int
+    user32.SetClipboardData.argtypes = (ctypes.c_uint, ctypes.c_void_p)
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.CloseClipboard.argtypes = ()
+    user32.CloseClipboard.restype = ctypes.c_int
+    kernel32.GlobalAlloc.argtypes = (ctypes.c_uint, ctypes.c_size_t)
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalUnlock.restype = ctypes.c_int
+    kernel32.GlobalFree.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalFree.restype = ctypes.c_void_p
+
     if not user32.OpenClipboard(None):
         raise UnavailableError(
             "set_clipboard", "the clipboard is locked by another process"
         )
+    handle = None
     try:
-        user32.EmptyClipboard()
+        if not user32.EmptyClipboard():
+            raise UnavailableError("set_clipboard", "EmptyClipboard refused the request")
         size = (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
-        handle = kernel32.GlobalAlloc(_GMEM_MOVEABLE, ctypes.c_size_t(size))
+        handle = kernel32.GlobalAlloc(_GMEM_MOVEABLE, size)
         if not handle:
             raise UnavailableError("set_clipboard", "the clipboard allocation failed")
         buffer = kernel32.GlobalLock(handle)
+        if not buffer:
+            kernel32.GlobalFree(handle)
+            handle = None
+            raise UnavailableError("set_clipboard", "the clipboard allocation could not be locked")
         try:
             ctypes.memmove(buffer, ctypes.create_unicode_buffer(text), size)
         finally:
             kernel32.GlobalUnlock(handle)
         if not user32.SetClipboardData(_CF_UNICODETEXT, handle):
             raise UnavailableError("set_clipboard", "SetClipboardData refused the text")
+        # Ownership transfers to the clipboard after a successful call.
+        handle = None
     finally:
+        if handle:
+            kernel32.GlobalFree(handle)
         user32.CloseClipboard()
 
 
@@ -668,6 +711,19 @@ def _win32_get_clipboard():
     ctypes = _win32()
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    user32.IsClipboardFormatAvailable.argtypes = (ctypes.c_uint,)
+    user32.IsClipboardFormatAvailable.restype = ctypes.c_int
+    user32.OpenClipboard.argtypes = (ctypes.c_void_p,)
+    user32.OpenClipboard.restype = ctypes.c_int
+    user32.GetClipboardData.argtypes = (ctypes.c_uint,)
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    user32.CloseClipboard.argtypes = ()
+    user32.CloseClipboard.restype = ctypes.c_int
+    kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalUnlock.restype = ctypes.c_int
 
     if not user32.IsClipboardFormatAvailable(_CF_UNICODETEXT):
         # Not a failure: a clipboard holding an image simply has no text.
@@ -681,6 +737,8 @@ def _win32_get_clipboard():
         if not handle:
             return ""
         buffer = kernel32.GlobalLock(handle)
+        if not buffer:
+            raise UnavailableError("get_clipboard", "the clipboard data could not be locked")
         try:
             return ctypes.c_wchar_p(buffer).value or ""
         finally:
@@ -692,6 +750,15 @@ def _win32_get_clipboard():
 def _win32_shell_execute(operation, target, args, working_dir, verb):
     ctypes = _win32()
     shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.ShellExecuteW.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+    )
+    shell32.ShellExecuteW.restype = ctypes.c_void_p
     result = shell32.ShellExecuteW(
         None,
         ctypes.c_wchar_p(verb or None),
@@ -700,7 +767,7 @@ def _win32_shell_execute(operation, target, args, working_dir, verb):
         ctypes.c_wchar_p(working_dir or None),
         _SW_SHOWNORMAL,
     )
-    if result <= _SE_ERROR_CEILING:
+    if not result or result <= _SE_ERROR_CEILING:
         raise UnavailableError(
             operation, "ShellExecuteW failed with code {}".format(result)
         )
@@ -712,6 +779,15 @@ def _win32_explore_file(path):
         _win32_shell_execute("explore_file", path, "", "", "explore")
         return
     shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.ShellExecuteW.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+    )
+    shell32.ShellExecuteW.restype = ctypes.c_void_p
     # `/select,<path>` must reach explorer.exe as one unquoted argument:
     # Explorer parses this argument itself and rejects a quoted form.
     result = shell32.ShellExecuteW(
@@ -722,7 +798,7 @@ def _win32_explore_file(path):
         None,
         _SW_SHOWNORMAL,
     )
-    if result <= _SE_ERROR_CEILING:
+    if not result or result <= _SE_ERROR_CEILING:
         raise UnavailableError(
             "explore_file", "ShellExecuteW failed with code {}".format(result)
         )

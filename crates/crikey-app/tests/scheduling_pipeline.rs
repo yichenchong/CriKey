@@ -151,12 +151,11 @@
 //! }
 //! ```
 //!
-//! Ranking at this boundary does **not** re-match plugin answers against the
-//! query: a plugin that answered `2+2` with `4` has already decided relevance,
-//! and re-matching would delete it. The pipeline orders the aggregated set by
-//! [`Item::score_hint`], strongest first, *stably*, so equal hints keep
-//! first-acceptance order and rows do not move under the selection
-//! (spec 11.5, 11.6).
+//! Ranking at this boundary does **not** re-match or reorder plugin answers:
+//! a plugin that answered `2+2` with `4` has already decided relevance, and
+//! re-matching would delete it. The pipeline preserves first-acceptance order
+//! for the aggregated set, so rows do not move under selection (spec 11.5,
+//! 11.6).
 
 use std::collections::BTreeMap;
 
@@ -384,9 +383,8 @@ struct PluginScript {
     final_batch_after: Millis,
     /// Items in every batch this worker sends.
     items_per_batch: usize,
-    /// Score hint of this worker's strongest item; later items step down by
-    /// one. Ranking order across workers is therefore decided by the fixture
-    /// rather than by arrival order.
+    /// Score hint varied across workers so an accidental host-side sort is
+    /// observable in the ordering assertions.
     top_score_hint: i32,
     /// Keeps answering for a generation the host already cancelled (§31.6).
     ignores_cancellation: bool,
@@ -1123,8 +1121,8 @@ fn fast_plugin_rows_are_presented_while_the_slow_plugin_is_still_running() {
     let early_at = early.at;
     let early_rows = early.rows.len();
 
-    // Let the slow plugin land. Its items outrank everyone else's, so its
-    // arrival is observable as a reorder rather than merely as extra rows.
+    // The slow plugin lands later. Its items are appended after the earlier
+    // answers rather than being host-ranked ahead of them.
     run_until(
         &mut pipeline,
         &mut fleet,
@@ -1140,14 +1138,14 @@ fn fast_plugin_rows_are_presented_while_the_slow_plugin_is_still_running() {
     );
     assert_eq!(
         settled.owners.first().map(String::as_str),
-        Some(short_name(&slow)),
-        "ranking ignored score_hint when the strongest answer arrived: {:?}",
+        Some(short_name(&fast)),
+        "plugin batches preserve first-acceptance order instead of host ranking: {:?}",
         settled.owners
     );
     assert!(
         settled.owners.iter().any(|owner| owner == short_name(&fast))
             && settled.owners.iter().any(|owner| owner == short_name(&legacy)),
-        "reranking dropped answers that had already been accepted: {:?}",
+        "accepted plugin batches must all remain visible: {:?}",
         settled.owners
     );
     assert!(
@@ -1757,6 +1755,99 @@ fn an_empty_tick_does_not_spend_the_same_timestamp_presentation_drain() {
             at,
         } if owner == &plugin && *traced == generation && *at == START
     )));
+}
+
+#[test]
+fn a_new_generation_can_drain_a_same_timestamp_batch_after_previous_drain() {
+    let mut pipeline = QueryPipeline::new(config());
+    let plugin = plugin_id("dev.crikey.same-timestamp-generation");
+    pipeline
+        .register_plugin(plugin.clone(), immediate_policy())
+        .expect("plugin registers");
+    let script = PluginScript::prompt(0, 1, 10);
+
+    let first = pipeline.keystroke("first", START);
+    assert_eq!(pipeline.tick(START).dispatches.len(), 1);
+    pipeline
+        .deliver(
+            ResultBatch {
+                generation: first,
+                plugin: plugin.clone(),
+                state: BatchState::Final,
+                items: scripted_items(&plugin, first, 0, &script),
+            },
+            START,
+        )
+        .expect("first result enters intake");
+    assert_eq!(
+        pipeline.complete(&plugin, first, START),
+        CompletionOutcome::Accepted
+    );
+    assert_eq!(
+        pipeline
+            .present(START)
+            .expect("first result is presented")
+            .generation,
+        first
+    );
+
+    let second = pipeline.keystroke("second", START);
+    assert!(second > first);
+    assert_eq!(pipeline.tick(START).dispatches.len(), 1);
+    pipeline
+        .deliver(
+            ResultBatch {
+                generation: second,
+                plugin: plugin.clone(),
+                state: BatchState::Final,
+                items: scripted_items(&plugin, second, 0, &script),
+            },
+            START,
+        )
+        .expect("same-timestamp second result enters intake");
+    assert_eq!(
+        pipeline.complete(&plugin, second, START),
+        CompletionOutcome::Accepted
+    );
+
+    let frame = pipeline
+        .present(START)
+        .expect("a new generation must drain its result at the same timestamp");
+    assert_eq!(frame.generation, second);
+    assert_eq!(frame.rows.len(), 1);
+    assert_eq!(row_generation(&frame.rows[0]), second.get());
+}
+
+#[test]
+fn a_late_result_after_plugin_shutdown_is_rejected_without_panicking() {
+    let mut pipeline = QueryPipeline::new(config());
+    let plugin = plugin_id("dev.crikey.late-result");
+    pipeline
+        .register_plugin(plugin.clone(), immediate_policy())
+        .expect("plugin registers");
+
+    let generation = pipeline.keystroke("shutdown", START);
+    assert_eq!(pipeline.tick(START).dispatches.len(), 1);
+    assert!(pipeline.unregister_plugin(&plugin), "shutdown removes the plugin");
+
+    let error = pipeline
+        .deliver(
+            ResultBatch {
+                generation,
+                plugin,
+                state: BatchState::Final,
+                items: Vec::new(),
+            },
+            START,
+        )
+        .expect_err("a result from a stopped provider must be rejected");
+    assert!(matches!(
+        error,
+        PipelineError::QueueRejected {
+            reason: QueueReject::Unregistered,
+            ..
+        }
+    ));
 }
 
 #[test]

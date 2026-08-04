@@ -44,4 +44,6 @@ jobs:
           python-version: "3.12"
       - name: Compile Python sources
         # setup-python places the selected 3.12 interpreter first on PATH.
-        run: python -m compileall -q sdk/python crates/crikey-legacy-compat/python
+        # Include the tracked synthetic legacy plugins as well as the two
+        # interpreter workers; every repository-owned Python source is checked.
+        run: python -m compileall -q sdk/python crates/crikey-legacy-compat/python compatibility/test-plugins

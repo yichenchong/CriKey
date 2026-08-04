@@ -80,7 +80,12 @@ impl WorkerPool {
                 && pooled.entrypoint == options.entrypoint
                 && pooled.import_path == options.import_path
         }) {
-            return Ok(&mut self.workers[index].worker);
+            if self.workers[index].worker.is_alive() {
+                return Ok(&mut self.workers[index].worker);
+            }
+            // A failed call has already stopped and reaped this process. Do
+            // not return a permanently dead worker to the next request.
+            self.workers.swap_remove(index);
         }
 
         let entrypoint = options.entrypoint.clone();
@@ -96,7 +101,8 @@ impl WorkerPool {
         Ok(&mut self.workers.last_mut().expect("a worker was just pushed").worker)
     }
 
-    /// How many live worker processes the pool currently owns.
+    /// Number of keyed worker entries, including a stopped worker until the next
+    /// lookup replaces it.
     pub fn worker_count(&self) -> usize {
         self.workers.len()
     }

@@ -835,6 +835,22 @@ fn a_window_without_a_title_is_still_enumerated() {
         "the scan must continue past a window with no readable properties"
     );
 }
+#[test]
+fn a_net_wm_name_with_the_wrong_type_falls_back_to_wm_name() {
+    let (server, fixture) = ewmh_server();
+    let window = fixture.create_window();
+    fixture.set_text(
+        window,
+        fixture.net_wm_name,
+        AtomEnum::STRING.into(),
+        b"wrong type",
+    );
+    fixture.set_wm_name(window, b"fallback title");
+    fixture.publish_client_list(&[window]);
+
+    let infos = server.service().enumerate().expect("enumerating");
+    assert_eq!(find(&infos, window).title, "fallback title");
+}
 
 /// A destroyed window still listed by the manager is omitted, and the rest of
 /// the scan survives.

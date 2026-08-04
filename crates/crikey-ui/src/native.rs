@@ -16,7 +16,7 @@ use thiserror::Error;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, KeyEvent, WindowEvent},
+    event::{ElementState, Ime, KeyEvent, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
     window::{Window, WindowId, WindowLevel},
@@ -383,6 +383,22 @@ impl SharedState {
         }
     }
 
+    /// Retires the pending wake for `session` without touching the frame it
+    /// announced.
+    ///
+    /// A wake is a promise that exactly one `FrameReady` is on its way, and
+    /// `submit_frame` stays silent while that promise is outstanding. Whoever
+    /// consumes the `FrameReady` must therefore retire the promise even when
+    /// it has no frame to draw, otherwise the mailbox is left permanently
+    /// "already woken" and every later submission for that session is stored
+    /// but never announced.
+    fn acknowledge_wake(&self, session: u64) {
+        let mut mailbox = lock_recover(&self.frames);
+        if mailbox.wake_session == Some(session) {
+            mailbox.wake_session = None;
+        }
+    }
+
     fn clear_all_frames(&self) {
         let mut mailbox = lock_recover(&self.frames);
         mailbox.latest = None;
@@ -657,6 +673,9 @@ struct NativeApplication<F> {
     active_session: Option<u64>,
     pending_activation: Option<Instant>,
     modifiers: ModifiersState,
+    /// True while an input method is building a character out of several key
+    /// presses. Those presses belong to the composition, not to the launcher.
+    composing: bool,
     next_repaint: Option<Instant>,
     consecutive_surface_retries: u32,
     on_event: F,
@@ -679,6 +698,7 @@ where
             active_session: None,
             pending_activation: None,
             modifiers: ModifiersState::default(),
+            composing: false,
             next_repaint: None,
             consecutive_surface_retries: 0,
             on_event,
@@ -734,6 +754,9 @@ where
         }
         self.frame = None;
         self.pending_activation = None;
+        // Hiding disables the input method, so a half-built character does not
+        // survive into the next activation.
+        self.composing = false;
         self.next_repaint = None;
         self.consecutive_surface_retries = 0;
     }
@@ -878,8 +901,18 @@ where
                 }
             }
             NativeEvent::FrameReady { session } => {
-                if self.active_session == Some(session) && self.accept_latest_frame(session, true) {
-                    self.request_redraw();
+                if self.active_session == Some(session) {
+                    if self.accept_latest_frame(session, true) {
+                        self.request_redraw();
+                    }
+                } else {
+                    // The frame belongs to a session this thread has not
+                    // activated yet (a submission can overtake its own
+                    // `Activate`) or to one it has already left. Either way the
+                    // wake this event carried is spent and must be retired, or
+                    // the next submission for that session never wakes the
+                    // loop and the list stops updating.
+                    self.shared.acknowledge_wake(session);
                 }
             }
             NativeEvent::RepaintAfter(delay) => self.schedule_repaint(delay),
@@ -910,7 +943,7 @@ where
                 event,
                 is_synthetic: false,
                 ..
-            } if self.active_session.is_some() => {
+            } if self.active_session.is_some() && !self.composing => {
                 translate_keyboard(event, self.modifiers, self.frame.as_ref())
             }
             _ => None,
@@ -940,6 +973,15 @@ where
         match event {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
+            }
+            // Enter commits a composition and Escape abandons one, so while an
+            // input method owns the keyboard those keys are its own and must
+            // not also run the selected result or close the launcher.
+            WindowEvent::Ime(ime) => {
+                self.composing = match ime {
+                    Ime::Preedit(text, _) => !text.is_empty(),
+                    Ime::Enabled | Ime::Commit(_) | Ime::Disabled => false,
+                };
             }
             WindowEvent::KeyboardInput { .. } => {
                 if let Some(command) = command {
@@ -1095,6 +1137,11 @@ impl GraphicsState {
             .map_err(|_| RendererError::NoSurfaceFormat)?;
         let alpha_mode = preferred_alpha_mode(&capabilities.alpha_modes, transparent)
             .ok_or(RendererError::NoSurfaceAlphaMode)?;
+        // A surface that advertises only `Opaque` ignores the alpha channel
+        // altogether, so a transparent canvas would be composited as solid
+        // black instead of disappearing. Draw the opaque theme in that case, so
+        // the window, the surface and the frame keep agreeing.
+        let transparent = transparent && alpha_mode != wgpu::CompositeAlphaMode::Opaque;
         let size = window.inner_size();
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1359,9 +1406,24 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
             );
             response.request_focus();
             if response.changed() {
+                flatten_line_breaks(&mut query);
                 commands.push(UiCommand::SetQuery(query));
             }
         });
+}
+
+/// Collapses the line breaks a paste can smuggle into the query field.
+///
+/// A single-line `TextEdit` only stops the Enter key; a clipboard paste is
+/// inserted verbatim, so pasting several lines leaves real line breaks in text
+/// the rest of the launcher treats as one line and hands to plugins as a search
+/// string. Each break becomes one space, which keeps every following character
+/// at the position the text cursor already points at, and the string is only
+/// rebuilt when there is something to replace.
+fn flatten_line_breaks(text: &mut String) {
+    if text.contains(['\n', '\r']) {
+        *text = text.replace(['\n', '\r'], " ");
+    }
 }
 
 fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
@@ -1423,7 +1485,7 @@ fn draw_result_row(
     } else {
         Stroke::new(1.0_f32, colors.border)
     };
-    Frame::default()
+    let frame = Frame::default()
         .fill(fill)
         .stroke(stroke)
         .rounding(Rounding::same(theme::RADIUS_SMALL))
@@ -1446,7 +1508,11 @@ fn draw_result_row(
                                 .color(colors.text_muted),
                         );
                         if !row.plugin_name.is_empty() {
-                            ui.label(RichText::new("/").size(theme::TEXT_SMALL).color(colors.border));
+                            ui.label(
+                                RichText::new("/")
+                                    .size(theme::TEXT_SMALL)
+                                    .color(colors.text_muted),
+                            );
                             ui.label(
                                 RichText::new(&row.plugin_name)
                                     .size(theme::TEXT_SMALL)
@@ -1477,6 +1543,12 @@ fn draw_result_row(
                 }
             });
         });
+    if selected {
+        // Keyboard navigation can walk the selection past the bottom of the
+        // visible list; `None` scrolls the least amount that brings the row
+        // back into view and does nothing at all once it is already visible.
+        frame.response.scroll_to_me(None);
+    }
 }
 
 fn display_label(row: &ResultRow) -> &str {
@@ -1599,17 +1671,21 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, colors: theme::Palette) {
 }
 
 fn clear_color(transparent: bool) -> wgpu::Color {
+    // A transparent surface is composited premultiplied, where the colour
+    // channels are already scaled by alpha: at alpha zero every other channel
+    // must be zero too, or the desktop showing through gets the canvas colour
+    // added on top of it instead of being left alone.
+    if transparent {
+        return wgpu::Color::TRANSPARENT;
+    }
+
     let [red, green, blue, alpha] = theme::palette().canvas.to_array();
     const BYTE_MAX: f64 = u8::MAX as f64;
     wgpu::Color {
         r: f64::from(red) / BYTE_MAX,
         g: f64::from(green) / BYTE_MAX,
         b: f64::from(blue) / BYTE_MAX,
-        a: if transparent {
-            0.0
-        } else {
-            f64::from(alpha) / BYTE_MAX
-        },
+        a: f64::from(alpha) / BYTE_MAX,
     }
 }
 
@@ -1670,8 +1746,32 @@ mod transparency_tests {
 
     #[test]
     fn clear_color_tracks_the_selected_alpha_mode() {
-        assert_eq!(clear_color(false).a, 1.0);
-        assert_eq!(clear_color(true).a, 0.0);
+        let opaque = clear_color(false);
+        let canvas = theme::palette().canvas;
+        assert_eq!(opaque.a, 1.0);
+        assert_eq!(opaque.r, f64::from(canvas.r()) / 255.0);
+
+        // Premultiplied compositing adds the clear colour straight onto the
+        // desktop, so a transparent canvas must be zero in every channel and
+        // not merely zero in alpha.
+        assert_eq!(clear_color(true), wgpu::Color::TRANSPARENT);
+    }
+
+    #[test]
+    fn a_pasted_line_break_cannot_reach_the_query() {
+        let mut pasted = "first\r\nsecond\nthird".to_owned();
+        let characters = pasted.chars().count();
+
+        flatten_line_breaks(&mut pasted);
+
+        assert_eq!(pasted, "first  second third");
+        // One space per break keeps every later character at the offset the
+        // text cursor already points at.
+        assert_eq!(pasted.chars().count(), characters);
+
+        let mut clean = "already one line".to_owned();
+        flatten_line_breaks(&mut clean);
+        assert_eq!(clean, "already one line");
     }
 }
 
@@ -1701,6 +1801,39 @@ mod lifecycle_tests {
         state.restore_visible(first);
 
         assert!(state.is_visible_session(second));
+    }
+
+    /// A `FrameReady` that finds nothing to draw still spends the wake it
+    /// carried. If the wake outlived it, `submit_frame` would keep believing a
+    /// wake-up was already on its way and the loop would stop being told about
+    /// new frames, while the frame itself must survive so the activation that
+    /// is still on its way can pick it up.
+    #[test]
+    fn acknowledging_a_wake_retires_it_without_dropping_the_frame() {
+        let state = SharedState::default();
+        {
+            let mut mailbox = lock_recover(&state.frames);
+            mailbox.latest = Some(PendingFrame {
+                session: 7,
+                model: ViewModel {
+                    generation: crikey_core::Generation::ZERO,
+                    query: String::new(),
+                    rows: Arc::default(),
+                    selected: 0,
+                    pending_plugins: false,
+                    actions_open: false,
+                },
+            });
+            mailbox.wake_session = Some(7);
+        }
+
+        state.acknowledge_wake(6);
+        assert_eq!(lock_recover(&state.frames).wake_session, Some(7));
+
+        state.acknowledge_wake(7);
+        let mailbox = lock_recover(&state.frames);
+        assert_eq!(mailbox.wake_session, None);
+        assert!(mailbox.latest.is_some());
     }
 }
 

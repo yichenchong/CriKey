@@ -199,6 +199,19 @@ fn a_maximum_wait_requires_a_nonzero_debounce() {
     }
 }
 
+/// Builtin providers inherit an immediate (zero-debounce) dispatch policy.
+/// A maximum wait must still be rejected when debounce is omitted; otherwise
+/// the declaration is accepted and then discarded by `query_policy`.
+#[test]
+fn a_builtin_maximum_wait_without_debounce_is_rejected() {
+    let error = reject("builtin", "[query]\nmaximum-wait-ms = 50\n");
+    assert_invalid(&error, "query.maximum-wait-ms", PolicyProblem::Contradictory);
+    assert!(
+        error.to_string().contains("effective debounce period of 0"),
+        "the error must explain the builtin default, got: {error}"
+    );
+}
+
 /// `minimum-query-length = 0` is a deliberate "gate on nothing"; absence leaves
 /// the field open for a future host default. Both currently resolve to zero, so
 /// only the declared value distinguishes them.
@@ -699,6 +712,18 @@ fn integer_overflow_in_a_scheduling_field_is_a_parse_error() {
     }
 }
 
+/// The overflow normalizer must not turn malformed TOML into a valid value.
+/// Decimal integers with a leading zero are invalid TOML even when their
+/// numeric value is inside the declared `u64` domain.
+#[test]
+fn an_oversized_integer_with_a_leading_zero_is_still_a_parse_error() {
+    let error = reject("native", "[query]\ndebounce-ms = 09223372036854775808\n");
+    assert!(
+        matches!(error, ManifestError::Parse(_)),
+        "a malformed oversized integer must not be normalized into a value: {error:?}"
+    );
+}
+
 /// Durations and budgets are unsigned counts. Negative and fractional values
 /// must fail at the type level rather than being truncated into something the
 /// author never wrote.
@@ -839,6 +864,50 @@ fn a_valid_toml_manifest_with_the_wrong_plugin_shape_is_rejected() {
     assert!(
         error.to_string().contains("plugin"),
         "the wrong-shape error must identify plugin, got: {error}"
+    );
+}
+
+/// TOML rejects a repeated key rather than choosing whichever occurrence was
+/// seen last. This matters for manifests because silently choosing one value
+/// would make a scheduling policy depend on file ordering.
+#[test]
+fn a_duplicate_manifest_key_is_rejected() {
+    let error = Manifest::parse(&manifest_text(
+        "native",
+        "[query]\ndebounce-ms = 40\ndebounce-ms = 60\n",
+    ))
+    .expect_err("duplicate query keys must be rejected");
+    assert!(
+        matches!(error, ManifestError::Parse(_)),
+        "duplicate keys must be parse errors, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("duplicate"),
+        "the duplicate-key error must explain the rejection, got: {error}"
+    );
+}
+
+/// An empty platform-specific path must not shadow a valid runtime-neutral
+/// fallback. Returning an empty path would defer a malformed manifest to a
+/// later process-start failure.
+#[test]
+fn an_empty_entrypoint_falls_back_to_a_nonempty_any_entrypoint() {
+    let manifest = Manifest::parse(
+        "manifest-version = 1\n\
+         \n[plugin]\n\
+         id = \"dev.example.entrypoint\"\n\
+         name = \"Entrypoint Fixture\"\n\
+         version = \"1.0.0\"\n\
+         runtime = \"native\"\n\
+         entrypoint = { \"linux-x86_64\" = \"\", any = \"bin/plugin\" }\n",
+    )
+    .expect("manifest must parse");
+
+    assert_eq!(
+        manifest
+            .entrypoint_for("linux", "x86_64")
+            .expect("nonempty any entrypoint is usable"),
+        "bin/plugin"
     );
 }
 

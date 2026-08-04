@@ -36,6 +36,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -164,6 +165,7 @@ fn read_bundle(path: &Path, name: &OsStr) -> Option<DiscoveredApplication> {
         // none (spec 18.2).
         icon_reference: None,
         platform_id: bundle_id,
+        working_directory: None,
     })
 }
 
@@ -186,29 +188,31 @@ fn bundle_stem(name: &OsStr) -> Option<String> {
 /// Reads an `Info.plist`, refusing anything that is not an ordinary file of
 /// plausible size and encoding.
 ///
-/// The type check happens before the open because the open is the dangerous
-/// part: opening a FIFO blocks until somebody writes to it, and a symlink to a
-/// device node hands the scanner a stream that never ends. Metadata
-/// deliberately follows symlinks -- an application may legitimately be a link
-/// -- so what is inspected is the file that would actually be read.
+/// The file is opened non-blocking before its metadata is checked. Checking
+/// first and opening second is a TOCTOU race: a third party can replace a
+/// regular file with a FIFO after the stat, making discovery block forever.
+/// Opening first also makes the size check and the bytes read refer to the same
+/// file, while following symlinks so a linked application remains supported.
 ///
-/// The size is capped twice. The stat rejects a file that is already too big,
-/// and the read still runs through a reader limited to one byte past the cap,
-/// so a file that grows between the two calls is dropped rather than followed.
+/// The read is still capped one byte past the maximum, so a file that grows
+/// after opening is dropped rather than followed.
 ///
 /// A file that is not UTF-8 is a binary property list, which this backend
 /// cannot decode; it is reported as absent so the caller falls back to the
 /// directory name instead of parsing bytes it cannot read.
 fn read_info_plist(path: &Path) -> Option<String> {
-    let metadata = fs::metadata(path).ok()?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
     if !metadata.is_file() || metadata.len() > BundleScanner::MAX_INFO_PLIST_BYTES {
         return None;
     }
 
     let mut contents = Vec::new();
-    fs::File::open(path)
-        .ok()?
-        .take(BundleScanner::MAX_INFO_PLIST_BYTES + 1)
+    file.take(BundleScanner::MAX_INFO_PLIST_BYTES + 1)
         .read_to_end(&mut contents)
         .ok()?;
     if contents.len() as u64 > BundleScanner::MAX_INFO_PLIST_BYTES {
@@ -279,22 +283,23 @@ impl ProcessLauncher for OpenLauncher {
     /// Without arguments the target stays positional, which is what lets the
     /// same call open a document as well as a bundle.
     fn launch(&self, target: &PlatformPath, args: &[String]) -> Result<()> {
-        let mut command = Command::new(OPEN);
-        if args.is_empty() {
-            command.arg(operand(target));
-        } else {
-            command.arg("-a").arg(operand(target)).arg("--args").args(args);
-        }
-        self.spawn(&mut command, &target.display().to_string())
+        self.launch_with_directory(target, args, None)
     }
 
-    /// Opens `uri` with whatever Launch Services has registered for its scheme.
+    /// Opens a target with a caller-selected current directory.
     ///
-    /// The scheme is required and checked here rather than left to `open`: a
-    /// string without one is a path, and `open` would silently open a *file* of
-    /// that name -- or, for a leading `-`, read it as one of its own options.
-    /// Handing user input to a program that reinterprets it is the class of bug
-    /// this check exists to prevent.
+    /// Launch Services still owns application activation; setting the
+    /// `/usr/bin/open` helper's directory preserves the process-launcher
+    /// contract for relative targets and helper-side path resolution.
+    fn launch_in(
+        &self,
+        target: &PlatformPath,
+        args: &[String],
+        working_directory: Option<&PlatformPath>,
+    ) -> Result<()> {
+        self.launch_with_directory(target, args, working_directory)
+    }
+
     fn open_uri(&self, uri: &str) -> Result<()> {
         if !has_scheme(uri) {
             return Err(CoreError::Invalid(format!(
@@ -305,6 +310,36 @@ impl ProcessLauncher for OpenLauncher {
         let mut command = Command::new(OPEN);
         command.arg(uri);
         self.spawn(&mut command, uri)
+    }
+}
+
+impl OpenLauncher {
+    fn launch_with_directory(
+        &self,
+        target: &PlatformPath,
+        args: &[String],
+        working_directory: Option<&PlatformPath>,
+    ) -> Result<()> {
+        if target.as_os_str().is_empty() {
+            return Err(CoreError::Invalid(
+                "the macOS backend cannot launch an empty target".to_owned(),
+            ));
+        }
+        let mut command = Command::new(OPEN);
+        if args.is_empty() {
+            command.arg(operand(target));
+        } else {
+            command.arg("-a").arg(operand(target)).arg("--args").args(args);
+        }
+        if let Some(directory) = working_directory {
+            if directory.as_os_str().is_empty() {
+                return Err(CoreError::Invalid(
+                    "the macOS backend cannot use an empty working directory".to_owned(),
+                ));
+            }
+            command.current_dir(directory.as_os_str());
+        }
+        self.spawn(&mut command, &target.display().to_string())
     }
 }
 

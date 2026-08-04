@@ -676,6 +676,63 @@ fn repeated_calls_agree() {
     assert!(!first.is_empty(), "fixture drift: `e` must offer something");
 }
 
+#[test]
+fn prefix_lookup_keeps_short_and_unicode_prefixes_lossless() {
+    let owner = plugin("fixture.prefix");
+    let catalog = stocked(
+        &owner,
+        vec![
+            item(&owner, "alpha", "Alpha", "", &[]),
+            item(&owner, "alpine", "Alpine", "", &[]),
+            item(&owner, "eclair", "Éclair", "", &[]),
+            item(&owner, "beta", "Beta", "", &[]),
+        ],
+    );
+
+    let mut short = Vec::new();
+    catalog.visit_label_prefixes(&owner, "a", |_, item, _| short.push(item.stable_id.0.as_str()));
+    assert_eq!(short, ["alpha", "alpine"]);
+
+    let mut unicode = Vec::new();
+    catalog.visit_label_prefixes(&owner, "é", |_, item, _| {
+        unicode.push(item.stable_id.0.as_str());
+    });
+    assert_eq!(unicode, ["eclair"]);
+}
+
+#[test]
+fn prepared_candidate_prefilter_keeps_match_recall() {
+    let owner = plugin("fixture.prepared");
+    let catalog = stocked(
+        &owner,
+        vec![
+            item(&owner, "atlas", "Fire Atlas", "Launch the map", &[]),
+            item(&owner, "reader", "File Reader", "Open documents", &[]),
+            item(&owner, "settings", "System Settings", "Your control panel", &[]),
+            item(&owner, "keyword", "Blaze Guide", "Wildland fire safety", &[]),
+        ],
+    );
+    let matcher = DefaultMatcher::default();
+
+    for raw in ["fa", "fr", "ss", "fire", "wildland", "é"] {
+        let query = normalize(raw);
+        let truth: BTreeSet<String> = catalog
+            .items(&owner)
+            .iter()
+            .filter(|item| matcher.match_item(&query, item).is_some())
+            .map(|item| item.stable_id.0.clone())
+            .collect();
+        let mut offered = BTreeSet::new();
+        catalog.visit_prepared_candidates(&owner, &query, |_, item, _| {
+            offered.insert(item.stable_id.0.clone());
+        });
+        assert!(
+            truth.is_subset(&offered),
+            "prepared candidate pruning lost {raw:?}: truth {truth:?}, offered {offered:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // the index tracks the slice
 // ---------------------------------------------------------------------------

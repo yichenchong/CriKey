@@ -42,12 +42,22 @@ impl Endpoint {
             if path.is_empty() {
                 return Err(ProtocolError::Malformed("unix endpoint has no path".to_owned()));
             }
+            if path.contains('\0') {
+                return Err(ProtocolError::Malformed(
+                    "unix endpoint contains a NUL byte".to_owned(),
+                ));
+            }
             return Ok(Self::UnixSocket(std::path::PathBuf::from(path)));
         }
         if let Some(name) = spec.strip_prefix("pipe:") {
             if name.is_empty() {
                 return Err(ProtocolError::Malformed(
                     "named pipe endpoint has no name".to_owned(),
+                ));
+            }
+            if name.contains('\0') {
+                return Err(ProtocolError::Malformed(
+                    "named pipe endpoint contains a NUL byte".to_owned(),
                 ));
             }
             return Ok(Self::NamedPipe(name.to_owned()));

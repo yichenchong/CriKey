@@ -540,3 +540,46 @@ fn truncation_witness_observes_cancel_before_flow_and_terminal_batch() {
     let exit = worker.shutdown();
     assert_eq!(exit.kind, ExitKind::Clean);
 }
+
+#[cfg(unix)]
+#[test]
+fn duplicate_result_sequence_is_a_protocol_violation() {
+    let (_, misbehaving) = conformance_binaries();
+    let mut worker = NativeWorker::spawn(
+        launch(
+            &misbehaving,
+            "misbehaving.duplicate-sequence",
+            "duplicate-sequence",
+        ),
+        options(TransportKind::UnixSocket),
+    )
+    .expect("duplicate-sequence fixture completes startup handshake");
+    let error = worker
+        .suggest(&request("duplicate", 1))
+        .expect_err("a duplicate result sequence must be rejected");
+    assert!(matches!(error, HostError::Protocol(_)));
+    assert!(!worker.is_alive());
+    assert_eq!(worker.shutdown().kind, ExitKind::ProtocolViolation);
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_batch_over_item_limit_does_not_wait_for_a_second_terminal() {
+    let (_, misbehaving) = conformance_binaries();
+    let limits = ResourceLimits {
+        max_items_per_query: 2,
+        ..ResourceLimits::default()
+    };
+    let mut worker = NativeWorker::spawn(
+        launch(&misbehaving, "misbehaving.terminal-items", "terminal-items"),
+        options_with_limits(TransportKind::UnixSocket, limits, 1_000),
+    )
+    .expect("terminal-items fixture completes startup handshake");
+    let suggestions = worker
+        .suggest(&request("terminal", 1))
+        .expect("a terminal frame with excess items is returned immediately");
+    assert_eq!(suggestions.state, BatchState::Final);
+    assert_eq!(suggestions.items.len(), 2);
+    assert!(suggestions.truncated);
+    assert_eq!(worker.shutdown().kind, ExitKind::Clean);
+}

@@ -27,6 +27,8 @@ use crikey_core::PlatformPath;
 use crikey_platform::ApplicationDiscovery;
 use crikey_platform::DiscoveredApplication;
 use crikey_platform_windows::{split_arguments, ApplicationSet, StartMenuDiscovery};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 
 /// A unique scratch directory that deletes itself when the test ends.
 ///
@@ -100,6 +102,7 @@ fn application(name: &str, target: &str) -> DiscoveredApplication {
         name: name.to_owned(),
         target: PlatformPath::new(target),
         arguments: Vec::new(),
+        working_directory: None,
         icon_reference: None,
         platform_id: None,
     }
@@ -170,12 +173,24 @@ fn only_shortcut_files_are_offered_to_the_shell() {
     write_shortcut(&root, "Upper.LNK");
     write_shortcut(&root, "Backup.lnk.bak");
     write_shortcut(&root, "lnk");
+    write_shortcut(&root, ".lnk");
     write_shortcut(&root, "Readme.txt");
     fs::create_dir_all(root.join("Folder.lnk")).expect("directory is creatable");
 
     let mut found = names(&scanner(vec![root]));
     found.sort();
     assert_eq!(found, vec!["Real", "Upper"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_shortcut_with_non_utf8_name_is_still_found() {
+    let scratch = Scratch::new();
+    let root = scratch.root("start-menu");
+    let name = std::ffi::OsString::from_vec(b"legacy-\xFF.LNK".to_vec());
+    fs::write(root.join(name), b"L\0\0\0").expect("shortcut is writable");
+
+    assert_eq!(names(&scanner(vec![root])), vec!["legacy-\u{FFFD}"]);
 }
 
 #[test]
@@ -263,6 +278,19 @@ fn targets_are_compared_the_way_windows_compares_paths() {
     assert_eq!(set.len(), 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn targets_with_different_non_utf8_units_are_not_deduplicated() {
+    let mut first = application("First", "placeholder");
+    first.target = PlatformPath::new(std::ffi::OsString::from_vec(b"C:\\app-\xFF.exe".to_vec()));
+    let mut second = application("Second", "placeholder");
+    second.target = PlatformPath::new(std::ffi::OsString::from_vec(b"C:\\app-\xFE.exe".to_vec()));
+
+    let mut set = ApplicationSet::new();
+    assert!(set.insert(first));
+    assert!(set.insert(second));
+    assert_eq!(set.len(), 2);
+}
 #[test]
 fn different_targets_are_different_applications() {
     let mut set = ApplicationSet::new();

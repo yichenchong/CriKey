@@ -487,7 +487,10 @@ impl InboundResultQueue {
                         self.evict_oldest(at_ms, &plugin);
                     }
                 }
-                OverflowPolicy::Disconnect if per_plugin_full => {
+                OverflowPolicy::Disconnect => {
+                    // This policy applies to either hard bound. A producer
+                    // that keeps publishing after the shared boundary is full
+                    // is just as unsafe as one that overruns its own queue.
                     self.plugins
                         .get_mut(&plugin)
                         .expect("registered plugin disappeared")
@@ -504,7 +507,7 @@ impl InboundResultQueue {
                     self.force_pause(at_ms, &plugin, generation);
                     return Err(rejection);
                 }
-                OverflowPolicy::RejectLowPriority | OverflowPolicy::Disconnect => {
+                OverflowPolicy::RejectLowPriority => {
                     let reason = if per_plugin_full {
                         QueueReject::QueueFull
                     } else {

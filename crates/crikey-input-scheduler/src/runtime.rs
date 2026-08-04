@@ -393,6 +393,8 @@ pub struct QueryScheduler {
     cancellations: Vec<CancelledRequest>,
     result_queue_depth: usize,
     shutdown: bool,
+    /// Highest timestamp observed by any state-changing operation.
+    last_now: Option<Millis>,
 }
 
 impl Default for QueryScheduler {
@@ -400,7 +402,6 @@ impl Default for QueryScheduler {
         Self::new(SchedulerConfig::default())
     }
 }
-
 impl QueryScheduler {
     pub fn new(mut config: SchedulerConfig) -> Self {
         normalize_config(&mut config);
@@ -415,9 +416,9 @@ impl QueryScheduler {
             cancellations: Vec::new(),
             result_queue_depth: 0,
             shutdown: false,
+            last_now: None,
         }
     }
-
     pub fn config(&self) -> &SchedulerConfig {
         &self.config
     }
@@ -436,6 +437,7 @@ impl QueryScheduler {
     }
 
     pub fn set_policy(&mut self, plugin: &PluginId, mut policy: PluginPolicy, now: Millis) {
+        let now = self.observe_now(now);
         let Some(old_profile) = self.plugins.get(plugin).map(|state| state.policy.profile) else {
             return;
         };
@@ -454,6 +456,7 @@ impl QueryScheduler {
     }
 
     pub fn disable_plugin(&mut self, plugin: &PluginId, now: Millis) {
+        let now = self.observe_now(now);
         self.invalidate_plugin(plugin, CancelReason::Disabled, now, true);
         if let Some(state) = self.plugins.get_mut(plugin) {
             state.enabled = false;
@@ -463,7 +466,8 @@ impl QueryScheduler {
         }
     }
 
-    pub fn enable_plugin(&mut self, plugin: &PluginId, _now: Millis) {
+    pub fn enable_plugin(&mut self, plugin: &PluginId, now: Millis) {
+        self.observe_now(now);
         if let Some(state) = self.plugins.get_mut(plugin) {
             state.enabled = true;
             state.relevant = false;
@@ -473,6 +477,7 @@ impl QueryScheduler {
 
     /// Records a query state. Dispatch remains exclusively a [`tick`](Self::tick) side effect.
     pub fn submit_query(&mut self, query: &str, now: Millis) -> Generation {
+        let now = self.observe_now(now);
         let generation = self.generations.advance();
         let normalized = query.trim().to_lowercase();
         self.result_queue_depth = 0;
@@ -559,6 +564,7 @@ impl QueryScheduler {
 
     /// Applies elapsed deadlines and dispatches ready work within rotating budgets.
     pub fn tick(&mut self, now: Millis) -> Vec<DispatchedRequest> {
+        let now = self.observe_now(now);
         if self.shutdown {
             return Vec::new();
         }
@@ -685,6 +691,7 @@ impl QueryScheduler {
     }
 
     pub fn complete(&mut self, plugin: &PluginId, generation: Generation, now: Millis) -> CompletionOutcome {
+        let now = self.observe_now(now);
         let Some(position) = self.plugins.get(plugin).and_then(|state| {
             state
                 .in_flight
@@ -717,6 +724,7 @@ impl QueryScheduler {
 
     /// Invalidates all of a plugin's in-flight and queued generations.
     pub fn cancel_plugin(&mut self, plugin: &PluginId, reason: CancelReason, now: Millis) -> Vec<Generation> {
+        let now = self.observe_now(now);
         self.invalidate_plugin(plugin, reason, now, true)
     }
 
@@ -752,6 +760,7 @@ impl QueryScheduler {
     }
 
     pub fn shutdown(&mut self, now: Millis) {
+        let now = self.observe_now(now);
         if self.shutdown {
             return;
         }
@@ -777,6 +786,7 @@ impl QueryScheduler {
         completion: BatchCompletion,
         now: Millis,
     ) -> BatchAdmission {
+        let now = self.observe_now(now);
         let current = generation == self.current_generation();
         let usable = self.plugins.get(plugin).is_some_and(|state| {
             state
@@ -853,6 +863,7 @@ impl QueryScheduler {
     }
 
     pub fn record_ranking(&mut self, generation: Generation, ranked_items: usize, now: Millis) {
+        let now = self.observe_now(now);
         self.result_queue_depth = 0;
         self.push_trace(QueryTraceEvent::Ranking {
             at: now,
@@ -862,6 +873,7 @@ impl QueryScheduler {
     }
 
     pub fn record_presentation(&mut self, generation: Generation, visible_items: usize, now: Millis) {
+        let now = self.observe_now(now);
         self.result_queue_depth = 0;
         self.push_trace(QueryTraceEvent::Presentation {
             at: now,
@@ -952,6 +964,17 @@ impl QueryScheduler {
 
         let prepared = {
             let state = self.plugins.get_mut(plugin).expect("registered plugin");
+            // A quiet gap after a leading dispatch starts a fresh burst even
+            // when activation relevance itself never changed.
+            if state.queue.is_empty()
+                && state.burst_started.is_some()
+                && state
+                    .diagnostics
+                    .last_dispatched_at
+                    .is_some_and(|last| now.saturating_sub(last) >= state.policy.debounce.debounce_ms)
+            {
+                state.burst_started = None;
+            }
             let was_relevant = state.relevant;
             state.relevant = true;
             if !state.policy.profile.allows_time_debounce() {
@@ -970,7 +993,7 @@ impl QueryScheduler {
                 };
                 Some(PreparedRequest::Legacy { decision })
             } else if !was_relevant && state.policy.debounce.leading_edge {
-                state.burst_started = None;
+                state.burst_started = Some(now);
                 Some(PreparedRequest::Modern {
                     ready: true,
                     due_at: None,
@@ -1324,6 +1347,11 @@ impl QueryScheduler {
             );
         }
         self.trace.push(event);
+    }
+    fn observe_now(&mut self, now: Millis) -> Millis {
+        let now = self.last_now.map_or(now, |last| last.max(now));
+        self.last_now = Some(now);
+        now
     }
 }
 

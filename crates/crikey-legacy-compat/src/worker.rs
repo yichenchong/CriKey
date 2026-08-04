@@ -49,7 +49,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -169,6 +169,11 @@ const REAP_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// deliberately finite: a stuck child must apply backpressure, not let the
 /// host retain an unbounded stream of requests or control updates.
 const WRITE_QUEUE_CAPACITY: usize = 32;
+
+/// Bounded stdout frames waiting for the callback thread. A hostile peer that
+/// emits replies without requests must apply backpressure rather than make the
+/// host retain an unbounded stream.
+const STDOUT_QUEUE_CAPACITY: usize = 8;
 
 /// Default per-callback bound when the caller sets none (spec 9.6).
 const DEFAULT_CALL_TIMEOUT_MS: Millis = 10_000;
@@ -565,9 +570,9 @@ impl WorkerOptions {
 
     /// Adds one environment variable for the child.
     ///
-    /// Applied after CriKey's own variables, so a caller can override anything
-    /// including them. This is also how a plugin's configured environment
-    /// reaches it.
+    /// Configured variables are applied before CriKey's protocol variables, so
+    /// a caller cannot replace the package identity, import path, or isolation
+    /// settings the worker needs in order to remain attributable and usable.
     pub fn with_env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
         self.env
             .push((key.as_ref().to_os_string(), value.as_ref().to_os_string()));
@@ -825,8 +830,10 @@ impl TerminateHandle {
 /// What the stdout reader thread hands to the thread inside `call`.
 #[derive(Debug)]
 enum StdoutEvent {
-    /// One complete protocol line, newline stripped.
+    /// One complete protocol line, newline stripped and known to be UTF-8.
     Frame(String),
+    /// A complete protocol line that was not valid UTF-8.
+    InvalidUtf8 { excerpt: String, bytes: usize },
     /// A line reached [`MAX_FRAME_BYTES`]. The reader stops afterwards: a peer
     /// that emitted it has lost framing, and guessing where the next frame
     /// starts would invent data.
@@ -895,7 +902,7 @@ fn read_frame_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<
         }
     }
 }
-fn spawn_stdout_reader(stdout: ChildStdout, sender: Sender<StdoutEvent>) {
+fn spawn_stdout_reader(stdout: ChildStdout, sender: mpsc::SyncSender<StdoutEvent>) {
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         let mut line: Vec<u8> = Vec::new();
@@ -903,10 +910,14 @@ fn spawn_stdout_reader(stdout: ChildStdout, sender: Sender<StdoutEvent>) {
             line.clear();
             let event = match read_frame_line(&mut reader, &mut line) {
                 Ok(LineRead::Frame) => {
-                    // Lossy on purpose: a frame that is not valid UTF-8 is not
-                    // a frame, and it must reach the decoder to be reported as
-                    // the protocol error it is rather than silently dropped.
-                    StdoutEvent::Frame(String::from_utf8_lossy(strip_carriage_return(&line)).into_owned())
+                    let bytes = strip_carriage_return(&line);
+                    match String::from_utf8(bytes.to_vec()) {
+                        Ok(frame) => StdoutEvent::Frame(frame),
+                        Err(_) => StdoutEvent::InvalidUtf8 {
+                            excerpt: excerpt(bytes),
+                            bytes: bytes.len(),
+                        },
+                    }
                 }
                 // Dropping the sender is how end of file reaches the caller:
                 // `recv` then answers `Disconnected`, which is the crash path.
@@ -957,6 +968,25 @@ struct StderrTail {
 
 impl StderrTail {
     fn push(&mut self, line: String) {
+        let line = if line.len() + 1 > MAX_STDERR_TAIL_BYTES {
+            let marker = "[crikey: stderr line truncated; retaining its tail] ";
+            let suffix_limit = MAX_STDERR_TAIL_BYTES
+                .saturating_sub(marker.len())
+                .saturating_sub(1);
+            let mut start = line.len().saturating_sub(suffix_limit);
+            while start < line.len() && !line.is_char_boundary(start) {
+                start += 1;
+            }
+            let mut retained = format!("{marker}{}", &line[start..]);
+            if retained.len() + 1 > MAX_STDERR_TAIL_BYTES {
+                let end = floor_char_boundary(&retained, MAX_STDERR_TAIL_BYTES.saturating_sub(1));
+                retained.truncate(end);
+            }
+            retained
+        } else {
+            line
+        };
+
         self.bytes = self.bytes.saturating_add(line.len() + 1);
         self.lines.push_back(line);
         while self.bytes > MAX_STDERR_TAIL_BYTES {
@@ -1081,6 +1111,13 @@ impl LegacyWorker {
         let content_root = package.root.content_root();
 
         let mut command = Command::new(interpreter.path());
+        // Custom variables are applied first. The variables below are part of
+        // the host/worker protocol and must win over plugin configuration:
+        // allowing them to be overridden can load a different module or break
+        // the worker's identity and isolation.
+        for (key, value) in &options.env {
+            command.env(key, value);
+        }
         command
             .arg(WORKER_ISOLATION_FLAG)
             .arg(&entry)
@@ -1107,9 +1144,6 @@ impl LegacyWorker {
         if let Some(cache_dir) = &options.cache_dir {
             command.env(ENV_CACHE_DIR, cache_dir);
         }
-        for (key, value) in &options.env {
-            command.env(key, value);
-        }
 
         // Own process group so a hard stop can signal the whole subtree, not
         // just the leader: a plugin that forks (subprocess.Popen, os.system,
@@ -1134,7 +1168,7 @@ impl LegacyWorker {
         let stdout = child.stdout.take().expect("worker stdout is piped");
         let stderr = child.stderr.take().expect("worker stderr is piped");
 
-        let (sender, frames) = mpsc::channel();
+        let (sender, frames) = mpsc::sync_channel(STDOUT_QUEUE_CAPACITY);
         spawn_stdout_reader(stdout, sender);
         let tail = Arc::new(Mutex::new(StderrTail::default()));
         spawn_stderr_drain(stderr, Arc::clone(&tail));
@@ -1224,18 +1258,26 @@ impl LegacyWorker {
     /// before this returns.
     pub fn call(&mut self, request: LegacyRequest) -> Result<LegacyResponse, WorkerError> {
         let callback = request.callback();
+        if request.plugin != self.plugin {
+            return Err(WorkerError::Io {
+                plugin: Some(self.plugin.clone()),
+                operation: format!("dispatching {callback}"),
+                message: format!(
+                    "request targets plugin {}, but this worker serves {}",
+                    request.plugin.0, self.plugin.0
+                ),
+            });
+        }
         if self.reaped.is_some() {
             return Err(self.crashed(callback));
         }
 
         let id = self.link.next_id();
         let frame = encode_request(id, &request, self.link.terminate.load(Ordering::SeqCst));
-        let write_started = Instant::now();
-        if let Err(error) = self
-            .link
-            .write_frame(&frame, Duration::from_millis(self.options.call_timeout_ms))
-        {
-            let waited_ms = millis(write_started.elapsed()).max(self.options.call_timeout_ms);
+        let call_budget = Duration::from_millis(self.options.call_timeout_ms);
+        let call_started = Instant::now();
+        if let Err(error) = self.link.write_frame(&frame, call_budget) {
+            let waited_ms = millis(call_started.elapsed()).max(self.options.call_timeout_ms);
             let _ = self.reap();
             if error.kind() == io::ErrorKind::TimedOut {
                 return Err(WorkerError::Timeout {
@@ -1247,8 +1289,27 @@ impl LegacyWorker {
             return Err(self.crashed(callback));
         }
 
-        let line = self.await_frame(self.options.call_timeout_ms, callback)?;
-        decode_response(&request, id, line)
+        let remaining = call_budget
+            .checked_sub(call_started.elapsed())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            let waited_ms = millis(call_started.elapsed()).max(self.options.call_timeout_ms);
+            let _ = self.reap();
+            return Err(WorkerError::Timeout {
+                plugin: self.plugin.clone(),
+                callback,
+                waited_ms,
+            });
+        }
+
+        let line = self.await_frame_duration(remaining, self.options.call_timeout_ms, callback)?;
+        match decode_response(&request, id, line) {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                let _ = self.reap();
+                Err(error)
+            }
+        }
     }
 
     /// Stops the child and reaps it, returning how it ended.
@@ -1273,9 +1334,7 @@ impl LegacyWorker {
         let ready = serde_json::from_str::<Value>(&line).ok().and_then(|value| {
             let frame = value.as_object()?;
             let ready = frame.get("ready")?.as_bool()?;
-            let protocol = frame
-                .get("protocol")
-                .map_or(Some(PROTOCOL_VERSION), Value::as_u64)?;
+            let protocol = frame.get("protocol")?.as_u64()?;
             (ready && protocol == PROTOCOL_VERSION).then_some(())
         });
 
@@ -1285,14 +1344,21 @@ impl LegacyWorker {
             line,
         })
     }
-
     /// Waits up to `budget_ms` for one protocol line.
     ///
     /// This is where the hard bound lives. Exceeding it stops the child, so a
     /// plugin that ignores cooperative termination still cannot hold the host
     /// (spec 9.6, acceptance 31.17).
     fn await_frame(&mut self, budget_ms: Millis, callback: LegacyCallback) -> Result<String, WorkerError> {
-        let budget = Duration::from_millis(budget_ms);
+        self.await_frame_duration(Duration::from_millis(budget_ms), budget_ms, callback)
+    }
+
+    fn await_frame_duration(
+        &mut self,
+        budget: Duration,
+        minimum_wait_ms: Millis,
+        callback: LegacyCallback,
+    ) -> Result<String, WorkerError> {
         let started = Instant::now();
 
         loop {
@@ -1301,7 +1367,7 @@ impl LegacyWorker {
                 // `.max` guards only clock granularity: the loop already waited
                 // the whole budget, and a reported wait shorter than the bound
                 // would misdescribe what happened.
-                let waited_ms = millis(started.elapsed()).max(budget_ms);
+                let waited_ms = millis(started.elapsed()).max(minimum_wait_ms);
                 let _ = self.reap();
                 return Err(WorkerError::Timeout {
                     plugin: self.plugin.clone(),
@@ -1312,6 +1378,14 @@ impl LegacyWorker {
 
             match self.frames.recv_timeout(remaining) {
                 Ok(StdoutEvent::Frame(line)) => return Ok(line),
+                Ok(StdoutEvent::InvalidUtf8 { excerpt, bytes }) => {
+                    let _ = self.reap();
+                    return Err(WorkerError::Protocol {
+                        plugin: self.plugin.clone(),
+                        callback,
+                        line: format!("{excerpt} [crikey: {bytes}-byte protocol line was not valid UTF-8]"),
+                    });
+                }
                 Ok(StdoutEvent::Oversized { excerpt, bytes }) => {
                     // Framing is lost, so the channel cannot be resynchronised.
                     let _ = self.reap();
@@ -1685,12 +1759,15 @@ fn decode_response(
     if frame.get("id").and_then(Value::as_u64) != Some(expected_id) {
         return Err(violation(line));
     }
+    if frame.get("callback").and_then(Value::as_str) != Some(callback.as_str()) {
+        return Err(violation(line));
+    }
     let Some(succeeded) = frame.get("ok").and_then(Value::as_bool) else {
         return Err(violation(line));
     };
 
     let outcome = if succeeded {
-        match decode_outcome(&request.plugin, &frame) {
+        match decode_outcome(&request.plugin, callback, &frame) {
             Some(outcome) => outcome,
             None => return Err(violation(line)),
         }
@@ -1700,6 +1777,17 @@ fn decode_response(
             None => return Err(violation(line)),
         }
     };
+    let terminate_polls = match frame.get("terminate_polls") {
+        None => 0,
+        Some(value) => match value.as_u64().and_then(|polls| u32::try_from(polls).ok()) {
+            Some(polls) => polls,
+            None => return Err(violation(line)),
+        },
+    };
+    let log = match decode_log(&frame) {
+        Some(log) => log,
+        None => return Err(violation(line)),
+    };
 
     Ok(LegacyResponse {
         plugin: request.plugin.clone(),
@@ -1707,18 +1795,18 @@ fn decode_response(
         generation: request.generation,
         callback,
         outcome,
-        log: decode_log(&frame),
-        terminate_polls: frame
-            .get("terminate_polls")
-            .and_then(Value::as_u64)
-            .and_then(|polls| u32::try_from(polls).ok())
-            .unwrap_or(0),
+        log,
+        terminate_polls,
     })
 }
 
-fn decode_outcome(plugin: &PluginId, frame: &Map<String, Value>) -> Option<LegacyOutcome> {
+fn decode_outcome(
+    plugin: &PluginId,
+    callback: LegacyCallback,
+    frame: &Map<String, Value>,
+) -> Option<LegacyOutcome> {
     match frame.get("outcome").and_then(Value::as_str)? {
-        "set_catalog" => {
+        "set_catalog" if callback == LegacyCallback::OnCatalog => {
             let items = decode_items(plugin, frame)?;
             // `merge_catalog` and `set_catalog` differ only in whether the
             // batch replaces the plugin's catalog (spec 14.8).
@@ -1728,22 +1816,36 @@ fn decode_outcome(plugin: &PluginId, frame: &Map<String, Value>) -> Option<Legac
                 LegacyOutcome::SetCatalog(items)
             })
         }
-        "suggestions" => Some(LegacyOutcome::Suggestions(decode_items(plugin, frame)?)),
-        "abandoned" => Some(LegacyOutcome::Abandoned),
-        "executed" => Some(LegacyOutcome::Executed),
-        "acknowledged" | "shutdown" => Some(LegacyOutcome::Acknowledged),
+        "suggestions" if callback == LegacyCallback::OnSuggest => {
+            Some(LegacyOutcome::Suggestions(decode_items(plugin, frame)?))
+        }
+        "abandoned" if matches!(callback, LegacyCallback::OnCatalog | LegacyCallback::OnSuggest) => {
+            Some(LegacyOutcome::Abandoned)
+        }
+        "executed" if callback == LegacyCallback::OnExecute => Some(LegacyOutcome::Executed),
+        "acknowledged"
+            if matches!(
+                callback,
+                LegacyCallback::OnStart
+                    | LegacyCallback::OnActivated
+                    | LegacyCallback::OnDeactivated
+                    | LegacyCallback::OnEvents
+            ) =>
+        {
+            Some(LegacyOutcome::Acknowledged)
+        }
         _ => None,
     }
 }
 
-/// A shim-internal failure is a transport defect, not a plugin bug, so only the
-/// one kind that means "the plugin raised" becomes a `Failed` outcome. Anything
-/// else falls through to a protocol error, which is where a broken host belongs.
 fn decode_failure(
     request: &LegacyRequest,
     callback: LegacyCallback,
     frame: &Map<String, Value>,
 ) -> Option<PluginException> {
+    if frame.get("outcome").and_then(Value::as_str) != Some("failed") {
+        return None;
+    }
     let error = frame.get("error")?.as_object()?;
     if error.get("kind").and_then(Value::as_str) != Some("plugin-exception") {
         return None;
@@ -1778,35 +1880,23 @@ fn decode_item(plugin: &PluginId, value: &Value) -> Option<Item> {
     let category = decode_category(object.get("category")?.as_str()?);
     let target = object.get("target")?.as_str()?.to_owned();
     let stable_id = ItemId::derived(plugin, &category, &target);
+    let argument_policy = decode_argument_policy(object.get("args_hint")?.as_str()?)?;
+    let hit_policy = decode_hit_policy(object.get("hit_hint")?.as_str()?)?;
 
     Some(Item {
         stable_id,
         plugin_id: plugin.clone(),
         category,
         label: object.get("label")?.as_str()?.to_owned(),
-        description: object
-            .get("short_desc")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        description: object.get("short_desc")?.as_str()?.to_owned(),
         target,
         // A legacy item has no search terms, no icon reference the host can
         // resolve, no score hint and no metadata of its own. Inventing any of
         // them here would fabricate ranking input.
         search_terms: Vec::new(),
         icon_reference: None,
-        argument_policy: decode_argument_policy(
-            object
-                .get("args_hint")
-                .and_then(Value::as_str)
-                .unwrap_or("forbidden"),
-        )?,
-        hit_policy: decode_hit_policy(
-            object
-                .get("hit_hint")
-                .and_then(Value::as_str)
-                .unwrap_or("keepall"),
-        )?,
+        argument_policy,
+        hit_policy,
         score_hint: 0,
         metadata: Default::default(),
         actions: Vec::new(),
@@ -1854,17 +1944,15 @@ fn decode_hit_policy(hint: &str) -> Option<HitPolicy> {
 }
 
 /// Retains a bounded, self-describing record of what the plugin printed.
-fn decode_log(frame: &Map<String, Value>) -> Vec<String> {
+fn decode_log(frame: &Map<String, Value>) -> Option<Vec<String>> {
     let Some(entries) = frame.get("log").and_then(Value::as_array) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
 
     let mut log: Vec<String> = Vec::new();
     let mut dropped = 0usize;
     for entry in entries {
-        let Some(text) = entry.as_str() else {
-            continue;
-        };
+        let text = entry.as_str()?;
         if log.len() >= MAX_LOG_LINES {
             dropped += 1;
             continue;
@@ -1880,7 +1968,7 @@ fn decode_log(frame: &Map<String, Value>) -> Vec<String> {
              {MAX_LOG_LINES}]"
         ));
     }
-    log
+    Some(log)
 }
 
 fn clamp_log_line(text: &str) -> String {
@@ -1888,13 +1976,11 @@ fn clamp_log_line(text: &str) -> String {
         return text.to_owned();
     }
 
-    let end = floor_char_boundary(text, MAX_LOG_LINE_BYTES);
-    format!(
-        "{}[crikey: log line truncated at {MAX_LOG_LINE_BYTES} bytes]",
-        &text[..end]
-    )
+    let marker = format!("[crikey: log line truncated at {MAX_LOG_LINE_BYTES} bytes]");
+    let prefix_limit = MAX_LOG_LINE_BYTES.saturating_sub(marker.len());
+    let end = floor_char_boundary(text, prefix_limit);
+    format!("{}{}", &text[..end], marker)
 }
-
 /// The largest index at or below `limit` that splits `text` between characters.
 ///
 /// Hand-written because `str::floor_char_boundary` is still unstable, and
@@ -1934,6 +2020,19 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_for_the_wrong_callback_is_a_protocol_violation() {
+        let asked = request(LegacyRequestKind::Catalog);
+        let error = decode_response(
+            &asked,
+            1,
+            r#"{"id":1,"ok":true,"callback":"on_suggest","outcome":"abandoned"}"#.to_owned(),
+        )
+        .expect_err("a callback cannot answer a different callback");
+
+        assert!(matches!(error, WorkerError::Protocol { .. }));
+    }
+
+    #[test]
     fn a_shim_internal_failure_is_a_transport_defect_not_a_plugin_bug() {
         let asked = request(LegacyRequestKind::Catalog);
         let error = decode_response(
@@ -1949,7 +2048,7 @@ mod tests {
     #[test]
     fn the_merge_flag_decides_between_replacing_and_extending_a_catalog() {
         let asked = request(LegacyRequestKind::Catalog);
-        let frame = r#"{"id":1,"ok":true,"outcome":"set_catalog","merge":true,"items":[
+        let frame = r#"{"id":1,"ok":true,"callback":"on_catalog","outcome":"set_catalog","merge":true,"items":[
             {"category":"keyword","label":"L","short_desc":"D","target":"T",
              "args_hint":"forbidden","hit_hint":"noargs"}]}"#;
 
@@ -1991,7 +2090,7 @@ mod tests {
         let mut frame = Map::new();
         frame.insert("log".to_owned(), Value::Array(entries));
 
-        let log = decode_log(&frame);
+        let log = decode_log(&frame).expect("a log array has string entries");
         assert_eq!(log.len(), MAX_LOG_LINES + 1);
         assert!(log[MAX_LOG_LINES].contains("5 further log line(s) dropped"));
     }
@@ -2001,8 +2100,8 @@ mod tests {
         let long = "é".repeat(MAX_LOG_LINE_BYTES);
         let mut frame = Map::new();
         frame.insert("log".to_owned(), Value::Array(vec![Value::String(long.clone())]));
-
-        let log = decode_log(&frame);
+        let log = decode_log(&frame).expect("a log array has string entries");
+        assert!(log[0].len() <= MAX_LOG_LINE_BYTES);
         assert!(log[0].len() < long.len());
         assert!(log[0].contains("truncated"));
     }
@@ -2033,6 +2132,16 @@ mod tests {
             "the newest line survives; it is the one that explains the crash"
         );
         assert!(!rendered.contains("line 0\n"), "the oldest lines are dropped");
+    }
+
+    #[test]
+    fn a_single_huge_stderr_line_keeps_a_bounded_tail() {
+        let mut tail = StderrTail::default();
+        tail.push("x".repeat(MAX_STDERR_TAIL_BYTES + 128));
+        let rendered = tail.render();
+        assert!(rendered.len() <= MAX_STDERR_TAIL_BYTES);
+        assert!(rendered.contains("retaining its tail"));
+        assert!(rendered.ends_with(&"x".repeat(64)));
     }
 
     #[test]

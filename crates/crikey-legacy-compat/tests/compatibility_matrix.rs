@@ -512,6 +512,63 @@ classification = "probably-ok""#
 }
 
 #[test]
+fn an_unknown_matrix_module_is_rejected_instead_of_being_claimed_as_legacy_api() {
+    let source = matrix_source(&[r#"module = "keypirinha_private"
+symbol = "Plugin.on_start"
+status = "full""#]);
+    let error = CompatibilityMatrix::parse(&source)
+        .expect_err("the matrix schema permits only the documented legacy modules");
+    match &error {
+        MatrixError::UnknownApiModule { index, module } => {
+            assert_eq!(*index, 0);
+            assert_eq!(module, "keypirinha_private");
+        }
+        other => panic!("expected MatrixError::UnknownApiModule, got {other:?}"),
+    }
+    assert!(
+        error.to_string().contains("keypirinha_private"),
+        "the unknown module must be named in the diagnostic, got {error}"
+    );
+}
+
+#[test]
+fn unsupported_matrix_and_corpus_versions_are_rejected_before_rows_are_read() {
+    let matrix = CompatibilityMatrix::parse(&matrix_source(&[GOOD_API_ROW]).replacen(
+        "matrix-version = 1",
+        "matrix-version = 2",
+        1,
+    ))
+    .expect_err("a newer matrix schema must not be interpreted as the old schema");
+    assert!(
+        matches!(
+            &matrix,
+            MatrixError::UnsupportedMatrixVersion {
+                version: 2,
+                expected: 1
+            }
+        ),
+        "unexpected matrix version error: {matrix:?}"
+    );
+
+    let corpus = PluginCorpus::parse(&corpus_source(&[GOOD_PACKAGE_ROW]).replacen(
+        "corpus-version = 1",
+        "corpus-version = 2",
+        1,
+    ))
+    .expect_err("a newer corpus schema must not be interpreted as the old schema");
+    assert!(
+        matches!(
+            &corpus,
+            MatrixError::UnsupportedCorpusVersion {
+                version: 2,
+                expected: 1
+            }
+        ),
+        "unexpected corpus version error: {corpus:?}"
+    );
+}
+
+#[test]
 fn every_status_and_classification_slug_is_distinct_and_round_trips() {
     // A total, injective slug vocabulary is what lets "unknown spelling" be a
     // decidable error rather than a judgement call.
@@ -1092,6 +1149,27 @@ notes = "synthetic evidence""#]);
         matches!(&error, MatrixError::InvalidPackageSource { .. }),
         "non-HTTPS corpus sources must be rejected by the parser, got {error:?}"
     );
+    for source in [
+        "https://",
+        "https:///example/repository",
+        "https://:443/repository",
+    ] {
+        let malformed = corpus_source(&[&format!(
+            r#"id = "example.invalid"
+source = "{source}"
+revision = "0123456789abcdef0123456789abcdef01234567"
+licence = "MIT"
+classification = "works-unchanged"
+notes = "synthetic evidence""#
+        )]);
+        assert!(
+            matches!(
+                PluginCorpus::parse(&malformed),
+                Err(MatrixError::InvalidPackageSource { .. })
+            ),
+            "source {source:?} has no usable HTTPS authority and must be rejected"
+        );
+    }
 }
 
 #[test]

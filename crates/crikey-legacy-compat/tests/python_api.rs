@@ -1254,6 +1254,7 @@ t.emit("observed_inside_callback", True)
 t.emit("after_flag_module", kp.should_terminate())
 t.emit("after_flag_plugin", plugin.should_terminate())
 t.emit("after_flag_with_delay", kp.should_terminate(0))
+t.emit("after_flag_negative_delay", kp.should_terminate(-1))
 
 # The flag is host state, not plugin state: a second instance sees it too.
 t.emit("after_flag_other_instance", TerminatePlugin().should_terminate())
@@ -1306,6 +1307,11 @@ t.done()
         "after_flag_with_delay",
         "True",
         "should_terminate(delay) must report the raised flag too",
+    );
+    run.expect_eq(
+        "after_flag_negative_delay",
+        "True",
+        "a non-positive delay must still poll the host; a negative delay must not hide a raised flag",
     );
     run.expect_eq(
         "after_flag_other_instance",
@@ -2533,6 +2539,7 @@ fn keypirinha_net_applies_proxy_agent_timeout_and_redirect_policy() {
         &scratch,
         r##"
 import urllib.request
+import ssl
 
 import keypirinha_net as kpnet
 import _kptest as t
@@ -2580,6 +2587,25 @@ except kpnet.InvalidUrlError:
 else:
     t.emit("unsafe_redirect_rejected", False)
 
+https_request = urllib.request.Request("https://example.invalid/")
+try:
+    kpnet._SafeRedirectHandler().redirect_request(
+        https_request, None, 302, "Found", {}, "http://example.invalid/"
+    )
+except kpnet.InvalidUrlError:
+    t.emit("https_downgrade_rejected", True)
+else:
+    t.emit("https_downgrade_rejected", False)
+
+tls_opener = kpnet.build_urllib_opener(ssl_check_hostname=False)
+tls_context = next(
+    getattr(handler, "_context")
+    for handler in tls_opener.handlers
+    if getattr(handler, "_context", None) is not None
+)
+t.emit("tls_hostname_can_be_disabled", tls_context.check_hostname is False)
+t.emit("tls_chain_verification_kept", tls_context.verify_mode == ssl.CERT_REQUIRED)
+
 t.done()
 "##,
         &[],
@@ -2606,6 +2632,140 @@ t.done()
     run.expect(
         "unsafe_redirect_rejected",
         "redirects leaving http(s) must be rejected instead of reaching file://",
+    );
+    run.expect(
+        "https_downgrade_rejected",
+        "an HTTPS request must not follow a redirect down to plain HTTP, which would silently disable TLS",
+    );
+    run.expect(
+        "tls_hostname_can_be_disabled",
+        "the compatibility option must still allow callers to disable hostname matching",
+    );
+    run.expect(
+        "tls_chain_verification_kept",
+        "disabling hostname matching must not disable TLS certificate-chain verification",
+    );
+}
+
+#[test]
+fn worker_translation_and_frames_keep_plugin_values_lossless_and_bounded() {
+    let scratch = TempDir::new("worker-shim");
+    let run = run_ok(
+        &scratch,
+        r##"
+import io
+import os
+import json
+import pathlib
+import tempfile
+
+import _crikey_legacy_worker as worker
+
+# The worker installs the original stdout as its protocol stream and redirects
+# ordinary stdout to its log capture. Keep a handle to the original stream for
+# this focused probe.
+wire = worker._PROTOCOL
+worker._PROTOCOL = io.StringIO()
+
+
+def emit(key, value):
+    wire.write(key + "=" + str(value) + "\n")
+    wire.flush()
+
+fd, name = tempfile.mkstemp()
+os.close(fd)
+path = pathlib.Path(name)
+try:
+    path.write_text(
+        "[Main]\nKey = first\n  continued=literal\nkey = second\n"
+        "multi = first\n  second line\n[main]\nOther: yes\n"
+        "url: https://example.invalid/?a=1\n",
+        encoding="utf-8",
+    )
+    parsed = worker._parse_ini(str(path))
+finally:
+    path.unlink()
+
+item = worker._item_from_wire(
+    {
+        "category": "legacy-user-107",
+        "label": "selected",
+        "short_desc": "",
+        "target": "selected",
+        "args_hint": "accepted",
+        "hit_hint": "ignore",
+    }
+)
+emit("duplicate_last_value", parsed["Main"]["Key"])
+emit("continuation_preserved", parsed["Main"]["multi"] == "first\nsecond line")
+emit("merged_section", parsed["Main"]["Other"])
+emit("colon_with_equals", parsed["Main"]["url"])
+emit("user_category", item.category() == 107)
+
+# NaN is not JSON. The emitter must turn that serialization failure into a
+# bounded plugin-exception response rather than writing invalid JSON or dying.
+worker._emit(
+    {
+        "id": 7,
+        "callback": "on_suggest",
+        "ok": True,
+        "outcome": "suggestions",
+        "log": [],
+        "terminate_polls": 0,
+        "items": [{"data_bag": float("nan")}],
+    }
+)
+failure = json.loads(worker._PROTOCOL.getvalue())
+emit("nonfinite_is_failure", failure["ok"] is False)
+emit("nonfinite_kind", failure["error"]["kind"])
+
+# Lone surrogates must be escaped before the strict UTF-8 protocol stream sees
+# them, while still round-tripping through JSON.
+surrogate = json.loads(worker._encode({"text": "\ud800"}))
+emit("surrogate_round_trip", surrogate["text"] == "\ud800")
+
+wire.write("DONE\n")
+wire.flush()
+"##,
+        &[],
+    );
+
+    run.expect_eq(
+        "duplicate_last_value",
+        "second",
+        "duplicate INI keys must use the last value while retaining the first spelling",
+    );
+    run.expect_eq(
+        "continuation_preserved",
+        "True",
+        "an indented INI continuation must remain part of its key's value",
+    );
+    run.expect_eq(
+        "merged_section",
+        "yes",
+        "repeated section headers must merge case-insensitively",
+    );
+    run.expect_eq(
+        "colon_with_equals",
+        "https://example.invalid/?a=1",
+        "a colon-delimited INI value may contain '=' without changing its key",
+    );
+    run.expect(
+        "user_category",
+        "plugin-defined category numbers must survive the host-to-worker translation",
+    );
+    run.expect(
+        "nonfinite_is_failure",
+        "non-finite JSON values must produce a failure frame",
+    );
+    run.expect_eq(
+        "nonfinite_kind",
+        "plugin-exception",
+        "serialization failures must be attributable without corrupting the protocol",
+    );
+    run.expect(
+        "surrogate_round_trip",
+        "JSON framing must escape lone surrogates so strict UTF-8 output cannot crash the worker",
     );
 }
 

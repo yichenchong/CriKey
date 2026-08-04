@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use crikey_core::{ArgumentPolicy, Category, HitPolicy, Item, ItemId, PluginId};
 use crikey_query::{
-    DefaultMatcher, DefaultNormalizer, MatchMethod, MatchOutcome, Matcher, NormalizedQuery, Normalizer,
-    PreparedLabel,
+    presence_mask, searchable_text, searchable_text_with_label, DefaultMatcher, DefaultNormalizer,
+    MatchMethod, MatchOutcome, Matcher, NormalizedQuery, Normalizer, PreparedLabel,
 };
 
 fn item(label: &str, description: &str, target: &str, search_terms: &[&str]) -> Item {
@@ -81,6 +81,52 @@ fn full_unicode_case_folding_matches_sigma_and_sharp_s() {
 }
 
 #[test]
+fn nfkc_casefold_recomposes_after_full_case_folding() {
+    // U+01F0 case-folds to `j` plus COMBINING CARON. The final NFKC pass
+    // must compose that expansion again, rather than leaving two spellings
+    // that were equivalent in the catalog on different sides of matching.
+    assert_eq!(normalize("\u{01F0}").normalized, "\u{01F0}");
+    assert_eq!(normalize("j\u{030C}").normalized, "\u{01F0}");
+}
+
+#[test]
+fn dotted_and_dotless_i_follow_locale_independent_case_folding() {
+    let query = normalize("\u{0130} I \u{0131} i");
+    assert_eq!(query.tokens, ["i\u{0307}", "i", "\u{131}", "i"]);
+    assert_eq!(normalize("\u{03A3} \u{03C2}").tokens, ["\u{03C3}", "\u{03C3}"]);
+
+    let dotted = item("\u{0130}stanbul", "", "/test/dotted-i", &[]);
+    let dotted_match = matched("\u{0130}STANBUL", &dotted);
+    assert_eq!(dotted_match.method, MatchMethod::ExactPrefix);
+    assert_eq!(dotted_match.highlights, [(0, dotted.label.len())]);
+
+    let dotless = item("\u{131}slak", "", "/test/dotless-i", &[]);
+    assert!(
+        try_match("i", &dotless).is_none(),
+        "non-Turkic folding must not equate dotless i with ordinary i"
+    );
+}
+
+#[test]
+fn presence_mask_keeps_every_casefolded_query_character() {
+    let candidate = item("Straße \u{01F0}", "", "/test/mask", &["ﬁle", "Ⅷ"]);
+    let text = searchable_text(&candidate);
+    let mask = presence_mask(&text);
+
+    for raw in ["ss", "strasse", "file", "viii", "\u{01F0}", "j\u{030C}"] {
+        let query = normalize(raw);
+        assert!(
+            query.tokens.iter().all(|token| presence_mask(token) & !mask == 0),
+            "mask for {raw:?} must be a subset of the candidate mask"
+        );
+        assert!(
+            try_match(raw, &candidate).is_some(),
+            "the matcher must agree with the mask for {raw:?}"
+        );
+    }
+}
+
+#[test]
 fn normalization_changes_map_back_to_complete_raw_characters() {
     let ligature = item("oﬃce", "", "/test/ligature", &[]);
     let expanded = matched("ffi", &ligature);
@@ -124,6 +170,15 @@ fn malformed_public_query_cannot_bypass_token_validation() {
     assert!(DefaultMatcher::default()
         .match_item(&empty_token, &candidate)
         .is_none());
+}
+
+#[test]
+fn empty_and_short_candidates_never_match_nonempty_queries() {
+    let empty = item("", "", "/test/empty", &[]);
+    let short = item("x", "", "/test/short", &[]);
+
+    assert!(try_match("x", &empty).is_none());
+    assert!(try_match("longer", &short).is_none());
 }
 
 #[test]
@@ -241,25 +296,31 @@ fn malformed_prepared_label_boundary_does_not_panic() {
 }
 
 #[test]
-fn mismatched_prepared_label_does_not_panic_or_emit_invalid_highlights() {
-    let candidate = item("z", "", "/test/mismatch", &[]);
-    let prepared = PreparedLabel::new("éx");
+fn mismatched_prepared_label_is_rebuilt_for_the_candidate() {
+    let candidate = item("abc", "", "/test/mismatch", &[]);
+    let prepared = PreparedLabel::new("aX");
     let query = normalize("x");
     let result =
         std::panic::catch_unwind(|| DefaultMatcher::default().match_prepared(&query, &candidate, &prepared));
 
     assert!(
         result.is_ok(),
-        "a prepared label from another item must not make score_prepared slice the candidate unsafely"
+        "a prepared label from another item must not make matching panic"
     );
-    let outcome = result
-        .expect("matching did not panic")
-        .expect("the mismatched prepared label still contains the query");
     assert!(
-        outcome
-            .highlights
-            .iter()
-            .all(|&(start, end)| candidate.label.get(start..end).is_some()),
-        "mismatched prepared labels must not emit ranges outside the candidate label"
+        result.expect("matching did not panic").is_none(),
+        "a mismatched prepared label must not turn an absent candidate character into a match"
     );
+}
+
+#[test]
+fn prepared_label_compatibility_handles_normalized_empty_fields() {
+    let candidate = item("", "\u{00AD}", "/test/empty-field", &["x"]);
+    let (text, label_bytes) = searchable_text_with_label(&candidate);
+    let prepared = PreparedLabel::from_searchable_text(&candidate.label, text, label_bytes);
+    let outcome = DefaultMatcher::default()
+        .match_prepared(&normalize("x"), &candidate, &prepared)
+        .expect("the search term remains searchable");
+
+    assert_eq!(outcome.method, MatchMethod::Keyword);
 }

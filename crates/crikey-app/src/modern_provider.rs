@@ -57,8 +57,9 @@ use crikey_package_manager::{
 use crikey_plugin_model::{Manifest, Runtime};
 use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
 use crikey_python_host::{
-    discover_interpreter, sdk_root, BatchState as WorkerBatchState, ExecuteOutcome, Interpreter,
-    ModernWorker, RequiresPython, RuntimeProfile, SuggestRequest, WorkerOptions, WORKER_ENTRY_FILE,
+    discover_interpreter, sdk_root, BatchState as WorkerBatchState, CancelHandle, ExecuteOutcome,
+    Interpreter, ModernWorker, RequiresPython, RuntimeProfile, SuggestRequest, WorkerOptions,
+    WORKER_ENTRY_FILE,
 };
 use crikey_ui::{ResultRow, ViewModel};
 
@@ -72,7 +73,9 @@ use crate::{
 /// plugin rather than a launcher that hangs on startup.
 const STARTUP_BUDGET_MS: Millis = 30_000;
 
-/// Bound on one modern `suggest` call, in milliseconds.
+/// Upper bound on one modern `suggest` call, in milliseconds. The effective
+/// deadline comes from `performance.suggest-hard-timeout-ms` and defaults to
+/// the manifest model's 500 ms value.
 const CALL_BUDGET_MS: Millis = 120_000;
 
 /// Bound on the cooperative teardown of one modern worker, in milliseconds.
@@ -216,6 +219,118 @@ impl ModernCatalogDispatcher {
     }
 }
 
+/// Cancellation state for one in-flight modern suggestion call.
+///
+/// The UI submission path can supersede a query while the provider thread is
+/// blocked reading the child response. A short-lived watcher owns the actual
+/// control-frame write so `submit` never inherits pipe backpressure.
+#[derive(Debug)]
+struct ModernCallControl {
+    requested: AtomicBool,
+    finished: AtomicBool,
+    handle: Mutex<Option<CancelHandle>>,
+    wake: Condvar,
+    wake_lock: Mutex<()>,
+}
+
+impl ModernCallControl {
+    fn new() -> Self {
+        Self {
+            requested: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            handle: Mutex::new(None),
+            wake: Condvar::new(),
+            wake_lock: Mutex::new(()),
+        }
+    }
+
+    fn install(&self, handle: CancelHandle) {
+        let cancel_now = self.requested.load(Ordering::Acquire);
+        *self.handle.lock().unwrap_or_else(|error| error.into_inner()) = Some(handle.clone());
+        if cancel_now {
+            handle.cancel();
+        }
+        self.wake.notify_all();
+    }
+
+    fn cancel(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
+
+    fn watch_cancel(self: Arc<Self>) {
+        let mut wake = self.wake_lock.lock().unwrap_or_else(|error| error.into_inner());
+        while !self.requested.load(Ordering::Acquire) && !self.finished.load(Ordering::Acquire) {
+            wake = self.wake.wait(wake).unwrap_or_else(|error| error.into_inner());
+        }
+        if self.requested.load(Ordering::Acquire) && !self.finished.load(Ordering::Acquire) {
+            if let Some(handle) = self
+                .handle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .cloned()
+            {
+                handle.cancel();
+            }
+        }
+    }
+
+    fn finish(&self) {
+        let _wake = self.wake_lock.lock().unwrap_or_else(|error| error.into_inner());
+        self.finished.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
+}
+
+#[derive(Debug, Default)]
+struct ModernCancellation {
+    calls: Mutex<BTreeMap<(u64, PluginId), Arc<ModernCallControl>>>,
+}
+
+impl ModernCancellation {
+    fn register(&self, generation: u64, plugin: PluginId, control: Arc<ModernCallControl>) {
+        self.calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert((generation, plugin), control);
+    }
+
+    fn unregister(&self, generation: u64, plugin: &PluginId) {
+        self.calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&(generation, plugin.clone()));
+    }
+
+    fn cancel_before(&self, generation: u64) {
+        let controls = self
+            .calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter(|((old_generation, _), _)| *old_generation < generation)
+            .map(|(_, control)| Arc::clone(control))
+            .collect::<Vec<_>>();
+        for control in controls {
+            control.cancel();
+        }
+    }
+
+    fn cancel_all(&self) {
+        let controls = self
+            .calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for control in controls {
+            control.cancel();
+        }
+    }
+}
+
 /// Owns one child process per shared worker key and records every runtime
 /// dispatch failure.
 ///
@@ -268,6 +383,7 @@ pub struct ModernProvider {
     /// Current async suggestion snapshots keyed by the owning plugin and item
     /// id. Stable item ids are only unique within an owner.
     action_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    cancellation: Arc<ModernCancellation>,
 }
 
 impl ModernProvider {
@@ -292,6 +408,7 @@ impl ModernProvider {
             plugins: Vec::new(),
             unavailable: Vec::new(),
             action_items: Arc::new(Mutex::new(BTreeMap::new())),
+            cancellation: Arc::new(ModernCancellation::default()),
         };
 
         // The worker shim must be on disk before any child can speak the
@@ -490,10 +607,10 @@ impl ModernProvider {
             entrypoint.clone(),
             dir.to_string_lossy().into_owned(),
         );
-
+        let suggest_timeout_ms = manifest.performance.suggest_hard_timeout_ms.min(CALL_BUDGET_MS);
         let worker_options = WorkerOptions::new(plugin.clone(), entrypoint, import_path)
             .with_startup_timeout_ms(STARTUP_BUDGET_MS)
-            .with_call_timeout_ms(CALL_BUDGET_MS)
+            .with_call_timeout_ms(suggest_timeout_ms)
             .with_shutdown_timeout_ms(SHUTDOWN_BUDGET_MS);
 
         // Register first so the pipeline creates the one shared per-plugin
@@ -586,7 +703,10 @@ impl ModernProvider {
             })?;
         let budget = Arc::clone(&loaded.budget);
         let interpreter = loaded.interpreter.clone();
-        let worker_options = loaded.worker_options.clone();
+        // Catalog callbacks are not suggestion callbacks; keep their
+        // independent long transport budget rather than applying the manifest
+        // suggestion hard deadline to catalog construction.
+        let worker_options = loaded.worker_options.clone().with_call_timeout_ms(CALL_BUDGET_MS);
         if self.catalog.tasks.len() >= CATALOG_RESULT_CAPACITY {
             return Err(CatalogDispatchError::QueueFull {
                 plugin: plugin.clone(),
@@ -861,6 +981,7 @@ impl ModernProvider {
 
     /// Cooperative teardown of every modern worker (spec 24.3).
     pub fn shutdown(&mut self, _now: Millis) {
+        self.cancellation.cancel_all();
         for result in self.catalog.shutdown() {
             if let CatalogBuildResult::Failed { plugin, reason, .. } = result {
                 self.pool.record_dispatch_failure(plugin, reason);
@@ -882,6 +1003,7 @@ impl ModernProvider {
         query: &str,
         generation: Generation,
     ) -> (BTreeMap<PluginId, Vec<Item>>, BTreeSet<PluginId>) {
+        self.cancellation.cancel_before(generation.get());
         let request = SuggestRequest {
             generation: generation.get(),
             text: query.to_owned(),
@@ -926,12 +1048,48 @@ impl ModernProvider {
                 continue;
             }
 
-            let answer = self
-                .pool
-                .workers
-                .get_mut(&key)
-                .expect("the worker was live a moment ago")
-                .suggest(&request);
+            let control = Arc::new(ModernCallControl::new());
+            self.cancellation
+                .register(generation.get(), plugin.clone(), Arc::clone(&control));
+            let control_for_thread = Arc::clone(&control);
+            let answer = {
+                let worker = self
+                    .pool
+                    .workers
+                    .get_mut(&key)
+                    .expect("the worker was live a moment ago");
+                let handle = worker.cancel_handle();
+                // Clear any cancellation left by the prior call before
+                // registering this one. The latched variant then preserves a
+                // cancellation that races with call start instead of clearing
+                // it with its normal pre-call reset.
+                handle.reset();
+                control.install(handle);
+                let watcher = thread::Builder::new()
+                    .name(format!("crikey-modern-cancel-{}", plugin.0))
+                    .spawn(move || control_for_thread.watch_cancel());
+                let answer = catch_unwind(AssertUnwindSafe(|| worker.suggest_with_cancel_latched(&request)));
+                control.finish();
+                if let Ok(watcher) = watcher {
+                    let _ = watcher.join();
+                }
+                answer
+            };
+            self.cancellation.unregister(generation.get(), &plugin);
+            let answer = match answer {
+                Ok(answer) => answer,
+                Err(_) => {
+                    dead_plugins.insert(plugin.clone());
+                    self.pool
+                        .record_dispatch_failure(plugin.clone(), "modern worker panicked".to_owned());
+                    self.pool.workers.remove(&key);
+                    self.action_items
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .retain(|(owner, _), _| owner != &plugin);
+                    continue;
+                }
+            };
             match answer {
                 Ok(suggestions) if suggestions.state == WorkerBatchState::Failed => {
                     let reason = suggestions
@@ -1250,6 +1408,7 @@ pub struct ModernDriver {
     /// Search generation the UI last submitted. The supervisor re-reads it
     /// before publishing and drops any answer that is no longer current.
     current: Arc<AtomicU64>,
+    cancellation: Arc<ModernCancellation>,
     has_plugins: bool,
     worker: Option<JoinHandle<()>>,
 }
@@ -1288,6 +1447,7 @@ impl ModernDriver {
             next_id: Arc::new(AtomicU64::new(0)),
             mailbox: Arc::clone(&mailbox),
         });
+        let cancellation = Arc::clone(&provider.cancellation);
         let current = Arc::new(AtomicU64::new(0));
 
         let thread_mailbox = Arc::clone(&mailbox);
@@ -1436,6 +1596,7 @@ impl ModernDriver {
                 catalog_results,
                 outcome,
                 current,
+                cancellation,
                 has_plugins,
                 worker: Some(worker),
             },
@@ -1445,6 +1606,7 @@ impl ModernDriver {
                 catalog_results,
                 outcome,
                 current,
+                cancellation,
                 has_plugins: false,
                 worker: None,
             },
@@ -1465,9 +1627,28 @@ impl ModernDriver {
         builtin_pending: bool,
         selected: usize,
     ) {
-        // Record the live generation first, so an answer for a query this call
-        // supersedes is dropped rather than shown even if it finishes late.
-        self.current.store(generation.get(), Ordering::Release);
+        // Intake is monotonic even though `Generation` can be reconstructed
+        // from an external value. A delayed caller must not rewind the live
+        // generation and make its obsolete job eligible for publication.
+        let generation_value = generation.get();
+        let mut observed = self.current.load(Ordering::Acquire);
+        loop {
+            if generation_value < observed {
+                return;
+            }
+            match self.current.compare_exchange_weak(
+                observed,
+                generation_value,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(next) => observed = next,
+            }
+        }
+        // Signal superseded in-flight callbacks before queueing the new job.
+        self.cancellation.cancel_before(generation_value);
+
         let (lock, cvar) = &*self.mailbox;
         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
         if slot.stop {
@@ -1526,6 +1707,9 @@ impl ModernDriver {
 
 impl Drop for ModernDriver {
     fn drop(&mut self) {
+        // Cancel any callback before signalling shutdown, so a cooperative
+        // child can return and let the supervisor join promptly.
+        self.cancellation.cancel_all();
         // Signal shutdown and join, so the supervisor thread and every child it
         // owns are torn down with the launcher — no thread leak.
         {

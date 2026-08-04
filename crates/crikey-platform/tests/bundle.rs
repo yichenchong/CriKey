@@ -270,6 +270,18 @@ fn a_non_string_value_is_not_silently_read_as_a_string() {
     );
 }
 
+#[test]
+fn nested_markup_inside_a_scalar_is_rejected() {
+    let malformed = plist(
+        "  <key>CFBundleName</key>\n\
+         \x20 <string>Visible <em>name</em></string>",
+    );
+    assert!(
+        parse_info_plist(&malformed).is_none(),
+        "nested markup must not be flattened into a scalar value"
+    );
+}
+
 /// Non-ASCII values survive byte-for-byte. Kills a parser that slices on byte
 /// offsets or normalises to ASCII, which would corrupt localised bundle names.
 #[test]
@@ -311,6 +323,27 @@ fn a_nested_dict_before_the_real_key_does_not_shadow_the_top_level_value() {
     assert_eq!(bundle.name, "Real Application");
     assert_eq!(bundle.bundle_id.as_deref(), Some("com.example.real"));
     assert_eq!(bundle.executable.as_deref(), Some("real-exec"));
+}
+
+#[test]
+fn a_dictionary_decoy_or_duplicate_key_is_not_accepted_as_bundle_data() {
+    let body = "  <key>CFBundleName</key>\n  <string>Real</string>";
+    let well_formed = plist(body);
+
+    let leading_decoy = well_formed.replace("<plist version=\"1.0\">", "<plist version=\"1.0\"><array/>");
+    assert!(
+        parse_info_plist(&leading_decoy).is_none(),
+        "a dictionary after another plist child is not the payload"
+    );
+
+    let duplicate = plist(
+        "  <key>CFBundleName</key>\n  <integer>42</integer>\n\
+         \x20 <key>CFBundleName</key>\n  <string>Decoy</string>",
+    );
+    assert!(
+        parse_info_plist(&duplicate).is_none(),
+        "a later duplicate must not replace a malformed first value"
+    );
 }
 
 // ---------------------------------------------------------------------------

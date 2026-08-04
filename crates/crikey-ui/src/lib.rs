@@ -94,9 +94,10 @@ pub trait LauncherWindow {
 
 /// Rows a page key moves the selection by (spec 6.3 "page navigation").
 ///
-/// One page is the launcher's visible list height, so `PageDown` lands on the
-/// row a page of scrolling would have revealed rather than on an arbitrary
-/// offset.
+/// A fixed step, not a measurement: the state machine has no window and the
+/// rendered list holds a variable number of rows depending on window size and
+/// how much text each row carries, so a page here is a constant the renderer
+/// scrolls to follow rather than the other way round.
 pub const PAGE_SIZE: usize = 8;
 
 /// Work the host must do about a command the view model has already applied to
@@ -396,23 +397,33 @@ impl LauncherViewModel {
         Some(UiEffect::Query(self.query.clone()))
     }
 
-    /// Attaches an actionable failure message to the selected row.
+    /// Tries to attach an actionable failure message to the selected row, and
+    /// reports whether the row is now carrying it.
+    ///
+    /// There is nothing to attach a message to when the result list is empty,
+    /// which happens when a republish empties the list while the action the
+    /// message describes is still running. `false` means exactly that: the
+    /// message was dropped and the caller still owns the job of telling the
+    /// user. `true` means the selected row carries the message, including the
+    /// case where it already did and nothing had to change.
     ///
     /// This copies the current row slice only on an action failure, never on
     /// query or navigation hot paths. The next frame renders the message
     /// through the row's existing `status` field.
-    pub fn set_selected_status(&mut self, status: String) {
+    #[must_use = "a dropped status message is invisible to the user unless the caller reports it"]
+    pub fn set_selected_status(&mut self, status: String) -> bool {
         let Some(selected) = self.rows.get(self.selected) else {
-            return;
+            return false;
         };
         if selected.status.as_deref() == Some(status.as_str()) {
-            return;
+            return true;
         }
 
         let mut rows = self.rows.to_vec();
         rows[self.selected].status = Some(status);
         self.rows = rows.into();
         self.dirty = true;
+        true
     }
 
     /// Opens the action list of the selected row (spec 6.3).

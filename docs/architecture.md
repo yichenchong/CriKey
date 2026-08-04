@@ -29,9 +29,10 @@ graph TB
 ```
 
 The main process owns the launcher window, keyboard input, local catalog
-indexes, ranking, history, platform services, and the provider drivers. Each
-provider driver owns a query pipeline and its own current generation; the
-provider generations are advanced in step with the launcher query. No
+indexes, ranking, platform services, and the provider drivers. The ranker accepts
+history signals, but the current application has no history store that supplies
+them. Each provider driver owns a query pipeline and its own current generation;
+the provider generations are advanced in step with the launcher query. No
 third-party code runs inside the main process.
 
 The native worker uses the versioned proto3 protocol. The legacy and modern
@@ -85,6 +86,7 @@ path an item arrives on decides whether the host matches it at all:
 
 | Path | Who produces it | Host matching |
 | --- | --- | --- |
+| Catalog search | `SearchService` over the built-in catalog | **Fuzzy matching.** Host-side `DefaultMatcher` filters and scores catalog rows before presentation |
 | Suggestion batch | A plugin's `on_suggest` / `suggest`, legacy or modern | **None.** The batch is delivered as the plugin published it; `QueryPipeline` preserves first-acceptance order and replaces enrichment updates in place |
 
 `DefaultMatcher` is owned by `SearchService` and is reachable from nowhere

@@ -163,49 +163,88 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut interval_ms = DEFAULT_INTERVAL_MS;
     let mut repeat = 1usize;
     let mut list_fixtures = false;
+    let mut fixture_seen = false;
+    let mut query_seen = false;
+    let mut interval_seen = false;
+    let mut repeat_seen = false;
     let mut index = 0;
 
     while index < args.len() {
         let arg = args[index].as_str();
         match arg {
             "--list-fixtures" => {
+                if list_fixtures {
+                    return Err("`--list-fixtures` may only be given once".to_owned());
+                }
                 list_fixtures = true;
                 index += 1;
             }
             "--fixture" => {
+                if fixture_seen {
+                    return Err("`--fixture` may only be given once".to_owned());
+                }
                 let value = required_value(args, index, "--fixture")?;
                 fixture = Some(parse_fixture(value)?);
+                fixture_seen = true;
                 index += 2;
             }
             "--query" => {
+                if query_seen {
+                    return Err("`--query` may only be given once".to_owned());
+                }
                 let value = required_value(args, index, "--query")?;
                 query = Some(value.to_owned());
+                query_seen = true;
                 index += 2;
             }
             "--interval-ms" => {
+                if interval_seen {
+                    return Err("`--interval-ms` may only be given once".to_owned());
+                }
                 let value = required_value(args, index, "--interval-ms")?;
                 interval_ms = positive_u64("--interval-ms", value)?;
+                interval_seen = true;
                 index += 2;
             }
             "--repeat" => {
+                if repeat_seen {
+                    return Err("`--repeat` may only be given once".to_owned());
+                }
                 let value = required_value(args, index, "--repeat")?;
                 repeat = positive_usize("--repeat", value)?;
+                repeat_seen = true;
                 index += 2;
             }
             other if other.starts_with("--fixture=") => {
+                if fixture_seen {
+                    return Err("`--fixture` may only be given once".to_owned());
+                }
                 fixture = Some(parse_fixture(&other["--fixture=".len()..])?);
+                fixture_seen = true;
                 index += 1;
             }
             other if other.starts_with("--query=") => {
+                if query_seen {
+                    return Err("`--query` may only be given once".to_owned());
+                }
                 query = Some(other["--query=".len()..].to_owned());
+                query_seen = true;
                 index += 1;
             }
             other if other.starts_with("--interval-ms=") => {
+                if interval_seen {
+                    return Err("`--interval-ms` may only be given once".to_owned());
+                }
                 interval_ms = positive_u64("--interval-ms", &other["--interval-ms=".len()..])?;
+                interval_seen = true;
                 index += 1;
             }
             other if other.starts_with("--repeat=") => {
+                if repeat_seen {
+                    return Err("`--repeat` may only be given once".to_owned());
+                }
                 repeat = positive_usize("--repeat", &other["--repeat=".len()..])?;
+                repeat_seen = true;
                 index += 1;
             }
             other => return Err(format!("unrecognized developer command argument `{other}`")),
@@ -241,7 +280,13 @@ fn unknown_help_argument(args: &[String]) -> Option<&str> {
         if matches!(argument, "-h" | "--help" | "--list-fixtures") {
             index += 1;
         } else if matches!(argument, "--fixture" | "--query" | "--interval-ms" | "--repeat") {
-            index = index.saturating_add(2);
+            let Some(value) = args.get(index + 1) else {
+                return Some(argument);
+            };
+            if value.starts_with('-') {
+                return Some(value);
+            }
+            index += 2;
         } else if argument.starts_with("--fixture=")
             || argument.starts_with("--query=")
             || argument.starts_with("--interval-ms=")
@@ -256,9 +301,16 @@ fn unknown_help_argument(args: &[String]) -> Option<&str> {
 }
 
 fn required_value<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
-    args.get(index + 1)
+    let value = args
+        .get(index + 1)
         .map(String::as_str)
-        .ok_or_else(|| format!("`{option}` needs a value"))
+        .ok_or_else(|| format!("`{option}` needs a value"))?;
+    if value.starts_with('-') {
+        return Err(format!(
+            "`{option}` needs a value, got flag-like argument `{value}`"
+        ));
+    }
+    Ok(value)
 }
 
 fn positive_u64(option: &str, value: &str) -> Result<u64, String> {
@@ -442,10 +494,19 @@ enum ObservedEvent {
 struct TraceCapture {
     events: Vec<ObservedEvent>,
     scheduler_seen: usize,
+    scheduler_dropped_seen: u64,
 }
 
 impl TraceCapture {
     fn capture(&mut self, pipeline: &mut QueryPipeline) -> Result<(), String> {
+        let diagnostics = pipeline.diagnostics();
+        if diagnostics.trace_events_dropped > self.scheduler_dropped_seen {
+            return Err(
+                "the bounded scheduler trace dropped events before the fixture was observed".to_owned(),
+            );
+        }
+        self.scheduler_dropped_seen = diagnostics.trace_events_dropped;
+
         self.events.extend(
             pipeline
                 .take_intake_events()
@@ -1527,5 +1588,41 @@ mod tests {
     fn help_does_not_hide_unknown_developer_options() {
         let args = vec!["--help".to_owned(), "--unknown".to_owned()];
         assert!(parse_args(&args).is_err());
+    }
+    #[test]
+    fn separate_values_cannot_consume_the_next_flag() {
+        let query = vec![
+            "--fixture".to_owned(),
+            "rapid-typing".to_owned(),
+            "--query".to_owned(),
+            "--unknown".to_owned(),
+        ];
+        assert!(parse_args(&query).is_err());
+
+        let fixture = vec!["--fixture".to_owned(), "--query".to_owned(), "--help".to_owned()];
+        assert!(parse_args(&fixture).is_err());
+        assert!(parse_args(&["--help".to_owned(), "--interval-ms".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn scalar_options_cannot_be_silently_replaced() {
+        let duplicate_fixture = vec![
+            "--fixture".to_owned(),
+            "rapid-typing".to_owned(),
+            "--fixture=modern-debounce".to_owned(),
+        ];
+        assert!(parse_args(&duplicate_fixture).is_err());
+
+        let duplicate_query = vec![
+            "--fixture".to_owned(),
+            "rapid-typing".to_owned(),
+            "--query".to_owned(),
+            "one".to_owned(),
+            "--query=two".to_owned(),
+        ];
+        assert!(parse_args(&duplicate_query).is_err());
+
+        let duplicate_list = vec!["--list-fixtures".to_owned(), "--list-fixtures".to_owned()];
+        assert!(parse_args(&duplicate_list).is_err());
     }
 }

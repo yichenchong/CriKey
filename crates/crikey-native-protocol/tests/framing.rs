@@ -1,9 +1,9 @@
 //! Red-first tests for length-delimited native protocol frames (spec 12.4).
 
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Error, ErrorKind, Read, Write};
 
 use crikey_native_protocol::{
-    frame::{read_frame, write_frame},
+    frame::{read_frame, write_frame, FrameReader},
     ProtocolError, MAX_FRAME_BYTES,
 };
 
@@ -137,4 +137,71 @@ fn frame_reader_resumes_partial_prefix_and_body_reads() {
     let mut decoded = Vec::new();
     read_frame(&mut reader, &mut decoded).expect("partial reads must be resumed");
     assert_eq!(decoded, b"partial reads are safe");
+}
+
+#[derive(Debug)]
+struct PausingReader {
+    inner: Cursor<Vec<u8>>,
+    consumed: usize,
+    pause_after: usize,
+    paused: bool,
+}
+
+impl Read for PausingReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if !self.paused && self.consumed >= self.pause_after {
+            self.paused = true;
+            return Err(Error::new(ErrorKind::WouldBlock, "pause once"));
+        }
+        let limit = bytes.len().min(2);
+        let count = self.inner.read(&mut bytes[..limit])?;
+        self.consumed = self.consumed.saturating_add(count);
+        Ok(count)
+    }
+}
+
+#[test]
+fn frame_reader_resumes_after_timeout_mid_frame() {
+    let mut encoded = Vec::new();
+    write_frame(&mut encoded, b"resume after timeout").expect("frame write");
+    for pause_after in [2, 6] {
+        let mut reader = PausingReader {
+            inner: Cursor::new(encoded.clone()),
+            consumed: 0,
+            pause_after,
+            paused: false,
+        };
+        let mut state = FrameReader::new();
+        let mut decoded = Vec::new();
+        assert!(matches!(
+            state.read_frame(&mut reader, &mut decoded),
+            Err(ProtocolError::Timeout)
+        ));
+        state
+            .read_frame(&mut reader, &mut decoded)
+            .expect("partial frame state must survive a timeout");
+        assert_eq!(decoded, b"resume after timeout");
+    }
+}
+
+#[derive(Debug)]
+struct BrokenPipeWriter;
+
+impl Write for BrokenPipeWriter {
+    fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+        Err(Error::new(ErrorKind::BrokenPipe, "peer closed"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(Error::new(ErrorKind::BrokenPipe, "peer closed"))
+    }
+}
+
+#[test]
+fn broken_pipe_is_reported_as_closed() {
+    let mut writer = BrokenPipeWriter;
+    assert!(matches!(
+        write_frame(&mut writer, b"payload"),
+        Err(ProtocolError::Closed)
+    ));
 }

@@ -14,3 +14,4 @@ workspace = true
 [dependencies]
 crikey-core.workspace = true
 crikey-platform.workspace = true
+libc = "0.2"

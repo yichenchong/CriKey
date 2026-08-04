@@ -21,7 +21,9 @@ platform code leaks into "portable" crates through a convenience import.
   `[target.'cfg(...)'.dependencies]`. Each backend crate is additionally
   `#![cfg(...)]`-gated so a mistaken dependency yields an empty crate rather than
   a build that silently links the wrong platform.
-- Nothing depends on `crikey-app` except `crikey-cli`.
+- Only production `crikey-cli` names `crikey-app`; the `benchmarks` crate also
+  depends on it as an out-of-band harness. Production code reaches the
+  composition root only through the CLI.
 - SDK crates (`sdk/rust`) depend on the protocol and core model, never on host crates.
 
 ## Consequences

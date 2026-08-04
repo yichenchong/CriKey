@@ -496,6 +496,34 @@ fn package_verify_rejects_a_truncated_archive_without_panicking() {
     assert_eq!(field(&report, "verdict", &run), "invalid");
 }
 
+#[test]
+fn package_commands_reject_nonexistent_paths_with_diagnostics() {
+    let scratch = Scratch::new("missing-path");
+    let absent_plugin = scratch.path.join("missing-plugin");
+    let absent_package = scratch.path.join("missing.crikey-package");
+
+    let build = build_package(&absent_plugin, &absent_package);
+    assert_completed(&build, EX_INVALID);
+    assert!(
+        build.stderr.contains("missing-plugin"),
+        "build diagnostics must name the missing plugin directory{build}"
+    );
+
+    let inspect = inspect_package(&absent_package);
+    assert_completed(&inspect, EX_INVALID);
+    assert!(
+        inspect.stderr.contains("missing.crikey-package"),
+        "inspect diagnostics must name the missing archive{inspect}"
+    );
+
+    let verify = verify_package(&absent_package, None);
+    assert_completed(&verify, EX_INVALID);
+    assert!(
+        verify.stderr.contains("missing.crikey-package"),
+        "verify diagnostics must name the missing archive{verify}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Status distinctions and required arguments
 // ---------------------------------------------------------------------------

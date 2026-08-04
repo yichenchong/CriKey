@@ -17,8 +17,14 @@ pub struct ImportPath {
     pub entries: Vec<PathBuf>,
 }
 
+fn push_unique(entries: &mut Vec<PathBuf>, entry: PathBuf) {
+    if !entries.iter().any(|existing| existing == &entry) {
+        entries.push(entry);
+    }
+}
+
 impl ImportPath {
-    /// Lay out the entries as exactly
+    /// Lay out the entries in the spec order, omitting duplicate path entries:
     /// `[plugin_source, packaged.., env.site_dir, sdk]`.
     pub fn assemble(
         plugin_source: &Path,
@@ -27,10 +33,12 @@ impl ImportPath {
         sdk: &Path,
     ) -> ImportPath {
         let mut entries = Vec::with_capacity(packaged.len() + 3);
-        entries.push(plugin_source.to_path_buf());
-        entries.extend(packaged.iter().cloned());
-        entries.push(env.site_dir.clone());
-        entries.push(sdk.to_path_buf());
+        push_unique(&mut entries, plugin_source.to_path_buf());
+        for path in packaged {
+            push_unique(&mut entries, path.clone());
+        }
+        push_unique(&mut entries, env.site_dir.clone());
+        push_unique(&mut entries, sdk.to_path_buf());
         ImportPath { entries }
     }
 
@@ -42,6 +50,11 @@ impl ImportPath {
     pub fn to_pythonpath(&self) -> Result<OsString, PackageError> {
         let separator = if cfg!(windows) { ';' } else { ':' };
         for entry in &self.entries {
+            if entry.as_os_str().is_empty() {
+                return Err(PackageError::InvalidImportPath(
+                    "empty path components would import the current directory".to_owned(),
+                ));
+            }
             if entry.to_string_lossy().contains(separator) {
                 return Err(PackageError::InvalidImportPath(format!(
                     "path component {:?} contains the path-list separator `{separator}`",

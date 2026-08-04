@@ -8,12 +8,14 @@
 //!
 //! Implemented so far: application discovery over XDG desktop entries, and
 //! process launching for the entries it finds. The parser covers group
-//! scoping, `Type`, visibility keys, `TryExec`, locale selection and `Exec`;
-//! action groups are not separately launchable entries and recursive root
-//! layouts stay for a later milestone. Launching runs a program directly and
-//! stops there: URI opening needs a portal or a session handler this backend
-//! does not have, so it -- and everything else without an implementation --
-//! keeps reporting itself unavailable (spec 18.2).
+//! scoping, `Type`, visibility keys, `TryExec`, locale selection, `Path` and
+//! `Exec`; `Terminal=true` entries are omitted because this backend has no
+//! terminal-emulator policy, while `DBusActivatable=true` entries use their
+//! `Exec` fallback. Action groups are not separately launchable entries and
+//! recursive root layouts stay for a later milestone. Launching runs a
+//! program directly and stops there: URI opening needs a portal or a session
+//! handler this backend does not have, so it -- and everything else without
+//! an implementation -- keeps reporting itself unavailable (spec 18.2).
 //!
 //! Global shortcuts and window control are reported against the detected
 //! session rather than in the abstract, because on Linux they are optional
@@ -34,7 +36,7 @@ use std::fs;
 use std::io::Read;
 use std::mem;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -224,14 +226,44 @@ impl ProcessLauncher for CommandLauncher {
     /// not kill the application, and the application cannot block writing into
     /// a pipe nobody drains.
     fn launch(&self, target: &PlatformPath, args: &[String]) -> Result<()> {
-        let mut command = Command::new(target.as_os_str());
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        let mut child = command.spawn().map_err(|error| {
+        self.launch_in(target, args, None)
+    }
+
+    /// Starts a target with an optional desktop-entry working directory.
+    ///
+    /// A stale `Path=` is ignored rather than turning a launch into an error:
+    /// this matches other freedesktop launchers and lets an application whose
+    /// working directory was removed still start with the launcher's directory.
+    fn launch_in(
+        &self,
+        target: &PlatformPath,
+        args: &[String],
+        working_directory: Option<&PlatformPath>,
+    ) -> Result<()> {
+        let directory = working_directory
+            .filter(|directory| fs::metadata(directory.as_path()).is_ok_and(|metadata| metadata.is_dir()));
+        let spawn = |directory: Option<&PlatformPath>| {
+            let mut command = Command::new(target.as_os_str());
+            if let Some(directory) = directory {
+                command.current_dir(directory.as_path());
+            }
+            command
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+        };
+        let mut child = match spawn(directory) {
+            Err(error) if directory.is_some() && error.kind() == std::io::ErrorKind::NotFound => {
+                // The directory can disappear after the metadata check. Retry
+                // without it so a stale desktop entry still launches.
+                spawn(None)
+            }
+            result => result,
+        }
+        .map_err(|error| {
             // Both halves matter to whoever reads this: which target was
             // tried, and what the kernel said about it.
             CoreError::Invalid(format!("cannot launch {}: {error}", target.display()))
@@ -476,10 +508,11 @@ impl LinuxBackend {
                 Arc::clone(&self.user_time),
             )?);
         }
-        let service = self
-            .hotkeys
-            .as_mut()
-            .expect("the hotkey service was just connected");
+        let Some(service) = self.hotkeys.as_mut() else {
+            return Err(CoreError::Invalid(
+                "the X11 hotkey service disappeared before it could be returned".to_owned(),
+            ));
+        };
         Ok(service)
     }
 }
@@ -530,22 +563,26 @@ fn absolute_from_env(key: &str) -> Option<PathBuf> {
 fn is_desktop_entry(id: &OsStr) -> bool {
     Path::new(id).extension() == Some(OsStr::new(DESKTOP_EXTENSION))
 }
-
 /// Reads one candidate entry, refusing anything that is not an ordinary file
 /// of plausible size.
 ///
-/// The type check happens before the open because the open is the dangerous
-/// part: opening a FIFO blocks until somebody writes to it, and a symlink to a
-/// device node hands the scanner a stream that never ends. A directory named
-/// `something.desktop` falls to the same check. Metadata deliberately follows
-/// symlinks -- distributions do ship entries as links -- so what is inspected
-/// is the file that would actually be read.
+/// Opening a path can race a directory scan: a candidate that was a regular
+/// file can become a FIFO or device before the open. `O_NONBLOCK` makes that
+/// open safe, and metadata taken from the opened descriptor checks the object
+/// that will actually be read. Metadata deliberately follows symlinks --
+/// distributions do ship entries as links -- while the descriptor check still
+/// rejects links to devices and other non-files.
 ///
 /// The size is capped twice. The stat rejects a file that is already too big,
 /// and the read still runs through a reader limited to one byte past the cap,
 /// so a file that grows between the two calls is dropped rather than followed.
 fn read_entry(path: &Path) -> Option<Vec<u8>> {
-    let metadata = fs::metadata(path).ok()?;
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
     if !metadata.is_file() || metadata.len() > DesktopEntryScanner::MAX_ENTRY_BYTES {
         return None;
     }
@@ -554,22 +591,21 @@ fn read_entry(path: &Path) -> Option<Vec<u8>> {
     // itself instead of being trusted to match the size the stat reported.
     let limit = DesktopEntryScanner::MAX_ENTRY_BYTES.saturating_add(1);
     let mut contents = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
-    let mut reader = fs::File::open(path).ok()?.take(limit);
+    let mut reader = file.take(limit);
     reader.read_to_end(&mut contents).ok()?;
 
     // The extra byte is spent only by a file that outgrew the cap.
     (reader.limit() > 0).then_some(contents)
 }
 
-/// Reads the `[Desktop Entry]` group of one file into a discovery result.
-///
 /// `None` means "nothing a launcher can show or run": another `Type`, no name,
 /// no runnable `Exec`, a failed `TryExec`, an entry hidden by the current
-/// desktop, or an author set `NoDisplay`/`Hidden`. Malformed lines are skipped
-/// rather than aborting the parse, because one junk line in a vendor file must
-/// not delete a working application. The desktop-entry specification requires
-/// the complete file to be UTF-8, so a non-UTF-8 candidate is ignored instead
-/// of being converted into a different application name.
+/// desktop, an entry requiring a terminal that this backend cannot provide, or
+/// an author set `NoDisplay`/`Hidden`. Malformed lines are skipped rather than
+/// aborting the parse, because one junk line in a vendor file must not delete a
+/// working application. The desktop-entry specification requires the complete
+/// file to be UTF-8, so a non-UTF-8 candidate is ignored instead of being
+/// converted into a different application name.
 fn parse_entry(
     contents: &[u8],
     id: &OsStr,
@@ -587,6 +623,8 @@ fn parse_entry(
     let mut icon = None;
     let mut no_display = None;
     let mut hidden = None;
+    let mut terminal = None;
+    let mut working_directory = None;
     let mut only_show_in = None;
     let mut not_show_in = None;
 
@@ -633,6 +671,8 @@ fn parse_entry(
             b"Icon" => keep_first(&mut icon, value),
             b"NoDisplay" => keep_first(&mut no_display, value),
             b"Hidden" => keep_first(&mut hidden, value),
+            b"Path" => keep_first(&mut working_directory, value),
+            b"Terminal" => keep_first(&mut terminal, value),
             b"OnlyShowIn" => keep_first(&mut only_show_in, value),
             b"NotShowIn" => keep_first(&mut not_show_in, value),
             _ => {}
@@ -644,6 +684,12 @@ fn parse_entry(
     }
     // Absent means visible, so the `NoDisplay=false` an author writes on
     // purpose keeps the entry.
+    // There is no portable terminal-emulator policy in this backend. Hiding
+    // terminal entries is safer than presenting an item that will silently
+    // lose its terminal when launched with detached standard streams.
+    if is_true(terminal) {
+        return None;
+    }
     if is_true(no_display) || is_true(hidden) {
         return None;
     }
@@ -661,12 +707,16 @@ fn parse_entry(
         return None;
     }
     let (target, arguments) = exec_command(exec?)?;
+    let working_directory = working_directory
+        .filter(|path| !path.is_empty())
+        .map(|path| PlatformPath::new(text(path)));
 
     Some(DiscoveredApplication {
         name: text(name),
         target,
         arguments,
         icon_reference: icon.filter(|icon| !icon.is_empty()).map(text),
+        working_directory,
         // The desktop id is the file name: the identity the rest of the
         // desktop (`gtk-launch`, `.desktop` references) uses for this entry.
         platform_id: Some(id.to_string_lossy().into_owned()),
@@ -794,7 +844,7 @@ fn is_executable_file(path: &Path) -> bool {
 /// `None` when nothing runnable is left, which is what an empty or field-code
 /// only `Exec` amounts to.
 fn exec_command(value: &[u8]) -> Option<(PlatformPath, Vec<String>)> {
-    let mut tokens = split_exec(value).into_iter();
+    let mut tokens = split_exec(value)?.into_iter();
     let program = tokens.next().filter(|program| !program.is_empty())?;
 
     Some((
@@ -803,18 +853,53 @@ fn exec_command(value: &[u8]) -> Option<(PlatformPath, Vec<String>)> {
     ))
 }
 
+/// Decodes the general string escapes before the `Exec` quoting rules run.
+///
+/// Desktop-entry values use `\\s`, `\\n`, `\\t`, `\\r` and `\\\\` escapes
+/// before the command-specific quoting pass. In particular, a literal
+/// backslash inside a quoted argument needs four source backslashes: the
+/// generic pass reduces those to two and the quoting pass reduces them to one.
+fn unescape_exec_value(value: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut index = 0;
+    while let Some(&byte) = value.get(index) {
+        index = index.saturating_add(1);
+        if byte != b'\\' {
+            decoded.push(byte);
+            continue;
+        }
+
+        let Some(&escaped) = value.get(index) else {
+            decoded.push(b'\\');
+            break;
+        };
+        let replacement = match escaped {
+            b's' => Some(b' '),
+            b'n' => Some(b'\n'),
+            b't' => Some(b'\t'),
+            b'r' => Some(b'\r'),
+            b'\\' => Some(b'\\'),
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            decoded.push(replacement);
+            index = index.saturating_add(1);
+        } else {
+            decoded.push(b'\\');
+        }
+    }
+    decoded
+}
+
 /// Tokenizes an `Exec` value.
 ///
-/// Double quotes group a token and inside them a backslash escapes the next
-/// byte: the two rules real entries rely on for paths containing spaces. Field
-/// codes are launcher substitutions rather than arguments, so they are removed
-/// and `%%` collapses to a single percent -- inside quotes exactly as outside,
-/// because the format expands field codes before quoting is considered, so the
-/// `"%f"` an author quoted is still a substitution and not a filename. A token
-/// that was nothing but field codes disappears instead of becoming an empty
-/// argument. An unterminated quote yields the rest of the value rather than
-/// discarding the entry.
-fn split_exec(value: &[u8]) -> Vec<Vec<u8>> {
+/// Desktop-entry string escapes are decoded before command quoting. Double
+/// quotes group a token, and inside them a backslash escapes only the four
+/// characters the specification names. Field codes are launcher substitutions
+/// rather than arguments, so they are removed and `%%` collapses to a single
+/// percent. An unknown or unescaped field code makes the command invalid.
+fn split_exec(value: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let value = unescape_exec_value(value);
     let mut tokens = Vec::new();
     let mut token = Vec::new();
     // Tracked separately from `token`, so `""` stays an explicit empty
@@ -827,10 +912,10 @@ fn split_exec(value: &[u8]) -> Vec<Vec<u8>> {
     while let Some(&byte) = value.get(index) {
         index = index.saturating_add(1);
 
-        // Ahead of the quoting rules on purpose: the launcher expands a field
-        // code wherever it appears. A backslash escaped percent never arrives
-        // here because the quoted arm below consumes it, which keeps `\%` the
-        // literal percent the author asked for.
+        // Field-code expansion happens after the generic string escapes but
+        // before the resulting argument is handed to the executable. A
+        // backslash-escaped percent is not valid Exec syntax and is rejected
+        // rather than silently handing a placeholder to the child.
         if byte == b'%' {
             match value.get(index) {
                 Some(b'%') => {
@@ -839,14 +924,13 @@ fn split_exec(value: &[u8]) -> Vec<Vec<u8>> {
                     index = index.saturating_add(1);
                 }
                 Some(code) if FIELD_CODES.contains(code) => {
+                    if matches!(code, b'F' | b'U' | b'i') && !token.is_empty() {
+                        return None;
+                    }
                     stripped = true;
                     index = index.saturating_add(1);
                 }
-                // A stray percent is not a substitution; keep it.
-                _ => {
-                    token.push(b'%');
-                    started = true;
-                }
+                _ => return None,
             }
             continue;
         }
@@ -855,12 +939,12 @@ fn split_exec(value: &[u8]) -> Vec<Vec<u8>> {
             match byte {
                 b'"' => quoted = false,
                 b'\\' => match value.get(index) {
-                    Some(&escaped) => {
+                    Some(&escaped) if matches!(escaped, b'"' | b'`' | b'$' | b'\\') => {
                         token.push(escaped);
                         index = index.saturating_add(1);
                     }
-                    // A trailing backslash escapes nothing; keep it literal.
-                    None => token.push(b'\\'),
+                    Some(_) => token.push(b'\\'),
+                    None => return None,
                 },
                 _ => token.push(byte),
             }
@@ -881,6 +965,27 @@ fn split_exec(value: &[u8]) -> Vec<Vec<u8>> {
                 // removal into whatever argument comes next.
                 stripped = false;
             }
+            _ if matches!(
+                byte,
+                b'\''
+                    | b'\\'
+                    | b'`'
+                    | b'$'
+                    | b'>'
+                    | b'<'
+                    | b'~'
+                    | b'|'
+                    | b'&'
+                    | b';'
+                    | b'*'
+                    | b'?'
+                    | b'#'
+                    | b'('
+                    | b')'
+            ) =>
+            {
+                return None
+            }
             _ => {
                 token.push(byte);
                 started = true;
@@ -888,11 +993,14 @@ fn split_exec(value: &[u8]) -> Vec<Vec<u8>> {
         }
     }
 
+    if quoted {
+        return None;
+    }
     if started {
         push_token(&mut tokens, token, stripped);
     }
 
-    tokens
+    Some(tokens)
 }
 
 /// Ends a token, dropping the ones field-code removal emptied.

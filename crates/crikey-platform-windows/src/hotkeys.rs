@@ -430,6 +430,14 @@ impl HotkeyService for WindowsHotkeys {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.registrations.remove(registration.accelerator());
+                #[cfg(target_os = "windows")]
+                if self.registrations.is_empty() {
+                    // `bind` starts the message thread before asking Win32 to
+                    // reserve the first id. If that reservation is refused,
+                    // do not leave an idle thread behind for a service that
+                    // owns no native hotkeys.
+                    self.thread.take();
+                }
                 Err(error)
             }
         }
@@ -442,18 +450,21 @@ impl HotkeyService for WindowsHotkeys {
     /// live, and a launcher that thinks it released a hotkey it never held will
     /// keep swallowing that key press.
     ///
-    /// The id is released even when Win32 refuses the call. Keeping it would
-    /// reserve an id for a registration nobody can describe any more, and the
-    /// error still reaches the caller.
+    /// The logical registration is removed only after Win32 accepts the
+    /// unregister request. If the native call fails, retaining the record lets
+    /// shutdown retry cleanup and avoids losing track of a still-live global
+    /// hotkey.
     fn unregister(&mut self, binding: &HotkeyBinding) -> Result<()> {
         let accelerator = parse(binding)?;
         let canonical = accelerator.canonical();
-        let registration = self.registrations.remove(&canonical).ok_or_else(|| {
+        let registration = self.registrations.find(&canonical).cloned().ok_or_else(|| {
             CoreError::Invalid(format!(
                 "{canonical} holds no Windows hotkey registration to release"
             ))
         })?;
-        self.unbind(&registration)
+        self.unbind(&registration)?;
+        self.registrations.remove(&canonical);
+        Ok(())
     }
 
     /// Installs the callback the message thread invokes on `WM_HOTKEY`.

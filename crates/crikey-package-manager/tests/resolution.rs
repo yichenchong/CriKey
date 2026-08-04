@@ -133,6 +133,27 @@ fn each_comparison_operator_selects_the_expected_version() {
 }
 
 #[test]
+fn pre_releases_are_ordered_before_stable_versions_and_supported_in_exact_specs() {
+    let scratch = Scratch::new("pre-release");
+    let root = scratch.subdir("index");
+    write_wheel(&root, "acme", "1.0.0-alpha");
+    write_wheel(&root, "acme", "1.0.0-beta");
+    write_wheel(&root, "acme", "1.0.0");
+    let index = PackageIndex::from_dir(&root).expect("pre-release index loads");
+
+    assert_eq!(
+        acme_version(&resolved(&index, "acme>=1.0.0")),
+        "1.0.0",
+        "an ordinary range prefers a matching stable release"
+    );
+    assert_eq!(
+        acme_version(&resolved(&index, "acme==1.0.0-alpha")),
+        "1.0.0-alpha",
+        "an exact pre-release requirement remains selectable"
+    );
+}
+
+#[test]
 fn multiple_dependencies_are_all_pinned_in_one_lockfile() {
     let scratch = Scratch::new("multi");
     let index = multi_version_index(&scratch, "index");

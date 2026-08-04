@@ -183,6 +183,29 @@ fn stale_generation_batch_is_rejected_without_mutating_state() {
 }
 
 #[test]
+fn cancelled_batch_from_an_obsolete_generation_is_rejected_before_terminal_state() {
+    let tracker = GenerationTracker::new();
+    let (mut aggregator, old) = started(&tracker, limits(8, 8, 8));
+    let apps = plugin("dev.crikey.apps");
+    let current = tracker.advance();
+    aggregator.begin_generation(current);
+    let _ = aggregator.take_ui_update();
+
+    assert_eq!(
+        aggregator.accept(batch(
+            old,
+            &apps,
+            BatchState::Cancelled,
+            vec![item(&apps, "late", "Late")],
+        )),
+        Err(RejectReason::StaleGeneration)
+    );
+    assert!(aggregator.items().is_empty());
+    assert_eq!(aggregator.plugin_state(&apps), None);
+    assert!(aggregator.take_ui_update().is_none());
+}
+
+#[test]
 fn batch_for_a_generation_never_begun_is_rejected() {
     let tracker = GenerationTracker::new();
     let (mut aggregator, _active) = started(&tracker, limits(8, 8, 8));
@@ -637,6 +660,32 @@ fn metadata_byte_limit_counts_keys_and_values_and_is_atomic() {
         .accept(partial(generation, &apps, vec![beta, gamma]))
         .expect("combined metadata exactly at the byte limit is accepted");
     assert_eq!(ids(aggregator.items()), ["alpha", "beta", "gamma"]);
+}
+
+#[test]
+fn zero_result_quotas_reject_nonempty_batches_without_mutation() {
+    let tracker = GenerationTracker::new();
+    let (mut aggregator, generation) = started(&tracker, limits(0, 0, 0));
+    let apps = plugin("dev.crikey.apps");
+
+    assert_eq!(
+        aggregator.accept(partial(
+            generation,
+            &apps,
+            vec![item(&apps, "blocked", "Blocked")],
+        )),
+        Err(RejectReason::QuotaExceeded)
+    );
+    assert!(aggregator.items().is_empty());
+    assert_eq!(aggregator.plugin_state(&apps), None);
+    assert!(aggregator.take_ui_update().is_none());
+
+    // A zero quota still permits an empty completion marker; it consumes no
+    // retained-item budget and makes the stream state observable.
+    aggregator
+        .accept(batch(generation, &apps, BatchState::Final, Vec::new()))
+        .expect("an empty completion has no result to quota");
+    assert_eq!(aggregator.plugin_state(&apps), Some(BatchState::Final));
 }
 
 // ---------------------------------------------------------------------------

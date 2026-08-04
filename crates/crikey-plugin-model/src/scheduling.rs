@@ -224,17 +224,21 @@ impl Manifest {
             ));
         }
 
-        // Modern declarations are retained for diagnostics but have no
-        // semantic force under the strict compatibility profile.
-        if profile == SchedulingProfile::LegacyStrict {
-            return Ok(());
-        }
-
-        if self.query.debounce_ms == Some(0) && self.query.maximum_wait_ms.is_some() {
+        // A maximum wait only has meaning when the effective debounce period
+        // can postpone dispatch. For runtimes such as `builtin`, the omitted
+        // debounce is itself a zero-valued default; checking only
+        // `query.debounce_ms == Some(0)` would accept a maximum wait and then
+        // silently discard it in `query_policy`.
+        let effective_network_backed = self.query.network_backed.unwrap_or(self.permissions.network);
+        let effective_debounce_ms = self
+            .query
+            .debounce_ms
+            .unwrap_or_else(|| default_debounce_ms(self.plugin.runtime, effective_network_backed));
+        if effective_debounce_ms == 0 && self.query.maximum_wait_ms.is_some() {
             return Err(invalid_with_detail(
                 "query.maximum-wait-ms",
                 PolicyProblem::Contradictory,
-                "query.maximum-wait-ms cannot be combined with query.debounce-ms = 0 because zero debounce dispatches immediately",
+                "query.maximum-wait-ms cannot be combined with query.debounce-ms = 0 or an effective debounce period of 0 because zero debounce dispatches immediately",
             ));
         }
 

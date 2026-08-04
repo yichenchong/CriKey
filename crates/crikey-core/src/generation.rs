@@ -17,9 +17,10 @@ impl Generation {
     /// catalog slice, an IPC frame, a stored query state.
     ///
     /// Decoding only. Live generations are minted exclusively by
-    /// [`GenerationTracker::advance`], which is what keeps them monotonic; a
-    /// value invented here has no relationship to any tracker's sequence and
-    /// would make staleness answers meaningless.
+    /// [`GenerationTracker::advance`] or [`GenerationTracker::try_advance`],
+    /// which is what keeps them monotonic; a value invented here has no
+    /// relationship to any tracker's sequence and would make staleness answers
+    /// meaningless.
     #[inline]
     pub const fn from_raw(value: u64) -> Generation {
         Generation(value)
@@ -55,17 +56,29 @@ impl GenerationTracker {
 
     /// Allocates the generation for a new query state.
     ///
-    /// There is no safe successor to `u64::MAX`. Rather than wrapping to zero
-    /// (which would make old results look current), exhaustion fails closed
-    /// with a clear panic.
+    /// There is no safe successor to `u64::MAX`; callers that can report
+    /// exhaustion should use [`GenerationTracker::try_advance`] instead.
+    /// This convenience method is retained for existing infallible callers;
+    /// it panics only when the process has exhausted every possible
+    /// generation. New long-lived services should prefer the fallible method.
     pub fn advance(&self) -> Generation {
+        self.try_advance()
+            .expect("query generation counter exhausted at u64::MAX")
+    }
+
+    /// Fallibly allocates the generation for a new query state.
+    ///
+    /// The counter never wraps. Once it reaches `u64::MAX`, this returns
+    /// [`CoreError::CapacityExceeded`] and leaves the current generation at
+    /// the maximum value.
+    pub fn try_advance(&self) -> crate::Result<Generation> {
         let previous = self
             .current
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
-            .expect("query generation counter exhausted at u64::MAX");
-        Generation(previous + 1)
+            .map_err(|_| crate::CoreError::CapacityExceeded("query generations"))?;
+        Ok(Generation(previous + 1))
     }
 
     /// Checks that work belongs to the currently visible generation.
@@ -131,6 +144,18 @@ mod tests {
                 if got == old.get() && seen == current.get()
         ));
         assert!(tracker.ensure_current(current).is_ok());
+    }
+
+    #[test]
+    fn fallible_advance_reports_exhaustion_without_wrapping() {
+        let tracker = GenerationTracker::new();
+        tracker.current.store(u64::MAX, Ordering::Relaxed);
+
+        assert!(matches!(
+            tracker.try_advance(),
+            Err(crate::CoreError::CapacityExceeded("query generations"))
+        ));
+        assert_eq!(tracker.current(), Generation::from_raw(u64::MAX));
     }
 
     #[test]

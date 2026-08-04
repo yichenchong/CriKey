@@ -632,6 +632,44 @@ fn native_query_returns_without_waiting_for_a_slow_sibling() {
 }
 
 #[test]
+fn native_manifest_hard_deadline_limits_suggest_call() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("manifest-timeout");
+    let plugins_root = scratch.subdir("plugins");
+    let package = write_native_plugin(&plugins_root, "timeout", &conformance, "slow:750");
+    let manifest_path = package.join("crikey.toml");
+    let mut manifest = fs::read_to_string(&manifest_path).expect("manifest is readable");
+    manifest.push_str("\n[performance]\nsuggest-hard-timeout-ms = 100\n");
+    fs::write(&manifest_path, manifest).expect("manifest deadline is writable");
+
+    let timeout_plugin = native_plugin("timeout");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider =
+        NativeProvider::load_with_collection_window(&mut pipeline, &[plugins_root], Duration::from_secs(2));
+    assert!(
+        provider.plugins().contains(&timeout_plugin),
+        "the timeout plugin must load; unavailable: {:?}",
+        provider.unavailable(),
+    );
+
+    let started = Instant::now();
+    let frame = provider
+        .drive_query(&mut pipeline, "timeout", 17)
+        .expect("a timed-out plugin still yields a current frame");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the manifest hard deadline must stop suggest near 100 ms, not the 5 s transport cap (elapsed {:?})",
+        started.elapsed(),
+    );
+    assert!(
+        !frame.rows.iter().any(|row| row.plugin_name == timeout_plugin.0),
+        "a timed-out plugin must contribute no rows",
+    );
+
+    provider.shutdown(0);
+}
+
+#[test]
 fn native_driver_refuses_a_superseded_generation_without_blocking_submit() {
     let (conformance, _) = conformance_binaries();
     let scratch = Scratch::new("supersede");

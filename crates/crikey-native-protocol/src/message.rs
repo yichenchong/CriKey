@@ -23,16 +23,10 @@ fn ensure_message_size(bytes: &[u8]) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-fn mark_singular(seen: &mut u64, field_number: u32) -> Result<(), ProtocolError> {
-    let bit = 1_u64
-        .checked_shl(field_number)
-        .ok_or_else(|| ProtocolError::Malformed("known field number is too large".to_owned()))?;
-    if *seen & bit != 0 {
-        return Err(ProtocolError::Malformed(format!(
-            "duplicate singular field {field_number}"
-        )));
-    }
-    *seen |= bit;
+fn mark_singular(_seen: &mut u64, _field_number: u32) -> Result<(), ProtocolError> {
+    // Proto3 permits a singular field to occur more than once.  Scalar and
+    // enum fields use the last value, while a message field is replaced by
+    // the last occurrence.  The caller already performs that assignment.
     Ok(())
 }
 

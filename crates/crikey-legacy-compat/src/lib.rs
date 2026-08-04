@@ -142,7 +142,12 @@ impl std::fmt::Display for ApiSupport {
     }
 }
 
-/// Scheduling state for one legacy plugin instance.
+/// Compatibility-only scheduling state for one legacy plugin instance.
+///
+/// This is **not** the live lifecycle state machine. Production dispatch uses
+/// [`crate::lifecycle::LegacyRuntime`], which also tracks initialization,
+/// catalog work, reloads, instance identity, and stale-result rejection.
+/// Prefer `LegacyRuntime` for all real plugin lifecycle decisions.
 #[derive(Debug)]
 pub struct LegacyPluginState {
     pub plugin: PluginId,

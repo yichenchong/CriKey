@@ -113,6 +113,10 @@ const MAX_CALL_ITEMS: usize = 100_000;
 /// (512 × 4096 bytes) fits many times over.
 const MAX_CALL_LOG_BYTES: usize = 8 * 1024 * 1024;
 
+/// Aggregate ceiling on retained log entries in one suggestion call. The byte
+/// ceiling alone would still allow millions of tiny `String` allocations.
+const MAX_CALL_LOG_LINES: usize = 16 * protocol::MAX_LOG_LINES;
+
 /// Bound on the last step of reaping a child that has already closed stdout.
 const REAP_GRACE: Duration = Duration::from_millis(250);
 
@@ -123,6 +127,16 @@ const REAP_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// crash tail is complete without ever blocking on a grandchild that inherited
 /// the pipe.
 const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(250);
+
+/// Prevents an untrusted public timeout field from overflowing `Instant`.
+const MAX_TIMEOUT_MILLIS: u64 = 365 * 24 * 60 * 60 * 1_000;
+
+fn deadline_after_millis(milliseconds: u64) -> Instant {
+    let bounded = milliseconds.min(MAX_TIMEOUT_MILLIS);
+    Instant::now()
+        .checked_add(Duration::from_millis(bounded))
+        .unwrap_or_else(Instant::now)
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -340,16 +354,38 @@ impl WorkerOptions {
 // The shared link
 // ---------------------------------------------------------------------------
 
+/// A serialized request for the dedicated stdin writer.
+#[derive(Debug)]
+struct StdinRequest {
+    bytes: Vec<u8>,
+    completion: SyncSender<Result<(), String>>,
+}
+
 /// The parts of a worker that outlive the thread that owns it.
 ///
-/// `stdin` is behind a mutex because two threads write frames to it: whichever
-/// thread is inside a call, and whichever thread raises the cancel flag through
-/// a [`CancelHandle`]. Both writes are a single small frame, so the lock is
-/// never held across a blocking read.
+/// Frames are handed to a dedicated writer thread. The mutex protects only
+/// taking or cloning the channel sender; no child I/O happens while it is held.
 #[derive(Debug)]
 struct WorkerLink {
     next_id: AtomicU64,
-    stdin: Mutex<Option<ChildStdin>>,
+    stdin: Mutex<Option<SyncSender<StdinRequest>>>,
+    stdin_thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+fn spawn_stdin_writer(mut stdin: ChildStdin, receiver: Receiver<StdinRequest>) -> JoinHandle<()> {
+    thread::spawn(move || {
+        for request in receiver {
+            let result = stdin
+                .write_all(&request.bytes)
+                .and_then(|()| stdin.flush())
+                .map_err(|error| error.to_string());
+            let failed = result.is_err();
+            let _ = request.completion.send(result);
+            if failed {
+                return;
+            }
+        }
+    })
 }
 
 impl WorkerLink {
@@ -359,30 +395,73 @@ impl WorkerLink {
         self.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
     }
 
-    fn write_frame(&self, frame: &Value) -> io::Result<()> {
-        // A poisoned mutex means another thread panicked mid-write. The frame
-        // stream may be truncated, which the peer reports as a protocol error;
-        // panicking again here would turn one plugin's fault into a host fault.
-        let mut guard = self.stdin.lock().unwrap_or_else(|error| error.into_inner());
-        let mut encoded =
-            serde_json::to_string(frame).expect("a frame built from owned JSON values serialises");
-        encoded.push('\n');
-        match guard.as_mut() {
-            Some(stdin) => {
-                stdin.write_all(encoded.as_bytes())?;
-                stdin.flush()
-            }
-            None => Err(io::Error::new(
+    fn enqueue_frame(&self, frame: &Value) -> io::Result<Receiver<Result<(), String>>> {
+        let mut encoded = serde_json::to_vec(frame).expect("a frame built from owned JSON values serialises");
+        encoded.push(b'\n');
+        let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        let sender = {
+            let guard = self.stdin.lock().unwrap_or_else(|error| error.into_inner());
+            guard.clone()
+        };
+        let Some(sender) = sender else {
+            return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "the modern worker's standard input is already closed",
+            ));
+        };
+        sender
+            .send(StdinRequest {
+                bytes: encoded,
+                completion: completion_sender,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "the stdin writer stopped"))?;
+        Ok(completion_receiver)
+    }
+
+    fn write_frame(&self, frame: &Value) -> io::Result<()> {
+        match self.enqueue_frame(frame)?.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, error)),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the stdin writer stopped before completing the frame",
             )),
         }
     }
 
-    /// Closes the child's stdin: end of file on stdin means "no more requests".
+    /// Queues a control frame without waiting for the child to consume it.
+    /// Shutdown uses this path so its timeout also covers a child that stopped
+    /// reading stdin.
+    fn queue_frame(&self, frame: &Value) -> io::Result<()> {
+        let completion = self.enqueue_frame(frame)?;
+        drop(completion);
+        Ok(())
+    }
+
+    /// Closes the channel: the writer then drops the child's stdin.
     fn close_stdin(&self) {
         let mut guard = self.stdin.lock().unwrap_or_else(|error| error.into_inner());
         drop(guard.take());
+    }
+
+    /// Joins the writer after the child has been stopped, without allowing a
+    /// grandchild that inherited stdin to hold teardown forever.
+    fn finish_stdin_writer(&self) {
+        let handle = self
+            .stdin_thread
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let Some(handle) = handle else {
+            return;
+        };
+        let deadline = Instant::now() + REAP_GRACE;
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(REAP_POLL_INTERVAL);
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
     }
 }
 /// Bounded operator-visible counters for child-registered background work.
@@ -511,9 +590,6 @@ impl BackgroundState {
             .remove(&task_id)
             .is_some();
         let mut counters = self.counters.lock().unwrap_or_else(|error| error.into_inner());
-        if !removed {
-            counters.unknown_completions = counters.unknown_completions.saturating_add(1);
-        }
         match status {
             "cancelled" => counters.cancelled = counters.cancelled.saturating_add(1),
             "failed" => counters.failed = counters.failed.saturating_add(1),
@@ -577,6 +653,9 @@ enum StdoutEvent {
     /// that emitted it has lost framing, and guessing where the next frame
     /// starts would invent data.
     Oversized { excerpt: String, bytes: usize },
+    /// The child emitted bytes that cannot be decoded as UTF-8, or a malformed
+    /// lifecycle frame. These are protocol failures, not interpreter crashes.
+    Protocol(String),
     /// Reading the pipe itself failed.
     Failed(String),
 }
@@ -651,11 +730,17 @@ fn spawn_stdout_reader(
             line.clear();
             let event = match read_frame_line(&mut reader, &mut line) {
                 Ok(LineRead::Frame) => {
-                    let text = String::from_utf8_lossy(strip_carriage_return(&line)).into_owned();
-                    match handle_background_frame(&text, &link, &background) {
-                        Ok(true) => continue,
-                        Ok(false) => StdoutEvent::Frame(text),
-                        Err(error) => StdoutEvent::Failed(error),
+                    let bytes = strip_carriage_return(&line);
+                    match std::str::from_utf8(bytes) {
+                        Ok(text) => {
+                            let text = text.to_owned();
+                            match handle_background_frame(&text, &link, &background) {
+                                Ok(true) => continue,
+                                Ok(false) => StdoutEvent::Frame(text),
+                                Err(error) => StdoutEvent::Protocol(error),
+                            }
+                        }
+                        Err(_) => StdoutEvent::Protocol("the modern worker emitted invalid UTF-8".to_owned()),
                     }
                 }
                 Ok(LineRead::Eof) => return,
@@ -739,7 +824,18 @@ struct StderrTail {
 }
 
 impl StderrTail {
-    fn push(&mut self, line: String) {
+    fn push(&mut self, mut line: String) {
+        const MARKER: &str = "[crikey: stderr line truncated] ";
+        let line_limit = MAX_STDERR_TAIL_BYTES.saturating_sub(1);
+        if line.len() > line_limit {
+            let suffix_limit = line_limit.saturating_sub(MARKER.len());
+            let mut start = line.len().saturating_sub(suffix_limit);
+            while start < line.len() && !line.is_char_boundary(start) {
+                start += 1;
+            }
+            line = format!("{MARKER}{}", &line[start..]);
+        }
+
         self.bytes = self.bytes.saturating_add(line.len() + 1);
         self.lines.push_back(line);
         while self.bytes > MAX_STDERR_TAIL_BYTES {
@@ -776,10 +872,17 @@ fn spawn_stderr_drain(stderr: ChildStderr, tail: Arc<Mutex<StderrTail>>) -> Join
                     let text = String::from_utf8_lossy(strip_carriage_return(&line)).into_owned();
                     tail.lock().unwrap_or_else(|error| error.into_inner()).push(text);
                 }
+                Ok(LineRead::Oversized(_)) => {
+                    tail.lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .push("[crikey: stderr line exceeded the frame limit and was truncated]".to_owned());
+                    // `read_frame_line` consumed through the oversized line's
+                    // newline, so the next iteration is still frame-aligned.
+                }
                 // Nothing more will arrive, or the log channel itself is broken.
                 // Either way the tail stops growing and the thread ends rather
                 // than spinning on a dead pipe.
-                Ok(LineRead::Eof | LineRead::Oversized(_)) | Err(_) => return,
+                Ok(LineRead::Eof) | Err(_) => return,
             }
         }
     })
@@ -877,9 +980,12 @@ impl ModernWorker {
         let stderr = child.stderr.take().expect("worker stderr is piped");
 
         let (sender, frames) = mpsc::sync_channel(128);
+        let (stdin_sender, stdin_requests) = mpsc::sync_channel(128);
+        let stdin_thread = spawn_stdin_writer(stdin, stdin_requests);
         let link = Arc::new(WorkerLink {
             next_id: AtomicU64::new(0),
-            stdin: Mutex::new(Some(stdin)),
+            stdin: Mutex::new(Some(stdin_sender)),
+            stdin_thread: Mutex::new(Some(stdin_thread)),
         });
         let background = Arc::new(BackgroundState::new(options.shared_budget.clone()));
         spawn_stdout_reader(stdout, sender, Arc::clone(&link), Arc::clone(&background));
@@ -955,7 +1061,7 @@ impl ModernWorker {
         // budget, decremented as time passes, so a plugin that streams partial
         // catalog batches forever is bounded rather than resetting the clock
         // with each frame.
-        let deadline = Instant::now() + Duration::from_millis(self.options.call_timeout_ms);
+        let deadline = deadline_after_millis(self.options.call_timeout_ms);
         let mut items = Vec::new();
         let mut log_bytes = 0usize;
         loop {
@@ -1056,18 +1162,17 @@ impl ModernWorker {
         // streams partial batches forever is bounded, not hung, because each
         // frame is read against the same shrinking budget rather than a fresh
         // per-frame one.
-        let deadline = Instant::now() + Duration::from_millis(self.options.call_timeout_ms);
+        let deadline = deadline_after_millis(self.options.call_timeout_ms);
         let mut items = Vec::new();
         let mut log = Vec::new();
         let mut log_bytes = 0usize;
         loop {
             let line = self.recv_frame_until(deadline)?;
             let frame = self.expect_frame(&line, id, KIND_RESULT_BATCH)?;
-            if let Some(generation) = frame.get("generation").and_then(Value::as_u64) {
-                if generation != request.generation {
-                    return Err(self.protocol_error(&line));
-                }
-            } else if frame.get("generation").is_some() {
+            let Some(generation) = frame.get("generation").and_then(Value::as_u64) else {
+                return Err(self.protocol_error(&line));
+            };
+            if generation != request.generation {
                 return Err(self.protocol_error(&line));
             }
             match protocol::decode_items(&self.plugin, &frame) {
@@ -1089,6 +1194,11 @@ impl ModernWorker {
             let Some(mut batch_log) = protocol::decode_log(&frame) else {
                 return Err(self.protocol_error(&line));
             };
+            if log.len().saturating_add(batch_log.len()) > MAX_CALL_LOG_LINES {
+                return Err(self.overflow(format!(
+                    "suggest streamed more than {MAX_CALL_LOG_LINES} log lines and was stopped"
+                )));
+            }
             log.append(&mut batch_log);
 
             match frame.get("state").and_then(Value::as_str) {
@@ -1230,7 +1340,7 @@ impl ModernWorker {
 
     /// Waits up to `budget_ms` for one protocol line.
     fn recv_frame(&mut self, budget_ms: u64) -> Result<String, HostError> {
-        self.recv_frame_until(Instant::now() + Duration::from_millis(budget_ms))
+        self.recv_frame_until(deadline_after_millis(budget_ms))
     }
 
     /// Waits for one protocol line until `deadline`. Reaching it, or observing
@@ -1254,6 +1364,10 @@ impl ModernWorker {
                         "{excerpt} [crikey: line of {bytes} bytes reached the \
                          {MAX_FRAME_BYTES}-byte frame limit and was abandoned]"
                     )));
+                }
+                Ok(StdoutEvent::Protocol(message)) => {
+                    self.fail_and_reap();
+                    return Err(HostError::Protocol(message));
                 }
                 Ok(StdoutEvent::Failed(message)) => {
                     self.fail_and_reap();
@@ -1330,6 +1444,9 @@ impl ModernWorker {
             ));
         }
 
+        if tail.is_empty() {
+            tail.push_str("no stderr output");
+        }
         HostError::Crashed {
             plugin: self.plugin.clone(),
             detail: tail,
@@ -1341,6 +1458,7 @@ impl ModernWorker {
         self.background.reap();
         self.link.close_stdin();
         let Some(mut child) = self.child.take() else {
+            self.link.finish_stdin_writer();
             return self.reaped;
         };
 
@@ -1356,6 +1474,7 @@ impl ModernWorker {
                 status
             }
         };
+        self.link.finish_stdin_writer();
         self.reaped = status;
         self.reaped
     }
@@ -1365,14 +1484,16 @@ impl ModernWorker {
         self.alive = false;
         self.background.reap();
         if let Some(status) = self.reaped {
+            self.link.finish_stdin_writer();
             self.drain_stderr();
             return WorkerExit {
                 code: status.code(),
                 hard_stopped: self.hard_stopped,
             };
         }
-
         let Some(mut child) = self.child.take() else {
+            self.link.close_stdin();
+            self.link.finish_stdin_writer();
             self.drain_stderr();
             return WorkerExit {
                 code: None,
@@ -1381,7 +1502,7 @@ impl ModernWorker {
         };
 
         let id = self.link.next_id();
-        let _ = self.link.write_frame(&encode_shutdown(id));
+        let _ = self.link.queue_frame(&encode_shutdown(id));
         // Redundant on purpose: end of file on stdin means the same thing, and a
         // shim that missed the frame still sees the pipe close.
         self.link.close_stdin();
@@ -1421,6 +1542,7 @@ impl ModernWorker {
                 self.hard_stopped = true;
                 let Some(status) = wait_bounded(&mut child, REAP_GRACE) else {
                     reap_in_background(child);
+                    self.link.finish_stdin_writer();
                     self.drain_stderr();
                     return WorkerExit {
                         code: None,
@@ -1430,8 +1552,8 @@ impl ModernWorker {
                 status
             }
         };
-
         self.reaped = Some(status);
+        self.link.finish_stdin_writer();
         self.drain_stderr();
         WorkerExit {
             code: status.code(),
@@ -1448,6 +1570,9 @@ impl Drop for ModernWorker {
         self.background.reap();
         if self.child.is_some() {
             let _ = self.reap();
+        } else {
+            self.link.close_stdin();
+            self.link.finish_stdin_writer();
         }
         self.drain_stderr();
     }
@@ -1465,6 +1590,9 @@ fn parse_object(line: &str) -> Option<Map<String, Value>> {
 }
 
 fn bounded_excerpt(line: &str) -> String {
+    if line.is_empty() {
+        return "<empty line>".to_owned();
+    }
     let end = floor_char_boundary(line, PROTOCOL_EXCERPT_BYTES);
     line[..end].to_owned()
 }
@@ -1587,5 +1715,34 @@ fn wait_bounded(child: &mut Child, budget: Duration) -> Option<ExitStatus> {
             return None;
         }
         thread::sleep(REAP_POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn empty_protocol_lines_have_a_clear_error_excerpt() {
+        assert_eq!(bounded_excerpt(""), "<empty line>");
+    }
+
+    #[test]
+    fn stderr_tail_keeps_a_bounded_suffix_of_one_long_line() {
+        let mut tail = StderrTail::default();
+        tail.push("x".repeat(MAX_STDERR_TAIL_BYTES * 2));
+        let rendered = tail.render();
+        assert!(rendered.len() <= MAX_STDERR_TAIL_BYTES);
+        assert!(rendered.starts_with("[crikey: stderr line truncated] "));
+    }
+
+    #[test]
+    fn frame_reader_accepts_a_complete_final_line_without_newline() {
+        let mut reader = std::io::Cursor::new(br#"{"kind":"final"}"#.to_vec());
+        let mut line = Vec::new();
+        assert!(matches!(
+            read_frame_line(&mut reader, &mut line),
+            Ok(LineRead::Frame)
+        ));
+        assert_eq!(line, br#"{"kind":"final"}"#);
     }
 }

@@ -47,6 +47,9 @@ struct HarnessPlugin {
     executed: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     fail_start: bool,
+    fail_suggest: bool,
+    emit_logs: bool,
+    many_results: bool,
 }
 
 impl HarnessPlugin {
@@ -55,6 +58,9 @@ impl HarnessPlugin {
             executed,
             stopped,
             fail_start: false,
+            fail_suggest: false,
+            emit_logs: false,
+            many_results: false,
         }
     }
 
@@ -63,7 +69,25 @@ impl HarnessPlugin {
             executed: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             fail_start: true,
+            fail_suggest: false,
+            emit_logs: false,
+            many_results: false,
         }
+    }
+
+    fn with_logs(mut self) -> Self {
+        self.emit_logs = true;
+        self
+    }
+
+    fn failing_suggest(mut self) -> Self {
+        self.fail_suggest = true;
+        self
+    }
+
+    fn with_many_results(mut self) -> Self {
+        self.many_results = true;
+        self
     }
 }
 
@@ -77,7 +101,10 @@ impl Plugin for HarnessPlugin {
         Ok(())
     }
 
-    fn build_catalog(&mut self, _context: &dyn PluginContext, sink: &mut dyn CatalogSink) -> Result<()> {
+    fn build_catalog(&mut self, context: &dyn PluginContext, sink: &mut dyn CatalogSink) -> Result<()> {
+        if self.emit_logs {
+            context.log(crikey_plugin_sdk::LogLevel::Info, "catalog log");
+        }
         sink.emit_batch(vec![
             item("catalog-one", "Catalog One"),
             item("catalog-two", "Catalog Two"),
@@ -88,9 +115,24 @@ impl Plugin for HarnessPlugin {
     fn suggest(
         &mut self,
         query: Query,
-        _context: &dyn PluginContext,
+        context: &dyn PluginContext,
         sink: &mut dyn SuggestionSink,
     ) -> Result<()> {
+        if self.fail_suggest {
+            return Err(crikey_core::CoreError::Invalid(
+                "fixture suggestion failure".to_owned(),
+            ));
+        }
+        if self.emit_logs {
+            context.log(crikey_plugin_sdk::LogLevel::Info, "suggestion log");
+        }
+        if self.many_results {
+            let items = (0..10_001)
+                .map(|index| item(format!("many-{index}"), format!("many {index}")))
+                .collect();
+            sink.emit_batch(items)?;
+            return sink.finish();
+        }
         if sink.is_cancelled() {
             return sink.finish();
         }
@@ -99,7 +141,10 @@ impl Plugin for HarnessPlugin {
         sink.finish()
     }
 
-    fn execute(&mut self, _request: ExecuteRequest, _context: &dyn PluginContext) -> Result<()> {
+    fn execute(&mut self, _request: ExecuteRequest, context: &dyn PluginContext) -> Result<()> {
+        if self.emit_logs {
+            context.log(crikey_plugin_sdk::LogLevel::Info, "execute log");
+        }
         self.executed.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -146,6 +191,54 @@ fn test_harness_drives_handshake_catalog_suggest_execute_and_shutdown() {
 
     harness.shutdown().expect("plugin shutdown");
     assert!(stopped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn test_harness_matches_host_log_and_failure_result_handling() {
+    let executed = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let mut harness = TestHarness::start(
+        HarnessPlugin::new(Arc::clone(&executed), Arc::clone(&stopped)).with_logs(),
+        config(),
+    )
+    .expect("start logging plugin");
+
+    let catalog = harness.catalog().expect("catalog with log");
+    assert_eq!(catalog.len(), 2);
+    assert_eq!(catalog[0].stable_id.0, "catalog-one");
+    assert_eq!(catalog[1].stable_id.0, "catalog-two");
+    let suggestions = harness.suggest("logged").expect("suggestion with log");
+    assert_eq!(suggestions.state, BatchStateKind::Final);
+    harness
+        .execute("catalog-one", None, None)
+        .expect("execute with log");
+    assert!(executed.load(Ordering::SeqCst));
+    harness.shutdown().expect("shutdown logging plugin");
+
+    let mut failing = TestHarness::start(
+        HarnessPlugin::new(Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)))
+            .failing_suggest(),
+        config(),
+    )
+    .expect("start failing suggestion plugin");
+    let result = failing.suggest("failure").expect("failed suggestion frame");
+    assert_eq!(result.state, BatchStateKind::Failed);
+    failing.shutdown().expect("shutdown failing plugin");
+}
+
+#[test]
+fn test_harness_applies_the_host_result_limit() {
+    let mut harness = TestHarness::start(
+        HarnessPlugin::new(Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)))
+            .with_many_results(),
+        config(),
+    )
+    .expect("start oversized plugin");
+
+    let result = harness.suggest("many").expect("bounded suggestion");
+    assert_eq!(result.state, BatchStateKind::Final);
+    assert_eq!(result.items.len(), 10_000);
+    harness.shutdown().expect("shutdown oversized plugin");
 }
 
 #[test]

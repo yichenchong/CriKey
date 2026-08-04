@@ -79,7 +79,10 @@ fn validate_help_args(command: &str, args: &[String]) -> Result<(), String> {
                 || argument == "--package"
                 || argument == "--expect-hash"
             {
-                position = position.saturating_add(2);
+                position += 1;
+                if args.get(position).is_some_and(|value| !value.starts_with("--")) {
+                    position += 1;
+                }
             } else {
                 position += 1;
             }
@@ -400,6 +403,11 @@ mod tests {
     fn help_does_not_hide_unknown_package_options() {
         let args = vec!["--help".to_owned(), "--unknown".to_owned()];
         assert!(validate_help_args("build", &args).is_err());
+        assert!(validate_help_args(
+            "build",
+            &["--help".to_owned(), "--plugin".to_owned(), "--unknown".to_owned()]
+        )
+        .is_err());
     }
 
     #[test]

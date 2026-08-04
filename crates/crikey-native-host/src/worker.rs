@@ -430,6 +430,12 @@ impl NativeWorker {
     }
 
     fn spawn_inner(spec: LaunchSpec, options: WorkerOptions) -> Result<Self, HostError> {
+        if options.limits.initial_credits == 0 {
+            return Err(HostError::ResourceLimit {
+                plugin: spec.plugin.clone(),
+                detail: "initial_credits must be greater than zero".to_owned(),
+            });
+        }
         let token = session_token().map_err(HostError::Spawn)?;
         let connection_id = next_connection_id();
         let (endpoint, listener) = make_endpoint(options.transport, &token)?;
@@ -499,6 +505,7 @@ impl NativeWorker {
                     Some(value) => value,
                     None => {
                         terminate_and_reap(&mut child);
+                        join_bounded(stderr_reader, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
                         return Err(HostError::Spawn("child stdin was not piped".to_owned()));
                     }
                 };
@@ -506,6 +513,7 @@ impl NativeWorker {
                     Some(value) => value,
                     None => {
                         terminate_and_reap(&mut child);
+                        join_bounded(stderr_reader, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
                         return Err(HostError::Spawn("child stdout was not piped".to_owned()));
                     }
                 };
@@ -524,10 +532,13 @@ impl NativeWorker {
                 )
             }
             TransportKind::UnixSocket | TransportKind::NamedPipe => {
+                let _ = child.stdin.take();
+                let _ = child.stdout.take();
                 let listener = match listener {
                     Some(value) => value,
                     None => {
                         terminate_and_reap(&mut child);
+                        join_bounded(stderr_reader, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
                         return Err(HostError::Spawn("native listener was not created".to_owned()));
                     }
                 };
@@ -536,6 +547,7 @@ impl NativeWorker {
                     Ok(value) => value,
                     Err(error) => {
                         terminate_and_reap(&mut child);
+                        join_bounded(stderr_reader, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
                         return Err(HostError::Handshake(format!("plugin did not connect: {error:?}")));
                     }
                 };
@@ -599,7 +611,21 @@ impl NativeWorker {
                 terminate_and_reap(&mut child);
                 join_bounded(stderr_reader, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
                 link.join_reader();
-                return Err(error);
+                let stderr = lock_unpoisoned(&stderr_tail).text();
+                if stderr.is_empty() {
+                    return Err(error);
+                }
+                let detail = format!("{error}; child stderr: {stderr}");
+                return Err(match error {
+                    HostError::Spawn(_) => HostError::Spawn(detail),
+                    HostError::Handshake(_) => HostError::Handshake(detail),
+                    HostError::Protocol(_) => HostError::Protocol(detail),
+                    HostError::Timeout { plugin, .. } => HostError::Timeout { plugin, detail },
+                    HostError::Crashed { plugin, .. } => HostError::Crashed { plugin, detail },
+                    HostError::PluginFailed { plugin, .. } => HostError::PluginFailed { plugin, detail },
+                    HostError::ResourceLimit { plugin, .. } => HostError::ResourceLimit { plugin, detail },
+                    HostError::Closed => HostError::Closed,
+                });
             }
         };
         link.credits
@@ -652,6 +678,7 @@ impl NativeWorker {
         let mut items = Vec::new();
         let mut batches = 0usize;
         let mut bytes = 0usize;
+        let mut next_sequence = 0_u64;
         loop {
             let event = self.next_event(end, request_id, 0)?;
             let envelope = match event {
@@ -660,6 +687,10 @@ impl NativeWorker {
             };
             match envelope.payload {
                 Some(Payload::CatalogBatch(batch)) => {
+                    self.validate_batch_sequence(batch.sequence, &mut next_sequence, "catalog")?;
+                    if let Some(error) = batch.error.as_ref() {
+                        self.validate_nested_error(error, request_id, "catalog")?;
+                    }
                     batches = batches.saturating_add(1);
                     let batch_bytes = batch.encode().len();
                     bytes = bytes.saturating_add(batch_bytes);
@@ -667,6 +698,10 @@ impl NativeWorker {
                     if batches > self.options.limits.max_batches_per_query
                         || bytes > self.options.limits.max_bytes_per_query
                     {
+                        if batch.done {
+                            self.mark_call_succeeded();
+                            return Ok(items);
+                        }
                         self.truncate(request_id, 0)?;
                         self.mark_call_succeeded();
                         return Ok(items);
@@ -680,6 +715,10 @@ impl NativeWorker {
                                 .take(remaining)
                                 .map(|value| from_proto_item(&self.spec.plugin, value)),
                         );
+                        if batch.done {
+                            self.mark_call_succeeded();
+                            return Ok(items);
+                        }
                         self.truncate(request_id, 0)?;
                         self.mark_call_succeeded();
                         return Ok(items);
@@ -704,8 +743,10 @@ impl NativeWorker {
                     }
                 }
                 Some(Payload::Log(log)) => self.record_log(log.message),
-                Some(Payload::Error(error)) => return Err(self.error_payload(error)),
-                Some(_) | None => {}
+                Some(Payload::Error(error)) => return Err(self.error_payload(error, request_id)),
+                Some(_) | None => {
+                    return Err(self.protocol_failure("unexpected catalog response payload".to_owned()));
+                }
             }
         }
     }
@@ -759,6 +800,7 @@ impl NativeWorker {
         let mut log_records = 0usize;
         let mut batches = 0usize;
         let mut bytes = 0usize;
+        let mut next_sequence = 0_u64;
         loop {
             let event = self.next_event(end, request_id, request.generation)?;
             let envelope = match event {
@@ -767,15 +809,24 @@ impl NativeWorker {
             };
             match envelope.payload {
                 Some(Payload::Results(batch)) => {
+                    self.validate_batch_sequence(batch.sequence, &mut next_sequence, "result")?;
+                    if let Some(error) = batch.error.as_ref() {
+                        self.validate_nested_error(error, request_id, "result")?;
+                    }
+                    let state = batch.state.as_i32();
+                    if !matches!(state, 1..=4) {
+                        return Err(self.protocol_failure("unknown result batch state".to_owned()));
+                    }
                     batches = batches.saturating_add(1);
                     let batch_bytes = batch.encode().len();
                     bytes = bytes.saturating_add(batch_bytes);
                     self.record_batch(batch_bytes, batch.items.len());
-                    if batches > self.options.limits.max_batches_per_query
-                        || bytes > self.options.limits.max_bytes_per_query
-                    {
+                    let limit_exceeded = batches > self.options.limits.max_batches_per_query
+                        || bytes > self.options.limits.max_bytes_per_query;
+                    if limit_exceeded && state == 1 {
                         self.truncate(request_id, request.generation)?;
-                        let terminal_batches = self.await_terminal(request_id, request.generation, end)?;
+                        let terminal_batches =
+                            self.await_terminal(request_id, request.generation, end, &mut next_sequence)?;
                         self.mark_call_succeeded();
                         return Ok(Suggestions {
                             items,
@@ -799,8 +850,34 @@ impl NativeWorker {
                                 .take(remaining)
                                 .map(|value| from_proto_item(&self.spec.plugin, value)),
                         );
+                        if state != 1 {
+                            let error = if state == 4 {
+                                batch.error.as_ref().map(plugin_error).or_else(|| {
+                                    Some(PluginError {
+                                        message: "plugin returned FAILED without an error".to_owned(),
+                                        detail: String::new(),
+                                    })
+                                })
+                            } else {
+                                None
+                            };
+                            self.mark_call_succeeded();
+                            return Ok(Suggestions {
+                                items,
+                                state: match state {
+                                    2 => BatchState::Final,
+                                    3 => BatchState::Cancelled,
+                                    _ => BatchState::Failed,
+                                },
+                                log: logs,
+                                error,
+                                batches,
+                                truncated: true,
+                            });
+                        }
                         self.truncate(request_id, request.generation)?;
-                        let terminal_batches = self.await_terminal(request_id, request.generation, end)?;
+                        let terminal_batches =
+                            self.await_terminal(request_id, request.generation, end, &mut next_sequence)?;
                         self.mark_call_succeeded();
                         return Ok(Suggestions {
                             items,
@@ -819,6 +896,7 @@ impl NativeWorker {
                     );
                     self.replenish_credit()?;
                     if let Some(error) = batch.error.as_ref() {
+                        self.validate_nested_error(error, request_id, "result")?;
                         self.mark_call_succeeded();
                         return Ok(Suggestions {
                             items,
@@ -826,10 +904,10 @@ impl NativeWorker {
                             log: logs,
                             error: Some(plugin_error(error)),
                             batches,
-                            truncated: false,
+                            truncated: limit_exceeded,
                         });
                     }
-                    match batch.state.as_i32() {
+                    match state {
                         1 => {}
                         2 => {
                             self.mark_call_succeeded();
@@ -839,7 +917,7 @@ impl NativeWorker {
                                 log: logs,
                                 error: None,
                                 batches,
-                                truncated: false,
+                                truncated: limit_exceeded,
                             });
                         }
                         3 => {
@@ -851,7 +929,7 @@ impl NativeWorker {
                                 log: logs,
                                 error: None,
                                 batches,
-                                truncated: false,
+                                truncated: limit_exceeded,
                             });
                         }
                         4 => {
@@ -868,10 +946,10 @@ impl NativeWorker {
                                 log: logs,
                                 error,
                                 batches,
-                                truncated: false,
+                                truncated: limit_exceeded,
                             });
                         }
-                        _ => return Err(HostError::Protocol("unknown result batch state".to_owned())),
+                        _ => unreachable!("result batch state validated above"),
                     }
                 }
                 Some(Payload::Log(log)) => {
@@ -888,8 +966,10 @@ impl NativeWorker {
                         }
                     }
                 }
-                Some(Payload::Error(error)) => return Err(self.error_payload(error)),
-                Some(_) | None => {}
+                Some(Payload::Error(error)) => return Err(self.error_payload(error, request_id)),
+                Some(_) | None => {
+                    return Err(self.protocol_failure("unexpected suggestion response payload".to_owned()));
+                }
             }
         }
     }
@@ -929,6 +1009,9 @@ impl NativeWorker {
                     Ok(ExecuteOutcome::Ok)
                 }
                 2 => {
+                    if let Some(error) = result.error.as_ref() {
+                        self.validate_nested_error(error, request_id, "execute")?;
+                    }
                     self.mark_call_succeeded();
                     Ok(ExecuteOutcome::Failed(
                         result
@@ -945,10 +1028,10 @@ impl NativeWorker {
                     self.mark_call_succeeded();
                     Ok(ExecuteOutcome::Unsupported)
                 }
-                _ => Err(HostError::Protocol("unknown execute outcome".to_owned())),
+                _ => Err(self.protocol_failure("unknown execute outcome".to_owned())),
             },
-            Some(Payload::Error(error)) => Err(self.error_payload(error)),
-            _ => Err(HostError::Protocol("unexpected execute response".to_owned())),
+            Some(Payload::Error(error)) => Err(self.error_payload(error, request_id)),
+            _ => Err(self.protocol_failure("unexpected execute response".to_owned())),
         }
     }
 
@@ -983,8 +1066,11 @@ impl NativeWorker {
                     detail: report.detail,
                 })
             }
-            Some(Payload::Error(error)) => Err(self.error_payload(error)),
-            _ => Err(HostError::Protocol("unexpected health response".to_owned())),
+            Some(Payload::HealthReport(_)) => {
+                Err(self.protocol_failure("health response nonce did not match request".to_owned()))
+            }
+            Some(Payload::Error(error)) => Err(self.error_payload(error, request_id)),
+            _ => Err(self.protocol_failure("unexpected health response".to_owned())),
         }
     }
 
@@ -1042,7 +1128,7 @@ impl NativeWorker {
         self.link.close();
         self.terminate_owned_tree();
         let status = if let Some(child) = self.child.as_mut() {
-            wait_child_bounded(
+            wait_child_after_termination(
                 child,
                 Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS),
             )
@@ -1156,14 +1242,52 @@ impl NativeWorker {
                 }
                 HostError::Protocol(_) => {
                     self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::ProtocolViolation);
+                    self.fail_and_reap(ExitKind::ProtocolViolation);
                 }
                 HostError::Crashed { .. } => {
                     self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::Crash);
+                    self.fail_and_reap(ExitKind::Crashed);
                 }
                 _ => {}
             }
         }
         result
+    }
+
+    fn protocol_failure(&mut self, detail: impl Into<String>) -> HostError {
+        self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::ProtocolViolation);
+        self.fail_and_reap(ExitKind::ProtocolViolation);
+        HostError::Protocol(detail.into())
+    }
+
+    fn validate_batch_sequence(
+        &mut self,
+        sequence: u64,
+        expected: &mut u64,
+        stream: &str,
+    ) -> Result<(), HostError> {
+        if sequence != *expected {
+            return Err(self.protocol_failure(format!(
+                "{stream} batch sequence {sequence} does not follow expected sequence {expected}"
+            )));
+        }
+        *expected = expected.saturating_add(1);
+        Ok(())
+    }
+
+    fn validate_nested_error(
+        &mut self,
+        error: &message::StructuredError,
+        request_id: u64,
+        context: &str,
+    ) -> Result<(), HostError> {
+        if error.request_id != 0 && error.request_id != request_id {
+            return Err(self.protocol_failure(format!(
+                "{context} error request_id {} does not match envelope request_id {request_id}",
+                error.request_id
+            )));
+        }
+        Ok(())
     }
 
     fn ensure_alive(&mut self) -> Result<(), HostError> {
@@ -1292,7 +1416,13 @@ impl NativeWorker {
         self.replenish_credit()?;
         Ok(())
     }
-    fn await_terminal(&mut self, request_id: u64, generation: u64, end: Instant) -> Result<usize, HostError> {
+    fn await_terminal(
+        &mut self,
+        request_id: u64,
+        generation: u64,
+        end: Instant,
+        next_sequence: &mut u64,
+    ) -> Result<usize, HostError> {
         let mut terminal_batches = 0usize;
         loop {
             let event = self.next_event(end, request_id, generation)?;
@@ -1300,13 +1430,26 @@ impl NativeWorker {
                 ReaderEvent::Envelope(value) => value,
                 ReaderEvent::Failure(failure) => return Err(self.transport_error(failure)),
             };
-            if let Some(Payload::Results(batch)) = envelope.payload {
-                terminal_batches = terminal_batches.saturating_add(1);
-                let bytes = batch.encode().len();
-                self.record_batch(bytes, batch.items.len());
-                self.replenish_credit()?;
-                if matches!(batch.state.as_i32(), 2..=4) {
-                    return Ok(terminal_batches);
+            match envelope.payload {
+                Some(Payload::Results(batch)) => {
+                    self.validate_batch_sequence(batch.sequence, next_sequence, "result")?;
+                    if !matches!(batch.state.as_i32(), 1..=4) {
+                        return Err(self.protocol_failure("unknown result batch state".to_owned()));
+                    }
+                    terminal_batches = terminal_batches.saturating_add(1);
+                    let bytes = batch.encode().len();
+                    self.record_batch(bytes, batch.items.len());
+                    self.replenish_credit()?;
+                    if matches!(batch.state.as_i32(), 2..=4) {
+                        return Ok(terminal_batches);
+                    }
+                }
+                Some(Payload::Log(log)) => self.record_log(log.message),
+                Some(Payload::Error(error)) => return Err(self.error_payload(error, request_id)),
+                Some(_) | None => {
+                    return Err(self.protocol_failure(
+                        "unexpected payload while waiting for terminal result".to_owned(),
+                    ));
                 }
             }
         }
@@ -1373,10 +1516,14 @@ impl NativeWorker {
         }
     }
 
-    fn error_payload(&mut self, error: message::StructuredError) -> HostError {
+    fn error_payload(&mut self, error: message::StructuredError, request_id: u64) -> HostError {
         let plugin_error = plugin_error(&error);
+        if let Err(protocol) = self.validate_nested_error(&error, request_id, "structured") {
+            return protocol;
+        }
         match error.code.as_i32() {
-            2 => HostError::PluginFailed {
+            1 => self.protocol_failure(error_detail(&plugin_error)),
+            2 | 4 | 6 => HostError::PluginFailed {
                 plugin: self.spec.plugin.clone(),
                 detail: error_detail(&plugin_error),
             },
@@ -1394,10 +1541,11 @@ impl NativeWorker {
                     detail: error_detail(&plugin_error),
                 }
             }
-            _ => {
-                self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::ProtocolViolation);
-                HostError::Protocol(error_detail(&plugin_error))
-            }
+            _ => self.protocol_failure(format!(
+                "unknown structured error code {}: {}",
+                error.code.as_i32(),
+                error_detail(&plugin_error)
+            )),
         }
     }
 
@@ -1411,7 +1559,7 @@ impl NativeWorker {
         // the owned tree before any wait, then bound the reap (spec 24.1).
         self.terminate_owned_tree();
         let status = if let Some(child) = self.child.as_mut() {
-            wait_child_bounded(
+            wait_child_after_termination(
                 child,
                 Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS),
             )
@@ -1500,6 +1648,7 @@ fn spawn_stdio_writer(
 ) -> JoinHandle<()> {
     thread::spawn(move || loop {
         if closed.load(Ordering::Acquire) {
+            drain_pending(&receiver, &pending);
             break;
         }
         match receiver.recv_timeout(Duration::from_millis(SOCKET_POLL_MS)) {
@@ -1507,13 +1656,23 @@ fn spawn_stdio_writer(
                 let result = write_frame(&mut stdin, &envelope.encode());
                 pending.fetch_sub(1, Ordering::AcqRel);
                 if result.is_err() {
+                    drain_pending(&receiver, &pending);
                     break;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                drain_pending(&receiver, &pending);
+                break;
+            }
         }
     })
+}
+
+fn drain_pending(receiver: &Receiver<Envelope>, pending: &AtomicUsize) {
+    while receiver.try_recv().is_ok() {
+        pending.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn spawn_blocking_reader(mut transport: Box<dyn Transport>, context: ReaderContext) -> JoinHandle<()> {
@@ -1579,6 +1738,7 @@ fn spawn_multiplex_reader(
         let _ = transport.set_read_timeout(Some(Duration::from_millis(SOCKET_POLL_MS)));
         loop {
             if context.closed.load(Ordering::Acquire) {
+                drain_pending(&outgoing, &writer_pending);
                 transport.close();
                 break;
             }
@@ -1588,6 +1748,7 @@ fn spawn_multiplex_reader(
                         let result = transport.send(&envelope);
                         writer_pending.fetch_sub(1, Ordering::AcqRel);
                         if let Err(error) = result {
+                            drain_pending(&outgoing, &writer_pending);
                             let _ = enqueue_reader_event(
                                 &context,
                                 ReaderEvent::Failure(ReaderFailure {
@@ -1602,6 +1763,7 @@ fn spawn_multiplex_reader(
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
+                        drain_pending(&outgoing, &writer_pending);
                         transport.close();
                         return;
                     }
@@ -2055,7 +2217,7 @@ fn envelope_kind(envelope: &Envelope) -> &'static str {
 }
 
 fn is_stale(envelope: &Envelope, request_id: u64, generation: u64) -> bool {
-    envelope.request_id != request_id || (generation != 0 && envelope.generation != generation)
+    envelope.request_id != request_id || envelope.generation != generation
 }
 
 fn plugin_error(error: &message::StructuredError) -> PluginError {
@@ -2144,10 +2306,16 @@ fn wait_child_bounded(child: &mut Child, end: Instant) -> Option<std::process::E
         }
     }
 }
+fn wait_child_after_termination(child: &mut Child, end: Instant) -> Option<std::process::ExitStatus> {
+    match wait_child_bounded(child, end) {
+        Some(status) => Some(status),
+        None => child.wait().ok(),
+    }
+}
 
 fn terminate_and_reap(child: &mut Child) {
     terminate_child_tree(child);
-    let _ = wait_child_bounded(
+    let _ = wait_child_after_termination(
         child,
         Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS),
     );
@@ -2230,18 +2398,33 @@ fn create_job_for_child(child: &Child, limits: &crate::launch::ResourceLimits) -
     };
     if let Some(bytes) = limits.max_memory_bytes {
         info.basic.limit_flags |= LIMIT_PROCESS_MEMORY;
-        info.process_memory_limit =
-            usize::try_from(bytes).map_err(|_| "memory limit does not fit this target".to_owned())?;
+        info.process_memory_limit = match usize::try_from(bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                unsafe { CloseHandle(job) };
+                return Err("memory limit does not fit this target".to_owned());
+            }
+        };
     }
     if let Some(processes) = limits.max_processes {
         info.basic.limit_flags |= LIMIT_ACTIVE_PROCESS;
-        info.basic.active_process_limit =
-            u32::try_from(processes).map_err(|_| "process limit does not fit Windows".to_owned())?;
+        info.basic.active_process_limit = match u32::try_from(processes) {
+            Ok(value) => value,
+            Err(_) => {
+                unsafe { CloseHandle(job) };
+                return Err("process limit does not fit Windows".to_owned());
+            }
+        };
     }
     if let Some(seconds) = limits.max_cpu_time_seconds {
         info.basic.limit_flags |= LIMIT_JOB_TIME;
-        info.basic.per_job_user_time = i64::try_from(seconds.saturating_mul(10_000_000))
-            .map_err(|_| "CPU limit does not fit Windows".to_owned())?;
+        info.basic.per_job_user_time = match i64::try_from(seconds.saturating_mul(10_000_000)) {
+            Ok(value) => value,
+            Err(_) => {
+                unsafe { CloseHandle(job) };
+                return Err("CPU limit does not fit Windows".to_owned());
+            }
+        };
     }
     if unsafe {
         SetInformationJobObject(

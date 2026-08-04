@@ -15,10 +15,13 @@ CriKey down, and Python must never execute on the UI thread.
 CPython runs only in supervised worker processes. The host embeds no
 interpreter: there is no PyO3 interpreter in the main process, ever.
 
-- A worker is keyed by runtime profile, interpreter, content-addressed
-  dependency environment, entrypoint, and plugin source path. Identical keys
-  may share a process; distinct source paths or entrypoints receive separate
-  workers because the protocol has no per-call plugin routing.
+- A worker is keyed by the resolved interpreter, content-addressed dependency
+  environment, entrypoint, and plugin source path. `RuntimeProfile` selects
+  interpreter discovery; the current modern provider resolves `Bundled`, and
+  its environment id includes the interpreter version rather than storing a
+  separate profile field. Identical keys may share a process; distinct source
+  paths or entrypoints receive separate workers because the protocol has no
+  per-call plugin routing.
 - The environment store may reuse a materialized dependency environment, but
   that reuse does not imply that unrelated plugin processes share an address
   space. Plugins with unstable native extensions still receive a dedicated

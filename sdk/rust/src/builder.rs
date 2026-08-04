@@ -7,6 +7,7 @@ use crikey_core::{
 };
 
 /// Builds a core [`Item`] with the plugin-author defaults (spec 10.1–10.3).
+#[must_use = "call ItemBuilder::build to create the item"]
 #[derive(Debug, Clone)]
 pub struct ItemBuilder {
     stable_id: String,
@@ -107,6 +108,7 @@ impl ItemBuilder {
 }
 
 /// Builds an action for an item (spec 10.4).
+#[must_use = "call ActionBuilder::build to create the action"]
 #[derive(Debug, Clone)]
 pub struct ActionBuilder {
     action_id: String,

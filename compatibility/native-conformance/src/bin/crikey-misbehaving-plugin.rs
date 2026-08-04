@@ -39,6 +39,8 @@ enum Mode {
     StderrFlood,
     PartialNoTerminal,
     ControlWitness,
+    DuplicateSequence,
+    TerminalItems,
     BadVersion(u32),
     BadToken,
     Hang,
@@ -69,6 +71,8 @@ fn parse_mode(spec: &str) -> Mode {
         "stderr-flood" => Mode::StderrFlood,
         "partial-no-terminal" => Mode::PartialNoTerminal,
         "control-witness" => Mode::ControlWitness,
+        "duplicate-sequence" => Mode::DuplicateSequence,
+        "terminal-items" => Mode::TerminalItems,
         "bad-token" => Mode::BadToken,
         "hang" => Mode::Hang,
         _ if spec.starts_with("bad-version:") => Mode::BadVersion(
@@ -271,6 +275,54 @@ fn partial_no_terminal(
     }
 }
 
+fn duplicate_sequence(
+    transport: &mut dyn Transport,
+    connection_id: u64,
+    request_id: u64,
+    generation: u64,
+) -> Result<(), ProtocolError> {
+    for state in [BatchState::Partial, BatchState::Final] {
+        transport.send(&envelope(
+            connection_id,
+            request_id,
+            generation,
+            Payload::Results(ResultBatch {
+                state,
+                items: Vec::new(),
+                sequence: 0,
+                error: None,
+                unknown: UnknownFields::default(),
+            }),
+        ))?;
+    }
+    loop {
+        thread::park();
+    }
+}
+
+fn terminal_items(
+    transport: &mut dyn Transport,
+    connection_id: u64,
+    request_id: u64,
+    generation: u64,
+) -> Result<(), ProtocolError> {
+    let items = (0..8)
+        .map(|index| control_item(index, "terminal"))
+        .collect();
+    transport.send(&envelope(
+        connection_id,
+        request_id,
+        generation,
+        Payload::Results(ResultBatch {
+            state: BatchState::Final,
+            items,
+            sequence: 0,
+            error: None,
+            unknown: UnknownFields::default(),
+        }),
+    ))
+}
+
 fn control_item(index: usize, kind: &str) -> Item {
     Item {
         stable_id: format!("control-{index}"),
@@ -430,9 +482,13 @@ fn run() -> Result<(), ProtocolError> {
             Ok(())
         }
         Mode::LogFlood => log_flood(&mut *transport, connection_id, 0, 0),
-        Mode::StderrFlood | Mode::PartialNoTerminal | Mode::Flood | Mode::ControlWitness | Mode::Hang => {
-            loop_messages(&mut *transport, connection_id, mode)
-        }
+        Mode::StderrFlood
+        | Mode::PartialNoTerminal
+        | Mode::Flood
+        | Mode::ControlWitness
+        | Mode::DuplicateSequence
+        | Mode::TerminalItems
+        | Mode::Hang => loop_messages(&mut *transport, connection_id, mode),
         Mode::BadVersion(_) | Mode::BadToken => Ok(()),
     }
 }
@@ -457,10 +513,15 @@ fn loop_messages(transport: &mut dyn Transport, connection_id: u64, mode: Mode) 
                 Mode::PartialNoTerminal => {
                     return partial_no_terminal(transport, connection_id, request_id, generation);
                 }
+                Mode::DuplicateSequence => {
+                    return duplicate_sequence(transport, connection_id, request_id, generation);
+                }
+                Mode::TerminalItems => {
+                    return terminal_items(transport, connection_id, request_id, generation);
+                }
                 Mode::ControlWitness => {
                     control_witness(transport, connection_id, request_id, generation)?;
                 }
-                Mode::Hang | Mode::LogFlood => {}
                 _ => {}
             },
             Some(Payload::Shutdown(_)) => return Ok(()),

@@ -147,7 +147,7 @@ def _timeout_value(timeout):
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Follows only redirects that stay inside the supported URL schemes."""
+    """Follows only safe redirects that stay inside supported URL schemes."""
 
     handler_order = 400
 
@@ -156,6 +156,13 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         if redirected is None:
             return None
         _validate_url(redirected.full_url)
+        source_scheme = urllib.parse.urlsplit(req.full_url).scheme.lower()
+        target_scheme = urllib.parse.urlsplit(redirected.full_url).scheme.lower()
+        if source_scheme == "https" and target_scheme == "http":
+            raise InvalidUrlError(
+                redirected.full_url,
+                "an HTTPS request cannot redirect down to plain HTTP",
+            )
         return redirected
 
 
@@ -288,9 +295,7 @@ def build_urllib_opener(
         if not isinstance(ssl_check_hostname, bool):
             raise TypeError("ssl_check_hostname must be a bool or None")
         context = ssl.create_default_context()
-        if not ssl_check_hostname:
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+        context.check_hostname = ssl_check_hostname
         https_handler = urllib.request.HTTPSHandler(context=context)
         https_handler.handler_order = 400
         own_handlers.append(https_handler)

@@ -106,7 +106,7 @@ use crikey_legacy_compat::{
     discover_interpreter, discover_interpreter_in, DiscoveryEnvironment, InstanceId, Interpreter,
     LegacyCallback, LegacyEventFlags, LegacyOutcome, LegacyPackage, LegacyRequest, LegacyRequestKind,
     LegacyResponse, LegacyWorker, PackageLoader, PluginException, TerminateHandle, WorkerError, WorkerExit,
-    WorkerOptions, ENV_PACKAGE_ROOT, MINIMUM_SUPPORTED_PYTHON, WORKER_ENTRY_FILE,
+    WorkerOptions, ENV_MAIN_MODULE_PATH, ENV_PACKAGE_ROOT, MINIMUM_SUPPORTED_PYTHON, WORKER_ENTRY_FILE,
 };
 // Only the stand-in-interpreter tests name these, and creating a stand-in needs
 // a POSIX executable bit, so they are `#[cfg(unix)]` and so is the import.
@@ -670,6 +670,26 @@ fn a_crikey_python_override_naming_a_missing_file_is_reported_as_python_unavaila
 
 #[cfg(unix)]
 #[test]
+fn search_path_skips_directories_and_non_executable_candidates() {
+    let scratch = Scratch::new("discovery-search-filter");
+    let directory = scratch.subdir("directory");
+    fs::create_dir(directory.join("python3")).expect("the directory candidate is writable");
+
+    let non_executable = scratch.subdir("non-executable");
+    let non_executable_path = version_shim(&non_executable, "python3", "3.12.1");
+    fs::set_permissions(&non_executable_path, fs::Permissions::from_mode(0o644))
+        .expect("the stand-in can be made non-executable");
+
+    let usable = scratch.subdir("usable");
+    let usable_path = version_shim(&usable, "python3", "3.11.2");
+    let environment = DiscoveryEnvironment::empty().with_search_path([directory, non_executable, usable]);
+
+    let interpreter = discover_interpreter_in(&RuntimeProfile::LegacyCompatibility, &environment)
+        .expect("search discovery skips unusable name matches");
+    assert_eq!(interpreter.path(), usable_path);
+}
+#[cfg(unix)]
+#[test]
 fn an_interpreter_below_the_minimum_version_is_rejected_with_both_the_found_and_minimum_versions() {
     let scratch = Scratch::new("discovery-old");
     let old = version_shim(&scratch.path, "python3.7", "3.7.9");
@@ -860,6 +880,27 @@ fn a_started_plugin_returns_its_catalog_with_every_field_intact() {
         "the worker hands the child its package root through the spawn options"
     );
 
+    worker.shutdown().expect("a live worker shuts down");
+}
+
+#[test]
+fn caller_environment_cannot_replace_the_worker_entry_module() {
+    let scratch = Scratch::new("reserved-env");
+    let package = legacy_package(&scratch, "reservedfixture", &source(CATALOG_FIDELITY));
+    let mut worker = LegacyWorker::spawn(
+        &host_interpreter(),
+        &package,
+        options("legacy.reserved").with_env(ENV_MAIN_MODULE_PATH, "does-not-exist.py"),
+    )
+    .expect("protocol environment variables remain owned by the host");
+
+    let response = worker
+        .call(request("legacy.reserved", 1, LegacyRequestKind::Start))
+        .unwrap_or_else(|error| panic!("reserved env test must start, got {error:?}"));
+    assert!(
+        matches!(response.outcome, LegacyOutcome::Acknowledged),
+        "the package still imports when a caller tries to replace the reserved module path"
+    );
     worker.shutdown().expect("a live worker shuts down");
 }
 
@@ -1201,6 +1242,32 @@ class Fixture(kp.Plugin):
     def on_activated(self):
         print("still alive")
 "#;
+
+/// A package whose module raises before it can define a plugin class.
+const IMPORT_RAISES: &str = r#"
+raise RuntimeError("fixture import failed")
+"#;
+
+#[test]
+fn an_import_failure_is_a_plugin_failure_and_not_a_worker_crash() {
+    let scratch = Scratch::new("import-raises");
+    let package = legacy_package(&scratch, "importraises", IMPORT_RAISES);
+    let mut worker = LegacyWorker::spawn(&host_interpreter(), &package, options("legacy.import"))
+        .expect("the shim handshake is independent of plugin import");
+
+    let response = call_ok(&mut worker, request("legacy.import", 1, LegacyRequestKind::Start));
+    let failure = match response.outcome {
+        LegacyOutcome::Failed(failure) => failure,
+        other => panic!("an import exception is a typed plugin failure, got {other:?}"),
+    };
+    assert_eq!(failure.exception_type, "RuntimeError");
+    assert_eq!(failure.message, "fixture import failed");
+    assert!(
+        worker.is_running(),
+        "a module import failure must not take down the isolated worker"
+    );
+    worker.shutdown().expect("a worker survives an import failure");
+}
 
 #[test]
 fn an_exception_raised_in_a_callback_is_reported_with_its_type_message_and_traceback() {

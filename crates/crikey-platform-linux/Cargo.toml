@@ -20,7 +20,7 @@ crikey-platform.workspace = true
 # cross-target checks.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = "0.13"
-
+libc = "0.2"
 # The X11 backends' tests drive a server directly, so the same client library
 # is needed at test time, gated the same way. The `xtest` feature is what lets
 # the delivery tests synthesise a real key press against their own Xvfb:

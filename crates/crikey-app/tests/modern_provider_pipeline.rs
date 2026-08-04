@@ -197,6 +197,42 @@ class Crashy(Plugin):
         os._exit(1)
 ";
 
+/// A plugin that announces an in-flight callback and then cooperatively waits
+/// for cancellation. A newer query must interrupt it rather than wait for the
+/// full modern call budget.
+const CANCELLABLE_SOURCE: &str = "\
+import os
+import time
+
+from crikey_sdk.plugin import Item, Plugin
+
+
+class Cancellable(Plugin):
+    def suggest(self, query, context):
+        with open(os.path.join(os.path.dirname(__file__), \"running\"), \"w\") as marker:
+            marker.write(\"1\")
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if context.cancelled:
+                return
+            time.sleep(0.01)
+        context.emit(Item(stable_id=\"cancelled-1\", label=\"late\", target=\"late\"))
+";
+
+/// A plugin that ignores cancellation and sleeps long enough to distinguish
+/// the manifest hard deadline from the provider's transport upper bound.
+const TIMEOUT_SOURCE: &str = "\
+import time
+
+from crikey_sdk.plugin import Item, Plugin
+
+
+class Timeout(Plugin):
+    def suggest(self, query, context):
+        time.sleep(3.0)
+        context.emit(Item(stable_id=\"timeout-1\", label=\"late\", target=\"late\"))
+";
+
 /// True when the provider recorded an attributable crash diagnostic for
 /// `plugin`, whether as a runtime dispatch failure or a degraded unavailable
 /// entry (contract §8: a crash becomes a recorded diagnostic, never a panic).
@@ -722,19 +758,161 @@ fn modern_driver_refuses_a_superseded_generation() {
     }
     assert!(seen_newer, "the newer generation must be presented");
 
-    // The older, superseded generation must NEVER have been presented. Kills
-    // "publish every completed frame including superseded" and "queue instead of
-    // replace-oldest" (a queued older job is dropped at the staleness gate).
+    // A delayed caller must also be unable to rewind the live generation after
+    // the newer frame is already visible. Without a monotonic intake guard,
+    // this submission queues an obsolete frame and publishes generation 1.
+    driver.submit(older, "report old again", 19, Vec::new(), false, 0);
+    for _ in 0..200 {
+        if published
+            .lock()
+            .expect("the publish sink is not poisoned")
+            .iter()
+            .any(|generation| *generation == older)
+        {
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
     let generations = published
         .lock()
         .expect("the publish sink is not poisoned")
         .clone();
     assert!(
         generations.iter().all(|generation| *generation == newer),
-        "only the newer generation is presented; saw {generations:?}",
+        "a delayed older submission must not rewind publication; saw {generations:?}",
     );
 
     drop(driver);
+}
+
+#[test]
+fn modern_driver_cancels_a_superseded_in_flight_callback() {
+    require_modern_interpreter();
+
+    let scratch = Scratch::new("cancel-in-flight");
+    let plugins_root = scratch.subdir("plugins");
+    write_modern_plugin(
+        &plugins_root,
+        "cancellable",
+        "cancellable_plugin",
+        "Cancellable",
+        CANCELLABLE_SOURCE,
+    );
+
+    let index_root = scratch.subdir("index");
+    let cache_root = scratch.join("cache");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root.clone()],
+        Some(index_root),
+        cache_root,
+    );
+    let plugin = modern_plugin("cancellable");
+    assert!(
+        provider.plugins().contains(&plugin),
+        "the cancellable plugin must load; unavailable: {:?}",
+        provider.unavailable(),
+    );
+
+    let published: Arc<Mutex<Vec<Generation>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&published);
+    let driver = ModernDriver::spawn(provider, pipeline, move |frame| {
+        sink.lock()
+            .expect("the publish sink is not poisoned")
+            .push(frame.generation);
+    });
+
+    let older = Generation::from_raw(1);
+    let newer = Generation::from_raw(2);
+    driver.submit(older, "old", 17, Vec::new(), false, 0);
+    let running = plugins_root.join("cancellable").join("running");
+    for _ in 0..2_000 {
+        if running.is_file() {
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    assert!(
+        running.is_file(),
+        "the first callback must be in flight before supersession"
+    );
+
+    let started = std::time::Instant::now();
+    driver.submit(newer, "new", 18, Vec::new(), false, 0);
+    let mut seen_newer = false;
+    for _ in 0..2_000 {
+        if published
+            .lock()
+            .expect("the publish sink is not poisoned")
+            .contains(&newer)
+        {
+            seen_newer = true;
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    assert!(
+        seen_newer,
+        "the newer query must complete after cancelling the old callback (elapsed {:?})",
+        started.elapsed(),
+    );
+    let generations = published
+        .lock()
+        .expect("the publish sink is not poisoned")
+        .clone();
+    assert!(
+        generations.iter().all(|generation| *generation == newer),
+        "the cancelled callback must never publish its old generation; saw {generations:?}",
+    );
+
+    drop(driver);
+}
+
+#[test]
+fn modern_manifest_hard_deadline_limits_suggest_call() {
+    require_modern_interpreter();
+
+    let scratch = Scratch::new("manifest-timeout");
+    let plugins_root = scratch.subdir("plugins");
+    write_modern_plugin(
+        &plugins_root,
+        "timeout",
+        "timeout_plugin",
+        "Timeout",
+        TIMEOUT_SOURCE,
+    );
+    let manifest_path = plugins_root.join("timeout").join("crikey.toml");
+    let mut manifest = fs::read_to_string(&manifest_path).expect("manifest is readable");
+    manifest.push_str("\n[performance]\nsuggest-hard-timeout-ms = 100\n");
+    fs::write(&manifest_path, manifest).expect("manifest deadline is writable");
+
+    let index_root = scratch.subdir("index");
+    let cache_root = scratch.join("cache");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    let plugin = modern_plugin("timeout");
+    assert!(
+        provider.plugins().contains(&plugin),
+        "the timeout plugin must load; unavailable: {:?}",
+        provider.unavailable(),
+    );
+
+    let started = std::time::Instant::now();
+    let frame = provider
+        .drive_query(&mut pipeline, "timeout", 17)
+        .expect("a timed-out plugin still yields a current empty frame");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the manifest hard deadline must stop suggest near 100 ms, not the 120 s transport cap (elapsed {:?})",
+        started.elapsed(),
+    );
+    assert!(
+        !frame.rows.iter().any(|row| row.plugin_name == plugin.0),
+        "a timed-out plugin must contribute no rows",
+    );
+
+    provider.shutdown(0);
 }
 
 #[test]

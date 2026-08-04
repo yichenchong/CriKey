@@ -38,12 +38,12 @@ impl BudgetKind {
 const KIND_COUNT: usize = 4;
 
 // An undeclared budget is NOT unlimited. The scheduler already normalises an
-// absent `max-concurrent-requests` with `.max(1)`
-// (`crikey-input-scheduler/src/runtime.rs:1265`), because §8.12 fairness
-// depends on every plugin being bounded. Treating silence as unbounded here
-// would silently uncap every manifest that never mentions concurrency, so the
-// conservative host default is one concurrent unit per kind. An author who
-// wants more says so; an author who wants none writes `0`.
+// absent `max-concurrent-requests` to one because §8.12 fairness depends on
+// every plugin being bounded.
+// Treating silence as unbounded here would silently uncap every manifest that
+// never mentions concurrency, so the conservative host default is one
+// concurrent unit per kind. An author who wants more says so; an author who
+// wants none writes `0`.
 
 /// Effective suggestion-request limit when the manifest declares none.
 pub const DEFAULT_SUGGESTION_BUDGET: u32 = 1;
@@ -140,7 +140,12 @@ impl ConcurrencyBudget {
             if current >= limit {
                 // A refusal is the operator's only evidence that a plugin is
                 // being throttled rather than broken, so it is always counted.
-                self.refusals[index].fetch_add(1, Ordering::Relaxed);
+                // Keep this diagnostic monotonic at the integer boundary;
+                // wrapping to zero would hide a plugin that has been refused
+                // for its entire lifetime.
+                let _ = self.refusals[index].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    Some(count.saturating_add(1))
+                });
                 return false;
             }
             match in_flight.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire) {
@@ -197,5 +202,22 @@ impl OwnedBudgetGuard {
 impl Drop for OwnedBudgetGuard {
     fn drop(&mut self) {
         self.budget.in_flight[self.kind.index()].fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusal_counter_saturates_at_u64_max() {
+        let budget = ConcurrencyBudget::from_section(&ConcurrencySection {
+            max_suggestion_requests: Some(0),
+            ..ConcurrencySection::default()
+        });
+        budget.refusals[BudgetKind::Suggestion.index()].store(u64::MAX, Ordering::Relaxed);
+
+        assert!(budget.try_acquire(BudgetKind::Suggestion).is_none());
+        assert_eq!(budget.refusals(BudgetKind::Suggestion), u64::MAX);
     }
 }

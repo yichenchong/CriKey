@@ -204,3 +204,76 @@ fn legacy_supervisor_publishes_off_the_ui_thread() {
     // tearing the child down cleanly — no thread or process leak.
     drop(driver);
 }
+
+#[test]
+fn legacy_driver_rejects_a_delayed_older_generation() {
+    require_legacy_interpreter();
+
+    let well_behaved = PluginId("legacy.well-behaved".to_owned());
+    let cache_root = std::env::temp_dir().join("crikey-legacy-generation-test-cache");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = LegacyProvider::load(
+        &mut pipeline,
+        &[test_plugins_root()],
+        cache_root,
+        LegacyDeadlines::default(),
+    );
+    assert!(
+        provider.plugins().contains(&well_behaved),
+        "the well-behaved legacy plugin must load; unavailable: {:?}",
+        provider.unavailable(),
+    );
+
+    let published: Arc<Mutex<Vec<Generation>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&published);
+    let driver = LegacyDriver::spawn(provider, pipeline, move |frame| {
+        sink.lock()
+            .expect("the publish sink is not poisoned")
+            .push(frame.generation);
+    });
+
+    let older = Generation::from_raw(1);
+    let newer = Generation::from_raw(2);
+    driver.submit(older, "report old", 17, Vec::new(), false, 0);
+    driver.submit(newer, "report new", 18, Vec::new(), false, 0);
+
+    let mut seen_newer = false;
+    for _ in 0..2_000 {
+        if published
+            .lock()
+            .expect("the publish sink is not poisoned")
+            .contains(&newer)
+        {
+            seen_newer = true;
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    assert!(seen_newer, "the newer generation must be presented");
+
+    // A stale caller can arrive after the newer frame is visible. It must not
+    // rewind `current` or publish another legacy frame under generation 1.
+    driver.submit(older, "report old again", 19, Vec::new(), false, 0);
+    for _ in 0..200 {
+        if published
+            .lock()
+            .expect("the publish sink is not poisoned")
+            .iter()
+            .any(|generation| *generation == older)
+        {
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    let generations = published
+        .lock()
+        .expect("the publish sink is not poisoned")
+        .clone();
+    assert!(
+        generations.iter().all(|generation| *generation == newer),
+        "a delayed older submission must not rewind publication; saw {generations:?}",
+    );
+
+    drop(driver);
+}

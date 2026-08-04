@@ -101,8 +101,17 @@ impl PrivateTempDir {
                 Ok(()) => {
                     #[cfg(unix)]
                     {
-                        let mut permissions = match fs::metadata(&path) {
-                            Ok(metadata) => metadata.permissions(),
+                        let mut permissions = match fs::symlink_metadata(&path) {
+                            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                                metadata.permissions()
+                            }
+                            Ok(_) => {
+                                let _ = fs::remove_dir_all(&path);
+                                return Err(format!(
+                                    "temporary directory `{}` was replaced by a non-directory",
+                                    path.display()
+                                ));
+                            }
                             Err(error) => {
                                 let _ = fs::remove_dir_all(&path);
                                 return Err(format!(
@@ -213,38 +222,53 @@ fn parse_args(command: &str, args: &[String]) -> Result<Option<Options>, String>
     let mut index: Option<String> = None;
     let mut queries: Vec<String> = Vec::new();
     let mut cancel = false;
+    let mut plugin_seen = false;
+    let mut index_seen = false;
 
     let mut position = 0;
     while position < args.len() {
         let argument = args[position].as_str();
         if let Some(value) = argument.strip_prefix("--plugin=") {
+            if plugin_seen {
+                return Err(format!("`dev {command}` accepts `--plugin` only once"));
+            }
             plugin = Some(value.to_owned());
+            plugin_seen = true;
             position += 1;
         } else if argument == "--plugin" {
-            let value = args
-                .get(position + 1)
-                .ok_or_else(|| format!("`dev {command}` needs a path after `--plugin`"))?;
-            plugin = Some(value.clone());
+            if plugin_seen {
+                return Err(format!("`dev {command}` accepts `--plugin` only once"));
+            }
+            let value = required_value(args, position, command, "--plugin")?;
+            plugin = Some(value.to_owned());
+            plugin_seen = true;
             position += 2;
         } else if let Some(value) = argument.strip_prefix("--index=") {
+            if index_seen {
+                return Err(format!("`dev {command}` accepts `--index` only once"));
+            }
             index = Some(value.to_owned());
+            index_seen = true;
             position += 1;
         } else if argument == "--index" {
-            let value = args
-                .get(position + 1)
-                .ok_or_else(|| format!("`dev {command}` needs a path after `--index`"))?;
-            index = Some(value.clone());
+            if index_seen {
+                return Err(format!("`dev {command}` accepts `--index` only once"));
+            }
+            let value = required_value(args, position, command, "--index")?;
+            index = Some(value.to_owned());
+            index_seen = true;
             position += 2;
         } else if let Some(value) = argument.strip_prefix("--query=") {
             queries.push(value.to_owned());
             position += 1;
         } else if argument == "--query" {
-            let value = args
-                .get(position + 1)
-                .ok_or_else(|| format!("`dev {command}` needs text after `--query`"))?;
-            queries.push(value.clone());
+            let value = required_value(args, position, command, "--query")?;
+            queries.push(value.to_owned());
             position += 2;
         } else if argument == "--cancel" && allow_cancel {
+            if cancel {
+                return Err("`--cancel` may only be given once".to_owned());
+            }
             cancel = true;
             position += 1;
         } else {
@@ -256,7 +280,6 @@ fn parse_args(command: &str, args: &[String]) -> Result<Option<Options>, String>
             ));
         }
     }
-
     let plugin = match plugin {
         // An empty path is refused rather than resolved: it would otherwise
         // become the process working directory and load whatever is there.
@@ -273,6 +296,9 @@ fn parse_args(command: &str, args: &[String]) -> Result<Option<Options>, String>
         }
         other => other,
     };
+    if cancel && queries.is_empty() {
+        return Err("`--cancel` needs at least one `--query`".to_owned());
+    }
 
     Ok(Some(Options {
         plugin,
@@ -290,7 +316,13 @@ fn unknown_help_argument<'a>(command: &str, args: &'a [String]) -> Option<&'a st
         if matches!(argument, "-h" | "--help") {
             index += 1;
         } else if matches!(argument, "--plugin" | "--index" | "--query") {
-            index = index.saturating_add(2);
+            let Some(value) = args.get(index + 1) else {
+                return Some(argument);
+            };
+            if value.starts_with('-') {
+                return Some(value);
+            }
+            index += 2;
         } else if argument.starts_with("--plugin=")
             || argument.starts_with("--index=")
             || argument.starts_with("--query=")
@@ -302,6 +334,24 @@ fn unknown_help_argument<'a>(command: &str, args: &'a [String]) -> Option<&'a st
         }
     }
     None
+}
+
+fn required_value<'a>(
+    args: &'a [String],
+    index: usize,
+    command: &str,
+    option: &str,
+) -> Result<&'a str, String> {
+    let value = args.get(index + 1).map(String::as_str).ok_or_else(|| {
+        let noun = if option == "--query" { "text" } else { "path" };
+        format!("`dev {command}` needs {noun} after `{option}`")
+    })?;
+    if value.starts_with('-') {
+        return Err(format!(
+            "`dev {command}` needs a value after `{option}`, got flag-like argument `{value}`"
+        ));
+    }
+    Ok(value)
 }
 
 fn refuse(command: &str, message: &str) -> ExitCode {
@@ -440,10 +490,14 @@ fn load_and_run(command: &str, options: &Options) -> Result<Report, String> {
     let mut faults: Vec<String> = Vec::new();
 
     for (ordinal, query) in queries.iter().enumerate() {
+        let generation = u64::try_from(ordinal)
+            .ok()
+            .and_then(|ordinal| ordinal.checked_add(1))
+            .ok_or_else(|| "too many queries for the worker generation range".to_owned())?;
         let request = SuggestRequest {
             // A distinct, monotonic generation per query, exactly as the live
             // pipeline tags keystrokes.
-            generation: ordinal as u64 + 1,
+            generation,
             text: query.clone(),
             normalized: query.to_lowercase(),
             selected_item_id: None,
@@ -483,7 +537,14 @@ fn load_and_run(command: &str, options: &Options) -> Result<Report, String> {
         }
     }
 
-    let _ = worker.shutdown();
+    let worker_exit = worker.shutdown();
+    if !any_failed && (worker_exit.code != Some(0) || worker_exit.hard_stopped) {
+        any_failed = true;
+        faults.push(format!(
+            "modern worker did not exit cleanly (code={:?}, hard_stopped={})",
+            worker_exit.code, worker_exit.hard_stopped
+        ));
+    }
 
     let state = if any_failed {
         "failed"
@@ -582,10 +643,11 @@ fn field(out: &mut String, key: &str, value: &str) {
 
 /// Percent-encodes a value so a line always splits into `key=value` tokens.
 ///
-/// Only unreserved ASCII survives unescaped. Everything else — the space that
-/// would split a token, the `=` that would split a pair, the `%` that would
-/// make an escape ambiguous, and every non-ASCII byte — becomes `%XX` with
-/// uppercase hex. One spelling per escape, so two runs never diff on case.
+/// Token-safe ASCII (unreserved characters plus `/` and `:`) survives
+/// unescaped. Everything else — the space that would split a token, the `=`
+/// that would split a pair, the `%` that would make an escape ambiguous, and
+/// every non-ASCII byte — becomes `%XX` with uppercase hex. One spelling per
+/// escape, so two runs never diff on case.
 fn encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -632,5 +694,52 @@ mod tests {
         assert!(parse_args("test", &help).is_err());
         let empty_index = vec!["--plugin".to_owned(), "plugin".to_owned(), "--index=".to_owned()];
         assert!(parse_args("test", &empty_index).is_err());
+    }
+    #[test]
+    fn separate_option_values_cannot_consume_the_next_flag() {
+        let query_value = vec![
+            "--plugin".to_owned(),
+            "plugin".to_owned(),
+            "--query".to_owned(),
+            "--unknown".to_owned(),
+        ];
+        assert!(parse_args("test", &query_value).is_err());
+
+        let plugin_value = vec!["--plugin".to_owned(), "--index".to_owned(), "--help".to_owned()];
+        assert!(parse_args("test", &plugin_value).is_err());
+        assert!(parse_args("test", &["--help".to_owned(), "--query".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn scalar_options_cannot_be_silently_replaced() {
+        let duplicate_plugin = vec![
+            "--plugin".to_owned(),
+            "first".to_owned(),
+            "--plugin=second".to_owned(),
+        ];
+        assert!(parse_args("test", &duplicate_plugin).is_err());
+
+        let duplicate_index = vec![
+            "--plugin".to_owned(),
+            "plugin".to_owned(),
+            "--index".to_owned(),
+            "first".to_owned(),
+            "--index=second".to_owned(),
+        ];
+        assert!(parse_args("test", &duplicate_index).is_err());
+
+        let duplicate_cancel = vec![
+            "--plugin".to_owned(),
+            "plugin".to_owned(),
+            "--cancel".to_owned(),
+            "--cancel".to_owned(),
+        ];
+        assert!(parse_args("test", &duplicate_cancel).is_err());
+    }
+
+    #[test]
+    fn cancellation_requires_a_query_to_cancel() {
+        let args = vec!["--plugin".to_owned(), "plugin".to_owned(), "--cancel".to_owned()];
+        assert!(parse_args("test", &args).is_err());
     }
 }

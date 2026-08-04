@@ -182,6 +182,21 @@ fn a_non_regular_journal_path_is_ignored_without_opening_it() {
     );
 }
 
+#[test]
+fn an_unwritable_state_parent_reports_save_failure_without_stopping_load() {
+    let scratch = Scratch::new("unwritable-parent");
+    let blocker = scratch.join("not-a-directory");
+    fs::write(&blocker, b"state directory blocker").expect("the blocker is writable");
+    let path = blocker.join("startup.json");
+
+    let mut journal = StartupJournal::load(&path);
+    assert_eq!(journal.begin_startup(&active_set()), StartupMode::Normal);
+    assert!(
+        journal.save().is_err(),
+        "an unwritable state parent must be reported to the caller"
+    );
+}
+
 /// A well-formed record built to exceed a byte budget.
 ///
 /// Deliberately *valid*: the size ceiling is only worth having if it stops the

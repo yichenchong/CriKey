@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crikey_core::{CoreError, Item, PluginId, Result};
 use crikey_native_protocol::message::{self, Envelope, HandshakeAck, Payload};
 use crikey_native_protocol::transport::Transport;
-use crikey_native_protocol::{Capabilities, MAX_FRAME_BYTES, PROTOCOL_VERSION};
+use crikey_native_protocol::{Capabilities, Message, MAX_FRAME_BYTES, PROTOCOL_VERSION};
 
 use crate::{
     serve_on, CatalogSink, ExecuteRequest, Plugin, PluginContext, PluginEvent, Query, SdkError, ServeConfig,
@@ -40,6 +40,10 @@ pub struct HarnessSuggestions {
 }
 
 const HARNESS_TIMEOUT: Duration = Duration::from_secs(5);
+const HARNESS_MAX_ITEMS_PER_QUERY: usize = 10_000;
+const HARNESS_MAX_BATCHES_PER_QUERY: usize = 512;
+const HARNESS_MAX_BYTES_PER_QUERY: usize = 32 * 1024 * 1024;
+const HARNESS_MAX_CATALOG_ITEMS: usize = 500_000;
 
 struct StartupProbe {
     plugin: Box<dyn Plugin + Send>,
@@ -140,9 +144,19 @@ impl TestHarness {
             };
             serve_on(&mut plugin, plugin_transport, worker_config)
         });
-        host.set_read_timeout(Some(HARNESS_TIMEOUT))
-            .map_err(SdkError::from)?;
-        let handshake = host.recv().map_err(SdkError::from)?;
+        if let Err(error) = host.set_read_timeout(Some(HARNESS_TIMEOUT)) {
+            drop(host);
+            let _ = worker.join();
+            return Err(SdkError::from(error));
+        }
+        let handshake = match host.recv() {
+            Ok(handshake) => handshake,
+            Err(error) => {
+                drop(host);
+                let _ = worker.join();
+                return Err(SdkError::from(error));
+            }
+        };
         if handshake.connection_id != 0 {
             drop(host);
             let _ = worker.join();
@@ -175,14 +189,18 @@ impl TestHarness {
             protocol_version: handshake.protocol_version,
             capabilities: capabilities_from_names(&handshake.capabilities),
         };
-        host.send(&Envelope {
+        if let Err(error) = host.send(&Envelope {
             connection_id: 1,
             request_id: 0,
             generation: 0,
             deadline_ms: 0,
             payload: Some(Payload::HandshakeAck(HandshakeAck {
                 protocol_version: PROTOCOL_VERSION,
-                host_capabilities: vec!["streaming".to_owned(), "cancellation".to_owned()],
+                host_capabilities: vec![
+                    "streaming_catalog".to_owned(),
+                    "streaming_suggestions".to_owned(),
+                    "cancellation".to_owned(),
+                ],
                 host_version: "sdk-test-harness".to_owned(),
                 accepted: true,
                 reject_reason: String::new(),
@@ -191,8 +209,11 @@ impl TestHarness {
                 unknown: Default::default(),
             })),
             unknown: Default::default(),
-        })
-        .map_err(SdkError::from)?;
+        }) {
+            drop(host);
+            let _ = worker.join();
+            return Err(SdkError::from(error));
+        }
         match ready_rx.recv_timeout(HARNESS_TIMEOUT) {
             Ok(Ok(())) => {}
             Ok(Err(detail)) => {
@@ -253,19 +274,42 @@ impl TestHarness {
             generation: 0,
             deadline_ms: 0,
             payload: Some(Payload::CatalogRequest(message::CatalogRequest {
-                max_items: 0,
+                max_items: HARNESS_MAX_CATALOG_ITEMS as u64,
                 unknown: Default::default(),
             })),
             unknown: Default::default(),
         })?;
         let mut items = Vec::new();
+        let mut batches = 0usize;
+        let mut bytes = 0usize;
+        let mut truncated = false;
         loop {
             let envelope = self.recv()?;
             self.check_identity(&envelope, request_id, 0)?;
             match envelope.payload {
                 Some(Payload::CatalogBatch(batch)) => {
-                    if let Some(error) = batch.error {
-                        return Err(SdkError::Protocol(format!("catalog failed: {}", error.message)));
+                    batches = batches.saturating_add(1);
+                    bytes = bytes.saturating_add(batch.encode().len());
+                    if truncated {
+                        self.grant_credit(request_id, 0)?;
+                        if batch.done {
+                            return Ok(items);
+                        }
+                        continue;
+                    }
+                    if batches > HARNESS_MAX_BATCHES_PER_QUERY || bytes > HARNESS_MAX_BYTES_PER_QUERY {
+                        self.cancel_and_grant(request_id, 0)?;
+                        truncated = true;
+                        continue;
+                    }
+                    let remaining = HARNESS_MAX_CATALOG_ITEMS.saturating_sub(items.len());
+                    if batch.items.len() > remaining {
+                        items.extend(batch.items.iter().take(remaining).map(|item| {
+                            crikey_native_protocol::convert::from_proto_item(&self.plugin_id, item)
+                        }));
+                        self.cancel_and_grant(request_id, 0)?;
+                        truncated = true;
+                        continue;
                     }
                     items.extend(
                         batch.items.iter().map(|item| {
@@ -273,10 +317,14 @@ impl TestHarness {
                         }),
                     );
                     self.grant_credit(request_id, 0)?;
+                    if let Some(error) = batch.error {
+                        return Err(SdkError::Protocol(format!("catalog failed: {}", error.message)));
+                    }
                     if batch.done {
                         return Ok(items);
                     }
                 }
+                Some(Payload::Log(_)) => {}
                 Some(Payload::Error(error)) => {
                     return Err(SdkError::Protocol(error.message));
                 }
@@ -328,22 +376,27 @@ impl TestHarness {
             })),
             unknown: Default::default(),
         })?;
-        let envelope = self.recv()?;
-        self.check_identity(&envelope, request_id, 0)?;
-        match envelope.payload {
-            Some(Payload::ExecuteResult(result)) if result.outcome.as_i32() == 1 => Ok(()),
-            Some(Payload::ExecuteResult(result)) => {
-                let detail = result
-                    .error
-                    .map(|error| error.message)
-                    .unwrap_or_else(|| "plugin execution failed".to_owned());
-                Err(SdkError::Protocol(detail))
+        loop {
+            let envelope = self.recv()?;
+            self.check_identity(&envelope, request_id, 0)?;
+            match envelope.payload {
+                Some(Payload::Log(_)) => {}
+                Some(Payload::ExecuteResult(result)) if result.outcome.as_i32() == 1 => return Ok(()),
+                Some(Payload::ExecuteResult(result)) => {
+                    let detail = result
+                        .error
+                        .map(|error| error.message)
+                        .unwrap_or_else(|| "plugin execution failed".to_owned());
+                    return Err(SdkError::Protocol(detail));
+                }
+                Some(payload) => {
+                    return Err(SdkError::Protocol(format!(
+                        "expected execute result, got {}",
+                        payload.kind()
+                    )))
+                }
+                None => return Err(SdkError::Protocol("empty execute response".to_owned())),
             }
-            Some(payload) => Err(SdkError::Protocol(format!(
-                "expected execute result, got {}",
-                payload.kind()
-            ))),
-            None => Err(SdkError::Protocol("empty execute response".to_owned())),
         }
     }
 
@@ -398,45 +451,93 @@ impl TestHarness {
                 text: text.to_owned(),
                 normalized_text: text.trim().to_lowercase(),
                 selected_item_id: String::new(),
-                max_items: 0,
-                max_batches: 0,
+                max_items: HARNESS_MAX_ITEMS_PER_QUERY as u64,
+                max_batches: HARNESS_MAX_BATCHES_PER_QUERY as u64,
                 unknown: Default::default(),
             })),
             unknown: Default::default(),
         })?;
         let mut items = Vec::new();
-        let mut batches = 0;
+        let mut batches = 0usize;
+        let mut bytes = 0usize;
+        let mut truncated = false;
         loop {
             let envelope = self.recv()?;
             self.check_identity(&envelope, request_id, generation)?;
             match envelope.payload {
                 Some(Payload::Results(batch)) => {
-                    batches += 1;
+                    batches = batches.saturating_add(1);
+                    bytes = bytes.saturating_add(batch.encode().len());
+                    if truncated {
+                        self.grant_credit(request_id, generation)?;
+                        match batch.state.as_i32() {
+                            1 => continue,
+                            2..=4 => {
+                                return Ok(HarnessSuggestions {
+                                    items,
+                                    state: BatchStateKind::Final,
+                                    batches,
+                                });
+                            }
+                            state => {
+                                return Err(SdkError::Protocol(format!(
+                                    "invalid suggestion batch state {state}"
+                                )));
+                            }
+                        }
+                    }
+                    if batches > HARNESS_MAX_BATCHES_PER_QUERY || bytes > HARNESS_MAX_BYTES_PER_QUERY {
+                        self.cancel_and_grant(request_id, generation)?;
+                        truncated = true;
+                        continue;
+                    }
+                    let remaining = HARNESS_MAX_ITEMS_PER_QUERY.saturating_sub(items.len());
+                    if batch.items.len() > remaining {
+                        items.extend(batch.items.iter().take(remaining).map(|item| {
+                            crikey_native_protocol::convert::from_proto_item(&self.plugin_id, item)
+                        }));
+                        self.cancel_and_grant(request_id, generation)?;
+                        truncated = true;
+                        continue;
+                    }
                     items.extend(
                         batch.items.iter().map(|item| {
                             crikey_native_protocol::convert::from_proto_item(&self.plugin_id, item)
                         }),
                     );
-                    let terminal_state = match batch.state.as_i32() {
-                        1 => None,
-                        2 => Some(BatchStateKind::Final),
-                        3 => Some(BatchStateKind::Cancelled),
-                        4 => Some(BatchStateKind::Failed),
+                    self.grant_credit(request_id, generation)?;
+                    if batch.error.is_some() || batch.state.as_i32() == 4 {
+                        return Ok(HarnessSuggestions {
+                            items,
+                            state: BatchStateKind::Failed,
+                            batches,
+                        });
+                    }
+                    match batch.state.as_i32() {
+                        1 => {}
+                        2 => {
+                            return Ok(HarnessSuggestions {
+                                items,
+                                state: BatchStateKind::Final,
+                                batches,
+                            });
+                        }
+                        3 => {
+                            self.cancel_latched = false;
+                            return Ok(HarnessSuggestions {
+                                items,
+                                state: BatchStateKind::Cancelled,
+                                batches,
+                            });
+                        }
                         state => {
                             return Err(SdkError::Protocol(format!(
                                 "invalid suggestion batch state {state}"
                             )));
                         }
-                    };
-                    self.grant_credit(request_id, generation)?;
-                    if let Some(state) = terminal_state {
-                        return Ok(HarnessSuggestions {
-                            items,
-                            state,
-                            batches,
-                        });
                     }
                 }
+                Some(Payload::Log(_)) => {}
                 Some(Payload::Error(error)) => return Err(SdkError::Protocol(error.message)),
                 Some(payload) => {
                     return Err(SdkError::Protocol(format!(
@@ -483,6 +584,21 @@ impl TestHarness {
             })),
             unknown: Default::default(),
         })
+    }
+
+    fn cancel_and_grant(&mut self, request_id: u64, generation: u64) -> Result<(), SdkError> {
+        self.send(Envelope {
+            connection_id: 1,
+            request_id,
+            generation,
+            deadline_ms: 0,
+            payload: Some(Payload::Cancel(message::Cancel {
+                reason: "harness result limit".to_owned(),
+                unknown: Default::default(),
+            })),
+            unknown: Default::default(),
+        })?;
+        self.grant_credit(request_id, generation)
     }
 
     fn close_and_join(&mut self) {

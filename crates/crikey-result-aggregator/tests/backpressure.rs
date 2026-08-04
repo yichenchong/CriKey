@@ -649,6 +649,45 @@ fn the_disconnect_policy_stops_admission_and_keeps_queued_work_drainable() {
 }
 
 #[test]
+fn disconnect_policy_also_disconnects_on_a_shared_boundary_overflow() {
+    let mut boundary = Boundary::new(
+        QueueLimits {
+            capacity_batches: 1,
+            capacity_items: 8,
+        },
+        generous_result_limits(),
+    );
+    let rogue = plugin("dev.crikey.rogue");
+    boundary.queue.register(
+        rogue.clone(),
+        IntakePolicy {
+            capacity_batches: 4,
+            pause_at_batches: 4,
+            resume_at_batches: 0,
+            ..unbounded_intake(OverflowPolicy::Disconnect)
+        },
+    );
+    let generation = boundary.begin_generation();
+
+    boundary
+        .queue
+        .submit(10, high(partial(generation, &rogue, &["r1"])))
+        .expect("the first batch fits the shared boundary");
+    let refusal = boundary
+        .queue
+        .submit(11, high(partial(generation, &rogue, &["r2"])))
+        .expect_err("a disconnect policy covers the shared boundary too");
+
+    assert_eq!(refusal, QueueReject::Disconnected);
+    assert_eq!(boundary.producer(&rogue), ProducerState::Disconnected);
+    assert_eq!(boundary.queue.plugin_depth(&rogue), depth(1, 1, 0));
+    assert_eq!(
+        boundary.queue.diagnostics().rejected(QueueReject::Disconnected),
+        1
+    );
+}
+
+#[test]
 fn a_disconnected_producer_is_revived_only_by_re_registration() {
     let mut boundary = Boundary::new(generous_queue_limits(), generous_result_limits());
     let rogue = plugin("dev.crikey.rogue");
@@ -1911,6 +1950,37 @@ fn delayed_drain_reports_the_original_admission_timestamp() {
         [17, 10_000],
         "admission and merge decisions retain their own event timestamps"
     );
+}
+
+#[test]
+fn a_zero_capacity_boundary_rejects_registered_work_without_admission() {
+    let mut queue = InboundResultQueue::new(QueueLimits {
+        capacity_batches: 0,
+        capacity_items: 0,
+    });
+    let apps = plugin("dev.crikey.apps");
+    queue.register(
+        apps.clone(),
+        IntakePolicy {
+            capacity_batches: 1,
+            capacity_items: 1,
+            pause_at_batches: 1,
+            resume_at_batches: 0,
+            overflow: OverflowPolicy::PauseProducer,
+        },
+    );
+    let generation = GenerationTracker::new().advance();
+    queue.begin_generation(generation);
+
+    assert_eq!(
+        queue
+            .submit(10, high(partial(generation, &apps, &["blocked"])))
+            .expect_err("zero boundary capacity cannot admit a batch"),
+        QueueReject::BoundaryFull
+    );
+    assert_eq!(queue.plugin_depth(&apps), depth(0, 0, 0));
+    assert_eq!(queue.producer_state(&apps), Some(ProducerState::Paused));
+    assert_eq!(queue.diagnostics().rejected(QueueReject::BoundaryFull), 1);
 }
 
 #[test]

@@ -30,9 +30,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crikey_core::{CoreError, Result};
 use crikey_platform::{Accelerator, HotkeyActivationHandler, HotkeyBinding, HotkeyService, Modifiers};
@@ -516,13 +518,29 @@ fn create_wake_target(connection: &RustConnection, root: Window) -> Result<(Wind
 /// Starts the thread that turns `KeyPress` events into handler calls.
 fn spawn_reader(connection: Arc<RustConnection>, root: Window, shared: Arc<Shared>) -> JoinHandle<()> {
     std::thread::spawn(move || loop {
-        let Ok(event) = connection.wait_for_event() else {
-            // The connection is gone; there is nothing left to read, and every
-            // grab this service still lists went with it. Saying so is what
-            // stops a later `register` of an already-listed accelerator from
-            // reporting a live hotkey nothing can deliver.
-            shared.failed.store(true, Ordering::Release);
-            return;
+        let event = loop {
+            if shared.stopping.load(Ordering::Acquire) {
+                return;
+            }
+            match connection.poll_for_event() {
+                Ok(Some(event)) => break event,
+                Ok(None) => {
+                    // `RustConnection` does not expose a way to close its
+                    // stream while another thread owns an `Arc`. Polling with
+                    // a short sleep gives Drop a bounded fallback when the
+                    // private wake window was destroyed by another client.
+                    std::thread::park_timeout(Duration::from_millis(10));
+                }
+                Err(_) => {
+                    // The connection is gone; there is nothing left to read,
+                    // and every grab this service still lists went with it.
+                    // Saying so stops a later `register` of an already-listed
+                    // accelerator from reporting a live hotkey nothing can
+                    // ever deliver.
+                    shared.failed.store(true, Ordering::Release);
+                    return;
+                }
+            }
         };
         match event {
             Event::ClientMessage(_) if shared.stopping.load(Ordering::Acquire) => return,
@@ -557,7 +575,12 @@ fn spawn_reader(connection: Arc<RustConnection>, root: Window, shared: Arc<Share
                 };
                 let handler = lock(&shared.handler).clone();
                 if let Some(handler) = handler {
-                    handler(&HotkeyBinding { accelerator });
+                    // A callback belongs to the host, not to this reader
+                    // thread. Catch an unwinding callback so one bad handler
+                    // does not leave its X grabs swallowing keys forever.
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        handler(&HotkeyBinding { accelerator });
+                    }));
                 }
             }
             _ => {}
@@ -674,13 +697,19 @@ fn lock_permutations(connection: &RustConnection) -> Result<Vec<u32>> {
             .map_err(|error| invalid("asking X for the modifier mapping", error))?;
         let per_modifier = usize::from(modifiers.keycodes_per_modifier()).max(1);
         for keycode in lock_keycodes {
-            let mask = modifiers
-                .keycodes
-                .chunks(per_modifier)
-                .position(|codes| codes.contains(&keycode))
-                .map_or(0u32, |index| 1 << index);
-            if mask != 0 && !lock_masks.contains(&mask) {
-                lock_masks.push(mask);
+            for (index, codes) in modifiers.keycodes.chunks(per_modifier).enumerate() {
+                if !codes.contains(&keycode) {
+                    continue;
+                }
+                let Some(mask) = u32::try_from(index)
+                    .ok()
+                    .and_then(|shift| 1u32.checked_shl(shift))
+                else {
+                    continue;
+                };
+                if !lock_masks.contains(&mask) {
+                    lock_masks.push(mask);
+                }
             }
         }
     }
@@ -818,19 +847,18 @@ impl Drop for X11HotkeyService {
     /// Stops the reader thread, then lets the connection close -- which is what
     /// makes the server drop every grab this client still held.
     ///
-    /// The reader is only joined once the wake-up is known to have been
-    /// delivered. When it cannot be, the thread is detached rather than waited
-    /// on: a launcher that hangs forever in a destructor is a worse outcome than
-    /// one leaked thread on a connection that is about to close underneath it.
+    /// The wake message normally makes the poll loop return immediately. The
+    /// stopping flag is also checked on every poll, so a wake target destroyed
+    /// by another client cannot leave a detached thread holding the connection
+    /// and all of its grabs forever.
     fn drop(&mut self) {
         let Some(reader) = self.reader.take() else {
             return;
         };
 
         self.shared.stopping.store(true, Ordering::Release);
-        if self.wake_reader() {
-            let _ = reader.join();
-        }
+        let _ = self.wake_reader();
+        let _ = reader.join();
         if let Ok(cookie) = self.connection.destroy_window(self.wake_window) {
             let _ = cookie.check();
         }

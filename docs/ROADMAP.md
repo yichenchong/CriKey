@@ -52,8 +52,9 @@ These are checked in review and encoded in tests. They outrank convenience.
 | `crikey-app` | composition root, startup staging | most |
 | `crikey-cli` | `crikey` binary (§28) | app |
 
-Dependency direction is enforced: nothing depends on `crikey-app`, and only
-`crikey-app` names a platform backend crate (via `cfg` target dependencies).
+Dependency direction is enforced: production crates depend on `crikey-app` only
+from `crikey-cli`; the `benchmarks` harness also depends on it out of band.
+Only `crikey-app` names a platform backend crate (via `cfg` target dependencies).
 
 ---
 
@@ -171,7 +172,8 @@ Status snapshot (2026-07-27):
 - `QueryPipeline` owns bounded per-plugin intake, round-robin drain budgets,
   backpressure transitions, generation retirement, aggregator merge, stable
   presentation, and terminal-publication rollback. The launcher publishes the
-  built-in application provider only after its real result batch crosses this
+  built-in application provider only after its real result batch crosses the same
+  intake and presentation boundary used by plugin providers.
 - Focused M2 verification passes 242 tests across plugin-model, scheduler,
   result-aggregator, app, and CLI targets with warnings denied. The deterministic
   `trace-query` and `simulate-typing` commands cover every §26.4 trace category;
@@ -367,6 +369,7 @@ explicit live integration of those backends.
 - **Cross-platform packaging and portable built-ins (§19.1–19.3).** Per-platform
   entrypoint resolution, OS and architecture gating, and a `MissingEntrypoint`
   failure naming the absent `<os>-<arch>` key distinctly from an undeclared
+  entrypoint.
 
 Three independent audits of the first green implementation each returned
 "incorrect" against an earlier 1132-test suite. The dominant defects included

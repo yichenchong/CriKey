@@ -38,6 +38,8 @@ The honest guard, and the only one that works, is :func:`is_available`::
 """
 
 import sys
+import ctypes
+
 import uuid
 import keypirinha as _keypirinha
 
@@ -114,12 +116,9 @@ _GUID_FIELDS = ("Data1", "Data2", "Data3", "Data4")
 def _resolve(symbol):
     """Builds one Win32-backed symbol. Only ever called on Windows.
 
-    ``ctypes`` is imported here rather than at module scope: ``ctypes.WinDLL``
-    and ``ctypes.WINFUNCTYPE`` do not exist off Windows, and a module-level
-    import would make this module heavier everywhere to serve a branch that
-    only one platform can reach.
+    ``ctypes`` itself is part of the standard library on every supported
+    platform; only the Windows DLL lookup is deferred until this function.
     """
-    import ctypes
 
     if symbol in ("kernel32", "user32", "shell32", "ole32"):
         # `use_last_error` keeps `GetLastError` meaningful across the ctypes

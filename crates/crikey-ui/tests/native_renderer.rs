@@ -1,9 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
-use crikey_core::Generation;
+use crikey_core::{Generation, ItemId};
 use crikey_ui::{
     build_launcher_frame, create_launcher_context, egui, ActivationLatencyTracker, NativeLauncher,
-    NativeLauncherConfig, NativeLauncherHandle, RendererError, ViewModel, ACTIVATION_SAMPLE_CAPACITY,
+    NativeLauncherConfig, NativeLauncherHandle, RendererError, ResultRow, ViewModel,
+    ACTIVATION_SAMPLE_CAPACITY,
 };
 
 fn model(query: &str) -> ViewModel {
@@ -14,6 +15,22 @@ fn model(query: &str) -> ViewModel {
         selected: 0,
         pending_plugins: false,
         actions_open: false,
+    }
+}
+
+fn result_row(index: usize) -> ResultRow {
+    ResultRow {
+        item: ItemId(format!("item-{index}")),
+        label: format!("row-{index}"),
+        description: String::new(),
+        icon_reference: None,
+        category: "application".to_owned(),
+        plugin_name: "core".to_owned(),
+        highlights: Vec::new(),
+        argument_hint: None,
+        status: None,
+        default_action: None,
+        alternate_actions: Vec::new(),
     }
 }
 
@@ -96,4 +113,53 @@ fn latency_tracker_reports_nearest_rank_p95_without_unbounded_retention() {
         wrapped.latest,
         Some(Duration::from_millis(ACTIVATION_SAMPLE_CAPACITY as u64 + 37))
     );
+}
+
+#[test]
+fn a_zero_sized_window_still_builds_a_frame() {
+    let context = create_launcher_context();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::ZERO)),
+        focused: true,
+        ..Default::default()
+    };
+
+    // A minimised or freshly mapped window can report no area at all. Laying
+    // the launcher out inside it must not divide by the missing height or
+    // panic on a negative size.
+    let frame = build_launcher_frame(&context, input, &model(""));
+
+    assert!(frame.commands.is_empty());
+}
+
+#[test]
+fn the_result_count_is_worded_for_one_result_and_for_several() {
+    fn status_shows(rows: usize, needle: &str) -> bool {
+        let context = create_launcher_context();
+        let window = NativeLauncherConfig::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(window.width as f32, window.height as f32),
+            )),
+            focused: true,
+            ..Default::default()
+        };
+        let mut view = model("q");
+        view.rows = (0..rows).map(result_row).collect();
+
+        let frame = build_launcher_frame(&context, input, &view);
+        frame
+            .output
+            .shapes
+            .iter()
+            .any(|clipped| contains_text(&clipped.shape, needle))
+    }
+
+    assert!(status_shows(1, "1 result"));
+    assert!(
+        !status_shows(1, "1 results"),
+        "a single result must not be reported in the plural"
+    );
+    assert!(status_shows(2, "2 results"));
 }

@@ -648,9 +648,7 @@ impl EventCoalescer {
             *counter = counter.saturating_add(1);
         }
         slot.notice = Some(PendingNotice { kind, due_at });
-        if slot.pending_since.is_none() {
-            slot.pending_since = Some(at);
-        }
+        slot.pending_since = Some(slot.pending_since.map_or(at, |existing| existing.min(at)));
     }
 
     /// Records that the host started a callback it did not get from `tick` -
@@ -873,7 +871,5 @@ fn merge_pending(
         counters.deferred_by_serialization = counters.deferred_by_serialization.saturating_add(1);
     }
     slot.pending.insert(flags);
-    if slot.pending_since.is_none() {
-        slot.pending_since = Some(at);
-    }
+    slot.pending_since = Some(slot.pending_since.map_or(at, |existing| existing.min(at)));
 }

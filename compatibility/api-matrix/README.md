@@ -15,7 +15,7 @@ unexplained caveat fails that suite.
 ## Schema
 
 ```toml
-matrix-version = 1     # schema version; a bump is a breaking change
+matrix-version = 1     # schema version; unknown versions are rejected
 
 [[api]]
 module = "keypirinha"       # required; one of the four documented modules
@@ -24,7 +24,9 @@ status = "full"             # required; one of the six values below
 notes  = ""                 # required for behavioural-difference and partial
 ```
 
-Entries are read in file order and `(module, symbol)` is unique.
+Entries are read in file order and `(module, symbol)` is unique. The parser
+rejects unknown module names and future schema versions instead of interpreting
+them with today's rules.
 
 | `status` | meaning |
 | --- | --- |

@@ -1,6 +1,6 @@
 //! Native worker restart and circuit supervision (spec 13.7, 24.1-24.4).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use crikey_core::PluginId;
@@ -44,7 +44,7 @@ struct Registration {
     worker: Option<NativeWorker>,
     exits: Vec<ExitRecord>,
     restarts: u32,
-    failure_times: Vec<u64>,
+    failure_times: VecDeque<u64>,
     last_failure_at: Option<u64>,
 }
 
@@ -92,7 +92,7 @@ impl NativeSupervisor {
                 worker: None,
                 exits: Vec::new(),
                 restarts: 0,
-                failure_times: Vec::new(),
+                failure_times: VecDeque::new(),
                 last_failure_at: None,
             },
         );
@@ -109,7 +109,13 @@ impl NativeSupervisor {
                 detail: "plugin is not registered".to_owned(),
             });
         }
-
+        if self
+            .memory
+            .snapshot(plugin)
+            .is_some_and(|snapshot| snapshot.state == WorkerState::Suspended)
+        {
+            self.discard_worker(plugin);
+        }
         let (already_alive, dead_exit, call_failure, call_success) = {
             let registration = self.registrations.get_mut(plugin).expect("checked above");
             let alive = registration.worker.as_mut().is_some_and(NativeWorker::is_alive);
@@ -137,7 +143,19 @@ impl NativeSupervisor {
             if let Some(failure) = call_failure {
                 let _ = self.record_failure(plugin, failure, now_ms);
             } else if call_success {
+                self.recover_failed_state(plugin);
                 let _ = self.memory.record_success(plugin);
+            }
+            if self
+                .memory
+                .snapshot(plugin)
+                .is_some_and(|snapshot| snapshot.state == WorkerState::Suspended)
+            {
+                self.discard_worker(plugin);
+                return Err(HostError::ResourceLimit {
+                    plugin: plugin.clone(),
+                    detail: "restart circuit breaker is open".to_owned(),
+                });
             }
         } else if let Some(exit) = dead_exit {
             let failure = call_failure.unwrap_or_else(|| failure_kind_for_exit(&exit));
@@ -160,6 +178,8 @@ impl NativeSupervisor {
             let replacement = match NativeWorker::spawn(spec, options) {
                 Ok(worker) => worker,
                 Err(error) => {
+                    let registration = self.registrations.get_mut(plugin).expect("checked above");
+                    registration.restarts = registration.restarts.saturating_add(1);
                     let failure = failure_kind_for_error(&error);
                     let _ = self.record_failure(plugin, failure, now_ms);
                     return Err(error);
@@ -209,7 +229,7 @@ impl NativeSupervisor {
         let registration = self.registrations.get(plugin)?;
         let backoff = registration
             .last_failure_at
-            .map(|at| at.saturating_add(self.backoff_ms(registration.restarts.saturating_add(1))));
+            .map(|at| at.saturating_add(self.backoff_ms(registration.restarts)));
         let circuit = self
             .memory
             .snapshot(plugin)
@@ -235,7 +255,27 @@ impl NativeSupervisor {
         }
     }
 
+    fn discard_worker(&mut self, plugin: &PluginId) {
+        if let Some(registration) = self.registrations.get_mut(plugin) {
+            if let Some(mut worker) = registration.worker.take() {
+                registration.exits.push(worker.kill());
+            }
+        }
+    }
+
+    fn recover_failed_state(&mut self, plugin: &PluginId) {
+        if self
+            .memory
+            .snapshot(plugin)
+            .is_some_and(|snapshot| snapshot.state == WorkerState::Failed)
+        {
+            let _ = self.memory.restart(plugin);
+            let _ = self.memory.mark_ready(plugin);
+        }
+    }
+
     fn mark_busy(&mut self, plugin: &PluginId) {
+        self.recover_failed_state(plugin);
         if self
             .memory
             .snapshot(plugin)
@@ -254,36 +294,23 @@ impl NativeSupervisor {
                 registration.failure_times.clone(),
             )
         };
-        if restarts > self.config.max_restarts && last_failure.is_some() {
-            return Ok(false);
-        }
         if let Some(last_failure) = last_failure {
-            let backoff = self.backoff_ms(restarts.saturating_add(1));
+            if self.config.restart_window_ms == 0 {
+                if restarts > self.config.max_restarts {
+                    return Ok(false);
+                }
+            } else {
+                let cutoff = now_ms.saturating_sub(self.config.restart_window_ms);
+                let recent = failure_times
+                    .iter()
+                    .filter(|timestamp| **timestamp >= cutoff)
+                    .count();
+                if recent > self.config.max_restarts as usize {
+                    return Ok(false);
+                }
+            }
+            let backoff = self.backoff_ms(restarts);
             if now_ms < last_failure.saturating_add(backoff) {
-                return Ok(false);
-            }
-        }
-        if self
-            .memory
-            .snapshot(plugin)
-            .is_some_and(|snapshot| snapshot.state == WorkerState::Suspended)
-        {
-            let _ = self.memory.resume_if_ready(plugin, Duration::from_millis(now_ms));
-            if self
-                .memory
-                .snapshot(plugin)
-                .is_some_and(|snapshot| snapshot.state == WorkerState::Suspended)
-            {
-                return Ok(false);
-            }
-        }
-        if self.config.restart_window_ms != 0 {
-            let cutoff = now_ms.saturating_sub(self.config.restart_window_ms);
-            let recent = failure_times
-                .iter()
-                .filter(|timestamp| **timestamp >= cutoff)
-                .count();
-            if recent > self.config.max_restarts as usize {
                 return Ok(false);
             }
         }
@@ -291,6 +318,26 @@ impl NativeSupervisor {
         match snapshot.map(|snapshot| snapshot.state) {
             Some(WorkerState::NotStarted) => {
                 let _ = self.memory.start(plugin);
+            }
+            Some(WorkerState::Suspended) => {
+                // An open circuit refuses restarts until its cooldown elapses.
+                // Without this arm a freshly opened circuit would still spawn a
+                // replacement, handing the caller a live worker and silently
+                // discarding the failure accounting that just suspended it.
+                if self
+                    .memory
+                    .resume_if_ready(plugin, Duration::from_millis(now_ms))
+                    .is_err()
+                {
+                    return Ok(false);
+                }
+                if self
+                    .memory
+                    .snapshot(plugin)
+                    .is_some_and(|snapshot| snapshot.state == WorkerState::Suspended)
+                {
+                    return Ok(false);
+                }
             }
             Some(WorkerState::Failed | WorkerState::Ready) => {
                 let _ = self.memory.restart(plugin);
@@ -301,8 +348,23 @@ impl NativeSupervisor {
     }
 
     fn record_failure(&mut self, plugin: &PluginId, kind: FailureKind, now_ms: u64) -> Result<(), HostError> {
+        let window = self.config.restart_window_ms;
+        let max_entries = usize::try_from(self.config.max_restarts)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
         if let Some(registration) = self.registrations.get_mut(plugin) {
-            registration.failure_times.push(now_ms);
+            if window == 0 {
+                registration.failure_times.clear();
+            } else {
+                let cutoff = now_ms.saturating_sub(window);
+                registration
+                    .failure_times
+                    .retain(|timestamp| *timestamp >= cutoff);
+            }
+            while registration.failure_times.len() >= max_entries {
+                let _ = registration.failure_times.pop_front();
+            }
+            registration.failure_times.push_back(now_ms);
             registration.last_failure_at = Some(now_ms);
         }
         self.memory

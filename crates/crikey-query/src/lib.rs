@@ -418,6 +418,38 @@ impl PreparedLabel {
         &self.text
     }
 
+    /// Checks whether this prepared buffer belongs to `item`.
+    ///
+    /// The constructor is public for catalog integrations, so a caller can
+    /// accidentally reuse a prepared label from another item. Matching with
+    /// such a buffer can otherwise produce a false positive or point at a
+    /// different, but still valid, byte range in the candidate label.
+    fn matches_item(&self, item: &Item) -> bool {
+        if self.normalized() != normalize_field(&item.label).as_ref() {
+            return false;
+        }
+        let mut remaining = self.keywords();
+        let mut wrote_any = !self.normalized().is_empty();
+        for raw in std::iter::once(&item.description).chain(item.search_terms.iter()) {
+            if raw.is_empty() {
+                continue;
+            }
+            let field = normalize_field(raw);
+            if wrote_any {
+                let Some(stripped) = remaining.strip_prefix(' ') else {
+                    return false;
+                };
+                remaining = stripped;
+            }
+            if !remaining.starts_with(field.as_ref()) {
+                return false;
+            }
+            remaining = &remaining[field.len()..];
+            wrote_any |= !field.is_empty();
+        }
+        remaining.is_empty()
+    }
+
     /// Cheaply rejects items that no matcher interpretation can accept.
     ///
     /// This repeats only the boolean shape of matching over ingestion-time
@@ -602,6 +634,9 @@ pub struct DefaultMatcher {
 impl DefaultMatcher {
     /// Scores a prepared label while reusing caller-owned highlight storage.
     ///
+    /// `label` must have been prepared from the same `item`; callers that
+    /// cannot guarantee that relationship should use [`Self::match_prepared`],
+    /// which validates and rebuilds mismatched buffers before scoring.
     /// `spans` is scratch state, not part of the result. Callers retaining only
     /// the best candidates can materialize full highlights after selection.
     pub fn score_prepared(
@@ -676,7 +711,26 @@ impl DefaultMatcher {
     }
 
     /// Matches using a label prepared when the catalog admitted the item.
+    ///
+    /// If a caller accidentally supplies a prepared buffer for another item,
+    /// the matcher rebuilds the candidate's buffer before scoring. This keeps
+    /// public misuse from turning into a false match or a wrong highlight.
     pub fn match_prepared(
+        &self,
+        query: &NormalizedQuery,
+        item: &Item,
+        label: &PreparedLabel,
+    ) -> Option<MatchOutcome> {
+        if label.matches_item(item) {
+            return self.match_prepared_unchecked(query, item, label);
+        }
+
+        let (text, label_bytes) = searchable_text_with_label(item);
+        let owned = PreparedLabel::from_searchable_text(&item.label, text, label_bytes);
+        self.match_prepared_unchecked(query, item, &owned)
+    }
+
+    fn match_prepared_unchecked(
         &self,
         query: &NormalizedQuery,
         item: &Item,
@@ -702,7 +756,7 @@ impl Matcher for DefaultMatcher {
     fn match_item(&self, query: &NormalizedQuery, item: &Item) -> Option<MatchOutcome> {
         let (text, label_bytes) = searchable_text_with_label(item);
         let label = PreparedLabel::from_searchable_text(&item.label, text, label_bytes);
-        self.match_prepared(query, item, &label)
+        self.match_prepared_unchecked(query, item, &label)
     }
 }
 

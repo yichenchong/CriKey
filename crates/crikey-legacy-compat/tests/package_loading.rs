@@ -646,6 +646,24 @@ fn a_loose_directory_with_a_top_level_module_is_discovered_with_its_id_main_modu
 }
 
 #[test]
+fn a_loose_directory_whose_name_looks_like_an_archive_keeps_its_full_directory_id() {
+    let tree = TempTree::new("directory-extension-id");
+    let root = tree.root("packages");
+    let package_dir = build_directory_package(&root, "named.keypirinha-package", &[("entry.py", b"")]);
+
+    let loader = PackageLoader::new(tree.cache_root());
+    let package = load_ok(&loader, &package_dir);
+
+    assert_eq!(
+        package.id,
+        PackageId("named.keypirinha-package".to_owned()),
+        "only archive files lose the .keypirinha-package suffix; a loose directory name is \
+         already the package identity"
+    );
+    assert_eq!(package.main_module, "entry");
+}
+
+#[test]
 fn package_local_modules_in_subdirectories_are_importable_entries_in_sorted_order() {
     const LAYOUT: &[FixtureFile] = &[
         ("sortedmods.py", b"import keypirinha\n"),
@@ -1170,10 +1188,12 @@ fn an_archive_entry_that_escapes_the_package_root_is_refused_and_writes_nothing(
 }
 
 #[test]
-fn absolute_and_backslash_entry_names_are_refused_before_extraction() {
+fn hostile_archive_path_spellings_are_refused_before_extraction() {
     for (label, hostile_name) in [
         ("absolute-entry", "/outside.py"),
         ("backslash-entry", "lib\\outside.py"),
+        ("windows-device-entry", "CON.txt"),
+        ("trailing-dot-entry", "payload.py."),
     ] {
         let tree = TempTree::new(label);
         let archive_path = tree.root("archived").join(archive_file_name(label));
@@ -1282,6 +1302,37 @@ fn an_empty_or_non_zip_keypirinha_package_file_is_refused_as_a_malformed_archive
     assert!(
         relative_files(&cache_root).is_empty(),
         "a container that cannot be opened must leave nothing behind in the cache root, found {:?}",
+        relative_files(&cache_root)
+    );
+}
+
+#[test]
+fn a_corrupt_entry_payload_is_reported_as_a_malformed_archive_without_cache_output() {
+    let tree = TempTree::new("corrupt-payload");
+    let archive_path = tree.root("archived").join(archive_file_name("corrupt"));
+    let mut archive = RawZip::default();
+    archive.push("corrupt.py", &b"import keypirinha\n"[..]);
+    archive.write_to(&archive_path);
+
+    // Keep the central directory and CRC untouched, but flip one byte in the
+    // stored local payload. The ZIP container remains structurally indexed;
+    // decompression must report the checksum failure while extraction is in
+    // progress.
+    let mut bytes = fs::read(&archive_path).expect("raw archive must be readable");
+    let payload_offset = 30 + "corrupt.py".len();
+    bytes[payload_offset] ^= 0xff;
+    write_file(&archive_path, &bytes);
+
+    let cache_root = tree.cache_root();
+    let loader = PackageLoader::new(cache_root.clone());
+    let error = load_err(&loader, &archive_path);
+    assert!(
+        matches!(error, PackageError::MalformedArchive { .. }),
+        "a CRC failure must be a clean malformed-archive error, got {error:?}"
+    );
+    assert!(
+        relative_files(&cache_root).is_empty(),
+        "a corrupt payload must remove its staging directory rather than leave partial output, found {:?}",
         relative_files(&cache_root)
     );
 }

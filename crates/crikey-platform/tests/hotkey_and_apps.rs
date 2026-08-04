@@ -28,8 +28,8 @@ use std::ffi::OsString;
 
 use crikey_core::{Category, Item, ItemId, PlatformPath, PluginId};
 use crikey_platform::{
-    application_arguments, application_items, decode_target, encode_target, Accelerator,
-    DiscoveredApplication, HotkeyError, Modifiers, TargetError, APPLICATION_LAUNCH_ACTION_ID,
+    application_arguments, application_items, application_working_directory, decode_target, encode_target,
+    Accelerator, DiscoveredApplication, HotkeyError, Modifiers, TargetError, APPLICATION_LAUNCH_ACTION_ID,
 };
 
 #[cfg(unix)]
@@ -280,6 +280,7 @@ fn discovered(name: &str, target: impl Into<OsString>) -> DiscoveredApplication 
         name: name.to_owned(),
         target: PlatformPath::new(target),
         arguments: Vec::new(),
+        working_directory: None,
         icon_reference: None,
         platform_id: None,
     }
@@ -396,6 +397,28 @@ fn application_arguments_rebuilds_exact_argument_boundaries() {
     assert_eq!(
         application_arguments(&item).expect("host-owned metadata is valid"),
         ["", "two words", "\"quoted\""]
+    );
+}
+
+#[test]
+fn working_directory_metadata_round_trips_when_present_and_absent() {
+    let mut with_directory = discovered("Editor", "/usr/bin/editor");
+    let directory = PlatformPath::new("/home/tester/project");
+    with_directory.working_directory = Some(directory.clone());
+    let with_item = application_items(&plugin(), &[with_directory])
+        .pop()
+        .expect("one discovery produces one item");
+    assert_eq!(
+        application_working_directory(&with_item).expect("working-directory metadata is valid"),
+        Some(directory)
+    );
+
+    let without_item = application_items(&plugin(), &[discovered("Editor", "/usr/bin/editor")])
+        .pop()
+        .expect("one discovery produces one item");
+    assert_eq!(
+        application_working_directory(&without_item).expect("missing working-directory metadata is valid"),
+        None
     );
 }
 

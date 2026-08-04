@@ -76,7 +76,7 @@ use crikey_legacy_compat::{
     CatalogRejectReason, DeadlinePolicy, Delivery, DynamicCachePolicy, InstanceId, LegacyCallback,
     LegacyCompatibility, LegacyDeadlines, LegacyInstanceState, LegacyPluginDiagnostics, LegacyRegistration,
     LegacyRequest, LegacyRequestKind, LegacyResponse, LegacyRuntime, LegacyTraceEvent, LegacyWorkerHandle,
-    PackageId, TerminationReason, WorkerError,
+    PackageId, PluginException, TerminationReason, WorkerError,
 };
 
 // ---------------------------------------------------------------------------
@@ -1301,6 +1301,40 @@ fn a_long_catalog_build_is_serialized_but_never_killed_on_the_modern_query_deadl
 }
 
 #[test]
+fn a_clock_that_moves_backwards_cannot_underflow_deadline_elapsed_time() {
+    let of = plugin("legacy.clock");
+    let mut runtime = runtime();
+    runtime.register(of.clone(), package("clock"));
+    boot(&mut runtime, 0);
+
+    runtime.submit_query("x", 100);
+    let dispatched = runtime.tick(100);
+    let request = only_for(&dispatched, &of).clone();
+
+    runtime.tick(0);
+    assert!(
+        !runtime
+            .trace()
+            .iter()
+            .any(|event| matches!(event, LegacyTraceEvent::SoftLatencyWarning { .. })),
+        "a timestamp earlier than dispatch must report zero elapsed time"
+    );
+
+    runtime.tick(5_100);
+    expect_trace(
+        &runtime,
+        LegacyTraceEvent::SoftLatencyWarning {
+            at_ms: 5_100,
+            plugin: of.clone(),
+            callback: LegacyCallback::OnSuggest,
+            elapsed_ms: 5_000,
+        },
+        "deadline elapsed time uses saturating subtraction",
+    );
+    let _ = runtime.deliver(LegacyResponse::suggestions(&request, Vec::new()), 5_100);
+}
+
+#[test]
 fn set_catalog_replaces_the_live_catalog_and_merge_catalog_extends_it() {
     let of = plugin("legacy.notes");
     let mut runtime = runtime();
@@ -1467,6 +1501,120 @@ fn a_catalog_update_from_an_obsolete_instance_is_rejected_without_mutating_the_c
         diagnostics(&runtime, &of).catalog_updates_rejected,
         1,
         "spec 26.4: rejected catalog updates are counted per plugin"
+    );
+}
+
+#[test]
+fn registering_a_plugin_again_supersedes_the_old_instance() {
+    let of = plugin("legacy.duplicate");
+    let mut runtime = runtime();
+    let original = runtime.register(of.clone(), package("first"));
+    boot(&mut runtime, 0);
+
+    runtime.submit_query("a", 10);
+    let first = only_for(&runtime.tick(10), &of).clone();
+    let replacement = runtime.register(of.clone(), package("second"));
+    assert_ne!(
+        replacement, original,
+        "registering the same plugin again creates a fresh instance"
+    );
+    assert_eq!(
+        runtime.package(&of),
+        Some(&package("second")),
+        "the replacement owns the newly registered package"
+    );
+
+    assert_eq!(
+        runtime.deliver(LegacyResponse::suggestions(&first, Vec::new()), 20),
+        Delivery::RejectedObsoleteInstance {
+            instance: original,
+            current: replacement,
+        },
+        "a late answer from the first registration cannot complete the replacement"
+    );
+    let restarted = runtime.tick(20);
+    assert_eq!(
+        (
+            restarted.len(),
+            restarted.first().map(|request| request.instance),
+            restarted.first().map(call_of),
+        ),
+        (1, Some(replacement), Some(Call::Start)),
+        "the replacement runs one-time initialization before new callbacks"
+    );
+}
+
+#[test]
+fn failed_initialization_disables_only_that_instance_until_reload() {
+    let of = plugin("legacy.init-failure");
+    let mut runtime = runtime();
+    let original = runtime.register(of.clone(), package("broken"));
+    let _start = only_for(&runtime.tick(0), &of).clone();
+    let response = LegacyResponse {
+        plugin: of.clone(),
+        instance: original,
+        generation: Generation::ZERO,
+        callback: LegacyCallback::OnStart,
+        outcome: crikey_legacy_compat::LegacyOutcome::Failed(PluginException {
+            plugin: of.clone(),
+            callback: LegacyCallback::OnStart,
+            exception_type: "ImportError".to_owned(),
+            message: "broken import".to_owned(),
+            traceback: "traceback".to_owned(),
+        }),
+        log: Vec::new(),
+        terminate_polls: 0,
+    };
+    assert_eq!(
+        runtime.deliver(response, 1),
+        Delivery::Accepted,
+        "an import failure is a plugin outcome, not a runtime transport failure"
+    );
+    assert!(
+        runtime.tick(2).is_empty(),
+        "a failed on_start instance must not receive later callbacks"
+    );
+
+    let replacement = runtime
+        .reload(&of, 3)
+        .expect("a failed instance remains reloadable");
+    assert_ne!(replacement, original);
+    let restarted = runtime.tick(3);
+    assert_eq!(
+        (
+            restarted.len(),
+            restarted.first().map(|request| request.instance),
+            restarted.first().map(call_of),
+        ),
+        (1, Some(replacement), Some(Call::Start)),
+        "reload creates a clean instance that can retry initialization"
+    );
+}
+
+#[test]
+fn reload_invalidates_old_visible_items_and_selection() {
+    let of = plugin("legacy.visible-reload");
+    let mut runtime = runtime();
+    let original = runtime.register(of.clone(), package("visible"));
+    boot(&mut runtime, 0);
+
+    runtime.submit_query("old", 10);
+    let request = only_for(&runtime.tick(10), &of).clone();
+    runtime.deliver(
+        LegacyResponse::suggestions(&request, vec![item(&of, "old-item", "Old")]),
+        11,
+    );
+    assert_eq!(item_ids(runtime.visible_items()), vec!["old-item"]);
+    runtime
+        .select_item(&ItemId("old-item".to_owned()), 12)
+        .expect("the old item is selectable before reload");
+
+    let replacement = runtime.reload(&of, 13).expect("a loaded plugin can be reloaded");
+    assert_ne!(replacement, original);
+    assert!(runtime.visible_items().is_empty());
+    assert!(
+        runtime.selected_item().is_none(),
+        "selection cannot outlive the instance that produced its item"
     );
 }
 

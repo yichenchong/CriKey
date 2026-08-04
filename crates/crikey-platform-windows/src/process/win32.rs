@@ -30,16 +30,22 @@ use crate::win32::{refused, wide, Apartment};
 /// Returns as soon as the operation has been dispatched, not when the launched
 /// program exits: no process handle is requested, so there is none to wait on
 /// and none to leak.
-pub(super) fn execute(verb: &str, file: &OsStr, parameters: Option<&OsStr>) -> Result<()> {
+pub(super) fn execute(
+    verb: &str,
+    file: &OsStr,
+    parameters: Option<&OsStr>,
+    directory: Option<&OsStr>,
+) -> Result<()> {
     // The shell delegates to COM-activated extensions -- verb handlers, data
     // sources -- and several of them require a single-threaded apartment, so
     // the documented preamble to `ShellExecuteEx` is this exact call.
     let _apartment = Apartment::enter("a shell launch")?;
 
-    // Both buffers must outlive the call, so they are named rather than
+    // All buffers must outlive the call, so they are named rather than
     // temporaries: a `PCWSTR` into a dropped `Vec` is a dangling pointer.
     let file_units = wide(file);
     let parameter_units = parameters.map(wide);
+    let directory_units = directory.map(wide);
 
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -62,16 +68,17 @@ pub(super) fn execute(verb: &str, file: &OsStr, parameters: Option<&OsStr>) -> R
         // application. Naming one would be this backend guessing at something
         // the shell already knows per target.
         //
-        // A null directory is deliberate too: `DiscoveredApplication` does not
-        // carry the working directory a shortcut may declare, so synthesising
-        // one from the target path would not be restoring the shortcut's answer
-        // but inventing a different one.
+        // A null directory deliberately inherits the launcher directory. A
+        // shortcut's recorded directory is supplied when one exists.
+        lpDirectory: directory_units
+            .as_ref()
+            .map_or(PCWSTR::null(), |units| PCWSTR(units.as_ptr())),
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
 
     // SAFETY: `info` is a fully initialised structure of the size it declares,
-    // and the two pointers it carries are NUL-terminated buffers that outlive
+    // and the pointers it carries are NUL-terminated buffers that outlive
     // this statement.
     unsafe { ShellExecuteExW(&mut info) }
         .map_err(|error| refused(&format!("{verb} {}", file.to_string_lossy()), &error))

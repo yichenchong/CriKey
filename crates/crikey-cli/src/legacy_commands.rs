@@ -98,7 +98,8 @@ const WINDOWS_ONLY_MODULE: &str = "keypirinha_wintypes";
 
 /// Most package modules the static import scan reads. A legacy package is
 /// third-party content of unknown provenance, so the scan is bounded by
-/// construction; modules past the cap are not scanned.
+/// construction; a package over the cap is refused rather than called
+/// portable without inspecting its remaining modules.
 const MAX_SCANNED_MODULES: usize = 512;
 
 /// Largest module the scan reads, in bytes. A larger file is skipped rather
@@ -596,7 +597,10 @@ fn unknown_help_argument(args: &[String]) -> Option<&str> {
         if matches!(argument, "-h" | "--help") {
             index += 1;
         } else if argument == "--package" {
-            index = index.saturating_add(2);
+            index += 1;
+            if args.get(index).is_some_and(|value| !value.starts_with("--")) {
+                index += 1;
+            }
         } else if argument.starts_with("--package=") {
             index += 1;
         } else {
@@ -766,9 +770,13 @@ fn catalog_of(worker: &mut LegacyWorker, plugin: &PluginId) -> Result<Vec<Item>,
     let response = worker
         .call(direct_request(plugin, LegacyRequestKind::Catalog))
         .map_err(|error| format!("on_catalog failed: {error}"))?;
-    match published_items(&response.outcome) {
-        Some(items) => Ok(items.to_vec()),
-        None => Err(format!("on_catalog published no catalog: {:?}", response.outcome)),
+    catalog_items(response.outcome)
+}
+
+fn catalog_items(outcome: LegacyOutcome) -> Result<Vec<Item>, String> {
+    match outcome {
+        LegacyOutcome::SetCatalog(items) | LegacyOutcome::MergeCatalog(items) => Ok(items),
+        outcome => Err(format!("on_catalog published no catalog: {outcome:?}")),
     }
 }
 
@@ -791,23 +799,34 @@ fn declared_classification(corpus: &PluginCorpus, package: &LegacyPackage) -> Op
         .map(|entry| entry.classification)
 }
 
-/// The Windows-only dependency this package declares, if any, named together
-/// with the module it was found in.
 fn scan_windows_only_dependency(package: &LegacyPackage) -> Result<Option<String>, String> {
+    if package.modules.len() > MAX_SCANNED_MODULES {
+        return Err(format!(
+            "portability scan is bounded at {MAX_SCANNED_MODULES} modules, but this package \
+             contains {}; refusing to claim it is portable",
+            package.modules.len()
+        ));
+    }
     let content_root = package.root.content_root();
-    for module in package.modules.iter().take(MAX_SCANNED_MODULES) {
+    for module in &package.modules {
         let path = content_root.join(&module.relative_path);
         let size = fs::metadata(&path)
             .map_err(|error| format!("cannot read module `{}`: {error}", module.import_name))?
             .len();
         if size > MAX_SCANNED_MODULE_BYTES {
-            continue;
+            return Err(format!(
+                "module `{}` is {size} bytes, over the {MAX_SCANNED_MODULE_BYTES}-byte \
+                 portability-scan limit; refusing to claim the package is portable",
+                module.import_name
+            ));
         }
-        let Ok(source) = fs::read_to_string(&path) else {
-            // Not valid UTF-8, so not a module CPython would import as source
-            // either. Skipped rather than refused: it cannot carry an import.
-            continue;
-        };
+        let source = fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "cannot decode module `{}` as UTF-8: {error}; refusing to claim the package is \
+                 portable",
+                module.import_name
+            )
+        })?;
         if imports_windows_only(&source) {
             return Ok(Some(format!(
                 "{WINDOWS_ONLY_MODULE} imported by {}",
@@ -862,15 +881,21 @@ fn windows_only_entry_point_in(source: &str) -> Option<String> {
             .and_then(|rest| rest.strip_prefix(WINDOWS_ONLY_MODULE))
         {
             if let Some(names) = after.trim_start().strip_prefix("import ") {
-                if let Some(name) = names
-                    .split(|c: char| !is_ident(c))
-                    .find(|token| !token.is_empty() && *token != PROBE)
-                {
-                    return Some(name.to_owned());
+                for clause in names.split(',') {
+                    let name = clause
+                        .trim()
+                        .trim_start_matches('(')
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default();
+                    if !name.is_empty() && name != PROBE {
+                        return Some(name.to_owned());
+                    }
                 }
             }
         } else if let Some(rest) = statement.strip_prefix("import ") {
-            let mut tokens = rest.split_whitespace();
+            let clause = rest.split(',').next().unwrap_or_default();
+            let mut tokens = clause.split_whitespace();
             if tokens.next() == Some(WINDOWS_ONLY_MODULE) {
                 binding = Some(match (tokens.next(), tokens.next()) {
                     (Some("as"), Some(alias)) => alias.to_owned(),
@@ -923,15 +948,8 @@ fn split_undocumented(message: &str) -> Option<(String, String)> {
 /// non-portable.
 fn imports_windows_only(source: &str) -> bool {
     source.lines().any(|line| {
-        let statement = line.trim_start();
-        statement
-            .strip_prefix("import ")
-            .or_else(|| statement.strip_prefix("from "))
-            .is_some_and(|rest| {
-                rest.split(|character: char| !character.is_alphanumeric() && character != '_')
-                    .next()
-                    == Some(WINDOWS_ONLY_MODULE)
-            })
+        let mut tokens = line.split_whitespace();
+        matches!(tokens.next(), Some("import") | Some("from")) && tokens.next() == Some(WINDOWS_ONLY_MODULE)
     })
 }
 
@@ -985,13 +1003,7 @@ fn classify_portability(checks: &mut BTreeMap<&'static str, Check>, dependency: 
 }
 
 fn host_platform() -> &'static str {
-    if cfg!(windows) {
-        "windows"
-    } else if cfg!(target_os = "macos") {
-        "macos"
-    } else {
-        "linux"
-    }
+    std::env::consts::OS
 }
 
 // ---------------------------------------------------------------------------
@@ -2000,7 +2012,7 @@ fn item_line(index: usize, item: &Item) -> String {
     for (key, value) in [
         ("item", index.to_string()),
         ("id", item.stable_id.0.clone()),
-        ("category", item.category.as_str().to_owned()),
+        ("category", item.category.wire_tag()),
         ("label", item.label.clone()),
         ("description", item.description.clone()),
         ("target", item.target.clone()),
@@ -2074,6 +2086,8 @@ fn workspace_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crikey_core::Category;
+    use crikey_legacy_compat::{PackageId, PackageModule, PackageRoot};
 
     #[test]
     fn every_character_that_would_break_the_format_is_escaped_with_uppercase_hex() {
@@ -2106,6 +2120,10 @@ mod tests {
             "from keypirinha_wintypes import declare_func\n"
         ));
         assert!(imports_windows_only("    import keypirinha_wintypes\n"));
+        assert!(imports_windows_only("import\tkeypirinha_wintypes\n"));
+        assert!(imports_windows_only(
+            "from\tkeypirinha_wintypes import declare_func\n"
+        ));
         // Documenting portability must never make a package non-portable.
         assert!(!imports_windows_only(
             "\"\"\"This plugin never touches keypirinha_wintypes.\"\"\"\n"
@@ -2308,6 +2326,15 @@ mod tests {
         let args = vec!["--help".to_owned(), "--unknown".to_owned()];
         assert!(parse_package_args("inspect-catalog", &args).is_err());
         assert!(parse_no_arguments("compatibility-report", &args).is_err());
+        assert!(parse_package_args(
+            "inspect-catalog",
+            &[
+                "--help".to_owned(),
+                "--package".to_owned(),
+                "--unknown".to_owned()
+            ]
+        )
+        .is_err());
     }
 
     #[test]
@@ -2336,5 +2363,60 @@ mod tests {
                 0o700
             );
         }
+    }
+    #[test]
+    fn a_suggestion_publication_is_not_accepted_as_a_catalog() {
+        assert!(catalog_items(LegacyOutcome::Suggestions(Vec::new())).is_err());
+    }
+
+    #[test]
+    fn windows_entry_scanner_skips_aliases_of_the_availability_probe() {
+        assert_eq!(
+            windows_only_entry_point_in(
+                "from keypirinha_wintypes import is_available as probe\n\
+                 import keypirinha_wintypes as kpwt, other\n\
+                 kpwt.kernel32\n"
+            )
+            .as_deref(),
+            Some("kernel32")
+        );
+    }
+
+    #[test]
+    fn an_over_bound_package_is_not_called_portable() {
+        let package = LegacyPackage {
+            id: PackageId("large".to_owned()),
+            root: PackageRoot::Directory(PathBuf::from(".")),
+            main_module: "large".to_owned(),
+            modules: (0..=MAX_SCANNED_MODULES)
+                .map(|index| PackageModule {
+                    import_name: format!("module{index}"),
+                    relative_path: PathBuf::from(format!("module{index}.py")),
+                })
+                .collect(),
+            resources: Vec::new(),
+        };
+        let error = scan_windows_only_dependency(&package).expect_err("the cap must be enforced");
+        assert!(error.contains("refusing to claim it is portable"), "{error}");
+    }
+
+    #[test]
+    fn catalog_category_keeps_plugin_defined_names_distinct() {
+        let item = Item {
+            stable_id: ItemId("id".to_owned()),
+            plugin_id: PluginId("plugin".to_owned()),
+            category: Category::PluginDefined("application".to_owned()),
+            label: "label".to_owned(),
+            description: String::new(),
+            target: "target".to_owned(),
+            search_terms: Vec::new(),
+            icon_reference: None,
+            argument_policy: ArgumentPolicy::Forbidden,
+            hit_policy: HitPolicy::Recorded,
+            score_hint: 0,
+            metadata: BTreeMap::new(),
+            actions: Vec::new(),
+        };
+        assert!(item_line(0, &item).contains("category=plugin-defined:application"));
     }
 }

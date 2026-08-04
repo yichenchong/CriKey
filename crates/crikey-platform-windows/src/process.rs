@@ -67,23 +67,21 @@ impl ProcessLauncher for ShellLauncher {
     /// means the program to receive, and [`quote_arguments`] is what makes the
     /// shell's own re-split give it back unchanged.
     fn launch(&self, target: &PlatformPath, args: &[String]) -> Result<()> {
-        let target = target.as_os_str();
-        if target.is_empty() {
-            return Err(CoreError::Invalid(
-                "the Windows backend cannot launch an empty target".to_owned(),
-            ));
-        }
-        carriable("launch target", target)?;
-        for argument in args {
-            carriable("launch argument", OsStr::new(argument.as_str()))?;
-        }
+        self.launch_with_directory(target, args, None)
+    }
 
-        let parameters = quote_arguments(args);
-        dispatch(
-            "launch",
-            target,
-            (!parameters.is_empty()).then(|| OsStr::new(parameters.as_str())),
-        )
+    /// Runs `target` with an optional shortcut working directory.
+    ///
+    /// `ShellExecuteExW` accepts the directory separately from the target, so
+    /// relative paths and configuration files resolve the same way as they do
+    /// when the user opens the original shortcut.
+    fn launch_in(
+        &self,
+        target: &PlatformPath,
+        args: &[String],
+        working_directory: Option<&PlatformPath>,
+    ) -> Result<()> {
+        self.launch_with_directory(target, args, working_directory)
     }
 
     /// Hands `uri` to the shell's registered handler for its scheme.
@@ -102,7 +100,45 @@ impl ProcessLauncher for ShellLauncher {
         let uri = OsStr::new(uri);
         carriable("URI", uri)?;
 
-        dispatch("open", uri, None)
+        dispatch("open", uri, None, None)
+    }
+}
+
+impl ShellLauncher {
+    fn launch_with_directory(
+        &self,
+        target: &PlatformPath,
+        args: &[String],
+        working_directory: Option<&PlatformPath>,
+    ) -> Result<()> {
+        let target = target.as_os_str();
+        if target.is_empty() {
+            return Err(CoreError::Invalid(
+                "the Windows backend cannot launch an empty target".to_owned(),
+            ));
+        }
+        carriable("launch target", target)?;
+        for argument in args {
+            carriable("launch argument", OsStr::new(argument.as_str()))?;
+        }
+
+        let directory = working_directory.map(PlatformPath::as_os_str);
+        if let Some(directory) = directory {
+            if directory.is_empty() {
+                return Err(CoreError::Invalid(
+                    "the Windows backend cannot use an empty working directory".to_owned(),
+                ));
+            }
+            carriable("working directory", directory)?;
+        }
+
+        let parameters = quote_arguments(args);
+        dispatch(
+            "launch",
+            target,
+            (!parameters.is_empty()).then(|| OsStr::new(parameters.as_str())),
+            directory,
+        )
     }
 }
 
@@ -112,12 +148,12 @@ impl ProcessLauncher for ShellLauncher {
 /// {verb} {target}" and "the Windows backend cannot {verb} {target}" -- so it
 /// is a bare verb: `"launch"`, `"open"`.
 #[cfg(target_os = "windows")]
-fn dispatch(verb: &str, file: &OsStr, parameters: Option<&OsStr>) -> Result<()> {
-    win32::execute(verb, file, parameters)
+fn dispatch(verb: &str, file: &OsStr, parameters: Option<&OsStr>, directory: Option<&OsStr>) -> Result<()> {
+    win32::execute(verb, file, parameters, directory)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn dispatch(verb: &str, file: &OsStr, _parameters: Option<&OsStr>) -> Result<()> {
+fn dispatch(verb: &str, file: &OsStr, _parameters: Option<&OsStr>, _directory: Option<&OsStr>) -> Result<()> {
     Err(crate::off_target(&format!("{verb} {}", file.to_string_lossy())))
 }
 

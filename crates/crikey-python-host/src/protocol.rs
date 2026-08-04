@@ -460,11 +460,13 @@ fn clamp_log_line(text: &str) -> String {
         return text.to_owned();
     }
 
-    let end = floor_char_boundary(text, MAX_LOG_LINE_BYTES);
-    format!(
-        "{}[crikey: log line truncated at {MAX_LOG_LINE_BYTES} bytes]",
-        &text[..end]
-    )
+    let marker = format!("[crikey: log line truncated at {MAX_LOG_LINE_BYTES} bytes]");
+    let prefix_limit = MAX_LOG_LINE_BYTES.saturating_sub(marker.len());
+    let end = floor_char_boundary(text, prefix_limit);
+    let mut rendered = String::with_capacity(end + marker.len());
+    rendered.push_str(&text[..end]);
+    rendered.push_str(&marker);
+    rendered
 }
 
 /// The largest index at or below `limit` that splits `text` between characters.
@@ -563,6 +565,20 @@ mod tests {
             decode_category("documents"),
             Category::PluginDefined("documents".to_owned())
         );
+    }
+
+    #[test]
+    fn truncated_log_lines_stay_within_the_declared_byte_bound() {
+        let mut frame = Map::new();
+        frame.insert(
+            "log".to_owned(),
+            json!([format!("x{}", "🙂".repeat(MAX_LOG_LINE_BYTES))]),
+        );
+
+        let log = decode_log(&frame).expect("a string log entry decodes");
+        assert_eq!(log.len(), 1);
+        assert!(log[0].len() <= MAX_LOG_LINE_BYTES);
+        assert!(log[0].ends_with("bytes]"));
     }
 
     #[test]

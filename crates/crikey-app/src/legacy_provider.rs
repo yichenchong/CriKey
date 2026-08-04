@@ -52,16 +52,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 
 use crikey_core::{Generation, Item, PluginId};
 use crikey_input_scheduler::{Millis, PluginPolicy};
 use crikey_legacy_compat::{
     discover_interpreter, shim_root, InstanceId, Interpreter, LegacyDeadlines, LegacyPackage, LegacyRequest,
-    LegacyResponse, LegacyRuntime, LegacyWorker, LegacyWorkerHandle, PackageLoader, TerminationReason,
-    WorkerError, WorkerOptions, WORKER_ENTRY_FILE,
+    LegacyResponse, LegacyRuntime, LegacyWorker, LegacyWorkerHandle, PackageLoader, TerminateHandle,
+    TerminationReason, WorkerError, WorkerOptions, WORKER_ENTRY_FILE,
 };
 use crikey_plugin_model::ConcurrencySection;
 use crikey_plugin_supervisor::{shared_budget_from_section, PluginBudgetHandle};
@@ -80,6 +80,104 @@ const STARTUP_BUDGET_MS: Millis = 30_000;
 /// being slow; the cooperative ladder in [`LegacyRuntime`] is what reacts to a
 /// long callback, not this transport budget.
 const CALL_BUDGET_MS: Millis = 120_000;
+
+/// Out-of-band cooperative termination state for one legacy callback.
+///
+/// A newer query can arrive while the provider thread is blocked in
+/// `LegacyWorker::call`. The watcher performs the control-frame write so the
+/// submitting thread only latches a flag and never waits on the child pipe.
+#[derive(Debug)]
+struct LegacyCallControl {
+    requested: AtomicBool,
+    finished: AtomicBool,
+    handle: Mutex<Option<TerminateHandle>>,
+    wake: Condvar,
+    wake_lock: Mutex<()>,
+}
+
+impl LegacyCallControl {
+    fn new() -> Self {
+        Self {
+            requested: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            handle: Mutex::new(None),
+            wake: Condvar::new(),
+            wake_lock: Mutex::new(()),
+        }
+    }
+
+    fn install(&self, handle: TerminateHandle) {
+        let signal_now = self.requested.load(Ordering::Acquire);
+        *self.handle.lock().unwrap_or_else(|error| error.into_inner()) = Some(handle.clone());
+        if signal_now {
+            handle.signal();
+        }
+        self.wake.notify_all();
+    }
+
+    fn signal(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
+
+    fn watch_signal(self: Arc<Self>) {
+        let mut wake = self.wake_lock.lock().unwrap_or_else(|error| error.into_inner());
+        while !self.requested.load(Ordering::Acquire) && !self.finished.load(Ordering::Acquire) {
+            wake = self.wake.wait(wake).unwrap_or_else(|error| error.into_inner());
+        }
+        if self.requested.load(Ordering::Acquire) && !self.finished.load(Ordering::Acquire) {
+            if let Some(handle) = self
+                .handle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .cloned()
+            {
+                handle.signal();
+            }
+        }
+    }
+
+    fn finish(&self) {
+        let _wake = self.wake_lock.lock().unwrap_or_else(|error| error.into_inner());
+        self.finished.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
+}
+
+#[derive(Debug, Default)]
+struct LegacyCancellation {
+    calls: Mutex<BTreeMap<PluginId, Arc<LegacyCallControl>>>,
+}
+
+impl LegacyCancellation {
+    fn register(&self, plugin: PluginId, control: Arc<LegacyCallControl>) {
+        self.calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(plugin, control);
+    }
+
+    fn unregister(&self, plugin: &PluginId) {
+        self.calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(plugin);
+    }
+
+    fn signal_all(&self) {
+        let controls = self
+            .calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for control in controls {
+            control.signal();
+        }
+    }
+}
 
 /// One legacy package that could not be made to serve suggestions, and why.
 ///
@@ -109,6 +207,7 @@ pub struct LegacyWorkerPool {
     replies: VecDeque<LegacyResponse>,
     failures: Vec<(PluginId, String)>,
     dead: BTreeSet<PluginId>,
+    cancellation: Arc<LegacyCancellation>,
 }
 
 impl LegacyWorkerPool {
@@ -141,8 +240,22 @@ impl LegacyWorkerHandle for LegacyWorkerPool {
             self.record_failure(request.plugin.clone(), error.to_string());
             return Err(error);
         };
+        let control = Arc::new(LegacyCallControl::new());
+        self.cancellation
+            .register(request.plugin.clone(), Arc::clone(&control));
+        let control_for_thread = Arc::clone(&control);
+        let handle = worker.terminate_handle();
+        control.install(handle);
+        let watcher = thread::Builder::new()
+            .name(format!("crikey-legacy-terminate-{}", request.plugin.0))
+            .spawn(move || control_for_thread.watch_signal());
         // The callback genuinely runs in the child process here (spec 4.2).
         let result = worker.call(request.clone());
+        control.finish();
+        if let Ok(watcher) = watcher {
+            let _ = watcher.join();
+        }
+        self.cancellation.unregister(&request.plugin);
         if let Err(error) = &result {
             // A crashed or unresponsive worker is contained: the runtime
             // frees the instance on this `Err`, and the failure is recorded
@@ -216,6 +329,7 @@ pub struct LegacyProvider {
     plugins: Vec<PluginId>,
     budgets: BTreeMap<PluginId, PluginBudgetHandle>,
     unavailable: Vec<LegacyUnavailable>,
+    cancellation: Arc<LegacyCancellation>,
 }
 
 impl LegacyProvider {
@@ -236,11 +350,19 @@ impl LegacyProvider {
         cache_root: PathBuf,
         deadlines: LegacyDeadlines,
     ) -> Self {
+        let cancellation = Arc::new(LegacyCancellation::default());
         let mut provider = Self {
-            runtime: LegacyRuntime::new(LegacyWorkerPool::default(), deadlines),
+            runtime: LegacyRuntime::new(
+                LegacyWorkerPool {
+                    cancellation: Arc::clone(&cancellation),
+                    ..LegacyWorkerPool::default()
+                },
+                deadlines,
+            ),
             plugins: Vec::new(),
             budgets: BTreeMap::new(),
             unavailable: Vec::new(),
+            cancellation,
         };
 
         // A host that cannot run CPython cannot run any legacy plugin, and
@@ -431,6 +553,7 @@ impl LegacyProvider {
 
     /// Cooperative teardown of every legacy worker (spec 9.6, 24.3).
     pub fn shutdown(&mut self, now: Millis) {
+        self.cancellation.signal_all();
         let _ = self.runtime.shutdown(now);
     }
 
@@ -523,6 +646,7 @@ pub struct LegacyDriver {
     /// Search generation the UI last submitted. The supervisor re-reads it
     /// before publishing and drops any answer that is no longer current.
     current: Arc<AtomicU64>,
+    cancellation: Arc<LegacyCancellation>,
     has_plugins: bool,
     worker: Option<JoinHandle<()>>,
 }
@@ -550,6 +674,7 @@ impl LegacyDriver {
         ));
         let outcome = Arc::new(Mutex::new(None));
         let current = Arc::new(AtomicU64::new(0));
+        let cancellation = Arc::clone(&provider.cancellation);
 
         let thread_mailbox = Arc::clone(&mailbox);
         let thread_outcome = Arc::clone(&outcome);
@@ -604,13 +729,20 @@ impl LegacyDriver {
                         actions_open: false,
                     };
 
-                    // A late answer must never appear under a newer generation:
-                    // once the UI has moved on, drop this one unpublished.
-                    if thread_current.load(Ordering::Acquire) != job.generation.get() {
+                    // Keep the staleness check, queued-job check, and
+                    // publication atomic with respect to `submit`. Without
+                    // the mailbox lock, a newer submission could arrive after
+                    // the load below but before this frame is published.
+                    let slot = lock.lock().unwrap_or_else(|error| error.into_inner());
+                    if slot.stop
+                        || slot.job.is_some()
+                        || thread_current.load(Ordering::Acquire) != job.generation.get()
+                    {
                         continue;
                     }
                     *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) = Some(merged.clone());
                     publish(&merged);
+                    drop(slot);
                 }
             });
 
@@ -619,6 +751,7 @@ impl LegacyDriver {
                 mailbox,
                 outcome,
                 current,
+                cancellation,
                 has_plugins,
                 worker: Some(worker),
             },
@@ -626,6 +759,7 @@ impl LegacyDriver {
                 mailbox,
                 outcome,
                 current,
+                cancellation,
                 has_plugins: false,
                 worker: None,
             },
@@ -646,9 +780,29 @@ impl LegacyDriver {
         builtin_pending: bool,
         selected: usize,
     ) {
-        // Record the live generation first, so an answer for a query this call
-        // supersedes is dropped rather than shown even if it finishes late.
-        self.current.store(generation.get(), Ordering::Release);
+        // Keep intake monotonic even when a caller hands us a decoded
+        // generation from an older request. Rewinding `current` would let an
+        // obsolete job pass the publication gate.
+        let generation_value = generation.get();
+        let mut observed = self.current.load(Ordering::Acquire);
+        loop {
+            if generation_value < observed {
+                return;
+            }
+            match self.current.compare_exchange_weak(
+                observed,
+                generation_value,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(next) => observed = next,
+            }
+        }
+        // Signal obsolete callbacks before queueing the replacement. The
+        // legacy contract is cooperative termination, not a hard cancellation.
+        self.cancellation.signal_all();
+
         let (lock, cvar) = &*self.mailbox;
         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
         if slot.stop {
@@ -684,6 +838,9 @@ impl LegacyDriver {
 
 impl Drop for LegacyDriver {
     fn drop(&mut self) {
+        // Raise cooperative termination before joining the supervisor so an
+        // in-flight callback can return instead of delaying teardown.
+        self.cancellation.signal_all();
         // Signal shutdown and join, so the supervisor thread and every child it
         // owns are torn down with the launcher — no thread leak.
         {

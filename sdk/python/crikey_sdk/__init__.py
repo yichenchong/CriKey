@@ -8,6 +8,7 @@ dependencies declared in the plugin manifest's ``[python]`` section.
 from .plugin import (
     Action,
     Item,
+    PLUGIN_DEFINED_PREFIX,
     Plugin,
     Query,
     SuggestContext,
@@ -18,6 +19,7 @@ from .plugin import (
 __all__ = [
     "Action",
     "Item",
+    "PLUGIN_DEFINED_PREFIX",
     "Plugin",
     "Query",
     "SuggestContext",

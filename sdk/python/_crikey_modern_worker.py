@@ -22,6 +22,7 @@ alive to serve the next request.
 """
 
 import asyncio
+import contextvars
 import importlib
 import inspect
 import json
@@ -62,6 +63,17 @@ _pin_text_stream(sys.stdin, "stdin", None)
 _pin_text_stream(_PROTOCOL, "stdout", "\n")
 _pin_text_stream(_REAL_STDERR, "stderr", "\n")
 
+def _stderr(message):
+    """Writes diagnostic text without letting non-UTF-8 data kill the worker."""
+    if not isinstance(message, str):
+        message = str(message)
+    safe = message.encode("utf-8", "backslashreplace").decode("utf-8")
+    try:
+        _REAL_STDERR.write(safe)
+        _REAL_STDERR.flush()
+    except (OSError, ValueError):
+        pass
+
 
 # --------------------------------------------------------------------------
 # Wire protocol constants (agreed with `crikey-python-host` worker codec).
@@ -77,6 +89,7 @@ _PROTOCOL_VERSION = 1
 _MAX_FRAME_BYTES = 8 * 1024 * 1024
 _MAX_LOG_LINES = 512
 _MAX_LOG_LINE_BYTES = 4096
+_MAX_MIRROR_BYTES = _MAX_LOG_LINES * _MAX_LOG_LINE_BYTES
 
 #: Appended to a log line clipped at the per-line cap so a truncated line reads
 #: as truncated instead of as the whole value (mirrors the legacy clamp marker).
@@ -85,6 +98,7 @@ _LOG_TRUNCATION_MARKER = " \u2026[log line truncated]"
 #: Items buffered before an intermediate ``result_batch`` / ``catalog_batch`` is
 #: flushed. Small on purpose: streaming beats a single fat frame.
 _FLUSH_THRESHOLD = 32
+_CAPTURE_ACTIVE = contextvars.ContextVar("crikey_capture_active", default=True)
 _OVERSIZED = object()
 
 ENV_PLUGIN_ID = "CRIKEY_MODERN_PLUGIN_ID"
@@ -117,14 +131,13 @@ _PENDING_QUEUE_CAPACITY = 64
 
 
 class _LogCapture:
-    """Text stream recording what a plugin writes and mirroring it onward.
+    """Text stream recording what a foreground plugin writes and mirroring it.
 
     Installed as both ``sys.stdout`` and ``sys.stderr`` for the worker's life,
-    so ``print``, ``sys.stdout.write`` and ``context.log`` all land here. The
-    captured lines are carried INSIDE the response frame, making attribution to
-    the answering request exact by construction (the host reads the reply off
-    stdout and drains stderr on a separate thread, so a stderr line cannot be
-    reliably attributed to a call).
+    so foreground ``print``, ``sys.stdout.write`` and ``context.log`` all land
+    in the active response frame. Host-managed background tasks are not tied to
+    a later request; their output is mirrored to stderr but excluded from the
+    foreground frame, avoiding cross-request log attribution.
     """
 
     def __init__(self, mirror):
@@ -135,6 +148,7 @@ class _LogCapture:
         self._partial_bytes = 0
         self._truncated = False
         self._dropped = 0
+        self._mirror_bytes = 0
 
     # -- stream protocol ---------------------------------------------------
     def write(self, text):
@@ -144,12 +158,9 @@ class _LogCapture:
     def _write_unlocked(self, text):
         if not isinstance(text, str):
             text = str(text)
-        try:
-            self._mirror.write(text)
-        except (OSError, ValueError):
-            # A closed or broken stderr must not turn plugin chatter into a
-            # plugin failure: the capture is the record that matters.
-            pass
+        self._mirror_unlocked(text)
+        if not _CAPTURE_ACTIVE.get():
+            return len(text)
         start = 0
         while True:
             newline = text.find("\n", start)
@@ -160,6 +171,22 @@ class _LogCapture:
             self._commit()
             start = newline + 1
         return len(text)
+    def _mirror_unlocked(self, text):
+        """Mirrors a bounded prefix without allowing stderr to grow forever."""
+        room = _MAX_MIRROR_BYTES - self._mirror_bytes
+        if room <= 0 or not text:
+            return
+        candidate = text[: min(len(text), _MAX_LOG_LINE_BYTES)]
+        encoded = candidate.encode("utf-8", "backslashreplace")
+        if len(encoded) > room:
+            encoded = encoded[:room].decode("utf-8", "ignore").encode("utf-8")
+        if not encoded:
+            return
+        try:
+            self._mirror.write(encoded.decode("utf-8"))
+        except (OSError, ValueError):
+            pass
+        self._mirror_bytes += len(encoded)
     def flush(self):
         with self._lock:
             try:
@@ -201,24 +228,21 @@ class _LogCapture:
         if room <= 0:
             self._truncated = True
             return
-        # The cap is a BYTE bound, so clip the utf-8 encoding at a char
-        # boundary within the remaining budget rather than by character count.
-        encoded = fragment.encode("utf-8")
+        # Bound the temporary encoding allocation by the remaining character
+        # room. A plugin can hand us a multi-gigabyte string, but clipping must
+        # still inspect at most one bounded prefix.
+        candidate = fragment if len(fragment) <= room else fragment[:room]
+        encoded = candidate.encode("utf-8", "backslashreplace")
         if len(encoded) <= room:
-            self._partial.append(fragment)
+            self._partial.append(candidate)
             self._partial_bytes += len(encoded)
+            if len(candidate) < len(fragment):
+                self._truncated = True
             return
         self._truncated = True
-        truncated = encoded[:room]
-        while truncated:
-            try:
-                clipped = truncated.decode("utf-8")
-            except UnicodeDecodeError:
-                truncated = truncated[:-1]
-                continue
-            self._partial.append(clipped)
-            self._partial_bytes += len(truncated)
-            return
+        clipped = encoded[:room].decode("utf-8", "ignore")
+        self._partial.append(clipped)
+        self._partial_bytes += len(clipped.encode("utf-8"))
 
     def _commit(self):
         line = "".join(self._partial)
@@ -244,6 +268,7 @@ class _LogCapture:
             self._partial_bytes = 0
             self._truncated = False
             self._dropped = 0
+            self._mirror_bytes = 0
 
     def take(self):
         """The lines written since :meth:`reset`, and starts a new record.
@@ -263,6 +288,7 @@ class _LogCapture:
                 )
             self._lines = []
             self._dropped = 0
+            self._mirror_bytes = 0
             return lines
 
 
@@ -270,6 +296,8 @@ class _LogCapture:
 _CAPTURE = _LogCapture(_REAL_STDERR)
 sys.stdout = _CAPTURE
 sys.stderr = _CAPTURE
+sys.__stdout__ = _CAPTURE
+sys.__stderr__ = _CAPTURE
 
 
 # --------------------------------------------------------------------------
@@ -393,12 +421,13 @@ _EMIT_LOCK = threading.Lock()
 def _encode(frame):
     """One frame as its wire line.
 
-    ``ensure_ascii=False`` keeps non-ASCII labels readable; JSON escaping makes
-    a label containing a newline safe on a line-delimited channel. ``default=
-    repr`` guards a plugin that put an unserialisable object in metadata from
-    costing the request its only response.
+    ``ensure_ascii=True`` keeps every frame representable on the strict UTF-8
+    protocol stream, including plugin strings containing lone surrogates.
+    JSON escaping makes a label containing a newline safe on a line-delimited
+    channel. ``default=repr`` guards a plugin that put an unserialisable object
+    in metadata from costing the request its only response.
     """
-    return json.dumps(frame, ensure_ascii=False, separators=(",", ":"), default=repr) + "\n"
+    return json.dumps(frame, ensure_ascii=True, separators=(",", ":"), default=repr) + "\n"
 
 
 def _emit(frame):
@@ -413,7 +442,7 @@ def _emit(frame):
     """
     try:
         line = _encode(frame)
-    except (TypeError, ValueError) as error:
+    except Exception as error:
         trimmed = dict(frame)
         trimmed["items"] = []
         trimmed["log"] = list(trimmed.get("log") or []) + [
@@ -574,10 +603,10 @@ class _Worker:
                 task.future.cancel()
 
     def _register_background(self, coro):
-        self._next_background_id += 1
-        task_id = self._next_background_id
-        task = _BackgroundTask(task_id, coro)
         with self._background_lock:
+            self._next_background_id += 1
+            task_id = self._next_background_id
+            task = _BackgroundTask(task_id, coro)
             self._background_tasks[task_id] = task
         # Registration is emitted before scheduling the coroutine. The wrapper
         # cannot pass its admission gate until the Rust host answers.
@@ -632,6 +661,7 @@ class _Worker:
             task.started = True
         status = "ok"
         error = None
+        capture_token = _CAPTURE_ACTIVE.set(False)
         try:
             task.admission_event = asyncio.Event()
             with self._background_lock:
@@ -647,7 +677,7 @@ class _Worker:
                 await task.coro
         except asyncio.CancelledError:
             status = "cancelled"
-        except BaseException as caught:  # noqa: BLE001 -- plugin task boundary
+        except Exception as caught:  # noqa: BLE001 -- plugin task boundary
             status = "failed"
             error = {"message": str(caught), "traceback": traceback.format_exc()}
         finally:
@@ -671,6 +701,7 @@ class _Worker:
                     pending.cancel()
                 await asyncio.gather(*leftovers, return_exceptions=True)
             self._complete_background(task, status, error)
+            _CAPTURE_ACTIVE.reset(capture_token)
 
 
     def stop_background(self):
@@ -688,13 +719,12 @@ class _Worker:
             callback = getattr(self._plugin, "stop", None)
             if callable(callback):
                 self.run_lifecycle(callback)
-        except BaseException as error:  # noqa: BLE001 -- shutdown is best effort
-            _REAL_STDERR.write(
+        except Exception as error:  # noqa: BLE001 -- shutdown is best effort
+            _stderr(
                 "[err][crikey] modern plugin stop failed: {}\n{}".format(
                     error, traceback.format_exc()
                 )
             )
-            _REAL_STDERR.flush()
         finally:
             self.stop_background()
             self._loop.close()
@@ -714,8 +744,7 @@ class _Worker:
         else:
             # Not a request this protocol version defines. Do not answer (a
             # stray reply would desync); note it for a watching developer.
-            _REAL_STDERR.write("[err][crikey] ignored unknown frame kind {!r}\n".format(kind))
-            _REAL_STDERR.flush()
+            _stderr("[err][crikey] ignored unknown frame kind {!r}\n".format(kind))
 
     def _handshake(self, frame):
         _emit(
@@ -788,14 +817,20 @@ class _Worker:
         _CAPTURE.reset()
         generation = 0
         buffer = []
+        active = threading.Event()
+        active.set()
+        sink_lock = threading.Lock()
 
         def sink(item):
             if self._cancel.is_set():
                 return
-            buffer.append(_item_to_wire(item))
-            if len(buffer) >= _FLUSH_THRESHOLD:
-                self._emit_batch(request_id, generation, "partial", buffer, [])
-                buffer.clear()
+            with sink_lock:
+                if not active.is_set() or self._cancel.is_set():
+                    return
+                buffer.append(_item_to_wire(item))
+                if len(buffer) >= _FLUSH_THRESHOLD:
+                    self._emit_batch(request_id, generation, "partial", buffer, [])
+                    buffer.clear()
 
         try:
             generation = _generation_from_wire(frame)
@@ -813,23 +848,29 @@ class _Worker:
             )
             result = self._plugin.suggest(query, context)
             self._run_callback(context, result)
-        except BaseException as error:  # noqa: BLE001 -- a plugin bug is not ours
+        except Exception as error:  # noqa: BLE001 -- a plugin bug is not ours
             # Flush anything already streamed, then a terminal failed frame.
-            if buffer:
-                self._emit_batch(request_id, generation, "partial", buffer, [])
-                buffer.clear()
-            self._emit_batch(
-                request_id,
-                generation,
-                "failed",
-                [],
-                _CAPTURE.take(),
-                error={"message": str(error), "traceback": traceback.format_exc()},
-            )
+            with sink_lock:
+                active.clear()
+                if buffer:
+                    self._emit_batch(request_id, generation, "partial", buffer, [])
+                    buffer.clear()
+                self._emit_batch(
+                    request_id,
+                    generation,
+                    "failed",
+                    [],
+                    _CAPTURE.take(),
+                    error={"message": str(error), "traceback": traceback.format_exc()},
+                )
             return
 
-        state = "cancelled" if self._cancel.is_set() else "final"
-        self._emit_batch(request_id, generation, state, buffer, _CAPTURE.take())
+        with sink_lock:
+            active.clear()
+            state = "cancelled" if self._cancel.is_set() else "final"
+            items = list(buffer)
+            buffer.clear()
+            self._emit_batch(request_id, generation, state, items, _CAPTURE.take())
 
     def _emit_batch(self, request_id, generation, state, items, log, error=None):
         _emit(
@@ -847,6 +888,7 @@ class _Worker:
 
     def _build_catalog(self, frame):
         request_id = frame.get("id")
+        _CAPTURE.reset()
         buffer = []
         context = WorkerContext(
             self._cancel.is_set,
@@ -870,7 +912,7 @@ class _Worker:
                     if len(buffer) >= _FLUSH_THRESHOLD:
                         self._emit_catalog(request_id, buffer, False, [])
                         buffer.clear()
-        except BaseException as error:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
             # A raise during catalog load is NOT an empty catalog: surface a
             # terminal frame carrying the fault so the host maps it to
             # HostError::PluginFailed rather than recording a silent empty
@@ -882,10 +924,11 @@ class _Worker:
                 _CAPTURE.take(),
                 error={"message": str(error), "traceback": traceback.format_exc()},
             )
-            _REAL_STDERR.write(
-                "[err][crikey] build_catalog raised: {}\n{}".format(error, traceback.format_exc())
+            _stderr(
+                "[err][crikey] build_catalog raised: {}\n{}".format(
+                    error, traceback.format_exc()
+                )
             )
-            _REAL_STDERR.flush()
             return
 
         self._emit_catalog(request_id, buffer, True, _CAPTURE.take())
@@ -918,7 +961,7 @@ class _Worker:
             )
             result = self._plugin.execute(item, action_id, argument)
             self._run_callback(context, result)
-        except BaseException as error:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
             _emit(
                 {
                     "id": request_id,
@@ -985,12 +1028,11 @@ def _read_stdin(stream, pending, worker):
             pending.put(_EOF)
             return
         if payload is _OVERSIZED:
-            _REAL_STDERR.write(
+            _stderr(
                 "[err][crikey] incoming frame exceeds {} bytes; worker exiting\n".format(
                     _MAX_FRAME_BYTES
                 )
             )
-            _REAL_STDERR.flush()
             pending.put(_EOF)
             return
         if not payload.strip():
@@ -999,16 +1041,18 @@ def _read_stdin(stream, pending, worker):
         try:
             frame = json.loads(payload.decode("utf-8", "strict"))
         except (UnicodeDecodeError, ValueError):
-            _REAL_STDERR.write("[err][crikey] undecodable request line ignored\n")
-            _REAL_STDERR.flush()
+            _stderr("[err][crikey] undecodable request line ignored\n")
             continue
         if not isinstance(frame, dict):
-            _REAL_STDERR.write("[err][crikey] request line was not an object; ignored\n")
-            _REAL_STDERR.flush()
+            _stderr("[err][crikey] request line was not an object; ignored\n")
             continue
 
         if frame.get("kind") == _KIND_SET_CANCEL:
-            worker.set_cancel(bool(frame.get("cancelled", True)))
+            cancelled = frame.get("cancelled")
+            if isinstance(cancelled, bool):
+                worker.set_cancel(cancelled)
+            else:
+                _stderr("[err][crikey] set_cancel requires a boolean; ignored\n")
             continue
         if frame.get("kind") in (
             KIND_BACKGROUND_ADMIT,
@@ -1019,7 +1063,6 @@ def _read_stdin(stream, pending, worker):
             continue
 
         pending.put(frame)
-
 
 def main():
     """Runs the worker until shutdown, end of stdin, or process death."""
@@ -1034,11 +1077,10 @@ def main():
         except ValueError:
             requested_version = None
         if requested_version != _PROTOCOL_VERSION:
-            _REAL_STDERR.write(
+            _stderr(
                 "[err][crikey] protocol version mismatch: host requested {!r}, "
                 "worker speaks {}\n".format(requested, _PROTOCOL_VERSION)
             )
-            _REAL_STDERR.flush()
             return 1
 
     entrypoint = os.environ.get(ENV_ENTRYPOINT, "")
@@ -1055,12 +1097,11 @@ def main():
         if worker is not None:
             worker.stop_background()
             worker._loop.close()
-        _REAL_STDERR.write(
+        _stderr(
             "[err][crikey] failed to load modern plugin from entrypoint {!r}: {}\n{}".format(
                 entrypoint, error, traceback.format_exc()
             )
         )
-        _REAL_STDERR.flush()
         return 1
 
     pending = queue.Queue(maxsize=_PENDING_QUEUE_CAPACITY)

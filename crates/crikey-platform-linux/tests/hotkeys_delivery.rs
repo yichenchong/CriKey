@@ -504,6 +504,35 @@ fn a_synthesised_press_of_a_registered_chord_reaches_the_handler() {
     activations.expect_no_more(CHORD_A);
 }
 
+#[test]
+fn a_panicking_handler_does_not_kill_hotkey_delivery() {
+    let server = XvfbServer::start();
+    let keyboard = server.keyboard();
+    let mut service = server.service();
+    let activations = Activations::new();
+    let (called, received) = mpsc::channel();
+
+    service.set_activation_handler(Some(Box::new(move |_binding| {
+        let _ = called.send(());
+        panic!("fixture handler panic");
+    })));
+    service
+        .register(&binding(CHORD_A))
+        .unwrap_or_else(|error| panic!("registering {CHORD_A} failed: {error}"));
+
+    keyboard.chord(CHORD_A_KEYS);
+    received
+        .recv_timeout(DELIVERY_LIMIT)
+        .expect("the panicking handler ran");
+
+    activations.install(&mut service);
+    keyboard.chord(CHORD_A_KEYS);
+    assert_eq!(
+        activations.next("delivery after handler panic"),
+        canonical(CHORD_A)
+    );
+}
+
 /// The handler is told *which* chord fired, not merely that one did.
 ///
 /// With two registrations live, a reader thread that hands the handler whatever

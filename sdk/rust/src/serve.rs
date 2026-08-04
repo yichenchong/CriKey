@@ -37,9 +37,11 @@ use crate::{
 /// is busy.  A full queue deliberately blocks the reader, which pauses IPC
 /// reads rather than allowing unbounded memory growth (spec 12.4).
 const READER_QUEUE_CAPACITY: usize = 64;
-/// Maximum time spent waiting for a handshake acknowledgement. Individual
-/// read timeouts are polling events, not a protocol failure.
+/// Maximum time spent waiting for a handshake acknowledgement.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Individual handshake reads use a short poll so the overall deadline is
+/// enforceable on transports that support read timeouts.
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_LOG_RECORDS_PER_REQUEST: u32 = 256;
 const MAX_LOG_BYTES_PER_REQUEST: usize = 64 * 1024;
 const MAX_LOG_MESSAGE_BYTES: usize = 8 * 1024;
@@ -270,6 +272,12 @@ fn handshake(
         sdk_version: config.sdk_version.clone(),
         unknown: Default::default(),
     };
+    let timeout_supported = transport.supports_read_timeout();
+    if timeout_supported {
+        transport
+            .set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT))
+            .map_err(SdkError::from)?;
+    }
     send_direct(
         transport,
         Envelope {
@@ -294,6 +302,12 @@ fn handshake(
             Err(error) => return Err(SdkError::from(error)),
         }
     };
+    if response.request_id != 0 || response.generation != 0 {
+        return Err(SdkError::Protocol(format!(
+            "handshake acknowledgement used request {} generation {}, expected zero",
+            response.request_id, response.generation
+        )));
+    }
     let connection_id = response.connection_id;
     let ack = match response.payload {
         Some(Payload::HandshakeAck(ack)) => ack,
@@ -327,6 +341,9 @@ fn handshake(
             "host selected unsupported protocol version {}",
             ack.protocol_version
         )));
+    }
+    if timeout_supported {
+        transport.set_read_timeout(None).map_err(SdkError::from)?;
     }
     Ok((ack, connection_id))
 }
@@ -417,11 +434,31 @@ fn spawn_reader(
         };
         match &mut reader {
             ReaderTransport::Independent(transport) => {
-                let _ = transport.set_read_timeout(Some(Duration::from_millis(10)));
+                if transport.supports_read_timeout() {
+                    if let Err(error) = transport.set_read_timeout(Some(Duration::from_millis(10))) {
+                        cancellation.cancel((0, 0));
+                        let _ = sender.send(ReadEvent::Failed(Box::new(SdkError::from(error))));
+                        return;
+                    }
+                }
             }
             ReaderTransport::Shared(transport) => {
-                if let Ok(mut locked) = transport.lock() {
-                    let _ = locked.set_read_timeout(Some(Duration::from_millis(10)));
+                let mut locked = match transport.lock() {
+                    Ok(locked) => locked,
+                    Err(_) => {
+                        cancellation.cancel((0, 0));
+                        let _ = sender.send(ReadEvent::Failed(Box::new(SdkError::Transport(
+                            "transport lock poisoned".to_owned(),
+                        ))));
+                        return;
+                    }
+                };
+                if locked.supports_read_timeout() {
+                    if let Err(error) = locked.set_read_timeout(Some(Duration::from_millis(10))) {
+                        cancellation.cancel((0, 0));
+                        let _ = sender.send(ReadEvent::Failed(Box::new(SdkError::from(error))));
+                        return;
+                    }
                 }
             }
         }
@@ -468,10 +505,19 @@ fn spawn_reader(
 
 fn stop_reader(stop: &Arc<AtomicBool>, reader: JoinHandle<()>) {
     stop.store(true, Ordering::Release);
-    // The reader may be blocked in inherited stdio, which has no portable
-    // read-timeout operation.  It is deliberately detached; process teardown
-    // reaps it, while a normal EOF/Closed frame lets it finish by itself.
-    drop(reader);
+    // Normal transports poll their read timeout and finish promptly.  Join
+    // those readers so repeated in-process harness runs do not accumulate
+    // threads.  Inherited stdio has no portable read-timeout operation; keep
+    // that exceptional reader detached rather than hanging shutdown forever.
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while !reader.is_finished() && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    if reader.is_finished() {
+        let _ = reader.join();
+    } else {
+        drop(reader);
+    }
 }
 
 #[derive(Debug)]
@@ -779,7 +825,10 @@ fn serve_requests(
     loop {
         let envelope = match input.next() {
             Ok(envelope) => envelope,
-            Err(_error) if input.closed => return Ok(()),
+            Err(_error) if input.closed => {
+                stop_plugin(plugin, context, metrics, false)?;
+                return Ok(());
+            }
             Err(error) => return Err(error),
         };
         let request_id = envelope.request_id;
@@ -801,22 +850,7 @@ fn serve_requests(
         let request_context = context.for_request(request_id, generation);
         match payload {
             Payload::Shutdown(_) => {
-                let callback = {
-                    let _in_flight = metrics.enter();
-                    invoke_callback(|| plugin.stop(&request_context))
-                };
-                match callback {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        return Err(SdkError::Protocol(format!("plugin stop failed: {error}")));
-                    }
-                    Err(detail) => {
-                        return Err(SdkError::Protocol(format!("plugin stop failed: {detail}")));
-                    }
-                }
-                if let Some(error) = request_context.take_log_error() {
-                    return Err(error);
-                }
+                stop_plugin(plugin, &request_context, metrics, true)?;
                 return Ok(());
             }
             Payload::Flow(flow) => credits.grant(&flow),
@@ -988,22 +1022,7 @@ fn serve_requests(
             }
         }
         if input.shutdown {
-            let callback = {
-                let _in_flight = metrics.enter();
-                invoke_callback(|| plugin.stop(&request_context))
-            };
-            match callback {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    return Err(SdkError::Protocol(format!("plugin stop failed: {error}")));
-                }
-                Err(detail) => {
-                    return Err(SdkError::Protocol(format!("plugin stop failed: {detail}")));
-                }
-            }
-            if let Some(error) = request_context.take_log_error() {
-                return Err(error);
-            }
+            stop_plugin(plugin, &request_context, metrics, true)?;
             return Ok(());
         }
     }
@@ -1253,6 +1272,34 @@ fn send_envelope(transport: &Arc<Mutex<Box<dyn Transport>>>, envelope: Envelope)
     locked.send(&envelope).map_err(SdkError::from)
 }
 
+fn stop_plugin(
+    plugin: &mut dyn Plugin,
+    context: &RuntimeContext,
+    metrics: &RuntimeMetrics,
+    propagate_log_error: bool,
+) -> Result<(), SdkError> {
+    let callback = {
+        let _in_flight = metrics.enter();
+        invoke_callback(|| plugin.stop(context))
+    };
+    match callback {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return Err(SdkError::Protocol(format!("plugin stop failed: {error}")));
+        }
+        Err(detail) => {
+            return Err(SdkError::Protocol(format!("plugin stop failed: {detail}")));
+        }
+    }
+    if propagate_log_error {
+        if let Some(error) = context.take_log_error() {
+            return Err(error);
+        }
+    } else {
+        let _ = context.take_log_error();
+    }
+    Ok(())
+}
 struct SuggestionSinkImpl<'a> {
     connection_id: u64,
     request_id: u64,

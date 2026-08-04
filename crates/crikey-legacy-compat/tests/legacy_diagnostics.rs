@@ -344,6 +344,29 @@ fn every_documented_category_names_its_plugin_a_stable_code_and_readable_prose()
     }
 }
 
+#[test]
+fn partial_api_diagnostics_do_not_claim_the_api_is_absent() {
+    let warning = CompatibilityWarning {
+        plugin: plugin("legacy.example.partial"),
+        issue: CompatibilityIssue::MissingApi {
+            module: "keypirinha_util".to_owned(),
+            symbol: "set_clipboard".to_owned(),
+            support: ApiSupport::Partial,
+        },
+    };
+    let message = warning.message();
+    assert!(
+        message.contains("partially available") && message.contains("partial"),
+        "a partial API must be described as partial rather than absent: {message}"
+    );
+    let suggestion = warning.suggestion().expect("partial support is actionable");
+    assert!(
+        suggestion.contains("partially supported"),
+        "a partial API suggestion must address the documented gap, not pretend the symbol is absent: \
+         {suggestion}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Spec 26.2: unsupported imports
 // ---------------------------------------------------------------------------

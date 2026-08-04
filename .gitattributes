@@ -2,9 +2,9 @@
 # CRLF diffs, and rustfmt/clippy behave identically on all three CI runners.
 * text=auto eol=lf
 
-# Keypirinha package archives and plugin binaries are opaque.
+# Keypirinha and CriKey native package archives are opaque.
 *.keypirinha-package binary
-*.lnk binary
+*.crikey-package binary
 *.png binary
 *.ico binary
 *.icns binary

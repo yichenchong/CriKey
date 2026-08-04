@@ -65,6 +65,46 @@ fn a_program_launched_without_arguments_receives_none() {
 }
 
 #[test]
+fn a_launch_uses_an_existing_working_directory() {
+    let recorder = Recorder::new();
+    let working_directory = recorder.sibling("working-directory");
+    fs::create_dir(&working_directory).expect("working directory fixture is creatable");
+    let fifo = recorder.sibling("working-directory-result");
+    make_fifo(&fifo);
+    let script = recorder.sibling("record-working-directory");
+    fs::write(&script, format!("#!/bin/sh\npwd > '{}'\n", fifo.display()))
+        .expect("working-directory probe is writable");
+    set_mode(&script, 0o755);
+
+    let reading =
+        thread::spawn(move || fs::read_to_string(fifo).expect("working-directory fifo is readable"));
+    CommandLauncher::new()
+        .launch_in(
+            &PlatformPath::from(script),
+            &[],
+            Some(&PlatformPath::from(working_directory.clone())),
+        )
+        .expect("launching the working-directory probe succeeds");
+    let observed = reading.join().expect("working-directory reader joins");
+
+    assert_eq!(observed.trim_end(), working_directory.display().to_string());
+}
+
+#[test]
+fn a_missing_working_directory_is_ignored() {
+    let recorder = Recorder::new();
+    let missing = recorder.sibling("missing-working-directory");
+    let observed =
+        CommandLauncher::new().launch_in(&recorder.target(), &[], Some(&PlatformPath::from(missing)));
+
+    assert!(
+        observed.is_ok(),
+        "a stale desktop Path= must not block launch: {observed:?}"
+    );
+    assert_eq!(recorder.observed(), Vec::<String>::new());
+}
+
+#[test]
 fn launching_returns_before_the_program_it_started_has_finished() {
     let recorder = Recorder::new();
     let target = recorder.target();

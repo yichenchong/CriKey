@@ -250,7 +250,10 @@ pub(crate) fn read_field<'a>(input: &'a [u8], cursor: &mut usize) -> Result<Fiel
     let field_start = *cursor;
     let key = decode_varint(input, cursor)?;
     let number = key >> 3;
-    if number == 0 || number > u64::from(u32::MAX) {
+    // Protobuf reserves three bits of every key for the wire type, leaving a
+    // 29-bit field-number space.  Accepting a larger number would make this
+    // decoder accept bytes no conforming proto3 peer can emit.
+    if number == 0 || number > 0x1fff_ffff {
         return Err(ProtocolError::Malformed(
             "invalid protobuf field number".to_owned(),
         ));

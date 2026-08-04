@@ -1326,7 +1326,7 @@ fn the_trace_and_the_stress_verdict_describe_the_same_run() {
 
 #[test]
 fn an_unusable_argument_list_is_refused_with_usage_status() {
-    let rejected: [&[&str]; 14] = [
+    let rejected: [&[&str]; 18] = [
         &["dev", "trace-query"],
         &["dev", "trace-query", "--fixture"],
         &["dev", "trace-query", "--fixture", "no-such-fixture"],
@@ -1349,6 +1349,22 @@ fn an_unusable_argument_list_is_refused_with_usage_status() {
             "-5",
         ],
         &["dev", "trace-query", "--fixture", "rapid-typing", "--sideways"],
+        &[
+            "dev",
+            "trace-query",
+            "--fixture",
+            "rapid-typing",
+            "--query",
+            "--unknown",
+        ],
+        &[
+            "dev",
+            "trace-query",
+            "--fixture",
+            "rapid-typing",
+            "--fixture=modern-debounce",
+        ],
+        &["dev", "trace-query", "--help", "--query"],
         &["dev", "simulate-typing"],
         &["dev", "simulate-typing", "--fixture", "no-such-fixture"],
         &["dev", "simulate-typing", "--fixture", "rapid-typing", "--repeat"],
@@ -1374,6 +1390,15 @@ fn an_unusable_argument_list_is_refused_with_usage_status() {
             "--fixture",
             "rapid-typing",
             "--interval-ms=",
+        ],
+        &[
+            "dev",
+            "simulate-typing",
+            "--fixture",
+            "rapid-typing",
+            "--query",
+            "one",
+            "--query=two",
         ],
     ];
 

@@ -436,6 +436,7 @@ dependencies = [
  "crikey-ranking",
  "crikey-result-aggregator",
  "crikey-ui",
+ "libc",
 ]
 
 [[package]]
@@ -550,6 +551,7 @@ version = "0.1.0"
 dependencies = [
  "crikey-core",
  "crikey-platform",
+ "libc",
  "x11rb",
 ]
 
@@ -559,6 +561,7 @@ version = "0.1.0"
 dependencies = [
  "crikey-core",
  "crikey-platform",
+ "libc",
 ]
 
 [[package]]
@@ -605,7 +608,6 @@ dependencies = [
  "crikey-package-manager",
  "crikey-plugin-model",
  "crikey-plugin-supervisor",
- "serde",
  "serde_json",
  "thiserror 2.0.19",
 ]

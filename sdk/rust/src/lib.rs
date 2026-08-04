@@ -52,6 +52,7 @@ impl From<protocol::ProtocolError> for SdkError {
         match error {
             protocol::ProtocolError::Closed => Self::Transport("connection closed".to_owned()),
             protocol::ProtocolError::Timeout => Self::Transport("transport timed out".to_owned()),
+            protocol::ProtocolError::Rejected(detail) => Self::Rejected(detail),
             other => Self::Protocol(other.to_string()),
         }
     }

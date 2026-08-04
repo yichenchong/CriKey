@@ -441,9 +441,9 @@ fn bind(window: HWND, registration: &HotkeyRegistration) -> LRESULT {
 fn unbind(window: HWND, id: i32) -> LRESULT {
     let known = STATE.with(|state| {
         state
-            .borrow_mut()
-            .as_mut()
-            .is_some_and(|state| state.bindings.remove(&id).is_some())
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| state.bindings.contains_key(&id))
     });
     if !known {
         return LRESULT(E_INVALIDARG.0 as isize);
@@ -451,7 +451,14 @@ fn unbind(window: HWND, id: i32) -> LRESULT {
 
     // SAFETY: called on the registering thread, as Win32 requires.
     match unsafe { UnregisterHotKey(Some(window), id) } {
-        Ok(()) => MARSHALLED_OK,
+        Ok(()) => {
+            STATE.with(|state| {
+                if let Some(state) = state.borrow_mut().as_mut() {
+                    state.bindings.remove(&id);
+                }
+            });
+            MARSHALLED_OK
+        }
         Err(error) => LRESULT(error.code().0 as isize),
     }
 }

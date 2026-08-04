@@ -31,6 +31,8 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read as _};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -236,16 +238,15 @@ static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 ///
 /// The ceiling is applied to the *reader*, not to a stat of the path: a size
 /// read before the open is a guess about a file another process may still be
-/// growing. Non-regular files are rejected before opening, so a directory or
-/// named pipe cannot block startup while the recovery reader waits for input.
+/// growing. Unix opens use no-follow and non-blocking flags before checking the
+/// handle type, so a path swapped to a symlink or named pipe cannot hang boot.
 /// Taking the reader bounds the allocation whatever a regular file's contents
 /// turn out to be.
 fn read_bounded(path: &Path) -> Option<String> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.file_type().is_file() {
+    let file = open_journal(path)?;
+    if !file.metadata().ok()?.file_type().is_file() {
         return None;
     }
-    let file = fs::File::open(path).ok()?;
     let mut text = String::new();
     let read = file
         .take(StartupJournal::MAX_BYTES.saturating_add(1))
@@ -254,6 +255,25 @@ fn read_bounded(path: &Path) -> Option<String> {
     u64::try_from(read)
         .is_ok_and(|read| read <= StartupJournal::MAX_BYTES)
         .then_some(text)
+}
+
+fn open_journal(path: &Path) -> Option<fs::File> {
+    #[cfg(unix)]
+    {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        fs::File::open(path).ok()
+    }
 }
 
 // ---------------------------------------------------------------------------

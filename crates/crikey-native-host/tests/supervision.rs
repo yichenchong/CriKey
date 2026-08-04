@@ -453,6 +453,37 @@ fn supervisor_records_startup_failures_in_the_matching_counter() {
     assert_eq!(health.timeouts, 0);
     assert_eq!(health.protocol_violations, 0);
 }
+
+#[test]
+fn zero_restart_budget_blocks_repeated_startup_failures_even_without_a_window() {
+    let plugin = PluginId("unbounded-startup.native".to_owned());
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig {
+        max_restarts: 0,
+        restart_window_ms: 0,
+        base_backoff_ms: 0,
+        max_backoff_ms: 0,
+        circuit: CircuitBreakerConfig {
+            failure_threshold: 0,
+            cooldown: Duration::ZERO,
+        },
+    });
+    supervisor
+        .register(
+            launch(
+                Path::new("/crikey-test-no-such-native-plugin"),
+                &plugin.0,
+                "echo",
+                &[],
+            ),
+            options(TransportKind::Stdio),
+        )
+        .expect("register missing plugin");
+    assert!(matches!(supervisor.worker(&plugin, 0), Err(HostError::Spawn(_))));
+    assert!(matches!(
+        supervisor.worker(&plugin, 1),
+        Err(HostError::ResourceLimit { .. })
+    ));
+}
 #[test]
 fn startup_error_names_the_plugin_and_underlying_spawn_cause() {
     let plugin = PluginId("named.native".to_owned());
@@ -475,6 +506,24 @@ fn startup_error_names_the_plugin_and_underlying_spawn_cause() {
         detail.contains("os error 2") || detail.contains("No such file") || detail.contains("not found"),
         "startup error preserves the operating-system cause: {detail}"
     );
+}
+
+#[test]
+fn zero_initial_credits_are_rejected_before_launch() {
+    let plugin = PluginId("zero-credits.native".to_owned());
+    let mut options = options(TransportKind::Stdio);
+    options.limits.initial_credits = 0;
+    let error = NativeWorker::spawn(
+        launch(
+            Path::new("/crikey-test-no-such-native-plugin"),
+            &plugin.0,
+            "echo",
+            &[],
+        ),
+        options,
+    )
+    .expect_err("a zero-credit stream cannot make progress");
+    assert!(matches!(error, HostError::ResourceLimit { .. }));
 }
 
 #[test]

@@ -455,7 +455,7 @@ impl PackageLoader {
     }
 
     fn load_directory(&self, path: &Path) -> Result<LegacyPackage, PackageError> {
-        let id = package_id_of(path).ok_or_else(|| PackageError::NotAPackage {
+        let id = package_id_of(path, false).ok_or_else(|| PackageError::NotAPackage {
             path: path.to_path_buf(),
         })?;
         let files = self.scan_directory(path)?;
@@ -521,7 +521,7 @@ impl PackageLoader {
     }
 
     fn load_archive(&self, path: &Path) -> Result<LegacyPackage, PackageError> {
-        let id = package_id_of(path).ok_or_else(|| PackageError::NotAPackage {
+        let id = package_id_of(path, true).ok_or_else(|| PackageError::NotAPackage {
             path: path.to_path_buf(),
         })?;
         preflight_archive(path, self.limits.max_entries)?;
@@ -1212,15 +1212,16 @@ fn has_archive_extension(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(PACKAGE_ARCHIVE_EXTENSION))
 }
 
-/// Package id for a directory or archive path.
+/// Package id for a directory or archive path. Directory names are preserved
+/// verbatim; only an archive's own suffix is removed.
 ///
 /// The archive extension is stripped by length rather than with
 /// [`Path::file_stem`], which would also eat a dot inside the name: `My.Tools`
 /// and `My.Tools.keypirinha-package` are the same package and must produce the
 /// same id.
-fn package_id_of(path: &Path) -> Option<String> {
+fn package_id_of(path: &Path, archive: bool) -> Option<String> {
     let name = path.file_name()?.to_str()?;
-    let id = if has_archive_extension(path) {
+    let id = if archive && has_archive_extension(path) {
         // `has_archive_extension` proved the name ends with `.` plus the
         // extension, all ASCII, so this index is a char boundary.
         &name[..name.len() - (PACKAGE_ARCHIVE_EXTENSION.len() + 1)]
@@ -1267,13 +1268,11 @@ fn safe_relative_path(name: &str) -> Option<PathBuf> {
         if part.is_empty() || part == "." {
             continue;
         }
-        if part == ".." {
-            return None;
-        }
-        // `C:evil` is drive-relative on Windows and `file:stream` opens an
-        // NTFS alternate data stream; neither is expressible as a plain
-        // package-relative path.
-        if part.contains(':') {
+        // Windows trims trailing dots/spaces and reserves DOS device names;
+        // accepting either would let two archive paths overwrite one another
+        // or make `File::create` open a device on a Windows host. Refuse these
+        // names on every host so one package has one extraction everywhere.
+        if part.ends_with(['.', ' ']) || is_windows_device_name(part) {
             return None;
         }
         relative.push(part);
@@ -1284,6 +1283,23 @@ fn safe_relative_path(name: &str) -> Option<PathBuf> {
     } else {
         Some(relative)
     }
+}
+/// Whether a path component aliases a reserved DOS device on Windows.
+fn is_windows_device_name(part: &str) -> bool {
+    let stem = part.split('.').next().unwrap_or(part);
+    matches!(
+        stem,
+        value if value.eq_ignore_ascii_case("CON")
+            || value.eq_ignore_ascii_case("PRN")
+            || value.eq_ignore_ascii_case("AUX")
+            || value.eq_ignore_ascii_case("NUL")
+            || (value.is_ascii()
+                && value.len() == 4
+                && (value[..3].eq_ignore_ascii_case("COM")
+                    || value[..3].eq_ignore_ascii_case("LPT"))
+                && value.as_bytes()[3].is_ascii_digit()
+                && value.as_bytes()[3] != b'0')
+    )
 }
 
 /// Copies at most `allowed` bytes from `reader` to `writer`.

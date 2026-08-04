@@ -37,7 +37,8 @@
 #   scripts/prune-build-cache.sh --force    # prune regardless of size
 #   scripts/prune-build-cache.sh --dry-run  # report only, change nothing
 #
-# THRESHOLD_GB may be set in the environment to override the default.
+# THRESHOLD_GB may be set to a non-negative integer in the environment to
+# override the default.
 #
 # The threshold is measured against `target/debug` ALONE, not the whole build
 # directory. That distinction matters: the cross-compilation directories,
@@ -69,6 +70,12 @@ for argument in "$@"; do
 	esac
 done
 
+if [[ ! "$THRESHOLD_GB" =~ ^[0-9]+$ ]]; then
+	printf 'prune-build-cache: THRESHOLD_GB must be a non-negative integer (got %s)\n' \
+		"$THRESHOLD_GB" >&2
+	exit 2
+fi
+
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 target_directory="${CARGO_TARGET_DIR:-$repository_root/target}"
 
@@ -84,6 +91,8 @@ if [[ ! -d "$development_profile" ]]; then
 	exit 0
 fi
 
+# A dry run only measures and reports; it must not create or lock `.cargo-lock`.
+if [[ "$DRY_RUN" -eq 0 ]]; then
 # Do not delete artefacts from underneath a live compiler: that produces
 # failures which look like source errors and wastes someone's afternoon.
 #
@@ -115,10 +124,11 @@ elif pgrep -u "$(id -u)" -x cargo >/dev/null 2>&1 ||
 	printf 'prune-build-cache: a build appears to be running, leaving it alone\n'
 	exit 0
 fi
+fi
 
 size_in_kilobytes="$(du -sk "$development_profile" | cut -f1)"
 size_in_megabytes=$((size_in_kilobytes / 1024))
-threshold_in_kilobytes=$((THRESHOLD_GB * 1048576))
+threshold_in_kilobytes=$((10#$THRESHOLD_GB * 1048576))
 
 printf 'prune-build-cache: %s is %s MB, threshold %s GB\n' \
 	"$development_profile" "$size_in_megabytes" "$THRESHOLD_GB"

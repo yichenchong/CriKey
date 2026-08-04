@@ -576,8 +576,8 @@ fn kill_probe_process_group(process_id: u32) {
 /// partially parsed, because a misread version silently downgrades the gate
 /// that keeps plugin code off an interpreter it cannot run on.
 fn parse_reported_version(stdout: &[u8]) -> Option<PythonVersion> {
-    String::from_utf8_lossy(stdout)
-        .lines()
+    let text = std::str::from_utf8(stdout).ok()?;
+    text.lines()
         .take(PROBE_SCAN_LINES)
         .find_map(|line| parse_version(line.trim()))
 }
@@ -633,6 +633,8 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the Unix environment-scrubbing test serialises on a lock.
+    #[cfg(unix)]
     use std::sync::LazyLock;
 
     #[test]
@@ -660,6 +662,10 @@ mod tests {
             parse_reported_version(b"notice before answer\n3.12.0\n"),
             Some(PythonVersion::new(3, 12, 0))
         );
+    }
+    #[test]
+    fn invalid_utf8_in_version_probe_output_is_rejected() {
+        assert_eq!(parse_reported_version(b"notice \xff\n3.12.0\n"), None);
     }
 
     #[cfg(unix)]

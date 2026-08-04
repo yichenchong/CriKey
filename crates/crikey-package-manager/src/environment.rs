@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use crate::index::{hex_lower, normalize_name, PackageIndex};
+use crate::index::{constant_time_hex_eq, hex_lower, normalize_name, PackageIndex};
 use crate::lockfile::{LockedPackage, Lockfile};
 use crate::PackageError;
 
@@ -43,14 +43,10 @@ impl EnvironmentInputs {
     /// the id, while every field — including each pinned hash — feeds it.
     pub fn environment_id(&self) -> EnvironmentId {
         let mut hasher = Sha256::new();
-
-        hasher.update(b"python_version=");
-        hasher.update(self.python_version.as_bytes());
-        hasher.update(b"\nos=");
-        hasher.update(self.os.as_bytes());
-        hasher.update(b"\narch=");
-        hasher.update(self.arch.as_bytes());
-        hasher.update(b"\n");
+        hasher.update(b"crikey-environment-id-v1");
+        hash_field(&mut hasher, self.python_version.as_bytes());
+        hash_field(&mut hasher, self.os.as_bytes());
+        hash_field(&mut hasher, self.arch.as_bytes());
 
         let mut locked = self.locked.clone();
         locked.sort_by(|a, b| {
@@ -60,26 +56,29 @@ impl EnvironmentInputs {
                 b.hash.to_ascii_lowercase(),
             ))
         });
-        hasher.update(b"locked=\n");
+        hasher.update((locked.len() as u64).to_le_bytes());
         for p in &locked {
-            hasher.update(normalize_name(&p.name).as_bytes());
-            hasher.update(b"\0");
-            hasher.update(p.version.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(p.hash.to_ascii_lowercase().as_bytes());
-            hasher.update(b"\n");
+            let name = normalize_name(&p.name);
+            hash_field(&mut hasher, name.as_bytes());
+            hash_field(&mut hasher, p.version.as_bytes());
+            let hash = p.hash.to_ascii_lowercase();
+            hash_field(&mut hasher, hash.as_bytes());
         }
 
         let mut options = self.native_build_options.clone();
         options.sort();
-        hasher.update(b"native_build_options=\n");
-        for o in &options {
-            hasher.update(o.as_bytes());
-            hasher.update(b"\n");
+        hasher.update((options.len() as u64).to_le_bytes());
+        for option in &options {
+            hash_field(&mut hasher, option.as_bytes());
         }
 
         EnvironmentId(hex_lower(&hasher.finalize()))
     }
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 /// A materialised, reusable managed environment.
@@ -145,17 +144,33 @@ impl EnvironmentStore {
         let result = (|| -> Result<(), PackageError> {
             let staging_site = staging.join("site");
             std::fs::create_dir_all(&staging_site)?;
-
             let mut ordered = inputs.locked.clone();
             ordered.sort_by(package_order);
-            for locked in &ordered {
+
+            for (ordinal, locked) in ordered.iter().enumerate() {
                 let entry = index.get(&locked.name, &locked.version).ok_or_else(|| {
                     PackageError::HashMismatch(format!(
                         "{}-{} not present in index",
                         locked.name, locked.version
                     ))
                 })?;
-                copy_tree(&entry.root, &staging_site)?;
+                // Copy each source tree into an isolated staging subtree, then
+                // hash those exact copied bytes before merging them. Hashing
+                // only before the copy would leave a source-file TOCTOU window.
+                let package_staging = staging.join(format!(".package-{ordinal}"));
+                std::fs::create_dir(&package_staging)?;
+                copy_tree(&entry.root, &package_staging)?;
+                let copied_hash = crate::index::tree_hash(&package_staging)?;
+                if !constant_time_hex_eq(&copied_hash, &locked.hash)
+                    || !constant_time_hex_eq(&copied_hash, &entry.hash)
+                {
+                    return Err(PackageError::HashMismatch(format!(
+                        "{}-{} changed while being materialised",
+                        locked.name, locked.version
+                    )));
+                }
+                copy_tree(&package_staging, &staging_site)?;
+                std::fs::remove_dir_all(package_staging)?;
             }
 
             let lockfile = Lockfile {
@@ -250,7 +265,7 @@ fn verify_packages<'a, 'b>(
             }
             Err(error) => return Err(error),
         };
-        if !actual.eq_ignore_ascii_case(&locked.hash) || !actual.eq_ignore_ascii_case(&entry.hash) {
+        if !constant_time_hex_eq(&actual, &locked.hash) || !constant_time_hex_eq(&actual, &entry.hash) {
             return Err(PackageError::HashMismatch(format!(
                 "{}-{}: recorded {}, current bytes hash {}",
                 locked.name, locked.version, locked.hash, actual
@@ -306,7 +321,7 @@ fn verify_committed(
             .any(|(expected, actual)| {
                 crate::index::normalize_name(&expected.name) != crate::index::normalize_name(&actual.name)
                     || expected.version != actual.version
-                    || !expected.hash.eq_ignore_ascii_case(&actual.hash)
+                    || !constant_time_hex_eq(&expected.hash, &actual.hash)
             })
     {
         return Err(PackageError::HashMismatch(
@@ -315,8 +330,26 @@ fn verify_committed(
     }
 
     let mut expected_files = BTreeMap::new();
-    for (entry, _) in verified {
-        collect_expected_files(&entry.root, &entry.root, &mut expected_files)?;
+    for (entry, locked) in verified {
+        let mut package_files = BTreeMap::new();
+        collect_expected_files(&entry.root, &entry.root, &mut package_files)?;
+        let source_hash = snapshot_tree_hash(&package_files)?;
+        if !constant_time_hex_eq(&source_hash, &locked.hash)
+            || !constant_time_hex_eq(&source_hash, &entry.hash)
+        {
+            return Err(PackageError::HashMismatch(format!(
+                "{}-{} changed while the cached environment was checked",
+                locked.name, locked.version
+            )));
+        }
+        for (path, bytes) in package_files {
+            if expected_files.insert(path.clone(), bytes).is_some() {
+                return Err(PackageError::Resolution(format!(
+                    "cross-package file collision at {}",
+                    path.display()
+                )));
+            }
+        }
     }
     let site_dir = env_dir.join("site");
     let mut actual_files = BTreeMap::new();
@@ -361,6 +394,30 @@ fn create_staging_dir(cache_root: &Path, id: &EnvironmentId) -> Result<PathBuf, 
             Err(error) => return Err(PackageError::Io(error)),
         }
     }
+}
+
+fn snapshot_tree_hash(files: &BTreeMap<PathBuf, Vec<u8>>) -> Result<String, PackageError> {
+    let mut normalized = Vec::with_capacity(files.len());
+    for (path, bytes) in files {
+        let mut components = Vec::new();
+        for component in path.components() {
+            let component = component.as_os_str().to_str().ok_or_else(|| {
+                PackageError::HashMismatch(format!("package path {} is not valid UTF-8", path.display()))
+            })?;
+            components.push(component);
+        }
+        normalized.push((components.join("/"), bytes));
+    }
+    normalized.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut hasher = Sha256::new();
+    for (relative, bytes) in normalized {
+        hasher.update((relative.len() as u64).to_le_bytes());
+        hasher.update(relative.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    Ok(hex_lower(&hasher.finalize()))
 }
 
 fn collect_expected_files(

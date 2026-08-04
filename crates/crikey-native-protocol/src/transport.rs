@@ -23,13 +23,23 @@ pub trait Transport: std::fmt::Debug + Send {
     /// The clone is deliberately explicit so a blocking reader can coexist
     /// with a writer on another thread (spec 16.2).
     fn try_clone_handle(&self) -> Result<Box<dyn Transport>, ProtocolError>;
+    /// Reports whether this transport can enforce a read timeout.
+    ///
+    /// A false result is normal for inherited stdio: callers may still set a
+    /// timeout as a no-op, but must use another mechanism if they need a
+    /// deadline.
+    fn supports_read_timeout(&self) -> bool {
+        false
+    }
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), ProtocolError>;
     fn close(&mut self);
 }
 
 #[cfg(any(unix, windows))]
 fn map_io(error: io::Error) -> ProtocolError {
-    if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        ProtocolError::Closed
+    } else if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
         ProtocolError::Timeout
     } else {
         ProtocolError::Io(error.to_string())
@@ -104,6 +114,7 @@ impl Write for IoStream {
 #[derive(Debug)]
 struct IoTransport {
     stream: IoStream,
+    reader: frame::FrameReader,
     read_timeout: Option<Duration>,
 }
 
@@ -111,6 +122,7 @@ impl IoTransport {
     fn new(stream: IoStream) -> Self {
         Self {
             stream,
+            reader: frame::FrameReader::new(),
             read_timeout: None,
         }
     }
@@ -144,7 +156,7 @@ impl Transport for IoTransport {
             return Err(ProtocolError::Closed);
         }
         let mut bytes = Vec::new();
-        frame::read_frame(&mut self.stream, &mut bytes)?;
+        self.reader.read_frame(&mut self.stream, &mut bytes)?;
         Envelope::decode(&bytes)
     }
 
@@ -153,6 +165,9 @@ impl Transport for IoTransport {
         let mut cloned = Self::new(stream);
         cloned.set_timeout(self.read_timeout)?;
         Ok(Box::new(cloned))
+    }
+    fn supports_read_timeout(&self) -> bool {
+        !matches!(&self.stream, IoStream::Stdio { .. } | IoStream::Closed)
     }
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), ProtocolError> {
@@ -216,6 +231,9 @@ impl Transport for PairSide {
             receiver: Arc::clone(&self.receiver),
             read_timeout: self.read_timeout,
         }))
+    }
+    fn supports_read_timeout(&self) -> bool {
+        true
     }
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), ProtocolError> {
@@ -405,8 +423,9 @@ mod windows_pipe {
 
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{
-        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_NO_DATA,
-        ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, HANDLE, INVALID_HANDLE_VALUE, WIN32_ERROR,
+        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
+        ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, HANDLE,
+        INVALID_HANDLE_VALUE, WIN32_ERROR,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -434,29 +453,59 @@ mod windows_pipe {
     // SAFETY: Win32 pipe handles are kernel-owned, transferable values; this
     // wrapper has unique ownership and all I/O is synchronized through &mut.
     unsafe impl Send for PipeFile {}
-
     impl PipeFile {
-        pub fn connect(name: &str) -> Result<Self, String> {
+        pub fn connect(name: &str, timeout: Option<Duration>) -> Result<Self, String> {
             let path = format!(r"\\.\pipe\{name}");
             let wide = wide(&path);
-            // SAFETY: `wide` is NUL-terminated and remains alive for the
-            // synchronous call; the returned handle is owned by `PipeFile`.
-            let handle = unsafe {
-                CreateFileW(
-                    PCWSTR(wide.as_ptr()),
-                    FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
-                    FILE_SHARE_NONE,
-                    None,
-                    OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
-                    None,
-                )
+            let deadline = match timeout {
+                Some(value) => Some(
+                    Instant::now()
+                        .checked_add(value)
+                        .ok_or_else(|| "named pipe connect timeout is too large".to_owned())?,
+                ),
+                None => None,
+            };
+            loop {
+                // SAFETY: `wide` is NUL-terminated and remains alive for the
+                // synchronous call; a successful handle is owned by `PipeFile`.
+                let result = unsafe {
+                    CreateFileW(
+                        PCWSTR(wide.as_ptr()),
+                        FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+                        FILE_SHARE_NONE,
+                        None,
+                        OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL,
+                        None,
+                    )
+                };
+                match result {
+                    Ok(handle) => {
+                        return Ok(Self {
+                            handle,
+                            read_timeout: None,
+                        });
+                    }
+                    Err(error) => {
+                        let retryable = matches!(
+                            WIN32_ERROR::from_error(&error),
+                            Some(ERROR_FILE_NOT_FOUND) | Some(ERROR_PIPE_BUSY)
+                        );
+                        if timeout.is_none() || !retryable {
+                            return Err(error.to_string());
+                        }
+                        let Some(deadline) = deadline else {
+                            return Err("named pipe connect timeout is unavailable".to_owned());
+                        };
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Err("named pipe connect timed out".to_owned());
+                        }
+                        let remaining = deadline.duration_since(now);
+                        thread::sleep(remaining.min(Duration::from_millis(1)));
+                    }
+                }
             }
-            .map_err(|error| error.to_string())?;
-            Ok(Self {
-                handle,
-                read_timeout: None,
-            })
         }
 
         pub fn try_clone(&self) -> Result<Self, io::Error> {
@@ -494,7 +543,12 @@ mod windows_pipe {
             let Some(timeout) = self.read_timeout else {
                 return Ok(());
             };
-            let deadline = Instant::now().checked_add(timeout);
+            let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "named pipe read timeout is too large",
+                )
+            })?;
             loop {
                 let mut available = 0_u32;
                 // SAFETY: querying availability does not provide an output
@@ -509,7 +563,7 @@ mod windows_pipe {
                 if available != 0 {
                     return Ok(());
                 }
-                if deadline.is_some_and(|at| Instant::now() >= at) {
+                if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "named pipe read timed out",
@@ -608,7 +662,12 @@ mod windows_pipe {
                 handle,
                 read_timeout: None,
             };
-            let deadline = timeout.and_then(|value| Instant::now().checked_add(value));
+            let deadline = match timeout {
+                Some(value) => Some(Instant::now().checked_add(value).ok_or(
+                    crate::ProtocolError::Malformed("named pipe accept timeout is too large".to_owned()),
+                )?),
+                None => None,
+            };
             loop {
                 // SAFETY: `file` owns the valid server handle and keeps it
                 // alive through each non-blocking ConnectNamedPipe call.
@@ -663,7 +722,7 @@ fn bind_named_pipe(endpoint: &Endpoint, name: &str) -> Result<Listener, Protocol
 }
 
 #[cfg(windows)]
-fn connect_named_pipe(name: &str, _timeout: Option<Duration>) -> Result<Box<dyn Transport>, ProtocolError> {
-    let file = windows_pipe::PipeFile::connect(name).map_err(ProtocolError::Io)?;
+fn connect_named_pipe(name: &str, timeout: Option<Duration>) -> Result<Box<dyn Transport>, ProtocolError> {
+    let file = windows_pipe::PipeFile::connect(name, timeout).map_err(ProtocolError::Io)?;
     Ok(Box::new(IoTransport::new(IoStream::NamedPipe(file))))
 }

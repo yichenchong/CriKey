@@ -218,6 +218,28 @@ fn a_guard_dropped_while_unwinding_returns_its_slot() {
     );
 }
 
+/// The owning guard is the form used by long-lived dispatch registries, so it
+/// must also release its slot during unwinding rather than keeping the `Arc`
+/// alive with a permanently occupied counter.
+#[test]
+fn an_owned_guard_dropped_while_unwinding_returns_its_slot() {
+    let budget = Arc::new(uniform_budget(1));
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = budget
+            .try_acquire_owned(BudgetKind::Suggestion)
+            .expect("in budget");
+        panic!("unit of work failed");
+    }));
+
+    assert!(outcome.is_err(), "the work panicked");
+    assert_eq!(budget.in_flight(BudgetKind::Suggestion), 0);
+    assert!(
+        budget.try_acquire_owned(BudgetKind::Suggestion).is_some(),
+        "owning capacity must survive a panicking unit of work"
+    );
+}
+
 /// `in_flight` is the live occupancy of one kind and must follow acquire and
 /// release step by step, independently for each kind.
 #[test]
@@ -327,6 +349,24 @@ fn an_explicit_declaration_overrides_the_host_default() {
         "raising one kind must not disturb the others' defaults"
     );
     drop(held);
+}
+
+/// A declared budget uses the full manifest integer domain. The supervisor
+/// must not narrow `u32::MAX` back to the one-slot default or wrap it.
+#[test]
+fn a_budget_at_the_u32_ceiling_is_retained_by_the_supervisor() {
+    let budget = ConcurrencyBudget::from_section(&ConcurrencySection {
+        max_background_tasks: Some(u32::MAX),
+        ..ConcurrencySection::default()
+    });
+    assert_eq!(budget.limit(BudgetKind::Background), u32::MAX);
+
+    let guard = budget
+        .try_acquire(BudgetKind::Background)
+        .expect("the first unit is below the maximum representable limit");
+    assert_eq!(budget.in_flight(BudgetKind::Background), 1);
+    drop(guard);
+    assert_eq!(budget.in_flight(BudgetKind::Background), 0);
 }
 
 /// The two layers must stay distinguishable. An undeclared budget and one

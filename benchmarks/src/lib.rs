@@ -625,24 +625,34 @@ static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
 /// A temp directory unique to one benchmark run, removed when the run ends.
 ///
-/// The cache root is a *child* of the guard directory and is deliberately not
-/// created: an absent root is a valid cold cache, and keeping the cache inside
-/// the guard means cleanup reaches whatever the cache wrote.
-#[derive(Debug)]
+/// The guard is created with an exclusive operation. A pre-existing path is
+/// never removed or reused, so a stale run or another process cannot lose data
+/// when this benchmark starts. The cache root is a child of the guard and is
+/// deliberately not created until the cache stores its first slice.
 struct TempRoot {
     dir: PathBuf,
+    owned: bool,
 }
 
 impl TempRoot {
     fn new() -> Self {
-        let unique = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "crikey-catalog-benchmark-{pid}-{unique}",
-            pid = std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::create_dir_all(&dir);
-        Self { dir }
+        let mut owned = false;
+        let dir = loop {
+            let unique = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+            let candidate = std::env::temp_dir().join(format!(
+                "crikey-catalog-benchmark-{pid}-{unique}",
+                pid = std::process::id()
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => {
+                    owned = true;
+                    break candidate;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => break candidate,
+            }
+        };
+        Self { dir, owned }
     }
 
     fn cache_dir(&self) -> PathBuf {
@@ -652,7 +662,9 @@ impl TempRoot {
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        if self.owned {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
     }
 }
 

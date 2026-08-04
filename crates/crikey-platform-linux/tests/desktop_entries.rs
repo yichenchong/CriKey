@@ -94,6 +94,12 @@ Name=Uninstalled Leftover
 Exec=/usr/bin/leftover
 Hidden=true
 ";
+const TERMINAL_ENTRY: &str = "[Desktop Entry]
+Type=Application
+Name=Needs Terminal
+Exec=/usr/bin/needs-terminal
+Terminal=true
+";
 
 const EXPLICITLY_VISIBLE: &str = "[Desktop Entry]
 Type=Application
@@ -347,6 +353,7 @@ fn a_visible_entry_is_discovered_with_its_name_exec_and_icon() {
         firefox.arguments
     );
     assert_eq!(firefox.icon_reference.as_deref(), Some("firefox"));
+    assert_eq!(firefox.working_directory.as_ref(), None);
 
     let platform_id = firefox
         .platform_id
@@ -359,6 +366,27 @@ fn a_visible_entry_is_discovered_with_its_name_exec_and_icon() {
 
     // Discovery is a pure read: rescanning an unchanged root repeats itself.
     assert_eq!(names(&discover(vec![root])), ["Firefox Web Browser"]);
+}
+
+#[test]
+fn a_desktop_entry_records_its_working_directory() {
+    let scratch = Scratch::new();
+    let root = scratch.root("applications");
+    write_entry(
+        &root,
+        "editor.desktop",
+        "[Desktop Entry]\nType=Application\nName=Editor\nPath=/home/tester/project\nExec=/usr/bin/editor\n",
+    );
+
+    let applications = discover(vec![root]);
+    let editor = only(&applications);
+    assert_eq!(
+        editor
+            .working_directory
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        Some("/home/tester/project".to_owned())
+    );
 }
 
 #[test]
@@ -412,6 +440,16 @@ fn nodisplay_and_hidden_entries_are_skipped_while_explicit_false_is_kept() {
 }
 
 #[test]
+fn terminal_entries_are_not_presented_as_detached_launches() {
+    let scratch = Scratch::new();
+    let root = scratch.root("applications");
+    write_entry(&root, "needs-terminal.desktop", TERMINAL_ENTRY);
+    write_entry(&root, "calculator.desktop", CALCULATOR);
+
+    assert_eq!(names(&discover(vec![root])), ["Calculator"]);
+}
+
+#[test]
 fn exec_field_codes_are_stripped_while_real_arguments_survive() {
     let scratch = Scratch::new();
     let root = scratch.root("applications");
@@ -435,6 +473,50 @@ fn quoted_exec_tokens_stay_single_arguments() {
 
     assert_eq!(target(notes), "/opt/My Apps/notes");
     assert_eq!(notes.arguments, ["--title", "Daily Notes", "--tag", "work"]);
+}
+
+#[test]
+fn exec_escapes_preserve_literal_backslashes_and_quotes() {
+    let scratch = Scratch::new();
+    let root = scratch.root("applications");
+    write_entry(
+        &root,
+        "escaped.desktop",
+        r#"[Desktop Entry]
+Type=Application
+Name=Escaped arguments
+Exec="/usr/bin/escape-fixture" "C:\\\\Program Files" "say\"hello"
+"#,
+    );
+
+    let applications = discover(vec![root]);
+    let application = only(&applications);
+    assert_eq!(target(application), "/usr/bin/escape-fixture");
+    assert_eq!(application.arguments, ["C:\\Program Files", "say\"hello"]);
+}
+
+#[test]
+fn unknown_field_codes_and_unterminated_quotes_are_skipped() {
+    let scratch = Scratch::new();
+    let root = scratch.root("applications");
+    write_entry(
+        &root,
+        "unknown-code.desktop",
+        "[Desktop Entry]\nType=Application\nName=Unknown code\nExec=/bin/false %x\n",
+    );
+    write_entry(
+        &root,
+        "unterminated.desktop",
+        "[Desktop Entry]\nType=Application\nName=Unterminated\nExec=/bin/false \"arg\n",
+    );
+    write_entry(&root, "calculator.desktop", CALCULATOR);
+    write_entry(
+        &root,
+        "single-quote.desktop",
+        "[Desktop Entry]\nType=Application\nName=Single quote\nExec=/bin/false 'arg with spaces'\n",
+    );
+
+    assert_eq!(names(&discover(vec![root])), ["Calculator"]);
 }
 
 /// The desktop-entry specification forbids field codes inside quoted

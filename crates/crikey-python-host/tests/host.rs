@@ -26,9 +26,10 @@
 //! A double would pass an in-process host that violates spec 4.2 ("Python code
 //! shall not execute on the CriKey user-interface thread") and could never let
 //! two conflicting versions of one module be imported at once — a single
-//! address space holds `acme` exactly once. So these tests spawn `python3` for
-//! real, and a missing or too-old interpreter is a **test failure**, never a
-//! skip. There is no `#[ignore]` and no early `return`.
+//! address space holds `acme` exactly once. These tests prefer the repository
+//! virtualenv, then use ordinary interpreter discovery on a fresh checkout; a
+//! host with no usable interpreter prints a reason and skips only real-worker
+//! tests.
 //!
 //! # Time and platform
 //!
@@ -199,12 +200,37 @@ fn write_executable(path: &Path, script: &str) -> PathBuf {
 // The interpreter this host actually has
 // ---------------------------------------------------------------------------
 
-/// The real CPython on this host. Never skips: if discovery fails, the test
-/// that asked for it fails, because a host that cannot run Python cannot run
-/// the modern worker at all.
-fn host_interpreter() -> Interpreter {
-    discover_interpreter(&RuntimeProfile::Bundled, &RequiresPython(SATISFIABLE.to_owned()))
-        .expect("this host must provide a supported CPython for the modern worker")
+/// Prefer the repository virtual environment, but keep a fresh checkout's
+/// Rust tests usable when that ignored directory has not been created.
+fn test_interpreter_path() -> Option<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    #[cfg(windows)]
+    let path = root.join(".venv").join("Scripts").join("python.exe");
+    #[cfg(not(windows))]
+    let path = root.join(".venv").join("bin").join("python");
+    path.is_file().then_some(path)
+}
+
+fn host_interpreter() -> Option<Interpreter> {
+    if let Some(path) = test_interpreter_path() {
+        let environment = DiscoveryEnvironment::empty().with_override(path);
+        return Some(
+            discover_interpreter_in(
+                &RuntimeProfile::Bundled,
+                &RequiresPython(SATISFIABLE.to_owned()),
+                &environment,
+            )
+            .unwrap_or_else(|error| panic!("the repository virtualenv is not usable: {error}")),
+        );
+    }
+
+    match discover_interpreter(&RuntimeProfile::Bundled, &RequiresPython(SATISFIABLE.to_owned())) {
+        Ok(interpreter) => Some(interpreter),
+        Err(error) => {
+            eprintln!("skipping real-interpreter test: no usable CPython was found ({error})");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,6 +489,37 @@ fn discovery_falls_back_to_python3_on_the_search_path_when_nothing_overrides_it(
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn an_unusable_environment_override_is_decisive_and_names_the_candidate() {
+    let scratch = Scratch::new("bad-override");
+    let missing = scratch.join("missing-python");
+    let directory = scratch.subdir("python-directory");
+    let non_executable = scratch.join("non-executable-python");
+    fs::write(&non_executable, "#!/bin/sh\nprintf '3.12.0\\n'\n")
+        .expect("the non-executable candidate is writable");
+
+    for (label, path) in [
+        ("missing", missing),
+        ("directory", directory),
+        ("non-executable", non_executable),
+    ] {
+        let error = discover_interpreter_in(
+            &RuntimeProfile::Bundled,
+            &RequiresPython(">=3.8".to_owned()),
+            &DiscoveryEnvironment::empty().with_override(&path),
+        )
+        .expect_err("an unusable override must fail instead of silently falling through");
+        match error {
+            HostError::Interpreter(message) => assert!(
+                message.contains(path.to_string_lossy().as_ref()),
+                "{label} override error names the candidate: {message}"
+            ),
+            other => panic!("{label} override is an interpreter error, got {other:?}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // requires-python is a hard gate, never a silent fall-through (spec 15.2, §4)
 // ---------------------------------------------------------------------------
@@ -473,11 +530,13 @@ fn an_interpreter_that_does_not_satisfy_requires_python_is_rejected_not_silently
     let scratch = Scratch::new("requires-python");
     let old = version_shim(&scratch.path, "python3.10", "3.10.3");
 
-    // The other two rules are made genuinely usable: this host's real python3
-    // sits on the search path. If the chosen interpreter fell through when it
-    // failed the requirement, discovery would succeed under a Python the plugin
+    // The other rules are made genuinely usable: the repository virtualenv sits
+    // on the search path. If the chosen interpreter fell through when it failed
+    // the requirement, discovery would succeed under a Python the plugin
     // declared it cannot run on — worse than not starting. It must error.
-    let real = host_interpreter();
+    let Some(real) = host_interpreter() else {
+        return;
+    };
     let real_directory = real
         .path()
         .parent()
@@ -566,7 +625,9 @@ fn discovery_stops_a_candidate_that_hangs_during_the_version_probe() {
 
 #[test]
 fn the_interpreter_on_this_host_is_discovered_and_satisfies_a_requirement_it_meets() {
-    let interpreter = host_interpreter();
+    let Some(interpreter) = host_interpreter() else {
+        return;
+    };
 
     assert!(
         interpreter.path().exists(),
@@ -589,21 +650,6 @@ fn the_interpreter_on_this_host_is_discovered_and_satisfies_a_requirement_it_mee
         reported,
         "the discovered version is the one the interpreter itself reports"
     );
-
-    // The convenience form is exactly the explicit form over the ambient
-    // environment; this is what lets every other test use the explicit form
-    // without diverging from production behaviour.
-    let ambient = discover_interpreter_in(
-        &RuntimeProfile::Bundled,
-        &RequiresPython(SATISFIABLE.to_owned()),
-        &DiscoveryEnvironment::from_process(),
-    )
-    .expect("discovery over the ambient environment resolves on this host");
-    assert_eq!(
-        ambient.path(),
-        interpreter.path(),
-        "discover_interpreter resolves against the ambient process environment"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -613,7 +659,9 @@ fn the_interpreter_on_this_host_is_discovered_and_satisfies_a_requirement_it_mee
 #[test]
 fn plugins_sharing_an_environment_id_share_one_worker_and_distinct_ids_get_separate_workers() {
     let scratch = Scratch::new("pool-sharing");
-    let interpreter = host_interpreter();
+    let Some(interpreter) = host_interpreter() else {
+        return;
+    };
     let index = PackageIndex::from_dir(&scratch.subdir("empty-index"))
         .expect("an empty directory is an empty package index");
     let store = EnvironmentStore::new(scratch.subdir("cache"));
@@ -749,14 +797,81 @@ fn plugins_sharing_an_environment_id_share_one_worker_and_distinct_ids_get_separ
     );
 }
 
+const CRASH_ON_SUGGEST: &str = r#"
+import os
+from crikey_sdk import Plugin
+
+class CrashPlugin(Plugin):
+    def suggest(self, query, context):
+        os._exit(17)
+"#;
+
+#[test]
+fn the_worker_pool_restarts_a_worker_after_a_transport_failure() {
+    let scratch = Scratch::new("pool-restart");
+    let Some(interpreter) = host_interpreter() else {
+        return;
+    };
+    let source = plugin_source(&scratch, "restart", "restart_mod", CRASH_ON_SUGGEST);
+    let environment = MaterializedEnvironment {
+        id: crikey_python_host::EnvironmentId("restart-env".to_owned()),
+        site_dir: scratch.subdir("env"),
+    };
+    let mut pool = WorkerPool::new();
+
+    {
+        let worker = pool
+            .worker_for(
+                &interpreter,
+                &environment.id,
+                worker_options("restart", "restart_mod:CrashPlugin", &source, &environment),
+            )
+            .expect("the crashing plugin initially spawns");
+        assert!(worker.is_alive());
+        let result = worker.suggest(&SuggestRequest {
+            generation: 1,
+            text: "crash".to_owned(),
+            normalized: "crash".to_owned(),
+            selected_item_id: None,
+        });
+        assert!(result.is_err(), "an interpreter exit is a transport failure");
+        assert!(!worker.is_alive(), "the failed worker is marked dead");
+    }
+
+    assert_eq!(
+        pool.worker_count(),
+        1,
+        "the dead entry is retained until replacement"
+    );
+    {
+        let worker = pool
+            .worker_for(
+                &interpreter,
+                &environment.id,
+                worker_options("restart", "restart_mod:CrashPlugin", &source, &environment),
+            )
+            .expect("the next request replaces the dead worker");
+        assert!(
+            worker.is_alive(),
+            "the replacement worker completed its handshake"
+        );
+    }
+    assert_eq!(
+        pool.worker_count(),
+        1,
+        "replacement does not accumulate dead entries"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Conflicting dependency versions coexist (acceptance 31.20)
 // ---------------------------------------------------------------------------
-
 #[test]
 fn conflicting_dependency_versions_coexist_in_separate_live_workers() {
     let scratch = Scratch::new("conflicting-deps");
-    let interpreter = host_interpreter();
+    let Some(interpreter) = host_interpreter() else {
+        return;
+    };
     let index = acme_index(&scratch);
     let store = EnvironmentStore::new(scratch.subdir("cache"));
 

@@ -16,11 +16,10 @@
 //! *only* from there, `print` never corrupting the JSON stream, an `async def`
 //! callback emitting on the worker's asyncio loop, an un-registered background
 //! task being cancelled rather than left running — none of these can be
-//! observed of an in-process stand-in. So the tests spawn `python3` for real
-//! and assert on what the real interpreter did.
-//!
-//! A missing or too-old interpreter is therefore a **test failure**, never a
-//! skip: there is no `#[ignore]` and no early `return` in this file.
+//! observed of an in-process stand-in. These tests prefer the repository
+//! virtualenv and otherwise use ordinary interpreter discovery, then assert on
+//! what the real interpreter did. If no usable interpreter exists, each test
+//! prints a reason and skips rather than using an in-process double.
 //!
 //! # Time
 //!
@@ -66,8 +65,8 @@ use crikey_package_manager::{EnvironmentId, ImportPath, MaterializedEnvironment}
 use crikey_plugin_model::ConcurrencySection;
 use crikey_plugin_supervisor::shared_budget_from_section;
 use crikey_python_host::{
-    discover_interpreter, BatchState, Interpreter, ModernWorker, RequiresPython, RuntimeProfile,
-    SuggestRequest, Suggestions, WorkerOptions,
+    discover_interpreter, discover_interpreter_in, BatchState, DiscoveryEnvironment, Interpreter,
+    ModernWorker, RequiresPython, RuntimeProfile, SuggestRequest, Suggestions, WorkerOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -160,14 +159,48 @@ fn sdk_python_dir() -> PathBuf {
     dir
 }
 
-/// The interpreter this host actually has. Never skips: if discovery fails, the
-/// test that asked for it fails.
-fn host_interpreter() -> Interpreter {
-    discover_interpreter(
+/// Prefer the repository virtual environment, but keep a fresh checkout's
+/// Rust tests usable when that ignored directory has not been created.
+fn test_interpreter_path() -> Option<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    #[cfg(windows)]
+    let path = root.join(".venv").join("Scripts").join("python.exe");
+    #[cfg(not(windows))]
+    let path = root.join(".venv").join("bin").join("python");
+    path.is_file().then_some(path)
+}
+
+fn host_interpreter() -> Option<Interpreter> {
+    if let Some(path) = test_interpreter_path() {
+        let environment = DiscoveryEnvironment::empty().with_override(path);
+        return Some(
+            discover_interpreter_in(
+                &RuntimeProfile::Bundled,
+                &RequiresPython(REQUIRES_PYTHON.to_owned()),
+                &environment,
+            )
+            .unwrap_or_else(|error| panic!("the repository virtualenv is not usable: {error}")),
+        );
+    }
+
+    match discover_interpreter(
         &RuntimeProfile::Bundled,
         &RequiresPython(REQUIRES_PYTHON.to_owned()),
-    )
-    .expect("this host must provide a supported CPython for the modern worker")
+    ) {
+        Ok(interpreter) => Some(interpreter),
+        Err(error) => {
+            eprintln!("skipping real-interpreter test: no usable CPython was found ({error})");
+            None
+        }
+    }
+}
+
+macro_rules! require_host_interpreter {
+    () => {
+        if host_interpreter().is_none() {
+            return;
+        }
+    };
 }
 
 /// Spawns a worker for the plugin at `plugin_source`, exposing `site_dir` as the
@@ -187,7 +220,8 @@ fn spawn_worker(plugin_id: &str, entrypoint: &str, plugin_source: &Path, site_di
     options.call_timeout_ms = CALL_BUDGET_MS;
     options.shutdown_timeout_ms = SHUTDOWN_BUDGET_MS;
 
-    ModernWorker::spawn(&host_interpreter(), options)
+    let interpreter = host_interpreter().expect("host interpreter was checked at test entry");
+    ModernWorker::spawn(&interpreter, options)
         .unwrap_or_else(|error| panic!("a loadable plugin spawns a worker, got {error}"))
 }
 
@@ -227,6 +261,7 @@ fn joined_log(reply: &Suggestions) -> String {
 
 #[test]
 fn a_plugin_loaded_from_its_entrypoint_imports_its_own_sibling_modules() {
+    require_host_interpreter!();
     // The plugin lives in a *sub*package and reaches a sibling module both by
     // absolute (`pkg.sub.helper`) and relative (`.helper`) import. The host
     // only put the plugin source root on the path, so both resolving proves the
@@ -311,6 +346,7 @@ class Impl(Plugin):
 
 #[test]
 fn an_import_declared_dependency_resolves_only_when_its_managed_env_is_on_the_path() {
+    require_host_interpreter!();
     // §31.19: the plugin declares no dep in Python — it just `import acme`.
     // Whether that import succeeds is decided entirely by whether the managed
     // env's site directory is on the assembled path. Same plugin, two envs.
@@ -402,6 +438,7 @@ class Impl(Plugin):
 
 #[test]
 fn the_worker_is_isolated_under_dash_s_yet_reaches_every_intended_import() {
+    require_host_interpreter!();
     // Contract §5: under `-S` with a path lacking global site, a plugin can
     // import the stdlib, its own package, its managed deps and `crikey_sdk` —
     // and nothing else. The deterministic isolation signal is `sys.flags.no_site`
@@ -478,6 +515,7 @@ class Impl(Plugin):
 
 #[test]
 fn emit_streams_results_and_log_and_print_land_in_the_reply_log_without_desyncing() {
+    require_host_interpreter!();
     // stdout is a strict protocol channel: anything the plugin `print`s must be
     // captured into the reply `log`, never written as a bare line that would
     // split the JSON stream. The reply parsing at all is half the contract; a
@@ -541,6 +579,7 @@ class Impl(Plugin):
 
 #[test]
 fn an_exception_in_a_callback_is_a_structured_failure_and_the_worker_serves_the_next_request() {
+    require_host_interpreter!();
     // A plugin raising is the plugin's fault, not the transport's: the worker
     // must report a terminal `failed` with the exception's message and
     // traceback, stay alive, and answer the next request. Conflating this with
@@ -628,6 +667,7 @@ class Impl(Plugin):
 
 #[test]
 fn both_synchronous_and_async_def_suggest_callbacks_emit_results() {
+    require_host_interpreter!();
     // §15.8: the worker supports both. The sync plugin is the baseline; the
     // async one only produces a result if it is awaited on the worker's loop,
     // and its `on_loop` witness proves it ran there rather than being called
@@ -704,6 +744,7 @@ class Impl(Plugin):
 
 #[test]
 fn an_unregistered_background_task_is_cancelled_and_reported_while_a_spawned_task_completes() {
+    require_host_interpreter!();
     // §15.8: unbounded background work is refused. A task created via the
     // documented `context.spawn` is admitted and runs on the host-managed
     // background loop; a raw un-registered pending task is cancelled at

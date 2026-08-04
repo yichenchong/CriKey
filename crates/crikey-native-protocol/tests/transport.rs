@@ -54,6 +54,17 @@ fn listener_rejects_stdio_endpoint() {
         Err(ProtocolError::Malformed(_))
     ));
 }
+#[test]
+fn stdio_survives_read_timeout_request() {
+    let mut connection = transport::stdio();
+    assert!(!connection.supports_read_timeout());
+    connection
+        .set_read_timeout(Some(Duration::from_millis(1)))
+        .expect("unsupported timeout must remain a no-op for stdio");
+    connection
+        .set_read_timeout(None)
+        .expect("clearing an unsupported timeout must remain harmless");
+}
 
 #[cfg(unix)]
 mod unix_tests {

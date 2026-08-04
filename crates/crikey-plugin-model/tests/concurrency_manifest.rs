@@ -186,6 +186,19 @@ fn a_budget_beyond_the_u32_ceiling_is_a_parse_error() {
     );
 }
 
+/// The upper edge of the declared integer type is valid and must survive
+/// parsing without truncation. The supervisor owns any separate policy cap;
+/// the manifest layer must preserve this `u32` declaration exactly.
+#[test]
+fn a_budget_at_the_u32_ceiling_is_preserved() {
+    let section = concurrency(&format!(
+        "\n[concurrency]\n\
+         max-catalog-tasks = {}\n",
+        u32::MAX
+    ));
+    assert_eq!(section.max_catalog_tasks, Some(u32::MAX));
+}
+
 /// The concurrency section rides alongside the other spec 19.1 tables; adding
 /// it must not disturb them, and they must not swallow its keys.
 #[test]

@@ -26,6 +26,8 @@ use std::fmt;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -296,15 +298,18 @@ pub fn discover_interpreter_in(
 /// symlink to 3.12 and `python3` may be 3.6, so only the interpreter's own
 /// answer decides whether plugin code may run on it.
 fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, WorkerError> {
-    let mut child = Command::new(path)
+    let mut command = Command::new(path);
+    command
         .args(VERSION_PROBE_ARGS)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| WorkerError::PythonUnavailable {
-            path: Some(path.to_path_buf()),
-            reason: format!("the interpreter could not be executed: {error}"),
-        })?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(|error| WorkerError::PythonUnavailable {
+        path: Some(path.to_path_buf()),
+        reason: format!("the interpreter could not be executed: {error}"),
+    })?;
+    let process_id = child.id();
 
     let stdout = child.stdout.take().expect("probe stdout is piped");
     let stderr = child.stderr.take().expect("probe stderr is piped");
@@ -330,7 +335,7 @@ fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, WorkerEr
     }
 
     if status.is_none() {
-        let _ = child.kill();
+        hard_kill_probe(process_id, &mut child);
         status = wait_probe_bounded(&mut child, PROBE_REAP_GRACE);
         if status.is_none() {
             reap_probe_in_background(child);
@@ -395,6 +400,32 @@ fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, WorkerEr
         version: found,
         source,
     })
+}
+
+fn hard_kill_probe(process_id: u32, child: &mut Child) {
+    // Only the Unix path can reach the probe's process group; on Windows the
+    // child handle is the whole story, so the id is deliberately unused there
+    // rather than absent from the signature.
+    #[cfg(unix)]
+    kill_probe_process_group(process_id);
+    #[cfg(not(unix))]
+    let _ = process_id;
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn kill_probe_process_group(pgid: u32) {
+    extern "C" {
+        fn killpg(pgrp: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    #[allow(
+        unsafe_code,
+        reason = "no safe std API kills a process group; the probe created this validated pgid"
+    )]
+    unsafe {
+        let _ = killpg(pgid as i32, SIGKILL);
+    }
 }
 
 fn spawn_probe_reader<R: Read + Send + 'static>(mut reader: R) -> Receiver<Vec<u8>> {

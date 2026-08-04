@@ -1528,7 +1528,10 @@ fn an_action_failure_becomes_visible_on_the_selected_row() {
     select_index(&mut view_model, 1);
     let _ = expect_frame(&mut view_model);
 
-    view_model.set_selected_status("launch failed: access denied".to_owned());
+    assert!(
+        view_model.set_selected_status("launch failed: access denied".to_owned()),
+        "a selected row is there to carry the message"
+    );
     let frame = expect_frame(&mut view_model);
 
     assert_eq!(frame.selected, 1);
@@ -1537,4 +1540,99 @@ fn an_action_failure_becomes_visible_on_the_selected_row() {
         frame.rows[1].status.as_deref(),
         Some("launch failed: access denied")
     );
+}
+
+#[test]
+fn an_action_failure_reports_itself_undelivered_when_no_row_is_selected() {
+    let generation = fresh_generation();
+    let mut view_model = open_showing(generation, &["alpha"]);
+    let _ = expect_frame(&mut view_model);
+
+    // The action outlives the results it was started from: a republish empties
+    // the list before the failure comes back.
+    view_model.publish(generation, Vec::new(), false);
+    let frame = expect_frame(&mut view_model);
+    assert!(frame.rows.is_empty());
+
+    assert!(
+        !view_model.set_selected_status("launch failed: access denied".to_owned()),
+        "there is no row to carry the message, and the caller must be told"
+    );
+    expect_idle(&mut view_model);
+}
+
+// ---------------------------------------------------------------------------
+// Boundary inputs: a one-row list and non-ASCII text.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn navigation_stays_put_on_a_single_result() {
+    let generation = fresh_generation();
+    let mut view_model = open_showing(generation, &["only"]);
+    assert_eq!(expect_frame(&mut view_model).selected, 0);
+
+    for command in [
+        UiCommand::SelectNext,
+        UiCommand::PageDown,
+        UiCommand::SelectPrevious,
+        UiCommand::PageUp,
+    ] {
+        assert_eq!(view_model.apply(command), None);
+        expect_idle(&mut view_model);
+    }
+
+    assert_eq!(
+        view_model.apply(UiCommand::ExecuteDefault),
+        Some(UiEffect::Execute {
+            item: ItemId("only".to_owned()),
+            action: ActionId("run".to_owned()),
+        }),
+        "the one row is still the selected, executable one"
+    );
+}
+
+#[test]
+fn a_query_of_multi_byte_characters_survives_editing_and_completion() {
+    let generation = fresh_generation();
+    let mut view_model = LauncherViewModel::new();
+    view_model.activate();
+    view_model.begin_generation(generation);
+
+    // Two-, three- and four-byte characters, plus one that is several code
+    // points: nothing here may be sliced on a byte index.
+    let typed = "café 日本語 👩‍💻";
+    assert_eq!(
+        view_model.apply(UiCommand::SetQuery(typed.to_owned())),
+        Some(UiEffect::Query(typed.to_owned()))
+    );
+    assert_eq!(expect_frame(&mut view_model).query, typed);
+
+    // Dropping the last character is an ordinary edit of a shorter string, not
+    // a one-byte truncation of the old one.
+    let mut shortened = typed.to_owned();
+    shortened.pop();
+    assert_eq!(
+        view_model.apply(UiCommand::SetQuery(shortened.clone())),
+        Some(UiEffect::Query(shortened.clone()))
+    );
+    assert_eq!(expect_frame(&mut view_model).query, shortened);
+
+    let mut completion = row("naïve");
+    completion.label = "naïve étude".to_owned();
+    view_model.publish(generation, vec![completion], false);
+    assert_eq!(expect_frame(&mut view_model).query, shortened);
+
+    assert_eq!(
+        view_model.apply(UiCommand::Complete),
+        Some(UiEffect::Query("naïve étude".to_owned()))
+    );
+    assert_eq!(expect_frame(&mut view_model).query, "naïve étude");
+
+    assert_eq!(
+        view_model.apply(UiCommand::Cancel),
+        Some(UiEffect::Query(String::new())),
+        "the first cancel clears the query rather than dismissing"
+    );
+    assert_eq!(expect_frame(&mut view_model).query, "");
+    assert!(view_model.is_visible());
 }

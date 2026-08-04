@@ -60,6 +60,9 @@ pub struct DiscoveredApplication {
     /// Platform native identifier, e.g. a Windows AppUserModelID or a Linux
     /// desktop-entry id.
     pub platform_id: Option<String>,
+    /// Directory the process should start in when the platform records one.
+    /// `None` means inherit the launcher's working directory.
+    pub working_directory: Option<PlatformPath>,
 }
 
 pub trait ApplicationDiscovery {
@@ -77,6 +80,9 @@ const MAX_APPLICATION_ARGUMENTS: usize = 4_096;
 
 /// Metadata key holding how many launch arguments an item records.
 const ARGUMENT_COUNT_KEY: &str = "application.argument.count";
+
+/// Metadata key holding the encoded working directory, when one was recorded.
+pub const APPLICATION_WORKING_DIRECTORY_KEY: &str = "application.working_directory";
 
 /// Prefix of the per-index launch-argument metadata keys.
 ///
@@ -106,9 +112,9 @@ pub fn application_items(plugin: &PluginId, discovered: &[DiscoveredApplication]
                 search_terms: vec![application.name.clone()],
                 icon_reference: application.icon_reference.clone(),
                 argument_policy: ArgumentPolicy::Forbidden,
+                metadata: argument_metadata(&application.arguments, application.working_directory.as_ref()),
                 hit_policy: HitPolicy::Recorded,
                 score_hint: 0,
-                metadata: argument_metadata(&application.arguments),
                 actions: vec![Action {
                     action_id: ActionId(APPLICATION_LAUNCH_ACTION_ID.to_owned()),
                     label: "Launch".to_owned(),
@@ -122,12 +128,21 @@ pub fn application_items(plugin: &PluginId, discovered: &[DiscoveredApplication]
         .collect()
 }
 
-/// Records the launch arguments as a count plus one key per index.
-fn argument_metadata(arguments: &[String]) -> BTreeMap<String, String> {
+/// Records launch arguments and an optional encoded working directory.
+fn argument_metadata(
+    arguments: &[String],
+    working_directory: Option<&PlatformPath>,
+) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     metadata.insert(ARGUMENT_COUNT_KEY.to_owned(), arguments.len().to_string());
     for (index, argument) in arguments.iter().enumerate() {
         metadata.insert(format!("{ARGUMENT_KEY_PREFIX}{index}"), argument.clone());
+    }
+    if let Some(working_directory) = working_directory {
+        metadata.insert(
+            APPLICATION_WORKING_DIRECTORY_KEY.to_owned(),
+            encode_target(working_directory),
+        );
     }
     metadata
 }
@@ -158,6 +173,19 @@ pub fn application_arguments(item: &Item) -> Result<Vec<String>> {
         arguments.push(argument.clone());
     }
     Ok(arguments)
+}
+/// Rebuilds the optional working directory recorded by [`application_items`].
+///
+/// Missing metadata means the launcher inherits its own working directory.
+/// Present metadata is decoded losslessly and malformed values are rejected
+/// rather than silently changing where an application starts.
+pub fn application_working_directory(item: &Item) -> Result<Option<PlatformPath>> {
+    let Some(encoded) = item.metadata.get(APPLICATION_WORKING_DIRECTORY_KEY) else {
+        return Ok(None);
+    };
+    decode_target(encoded)
+        .map(Some)
+        .map_err(|error| CoreError::Invalid(format!("application working directory is invalid: {error}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -802,7 +830,6 @@ fn canonical_key(component: &str) -> Option<&'static str> {
             return DIGIT_KEYS.get(index..=index);
         }
     }
-
     function_key(component)
 }
 
@@ -827,6 +854,19 @@ fn function_key(component: &str) -> Option<&'static str> {
 
 pub trait ProcessLauncher {
     fn launch(&self, target: &PlatformPath, args: &[String]) -> Result<()>;
+    /// Starts a target in an optional working directory.
+    ///
+    /// The default preserves existing backends by ignoring the directory. A
+    /// backend that can honor it should override this method.
+    fn launch_in(
+        &self,
+        target: &PlatformPath,
+        args: &[String],
+        working_directory: Option<&PlatformPath>,
+    ) -> Result<()> {
+        let _ = working_directory;
+        self.launch(target, args)
+    }
     fn open_uri(&self, uri: &str) -> Result<()>;
 }
 

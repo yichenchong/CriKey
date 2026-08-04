@@ -781,6 +781,9 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
             profile,
             compatibility,
         } = registration;
+        if self.plugins.contains_key(&plugin) {
+            self.invalidate_plugin_display(&plugin);
+        }
         let id = self.mint_instance();
 
         // Registration is also the instance-supersession path used by package
@@ -981,6 +984,7 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
         if !self.plugins.contains_key(plugin) {
             return Err(LegacyRuntimeError::UnknownPlugin(plugin.clone()));
         }
+        self.invalidate_plugin_display(plugin);
         let replacement = self.mint_instance();
         let Some(record) = self.plugins.get_mut(plugin) else {
             return Err(LegacyRuntimeError::UnknownPlugin(plugin.clone()));
@@ -1590,12 +1594,18 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
     // -- internals ----------------------------------------------------------
 
     fn mint_generation(&mut self) -> Generation {
-        self.next_generation += 1;
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("legacy query generation counter exhausted at u64::MAX");
         Generation::from_raw(self.next_generation)
     }
 
     fn mint_instance(&mut self) -> InstanceId {
-        self.next_instance += 1;
+        self.next_instance = self
+            .next_instance
+            .checked_add(1)
+            .expect("legacy instance counter exhausted at u64::MAX");
         InstanceId(self.next_instance)
     }
 
@@ -1915,6 +1925,15 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
         );
     }
 
+    /// A reload or duplicate registration invalidates results produced by the
+    /// superseded instance. Keeping them selectable would route an old item to
+    /// a new package instance.
+    fn invalidate_plugin_display(&mut self, plugin: &PluginId) {
+        self.visible.retain(|item| &item.plugin_id != plugin);
+        if self.selected.as_ref().is_some_and(|(owner, _)| owner == plugin) {
+            self.selected = None;
+        }
+    }
     /// One plugin's contribution to the display replaces its previous one; the
     /// other plugins' answers for the same generation are untouched.
     fn replace_visible(&mut self, plugin: &PluginId, items: Vec<Item>) {

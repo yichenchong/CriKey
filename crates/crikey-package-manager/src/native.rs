@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use crate::index::constant_time_hex_eq;
 use crate::PackageError;
 
 const MANIFEST_MEMBER: &str = "crikey.toml";
@@ -155,9 +156,8 @@ pub fn verify_package(
     expected_hash: Option<&str>,
 ) -> Result<NativePackageReport, PackageError> {
     let package = load_package(archive)?;
-    validate_integrity(&package)?;
     if let Some(expected) = expected_hash {
-        if !is_hex_sha256(expected) || !package.archive_hash.eq_ignore_ascii_case(expected) {
+        if !is_hex_sha256(expected) || !constant_time_hex_eq(&package.archive_hash, expected) {
             return Err(PackageError::HashMismatch(format!(
                 "archive hash is {}, expected {expected}",
                 package.archive_hash
@@ -604,7 +604,7 @@ fn validate_integrity(package: &LoadedPackage) -> Result<(), PackageError> {
             .get(&name)
             .ok_or_else(|| PackageError::HashMismatch(format!("{LOCK_MEMBER} has no digest for {name}")))?;
         let actual = sha256_hex(&package.members[&name].bytes);
-        if !is_hex_sha256(expected) || !expected.eq_ignore_ascii_case(&actual) {
+        if !is_hex_sha256(expected) || !constant_time_hex_eq(expected, &actual) {
             return Err(PackageError::HashMismatch(format!(
                 "digest mismatch for archive member {name}"
             )));

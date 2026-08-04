@@ -55,6 +55,9 @@ pub struct Debouncer {
     /// When the newest query arrived.
     last_change: Millis,
     last_dispatch: Option<Millis>,
+    /// Highest timestamp observed so a late event cannot move a deadline
+    /// backwards.
+    last_observed: Option<Millis>,
 }
 
 impl Debouncer {
@@ -65,6 +68,7 @@ impl Debouncer {
             burst_started: None,
             last_change: 0,
             last_dispatch: None,
+            last_observed: None,
         }
     }
 
@@ -76,13 +80,40 @@ impl Debouncer {
         self.pending
     }
 
-    /// Records a query change and reports the resulting dispatch decision.
     pub fn on_query(&mut self, now: Millis, generation: Generation, query_len: usize) -> Dispatch {
+        let now = self.observe(now);
         if query_len < self.policy.minimum_query_length {
             // Leaving relevance must re-arm the leading edge for the next admissible
             // query, not merely discard the pending generation.
             self.reset();
             return Dispatch::Idle;
+        }
+
+        // A policy with neither edge enabled has no legal dispatch point. Do not
+        // retain a request that can never be woken.
+        if !self.policy.leading_edge && !self.policy.trailing_edge {
+            self.pending = None;
+            self.burst_started = None;
+            return Dispatch::Idle;
+        }
+
+        // Leading-only policies intentionally ignore later changes while the
+        // plugin remains relevant. They must not retain an unreachable pending
+        // request.
+        if !self.policy.trailing_edge && self.last_dispatch.is_some() {
+            self.pending = None;
+            return Dispatch::Idle;
+        }
+
+        // A quiet gap after a leading dispatch starts a fresh burst even
+        // though the plugin may remain relevant.
+        if self.pending.is_none()
+            && self.burst_started.is_some()
+            && self
+                .last_dispatch
+                .is_some_and(|last| now.saturating_sub(last) >= self.policy.debounce_ms)
+        {
+            self.burst_started = None;
         }
 
         // Coalesce: the newest query replaces any older undispatched one.
@@ -92,10 +123,11 @@ impl Debouncer {
 
         let newly_relevant = self.last_dispatch.is_none();
         if self.policy.leading_edge && newly_relevant {
-            return self.dispatch(now);
+            return self.dispatch(now, false);
         }
 
         if !self.policy.trailing_edge {
+            self.pending = None;
             return Dispatch::Idle;
         }
 
@@ -109,16 +141,21 @@ impl Debouncer {
 
     /// Called when a previously requested wake-up time is reached.
     pub fn on_timer(&mut self, now: Millis) -> Dispatch {
+        let now = self.observe(now);
+        if !self.policy.trailing_edge {
+            self.pending = None;
+            return Dispatch::Idle;
+        }
         let Some(_) = self.pending else {
             return Dispatch::Idle;
         };
-        let trailing_ready = now.saturating_sub(self.last_change) >= self.policy.debounce_ms;
+        let trailing_ready = now >= self.last_change.saturating_add(self.policy.debounce_ms);
         let max_wait_ready = match (self.policy.maximum_wait_ms, self.burst_started) {
-            (Some(max_wait), Some(start)) => now.saturating_sub(start) >= max_wait,
+            (Some(max_wait), Some(start)) => now >= start.saturating_add(max_wait),
             _ => false,
         };
         if trailing_ready || max_wait_ready {
-            self.dispatch(now)
+            self.dispatch(now, true)
         } else {
             let trailing_at = self.last_change.saturating_add(self.policy.debounce_ms);
             let deadline = match (self.policy.maximum_wait_ms, self.burst_started) {
@@ -137,11 +174,19 @@ impl Debouncer {
         self.last_dispatch = None;
     }
 
-    fn dispatch(&mut self, now: Millis) -> Dispatch {
+    fn dispatch(&mut self, now: Millis, reset_burst: bool) -> Dispatch {
         let generation = self.pending.take().expect("dispatch requires a pending query");
-        self.burst_started = None;
+        if reset_burst {
+            self.burst_started = None;
+        }
         self.last_dispatch = Some(now);
         Dispatch::Now(generation)
+    }
+
+    fn observe(&mut self, now: Millis) -> Millis {
+        let now = self.last_observed.map_or(now, |last| last.max(now));
+        self.last_observed = Some(now);
+        now
     }
 }
 
@@ -199,8 +244,10 @@ mod tests {
             d.on_query(now, latest, step as usize);
             now += 10;
         }
-        // Typing never paused for 50 ms, but the maximum wait forces dispatch.
-        assert_eq!(d.on_timer(130), Dispatch::Now(latest));
+        // The leading edge starts the same burst, so the maximum is measured
+        // from timestamp zero rather than from the first trailing update.
+        assert_eq!(d.on_timer(119), Dispatch::At(120));
+        assert_eq!(d.on_timer(120), Dispatch::Now(latest));
     }
     #[test]
     fn minimum_query_length_gates_dispatch() {
@@ -250,5 +297,67 @@ mod tests {
             "an early wake-up must preserve the earlier maximum-wait deadline"
         );
         assert_eq!(d.on_timer(50), Dispatch::Now(latest));
+    }
+
+    #[test]
+    fn leading_only_does_not_retain_an_unreachable_request() {
+        let policy = DebouncePolicy {
+            leading_edge: true,
+            trailing_edge: false,
+            ..Default::default()
+        };
+        let mut d = Debouncer::new(policy);
+        let first = gen(1);
+        let second = gen(2);
+        assert_eq!(d.on_query(10, first, 1), Dispatch::Now(first));
+        assert_eq!(d.on_query(20, second, 2), Dispatch::Idle);
+        assert_eq!(d.pending(), None);
+        assert_eq!(d.on_timer(70), Dispatch::Idle);
+    }
+
+    #[test]
+    fn backwards_timestamps_do_not_move_a_deadline_earlier() {
+        let policy = DebouncePolicy {
+            debounce_ms: 50,
+            maximum_wait_ms: None,
+            leading_edge: false,
+            trailing_edge: true,
+            ..Default::default()
+        };
+        let mut d = Debouncer::new(policy);
+        let latest = gen(1);
+        assert_eq!(d.on_query(100, latest, 1), Dispatch::At(150));
+        assert_eq!(d.on_query(90, latest, 1), Dispatch::At(150));
+        assert_eq!(d.on_timer(149), Dispatch::At(150));
+        assert_eq!(d.on_timer(150), Dispatch::Now(latest));
+    }
+
+    #[test]
+    fn zero_debounce_dispatches_on_an_equal_timestamp() {
+        let policy = DebouncePolicy {
+            debounce_ms: 0,
+            maximum_wait_ms: Some(0),
+            leading_edge: false,
+            trailing_edge: true,
+            ..Default::default()
+        };
+        let mut d = Debouncer::new(policy);
+        let latest = gen(1);
+        assert_eq!(d.on_query(7, latest, 1), Dispatch::At(7));
+        assert_eq!(d.on_timer(7), Dispatch::Now(latest));
+    }
+    #[test]
+    fn saturated_deadline_at_max_timestamp_still_dispatches() {
+        let policy = DebouncePolicy {
+            debounce_ms: 1,
+            maximum_wait_ms: Some(2),
+            leading_edge: false,
+            trailing_edge: true,
+            ..Default::default()
+        };
+        let mut d = Debouncer::new(policy);
+        let latest = gen(1);
+        assert_eq!(d.on_query(u64::MAX, latest, 1), Dispatch::At(u64::MAX));
+        assert_eq!(d.on_timer(u64::MAX), Dispatch::Now(latest));
     }
 }

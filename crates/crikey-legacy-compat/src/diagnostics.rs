@@ -345,10 +345,23 @@ impl CompatibilityWarning {
                 module,
                 symbol,
                 support,
-            } => format!(
-                "`{module}.{symbol}` is not available in the legacy compatibility layer; the \
-                 compatibility matrix classifies it as `{support}`"
-            ),
+            } => match support {
+                ApiSupport::Partial => format!(
+                    "`{module}.{symbol}` is only partially available in the legacy compatibility \
+                     layer; the compatibility matrix classifies it as `{support}`"
+                ),
+                ApiSupport::Planned => format!(
+                    "`{module}.{symbol}` is not yet available in the legacy compatibility layer; \
+                     the compatibility matrix classifies it as `{support}`"
+                ),
+                ApiSupport::Unsupported => format!(
+                    "`{module}.{symbol}` is unsupported by the legacy compatibility layer; the \
+                     compatibility matrix classifies it as `{support}`"
+                ),
+                ApiSupport::WindowsOnly | ApiSupport::Full | ApiSupport::BehaviouralDifference => {
+                    format!("`{module}.{symbol}` is classified `{support}` in the compatibility matrix")
+                }
+            },
             CompatibilityIssue::UnsupportedImport { module, detail } => format!(
                 "the plugin imports `{module}`, which the legacy compatibility layer does not \
                  provide: {detail}"
@@ -411,10 +424,22 @@ impl CompatibilityWarning {
                 module,
                 symbol,
                 support,
-            } => Some(format!(
-                "`{module}.{symbol}` is classified `{support}`; guard the call with `hasattr` and \
-                 fall back, or drop the feature that needs it"
-            )),
+            } => match support {
+                ApiSupport::Partial => Some(format!(
+                    "`{module}.{symbol}` is partially supported; account for the documented gap \
+                     in the compatibility matrix, or avoid the feature when that gap matters"
+                )),
+                ApiSupport::Planned | ApiSupport::Unsupported => Some(format!(
+                    "`{module}.{symbol}` is classified `{support}`; guard the call with `hasattr` \
+                     and fall back, or drop the feature that needs it"
+                )),
+                ApiSupport::WindowsOnly | ApiSupport::Full | ApiSupport::BehaviouralDifference => {
+                    Some(format!(
+                        "`{module}.{symbol}` is classified `{support}`; check the matrix caveat \
+                         before relying on this access"
+                    ))
+                }
+            },
             CompatibilityIssue::UnsupportedImport { module, .. } => Some(format!(
                 "remove `import {module}` or wrap it in `try`/`except ImportError` and degrade \
                  gracefully; the layer provides only the documented `keypirinha`, \

@@ -6,6 +6,17 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Coroutine, Iterable, Protocol
 
+__all__ = [
+    "Action",
+    "Item",
+    "Plugin",
+    "Query",
+    "SuggestContext",
+    "WorkerContext",
+    "PLUGIN_DEFINED_PREFIX",
+    "plugin_defined_category",
+]
+
 
 @dataclass(frozen=True)
 class Action:
@@ -99,20 +110,24 @@ class Plugin:
     both supported; asynchronous callbacks run on the worker's event loop.
     """
 
-    def start(self) -> None | Awaitable[None]: ...
+    def start(self) -> None | Awaitable[None]:
+        return None
 
     def build_catalog(self) -> Iterable[Item] | Awaitable[Iterable[Item]] | None:
         return ()
 
     def suggest(
         self, query: Query, context: SuggestContext
-    ) -> None | Awaitable[None]: ...
+    ) -> None | Awaitable[None]:
+        return None
 
     def execute(
         self, item: Item, action_id: str | None, argument: str | None
-    ) -> None | Awaitable[None]: ...
+    ) -> None | Awaitable[None]:
+        return None
 
-    def stop(self) -> None | Awaitable[None]: ...
+    def stop(self) -> None | Awaitable[None]:
+        return None
 
 
 class WorkerContext:

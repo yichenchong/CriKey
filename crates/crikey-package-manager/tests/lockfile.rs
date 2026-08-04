@@ -56,6 +56,15 @@ fn serialisation_is_independent_of_in_memory_package_order() {
 }
 
 #[test]
+fn serialised_lockfiles_carry_an_explicit_format_version() {
+    let text = sorted_lockfile().to_toml();
+    assert!(
+        text.starts_with("format_version = 1\n"),
+        "lockfiles must identify the format that readers validate, got {text:?}"
+    );
+}
+
+#[test]
 fn a_round_tripped_lockfile_preserves_every_pinned_field() {
     let original = sorted_lockfile();
     let restored = Lockfile::from_toml(&original.to_toml()).expect("deserialises");

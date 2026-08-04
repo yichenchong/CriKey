@@ -31,6 +31,8 @@ single-slot state rather than of bookkeeping here (spec 7.1).
 """
 
 import enum
+import math
+
 import sys
 import time
 
@@ -516,7 +518,7 @@ class Settings:
             key,
             section,
             fallback,
-            float,
+            _parse_float,
             "a number",
             minimum=min,
             maximum=max,
@@ -547,6 +549,13 @@ def _parse_bool(raw):
     if folded in _FALSE_WORDS:
         return False
     raise ValueError(raw)
+
+
+def _parse_float(raw):
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(raw)
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -608,8 +617,15 @@ def should_terminate(delay=None):
         return False
 
     poll = _host_capability("should_terminate")
-
-    if not delay:
+    if delay is None:
+        return bool(poll())
+    try:
+        seconds = float(delay)
+    except (TypeError, ValueError):
+        raise TypeError("delay must be a finite number of seconds") from None
+    if not math.isfinite(seconds):
+        raise ValueError("delay must be a finite number of seconds")
+    if seconds <= 0.0:
         return bool(poll())
 
     # The host's own event wakes the instant the flag is raised: no clock
@@ -618,9 +634,9 @@ def should_terminate(delay=None):
     if callable(waitable):
         event = waitable()
         if event is not None:
-            return bool(event.wait(delay))
+            return bool(event.wait(seconds))
 
-    deadline = time.monotonic() + float(delay)
+    deadline = time.monotonic() + seconds
     while True:
         if poll():
             return True
@@ -658,7 +674,9 @@ def _install_stdout_guard(replacement=None):
                 newline="\n",
                 write_through=True,
             )
-        elif getattr(_PROTOCOL_STDOUT, "encoding", "utf-8").lower().replace("-", "") != "utf8":
+        elif (getattr(_PROTOCOL_STDOUT, "encoding", None) or "utf-8").lower().replace(
+            "-", ""
+        ) != "utf8":
             raise ValueError("the protocol stdout stream cannot be configured as UTF-8")
         sys.stdout = sys.stderr if replacement is None else replacement
     return _PROTOCOL_STDOUT

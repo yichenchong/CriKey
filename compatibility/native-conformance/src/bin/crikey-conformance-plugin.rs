@@ -169,7 +169,9 @@ fn pid_item() -> crikey_core::Item {
 }
 
 fn wait_for_cancellation(context: &dyn PluginContext, milliseconds: u64) -> bool {
-    let deadline = Instant::now() + Duration::from_millis(milliseconds);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(milliseconds))
+        .unwrap_or_else(Instant::now);
     loop {
         if context.cancellation().is_cancelled() {
             return true;

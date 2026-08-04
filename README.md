@@ -124,13 +124,14 @@ To have it happen without being asked, install the timer described in
 
 ### Python
 
-The Python software development kit and the legacy compatibility shim are
-driven by real interpreters during tests. Use a virtual environment rather than
-a system-wide interpreter:
+The Python software development kit, legacy compatibility shim, and synthetic
+test plugins are driven by real interpreters during tests. Use a virtual
+environment rather than a system-wide interpreter:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m compileall -q sdk/python crates/crikey-legacy-compat/python
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m compileall -q \
+    sdk/python crates/crikey-legacy-compat/python compatibility/test-plugins
 ```
 
 `.venv/` is ignored by git. Set `CRIKEY_PYTHON` to point the interpreter

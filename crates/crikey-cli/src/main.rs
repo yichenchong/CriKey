@@ -439,8 +439,7 @@ fn run_native_launcher() -> Result<(), String> {
                         completion.plugin.0, completion.action_id.0
                     ),
                 };
-                eprintln!("crikey: {message}");
-                view_model.set_selected_status(message);
+                report_status(&mut view_model, message);
             }
             // into the retained view model, so a later navigation keystroke
             // keeps them. `publish` refuses a superseded or retired generation,
@@ -621,13 +620,10 @@ fn run_native_launcher() -> Result<(), String> {
                             "Action pending ({} / request {})",
                             request_id.plugin.0, request_id.sequence
                         );
-                        view_model.set_selected_status(message.clone());
-                        eprintln!("crikey: {message}");
+                        report_status(&mut view_model, message);
                     }
                     Err(error) => {
-                        let message = format!("Launch failed: {error}");
-                        view_model.set_selected_status(message.clone());
-                        eprintln!("crikey: {message}");
+                        report_status(&mut view_model, format!("Launch failed: {error}"));
                     }
                 },
                 None => {}
@@ -646,6 +642,40 @@ fn run_native_launcher() -> Result<(), String> {
     outcome
 }
 
+/// Tells the operator about an action's outcome and puts it on the selected
+/// result.
+///
+/// The launcher can only show the message when a result is selected, and the
+/// list may have emptied while the action was running. In that case the
+/// message would otherwise vanish, so say plainly that it is not on screen
+/// rather than leaving the operator to wonder why nothing appeared.
+fn report_status(view_model: &mut LauncherViewModel, message: String) {
+    eprintln!("crikey: {message}");
+    if !view_model.set_selected_status(message) {
+        eprintln!("crikey: no result is selected, so the message above is not shown in the launcher");
+    }
+}
+
+/// Reads a platform path-list environment variable as plugin roots.
+///
+/// Empty components are ignored instead of becoming the current directory,
+/// and duplicate roots are removed while preserving the operator's order.
+/// Scanning one root twice would try to register every plugin twice and turn a
+/// harmless repeated path into a spurious duplicate-plugin diagnostic.
+fn configured_plugin_roots(variable: &str) -> Vec<std::path::PathBuf> {
+    let Some(value) = std::env::var_os(variable) else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    for path in std::env::split_paths(&value) {
+        if path.as_os_str().is_empty() || roots.iter().any(|root| root == &path) {
+            continue;
+        }
+        roots.push(path);
+    }
+    roots
+}
+
 /// Directories scanned for legacy packages on the live path (spec 14.3).
 ///
 /// Read from `CRIKEY_LEGACY_PACKAGE_ROOTS` using the platform path-list syntax,
@@ -654,24 +684,18 @@ fn run_native_launcher() -> Result<(), String> {
 /// milestone; an unset variable means no legacy roots, which loads nothing
 /// rather than failing.
 fn legacy_package_roots() -> Vec<std::path::PathBuf> {
-    match std::env::var_os("CRIKEY_LEGACY_PACKAGE_ROOTS") {
-        Some(value) => std::env::split_paths(&value).collect(),
-        None => Vec::new(),
-    }
+    configured_plugin_roots("CRIKEY_LEGACY_PACKAGE_ROOTS")
 }
 
 /// Directories scanned for modern python plugins on the live path (spec 15.1).
 ///
 /// Read from `CRIKEY_MODERN_PLUGIN_ROOTS` using the platform path-list syntax,
-/// mirroring [`legacy_package_roots`]. Each root holds `<id>/crikey.toml` plugin
-/// subdirectories (contract §11). An unset variable means no modern roots, which
-/// loads nothing rather than failing — `crikey run` is unchanged on a host with
-/// none.
+/// mirroring [`legacy_package_roots`]. Each root holds `<id>/crikey.toml`
+/// plugin subdirectories (contract §11). An unset variable means no modern
+/// roots, which loads nothing rather than failing — `crikey run` is unchanged
+/// on a host with none.
 fn modern_plugin_roots() -> Vec<std::path::PathBuf> {
-    match std::env::var_os("CRIKEY_MODERN_PLUGIN_ROOTS") {
-        Some(value) => std::env::split_paths(&value).collect(),
-        None => Vec::new(),
-    }
+    configured_plugin_roots("CRIKEY_MODERN_PLUGIN_ROOTS")
 }
 
 /// Directories scanned for native packages on the live path (spec 16.1).
@@ -680,10 +704,7 @@ fn modern_plugin_roots() -> Vec<std::path::PathBuf> {
 /// this helper only applies the platform path-list syntax and keeps an unset
 /// variable equivalent to an empty discovery set.
 fn native_plugin_roots() -> Vec<std::path::PathBuf> {
-    match std::env::var_os("CRIKEY_NATIVE_PLUGIN_ROOTS") {
-        Some(value) => std::env::split_paths(&value).collect(),
-        None => Vec::new(),
-    }
+    configured_plugin_roots("CRIKEY_NATIVE_PLUGIN_ROOTS")
 }
 
 /// The offline modern package index root, read from `CRIKEY_MODERN_INDEX_ROOT`
@@ -864,7 +885,9 @@ fn catalog_cache_root() -> Result<std::path::PathBuf, String> {
 /// fall back to one.
 fn modern_cache_root() -> Result<std::path::PathBuf, String> {
     if let Some(value) = std::env::var_os("CRIKEY_MODERN_CACHE_ROOT").filter(|value| !value.is_empty()) {
-        return Ok(std::path::PathBuf::from(value));
+        let path = std::path::PathBuf::from(value);
+        create_private_dir(&path)?;
+        return Ok(path);
     }
     let base = std::env::var_os("XDG_CACHE_HOME")
         .filter(|value| !value.is_empty())
@@ -914,11 +937,10 @@ fn legacy_cache_root() -> Result<std::path::PathBuf, String> {
     create_private_dir(&path)?;
     Ok(path)
 }
-
 /// Creates `dir` (and parents) as a private, per-user directory. On unix the
 /// leaf is forced to `0700` so a cache later imported by path can never be
-/// world- or group-writable. If the directory already exists but is not ours,
-/// forcing the mode fails and the caller refuses rather than trust it.
+/// world- or group-writable. Symlink leaves are rejected: following one would
+/// secure a different directory than the configured trust root.
 fn create_private_dir(dir: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|error| {
         format!(
@@ -926,6 +948,18 @@ fn create_private_dir(dir: &std::path::Path) -> Result<(), String> {
             dir.display()
         )
     })?;
+    let metadata = std::fs::symlink_metadata(dir).map_err(|error| {
+        format!(
+            "cannot inspect private cache directory `{}`: {error}",
+            dir.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "private cache path `{}` is not a real directory",
+            dir.display()
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1895,6 +1929,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn private_cache_rejects_a_symlink_leaf() {
+        let scratch = Scratch::new("private-cache-symlink");
+        let target = scratch.path.join("target");
+        let link = scratch.path.join("link");
+        std::fs::create_dir(&target).expect("the cache target is creatable");
+        std::os::unix::fs::symlink(&target, &link).expect("the cache symlink is creatable");
+
+        assert!(
+            create_private_dir(&link).is_err(),
+            "a trust-root helper must not follow a symlink to another directory"
+        );
     }
 
     /// A launch in progress whose journal already carries one failure short of

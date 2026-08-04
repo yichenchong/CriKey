@@ -412,6 +412,38 @@ fn leading_and_trailing_dispatch_both_edges_of_one_burst() {
 }
 
 #[test]
+fn leading_and_trailing_maximum_wait_includes_the_leading_edge() {
+    let search = plugin("dev.crikey.leading-maximum");
+    let mut scheduler = scheduler();
+    scheduler.register_plugin(search.clone(), modern(50, Some(120), true, true));
+
+    let first = scheduler.submit_query("x", 0);
+    assert_eq!(shape(&scheduler.tick(0)).len(), 1);
+    let mut latest_query = String::from("x");
+    for at in (10..=100).step_by(10) {
+        latest_query.push('x');
+        scheduler.submit_query(&latest_query, at);
+        assert!(scheduler.tick(at).is_empty());
+    }
+    assert_eq!(scheduler.complete(&search, first, 110), CompletionOutcome::Stale);
+    assert!(scheduler.tick(119).is_empty());
+    let latest = scheduler.current_generation();
+    assert_eq!(
+        shape(&scheduler.tick(120)),
+        vec![(
+            "dev.crikey.leading-maximum",
+            latest.get(),
+            latest_query.as_str(),
+            120
+        )]
+    );
+    assert_eq!(
+        decisions(&scheduler, &search).last().copied(),
+        Some((120, latest.get(), DebounceDecision::MaximumWait))
+    );
+}
+
+#[test]
 fn the_maximum_wait_forces_dispatch_under_sustained_typing() {
     // Spec 8.6 + 25.1: continuous input must not postpone a plugin
     // indefinitely, and the burst window restarts after the forced dispatch.
@@ -1581,5 +1613,65 @@ fn maximum_wait_shorter_than_debounce_still_fires_at_the_maximum() {
     assert_eq!(
         shape(&scheduler.tick(20)),
         vec![("dev.crikey.short-maximum", generation.get(), "query", 20)]
+    );
+}
+
+#[test]
+fn equal_timestamps_restart_the_quiet_period_without_double_dispatch() {
+    let weather = plugin("dev.crikey.equal-time");
+    let mut scheduler = scheduler();
+    scheduler.register_plugin(weather.clone(), modern(50, None, false, true));
+
+    let first = scheduler.submit_query("a", 10);
+    assert!(scheduler.tick(10).is_empty());
+    let second = scheduler.submit_query("ab", 10);
+    assert!(scheduler.tick(10).is_empty());
+    assert_eq!(scheduler.next_wakeup(), Some(60));
+    assert_eq!(
+        shape(&scheduler.tick(60)),
+        vec![("dev.crikey.equal-time", second.get(), "ab", 60)]
+    );
+    assert!(scheduler.tick(60).is_empty());
+    assert_eq!(
+        scheduler.diagnostics().coalesced_requests,
+        1,
+        "the equal-time update replaces the first pending request exactly once"
+    );
+    assert_ne!(first, second);
+}
+
+#[test]
+fn backwards_timestamps_are_clamped_and_never_early_wake_work() {
+    let history = plugin("dev.crikey.backwards-time");
+    let mut scheduler = scheduler();
+    scheduler.register_plugin(history.clone(), modern(50, None, false, true));
+
+    scheduler.submit_query("first", 100);
+    assert!(scheduler.tick(100).is_empty());
+    let newest = scheduler.submit_query("newest", 90);
+    assert!(scheduler.tick(90).is_empty());
+    assert_eq!(
+        scheduler.next_wakeup(),
+        Some(150),
+        "a late timestamp must not pull a deadline earlier"
+    );
+    assert!(scheduler.tick(149).is_empty());
+    assert_eq!(
+        shape(&scheduler.tick(150)),
+        vec![("dev.crikey.backwards-time", newest.get(), "newest", 150)]
+    );
+    let trace_times: Vec<Millis> = scheduler
+        .trace()
+        .iter()
+        .filter_map(|event| match event {
+            QueryTraceEvent::Keystroke { at, .. }
+            | QueryTraceEvent::Debounce { at, .. }
+            | QueryTraceEvent::Dispatched { at, .. } => Some(*at),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        trace_times.windows(2).all(|pair| pair[0] <= pair[1]),
+        "clamped timestamps keep the trace chronological: {trace_times:?}"
     );
 }

@@ -6,17 +6,17 @@ the mechanics of building, testing and not running out of disk.
 
 ## Toolchain
 
-`rust-toolchain.toml` pins the `stable` channel and requests `rustfmt` and
-`clippy`. The root `Cargo.toml` declares a minimum supported Rust version.
+`rust-toolchain.toml` pins Rust `1.86.0` and requests `rustfmt` and
+`clippy`. The root `Cargo.toml` declares the same minimum supported Rust version.
 
-Before proposing a change, run what continuous integration runs:
+Before proposing a Rust change, run what the Rust job in continuous integration runs:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets
 cargo test --workspace --all-targets
+cargo check --manifest-path compatibility/native-conformance/Cargo.toml --all-targets
 ```
-
 Continuous integration sets `RUSTFLAGS: -D warnings`, so a warning fails the
 build. Check cargo's own exit status rather than a pipeline's: in a shell,
 `cargo test | grep ...` reports grep's status, not cargo's, so a failing test
@@ -37,20 +37,22 @@ not the same as running them; say which you did when reporting results.
 
 ## Python
 
-The Python software development kit under `sdk/python/` and the legacy
-compatibility shim under `crates/crikey-legacy-compat/python/` are executed by
-real interpreters during tests. Use a virtual environment, not a system-wide
-interpreter:
+The Python software development kit under `sdk/python/`, the legacy
+compatibility shim under `crates/crikey-legacy-compat/python/`, and the
+synthetic test plugins under `compatibility/test-plugins/` are compiled by
+continuous integration with Python 3.12 and executed by real interpreters during
+tests. Use a virtual environment, not a system-wide interpreter:
 
 ```sh
 python3 -m venv .venv
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m compileall -q \
-    sdk/python crates/crikey-legacy-compat/python
+    sdk/python crates/crikey-legacy-compat/python compatibility/test-plugins
 ```
 
-`.venv/` and `__pycache__/` are ignored by git. Prefer
-`PYTHONDONTWRITEBYTECODE=1` so byte-code caches are not created inside the
-tree; stray ones have been committed by accident before.
+`.venv/` and `__pycache__/` are ignored by git. The
+`PYTHONDONTWRITEBYTECODE=1` setting prevents regular imports from creating
+byte-code caches; explicit `compileall` writes its checked bytecode by design,
+and those outputs are ignored.
 
 Interpreter discovery order is the `CRIKEY_PYTHON` environment variable, then a
 configured external runtime profile, then `python3` on the search path. Set
@@ -89,7 +91,7 @@ specific investigation, ask for it on the command line for that run rather than
 widening the profile for everyone:
 
 ```sh
-CARGO_PROFILE_DEV_DEBUG=2 cargo test -p <one-crate>
+CARGO_PROFILE_TEST_DEBUG=2 cargo test -p crikey-core
 ```
 
 ### Accumulated stale artefacts
@@ -144,6 +146,9 @@ happily alongside the deletion. That is why the removal skips that one entry
 rather than deleting the directory outright. The only remaining caveat is that
 if `flock` is not installed the script falls back to a process check, which is
 advisory only.
+
+A dry run only measures and reports, so it does not create or lock
+`.cargo-lock`.
 
 ### Running it automatically
 
@@ -218,8 +223,8 @@ directory, which has two consequences worth knowing.
 A crate that fails to parse blocks everyone downstream of it, and this
 dependency graph funnels almost everything through a few low-level crates. So
 make each edit take a file from one compiling state to another, and run
-`cargo check -p <crate>` immediately after a structural change rather than
-batching several and checking at the end.
+`cargo check -p crikey-core` (using the affected package name) immediately
+after a structural change rather than batching several and checking at the end.
 
 If a build fails inside a crate you are not editing, it is very likely someone
 else's in-flight edit. Tell the owner and wait rather than fixing it yourself:

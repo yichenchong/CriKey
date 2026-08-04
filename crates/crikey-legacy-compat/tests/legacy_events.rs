@@ -1041,6 +1041,28 @@ fn an_out_of_order_raw_notification_keeps_the_burst_deadline_bounded_by_its_earl
 }
 
 #[test]
+fn pending_since_tracks_the_oldest_out_of_order_notice() {
+    let plugin = plugin("legacy.out-of-order-pending");
+    let mut coalescer = coalescer(&[&plugin]);
+
+    coalescer.post_event(&plugin, LegacyEventFlags::APP_CONFIG, 100);
+    coalescer.post_event(&plugin, LegacyEventFlags::PACKAGE_CONFIG, 10);
+    assert_eq!(
+        coalescer.pending_since(&plugin),
+        Some(10),
+        "the pending timestamp is the oldest undelivered notice, even when callbacks arrive out of order"
+    );
+
+    coalescer.note_deactivated(&plugin, 90);
+    coalescer.note_activated(&plugin, 20);
+    assert_eq!(
+        coalescer.pending_since(&plugin),
+        Some(10),
+        "replacing a lifecycle notice must not make an already queued event appear newer"
+    );
+}
+
+#[test]
 fn a_duplicate_begin_callback_cannot_replace_the_callback_already_in_flight() {
     let plugin = plugin("legacy.duplicate-callback");
     let mut coalescer = coalescer(&[&plugin]);

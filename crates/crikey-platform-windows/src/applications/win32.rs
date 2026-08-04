@@ -17,6 +17,7 @@ use windows::core::{Interface, GUID, PCWSTR, PWSTR};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ,
 };
+use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows::Win32::UI::Shell::{
     BHID_EnumItems, FOLDERID_AppsFolder, FOLDERID_CommonStartMenu, FOLDERID_StartMenu, IEnumShellItems,
     IShellItem, IShellLinkW, SHGetKnownFolderItem, SHGetKnownFolderPath, SHGetNameFromIDList, ShellLink,
@@ -139,6 +140,19 @@ fn resolve(shortcut: &Shortcut, text: &mut [u16]) -> Option<DiscoveredApplicatio
         }
         _ => resolve_id_list(&link).or(direct_target),
     }?;
+    // `GetPath` normally returns the resolved form, but shell links can retain
+    // environment-variable spelling. Expand the final target before it becomes
+    // the catalog identity, otherwise launching a link such as
+    // `%ProgramFiles%\\Tool\\tool.exe` can fail or point at the wrong path.
+    let target = expand_environment(&target)?;
+    // A shortcut can carry a working directory separately from its target.
+    // Preserve it so launching does not accidentally inherit CriKey's current
+    // directory when the shortcut relies on relative files.
+    // SAFETY: the slice is a live buffer the call writes into.
+    let working_directory = read_shell_text(text, |slot| unsafe { link.GetWorkingDirectory(slot) })
+        .filter(|directory| !directory.is_empty())
+        .and_then(|directory| expand_environment(&directory))
+        .map(PlatformPath::new);
 
     // SAFETY: as above.
     let arguments = read_shell_text(text, |slot| unsafe { link.GetArguments(slot) })
@@ -158,10 +172,43 @@ fn resolve(shortcut: &Shortcut, text: &mut [u16]) -> Option<DiscoveredApplicatio
         target: PlatformPath::new(target),
         arguments,
         icon_reference,
+        working_directory,
+
         // A Start Menu shortcut is identified by where it points, not by an
         // AppUserModelID: only packaged applications below carry one.
         platform_id: None,
     })
+}
+/// Expands `%NAME%` references in a shell-link path without truncating it.
+///
+/// The Win32 API reports the required UTF-16 capacity when called without an
+/// output buffer. A fixed bound keeps a hostile environment variable from
+/// turning discovery into an unbounded allocation; it matches the buffer used
+/// for `IShellLinkW` text and the Windows extended path limit.
+fn expand_environment(text: &OsString) -> Option<OsString> {
+    let source = wide(text);
+    let required = usize::try_from(unsafe {
+        // SAFETY: `source` is NUL terminated and remains alive for the call;
+        // `None` asks only for the required output length.
+        ExpandEnvironmentStringsW(PCWSTR(source.as_ptr()), None)
+    })
+    .ok()?;
+    if required == 0 || required > SHELL_TEXT_CAPACITY {
+        return None;
+    }
+
+    let mut expanded = vec![0u16; required];
+    let written = usize::try_from(unsafe {
+        // SAFETY: `expanded` has exactly the capacity returned by the sizing
+        // call and its pointer remains valid for this call.
+        ExpandEnvironmentStringsW(PCWSTR(source.as_ptr()), Some(&mut expanded))
+    })
+    .ok()?;
+    if written == 0 || written > expanded.len() {
+        return None;
+    }
+    let length = expanded[..written].iter().position(|unit| *unit == 0)?;
+    Some(OsString::from_wide(&expanded[..length]))
 }
 /// Retrieves a link target through its item identifier list.
 ///
@@ -275,6 +322,7 @@ fn packaged_application(item: &IShellItem) -> Option<DiscoveredApplication> {
         // line; the shell rejects arguments appended to the moniker.
         arguments: Vec::new(),
         platform_id: Some(readable),
+        working_directory: None,
     })
 }
 

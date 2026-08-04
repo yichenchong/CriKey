@@ -79,7 +79,10 @@ use std::{
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
 };
 
 use crikey_app::{App, SearchError, SearchHit, SearchService, StartupStage};
@@ -596,6 +599,30 @@ fn a_cold_cache_loads_nothing_without_failing_startup() {
         generation > Generation::ZERO,
         "an empty catalog still answers with its own generation"
     );
+}
+
+#[test]
+fn replacing_with_an_empty_catalog_removes_the_persisted_slice() {
+    let root = TempRoot::new("empty-replacement");
+    let cache = FileCatalogCache::new(root.path().to_path_buf());
+    let shared = Arc::new(cache.clone());
+    let owner = PluginId(PLUGIN.to_owned());
+
+    let mut writer = accepting_service();
+    writer.set_catalog_cache(shared.clone());
+    assert_eq!(
+        writer.replace_catalog(&owner, 1, vec![candidate("old", "Old", "", &[])]),
+        Ok(1)
+    );
+    assert_eq!(writer.replace_catalog(&owner, 2, Vec::new()), Ok(0));
+
+    let mut reader = accepting_service();
+    let loaded = reader
+        .load_persisted_catalog(shared.as_ref())
+        .expect("the cache can be reloaded after an empty replacement");
+    assert_eq!(loaded.items, 0);
+    assert_eq!(loaded.skipped, 0);
+    assert!(reader.results().is_empty());
 }
 
 #[test]
@@ -1273,6 +1300,10 @@ fn a_live_catalog_replacement_is_immediately_searchable_and_drops_the_old_slice(
         service.replace_catalog(&owner, 2, vec![candidate("new", "New Calculator", "", &[])],),
         Ok(1)
     );
+    assert!(
+        service.results().is_empty(),
+        "replacing a catalog invalidates the visible answer immediately"
+    );
     service.submit_query("old").expect("query accepted");
     assert!(
         service.results().is_empty(),
@@ -1368,6 +1399,7 @@ fn a_selected_discovered_application_launches_with_its_exact_argument_vector() {
         arguments: arguments.clone(),
         icon_reference: None,
         platform_id: None,
+        working_directory: None,
     }];
     let item = application_items(&owner, &discovered)
         .pop()
@@ -1404,4 +1436,40 @@ fn a_selected_discovered_application_launches_with_its_exact_argument_vector() {
         .collect::<Vec<_>>();
     assert_eq!(fields[0], arguments.len().to_string());
     assert_eq!(&fields[1..], arguments);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_missing_application_target_surfaces_a_launch_error() {
+    let root = TempRoot::new("missing-application");
+    let owner = PluginId("builtin.crikey.applications".to_owned());
+    let missing = root.path().join("does-not-exist");
+    let discovered = [DiscoveredApplication {
+        name: "Missing Application".to_owned(),
+        target: crikey_core::PlatformPath::from(missing),
+        arguments: Vec::new(),
+        icon_reference: None,
+        platform_id: None,
+        working_directory: None,
+    }];
+    let item = application_items(&owner, &discovered)
+        .pop()
+        .expect("one missing application becomes one item");
+    let item_id = item.stable_id.clone();
+    let action_id = item.actions[0].action_id.clone();
+
+    let mut service = accepting_service();
+    service
+        .replace_catalog(&owner, 1, vec![item])
+        .expect("application catalog accepted");
+    service
+        .submit_query("missing")
+        .expect("application query accepted");
+    let error = service
+        .execute(&item_id, &action_id)
+        .expect_err("a missing target must be reported instead of silently succeeding");
+    assert!(
+        error.to_string().contains("cannot launch"),
+        "the launch failure must identify the failed operation: {error}"
+    );
 }

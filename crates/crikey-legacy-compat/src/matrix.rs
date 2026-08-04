@@ -183,6 +183,12 @@ pub enum MatrixError {
 
     #[error("api[{index}] has an empty `{field}`, so it identifies no API")]
     EmptyApiField { index: usize, field: &'static str },
+    #[error("compatibility matrix version {version} is unsupported; expected {expected}")]
+    UnsupportedMatrixVersion { version: u32, expected: u32 },
+    #[error("api[{index}] uses unknown module `{module}`; expected one of the documented legacy modules")]
+    UnknownApiModule { index: usize, module: String },
+    #[error("package corpus version {version} is unsupported; expected {expected}")]
+    UnsupportedCorpusVersion { version: u32, expected: u32 },
 
     #[error("package[{index}] `{id}` has an empty `{field}`")]
     EmptyPackageField {
@@ -191,7 +197,7 @@ pub enum MatrixError {
         field: &'static str,
     },
 
-    #[error("package `{id}` declares source `{url}`, but corpus sources must be https URLs")]
+    #[error("package `{id}` declares source `{url}`, but corpus sources must be valid https URLs")]
     InvalidPackageSource { id: String, url: String },
 
     #[error(
@@ -230,6 +236,16 @@ pub enum MatrixError {
     UnpinnedRevision { id: String, revision: String },
 }
 
+/// Schema versions understood by this crate. A file with a newer version must
+/// fail closed: parsing it as the old shape could silently misclassify APIs.
+const MATRIX_SCHEMA_VERSION: u32 = 1;
+const CORPUS_SCHEMA_VERSION: u32 = 1;
+const DOCUMENTED_MODULES: [&str; 4] = [
+    "keypirinha",
+    "keypirinha_util",
+    "keypirinha_net",
+    "keypirinha_wintypes",
+];
 /// A full commit hash, in characters. Anything shorter is ambiguous and
 /// anything else is not a commit at all.
 const REVISION_LENGTH: usize = 40;
@@ -313,7 +329,12 @@ impl CompatibilityMatrix {
     /// reachable without touching the filesystem.
     pub fn parse(source: &str) -> Result<Self, MatrixError> {
         let raw: RawMatrix = toml::from_str(source).map_err(|source| MatrixError::Syntax { source })?;
-
+        if raw.matrix_version != MATRIX_SCHEMA_VERSION {
+            return Err(MatrixError::UnsupportedMatrixVersion {
+                version: raw.matrix_version,
+                expected: MATRIX_SCHEMA_VERSION,
+            });
+        }
         let mut entries = Vec::with_capacity(raw.api.len());
         for (index, row) in raw.api.into_iter().enumerate() {
             let module = row.module.trim();
@@ -321,6 +342,12 @@ impl CompatibilityMatrix {
                 return Err(MatrixError::EmptyApiField {
                     index,
                     field: "module",
+                });
+            }
+            if !DOCUMENTED_MODULES.contains(&module) {
+                return Err(MatrixError::UnknownApiModule {
+                    index,
+                    module: module.to_owned(),
                 });
             }
             let symbol = row.symbol.trim();
@@ -460,7 +487,12 @@ impl PluginCorpus {
     /// Validates corpus data already in memory.
     pub fn parse(source: &str) -> Result<Self, MatrixError> {
         let raw: RawCorpus = toml::from_str(source).map_err(|source| MatrixError::Syntax { source })?;
-
+        if raw.corpus_version != CORPUS_SCHEMA_VERSION {
+            return Err(MatrixError::UnsupportedCorpusVersion {
+                version: raw.corpus_version,
+                expected: CORPUS_SCHEMA_VERSION,
+            });
+        }
         let mut entries = Vec::with_capacity(raw.package.len());
         for (index, row) in raw.package.into_iter().enumerate() {
             let id = row.id.trim();
@@ -484,15 +516,15 @@ impl PluginCorpus {
                     Ok(())
                 }
             };
-
             let source_url = row.source.trim();
             require(source_url, "source")?;
-            if !source_url.starts_with("https://") {
+            if !is_valid_https_url(source_url) {
                 return Err(MatrixError::InvalidPackageSource {
                     id: id.to_string(),
                     url: source_url.to_string(),
                 });
             }
+
             let revision = row.revision.trim();
             require(revision, "revision")?;
             let licence = row.licence.trim();
@@ -695,4 +727,19 @@ fn push_prefixed_count(out: &mut String, prefix: &str, slug: &str, count: usize)
     out.push('=');
     out.push_str(&count.to_string());
     out.push('\n');
+}
+
+/// Accepts an HTTPS URL only when it has a non-empty authority. A prefix check
+/// alone would accept `https://`, which is not a usable repository reference.
+fn is_valid_https_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty()
+        && !authority.starts_with(':')
+        && !authority.ends_with(':')
+        && !authority
+            .chars()
+            .any(|character| character.is_ascii_control() || character.is_whitespace())
 }

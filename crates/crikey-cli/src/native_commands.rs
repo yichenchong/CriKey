@@ -74,7 +74,10 @@ struct ResultItem {
 #[derive(Debug)]
 struct Report {
     plugin: String,
-    protocol: u32,
+    /// The protocol version the session settled on. A handshake rejected
+    /// over the version itself never settled on one, so it stays `None`
+    /// rather than claiming a version that was never agreed.
+    protocol: Option<u32>,
     transport: &'static str,
     capabilities: String,
     catalog_items: usize,
@@ -207,7 +210,10 @@ fn unknown_help_argument(args: &[String]) -> Option<&str> {
         if matches!(argument, "-h" | "--help" | "--cancel" | "--trace") {
             position += 1;
         } else if matches!(argument, "--plugin" | "--transport" | "--query" | "--env") {
-            position = position.saturating_add(2);
+            position += 1;
+            if args.get(position).is_some_and(|value| !value.starts_with("--")) {
+                position += 1;
+            }
         } else if argument.starts_with("--plugin=")
             || argument.starts_with("--transport=")
             || argument.starts_with("--query=")
@@ -525,7 +531,7 @@ fn inspect(options: Options) -> Result<Report, String> {
     let result_count = results.len();
     Ok(Report {
         plugin,
-        protocol,
+        protocol: Some(protocol),
         transport: options.transport_name,
         capabilities,
         catalog_items,
@@ -543,8 +549,12 @@ fn inspect(options: Options) -> Result<Report, String> {
 
 fn handshake_failure_report(options: &Options, error: &HostError) -> Report {
     let detail = error.to_string().to_ascii_lowercase();
-    let protocol_ok = !detail.contains("protocol version") && !detail.contains("unsupported protocol");
-    let session_ok = !detail.contains("token");
+    // Only the host's explicit rejection phrases identify these checks. A
+    // plugin id or diagnostic may contain words such as "token" without
+    // describing a failed session token.
+    let protocol_ok =
+        !detail.contains("unsupported protocol version") && !detail.contains("unsupportedversion");
+    let session_ok = !detail.contains("session token mismatch");
     let mut checks = Vec::with_capacity(CHECKS.len());
     checks.push(check("handshake", false, "handshake was rejected"));
     checks.push(check(
@@ -572,13 +582,13 @@ fn handshake_failure_report(options: &Options, error: &HostError) -> Report {
     if options.cancel {
         checks.push(check("cancellation", false, "handshake did not complete"));
     }
-    checks.push(check("credit-discipline", false, "handshake did not complete"));
-    checks.push(check("frame-bounds", false, "handshake did not complete"));
-    checks.push(check("shutdown", false, "worker was not started"));
     let traces = Vec::new();
     Report {
         plugin: "unknown".to_owned(),
-        protocol: PROTOCOL_VERSION,
+        // The handshake failed, but unless the host rejected the version
+        // itself the session had already agreed on ours; claiming it is
+        // honest. A version rejection leaves nothing trustworthy to report.
+        protocol: protocol_ok.then_some(PROTOCOL_VERSION),
         transport: options.transport_name,
         capabilities: String::new(),
         catalog_items: 0,
@@ -643,7 +653,10 @@ fn print_report(report: &Report) {
         );
     }
     field("plugin", &report.plugin);
-    field("protocol", &report.protocol.to_string());
+    match report.protocol {
+        Some(protocol) => field("protocol", &protocol.to_string()),
+        None => field("protocol", "unknown"),
+    }
     field("transport", report.transport);
     field("capabilities", &report.capabilities);
     field("catalog_items", &report.catalog_items.to_string());
@@ -722,5 +735,33 @@ mod tests {
     fn help_does_not_hide_unknown_protocol_options() {
         let args = vec!["--help".to_owned(), "--unknown".to_owned()];
         assert!(parse_args(&args).is_err());
+        assert!(parse_args(&["--help".to_owned(), "--plugin".to_owned(), "--unknown".to_owned()]).is_err());
+    }
+    #[test]
+    fn a_failed_handshake_does_not_claim_the_host_protocol_version() {
+        let options = Options {
+            plugin: PathBuf::from("plugin"),
+            transport: TransportKind::Stdio,
+            transport_name: "stdio",
+            queries: Vec::new(),
+            cancel: false,
+            trace: false,
+            environment: Vec::new(),
+        };
+        let report = handshake_failure_report(
+            &options,
+            &HostError::Handshake("plugin `tokenizer` rejected session token".to_owned()),
+        );
+        assert_eq!(report.protocol, Some(PROTOCOL_VERSION));
+
+        let report = handshake_failure_report(
+            &options,
+            &HostError::Handshake("unsupported protocol version 99".to_owned()),
+        );
+        assert_eq!(report.protocol, None);
+        assert!(!report
+            .checks
+            .iter()
+            .any(|check| check.name == "session-token" && !check.result));
     }
 }

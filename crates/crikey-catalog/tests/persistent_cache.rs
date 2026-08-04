@@ -29,7 +29,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime},
 };
 
 use crikey_catalog::{
@@ -575,6 +579,30 @@ fn round_trip_preserves_every_field_of_a_stored_slice() {
 }
 
 #[test]
+fn a_slice_with_a_foreign_item_is_rejected_before_writing() {
+    let root = TempRoot::new("foreign-item");
+    let cache = FileCatalogCache::new(root.cache_dir());
+    let owner = plugin_id("com.example.owner");
+    let foreign = plugin_id("com.example.foreign");
+    let mut slice = fixture_slice(&owner, 1, 1, "FOREIGN");
+    slice.items[0].plugin_id = foreign;
+
+    let error = cache
+        .store_slice(&slice)
+        .expect_err("a slice must not persist an item owned by another plugin");
+    assert_eq!(
+        error,
+        CacheError::InvalidSliceOwner {
+            plugin: owner.clone()
+        }
+    );
+    assert!(
+        list_files(cache.root()).is_empty(),
+        "validation must happen before creating a cache file"
+    );
+}
+
+#[test]
 fn round_trip_survives_a_fresh_cache_handle_over_the_same_root() {
     let root = TempRoot::new("reopen");
     let plugin = plugin_id("com.example.reopen");
@@ -758,6 +786,41 @@ fn windows_device_names_are_encoded_as_safe_file_components() {
 }
 
 #[test]
+fn windows_device_names_with_extensions_are_encoded_as_safe_components() {
+    let root = TempRoot::new("windows-device-extensions");
+    let cache = FileCatalogCache::new(root.cache_dir());
+    let names = [
+        "con.txt", "prn.log", "aux.data", "nul.bin", "com1.exe", "lpt9.cfg",
+    ];
+
+    for (index, name) in names.iter().enumerate() {
+        let plugin = plugin_id(name);
+        store(&cache, &fixture_slice(&plugin, index as u64, 1, "DEVICE-EXT"));
+        assert_slice_eq(
+            &load(&cache, &plugin).expect("a reserved-name extension must round trip"),
+            &fixture_slice(&plugin, index as u64, 1, "DEVICE-EXT"),
+            name,
+        );
+    }
+
+    for path in list_files(cache.root()) {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(
+            !names
+                .iter()
+                .any(|name| { file_name.eq_ignore_ascii_case(&format!("{name}.slice")) }),
+            "a Windows device name with an extension must not be used as a cache filename: {file_name}"
+        );
+    }
+    let mut expected: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    expected.sort();
+    assert_eq!(owners(&cache), expected);
+}
+
+#[test]
 fn storing_a_slice_again_replaces_the_previous_one_without_residue() {
     let root = TempRoot::new("replace");
     let cache_dir = root.cache_dir();
@@ -792,6 +855,71 @@ fn storing_a_slice_again_replaces_the_previous_one_without_residue() {
         owners(&cache),
         vec![plugin.0.clone()],
         "replacing a slice must not register the owner twice"
+    );
+}
+
+#[test]
+fn concurrent_replacements_leave_a_complete_slice() {
+    let root = TempRoot::new("concurrent-replacements");
+    let cache = Arc::new(FileCatalogCache::new(root.cache_dir()));
+    let plugin = plugin_id("com.example.concurrent");
+
+    std::thread::scope(|scope| {
+        for worker in 0..4u64 {
+            let cache = Arc::clone(&cache);
+            let plugin = plugin.clone();
+            scope.spawn(move || {
+                for iteration in 0..8u64 {
+                    let marker = format!("CONCURRENT-{worker}-{iteration}");
+                    let slice = fixture_slice(&plugin, worker, iteration, &marker);
+                    cache
+                        .store_slice(&slice)
+                        .expect("concurrent replacement must write a complete archive");
+                }
+            });
+        }
+    });
+
+    let loaded = load(cache.as_ref(), &plugin).expect("one complete concurrent archive must remain");
+    assert_eq!(loaded.plugin, plugin);
+    assert_eq!(loaded.items.len(), 3);
+    assert!(
+        loaded.items[0].label.starts_with("CONCURRENT-"),
+        "the final archive must come from one complete writer"
+    );
+    assert!(
+        loaded.items.iter().all(|item| item.plugin_id == plugin),
+        "a concurrent write must never mix owners"
+    );
+}
+
+#[test]
+fn stale_scratch_files_are_reclaimed_without_touching_fresh_writes() {
+    let root = TempRoot::new("stale-scratch");
+    let cache = FileCatalogCache::new(root.cache_dir());
+    fs::create_dir_all(cache.root()).expect("the cache root must be creatable");
+
+    let stale = cache.root().join("tmp-old-process-1.part");
+    fs::write(&stale, b"abandoned scratch bytes").expect("the stale scratch file must be writable");
+    fs::File::open(&stale)
+        .expect("the stale scratch file must be reopenable")
+        .set_modified(SystemTime::now() - Duration::from_secs(2 * 60 * 60))
+        .expect("the test must be able to backdate the stale scratch file");
+
+    let fresh = cache.root().join("tmp-current-process-2.part");
+    fs::write(&fresh, b"active scratch bytes").expect("the fresh scratch file must be writable");
+
+    let plugin = plugin_id("com.example.stale-cleanup");
+    store(&cache, &fixture_slice(&plugin, 1, 1, "STALE-CLEANUP"));
+
+    assert!(
+        !stale.exists(),
+        "a scratch file older than the retention age must be reclaimed"
+    );
+    assert!(fresh.exists(), "a fresh scratch file must remain untouched");
+    assert!(
+        load(&cache, &plugin).is_some(),
+        "the valid store must still succeed"
     );
 }
 

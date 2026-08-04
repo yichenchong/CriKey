@@ -941,6 +941,8 @@ fn message_decoding_is_total_for_adversarial_bytes() {
         vec![0x0f],
         vec![0x08, 0x80],
         vec![0xff; 10],
+        // Field number 2^29 is outside protobuf's 29-bit field-number range.
+        vec![0x80, 0x80, 0x80, 0x80, 0x10],
         vec![0x72, 0x05, 0x0a, 0x02, b'x'],
         vec![0x72, 0x7f],
         vec![0x0d, 0, 0, 0, 0],
@@ -1090,7 +1092,15 @@ fn endpoint_specs_are_total_and_round_trip() {
         assert_eq!(parsed, endpoint);
         assert_eq!(parsed.to_spec(), spec);
     }
-    for garbage in ["", "tcp:localhost:1", "unix:", "pipe:", "stdio:extra"] {
+    for garbage in [
+        "",
+        "tcp:localhost:1",
+        "unix:",
+        "pipe:",
+        "stdio:extra",
+        "unix:/tmp/has\0nul",
+        "pipe:has\0nul",
+    ] {
         assert!(matches!(
             Endpoint::parse(garbage),
             Err(ProtocolError::Malformed(_))
@@ -1099,26 +1109,23 @@ fn endpoint_specs_are_total_and_round_trip() {
 }
 
 #[test]
-fn singular_fields_and_map_entry_keys_reject_duplicates() {
+fn singular_fields_and_map_entry_keys_use_last_value() {
     let envelope = vec![0x08, 0x01, 0x08, 0x02];
-    let result = message::Envelope::decode(&envelope);
-    assert!(
-        matches!(&result, Err(ProtocolError::Malformed(message)) if message.contains("duplicate")),
-        "duplicate singular field was accepted: {result:?}"
-    );
+    let decoded = message::Envelope::decode(&envelope).expect("proto3 permits duplicate scalars");
+    assert_eq!(decoded.connection_id, 2);
+    assert_eq!(decoded.encode(), vec![0x08, 0x02]);
 
     let action = vec![0x12, 0x01, b'a', 0x12, 0x01, b'b'];
-    let result = message::Action::decode(&action);
-    assert!(
-        matches!(&result, Err(ProtocolError::Malformed(message)) if message.contains("duplicate")),
-        "duplicate singular field was accepted: {result:?}"
-    );
+    let decoded = message::Action::decode(&action).expect("proto3 permits duplicate strings");
+    assert_eq!(decoded.label, "b");
+    assert_eq!(decoded.encode(), vec![0x12, 0x01, b'b']);
 
     let item = [0x4a, 0x09, 0x0a, 0x01, b'k', 0x12, 0x01, b'v', 0x0a, 0x01, b'x'];
-    let result = message::Item::decode(&item);
-    assert!(
-        matches!(&result, Err(ProtocolError::Malformed(message)) if message.contains("duplicate")),
-        "duplicate map-entry field was accepted: {result:?}"
+    let decoded = message::Item::decode(&item).expect("map entries use the last key/value");
+    assert_eq!(decoded.metadata.get("x"), Some(&"v".to_owned()));
+    assert_eq!(
+        decoded.encode(),
+        vec![0x4a, 0x06, 0x0a, 0x01, b'x', 0x12, 0x01, b'v']
     );
 }
 

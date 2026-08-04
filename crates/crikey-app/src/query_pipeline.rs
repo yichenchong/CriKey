@@ -392,6 +392,7 @@ impl QueryPipeline {
         self.query.push_str(text);
         self.generation = generation;
         self.unranked_batches = 0;
+        self.last_intake_drain_at = None;
         self.capture_cancellations();
 
         self.intake.begin_generation(generation);
@@ -568,9 +569,9 @@ impl QueryPipeline {
         true
     }
 
-    /// Fair-drains intake, ranks the aggregated set and publishes at most one
-    /// coalesced frame. The empty opening frame of every generation is visible,
-    /// so rows can never outlive the query generation that produced them.
+    /// Fair-drains intake, preserves plugin publication order and publishes at
+    /// most one coalesced frame. The empty opening frame of every generation is
+    /// visible, so rows can never outlive the query generation that produced them.
     pub fn present(&mut self, now: Millis) -> Option<ViewModel> {
         let (_, errors) = self.drain_intake(now);
         for error in errors {
@@ -581,8 +582,7 @@ impl QueryPipeline {
         let update = self.aggregator.take_ui_update();
         let mut rows_changed = false;
 
-        if let Some(mut items) = update {
-            items.sort_by_key(|item| std::cmp::Reverse(item.score_hint));
+        if let Some(items) = update {
             self.rows = items.into_iter().map(result_row).collect::<Vec<_>>().into();
             self.visible_generation = Some(self.generation);
             rows_changed = true;
@@ -872,6 +872,12 @@ impl QueryPipeline {
     }
 }
 
+/// Resolves the shared suggestion budget from both manifest declarations.
+///
+/// `query.max-concurrent-requests` is the scheduler's hard ceiling and
+/// defaults to one when omitted. `[concurrency].max-suggestion-requests` may
+/// tighten that ceiling, but cannot raise it; a plugin requesting more
+/// suggestion slots must repeat the higher value in the query policy.
 fn resolved_budget_for_policy(policy: &PluginPolicy, concurrency: &ConcurrencySection) -> PluginBudgetHandle {
     let scheduler_limit = u32::try_from(policy.max_concurrent_requests).unwrap_or(u32::MAX);
     let mut resolved = concurrency.clone();

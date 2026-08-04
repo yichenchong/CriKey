@@ -26,6 +26,8 @@ crikey-query.workspace = true
 crikey-ranking.workspace = true
 crikey-result-aggregator.workspace = true
 crikey-ui.workspace = true
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 crikey-platform-windows.workspace = true

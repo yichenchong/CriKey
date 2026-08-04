@@ -576,6 +576,30 @@ fn score_constructor_enforces_a_finite_totally_ordered_value() {
 }
 
 #[test]
+fn score_treats_positive_and_negative_zero_as_the_same_tie() {
+    assert_eq!(
+        Score::new(-0.0),
+        Score::new(0.0),
+        "signed zero must not become an accidental ordering key"
+    );
+    assert_eq!(Score::new(-0.0).get().to_bits(), 0.0f32.to_bits());
+
+    let ranker = ranker(true);
+    let negative_zero = RankingSignals {
+        match_quality: -0.0,
+        category_weight: -0.0,
+        query_history: -0.0,
+        user_preference: -0.0,
+        ..RankingSignals::default()
+    };
+    assert_eq!(
+        ranker.score_signals(negative_zero),
+        ranker.score_signals(RankingSignals::default()),
+        "equivalent zero-valued signal sets must produce one ordering key"
+    );
+}
+
+#[test]
 fn scores_are_totally_ordered_so_the_result_list_can_sort() {
     let r = ranker(true);
     let mixed = [
@@ -748,6 +772,36 @@ fn an_outcome_without_highlights_receives_no_position_bonus() {
     assert!(
         localized > unlocalized,
         "missing positional evidence must not receive a start-of-label bonus"
+    );
+}
+
+#[test]
+fn malformed_highlights_do_not_grant_position_evidence() {
+    let r = ranker(true);
+    let q = query("x");
+    let it = item("éx");
+    let malformed = r.score(
+        &q,
+        &it,
+        &MatchOutcome {
+            score: 0.6,
+            method: MatchMethod::Substring,
+            // The first range splits `é`; the second is outside the label.
+            highlights: vec![(1, 2), (999, 1_000)],
+        },
+    );
+    let unlocalized = r.score(
+        &q,
+        &it,
+        &MatchOutcome {
+            score: 0.6,
+            method: MatchMethod::Substring,
+            highlights: Vec::new(),
+        },
+    );
+    assert_eq!(
+        malformed, unlocalized,
+        "invalid public ranges must be ignored rather than changing rank"
     );
 }
 

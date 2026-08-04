@@ -95,6 +95,27 @@ max-concurrent-requests = 2
 max-suggestion-requests = 0
 "#;
 
+/// The query policy ceiling remains one when its declaration is omitted, even
+/// if the separate suggestion budget asks for more.
+const CONCURRENCY_ONLY_MANIFEST: &str = r#"
+manifest-version = 1
+
+[plugin]
+id = "dev.crikey.concurrency-only"
+name = "Concurrency only"
+version = "1.0.0"
+runtime = "native"
+entrypoint = "concurrency-only"
+
+[query]
+debounce-ms = 0
+leading-edge = true
+trailing-edge = true
+
+[concurrency]
+max-suggestion-requests = 8
+"#;
+
 const WASM_MANIFEST: &str = r#"
 manifest-version = 1
 
@@ -121,6 +142,24 @@ fn dispatched(pipeline: &mut QueryPipeline, now: Millis) -> Vec<PluginId> {
         .into_iter()
         .map(|dispatch| dispatch.plugin)
         .collect()
+}
+#[test]
+fn omitted_query_maximum_still_caps_an_explicit_suggestion_budget() {
+    let manifest = Manifest::parse(CONCURRENCY_ONLY_MANIFEST).expect("fixture manifest parses");
+    let plugin = PluginId(manifest.plugin.id.clone());
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    pipeline
+        .register_namespaced_manifest(plugin.clone(), &manifest)
+        .expect("fixture plugin registers");
+
+    assert_eq!(
+        pipeline
+            .plugin_budget(&plugin)
+            .expect("registered plugin has a budget")
+            .limit(BudgetKind::Suggestion),
+        1,
+        "an omitted query maximum resolves to the conservative one-request ceiling"
+    );
 }
 
 fn refusals(pipeline: &QueryPipeline, plugin: &PluginId) -> u64 {

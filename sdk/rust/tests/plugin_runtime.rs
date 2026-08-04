@@ -7,7 +7,7 @@
 //! environment, avoiding process-wide environment races.
 
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -104,6 +104,147 @@ fn complete_handshake(host: &mut Box<dyn Transport>, initial_credits: u32) -> Ha
     handshake
 }
 
+#[derive(Debug)]
+struct NoTimeoutTransport {
+    inner: Box<dyn Transport>,
+    timeout_calls: Arc<AtomicUsize>,
+}
+
+impl NoTimeoutTransport {
+    fn new(inner: Box<dyn Transport>, timeout_calls: Arc<AtomicUsize>) -> Self {
+        Self { inner, timeout_calls }
+    }
+}
+
+impl Transport for NoTimeoutTransport {
+    fn send(&mut self, envelope: &Envelope) -> Result<(), protocol::ProtocolError> {
+        self.inner.send(envelope)
+    }
+
+    fn recv(&mut self) -> Result<Envelope, protocol::ProtocolError> {
+        self.inner.recv()
+    }
+
+    fn try_clone_handle(&self) -> Result<Box<dyn Transport>, protocol::ProtocolError> {
+        Ok(Box::new(Self::new(
+            self.inner.try_clone_handle()?,
+            Arc::clone(&self.timeout_calls),
+        )))
+    }
+
+    fn supports_read_timeout(&self) -> bool {
+        false
+    }
+
+    fn set_read_timeout(&mut self, _timeout: Option<Duration>) -> Result<(), protocol::ProtocolError> {
+        self.timeout_calls.fetch_add(1, Ordering::SeqCst);
+        Err(protocol::ProtocolError::Malformed(
+            "read timeouts are unsupported".to_owned(),
+        ))
+    }
+
+    fn close(&mut self) {
+        self.inner.close();
+    }
+}
+#[derive(Debug)]
+struct FailingTimeoutTransport {
+    inner: Box<dyn Transport>,
+    timeout_calls: Arc<AtomicUsize>,
+}
+
+impl FailingTimeoutTransport {
+    fn new(inner: Box<dyn Transport>, timeout_calls: Arc<AtomicUsize>) -> Self {
+        Self { inner, timeout_calls }
+    }
+}
+
+impl Transport for FailingTimeoutTransport {
+    fn send(&mut self, envelope: &Envelope) -> Result<(), protocol::ProtocolError> {
+        self.inner.send(envelope)
+    }
+
+    fn recv(&mut self) -> Result<Envelope, protocol::ProtocolError> {
+        self.inner.recv()
+    }
+
+    fn try_clone_handle(&self) -> Result<Box<dyn Transport>, protocol::ProtocolError> {
+        Ok(Box::new(Self {
+            inner: self.inner.try_clone_handle()?,
+            timeout_calls: Arc::clone(&self.timeout_calls),
+        }))
+    }
+
+    fn supports_read_timeout(&self) -> bool {
+        true
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), protocol::ProtocolError> {
+        if self.timeout_calls.fetch_add(1, Ordering::SeqCst) >= 2 {
+            return Err(protocol::ProtocolError::Malformed(
+                "read timeout setup failed".to_owned(),
+            ));
+        }
+        self.inner.set_read_timeout(timeout)
+    }
+
+    fn close(&mut self) {
+        self.inner.close();
+    }
+}
+
+#[derive(Debug)]
+struct FaultAfterHandshakeTransport {
+    inner: Box<dyn Transport>,
+    after_handshake: Arc<AtomicBool>,
+    detail: &'static str,
+}
+
+impl FaultAfterHandshakeTransport {
+    fn new(inner: Box<dyn Transport>, detail: &'static str) -> Self {
+        Self {
+            inner,
+            after_handshake: Arc::new(AtomicBool::new(false)),
+            detail,
+        }
+    }
+}
+
+impl Transport for FaultAfterHandshakeTransport {
+    fn send(&mut self, envelope: &Envelope) -> Result<(), protocol::ProtocolError> {
+        self.inner.send(envelope)
+    }
+
+    fn recv(&mut self) -> Result<Envelope, protocol::ProtocolError> {
+        if self.after_handshake.swap(false, Ordering::AcqRel) {
+            return Err(protocol::ProtocolError::Malformed(self.detail.to_owned()));
+        }
+        let envelope = self.inner.recv()?;
+        self.after_handshake.store(true, Ordering::Release);
+        Ok(envelope)
+    }
+
+    fn try_clone_handle(&self) -> Result<Box<dyn Transport>, protocol::ProtocolError> {
+        Ok(Box::new(Self {
+            inner: self.inner.try_clone_handle()?,
+            after_handshake: Arc::clone(&self.after_handshake),
+            detail: self.detail,
+        }))
+    }
+
+    fn supports_read_timeout(&self) -> bool {
+        self.inner.supports_read_timeout()
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), protocol::ProtocolError> {
+        self.inner.set_read_timeout(timeout)
+    }
+
+    fn close(&mut self) {
+        self.inner.close();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum SuggestMode {
     Echo,
@@ -120,6 +261,7 @@ struct RuntimePlugin {
     mode: SuggestMode,
     calls: usize,
     credit_progress: Option<Arc<AtomicUsize>>,
+    stop_observed: Option<Arc<AtomicUsize>>,
 }
 
 impl RuntimePlugin {
@@ -128,6 +270,7 @@ impl RuntimePlugin {
             mode,
             calls: 0,
             credit_progress: None,
+            stop_observed: None,
         }
     }
 
@@ -136,6 +279,16 @@ impl RuntimePlugin {
             mode: SuggestMode::Credit,
             calls: 0,
             credit_progress: Some(progress),
+            stop_observed: None,
+        }
+    }
+
+    fn with_stop_observer(mode: SuggestMode, stop_observed: Arc<AtomicUsize>) -> Self {
+        Self {
+            mode,
+            calls: 0,
+            credit_progress: None,
+            stop_observed: Some(stop_observed),
         }
     }
 }
@@ -222,6 +375,9 @@ impl Plugin for RuntimePlugin {
     }
 
     fn stop(&mut self, _context: &dyn PluginContext) -> Result<()> {
+        if let Some(stop_observed) = &self.stop_observed {
+            stop_observed.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 }
@@ -297,6 +453,7 @@ fn serve_on_handshakes_and_stops_on_shutdown() {
     assert_eq!(handshake.protocol_version, PROTOCOL_VERSION);
     assert_eq!(handshake.plugin_name, "SDK test plugin");
     assert_eq!(handshake.plugin_version, "1.2.3");
+
     assert_eq!(handshake.sdk_version, "sdk-test");
     assert_eq!(handshake.session_token, "session-token-for-tests");
     for capability in [
@@ -325,12 +482,96 @@ fn serve_on_handshakes_and_stops_on_shutdown() {
         .expect("serve thread did not panic")
         .expect("shutdown should end serving cleanly");
 }
+#[test]
+fn serve_on_accepts_a_transport_without_read_timeout_support() {
+    let timeout_calls = Arc::new(AtomicUsize::new(0));
+    let (mut host, plugin_transport) = protocol::transport::pair();
+    let plugin_transport = Box::new(NoTimeoutTransport::new(
+        plugin_transport,
+        Arc::clone(&timeout_calls),
+    ));
+    let join = thread::spawn(move || {
+        let mut plugin = RuntimePlugin::new(SuggestMode::Echo);
+        serve_on(&mut plugin, plugin_transport, explicit_config())
+    });
+
+    let handshake = complete_handshake(&mut host, 8);
+    assert_eq!(handshake.plugin_id, "sdk.test");
+    host.send(&envelope(
+        0,
+        0,
+        Payload::Shutdown(Shutdown {
+            immediate: false,
+            unknown: UnknownFields::default(),
+        }),
+    ))
+    .expect("shutdown frame");
+    drop(host);
+    join.join()
+        .expect("serve thread did not panic")
+        .expect("unsupported timeout must not abort the handshake");
+    assert_eq!(
+        timeout_calls.load(Ordering::SeqCst),
+        0,
+        "the SDK must not request an unsupported optional timeout",
+    );
+}
+
+#[test]
+fn serve_on_reports_reader_timeout_setup_failure() {
+    let timeout_calls = Arc::new(AtomicUsize::new(0));
+    let (mut host, plugin_transport) = protocol::transport::pair();
+    let plugin_transport = Box::new(FailingTimeoutTransport::new(
+        plugin_transport,
+        Arc::clone(&timeout_calls),
+    ));
+    let join = thread::spawn(move || {
+        let mut plugin = RuntimePlugin::new(SuggestMode::Echo);
+        serve_on(&mut plugin, plugin_transport, explicit_config())
+    });
+
+    complete_handshake(&mut host, 8);
+    let result = join.join().expect("serve thread did not panic");
+    assert_eq!(
+        result,
+        Err(SdkError::Protocol(
+            "malformed message: read timeout setup failed".to_owned(),
+        )),
+        "reader setup failures must reach the plugin caller",
+    );
+    assert_eq!(timeout_calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn serve_on_reports_a_truncated_frame_without_panicking() {
+    let (mut host, plugin_transport) = protocol::transport::pair();
+    let plugin_transport = Box::new(FaultAfterHandshakeTransport::new(
+        plugin_transport,
+        "truncated frame body",
+    ));
+    let join = thread::spawn(move || {
+        let mut plugin = RuntimePlugin::new(SuggestMode::Echo);
+        serve_on(&mut plugin, plugin_transport, explicit_config())
+    });
+
+    complete_handshake(&mut host, 8);
+    let result = join.join().expect("serve thread did not panic");
+    assert_eq!(
+        result,
+        Err(SdkError::Protocol(
+            "malformed message: truncated frame body".to_owned(),
+        )),
+        "a truncated frame must be reported to the plugin caller",
+    );
+}
 
 #[test]
 fn serve_on_treats_eof_at_a_frame_boundary_as_clean_shutdown() {
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&stopped);
     let (mut host, plugin_transport) = protocol::transport::pair();
     let join = thread::spawn(move || {
-        let mut plugin = RuntimePlugin::new(SuggestMode::Echo);
+        let mut plugin = RuntimePlugin::with_stop_observer(SuggestMode::Echo, observed);
         serve_on(&mut plugin, plugin_transport, explicit_config())
     });
 
@@ -339,6 +580,11 @@ fn serve_on_treats_eof_at_a_frame_boundary_as_clean_shutdown() {
     join.join()
         .expect("serve thread did not panic")
         .expect("EOF should end serving cleanly");
+    assert_eq!(
+        stopped.load(Ordering::SeqCst),
+        1,
+        "EOF must run the plugin stop callback before returning",
+    );
 }
 
 #[test]

@@ -118,7 +118,19 @@ impl Score {
     /// Builds an ordering key, mapping an unusable non-finite value to neutral.
     #[must_use]
     pub fn new(value: f32) -> Self {
-        Self(if value.is_finite() { value } else { 0.0 })
+        let value = if value.is_finite() {
+            // IEEE-754 has two zero encodings. They compare equal as scores;
+            // canonicalise them so total_cmp does not invent a tie-break that
+            // callers never supplied.
+            if value == 0.0 {
+                0.0
+            } else {
+                value
+            }
+        } else {
+            0.0
+        };
+        Self(value)
     }
 
     /// Returns the finite numeric value of this ordering key.
@@ -300,9 +312,13 @@ impl Ranker for DefaultRanker {
 /// Match outcomes expose raw-label byte ranges for rendering. Ranking converts
 /// that boundary to a character position so equivalent Unicode labels receive
 /// the same positional contribution. No highlight means no positional evidence
-/// and therefore no position bonus.
+/// and therefore no position bonus. Malformed public ranges are ignored rather
+/// than being treated as evidence at an arbitrary byte offset.
 fn earliest_highlight(label: &str, highlights: &[(usize, usize)]) -> Option<u32> {
-    let earliest_byte = highlights.iter().map(|&(start, _)| start).min()?;
+    let earliest_byte = highlights
+        .iter()
+        .filter_map(|&(start, end)| (start < end && label.get(start..end).is_some()).then_some(start))
+        .min()?;
     let character_position = label
         .char_indices()
         .take_while(|&(byte_offset, _)| byte_offset < earliest_byte)

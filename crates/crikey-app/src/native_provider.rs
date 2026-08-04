@@ -37,7 +37,7 @@ use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -92,6 +92,10 @@ struct LoadedPlugin {
 /// Admission counts active and completed-but-undrained tasks together, so the
 /// synchronous result channel cannot back up behind a hidden UI.
 const CATALOG_RESULT_CAPACITY: usize = 64;
+/// Capacity of the bounded native suggestion-result channel. Dispatchers use
+/// blocking send as backpressure; shutdown drains this channel while joining
+/// calls so a full channel cannot strand a worker thread.
+const NATIVE_RESULT_CAPACITY: usize = 64;
 
 /// One native catalog build running away from the query worker.
 #[derive(Debug)]
@@ -323,7 +327,9 @@ struct NativeWorkerPool {
     /// Plugins already reported as failed. A dead worker must not produce one
     /// diagnostic per later keystroke (contract §11.5).
     recorded: BTreeSet<PluginId>,
-    result_tx: Sender<DispatchResult>,
+    /// Bounded with [`NATIVE_RESULT_CAPACITY`]; dispatchers apply backpressure
+    /// rather than growing an unbounded queue.
+    result_tx: SyncSender<DispatchResult>,
     result_rx: Receiver<DispatchResult>,
     in_flight: BTreeMap<(u64, PluginId), InFlightCall>,
     cancellation: Arc<NativeCancellation>,
@@ -342,7 +348,7 @@ impl std::fmt::Debug for NativeWorkerPool {
 
 impl Default for NativeWorkerPool {
     fn default() -> Self {
-        let (result_tx, result_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::sync_channel(NATIVE_RESULT_CAPACITY);
         Self {
             supervisors: BTreeMap::new(),
             failures: Vec::new(),
@@ -396,6 +402,12 @@ impl NativeWorkerPool {
         for (_, mut call) in calls {
             self.cancellation.unregister(call.generation, &call.plugin);
             if let Some(join) = call.join.take() {
+                // A dispatcher applies bounded-channel backpressure while
+                // publishing its one result. Drain while waiting so shutdown
+                // cannot deadlock behind a full result channel.
+                while !join.is_finished() {
+                    let _ = self.result_rx.recv_timeout(Duration::from_millis(10));
+                }
                 let _ = join.join();
             }
         }
@@ -434,8 +446,9 @@ pub struct NativeProvider {
 /// window contributes no rows to this frame. Production always uses it.
 pub const DEFAULT_COLLECTION_WINDOW: Duration = Duration::from_millis(100);
 
-/// Bound on one native worker callback. The same value is used by the native
-/// host and by the provider's action queue deadline.
+/// Upper bound on a native worker call. The effective suggestion deadline
+/// comes from `performance.suggest-hard-timeout-ms` and defaults to the
+/// manifest model's 500 ms value; this cap remains the action/transport bound.
 const NATIVE_CALL_TIMEOUT_MS: u64 = 5_000;
 
 impl NativeProvider {
@@ -577,7 +590,11 @@ impl NativeProvider {
             working_dir: Some(directory.to_path_buf()),
             environment: Vec::new(),
         };
-        let options = WorkerOptions::new().with_call_timeout_ms(NATIVE_CALL_TIMEOUT_MS);
+        let suggest_timeout_ms = manifest
+            .performance
+            .suggest_hard_timeout_ms
+            .min(NATIVE_CALL_TIMEOUT_MS);
+        let options = WorkerOptions::new().with_call_timeout_ms(suggest_timeout_ms);
 
         // Register first so this provider receives the exact shared budget
         // handle that the query pipeline stores for the plugin. A worker
@@ -679,7 +696,13 @@ impl NativeProvider {
             })?;
         let budget = Arc::clone(&loaded.budget);
         let launch = loaded.launch.clone();
-        let worker_options = loaded.worker_options.clone();
+        // Catalog callbacks are not suggestion callbacks; keep their
+        // independent long transport budget rather than applying the manifest
+        // suggestion hard deadline to catalog construction.
+        let worker_options = loaded
+            .worker_options
+            .clone()
+            .with_call_timeout_ms(NATIVE_CALL_TIMEOUT_MS);
         if self.catalog.tasks.len() >= CATALOG_RESULT_CAPACITY {
             return Err(CatalogDispatchError::QueueFull {
                 plugin: plugin.clone(),
@@ -1643,6 +1666,9 @@ impl NativeDriver {
         self.cancellation.cancel_before(generation_value);
         let (lock, cvar) = &*self.mailbox;
         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if slot.stop {
+            return;
+        }
         if slot.job.is_some() {
             self.replacements.fetch_add(1, Ordering::Relaxed);
         }
@@ -1709,6 +1735,9 @@ impl NativeDriver {
 
 impl Drop for NativeDriver {
     fn drop(&mut self) {
+        // Cancel in-flight callbacks before joining the supervisor so a
+        // cooperative native worker gets a chance to return promptly.
+        self.cancellation.cancel_all();
         {
             let (lock, cvar) = &*self.mailbox;
             let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());

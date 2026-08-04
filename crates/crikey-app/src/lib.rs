@@ -44,7 +44,8 @@ use crikey_core::{
     Result as CoreResult,
 };
 use crikey_platform::{
-    application_arguments, application_items, decode_target, APPLICATION_LAUNCH_ACTION_ID,
+    application_arguments, application_items, application_working_directory, decode_target,
+    APPLICATION_LAUNCH_ACTION_ID,
 };
 #[cfg(any(windows, target_os = "linux"))]
 use crikey_platform::{HotkeyActivationHandler, HotkeyBinding};
@@ -288,7 +289,10 @@ impl App {
             crikey_core::CoreError::Invalid(format!("invalid application target: {error}"))
         })?;
         let arguments = application_arguments(item)?;
-        self.backend.process_launcher().launch(&target, &arguments)
+        let working_directory = application_working_directory(item)?;
+        self.backend
+            .process_launcher()
+            .launch_in(&target, &arguments, working_directory.as_ref())
     }
 
     /// Name of the platform backend compiled into this build.
@@ -710,6 +714,9 @@ impl SearchService {
             let _ = self.catalog.retire_instance(plugin, instance);
             return Err(error);
         }
+        // A successful catalog replacement invalidates the visible answer.
+        // Keeping old hits would let a user execute an item no longer in the catalog.
+        self.results.clear();
 
         let retained = self.catalog.plugin_len(plugin);
         if let Some(upper) = self
@@ -728,8 +735,8 @@ impl SearchService {
             (0, Err(_)) | (_, Ok(_)) => {}
             (_, Err(at)) => self.owners.insert(at, plugin.clone()),
         }
-        if retained > 0 {
-            if let Some(cache) = &self.catalog_cache {
+        if let Some(cache) = &self.catalog_cache {
+            if retained > 0 {
                 let slice = CachedSlice {
                     plugin: plugin.clone(),
                     instance,
@@ -739,6 +746,8 @@ impl SearchService {
                 if let Err(error) = cache.0.store_slice(&slice) {
                     self.cache_error = Some(error);
                 }
+            } else if let Err(error) = cache.0.invalidate(plugin) {
+                self.cache_error = Some(error);
             }
         }
         Ok(retained)
@@ -941,7 +950,8 @@ impl SearchService {
         action_id: &ActionId,
         argument: Option<&str>,
     ) -> CoreResult<ActionSubmission> {
-        let Some(hit) = self.results.iter().find(|hit| &hit.item.stable_id == item_id) else {
+        let mut matching_hits = self.results.iter().filter(|hit| &hit.item.stable_id == item_id);
+        let Some(hit) = matching_hits.next() else {
             // Modern/native rows are presented through their asynchronous
             // drivers rather than this synchronous built-in result cache.
             // Their exact-owner endpoint retains the current item snapshot,
@@ -955,6 +965,11 @@ impl SearchService {
                 .submit_by_item_id(item_id, action_id, argument)
                 .map(ActionSubmission::Pending);
         };
+        if matching_hits.next().is_some() {
+            return Err(crikey_core::CoreError::Invalid(
+                "selected result has ambiguous item ownership".to_owned(),
+            ));
+        }
         let action = hit
             .item
             .actions
@@ -1239,7 +1254,7 @@ mod tests {
     use std::{collections::BTreeMap, fs, sync::Mutex};
 
     use crikey_catalog::{CatalogCache, CatalogError, FileCatalogCache};
-    use crikey_core::{ArgumentPolicy, Category, HitPolicy};
+    use crikey_core::{Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy};
 
     use super::*;
 
@@ -1249,6 +1264,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingCache {
         writes: Mutex<Vec<CachedSlice>>,
+        invalidated: Mutex<Vec<PluginId>>,
     }
 
     impl CatalogCache for RecordingCache {
@@ -1264,7 +1280,11 @@ mod tests {
             Ok(())
         }
 
-        fn invalidate(&self, _plugin: &PluginId) -> Result<(), CacheError> {
+        fn invalidate(&self, plugin: &PluginId) -> Result<(), CacheError> {
+            self.invalidated
+                .lock()
+                .expect("recording cache lock")
+                .push(plugin.clone());
             Ok(())
         }
 
@@ -1334,6 +1354,31 @@ mod tests {
             "backend NAME must be a known platform id, got {:?}",
             App::platform_backend_name()
         );
+    }
+    #[test]
+    fn duplicate_item_ids_are_refused_for_action_execution() {
+        let mut first = burning("same", OWNER);
+        first.actions = vec![Action {
+            action_id: ActionId("run".to_owned()),
+            label: "Run".to_owned(),
+            description: String::new(),
+            applicable_categories: vec![Category::Application],
+            icon_reference: None,
+            execution_policy: ExecutionPolicy::Plugin,
+        }];
+        let mut second = burning("same", OTHER);
+        second.actions = first.actions.clone();
+
+        let mut service = accepting(ResultLimits::default());
+        assert_eq!(service.replace_catalog(&plugin(OWNER), 1, vec![first]), Ok(1));
+        assert_eq!(service.replace_catalog(&plugin(OTHER), 1, vec![second]), Ok(1));
+        service.submit_query("fire").expect("query is accepted");
+        assert_eq!(service.results().len(), 2);
+
+        let error = service
+            .execute(&ItemId("same".to_owned()), &ActionId("run".to_owned()))
+            .expect_err("an ambiguous item id must not select an arbitrary owner");
+        assert!(error.to_string().contains("ambiguous item ownership"));
     }
 
     #[test]
@@ -1416,7 +1461,7 @@ mod tests {
         assert_eq!(service.catalog.plugin_len(&owner), 1);
     }
     #[test]
-    fn cache_persists_only_a_nonempty_successful_catalog() {
+    fn cache_invalidates_an_empty_replacement() {
         let cache = Arc::new(RecordingCache::default());
         let mut service = accepting(ResultLimits::default());
         service.set_catalog_cache(cache.clone());
@@ -1434,9 +1479,9 @@ mod tests {
 
         assert_eq!(service.replace_catalog(&owner, 2, Vec::new()), Ok(0));
         assert_eq!(
-            cache.writes.lock().expect("recording cache lock").len(),
-            1,
-            "an empty rebuild must not overwrite a known-good cached slice"
+            cache.invalidated.lock().expect("recording cache lock").as_slice(),
+            [owner],
+            "an empty replacement must delete the previous cached slice"
         );
     }
     #[test]
@@ -1461,6 +1506,14 @@ mod tests {
         assert_eq!(loaded.items, 1);
         assert_eq!(loaded.skipped, 0);
         assert_eq!(reader.catalog.plugin_len(&owner), 1);
+        assert_eq!(writer.replace_catalog(&owner, 2, Vec::new()), Ok(0));
+        let mut empty_reader = accepting(ResultLimits::default());
+        let loaded = empty_reader
+            .load_persisted_catalog(cache.as_ref())
+            .expect("an empty replacement leaves no stale slice to reload");
+        assert_eq!(loaded.items, 0);
+        assert_eq!(loaded.skipped, 0);
+        assert_eq!(empty_reader.catalog.plugin_len(&owner), 0);
 
         fs::remove_dir_all(root).expect("remove the round-trip cache");
     }

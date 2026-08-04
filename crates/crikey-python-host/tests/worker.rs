@@ -12,9 +12,10 @@
 //! the host with it, and could not be observed to survive an interpreter crash
 //! — which is precisely spec 4.2 ("Python shall not run in the UI process") and
 //! acceptance 31.10 ("an interpreter crash shall not terminate CriKey"). So
-//! these tests spawn `python3` for real and the failure tests provoke real
-//! failures. A missing or too-old interpreter is a **test failure**, never a
-//! skip: there is no `#[ignore]` and no early return here.
+//! these tests prefer the repository virtualenv and otherwise use ordinary
+//! interpreter discovery, while the failure tests provoke real failures. If no
+//! usable interpreter exists, each real-Python test prints a reason and skips;
+//! there is no silent fallback to an in-process double.
 //!
 //! # Fixtures
 //!
@@ -51,13 +52,13 @@ use crikey_core::{
 use crikey_package_manager::ImportPath;
 use crikey_plugin_model::ConcurrencySection;
 use crikey_plugin_supervisor::{shared_budget_from_section, BudgetKind};
-use crikey_python_host::{
-    discover_interpreter, sdk_root, BatchState, CancelHandle, ExecuteOutcome, HostError, Interpreter,
-    ModernWorker, PluginError, RequiresPython, RuntimeProfile, SuggestRequest, Suggestions, WorkerExit,
-    WorkerOptions, MAX_FRAME_BYTES, MAX_LOG_LINE_BYTES, WORKER_ENTRY_FILE,
-};
 #[cfg(unix)]
-use crikey_python_host::{discover_interpreter_in, DiscoveryEnvironment};
+use crikey_python_host::discover_interpreter_in;
+use crikey_python_host::{
+    discover_interpreter, sdk_root, BatchState, CancelHandle, DiscoveryEnvironment, ExecuteOutcome,
+    HostError, Interpreter, ModernWorker, PluginError, RequiresPython, RuntimeProfile, SuggestRequest,
+    Suggestions, WorkerExit, WorkerOptions, MAX_FRAME_BYTES, MAX_LOG_LINE_BYTES, WORKER_ENTRY_FILE,
+};
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -148,6 +149,37 @@ done
     fs::rename(&staging, &path).expect("generation mismatch shim is published atomically");
     path
 }
+
+#[cfg(unix)]
+fn invalid_utf8_shim(scratch: &Scratch) -> PathBuf {
+    let path = scratch.join("invalid-utf8-python");
+    let staging = path.with_extension("staging");
+    fs::write(
+        &staging,
+        r#"#!/bin/sh
+if [ "$1" = "-c" ]; then
+    printf '3.12.0\n'
+    exit 0
+fi
+while IFS= read -r line; do
+    case "$line" in
+        *'"kind":"handshake"'*) printf '%s\n' '{"id":1,"kind":"handshake_ack","protocol_version":1}' ;;
+        *'"kind":"suggest"'*)
+            printf '%s' '{"id":2,"kind":"result_batch","generation":1,"state":"final","items":[],"log":["'
+            printf '\377'
+            printf '%s\n' '"],"error":null}'
+            ;;
+        *'"kind":"shutdown"'*) exit 0 ;;
+    esac
+done
+"#,
+    )
+    .expect("invalid UTF-8 shim is writable");
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))
+        .expect("invalid UTF-8 shim is executable");
+    fs::rename(&staging, &path).expect("invalid UTF-8 shim is published atomically");
+    path
+}
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
@@ -189,22 +221,56 @@ fn options(plugin: &str, plugin_dir: &Path) -> WorkerOptions {
     .with_shutdown_timeout_ms(SHUTDOWN_BUDGET_MS)
 }
 
-/// The interpreter this host actually has. Never skips: if discovery fails, the
-/// test that asked for it fails, because a host that cannot run Python cannot
-/// run modern plugins and a green run would hide exactly that.
-fn host_interpreter() -> Interpreter {
-    discover_interpreter(
+/// Prefer the repository virtual environment, but keep a fresh checkout's
+/// Rust tests usable when that ignored directory has not been created.
+fn test_interpreter_path() -> Option<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    #[cfg(windows)]
+    let path = root.join(".venv").join("Scripts").join("python.exe");
+    #[cfg(not(windows))]
+    let path = root.join(".venv").join("bin").join("python");
+    path.is_file().then_some(path)
+}
+
+fn host_interpreter() -> Option<Interpreter> {
+    if let Some(path) = test_interpreter_path() {
+        let environment = DiscoveryEnvironment::empty().with_override(path);
+        return Some(
+            crikey_python_host::discover_interpreter_in(
+                &RuntimeProfile::Bundled,
+                &RequiresPython(REQUIRES_PYTHON.to_owned()),
+                &environment,
+            )
+            .unwrap_or_else(|error| panic!("the repository virtualenv is not usable: {error}")),
+        );
+    }
+
+    match discover_interpreter(
         &RuntimeProfile::Bundled,
         &RequiresPython(REQUIRES_PYTHON.to_owned()),
-    )
-    .expect("this host must provide a supported CPython for the modern worker")
+    ) {
+        Ok(interpreter) => Some(interpreter),
+        Err(error) => {
+            eprintln!("skipping real-interpreter test: no usable CPython was found ({error})");
+            None
+        }
+    }
+}
+
+macro_rules! require_host_interpreter {
+    () => {
+        if host_interpreter().is_none() {
+            return;
+        }
+    };
 }
 
 /// Spawns a worker for `plugin` whose source is `source`, borrowing `scratch`
 /// for the fixture tree.
 fn spawn(scratch: &Scratch, plugin: &str, source: &str) -> ModernWorker {
     let dir = write_plugin(scratch, plugin, source);
-    ModernWorker::spawn(&host_interpreter(), options(plugin, &dir))
+    let interpreter = host_interpreter().expect("host interpreter was checked at test entry");
+    ModernWorker::spawn(&interpreter, options(plugin, &dir))
         .expect("a loadable modern plugin spawns a worker")
 }
 
@@ -516,12 +582,47 @@ fn a_present_mismatched_result_generation_is_rejected_as_protocol_error() {
     worker.shutdown();
 }
 
+#[cfg(unix)]
+#[test]
+fn invalid_utf8_on_the_protocol_channel_is_rejected() {
+    let scratch = Scratch::new("invalid-utf8");
+    let shim = invalid_utf8_shim(&scratch);
+    let interpreter = discover_interpreter_in(
+        &RuntimeProfile::External(shim),
+        &RequiresPython(">=3.8".to_owned()),
+        &DiscoveryEnvironment::empty(),
+    )
+    .expect("the protocol shim reports a supported interpreter");
+    let options = WorkerOptions::new(
+        PluginId("modern.invalid-utf8".to_owned()),
+        "unused:Fixture",
+        ImportPath {
+            entries: vec![sdk_root()],
+        },
+    )
+    .with_startup_timeout_ms(1_000)
+    .with_call_timeout_ms(1_000)
+    .with_shutdown_timeout_ms(1_000);
+    let mut worker = ModernWorker::spawn(&interpreter, options).expect("the protocol shim handshakes");
+
+    let error = worker
+        .suggest(&suggest_request("query"))
+        .expect_err("invalid UTF-8 is a protocol failure");
+    assert!(
+        matches!(error, HostError::Protocol(_)),
+        "invalid UTF-8 is rejected as HostError::Protocol, got {error:?}"
+    );
+    assert!(!worker.is_alive(), "invalid protocol bytes stop the worker");
+    worker.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Handshake and the process boundary (spec 4.2, 15.6)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn a_spawned_worker_completes_its_handshake_and_reports_itself_alive() {
+    require_host_interpreter!();
     let scratch = Scratch::new("handshake");
     let worker = spawn(&scratch, "modern.handshake", WELL_BEHAVED);
 
@@ -539,6 +640,7 @@ fn a_spawned_worker_completes_its_handshake_and_reports_itself_alive() {
 
 #[test]
 fn suggest_collects_the_plugins_streamed_items_in_order() {
+    require_host_interpreter!();
     let scratch = Scratch::new("suggest");
     let mut worker = spawn(&scratch, "modern.suggest", WELL_BEHAVED);
 
@@ -584,6 +686,7 @@ fn suggest_collects_the_plugins_streamed_items_in_order() {
 
 #[test]
 fn build_catalog_returns_the_plugins_catalog_with_fields_intact() {
+    require_host_interpreter!();
     let scratch = Scratch::new("catalog");
     let mut worker = spawn(&scratch, "modern.catalog", WELL_BEHAVED);
 
@@ -634,6 +737,7 @@ fn build_catalog_returns_the_plugins_catalog_with_fields_intact() {
 
 #[test]
 fn execute_is_ok_for_a_normal_action_and_a_plugin_raise_leaves_the_worker_usable() {
+    require_host_interpreter!();
     let scratch = Scratch::new("execute");
     let mut worker = spawn(&scratch, "modern.execute", WELL_BEHAVED);
     let item = core_item("modern.execute", "s-00");
@@ -683,6 +787,7 @@ fn execute_is_ok_for_a_normal_action_and_a_plugin_raise_leaves_the_worker_usable
 
 #[test]
 fn a_plugin_that_raises_in_suggest_fails_the_batch_and_the_worker_stays_alive() {
+    require_host_interpreter!();
     let scratch = Scratch::new("suggest-raise");
     let mut worker = spawn(&scratch, "modern.raise", RAISES_IN_SUGGEST);
 
@@ -731,6 +836,7 @@ fn a_plugin_that_raises_in_suggest_fails_the_batch_and_the_worker_stays_alive() 
 
 #[test]
 fn an_interpreter_that_exits_mid_call_is_a_contained_crash_and_a_fresh_worker_still_works() {
+    require_host_interpreter!();
     let scratch = Scratch::new("crash");
     let mut worker = spawn(&scratch, "modern.crash", CRASHES_IN_SUGGEST);
 
@@ -784,6 +890,7 @@ fn an_interpreter_that_exits_mid_call_is_a_contained_crash_and_a_fresh_worker_st
 
 #[test]
 fn a_cancel_handle_raised_from_another_thread_makes_a_cooperative_plugin_return_cancelled() {
+    require_host_interpreter!();
     let scratch = Scratch::new("cancel");
     let marker = scratch.join("suggest-running");
     let mut worker = spawn(&scratch, "modern.cancel", CANCEL_THEN_FINISH);
@@ -850,6 +957,7 @@ fn a_cancel_handle_raised_from_another_thread_makes_a_cooperative_plugin_return_
 
 #[test]
 fn background_registration_is_budgeted_and_cancellation_releases_the_guard() {
+    require_host_interpreter!();
     let scratch = Scratch::new("background");
     let dir = write_plugin(&scratch, "background", BACKGROUND_TASKS);
     let section = ConcurrencySection {
@@ -858,7 +966,7 @@ fn background_registration_is_budgeted_and_cancellation_releases_the_guard() {
     };
     let budget = shared_budget_from_section(&section);
     let mut worker = ModernWorker::spawn(
-        &host_interpreter(),
+        &host_interpreter().expect("host interpreter was checked at test entry"),
         options("modern.background", &dir).with_shared_budget(budget.clone()),
     )
     .expect("a loadable plugin spawns with a shared background budget");
@@ -910,15 +1018,18 @@ fn background_registration_is_budgeted_and_cancellation_releases_the_guard() {
 
 #[test]
 fn a_plugin_that_streams_partials_forever_is_bounded_not_hung() {
+    require_host_interpreter!();
     let scratch = Scratch::new("streams-forever");
     let dir = write_plugin(&scratch, "forever", STREAMS_FOREVER);
     // A short AGGREGATE budget for the whole call. A host that reset the budget
     // per frame would never time out against a plugin that keeps streaming; the
     // item cap would also bound a fast flood. Either way the call must END.
     let opts = options("modern.forever", &dir).with_call_timeout_ms(2_000);
-    let mut worker =
-        ModernWorker::spawn(&host_interpreter(), opts).expect("a loadable plugin spawns a worker");
-
+    let mut worker = ModernWorker::spawn(
+        &host_interpreter().expect("host interpreter was checked at test entry"),
+        opts,
+    )
+    .expect("a loadable plugin spawns a worker");
     let (tx, rx) = mpsc::channel();
     let call = thread::spawn(move || {
         let errored = worker.suggest(&suggest_request("go")).is_err();
@@ -948,6 +1059,7 @@ fn a_plugin_that_streams_partials_forever_is_bounded_not_hung() {
 
 #[test]
 fn a_build_catalog_that_raises_is_a_plugin_failed_error_and_the_worker_survives() {
+    require_host_interpreter!();
     let scratch = Scratch::new("catalog-raise");
     let mut worker = spawn(&scratch, "modern.catalog.raise", RAISES_IN_CATALOG);
 
@@ -994,6 +1106,7 @@ fn a_build_catalog_that_raises_is_a_plugin_failed_error_and_the_worker_survives(
 
 #[test]
 fn an_oversized_frame_from_the_plugin_is_a_bounded_protocol_error_that_stops_the_worker() {
+    require_host_interpreter!();
     let scratch = Scratch::new("oversized-frame");
     let oversize = MAX_FRAME_BYTES + 1024 * 1024;
     let source = OVERSIZED_FRAME.replace("__N__", &oversize.to_string());
@@ -1023,6 +1136,7 @@ fn an_oversized_frame_from_the_plugin_is_a_bounded_protocol_error_that_stops_the
 
 #[test]
 fn an_oversized_log_line_is_truncated_with_a_marker_while_the_reply_stays_valid() {
+    require_host_interpreter!();
     let scratch = Scratch::new("oversized-log");
     let logged = 64 * 1024;
     let source = OVERSIZED_LOG.replace("__N__", &logged.to_string());
@@ -1072,6 +1186,7 @@ fn an_oversized_log_line_is_truncated_with_a_marker_while_the_reply_stays_valid(
 
 #[test]
 fn shutdown_returns_a_clean_worker_exit() {
+    require_host_interpreter!();
     let scratch = Scratch::new("shutdown");
     let mut worker = spawn(&scratch, "modern.shutdown", WELL_BEHAVED);
     assert!(worker.is_alive(), "the worker is live before shutdown");
@@ -1095,6 +1210,7 @@ fn shutdown_returns_a_clean_worker_exit() {
 
 #[test]
 fn dropping_a_worker_reaps_its_child_and_leaves_no_orphan() {
+    require_host_interpreter!();
     let scratch = Scratch::new("drop");
 
     // The plugin reports its own pid — which is the worker interpreter's pid —

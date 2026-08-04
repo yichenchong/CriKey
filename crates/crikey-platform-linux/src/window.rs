@@ -434,20 +434,28 @@ impl X11WindowService {
     /// A property that does not exist, one stored under a different type, and a
     /// window that no longer exists are all `None`: the caller is scanning a set
     /// that other programs mutate concurrently, so none of them is exceptional.
-    /// A genuinely broken connection still surfaces, because the request itself
-    /// fails rather than its reply.
+    /// If the connection breaks during a per-window read it is also treated as
+    /// an omitted window; the root list request in [`enumerate`] still reports
+    /// a connection failure before this helper is reached.
     ///
     /// Naming `kind` rather than passing `AnyPropertyType` is what makes the
     /// answer trustworthy: the server filters on it, so a client that stored
     /// text where this backend expects a window id yields nothing instead of
     /// having its bytes reinterpreted.
     fn property(&self, window: Window, property: impl Into<u32>, kind: impl Into<u32>) -> Option<Vec<u8>> {
+        let kind = kind.into();
         let reply = self
             .connection
             .get_property(false, window, property, kind, 0, MAX_PROPERTY_WORDS)
             .ok()?
             .reply()
             .ok()?;
+        // XGetProperty returns a property's actual type when the requested
+        // type does not match. Treating those bytes as the requested text
+        // would turn arbitrary client data into a title or WM_CLASS.
+        if reply.type_ != kind || reply.format != 8 {
+            return None;
+        }
         if reply.value.is_empty() {
             return None;
         }

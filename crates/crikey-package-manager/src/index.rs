@@ -29,6 +29,13 @@ pub struct PackageIndex {
 impl PackageIndex {
     /// Load the index from a directory of `<name>-<version>/` wheel dirs.
     pub fn from_dir(root: &Path) -> Result<PackageIndex, PackageError> {
+        let root_metadata = std::fs::symlink_metadata(root)?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(PackageError::MalformedIndex(format!(
+                "package index root {} is not a real directory",
+                root.display()
+            )));
+        }
         let mut packages = Vec::new();
         let mut identities = BTreeSet::new();
         // Sort directory entries so the load order is itself deterministic.
@@ -48,15 +55,20 @@ impl PackageIndex {
             if !metadata.is_dir() {
                 continue;
             }
-            let dir_name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n,
+            let dir_name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+                PackageError::MalformedIndex(format!(
+                    "package directory name {} is not valid UTF-8",
+                    path.display()
+                ))
+            })?;
+            // A pre-release can itself contain a hyphen (for example
+            // `1.0.0-alpha`), so splitting at the last hyphen would mistake
+            // `alpha` for the whole version. Select the first suffix that
+            // has the shape of a version and therefore leave package-name
+            // hyphens on the left.
+            let (raw_name, version) = match split_index_dir_name(dir_name) {
+                Some((name, version)) => (name, version),
                 None => continue,
-            };
-            // `<name>-<version>`: split on the LAST hyphen so package names may
-            // themselves contain hyphens while the version tail stays intact.
-            let (raw_name, version) = match dir_name.rsplit_once('-') {
-                Some((n, v)) if !n.is_empty() && !v.is_empty() => (n, v.to_owned()),
-                _ => continue,
             };
             let name = normalize_name(raw_name);
             if name.is_empty() {
@@ -94,6 +106,37 @@ impl PackageIndex {
     }
 }
 
+/// Split an on-disk `<name>-<version>` directory without losing a
+/// hyphenated pre-release suffix such as `1.0.0-alpha`.
+fn split_index_dir_name(dir_name: &str) -> Option<(&str, String)> {
+    let mut search_from = 0;
+    while let Some(relative) = dir_name[search_from..].find('-') {
+        let split = search_from + relative;
+        let version_start = split + 1;
+        if split > 0 && version_start < dir_name.len() && looks_like_version(&dir_name[version_start..]) {
+            return Some((&dir_name[..split], dir_name[version_start..].to_owned()));
+        }
+        search_from = version_start;
+    }
+    None
+}
+
+fn looks_like_version(version: &str) -> bool {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let Some(first) = version.as_bytes().first() else {
+        return false;
+    };
+    if !first.is_ascii_digit() {
+        return false;
+    }
+    if version.matches('-').count() > 1 {
+        return false;
+    }
+    version
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'!' | b'-' | b'_'))
+}
+
 /// The deterministic content hash of a module tree: SHA-256 over every file's
 /// relative path and bytes, walked in path-sorted order.
 pub(crate) fn tree_hash(root: &Path) -> Result<String, PackageError> {
@@ -128,15 +171,27 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> R
         if metadata.is_dir() {
             collect_files(base, &path, out)?;
         } else if metadata.is_file() {
-            // A relative path with forward slashes: stable across platforms so
-            // the same tree hashes identically everywhere.
-            let rel = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .components()
-                .filter_map(|c| c.as_os_str().to_str())
-                .collect::<Vec<_>>()
-                .join("/");
+            // A lossy conversion would silently drop or rewrite a component,
+            // allowing two different trees to receive the same digest. Reject
+            // paths that cannot be represented in the stable UTF-8 hash.
+            let relative_path = path.strip_prefix(base).map_err(|_| {
+                PackageError::MalformedIndex(format!(
+                    "package path {} escaped index root {}",
+                    path.display(),
+                    base.display()
+                ))
+            })?;
+            let mut components = Vec::new();
+            for component in relative_path.components() {
+                let component = component.as_os_str().to_str().ok_or_else(|| {
+                    PackageError::MalformedIndex(format!(
+                        "package path {} is not valid UTF-8",
+                        path.display()
+                    ))
+                })?;
+                components.push(component);
+            }
+            let rel = components.join("/");
             out.push((rel, path));
         } else {
             return Err(PackageError::MalformedIndex(format!(
@@ -177,4 +232,17 @@ pub(crate) fn normalize_name(name: &str) -> String {
 
 pub(crate) fn is_hex_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Compare two hexadecimal digests without returning early on a differing
+/// byte. Callers validate the hexadecimal shape separately.
+pub(crate) fn constant_time_hex_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (&left, &right) in left.as_bytes().iter().zip(right.as_bytes()) {
+        difference |= left.to_ascii_lowercase() ^ right.to_ascii_lowercase();
+    }
+    difference == 0
 }
