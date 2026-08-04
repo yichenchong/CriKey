@@ -53,8 +53,8 @@ use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle}
 use crikey_ui::{ResultRow, ViewModel};
 
 use crate::{
-    ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError, ObsoleteCatalogBuild,
-    PluginActionCompletion, QueryPipeline, ResultBatch,
+    ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError, DisabledPlugins,
+    ObsoleteCatalogBuild, PluginActionCompletion, QueryPipeline, ResultBatch, DISABLED_BY_CONFIGURATION,
 };
 
 /// Identifies a native worker by its executable and the package source
@@ -460,8 +460,8 @@ impl NativeProvider {
     /// continues with the remaining package directories. The worker's working
     /// directory is the package directory itself so shipped witness/config
     /// files are visible to the child (contract §3.1(8), §11.1).
-    pub fn load(pipeline: &mut QueryPipeline, roots: &[PathBuf]) -> Self {
-        Self::load_with_collection_window(pipeline, roots, DEFAULT_COLLECTION_WINDOW)
+    pub fn load(pipeline: &mut QueryPipeline, roots: &[PathBuf], disabled: &DisabledPlugins) -> Self {
+        Self::load_with_collection_window(pipeline, roots, DEFAULT_COLLECTION_WINDOW, disabled)
     }
 
     /// [`Self::load`] with an explicit collection window.
@@ -475,6 +475,7 @@ impl NativeProvider {
         pipeline: &mut QueryPipeline,
         roots: &[PathBuf],
         collection_window: Duration,
+        disabled: &DisabledPlugins,
     ) -> Self {
         let mut provider = Self {
             pool: NativeWorkerPool::default(),
@@ -510,7 +511,7 @@ impl NativeProvider {
             directories.sort();
 
             for directory in directories {
-                provider.register_plugin_dir(pipeline, &directory);
+                provider.register_plugin_dir(pipeline, &directory, disabled);
             }
         }
 
@@ -520,7 +521,12 @@ impl NativeProvider {
     /// Loads one candidate package, starts its worker, and registers the
     /// namespaced plugin with the manifest-derived scheduling policy. No
     /// failure here can abort sibling discovery (spec 24.1).
-    fn register_plugin_dir(&mut self, pipeline: &mut QueryPipeline, directory: &Path) {
+    fn register_plugin_dir(
+        &mut self,
+        pipeline: &mut QueryPipeline,
+        directory: &Path,
+        disabled: &DisabledPlugins,
+    ) {
         let package = directory
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -549,6 +555,13 @@ impl NativeProvider {
         }
 
         let plugin = PluginId(format!("native.{}", manifest.plugin.id));
+        // Held back before the worker process is spawned: an operator who
+        // disabled a plugin must not pay for its process, and the only proof
+        // that it did not run is that nothing started it (spec 21.2).
+        if disabled.blocks(&plugin) {
+            self.record_unavailable(package, Some(plugin), DISABLED_BY_CONFIGURATION.to_owned());
+            return;
+        }
         let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
         let entrypoint = match manifest.entrypoint_for(os, arch) {
             Ok(entrypoint) => entrypoint.to_owned(),
@@ -646,6 +659,62 @@ impl NativeProvider {
             worker_options: options,
             budget,
         });
+    }
+
+    /// Delivers each loaded plugin its own complete configuration state (spec 21.4).
+    ///
+    /// Returns one `(plugin, reason)` per plugin that could not be reached, so a
+    /// dead or refusing worker is a named diagnostic rather than a configuration
+    /// change that silently did nothing. Delivery continues past a failure: one
+    /// broken plugin must not stop the others from being configured.
+    ///
+    /// A loaded plugin the state does not mention is sent an EMPTY map rather
+    /// than skipped. Skipping would leave it applying whatever it last received,
+    /// which is exactly the stale-state bug the complete-publication rule exists
+    /// to prevent.
+    pub fn publish_configuration(
+        &mut self,
+        configuration: &crate::PluginConfiguration,
+    ) -> Vec<(PluginId, String)> {
+        let mut failures = Vec::new();
+        let empty = BTreeMap::new();
+        let targets: Vec<(PluginId, WorkerKey)> = self
+            .loaded
+            .iter()
+            .map(|loaded| (loaded.plugin.clone(), loaded.key.clone()))
+            .collect();
+        for (plugin, key) in targets {
+            let values = configuration.get(&plugin).unwrap_or(&empty);
+            let Some(supervisor) = self.pool.supervisors.get(&key).cloned() else {
+                failures.push((plugin, "native worker is unavailable".to_owned()));
+                continue;
+            };
+            // Caught rather than propagated for the same reason every other
+            // dispatch seam here catches: a panic inside one plugin's transport
+            // must not take down the supervisor thread publishing to the rest.
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let mut supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
+                supervisor
+                    .worker(&plugin, 0)
+                    .map_err(|error| error.to_string())?
+                    .send_configuration(values, true)
+                    .map_err(|error| error.to_string())
+            }));
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => {
+                    let reason = format!("configuration delivery failed: {reason}");
+                    self.pool.record_dispatch_failure(plugin.clone(), reason.clone());
+                    failures.push((plugin, reason));
+                }
+                Err(_) => {
+                    let reason = "configuration delivery panicked".to_owned();
+                    self.pool.record_dispatch_failure(plugin.clone(), reason.clone());
+                    failures.push((plugin, reason));
+                }
+            }
+        }
+        failures
     }
 
     fn record_unavailable(&mut self, package: String, plugin: Option<PluginId>, reason: String) {
@@ -1195,6 +1264,14 @@ struct NativeJob {
 #[derive(Debug)]
 struct NativeRequestSlot {
     job: Option<NativeJob>,
+    /// The latest configuration state to publish, if one is waiting.
+    ///
+    /// Single-slot replace-oldest for the same reason the query slot is: only the
+    /// newest complete state matters, and a queue of superseded states would
+    /// publish intermediate configurations the host already decided to coalesce
+    /// away (spec 21.4). Boxed because the map is much larger than a query job
+    /// and the slot is held under the mailbox lock.
+    configuration: Option<Box<crate::PluginConfiguration>>,
     stop: bool,
 }
 
@@ -1219,6 +1296,8 @@ struct NativeActionRequest {
 enum NativeWork {
     Query(NativeJob),
     Action(Box<NativeActionRequest>),
+    /// Publish this complete configuration state to every loaded plugin.
+    Configuration(Box<crate::PluginConfiguration>),
 }
 
 /// Bounded action endpoint retained by the live native driver.
@@ -1426,6 +1505,10 @@ pub struct NativeDriver {
     mailbox: Arc<(Mutex<NativeRequestSlot>, Condvar)>,
     action_endpoint: Arc<NativeActionEndpoint>,
     catalog_results: Arc<Mutex<Vec<CatalogBuildResult>>>,
+    /// Per-plugin diagnostics refreshed by the supervisor thread after every
+    /// unit of work, so the UI thread can report a throttled plugin without
+    /// reaching into the pipeline it does not own.
+    health: Arc<Mutex<Vec<(PluginId, crikey_plugin_supervisor::PluginHealth)>>>,
     outcome: Arc<Mutex<Option<ViewModel>>>,
     current: Arc<AtomicU64>,
     cancellation: Arc<NativeCancellation>,
@@ -1448,12 +1531,14 @@ impl NativeDriver {
         let mailbox = Arc::new((
             Mutex::new(NativeRequestSlot {
                 job: None,
+                configuration: None,
                 stop: false,
             }),
             Condvar::new(),
         ));
         let outcome = Arc::new(Mutex::new(None));
         let catalog_results = Arc::new(Mutex::new(Vec::new()));
+        let health = Arc::new(Mutex::new(Vec::new()));
         let current = Arc::new(AtomicU64::new(0));
         let cancellation = Arc::clone(&provider.pool.cancellation);
         let replacements = Arc::new(AtomicU64::new(0));
@@ -1472,6 +1557,7 @@ impl NativeDriver {
         let busy = Arc::new(AtomicBool::new(false));
         let thread_mailbox = Arc::clone(&mailbox);
         let thread_catalog_results = Arc::clone(&catalog_results);
+        let thread_health = Arc::clone(&health);
         let thread_outcome = Arc::clone(&outcome);
         let thread_current = Arc::clone(&current);
         let thread_busy = Arc::clone(&busy);
@@ -1508,6 +1594,12 @@ impl NativeDriver {
                             }
                             if let Ok(request) = action_receiver.try_recv() {
                                 break NativeWork::Action(Box::new(request));
+                            }
+                            // Ahead of a query: a plugin about to answer should
+                            // answer under the configuration the user just
+                            // applied, not the one it is about to lose.
+                            if let Some(configuration) = slot.configuration.take() {
+                                break NativeWork::Configuration(configuration);
                             }
                             if let Some(job) = slot.job.take() {
                                 break NativeWork::Query(job);
@@ -1562,6 +1654,17 @@ impl NativeDriver {
                                 outcome: result,
                             };
                             enqueue_native_completion(&thread_completion_mailbox, completion);
+                            *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
+                                pipeline.plugin_health_report();
+                            continue;
+                        }
+                        NativeWork::Configuration(configuration) => {
+                            for (plugin, reason) in provider.publish_configuration(&configuration) {
+                                eprintln!(
+                                    "crikey: native configuration not delivered to {}: {reason}",
+                                    plugin.0
+                                );
+                            }
                             continue;
                         }
                         NativeWork::Query(job) => job,
@@ -1570,6 +1673,8 @@ impl NativeDriver {
 
                     thread_busy.store(true, Ordering::Release);
                     let native = provider.drive_query(&mut pipeline, &job.query, job.now);
+                    *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
+                        pipeline.plugin_health_report();
                     let mut rows = job.builtin_rows;
                     let mut pending = job.builtin_pending;
                     if let Some(frame) = native {
@@ -1609,6 +1714,7 @@ impl NativeDriver {
                 mailbox,
                 action_endpoint,
                 catalog_results,
+                health,
                 outcome,
                 current,
                 cancellation,
@@ -1621,6 +1727,7 @@ impl NativeDriver {
                 mailbox,
                 action_endpoint,
                 catalog_results,
+                health,
                 outcome,
                 current,
                 cancellation,
@@ -1684,6 +1791,26 @@ impl NativeDriver {
         cvar.notify_one();
     }
 
+    /// Hands the supervisor thread one complete configuration state to publish
+    /// to every native plugin (spec 21.4).
+    ///
+    /// Returns at once and never blocks the caller: delivery happens on the
+    /// supervisor thread, which is the only thread allowed to touch a native
+    /// worker. Replace-oldest, so a caller that publishes twice before the
+    /// supervisor gets a turn delivers only the newer state — the same
+    /// coalescing rule the host applied upstream, enforced again here because
+    /// the two are separated by a thread boundary.
+    pub fn publish_configuration(&self, configuration: crate::PluginConfiguration) {
+        let (lock, cvar) = &*self.mailbox;
+        let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if slot.stop {
+            return;
+        }
+        slot.configuration = Some(Box::new(configuration));
+        drop(slot);
+        cvar.notify_one();
+    }
+
     /// Takes the newest merged frame published by the supervisor, if any.
     pub fn take_outcome(&self) -> Option<ViewModel> {
         self.outcome
@@ -1730,6 +1857,15 @@ impl NativeDriver {
     /// budget handles.
     pub fn action_executor(&self) -> Arc<dyn crate::PluginActionExecutor> {
         self.action_endpoint.clone()
+    }
+
+    /// Per-plugin diagnostics (spec 24.3) as of the supervisor thread's last
+    /// unit of work, including the per-kind §13.5 refusal counters.
+    pub fn health_report(&self) -> Vec<(PluginId, crikey_plugin_supervisor::PluginHealth)> {
+        self.health
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 }
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -8,8 +9,8 @@ use std::{
 };
 
 use egui::{
-    text::LayoutJob, Align, FontFamily, FontId, Frame, Layout, Margin, RawInput, RichText, Rounding, Stroke,
-    TextEdit, TextFormat, TextStyle,
+    load::SizedTexture, text::LayoutJob, vec2, Align, ColorImage, FontFamily, FontId, Frame, Layout, Margin,
+    RawInput, RichText, Rounding, Stroke, TextEdit, TextFormat, TextStyle, TextureHandle, TextureOptions,
 };
 use egui_wgpu::{wgpu, Renderer, ScreenDescriptor};
 use thiserror::Error;
@@ -1492,6 +1493,7 @@ fn draw_result_row(
         .inner_margin(Margin::symmetric(theme::SPACE_3, theme::SPACE_2))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                draw_row_icon(ui, row);
                 ui.vertical(|ui| {
                     ui.add(egui::Label::new(highlighted_label(row, colors)));
                     if !row.description.is_empty() {
@@ -1549,6 +1551,91 @@ fn draw_result_row(
         // back into view and does nothing at all once it is already visible.
         frame.response.scroll_to_me(None);
     }
+}
+
+/// How many icon textures one context retains before the cache is dropped
+/// whole.
+///
+/// A launcher session can walk past thousands of distinct icons, and a texture
+/// nothing draws is still GPU memory. Dropping the whole map rather than
+/// evicting one entry keeps the policy to a single branch: the next frame
+/// re-uploads only the icons it actually draws, which is at most a screenful,
+/// and the decoded pixels are still in the row model, so nothing is re-decoded.
+const MAX_ICON_TEXTURES: usize = 256;
+
+/// Uploaded icon textures, keyed by the content identity of the pixels.
+///
+/// Keyed on content rather than on the icon reference because a reference is not
+/// unique to one image: the theme behind a themed name can be replaced while the
+/// launcher runs, and two references routinely resolve to the same file. Keying
+/// on the reference would draw the stale texture in the first case and upload
+/// the same pixels twice in the second.
+#[derive(Default)]
+struct IconTextures {
+    by_content: HashMap<u64, TextureHandle>,
+}
+
+/// `egui::TextureHandle` is not `Debug`, and the workspace requires every type
+/// to be: the count is what a diagnostic wants anyway, since the handles
+/// themselves are opaque ids.
+impl fmt::Debug for IconTextures {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IconTextures")
+            .field("uploaded", &self.by_content.len())
+            .finish()
+    }
+}
+
+/// Draws `row`'s icon, or reserves exactly the space it would have taken.
+///
+/// The slot is allocated in both branches, and that is the point: a result list
+/// whose rows shift sideways because one icon is missing, still loading or
+/// undecodable is worse than one with no icons at all. "Absent", "not found" and
+/// "failed to decode" all arrive here as `None` and are drawn identically.
+fn draw_row_icon(ui: &mut egui::Ui, row: &ResultRow) {
+    let slot = vec2(theme::ICON_SIZE, theme::ICON_SIZE);
+    match &row.icon {
+        Some(icon) => {
+            let texture = icon_texture(ui.ctx(), icon);
+            ui.add(egui::Image::new(SizedTexture::new(texture.id(), slot)).fit_to_exact_size(slot));
+        }
+        None => {
+            ui.allocate_space(slot);
+        }
+    }
+}
+
+/// The texture for one decoded icon, uploaded on first sight and reused after.
+///
+/// The cache lives in the context's own frame-persistent store rather than in
+/// the renderer, because [`build_launcher_frame`] is a free function over a
+/// context: a headless caller gets the same uploads, and therefore the same
+/// frame, that the windowed renderer produces. The handle returned here is a
+/// clone; the cache holds the one that keeps the texture alive.
+fn icon_texture(context: &egui::Context, icon: &crikey_platform::IconImage) -> TextureHandle {
+    let cache: Arc<Mutex<IconTextures>> = context.data_mut(|data| {
+        Arc::clone(data.get_temp_mut_or_default::<Arc<Mutex<IconTextures>>>(egui::Id::NULL))
+    });
+    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let content = icon.content_id();
+    if let Some(handle) = cache.by_content.get(&content) {
+        return handle.clone();
+    }
+    if cache.by_content.len() >= MAX_ICON_TEXTURES {
+        cache.by_content.clear();
+    }
+    let image =
+        ColorImage::from_rgba_unmultiplied([icon.width() as usize, icon.height() as usize], icon.rgba());
+    // Linear filtering because the slot is smaller than the icons are requested
+    // at, so every icon is being minified rather than magnified.
+    let handle = context.load_texture(
+        format!("crikey-icon-{content:016x}"),
+        image,
+        TextureOptions::LINEAR,
+    );
+    cache.by_content.insert(content, handle.clone());
+    handle
 }
 
 fn display_label(row: &ResultRow) -> &str {
@@ -1874,6 +1961,7 @@ mod label_tests {
             label: String::new(),
             description: String::new(),
             icon_reference: None,
+            icon: None,
             category: String::new(),
             plugin_name: String::new(),
             highlights: Vec::new(),
@@ -1893,6 +1981,7 @@ mod label_tests {
             label: "café".to_owned(),
             description: String::new(),
             icon_reference: None,
+            icon: None,
             category: String::new(),
             plugin_name: String::new(),
             highlights: vec![(4, 5)],

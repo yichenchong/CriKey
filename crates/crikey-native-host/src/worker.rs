@@ -1,6 +1,6 @@
 //! Supervised native worker runtime (spec 16.3-16.6, 24.1-24.4).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::Read;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -656,6 +656,46 @@ impl NativeWorker {
     /// Returns host-authoritative plugin identity.
     pub fn plugin(&self) -> &PluginId {
         &self.spec.plugin
+    }
+
+    /// Delivers the latest complete configuration state to the plugin (spec 21.4).
+    ///
+    /// Host-initiated and unsolicited: there is no request to correlate, so the
+    /// envelope carries `request_id = 0`, which no real request ever uses
+    /// (`next_request_id` starts at 1). That matters for the failure path — the
+    /// SDK answers a raising `on_configuration` with an `Error` envelope, and
+    /// tagging this publication with a live request id would let that error be
+    /// mistaken for the reply to a call the host is waiting on. Against
+    /// `request_id = 0` it is simply an envelope no call claims, which the reader
+    /// already discards.
+    ///
+    /// Nothing is awaited. Configuration delivery is not a request: a host that
+    /// blocked here would let one slow plugin delay publication to every other
+    /// plugin, and there is no answer worth waiting for.
+    ///
+    /// `complete` says whether `values` is the whole state rather than a delta.
+    /// The host only ever publishes whole states — that IS the coalescing rule of
+    /// spec 21.4 — so a caller passing `false` is describing a delta path that
+    /// does not exist yet.
+    pub fn send_configuration(
+        &mut self,
+        values: &BTreeMap<String, String>,
+        complete: bool,
+    ) -> Result<(), HostError> {
+        self.ensure_alive()?;
+        let envelope = Envelope {
+            connection_id: self.link.connection_id,
+            request_id: 0,
+            generation: 0,
+            deadline_ms: 0,
+            payload: Some(Payload::Configuration(message::ConfigurationChange {
+                values: values.clone(),
+                complete,
+                unknown: Default::default(),
+            })),
+            unknown: Default::default(),
+        };
+        self.send_control(&envelope)
     }
 
     /// Streams and folds the plugin catalog under aggregate bounds.

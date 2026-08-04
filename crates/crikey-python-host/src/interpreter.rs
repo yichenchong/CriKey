@@ -16,6 +16,17 @@
 //! declared it cannot run on, or one the operator did not choose, which is
 //! worse than not starting at all (spec 15.2, §4).
 //!
+//! # Which profile a plugin gets
+//!
+//! The rules above decide *whether* a named candidate may run plugin code; they
+//! do not decide *which* interpreter a plugin should be offered. That is
+//! [`RuntimeCatalog`]: it probes every interpreter on the search path once and
+//! maps a declared `requires-python` onto the [`RuntimeProfile`] whose
+//! interpreter satisfies it, so two plugins with incompatible requirements are
+//! offered two different interpreters instead of both being gated against one.
+//! The choice is then still passed through the ordered rules above, which is
+//! why `CRIKEY_PYTHON` keeps winning over the mapping.
+//!
 //! # Why discovery takes the environment as a value
 //!
 //! [`discover_interpreter_in`] resolves against a [`DiscoveryEnvironment`] the
@@ -25,6 +36,7 @@
 //! caller that had to mutate `CRIKEY_PYTHON` to select an interpreter would be
 //! changing global state for unrelated work at the same time.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -304,6 +316,208 @@ impl DiscoveryEnvironment {
                 .map(|name| directory.join(name))
                 .find(|candidate| is_executable_file(candidate))
         })
+    }
+
+    /// Every distinct interpreter the search path offers, in search order.
+    ///
+    /// Unlike [`Self::find_on_search_path`], which answers the single
+    /// *decisive* `python3`, this enumerates the whole host so a plugin's
+    /// `requires-python` can pick among the versions actually installed
+    /// (spec 14.11). Duplicates are removed by resolved target, because
+    /// `python3` is normally a symlink to `python3.<minor>` and probing both
+    /// would spawn two processes to learn one version.
+    fn enumerate_search_path(&self) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        for directory in &self.search_path {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                continue;
+            };
+            // Sorted so the enumeration does not depend on directory order,
+            // and so the short name (`python3`) is the one kept for a target
+            // it shares with a versioned alias.
+            let mut candidates: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(is_interpreter_name)
+                        && is_executable_file(path)
+                })
+                .collect();
+            candidates.sort();
+
+            for candidate in candidates {
+                let identity = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+                if seen.insert(identity) {
+                    found.push(candidate);
+                }
+            }
+        }
+
+        found
+    }
+}
+
+/// Whether `name` is a file name this host is willing to treat as a CPython.
+///
+/// `python3` and `python3.<minor>` only: a bare `python` on Unix is still a
+/// Python 2 on some hosts and is not a name the decisive search-path rule
+/// chooses either, so the catalog does not invent a candidate the rest of this
+/// module would never pick. Windows ships the unsuffixed `python.exe` as the
+/// normal name, so there it is included — matching [`SEARCH_PATH_CANDIDATES`].
+fn is_interpreter_name(name: &str) -> bool {
+    #[cfg(windows)]
+    let lowered = name.to_ascii_lowercase();
+    #[cfg(windows)]
+    let name = lowered.as_str();
+
+    #[cfg(windows)]
+    let Some(stem) = name.strip_suffix(".exe") else {
+        return false;
+    };
+    #[cfg(not(windows))]
+    let stem = name;
+
+    if cfg!(windows) && stem == "python" {
+        return true;
+    }
+    let Some(rest) = stem.strip_prefix("python3") else {
+        return false;
+    };
+    rest.is_empty()
+        || rest
+            .strip_prefix('.')
+            .is_some_and(|minor| !minor.is_empty() && minor.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// The interpreters this host offers, probed once (spec 14.11).
+///
+/// # Why this exists
+///
+/// A plugin declares a `requires-python`, not an interpreter. Without a catalog
+/// the host can only offer one interpreter and the declaration degrades to a
+/// yes/no gate on it, so a plugin needing 3.13 on a host whose `python3` is
+/// 3.11 simply fails even though 3.13 is installed beside it — and two plugins
+/// with incompatible requirements can never both run. Mapping a requirement to
+/// a [`RuntimeProfile`] is what makes those two plugins land on two
+/// interpreters and therefore, since the worker key carries the interpreter's
+/// version, two separate processes (spec 14.11, 15.6).
+///
+/// # Why it is cached
+///
+/// The only way to know an interpreter's version is to run it. Mapping each
+/// plugin independently would spawn one probe per candidate per plugin at
+/// startup; the scan is therefore done once and every plugin is mapped from the
+/// result. Nothing here is refreshed: an interpreter installed while the
+/// launcher is running is picked up on the next start, which is the same
+/// contract the search path itself has.
+#[derive(Debug)]
+pub struct RuntimeCatalog {
+    /// Set when `CRIKEY_PYTHON` is present. The override is decisive in
+    /// [`discover_interpreter_in`], so the mapping must not name a competing
+    /// interpreter and the scan is skipped entirely.
+    overridden: bool,
+    interpreters: Vec<Interpreter>,
+}
+
+impl RuntimeCatalog {
+    /// Scans the ambient process environment.
+    pub fn for_process() -> Self {
+        Self::probe_in(&DiscoveryEnvironment::from_process())
+    }
+
+    /// Scans `environment`, probing every candidate it enumerates.
+    ///
+    /// A candidate that will not run, or answers with nothing recognisable as a
+    /// version, is left out rather than reported: this is a *scan*, and unlike
+    /// the decisive rules of [`discover_interpreter_in`] no plugin asked for
+    /// this particular file. A broken `python3.9` beside a working `python3.13`
+    /// must not stop the host from offering 3.13.
+    pub fn probe_in(environment: &DiscoveryEnvironment) -> Self {
+        if environment.python_override().is_some() {
+            return Self {
+                overridden: true,
+                interpreters: Vec::new(),
+            };
+        }
+
+        let interpreters = environment
+            .enumerate_search_path()
+            .into_iter()
+            .filter_map(|path| probe(&path, InterpreterSource::SearchPath).ok())
+            .collect();
+
+        Self {
+            overridden: false,
+            interpreters,
+        }
+    }
+
+    /// A catalog that offers exactly `interpreters`, bypassing the scan.
+    ///
+    /// Exists so the mapping rule can be exercised against version
+    /// combinations no single host has installed.
+    #[cfg(test)]
+    fn of(interpreters: Vec<Interpreter>) -> Self {
+        Self {
+            overridden: false,
+            interpreters,
+        }
+    }
+
+    /// Maps a declared `requires-python` onto the profile whose interpreter
+    /// satisfies it (spec 14.11).
+    ///
+    /// The newest satisfying interpreter wins, because a plugin that declares a
+    /// floor wants the maintained runtime rather than the oldest one that still
+    /// technically passes; ties are impossible and equal versions are broken by
+    /// search-path order, so the answer is deterministic for a given host.
+    ///
+    /// The result is a profile, not an [`Interpreter`]: the caller still passes
+    /// it through [`discover_interpreter_in`], which is the one place the
+    /// `requires` gate and the `CRIKEY_PYTHON` override are applied. That keeps
+    /// this a *choice* and leaves the *decision* where the ordered rules live.
+    pub fn profile_for(&self, requires: &RequiresPython) -> Result<RuntimeProfile, HostError> {
+        if self.overridden {
+            // `Bundled` names no path, so discovery's first rule — the
+            // override — stays decisive and the operator's choice is what runs
+            // (and what the `requires` gate reports on).
+            return Ok(RuntimeProfile::Bundled);
+        }
+
+        let chosen = self
+            .interpreters
+            .iter()
+            .filter(|interpreter| requires.is_satisfied_by(&interpreter.version))
+            .fold(None::<&Interpreter>, |best, candidate| match best {
+                Some(best) if best.version >= candidate.version => Some(best),
+                _ => Some(candidate),
+            });
+
+        match chosen {
+            Some(interpreter) => Ok(RuntimeProfile::External(interpreter.path.clone())),
+            None => Err(HostError::UnsatisfiedRequiresPython {
+                required: requires.0.clone(),
+                found: self.describe_found(),
+            }),
+        }
+    }
+
+    /// What the scan saw, for the failure message: an operator can only fix an
+    /// unsatisfiable requirement if the diagnostic says which interpreters were
+    /// considered and what versions they reported.
+    fn describe_found(&self) -> String {
+        if self.interpreters.is_empty() {
+            return format!("no {} on the search path", SEARCH_PATH_CANDIDATES.join(" or "));
+        }
+        self.interpreters
+            .iter()
+            .map(Interpreter::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -698,6 +912,162 @@ mod tests {
         assert!(
             status.success(),
             "sanitizing Python variables leaves no hostile startup values"
+        );
+    }
+
+    /// A catalog entry with a known version, so the mapping rule can be tested
+    /// against version combinations no single host has installed.
+    fn found(path: &str, major: u32, minor: u32, patch: u32) -> Interpreter {
+        Interpreter {
+            path: PathBuf::from(path),
+            version: PythonVersion::new(major, minor, patch),
+            source: InterpreterSource::SearchPath,
+        }
+    }
+
+    fn host_with_three_versions() -> RuntimeCatalog {
+        RuntimeCatalog::of(vec![
+            found("/usr/bin/python3", 3, 11, 9),
+            found("/usr/bin/python3.12", 3, 12, 7),
+            found("/usr/bin/python3.13", 3, 13, 1),
+        ])
+    }
+
+    #[test]
+    fn the_newest_interpreter_satisfying_the_requirement_is_the_one_mapped() {
+        let profile = host_with_three_versions()
+            .profile_for(&RequiresPython(">=3.12".to_owned()))
+            .expect("3.12 and 3.13 both satisfy >=3.12");
+        assert_eq!(
+            profile,
+            RuntimeProfile::External(PathBuf::from("/usr/bin/python3.13"))
+        );
+    }
+
+    #[test]
+    fn two_incompatible_requirements_map_to_two_different_interpreters() {
+        let host = host_with_three_versions();
+        let newer = host
+            .profile_for(&RequiresPython(">=3.13".to_owned()))
+            .expect("3.13.1 satisfies >=3.13");
+        let older = host
+            .profile_for(&RequiresPython("<3.12".to_owned()))
+            .expect("3.11.9 satisfies <3.12");
+
+        assert_eq!(
+            newer,
+            RuntimeProfile::External(PathBuf::from("/usr/bin/python3.13"))
+        );
+        assert_eq!(older, RuntimeProfile::External(PathBuf::from("/usr/bin/python3")));
+        // The point of the mapping: incompatible requirements cannot share an
+        // interpreter, hence cannot share a worker process.
+        assert_ne!(
+            newer, older,
+            "incompatible requirements must not map to one interpreter"
+        );
+    }
+
+    #[test]
+    fn an_unsatisfiable_requirement_names_the_requirement_and_every_version_found() {
+        let error = host_with_three_versions()
+            .profile_for(&RequiresPython("==3.9.9".to_owned()))
+            .expect_err("no 3.9 is installed on this fixture host");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("==3.9.9"),
+            "the requirement must be quoted: {message}"
+        );
+        for version in ["3.11.9", "3.12.7", "3.13.1"] {
+            assert!(
+                message.contains(version),
+                "the versions actually found must be quoted: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsatisfiable_requirement_on_a_host_with_no_interpreter_says_so() {
+        let error = RuntimeCatalog::of(Vec::new())
+            .profile_for(&RequiresPython(">=3.12".to_owned()))
+            .expect_err("an empty host satisfies nothing");
+        assert!(
+            error.to_string().contains("on the search path"),
+            "an empty catalog must say the search path held nothing: {error}"
+        );
+    }
+
+    #[test]
+    fn an_environment_override_maps_every_requirement_to_the_bundled_profile() {
+        let catalog = RuntimeCatalog::probe_in(
+            &DiscoveryEnvironment::empty()
+                .with_override("/opt/operator/python3")
+                .with_search_path(["/usr/bin"]),
+        );
+
+        assert!(
+            catalog.interpreters.is_empty(),
+            "an override makes the scan pointless, so nothing is probed"
+        );
+        // `Bundled` names no path, so discovery's first rule — the override —
+        // stays decisive and the operator's interpreter is what runs.
+        assert_eq!(
+            catalog
+                .profile_for(&RequiresPython(">=3.13".to_owned()))
+                .expect("an override never fails the mapping"),
+            RuntimeProfile::Bundled
+        );
+    }
+
+    #[test]
+    fn only_python3_file_names_are_treated_as_interpreters() {
+        for name in ["python3", "python3.9", "python3.13"] {
+            assert!(is_interpreter_name(name), "{name} is an interpreter name");
+        }
+        for name in [
+            "python",
+            "python3.",
+            "python3.x",
+            "python3x",
+            "pythonw3",
+            "python2.7",
+        ] {
+            assert_eq!(
+                is_interpreter_name(name),
+                cfg!(windows) && name == "python",
+                "{name} must not be picked up off the search path"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_search_path_scan_skips_non_executables_and_collapses_aliases() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("crikey-catalog-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("fixture directory is creatable");
+
+        let real = root.join("python3.13");
+        std::fs::write(&real, "#!/bin/sh\nexit 0\n").expect("fixture interpreter is writable");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755))
+            .expect("fixture interpreter is executable");
+        // The usual layout: `python3` is an alias for the versioned binary.
+        std::os::unix::fs::symlink("python3.13", root.join("python3")).expect("alias is creatable");
+        // Neither of these is a runnable interpreter.
+        std::fs::write(root.join("python3.9"), "not executable").expect("decoy is writable");
+        std::fs::create_dir_all(root.join("python3.8")).expect("decoy directory is creatable");
+
+        let found = DiscoveryEnvironment::empty()
+            .with_search_path([root.clone()])
+            .enumerate_search_path();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            found,
+            vec![root.join("python3")],
+            "one target is one candidate, and a non-executable of the right name is not one"
         );
     }
 }

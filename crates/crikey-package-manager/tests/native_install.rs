@@ -406,6 +406,65 @@ fn verify_package_accepts_good_hash_rejects_wrong_hash_and_reports_corruption_as
     let _: PackageError = package_error(corrupted);
 }
 
+#[test]
+fn verify_package_refuses_a_member_whose_bytes_no_longer_match_the_embedded_lock() {
+    // `crikey package verify` answers one question: are these the bytes the
+    // publisher packaged? A substituted payload leaves a well-formed ZIP with
+    // a valid manifest, so the only thing that can refuse it is the embedded
+    // per-member lock — and an operator verifying a package they were handed
+    // has no separately-published whole-archive hash to pin it against.
+    let scratch = Scratch::new("verify-integrity");
+    let fixture = write_fixture(
+        &scratch,
+        "plugin",
+        FixtureSpec {
+            id: "dev.example.substituted",
+            version: "1.0.0",
+            os: &["linux"],
+            arch: &["x86_64"],
+            binary: b"authentic-binary",
+            signed: false,
+        },
+    );
+    let (archive, _) = build_archive(&scratch, &fixture, "package.crikeypkg");
+    substitute_member(&archive, &format!("bin/{BINARY_NAME}"), b"substituted-binary");
+
+    let unpinned = package_error(verify_package(&archive, None));
+    assert!(
+        matches!(unpinned, PackageError::HashMismatch(_)),
+        "verification with no pinned hash must still authenticate every member, got {unpinned}"
+    );
+
+    // The whole-archive hash of the tampered archive is, of course, the hash
+    // of the tampered archive: pinning it against itself must not launder the
+    // substitution into a pass.
+    let self_hash = sha256_hex(&fs::read(&archive).expect("archive is readable"));
+    let pinned = package_error(verify_package(&archive, Some(&self_hash)));
+    assert!(matches!(pinned, PackageError::HashMismatch(_)));
+
+    let inspected = package_error(inspect_package(&archive));
+    assert!(matches!(inspected, PackageError::HashMismatch(_)));
+}
+
+/// Rewrites one member's payload, leaving the lock describing the original
+/// bytes. The archive stays a valid ZIP with a valid manifest.
+fn substitute_member(archive: &Path, member: &str, bytes: &[u8]) {
+    let existing = archive_members(archive);
+    assert!(
+        existing.contains_key(member),
+        "the fixture has no member {member}"
+    );
+    let file = fs::File::create(archive).expect("archive is rewritable");
+    let mut writer = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, payload) in existing {
+        writer.start_file(name.clone(), options).expect("member starts");
+        let payload = if name == member { bytes.to_vec() } else { payload };
+        std::io::Write::write_all(&mut writer, &payload).expect("member is writable");
+    }
+    writer.finish().expect("archive finishes");
+}
+
 // ---------------------------------------------------------------------------
 // Installation selection, marking, ordering, rollback, and atomicity
 // ---------------------------------------------------------------------------

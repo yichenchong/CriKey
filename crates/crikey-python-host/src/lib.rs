@@ -18,7 +18,7 @@ mod worker;
 pub use host::WorkerPool;
 pub use interpreter::{
     discover_interpreter, discover_interpreter_in, DiscoveryEnvironment, Interpreter, InterpreterSource,
-    PythonVersion, RequiresPython, ENV_PYTHON_OVERRIDE,
+    PythonVersion, RequiresPython, RuntimeCatalog, ENV_PYTHON_OVERRIDE,
 };
 pub use protocol::{
     MAX_FRAME_BYTES, MAX_LOG_LINES, MAX_LOG_LINE_BYTES, MAX_STDERR_TAIL_BYTES, PROTOCOL_VERSION,
@@ -36,13 +36,24 @@ pub use worker::{
 pub use crikey_package_manager::{EnvironmentId, ImportPath, MaterializedEnvironment};
 
 /// Which interpreter a worker runs (spec 14.11).
+///
+/// A plugin never names one of these: it declares a `requires-python`, and
+/// [`RuntimeCatalog::profile_for`] maps that declaration onto the profile whose
+/// interpreter satisfies it. Two plugins with incompatible requirements
+/// therefore map to two profiles, two interpreters and — because the
+/// interpreter's version is part of a worker's environment identity — two
+/// separate child processes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeProfile {
     /// Interpreter kept for legacy compatibility.
     LegacyCompatibility,
-    /// Interpreter bundled with this CriKey build.
+    /// Interpreter bundled with this CriKey build, reached through the search
+    /// path. Also the profile used when `CRIKEY_PYTHON` is set, because that
+    /// override is decisive and a profile naming a path would only compete
+    /// with it.
     Bundled,
-    /// Externally managed interpreter selected by manifest or user override.
+    /// A specific interpreter, named by [`RuntimeCatalog::profile_for`] from a
+    /// plugin's `requires-python`.
     External(PathBuf),
 }
 

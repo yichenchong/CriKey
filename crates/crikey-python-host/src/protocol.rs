@@ -12,6 +12,8 @@
 //! plugin cannot make the host allocate without limit, and an over-long line is
 //! a named protocol failure rather than unbounded growth.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Map, Value};
 
 use crikey_core::{
@@ -86,6 +88,15 @@ pub(crate) const KIND_BACKGROUND_REFUSE: &str = "background_refuse";
 /// Host → worker: cancel one registered background task, or all tasks when
 /// `task_id` is omitted.
 pub(crate) const KIND_BACKGROUND_CANCEL: &str = "background_cancel";
+/// Host → worker: deliver the latest complete configuration state (spec 21.4).
+///
+/// No `id` and no reply. Unlike [`KIND_SET_CANCEL`] it is NOT applied by the
+/// child's control-reader thread: it invokes a plugin callback, and running
+/// plugin code on the reader thread would let a slow `on_configuration` stop the
+/// child from ever seeing the next cancellation. It is therefore queued for the
+/// child's main loop, which keeps it serialised behind whatever call is in flight
+/// exactly like every other request.
+pub(crate) const KIND_CONFIGURATION: &str = "configuration";
 /// Host → worker: ask the child to exit.
 pub(crate) const KIND_SHUTDOWN: &str = "shutdown";
 
@@ -166,6 +177,26 @@ pub(crate) fn encode_background_refuse(task_id: u64, reason: &str) -> Value {
 /// task or all tasks on shutdown/restart.
 pub(crate) fn encode_background_cancel(task_id: Option<u64>) -> Value {
     json!({ "kind": KIND_BACKGROUND_CANCEL, "task_id": task_id })
+}
+
+/// `{"kind":"configuration","values":{...},"complete":<bool>}` — a control frame
+/// with NO `id`, mirroring the native transport's `ConfigurationChange`
+/// (spec 21.4).
+///
+/// `complete` is always true in the host's current publication path, because the
+/// host coalesces edits and publishes whole states rather than deltas; the field
+/// is on the wire so the two transports carry the same shape and a plugin can
+/// tell the two apart if a delta path is ever added.
+pub(crate) fn encode_configuration(values: &BTreeMap<String, String>, complete: bool) -> Value {
+    let rendered: Map<String, Value> = values
+        .iter()
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect();
+    json!({
+        "kind": KIND_CONFIGURATION,
+        "values": Value::Object(rendered),
+        "complete": complete,
+    })
 }
 
 /// `{"id","kind":"shutdown"}`

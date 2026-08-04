@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::LazyLock;
 
 use crikey_app::{
-    admitted_plugin_roots, BatchState, NativeProvider, PipelineConfig, QueryPipeline, ResultBatch,
-    StartupMode, SAFE_MODE_AFTER_FAILURES,
+    admitted_plugin_roots, BatchState, DisabledPlugins, NativeProvider, PipelineConfig, QueryPipeline,
+    ResultBatch, StartupMode, DISABLED_BY_CONFIGURATION, SAFE_MODE_AFTER_FAILURES,
 };
 use crikey_core::{ArgumentPolicy, Category, Generation, HitPolicy, Item, ItemId, PluginId};
 use crikey_input_scheduler::{CompletionOutcome, DebouncePolicy, Millis, PluginPolicy, SchedulingProfile};
@@ -189,11 +189,16 @@ fn safe_mode() -> StartupMode {
 }
 
 /// Loads every admitted third-party root under `mode` through the real
-/// provider and reports the plugins it brought up plus a description of the
-/// packages it refused.
-fn plugins_loaded_under(mode: &StartupMode, roots: &[PathBuf]) -> (Vec<PluginId>, Vec<String>) {
+/// provider, with `disabled` naming plugins the operator switched off, and
+/// reports the plugins it brought up plus a description of the packages it
+/// refused.
+fn plugins_loaded_under(
+    mode: &StartupMode,
+    roots: &[PathBuf],
+    disabled: &DisabledPlugins,
+) -> (Vec<PluginId>, Vec<String>) {
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = NativeProvider::load(&mut pipeline, &admitted_plugin_roots(mode, roots));
+    let mut provider = NativeProvider::load(&mut pipeline, &admitted_plugin_roots(mode, roots), disabled);
     let loaded = provider.plugins().to_vec();
     let unavailable = provider
         .unavailable()
@@ -265,7 +270,8 @@ fn the_same_native_package_loads_in_normal_mode_and_loads_not_at_all_in_safe_mod
     let roots = vec![plugins_root];
     let healthy = native_plugin("healthy");
 
-    let (normal_loaded, normal_unavailable) = plugins_loaded_under(&StartupMode::Normal, &roots);
+    let (normal_loaded, normal_unavailable) =
+        plugins_loaded_under(&StartupMode::Normal, &roots, &DisabledPlugins::default());
     assert!(
         normal_loaded.contains(&healthy),
         "a normal startup must load the third-party native package; unavailable: {normal_unavailable:?}",
@@ -275,7 +281,7 @@ fn the_same_native_package_loads_in_normal_mode_and_loads_not_at_all_in_safe_mod
         "the package is healthy, so nothing may be recorded unavailable: {normal_unavailable:?}",
     );
 
-    let (safe_loaded, _) = plugins_loaded_under(&safe_mode(), &roots);
+    let (safe_loaded, _) = plugins_loaded_under(&safe_mode(), &roots, &DisabledPlugins::default());
     assert_eq!(
         safe_loaded.len(),
         0,
@@ -285,6 +291,60 @@ fn the_same_native_package_loads_in_normal_mode_and_loads_not_at_all_in_safe_mod
     assert!(
         !normal_loaded.is_empty() && safe_loaded.is_empty(),
         "the two runs must differ: normal loaded {normal_loaded:?}, safe mode loaded {safe_loaded:?}",
+    );
+}
+
+/// Two gates, one reason: safe mode wins over `crikey plugin disable`.
+///
+/// [`admitted_plugin_roots`] withholds whole roots, so under safe mode the
+/// provider never opens the directory the package lives in and cannot know the
+/// plugin exists — let alone that it is disabled. That ordering is deliberate:
+/// the operator must read exactly one explanation for a missing plugin, and
+/// "third-party plugins are disabled by safe mode" is the one that tells them
+/// what to fix. A `disabled by configuration` line beside it would send them to
+/// `crikey plugin enable`, which would change nothing while safe mode holds.
+///
+/// The disabled-only half in the same test is what makes this non-vacuous: it
+/// proves the per-plugin gate does fire when the root is admitted, so the
+/// silence under safe mode is the root gate winning rather than the plugin gate
+/// being broken.
+#[test]
+fn safe_mode_reports_its_own_reason_and_never_a_second_disabled_reason_for_the_same_plugin() {
+    let conformance = conformance_binary();
+    let scratch = Scratch::new("disabled-and-safe");
+    let plugins_root = scratch.subdir("plugins");
+    write_native_plugin(&plugins_root, "healthy", &conformance, "echo");
+    let roots = vec![plugins_root];
+    let healthy = native_plugin("healthy");
+    let disabled = DisabledPlugins::from_ids([healthy.0.clone()]);
+
+    // Normal mode: the root is admitted, so the per-plugin gate is what holds
+    // the plugin back, and it says so.
+    let (normal_loaded, normal_unavailable) = plugins_loaded_under(&StartupMode::Normal, &roots, &disabled);
+    assert!(
+        !normal_loaded.contains(&healthy),
+        "a disabled plugin must not be loaded even in normal mode, loaded: {normal_loaded:?}",
+    );
+    assert_eq!(
+        normal_unavailable.len(),
+        1,
+        "the disabled plugin must be reported exactly once: {normal_unavailable:?}",
+    );
+    assert!(
+        normal_unavailable[0].contains(DISABLED_BY_CONFIGURATION),
+        "the recorded reason must be the shared disabled sentence: {normal_unavailable:?}",
+    );
+
+    // Safe mode: no root is offered, so nothing is discovered and nothing is
+    // reported. One gate, one reason.
+    let (safe_loaded, safe_unavailable) = plugins_loaded_under(&safe_mode(), &roots, &disabled);
+    assert!(
+        safe_loaded.is_empty(),
+        "safe mode must load no third-party plugin, loaded: {safe_loaded:?}",
+    );
+    assert!(
+        safe_unavailable.is_empty(),
+        "safe mode withholds the root, so no per-plugin reason may be recorded: {safe_unavailable:?}",
     );
 }
 
@@ -306,7 +366,11 @@ fn safe_mode_suppresses_third_party_plugins_without_disabling_the_pipeline_itsel
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
     let mode = safe_mode();
-    let mut provider = NativeProvider::load(&mut pipeline, &admitted_plugin_roots(&mode, &roots));
+    let mut provider = NativeProvider::load(
+        &mut pipeline,
+        &admitted_plugin_roots(&mode, &roots),
+        &DisabledPlugins::default(),
+    );
     assert!(
         provider.plugins().is_empty(),
         "precondition: safe mode loaded no third-party plugin, found {:?}",

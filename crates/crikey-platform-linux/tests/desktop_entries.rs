@@ -830,7 +830,6 @@ fn capabilities_without_a_linux_implementation_report_unavailable() {
         Capability::Clipboard,
         Capability::UriOpen,
         Capability::Notifications,
-        Capability::Icons,
         Capability::FileWatching,
         Capability::SecretStorage,
         Capability::ShellIntegration,
@@ -840,6 +839,10 @@ fn capabilities_without_a_linux_implementation_report_unavailable() {
     // X11 claims it only as `Partial` (spec 18.2, 18.6).
     let hotkeys_only = [Capability::GlobalHotkeys];
     let window_control = [Capability::WindowEnumeration, Capability::WindowActivation];
+    // Icons need no display server at all, so the answer is the same in every
+    // session, and it is `Partial` rather than `Available` because `.svgz`,
+    // `.xpm` and scaled theme directories are not decoded.
+    let icons = [Capability::Icons];
 
     for (environment, expected_hotkeys, expected_windows) in [
         (
@@ -865,6 +868,14 @@ fn capabilities_without_a_linux_implementation_report_unavailable() {
                 CapabilityState::Unavailable,
                 "{capability:?} has no Linux implementation yet and must not be claimed under \
                  {environment:?} (spec 18.2)"
+            );
+        }
+        for capability in icons {
+            assert_eq!(
+                backend.capability(capability),
+                CapabilityState::Partial,
+                "{capability:?} resolves themed names in any session, including {environment:?}, \
+                 but not every theme asset (spec 18.2)"
             );
         }
         for (group, expected) in [

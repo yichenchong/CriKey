@@ -126,6 +126,26 @@ class Plugin:
     ) -> None | Awaitable[None]:
         return None
 
+    def on_configuration(self, values: dict[str, str]) -> None | Awaitable[None]:
+        """Receives the plugin's complete configuration state (spec 21.4).
+
+        ``values`` is keyed by the field names the plugin declared in its
+        manifest's ``[configuration]`` section, with the host's
+        ``plugins.<id>.settings.`` prefix already stripped, and every value is
+        text — the declared type is a validation rule the host applied, not a
+        Python type it guesses at.
+
+        Always the WHOLE state, never a delta: the host coalesces rapid edits and
+        publishes the latest complete state, so a field that is absent here is
+        absent from the configuration rather than merely unchanged. That is what
+        makes replacing retained settings wholesale the correct implementation.
+
+        Called on the worker's callback path, in order, after whatever request was
+        in flight. Raising is contained and reported like any other callback
+        fault; the worker stays usable.
+        """
+        return None
+
     def stop(self) -> None | Awaitable[None]:
         return None
 

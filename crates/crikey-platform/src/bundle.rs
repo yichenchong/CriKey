@@ -20,6 +20,8 @@
 //! key names, so a flat scan for the first `<key>CFBundleName</key>` would
 //! index the decoy that happens to appear first.
 
+use std::path::{Component, Path, PathBuf};
+
 /// What a launcher needs out of an `Info.plist`.
 ///
 /// A bundle without a usable display name is not a value of this type at all:
@@ -30,6 +32,10 @@ pub struct AppBundle {
     pub name: String,
     pub bundle_id: Option<String>,
     pub executable: Option<String>,
+    /// The `Resources` file holding the bundle's icon, as the plist spells it:
+    /// with or without the `.icns` extension, since Apple's tools accept both.
+    /// [`bundle_icon_path`] is what turns it into a file.
+    pub icon_file: Option<String>,
 }
 
 /// The user-visible name, preferred over [`BUNDLE_NAME_KEY`] wherever both are
@@ -38,6 +44,7 @@ const DISPLAY_NAME_KEY: &str = "CFBundleDisplayName";
 const BUNDLE_NAME_KEY: &str = "CFBundleName";
 const IDENTIFIER_KEY: &str = "CFBundleIdentifier";
 const EXECUTABLE_KEY: &str = "CFBundleExecutable";
+const ICON_FILE_KEY: &str = "CFBundleIconFile";
 
 /// The suffix that names an application bundle, spelled exactly as Apple
 /// spells it. Matching is case sensitive on purpose: HFS+ and APFS are
@@ -46,7 +53,13 @@ const EXECUTABLE_KEY: &str = "CFBundleExecutable";
 /// Apple tool produced.
 const BUNDLE_SUFFIX: &str = ".app";
 
-/// Reads the four keys a launcher consumes out of an `Info.plist` document.
+/// Where a bundle keeps the resources `CFBundleIconFile` names.
+const BUNDLE_RESOURCES: &str = "Contents/Resources";
+
+/// The extension `CFBundleIconFile` is allowed to omit.
+const ICNS_SUFFIX: &str = ".icns";
+
+/// Reads the five keys a launcher consumes out of an `Info.plist` document.
 ///
 /// `None` means "nothing launchable here": the document is not well-formed XML,
 /// carries no top-level dictionary, or declares no string-valued name. A value
@@ -88,10 +101,12 @@ pub fn parse_info_plist(xml: &str) -> Option<AppBundle> {
     let mut name = None;
     let mut bundle_id = None;
     let mut executable = None;
+    let mut icon_file = None;
     let mut display_name_seen = false;
     let mut name_seen = false;
     let mut bundle_id_seen = false;
     let mut executable_seen = false;
+    let mut icon_file_seen = false;
 
     let mut index = dict + 1;
     while index < events.len() {
@@ -130,6 +145,7 @@ pub fn parse_info_plist(xml: &str) -> Option<AppBundle> {
                     BUNDLE_NAME_KEY => (&mut name, &mut name_seen),
                     IDENTIFIER_KEY => (&mut bundle_id, &mut bundle_id_seen),
                     EXECUTABLE_KEY => (&mut executable, &mut executable_seen),
+                    ICON_FILE_KEY => (&mut icon_file, &mut icon_file_seen),
                     _ => {
                         index = skip_element(&events, index);
                         continue;
@@ -155,6 +171,7 @@ pub fn parse_info_plist(xml: &str) -> Option<AppBundle> {
         name: display_name.or(name)?,
         bundle_id,
         executable,
+        icon_file,
     })
 }
 
@@ -169,6 +186,32 @@ pub fn parse_info_plist(xml: &str) -> Option<AppBundle> {
 pub fn bundle_display_name(dir_name: &str) -> Option<&str> {
     let stem = dir_name.strip_suffix(BUNDLE_SUFFIX)?;
     (!stem.is_empty()).then_some(stem)
+}
+
+/// The icon file a bundle's [`AppBundle::icon_file`] names, if it is there.
+///
+/// Apple's tools accept the key with or without its extension and both
+/// spellings ship in real bundles, so both are tried: the literal name first,
+/// because a bundle that really does contain both `AppIcon` and `AppIcon.icns`
+/// meant the one it named.
+///
+/// Only `Contents/Resources` is searched, and only for a single plain component.
+/// The key is documented as naming a file there, and a `CFBundleIconFile` of
+/// `../../../../etc/shadow` in a bundle any user can unzip into `~/Applications`
+/// is exactly the input this refuses: an icon path is a display detail, and it
+/// must not become a way to make the launcher read an arbitrary file.
+pub fn bundle_icon_path(bundle: &Path, icon_file: &str) -> Option<PathBuf> {
+    let mut components = Path::new(icon_file).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return None;
+    }
+    let resources = bundle.join(BUNDLE_RESOURCES);
+    let literal = resources.join(icon_file);
+    if literal.is_file() {
+        return Some(literal);
+    }
+    let suffixed = resources.join(format!("{icon_file}{ICNS_SUFFIX}"));
+    suffixed.is_file().then_some(suffixed)
 }
 
 // ---------------------------------------------------------------------------

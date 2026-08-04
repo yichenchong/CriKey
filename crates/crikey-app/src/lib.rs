@@ -16,6 +16,10 @@ mod plugin_action;
 mod query_pipeline;
 mod startup_recovery;
 
+/// Re-exported so the composition root can report per-plugin diagnostics
+/// without depending on the supervisor crate directly; the driver accessors
+/// that return these live here.
+pub use crikey_plugin_supervisor::{BudgetKind, ConcurrencyRefusals, PluginHealth};
 pub use crikey_result_aggregator::{
     BatchPriority, BatchState, DrainBudget, DrainReport, InboundBatch, IntakePolicy, MergedBatch,
     OverflowPolicy, ProducerState, QueueDepth, QueueDiagnostics, QueueEvent, QueueEventKind, QueueLimits,
@@ -28,12 +32,29 @@ pub use plugin_action::{
     ActionRequestId, ActionSubmission, PluginActionCompletion, PluginActionExecutor, PluginActionRouter,
 };
 pub use query_pipeline::{PipelineConfig, PipelineError, PipelineTick, QueryPipeline};
-pub use startup_recovery::{admitted_plugin_roots, StartupJournal, StartupMode, SAFE_MODE_AFTER_FAILURES};
+pub use startup_recovery::{
+    admitted_plugin_roots, DisabledPlugins, StartupJournal, StartupMode, DISABLED_BY_CONFIGURATION,
+    SAFE_MODE_AFTER_FAILURES,
+};
+
+/// One complete configuration state, per plugin, ready for delivery (spec 21.4).
+///
+/// The host resolves layering and per-plugin scoping before this point, so a
+/// provider's job is only to hand each worker the map addressed to it. Keyed by
+/// the namespaced plugin identity the providers register, and each inner map is
+/// keyed by the field names the plugin declared — never by the host's dotted
+/// configuration keys, which a plugin has no use for.
+///
+/// A plugin present with an EMPTY map is meaningful and different from an absent
+/// one: it says "you have no settings", where absence says nothing at all and
+/// would leave the plugin applying whatever it was last sent.
+pub type PluginConfiguration =
+    std::collections::BTreeMap<PluginId, std::collections::BTreeMap<String, String>>;
 
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crikey_catalog::{
@@ -44,8 +65,8 @@ use crikey_core::{
     Result as CoreResult,
 };
 use crikey_platform::{
-    application_arguments, application_items, application_working_directory, decode_target,
-    APPLICATION_LAUNCH_ACTION_ID,
+    application_arguments, application_items, application_working_directory, decode_target, IconImage,
+    IconProvider, APPLICATION_LAUNCH_ACTION_ID, DEFAULT_ICON_SIZE,
 };
 #[cfg(any(windows, target_os = "linux"))]
 use crikey_platform::{HotkeyActivationHandler, HotkeyBinding};
@@ -55,6 +76,13 @@ use crikey_query::{
 use crikey_ranking::{DefaultRanker, Ranker, Score};
 use crikey_result_aggregator::{MemoryResultAggregator, ResultAggregator};
 use crikey_ui::ResultRow;
+
+/// How many resolved icons one session retains before the memo is dropped whole.
+///
+/// Bounds a walk through a very large catalog: a decoded 48x48 icon is 9 KiB, so
+/// this is a few megabytes at worst, and the platform's on-disk cache is what
+/// makes re-resolving after a clear cheap.
+const MAX_RESOLVED_ICONS: usize = 512;
 
 /// State-only milestones for staged startup (spec 25.6).
 ///
@@ -242,6 +270,17 @@ impl App {
     /// This does not mean that any lazy modern plugin has been activated.
     pub fn startup_complete(&self) -> bool {
         self.eager_startup_complete
+    }
+
+    /// The platform's icon resolver, behind
+    /// [`Capability::Icons`](crikey_platform::Capability::Icons).
+    ///
+    /// Every backend has one, so this is not an `Option`: what varies is how
+    /// much of its platform's icon surface it can answer for, which each backend
+    /// reports through its own capability state rather than by withholding the
+    /// service.
+    pub fn icon_provider(&self) -> &dyn IconProvider {
+        self.backend.icon_provider()
     }
 
     /// Discovers the current platform's applications and maps them into one
@@ -590,6 +629,13 @@ pub struct SearchService {
     non_prefix_upper: HashMap<PluginId, Score>,
     /// Exact-owner runtime endpoints for plugin-owned actions.
     plugin_actions: Option<Arc<PluginActionRouter>>,
+    /// Icons already resolved for this session, keyed by reference.
+    ///
+    /// A miss is recorded too. A themed name no installed theme carries costs a
+    /// walk of every directory of every theme in the chain, and re-walking it
+    /// for the same reference on every publication would make an item with a
+    /// broken icon the most expensive kind of item to display.
+    icons: Mutex<HashMap<String, Option<Arc<IconImage>>>>,
 }
 
 impl SearchService {
@@ -611,6 +657,7 @@ impl SearchService {
             candidate_cache: None,
             non_prefix_upper: HashMap::new(),
             plugin_actions: None,
+            icons: Mutex::new(HashMap::new()),
         }
     }
 
@@ -892,6 +939,13 @@ impl SearchService {
     ///
     /// Search hits stay authoritative for ordering and highlights. The first
     /// declared item action is the default; remaining actions are alternates.
+    ///
+    /// Icons are resolved here, and this is the only place they are: the
+    /// renderer must not touch a filesystem, so a row reaches it either with
+    /// pixels or without (spec 6.4). Rows are built once per publication rather
+    /// than once per frame, every reference is resolved at most once per session,
+    /// and the platform's own cache means a reference already seen on this
+    /// machine costs a `stat` and a copy rather than a decode (spec 22.1).
     pub fn result_rows(&self) -> Vec<ResultRow> {
         self.results
             .iter()
@@ -908,6 +962,11 @@ impl SearchService {
                     item: hit.item.stable_id.clone(),
                     label: hit.item.label.clone(),
                     description: hit.item.description.clone(),
+                    icon: hit
+                        .item
+                        .icon_reference
+                        .as_deref()
+                        .and_then(|reference| self.icon(reference)),
                     icon_reference: hit.item.icon_reference.clone(),
                     category: hit.item.category.as_str().to_owned(),
                     plugin_name: hit.item.plugin_id.0.clone(),
@@ -919,6 +978,36 @@ impl SearchService {
                 }
             })
             .collect()
+    }
+
+    /// The pixels behind one icon reference, resolved once per session.
+    ///
+    /// `None` for every ordinary reason a row has no icon: the platform knows of
+    /// no file for this reference, or the file it knows of would not decode.
+    /// A decode failure is not propagated, because there is nothing a user can
+    /// do about a broken icon in somebody else's package and nothing the
+    /// launcher should do except draw the row.
+    fn icon(&self, reference: &str) -> Option<Arc<IconImage>> {
+        let mut resolved = self.icons.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(icon) = resolved.get(reference) {
+            return icon.clone();
+        }
+        // A session that walks a very large catalog must not accumulate every
+        // icon it ever showed. Clearing wholesale rather than evicting one entry
+        // keeps the policy to a single branch; the platform cache is what makes
+        // re-resolving cheap.
+        if resolved.len() >= MAX_RESOLVED_ICONS {
+            resolved.clear();
+        }
+        let icon = self
+            .app
+            .icon_provider()
+            .load(reference, DEFAULT_ICON_SIZE)
+            .ok()
+            .flatten()
+            .map(Arc::new);
+        resolved.insert(reference.to_owned(), icon.clone());
+        icon
     }
 
     /// Installs the exact-owner plugin action endpoints retained by the live

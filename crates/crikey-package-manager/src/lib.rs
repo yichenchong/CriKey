@@ -2,14 +2,14 @@
 //!
 //! This crate carries two related but distinct responsibilities:
 //!
-//! * the legacy install/verify surface ([`InstallSource`], [`PackageManager`]),
-//!   and
+//! * installing, verifying, upgrading and rolling back plugin packages
+//!   ([`PluginInstaller`], [`InstallSource`]), and
 //! * the *modern* managed-environment machinery (spec 15.3, 15.4, 23.2, 23.4):
 //!   content-addressed [`EnvironmentId`]s, offline [`PackageIndex`] resolution
 //!   into a byte-stable [`Lockfile`], and an [`EnvironmentStore`] that
 //!   materialises a plugin's dependency closure into an isolated site dir.
 
-use crikey_core::PluginId;
+use std::path::{Path, PathBuf};
 
 mod environment;
 mod native;
@@ -19,34 +19,69 @@ pub use native::{
     NativePackageReport,
 };
 
+mod fetch;
 mod import_path;
 mod index;
+mod installer;
+mod launcher_lock;
 mod lockfile;
 mod resolve;
 
 pub use environment::{EnvironmentId, EnvironmentInputs, EnvironmentStore, MaterializedEnvironment};
+pub use fetch::{HttpFetcher, PackageFetcher};
 pub use import_path::ImportPath;
 pub use index::PackageIndex;
+pub use installer::{InstalledPlugin, PluginInstaller};
+pub use launcher_lock::LauncherLock;
 pub use lockfile::{LockedPackage, Lockfile};
 pub use resolve::resolve;
 
+/// Where a package to install comes from (spec 23.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallSource {
-    Directory(std::path::PathBuf),
-    Archive(std::path::PathBuf),
+    /// An unpacked plugin source tree.
+    Directory(PathBuf),
+    /// A packaged plugin: a native `crikey` package or a modern source archive.
+    Archive(PathBuf),
+    /// An `http`/`https` URL naming an archive.
     Url(String),
     /// An existing Keypirinha package file.
-    LegacyPackage(std::path::PathBuf),
+    LegacyPackage(PathBuf),
 }
 
-/// Installations are atomic: a failed update leaves the previous working
-/// version in place (spec 23.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallOutcome {
-    Installed,
-    Upgraded,
-    RolledBack,
-    Unavailable,
+impl InstallSource {
+    /// Classifies what a user typed on a command line.
+    ///
+    /// One place decides what `crikey plugin install <thing>` means, so the
+    /// command line and any other caller cannot disagree about whether a path
+    /// ending in `.keypirinha-package` is a legacy package. The distinction
+    /// between a directory and a file is taken from the filesystem rather than
+    /// from the spelling, because a plugin source tree is not required to have
+    /// a trailing separator.
+    pub fn detect(value: &str) -> Result<Self, PackageError> {
+        if value.starts_with("https://") || value.starts_with("http://") {
+            return Ok(Self::Url(value.to_owned()));
+        }
+        let path = Path::new(value);
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            PackageError::SourceUnavailable(format!("{value} could not be read: {error}"))
+        })?;
+        if metadata.is_dir() {
+            return Ok(Self::Directory(path.to_path_buf()));
+        }
+        if !metadata.is_file() {
+            return Err(PackageError::SourceUnavailable(format!(
+                "{value} is neither a directory nor a package file"
+            )));
+        }
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("keypirinha-package"))
+        {
+            return Ok(Self::LegacyPackage(path.to_path_buf()));
+        }
+        Ok(Self::Archive(path.to_path_buf()))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -73,18 +108,20 @@ pub enum PackageError {
     Manifest(String),
     #[error("native package installation failed: {0}")]
     Install(String),
+    /// A launcher holds the exclusive lock, so replacing installed files would
+    /// be replacing them underneath running plugins (spec 23.3). The pid is
+    /// diagnostic text; the lock, not the pid, is what makes this safe.
+    #[error("crikey is running{}; quit the launcher before changing plugins", match pid {
+        Some(pid) => format!(" (pid {pid})"),
+        None => String::new(),
+    })]
+    LauncherRunning { pid: Option<u32> },
     #[error("invalid import path: {0}")]
     InvalidImportPath(String),
-    #[error("indexed package source unavailable: {0}")]
+    #[error("package source unavailable: {0}")]
     SourceUnavailable(String),
     #[error("malformed package index: {0}")]
     MalformedIndex(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-}
-
-pub trait PackageManager {
-    fn install(&mut self, source: InstallSource) -> Result<InstallOutcome, PackageError>;
-    fn remove(&mut self, plugin: &PluginId) -> Result<(), PackageError>;
-    fn verify(&self, plugin: &PluginId) -> Result<(), PackageError>;
 }

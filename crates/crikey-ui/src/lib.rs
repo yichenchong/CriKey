@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use crikey_core::{Action, ActionId, Generation, ItemId};
+use crikey_platform::IconImage;
 
 mod native;
 mod theme;
@@ -33,7 +34,21 @@ pub struct ResultRow {
     pub item: ItemId,
     pub label: String,
     pub description: String,
+    /// What the producing plugin or backend said about this item's icon, which
+    /// only the platform that wrote it can interpret (spec 10.1).
     pub icon_reference: Option<String>,
+    /// The pixels that reference resolved to, where a platform resolved it.
+    ///
+    /// Decoded before the row reaches the renderer, never by it: resolution
+    /// stats theme directories and decodes an image, and the UI thread may do
+    /// neither. `None` covers every ordinary reason a row has no icon -- the
+    /// item named none, the platform knows of none, the file would not decode --
+    /// and the row is drawn identically for all of them.
+    ///
+    /// Shared rather than owned because one icon answers many rows: an
+    /// application appears in several result sets over a session, and every
+    /// generation would otherwise carry its own copy of the same 9 KiB.
+    pub icon: Option<Arc<IconImage>>,
     pub category: String,
     pub plugin_name: String,
     /// Byte ranges within `label` to highlight.

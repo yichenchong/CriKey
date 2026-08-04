@@ -19,6 +19,10 @@ path = "src/main.rs"
 crikey-app.workspace = true
 crikey-benchmarks.workspace = true
 crikey-catalog.workspace = true
+# The layered configuration store (spec 21.2): `crikey plugin enable/disable`
+# and `crikey plugin scheduling-profile` persist through it, and `crikey run`
+# reads the disabled set from it before any provider loads.
+crikey-config.workspace = true
 crikey-core.workspace = true
 crikey-input-scheduler.workspace = true
 # The M3 developer commands (`dev test-legacy-compat`, `dev inspect-catalog`,
@@ -36,4 +40,11 @@ crikey-native-protocol.workspace = true
 crikey-package-manager.workspace = true
 # `Manifest`: parse a modern plugin's `crikey.toml` (id, entrypoint, `[python]`).
 crikey-plugin-model.workspace = true
+# `StandardDirectories`/`PluginKind` (spec 21.2, 23): where plugins are
+# installed and where the configuration lives. Platform-independent; naming a
+# backend crate remains `crikey-app`'s alone (ADR-0001).
+crikey-platform.workspace = true
+# `ConcurrencyBudget` (spec 13.5): `crikey plugin doctor` builds a plugin's
+# declared budgets and probes admission of each of the four work kinds.
+crikey-plugin-supervisor.workspace = true
 crikey-ui.workspace = true

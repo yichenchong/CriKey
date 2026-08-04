@@ -1,0 +1,24 @@
+[package]
+name = "crikey-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Layered TOML configuration for CriKey (spec 21)."
+
+[dependencies]
+crikey-core.workspace = true
+# The standard directory layout (spec 18.3). A plain value type rather than a
+# platform backend trait, which is what lets this crate resolve `config_dir()`
+# without naming a per-OS crate (ADR-0001).
+crikey-platform.workspace = true
+# `[configuration]` schemas: the field declarations this crate validates values
+# against and reads `secret` out of (spec 21.3).
+crikey-plugin-model.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

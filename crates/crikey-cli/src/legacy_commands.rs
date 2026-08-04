@@ -112,17 +112,19 @@ const MAX_SCANNED_MODULE_BYTES: u64 = 1 << 20;
 /// `PackageLoader` trusts an already extracted content-addressed directory, so
 /// a fixed directory below the shared temporary root would let another local
 /// process plant files under the digest that this command is about to use.
-struct PrivatePackageCache {
-    path: PathBuf,
+pub(crate) struct PrivatePackageCache {
+    pub(crate) path: PathBuf,
 }
 
 impl PrivatePackageCache {
-    fn new() -> Result<Self, String> {
+    /// A fresh private cache whose directory name carries `label`, so a leaked
+    /// directory can be traced back to the command that made it.
+    pub(crate) fn new(label: &str) -> Result<Self, String> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let pid = std::process::id();
         for _ in 0..256 {
             let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("crikey-dev-legacy-{pid}-{ordinal}"));
+            let path = std::env::temp_dir().join(format!("crikey-{label}-{pid}-{ordinal}"));
             match fs::create_dir(&path) {
                 Ok(()) => {
                     #[cfg(unix)]
@@ -366,11 +368,14 @@ pub(crate) fn test_legacy_compat(args: &[String]) -> ExitCode {
     let diagnostics = compatibility_diagnostics(
         &plugin,
         &package,
-        &interpreter,
-        dependency.as_deref(),
-        declared,
-        obsolete_callback,
-        &undocumented,
+        Some(&interpreter),
+        SchedulingProfile::LegacyStrict,
+        LegacyObservations {
+            dependency: dependency.as_deref(),
+            declared,
+            obsolete_callback,
+            undocumented: &undocumented,
+        },
     );
     field(
         &mut report,
@@ -448,11 +453,13 @@ pub(crate) fn inspect_catalog(args: &[String]) -> ExitCode {
     let diagnostics = compatibility_diagnostics(
         &plugin,
         &package,
-        &interpreter,
-        dependency.as_deref(),
-        declared,
-        None,
-        &[],
+        Some(&interpreter),
+        SchedulingProfile::LegacyStrict,
+        LegacyObservations {
+            dependency: dependency.as_deref(),
+            declared,
+            ..LegacyObservations::default()
+        },
     );
     render_diagnostics(&mut report, &diagnostics, &plugin);
     for (index, item) in items.iter().enumerate() {
@@ -671,7 +678,7 @@ fn open_package(
     command: &str,
     path: &str,
 ) -> Result<(LegacyPackage, Interpreter, PrivatePackageCache), ExitCode> {
-    let cache = match PrivatePackageCache::new() {
+    let cache = match PrivatePackageCache::new("dev-legacy") {
         Ok(cache) => cache,
         Err(error) => {
             eprintln!("crikey: dev {command}: cannot prepare the package cache: {error}");
@@ -799,7 +806,7 @@ fn declared_classification(corpus: &PluginCorpus, package: &LegacyPackage) -> Op
         .map(|entry| entry.classification)
 }
 
-fn scan_windows_only_dependency(package: &LegacyPackage) -> Result<Option<String>, String> {
+pub(crate) fn scan_windows_only_dependency(package: &LegacyPackage) -> Result<Option<String>, String> {
     if package.modules.len() > MAX_SCANNED_MODULES {
         return Err(format!(
             "portability scan is bounded at {MAX_SCANNED_MODULES} modules, but this package \
@@ -1908,20 +1915,56 @@ fn field(out: &mut String, key: &str, value: &str) {
     writeln!(out, "{key}={}", encode(value)).expect("writing to a String cannot fail");
 }
 
-/// Feed every compatibility observation the command can genuinely make about
+/// What a run observed about a legacy package, beyond the package itself.
+///
+/// Grouped because these four are evidence gathered by whichever command is
+/// asking, and each caller supplies a different subset: `test-legacy-compat`
+/// has run the plugin and can report a callback that ignored cancellation,
+/// while `plugin doctor` has only read the package off disk. Passing them
+/// individually meant four `None`s in a row at one call site, which is exactly
+/// the shape that puts an argument in the wrong position.
+#[derive(Default)]
+pub(crate) struct LegacyObservations<'a> {
+    /// A Windows-only dependency the package imports, if any.
+    pub(crate) dependency: Option<&'a str>,
+    /// How the real-plugin corpus classifies this package.
+    pub(crate) declared: Option<PluginClassification>,
+    /// A callback that answered a superseded request without ever polling
+    /// `should_terminate()`.
+    pub(crate) obsolete_callback: Option<CallbackObservation>,
+    /// Legacy API symbols the plugin used that the matrix does not document.
+    pub(crate) undocumented: &'a [(String, String)],
+}
+
+/// Feed every compatibility observation a caller can genuinely make about
 /// `plugin` into a fresh diagnostics store (spec 26.1, 26.2, 14.11, 14.12;
 /// acceptance 31.29, 31.31). This is the live feed the §26.2 subsystem otherwise
-/// lacks (Finding 5); every observation is a fact the command already
+/// lacks (Finding 5); every observation is a fact the caller already
 /// established, so the store stays deterministic on every host.
-fn compatibility_diagnostics(
+///
+/// `interpreter` is `None` when no supported CPython could be resolved. The
+/// version check is then skipped rather than filed as a passing observation:
+/// `crikey plugin doctor` runs on hosts with no interpreter at all, and
+/// reporting "the Python version is fine" about an interpreter that does not
+/// exist would be the one finding in the store that is not a fact.
+///
+/// `profile` is the profile the plugin will actually run under, which is not
+/// always `legacy-strict`: `crikey plugin scheduling-profile` may set
+/// `legacy-optimized` on a legacy plugin (spec 7.2), and a report that named the
+/// default anyway would describe a run that is not going to happen.
+pub(crate) fn compatibility_diagnostics(
     plugin: &PluginId,
     package: &LegacyPackage,
-    interpreter: &Interpreter,
-    dependency: Option<&str>,
-    declared: Option<PluginClassification>,
-    obsolete_callback: Option<CallbackObservation>,
-    undocumented: &[(String, String)],
+    interpreter: Option<&Interpreter>,
+    profile: SchedulingProfile,
+    observed: LegacyObservations<'_>,
 ) -> LegacyDiagnostics {
+    let LegacyObservations {
+        dependency,
+        declared,
+        obsolete_callback,
+        undocumented,
+    } = observed;
     // The reportable long callback here is one that answered a superseded request
     // without ever polling should_terminate(); the threshold is zero because the
     // defect is the missing poll, not the duration spec 9.6 forbids acting on.
@@ -1932,7 +1975,7 @@ fn compatibility_diagnostics(
 
     // Scheduling profile (spec 26.2): a fact about how CriKey runs the plugin,
     // not a defect.
-    diagnostics.observe_scheduling_profile(plugin, SchedulingProfile::LegacyStrict);
+    diagnostics.observe_scheduling_profile(plugin, profile);
 
     // Imports (spec 14.2, 14.12; acceptance 31.31): a Windows-only module makes
     // the plugin non-portable wherever it runs, detected from the package's own
@@ -1964,7 +2007,9 @@ fn compatibility_diagnostics(
     // Python version (spec 14.11): a legacy package declares no interpreter
     // requirement, so this verifies the resolved interpreter meets the layer's
     // supported floor; a supported host is clean and reports nothing.
-    diagnostics.observe_python_requirement(plugin, MINIMUM_SUPPORTED_PYTHON, interpreter.version());
+    if let Some(interpreter) = interpreter {
+        diagnostics.observe_python_requirement(plugin, MINIMUM_SUPPORTED_PYTHON, interpreter.version());
+    }
 
     // A long callback that never read should_terminate() on superseded work
     // (spec 9.2, 9.6, 26.2). Absent for a run that never reached the phase.
@@ -2339,8 +2384,8 @@ mod tests {
 
     #[test]
     fn legacy_package_cache_is_private_and_unique() {
-        let first = PrivatePackageCache::new().expect("first private cache");
-        let second = PrivatePackageCache::new().expect("second private cache");
+        let first = PrivatePackageCache::new("dev-legacy").expect("first private cache");
+        let second = PrivatePackageCache::new("dev-legacy").expect("second private cache");
         assert_ne!(first.path, second.path);
         assert!(first.path.is_dir());
         assert!(second.path.is_dir());

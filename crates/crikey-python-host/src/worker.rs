@@ -33,7 +33,7 @@
 //! wait forever, and an over-long line is a named protocol failure.
 
 use serde_json::{Map, Value};
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap};
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1043,6 +1043,42 @@ impl ModernWorker {
         CancelHandle {
             link: Arc::clone(&self.link),
         }
+    }
+
+    /// Delivers the latest complete configuration state to the plugin (spec 21.4).
+    ///
+    /// Queued rather than written synchronously: the child may be inside a
+    /// callback and not reading stdin, and a host that blocked here would let a
+    /// slow plugin stall the thread publishing configuration to every OTHER
+    /// plugin. The frame carries no `id` and expects no reply, so there is
+    /// nothing to correlate; the child applies it on its main loop, in order,
+    /// after whatever call is in flight.
+    ///
+    /// `complete` says whether `values` is the whole state rather than a delta.
+    /// The host only ever publishes whole states — that IS the coalescing rule of
+    /// spec 21.4 — so a caller passing `false` is describing a delta path that
+    /// does not exist yet.
+    ///
+    /// A worker that has already died is an error rather than a silent no-op: the
+    /// caller is publishing configuration and needs to know the plugin did not
+    /// get it.
+    pub fn send_configuration(
+        &mut self,
+        values: &BTreeMap<String, String>,
+        complete: bool,
+    ) -> Result<(), HostError> {
+        if !self.alive {
+            return Err(self.crashed());
+        }
+        if self
+            .link
+            .queue_frame(&protocol::encode_configuration(values, complete))
+            .is_err()
+        {
+            self.fail_and_reap();
+            return Err(self.crashed());
+        }
+        Ok(())
     }
 
     /// Runs the plugin's `build_catalog`, folding its catalog batches.

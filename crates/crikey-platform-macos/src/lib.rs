@@ -27,8 +27,9 @@
 
 use crikey_core::{CoreError, PlatformPath, Result};
 use crikey_platform::{
-    bundle_display_name, parse_info_plist, ApplicationDiscovery, Capability, CapabilityState,
-    DiscoveredApplication, ProcessLauncher,
+    bundle_display_name, bundle_icon_path, parse_info_plist, ApplicationDiscovery, Capability,
+    CapabilityState, DiscoveredApplication, IconLoader, IconProvider, PathIconSource, ProcessLauncher,
+    StandardDirectories,
 };
 use std::collections::HashSet;
 use std::env;
@@ -40,7 +41,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 
 /// The suffix a bundle directory carries, as bytes: a directory name is not
@@ -149,9 +150,9 @@ fn read_bundle(path: &Path, name: &OsStr) -> Option<DiscoveredApplication> {
     }
 
     let info = read_info_plist(&path.join(INFO_PLIST)).and_then(|xml| parse_info_plist(&xml));
-    let (name, bundle_id) = match info {
-        Some(bundle) => (bundle.name, bundle.bundle_id),
-        None => (directory_name, None),
+    let (name, bundle_id, icon_file) = match info {
+        Some(bundle) => (bundle.name, bundle.bundle_id, bundle.icon_file),
+        None => (directory_name, None, None),
     };
 
     Some(DiscoveredApplication {
@@ -160,10 +161,20 @@ fn read_bundle(path: &Path, name: &OsStr) -> Option<DiscoveredApplication> {
         // the bundle directory is the launch target.
         target: PlatformPath::new(path.as_os_str().to_owned()),
         arguments: Vec::new(),
-        // `CFBundleIconFile` names an `.icns` file nothing in this build can
-        // render, and an icon reference no consumer can resolve is worse than
-        // none (spec 18.2).
-        icon_reference: None,
+        // The resolved `.icns` file, which [`MacOsBackend::icon_provider`]
+        // decodes. A reference is only recorded when the file is really there:
+        // `CFBundleIconFile` is author supplied and routinely names a resource a
+        // trimmed or relocated bundle no longer ships.
+        //
+        // The path has to be UTF-8 to be carried, because an icon reference is a
+        // `String` (spec 10.1) and a lossy conversion would name a different
+        // file. A bundle under a non-UTF-8 path therefore loses its icon and
+        // keeps everything else, which is the right way round: the launch target
+        // keeps the exact bytes (spec 18.3).
+        icon_reference: icon_file
+            .as_deref()
+            .and_then(|icon_file| bundle_icon_path(path, icon_file))
+            .and_then(|icon| icon.to_str().map(str::to_owned)),
         platform_id: bundle_id,
         working_directory: None,
     })
@@ -411,6 +422,9 @@ fn has_scheme(uri: &str) -> bool {
 pub struct MacOsBackend {
     applications: BundleScanner,
     processes: OpenLauncher,
+    /// Built on first use and cached: resolving the cache directory reads the
+    /// environment, which a constructor that touches nothing should not do.
+    icons: OnceLock<IconLoader<PathIconSource>>,
 }
 
 impl MacOsBackend {
@@ -429,6 +443,7 @@ impl MacOsBackend {
         Self {
             applications: BundleScanner::new(roots),
             processes: OpenLauncher::new(),
+            icons: OnceLock::new(),
         }
     }
 
@@ -441,13 +456,19 @@ impl MacOsBackend {
             Capability::ApplicationDiscovery | Capability::ProcessLaunch | Capability::UriOpen => {
                 CapabilityState::Available
             }
+            // A bundle's own `.icns` resolves and decodes. Everything else macOS
+            // calls an icon does not: a document icon composed by Launch
+            // Services, a folder or volume icon, the generic icon for a bundle
+            // that ships none, and the badge overlays `NSWorkspace` applies are
+            // all `NSImage` compositions rather than files, and none of them is
+            // implemented. `Partial` is that split.
+            Capability::Icons => CapabilityState::Partial,
             Capability::FileSearch
             | Capability::Clipboard
             | Capability::GlobalHotkeys
             | Capability::WindowEnumeration
             | Capability::WindowActivation
             | Capability::Notifications
-            | Capability::Icons
             | Capability::FileWatching
             | Capability::SecretStorage
             | Capability::ShellIntegration => CapabilityState::Unavailable,
@@ -463,6 +484,22 @@ impl MacOsBackend {
     /// [`Capability::UriOpen`].
     pub fn process_launcher(&self) -> &dyn ProcessLauncher {
         &self.processes
+    }
+
+    /// The provider behind [`Capability::Icons`], built on first use.
+    ///
+    /// The reference discovery recorded is already an absolute path to an
+    /// `.icns` file inside the bundle, so resolution is the shared
+    /// [`PathIconSource`]: there is no theme search and no shell call to make.
+    pub fn icon_provider(&self) -> &dyn IconProvider {
+        self.icons.get_or_init(|| {
+            match StandardDirectories::for_process() {
+                Ok(directories) => IconLoader::caching(PathIconSource, Self::NAME, &directories),
+                // A disposable cache with nowhere to live costs a decode per
+                // lookup, not an icon.
+                Err(_) => IconLoader::new(PathIconSource),
+            }
+        })
     }
 }
 

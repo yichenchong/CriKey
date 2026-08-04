@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use crikey_core::{Generation, ItemId};
+use crikey_platform::IconImage;
 use crikey_ui::{
     build_launcher_frame, create_launcher_context, egui, ActivationLatencyTracker, NativeLauncher,
     NativeLauncherConfig, NativeLauncherHandle, RendererError, ResultRow, ViewModel,
@@ -24,6 +25,7 @@ fn result_row(index: usize) -> ResultRow {
         label: format!("row-{index}"),
         description: String::new(),
         icon_reference: None,
+        icon: None,
         category: "application".to_owned(),
         plugin_name: "core".to_owned(),
         highlights: Vec::new(),
@@ -162,4 +164,205 @@ fn the_result_count_is_worded_for_one_result_and_for_several() {
         "a single result must not be reported in the plural"
     );
     assert!(status_shows(2, "2 results"));
+}
+
+// ---------------------------------------------------------------------------
+// Icons (spec 6.4)
+// ---------------------------------------------------------------------------
+
+/// An opaque solid-colour icon.
+///
+/// Opaque on purpose: `egui` stores premultiplied colour, so an opaque pixel is
+/// the one case where the uploaded bytes must equal the decoded ones and the
+/// assertion can be an equality rather than a tolerance.
+fn solid_icon(colour: [u8; 4]) -> Arc<IconImage> {
+    let rgba = colour
+        .iter()
+        .copied()
+        .cycle()
+        .take(ICON_EDGE * ICON_EDGE * 4)
+        .collect();
+    Arc::new(
+        IconImage::new("test-icon", ICON_EDGE as u32, ICON_EDGE as u32, rgba)
+            .expect("a solid icon is well formed"),
+    )
+}
+
+/// Deliberately not the size of the row's icon slot: the frame has to carry the
+/// decoded extent, and a slot-sized fixture could not tell the two apart.
+const ICON_EDGE: usize = 6;
+
+fn frame_of(context: &egui::Context, model: &ViewModel) -> egui::FullOutput {
+    let window = NativeLauncherConfig::default();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(window.width as f32, window.height as f32),
+        )),
+        focused: true,
+        ..Default::default()
+    };
+    build_launcher_frame(context, input, model).output
+}
+
+fn one_row_model(row: ResultRow) -> ViewModel {
+    let mut view = model("row");
+    view.rows = Arc::from(vec![row]);
+    view
+}
+
+/// Every textured rectangle in a frame, with the texture it samples.
+fn textured_rects(shape: &egui::Shape, found: &mut Vec<(egui::TextureId, egui::Rect)>) {
+    match shape {
+        egui::Shape::Rect(rect) if rect.fill_texture_id != egui::TextureId::default() => {
+            found.push((rect.fill_texture_id, rect.rect));
+        }
+        egui::Shape::Vec(shapes) => {
+            for shape in shapes {
+                textured_rects(shape, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Where the label of a row was laid out.
+fn text_origin(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+    match shape {
+        egui::Shape::Text(text) if text.galley.text().contains(needle) => Some(text.pos),
+        egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_origin(shape, needle)),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_row_icon_is_uploaded_as_a_texture_and_painted_beside_the_label() {
+    let context = create_launcher_context();
+    let colour = [17, 34, 51, 255];
+    let mut row = result_row(0);
+    row.icon = Some(solid_icon(colour));
+
+    let output = frame_of(&context, &one_row_model(row));
+
+    // The decoded pixels reached the texture upload path the renderer feeds to
+    // `Renderer::update_texture`.
+    let (id, delta) = output
+        .textures_delta
+        .set
+        .iter()
+        .find(|(_, delta)| delta.image.size() == [ICON_EDGE, ICON_EDGE])
+        .expect("the icon's pixels are uploaded as a texture of its decoded extent");
+    match &delta.image {
+        egui::ImageData::Color(image) => assert_eq!(
+            image.pixels[0],
+            egui::Color32::from_rgba_premultiplied(colour[0], colour[1], colour[2], colour[3]),
+            "the uploaded texture carries the decoded pixels, unaltered"
+        ),
+        egui::ImageData::Font(_) => panic!("an icon uploads colour data, not font coverage"),
+    }
+
+    // And that texture is what a rectangle in the painted frame samples.
+    let mut painted = Vec::new();
+    for clipped in &output.shapes {
+        textured_rects(&clipped.shape, &mut painted);
+    }
+    let icon = painted
+        .iter()
+        .find(|(painted, _)| painted == id)
+        .expect("the uploaded icon texture is painted in this frame");
+    assert!(
+        icon.1.width() > 0.0 && icon.1.height() > 0.0,
+        "the icon is painted into a rectangle with area, got {:?}",
+        icon.1
+    );
+
+    let label = output
+        .shapes
+        .iter()
+        .find_map(|clipped| text_origin(&clipped.shape, "row-0"))
+        .expect("the row label is painted");
+    assert!(
+        icon.1.max.x <= label.x,
+        "the icon is drawn beside the label rather than over it: icon ends at {}, label starts at {}",
+        icon.1.max.x,
+        label.x
+    );
+}
+
+#[test]
+fn a_row_with_no_icon_leaves_the_label_exactly_where_an_icon_would_have_put_it() {
+    let context = create_launcher_context();
+    let mut with_icon = result_row(0);
+    with_icon.icon = Some(solid_icon([17, 34, 51, 255]));
+    let without_icon = result_row(0);
+
+    // A launcher whose rows shift because one icon 404s is worse than one with no
+    // icons, so the slot is reserved whether or not it is filled. The two frames
+    // are built in separate contexts so that neither can be reading the other's
+    // retained layout.
+    let placed = frame_of(&create_launcher_context(), &one_row_model(with_icon));
+    let missing = frame_of(&context, &one_row_model(without_icon));
+
+    let origin = |output: &egui::FullOutput| {
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| text_origin(&clipped.shape, "row-0"))
+            .expect("the row label is painted")
+    };
+
+    assert_eq!(origin(&placed), origin(&missing));
+}
+
+#[test]
+fn one_icon_shown_twice_is_uploaded_once() {
+    let context = create_launcher_context();
+    let icon = solid_icon([17, 34, 51, 255]);
+    let mut view = model("row");
+    let rows: Vec<ResultRow> = (0..2)
+        .map(|index| {
+            let mut row = result_row(index);
+            row.icon = Some(Arc::clone(&icon));
+            row
+        })
+        .collect();
+    view.rows = Arc::from(rows);
+
+    let output = frame_of(&context, &view);
+
+    // Two rows, one upload: the texture cache is keyed on the pixels, so the
+    // same icon on every row of a large result set costs one texture.
+    let uploads = output
+        .textures_delta
+        .set
+        .iter()
+        .filter(|(_, delta)| delta.image.size() == [ICON_EDGE, ICON_EDGE])
+        .count();
+    assert_eq!(uploads, 1);
+}
+
+#[test]
+fn a_second_frame_reuses_the_texture_the_first_one_uploaded() {
+    let context = create_launcher_context();
+    let mut row = result_row(0);
+    row.icon = Some(solid_icon([17, 34, 51, 255]));
+    let view = one_row_model(row);
+
+    let first = frame_of(&context, &view);
+    let second = frame_of(&context, &view);
+
+    let icon_uploads = |output: &egui::FullOutput| {
+        output
+            .textures_delta
+            .set
+            .iter()
+            .filter(|(_, delta)| delta.image.size() == [ICON_EDGE, ICON_EDGE])
+            .count()
+    };
+    assert_eq!(icon_uploads(&first), 1, "the first frame uploads the icon");
+    assert_eq!(
+        icon_uploads(&second),
+        0,
+        "a steady-state frame must not re-upload an icon it already holds"
+    );
 }

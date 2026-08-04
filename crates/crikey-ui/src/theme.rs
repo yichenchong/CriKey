@@ -17,6 +17,14 @@ pub(crate) const SPACE_8: f32 = 32.0;
 pub(crate) const RADIUS_SMALL: f32 = 4.0;
 pub(crate) const RADIUS_MEDIUM: f32 = 8.0;
 
+/// The edge of a result row's icon slot, in logical pixels.
+///
+/// The slot is a fixed square whether or not an icon fills it, so the label
+/// column starts at the same x on every row of every list. Decoded icons are
+/// requested at [`crikey_platform::DEFAULT_ICON_SIZE`], which is larger, so a
+/// themed raster is downscaled rather than stretched.
+pub(crate) const ICON_SIZE: f32 = 32.0;
+
 pub(crate) const TEXT_SMALL: f32 = 12.0;
 pub(crate) const TEXT_BODY: f32 = 14.0;
 pub(crate) const TEXT_LABEL: f32 = 16.0;

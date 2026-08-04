@@ -54,6 +54,7 @@
 //!   registration (§5, §15.8), plus captured `print` landing in the reply
 //!   `log`.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -817,4 +818,232 @@ fn an_unregistered_background_task_is_cancelled_and_reported_while_a_spawned_tas
     );
 
     worker.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Live configuration delivery (spec 21.4)
+// ---------------------------------------------------------------------------
+
+/// A plugin that retains whatever configuration it was last given and reports it
+/// back through `suggest`, which is the only way a test can observe a callback
+/// that returns nothing and answers nothing.
+const CONFIGURATION_PLUGIN: &str = r#"
+from crikey_sdk import Plugin, Item
+
+
+class Impl(Plugin):
+    def __init__(self):
+        # A dict, not an accumulator: the host publishes the COMPLETE state, so
+        # replacing wholesale is the documented correct implementation.
+        self.settings = {}
+        self.deliveries = 0
+
+    def on_configuration(self, values):
+        self.settings = dict(values)
+        self.deliveries += 1
+
+    def suggest(self, query, context):
+        rendered = ",".join("{}={}".format(k, self.settings[k]) for k in sorted(self.settings))
+        context.emit(
+            Item(
+                stable_id="config-1",
+                label=rendered or "<none>",
+                target="t",
+                metadata={"deliveries": str(self.deliveries)},
+            )
+        )
+"#;
+
+#[test]
+fn a_configuration_frame_reaches_the_plugins_on_configuration_hook() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("configuration");
+    let src = scratch.subdir("source");
+    write_file(&src.join("cfg.py"), CONFIGURATION_PLUGIN);
+    let site = scratch.subdir("empty-site");
+    let mut worker = spawn_worker("modern.configuration", "cfg:Impl", &src, &site);
+
+    // Before any publication the plugin holds nothing. Asserted first so a plugin
+    // that somehow started with settings could not make the next step pass.
+    let before = suggest(&mut worker, "q");
+    assert_eq!(before.items[0].label, "<none>");
+    assert_eq!(meta(&before.items[0], "deliveries"), "0");
+
+    let values = BTreeMap::from([
+        ("theme".to_owned(), "dark".to_owned()),
+        ("result-limit".to_owned(), "20".to_owned()),
+    ]);
+    worker
+        .send_configuration(&values, true)
+        .expect("a live worker accepts a configuration publication");
+
+    // No sleep: frames are consumed in the order they were written, so the
+    // configuration frame is applied before this request is served.
+    let after = suggest(&mut worker, "q");
+    assert_eq!(
+        after.items[0].label, "result-limit=20,theme=dark",
+        "the plugin must observe exactly the published state"
+    );
+    assert_eq!(
+        meta(&after.items[0], "deliveries"),
+        "1",
+        "the hook must run exactly once per publication"
+    );
+
+    worker.shutdown();
+}
+
+#[test]
+fn a_later_publication_replaces_the_whole_state_rather_than_merging_into_it() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("configuration-replace");
+    let src = scratch.subdir("source");
+    write_file(&src.join("cfg.py"), CONFIGURATION_PLUGIN);
+    let site = scratch.subdir("empty-site");
+    let mut worker = spawn_worker("modern.configuration-replace", "cfg:Impl", &src, &site);
+
+    worker
+        .send_configuration(
+            &BTreeMap::from([
+                ("theme".to_owned(), "dark".to_owned()),
+                ("removed".to_owned(), "yes".to_owned()),
+            ]),
+            true,
+        )
+        .expect("publication accepted");
+    worker
+        .send_configuration(&BTreeMap::from([("theme".to_owned(), "light".to_owned())]), true)
+        .expect("publication accepted");
+
+    let reply = suggest(&mut worker, "q");
+    assert_eq!(
+        reply.items[0].label, "theme=light",
+        "a complete publication replaces the previous state; a merged one would keep `removed`"
+    );
+    assert_eq!(meta(&reply.items[0], "deliveries"), "2");
+
+    worker.shutdown();
+}
+
+#[test]
+fn a_plugin_that_implements_no_configuration_hook_is_unaffected_by_a_publication() {
+    require_host_interpreter!();
+    // Every SDK callback is optional. A publication to a plugin that ignores
+    // configuration must be a no-op, not a protocol fault that stops the worker.
+    let scratch = Scratch::new("configuration-absent");
+    let src = scratch.subdir("source");
+    write_file(
+        &src.join("plain.py"),
+        r#"
+from crikey_sdk import Plugin, Item
+
+
+class Impl(Plugin):
+    def suggest(self, query, context):
+        context.emit(Item(stable_id="plain-1", label="still-here", target="t"))
+"#,
+    );
+    let site = scratch.subdir("empty-site");
+    let mut worker = spawn_worker("modern.configuration-absent", "plain:Impl", &src, &site);
+
+    worker
+        .send_configuration(&BTreeMap::from([("theme".to_owned(), "dark".to_owned())]), true)
+        .expect("publication accepted");
+
+    let reply = suggest(&mut worker, "q");
+    assert!(matches!(reply.state, BatchState::Final), "{:?}", reply.state);
+    assert_eq!(reply.items[0].label, "still-here");
+    assert!(
+        worker.is_alive(),
+        "an ignored publication must not stop the worker"
+    );
+
+    worker.shutdown();
+}
+
+#[test]
+fn a_raising_configuration_hook_leaves_the_worker_serving() {
+    require_host_interpreter!();
+    // Configuration delivery is not a request anyone awaits, so a plugin bug in
+    // `on_configuration` cannot be reported as a failed reply. It must instead
+    // leave the worker usable, which is the only observable guarantee available.
+    let scratch = Scratch::new("configuration-raises");
+    let src = scratch.subdir("source");
+    write_file(
+        &src.join("bad.py"),
+        r#"
+from crikey_sdk import Plugin, Item
+
+
+class Impl(Plugin):
+    def on_configuration(self, values):
+        raise RuntimeError("configuration hook is broken")
+
+    def suggest(self, query, context):
+        context.emit(Item(stable_id="bad-1", label="survived", target="t"))
+"#,
+    );
+    let site = scratch.subdir("empty-site");
+    let mut worker = spawn_worker("modern.configuration-raises", "bad:Impl", &src, &site);
+
+    worker
+        .send_configuration(&BTreeMap::from([("theme".to_owned(), "dark".to_owned())]), true)
+        .expect("publication accepted");
+
+    let reply = suggest(&mut worker, "q");
+    assert!(
+        matches!(reply.state, BatchState::Final),
+        "a raising configuration hook must not poison the next request, got {:?}",
+        reply.state
+    );
+    assert_eq!(reply.items[0].label, "survived");
+    assert!(worker.is_alive());
+
+    worker.shutdown();
+}
+
+#[test]
+fn publishing_configuration_to_a_dead_worker_is_an_error_rather_than_a_silent_loss() {
+    require_host_interpreter!();
+    // A publication that vanished into a dead worker would leave the launcher
+    // believing a plugin holds a state it never received.
+    let scratch = Scratch::new("configuration-dead");
+    let src = scratch.subdir("source");
+    write_file(
+        &src.join("crasher.py"),
+        r#"
+import os
+
+from crikey_sdk import Plugin
+
+
+class Impl(Plugin):
+    def suggest(self, query, context):
+        os._exit(9)
+"#,
+    );
+    let site = scratch.subdir("empty-site");
+    let mut worker = spawn_worker("modern.configuration-dead", "crasher:Impl", &src, &site);
+
+    let crash = worker
+        .suggest(&SuggestRequest {
+            generation: 1,
+            text: "boom".to_owned(),
+            normalized: "boom".to_owned(),
+            selected_item_id: None,
+        })
+        .expect_err("an interpreter that exits mid-call is a transport fault");
+    assert!(
+        matches!(crash, crikey_python_host::HostError::Crashed { .. }),
+        "expected a crashed-worker error, got {crash}"
+    );
+    assert!(!worker.is_alive());
+
+    let error = worker
+        .send_configuration(&BTreeMap::from([("theme".to_owned(), "dark".to_owned())]), true)
+        .expect_err("the caller must learn the plugin did not receive the state");
+    assert!(
+        matches!(error, crikey_python_host::HostError::Crashed { .. }),
+        "expected a crashed-worker error, got {error}"
+    );
 }

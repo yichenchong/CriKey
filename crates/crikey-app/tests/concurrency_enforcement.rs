@@ -162,8 +162,8 @@ fn omitted_query_maximum_still_caps_an_explicit_suggestion_budget() {
     );
 }
 
-fn refusals(pipeline: &QueryPipeline, plugin: &PluginId) -> u64 {
-    pipeline.health(plugin).concurrency_refusals
+fn refusals(pipeline: &mut QueryPipeline, plugin: &PluginId) -> u64 {
+    pipeline.health(plugin).concurrency_refusals.total()
 }
 
 /// The provider and pipeline must observe one occupancy counter rather than
@@ -197,7 +197,7 @@ fn provider_and_pipeline_budget_clones_share_suggestion_admission() {
         dispatched(&mut pipeline, 0).is_empty(),
         "the occupied shared slot must refuse the suggestion"
     );
-    assert_eq!(refusals(&pipeline, &plugin), 1);
+    assert_eq!(refusals(&mut pipeline, &plugin), 1);
     drop(held);
     assert_eq!(pipeline_handle.in_flight(BudgetKind::Suggestion), 0);
 }
@@ -227,7 +227,7 @@ fn unregister_plugin_drops_registration_and_allows_clean_reload() {
         .register_namespaced_manifest(plugin.clone(), &manifest)
         .expect("the removed plugin can be registered cleanly");
     assert!(!Arc::ptr_eq(&handle, &replacement));
-    assert_eq!(pipeline.health(&plugin).concurrency_refusals, 0);
+    assert_eq!(pipeline.health(&plugin).concurrency_refusals.total(), 0);
 }
 
 /// The blocking finding: a declared limit must bind live dispatch.
@@ -264,12 +264,12 @@ fn a_plugin_at_its_declared_suggestion_limit_is_refused_while_its_sibling_is_not
     );
 
     assert_eq!(
-        refusals(&pipeline, &capped),
+        refusals(&mut pipeline, &capped),
         1,
         "the refusal must be observable in per-plugin diagnostics, not a silent drop"
     );
     assert_eq!(
-        refusals(&pipeline, &sibling),
+        refusals(&mut pipeline, &sibling),
         0,
         "an admitted request is not a refusal"
     );
@@ -308,7 +308,7 @@ fn retiring_the_running_request_returns_the_slot_to_the_plugin() {
         dispatched(&mut pipeline, 10).is_empty(),
         "the plugin is at its limit while the first request runs"
     );
-    assert_eq!(refusals(&pipeline, &capped), 1);
+    assert_eq!(refusals(&mut pipeline, &capped), 1);
 
     pipeline.complete(&capped, first_generation, 20);
     assert_eq!(
@@ -327,7 +327,7 @@ fn retiring_the_running_request_returns_the_slot_to_the_plugin() {
         "the freed slot must admit the next request"
     );
     assert_eq!(
-        refusals(&pipeline, &capped),
+        refusals(&mut pipeline, &capped),
         1,
         "releasing a slot must not erase the refusal history"
     );
@@ -353,7 +353,7 @@ fn a_declared_limit_of_zero_admits_no_suggestion_request_at_all() {
             "a plugin declaring zero must not stall its neighbours: {plugins:?}"
         );
         assert_eq!(
-            refusals(&pipeline, &refusing),
+            refusals(&mut pipeline, &refusing),
             u64::try_from(index).expect("small index") + 1,
             "every refused request is counted"
         );
@@ -363,7 +363,7 @@ fn a_declared_limit_of_zero_admits_no_suggestion_request_at_all() {
     }
 
     assert_eq!(
-        refusals(&pipeline, &sibling),
+        refusals(&mut pipeline, &sibling),
         0,
         "the neighbour of a zero-budget plugin is never throttled"
     );
@@ -405,4 +405,179 @@ fn unsupported_wasm_registration_is_explicit_and_leaves_no_pipeline_state() {
     pipeline
         .register_plugin(plugin.clone(), crikey_input_scheduler::PluginPolicy::modern())
         .expect("a refused runtime must leave the id available for a supported registration");
+}
+
+/// A four-slot manifest that grants exactly one unit of every §13.5 kind, so
+/// occupying a slot and asking for a second one is a refusal of that kind and
+/// of nothing else.
+const EVERY_KIND_MANIFEST: &str = r#"
+manifest-version = 1
+
+[plugin]
+id = "dev.crikey.every-kind"
+name = "Every kind"
+version = "1.0.0"
+runtime = "python"
+entrypoint = "plugin.py"
+
+[query]
+max-concurrent-requests = 1
+
+[concurrency]
+max-suggestion-requests = 1
+max-action-requests = 1
+max-background-tasks = 1
+max-catalog-tasks = 1
+"#;
+
+/// Occupies one slot of `kind` on the shared budget, asks for a second, and
+/// returns the plugin's health after the refusal.
+///
+/// The handle this reaches for is the exact `Arc` every production dispatch
+/// site holds: `ModernProvider`/`NativeProvider` keep it in their loaded-plugin
+/// record and clone it into their action endpoints and catalog builders,
+/// `LegacyProvider::action_budgets` clones the same one, and
+/// `WorkerOptions::with_shared_budget` hands it to the Python worker that
+/// admits background tasks. Refusing on it is therefore what those sites do,
+/// not an imitation of it.
+fn refuse_one(kind: BudgetKind) -> (QueryPipeline, PluginId) {
+    let manifest = Manifest::parse(EVERY_KIND_MANIFEST).expect("fixture manifest parses");
+    let plugin = PluginId(manifest.plugin.id.clone());
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let budget = pipeline
+        .register_namespaced_manifest(plugin.clone(), &manifest)
+        .expect("fixture plugin registers once");
+
+    let held = budget
+        .try_acquire_owned(kind)
+        .expect("the single declared slot admits the first unit");
+    assert!(
+        budget.try_acquire_owned(kind).is_none(),
+        "a second unit must be refused while the first holds the only slot"
+    );
+    drop(held);
+    (pipeline, plugin)
+}
+
+/// The refusal an operator can act on is the one attributed to a kind. All
+/// four are asserted the same way so no kind can quietly stop reporting.
+#[test]
+fn a_refused_suggestion_reaches_per_plugin_health_as_a_suggestion_refusal() {
+    let (mut pipeline, plugin) = refuse_one(BudgetKind::Suggestion);
+    let refusals = pipeline.health(&plugin).concurrency_refusals;
+
+    assert_eq!(refusals.suggestion, 1, "the suggestion refusal must be reported");
+    assert_eq!(refusals.total(), 1, "no other kind may be credited with it");
+    assert_eq!(
+        (refusals.action, refusals.background, refusals.catalog),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn a_refused_action_reaches_per_plugin_health_as_an_action_refusal() {
+    let (mut pipeline, plugin) = refuse_one(BudgetKind::Action);
+    let refusals = pipeline.health(&plugin).concurrency_refusals;
+
+    assert_eq!(refusals.action, 1, "the action refusal must be reported");
+    assert_eq!(refusals.total(), 1, "no other kind may be credited with it");
+    assert_eq!(
+        (refusals.suggestion, refusals.background, refusals.catalog),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn a_refused_background_task_reaches_per_plugin_health_as_a_background_refusal() {
+    let (mut pipeline, plugin) = refuse_one(BudgetKind::Background);
+    let refusals = pipeline.health(&plugin).concurrency_refusals;
+
+    assert_eq!(refusals.background, 1, "the background refusal must be reported");
+    assert_eq!(refusals.total(), 1, "no other kind may be credited with it");
+    assert_eq!(
+        (refusals.suggestion, refusals.action, refusals.catalog),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn a_refused_catalog_build_reaches_per_plugin_health_as_a_catalog_refusal() {
+    let (mut pipeline, plugin) = refuse_one(BudgetKind::Catalog);
+    let refusals = pipeline.health(&plugin).concurrency_refusals;
+
+    assert_eq!(refusals.catalog, 1, "the catalog refusal must be reported");
+    assert_eq!(refusals.total(), 1, "no other kind may be credited with it");
+    assert_eq!(
+        (refusals.suggestion, refusals.action, refusals.background),
+        (0, 0, 0)
+    );
+}
+
+/// A refusal raised on another thread must still reach health: reconciliation
+/// happens when health is read, not only when the pipeline happens to tick.
+/// Without that, an action refused on the UI thread would stay invisible until
+/// the next keystroke, which is exactly when the operator stops looking.
+#[test]
+fn a_refusal_raised_off_the_pipeline_thread_is_reported_without_a_tick() {
+    let manifest = Manifest::parse(EVERY_KIND_MANIFEST).expect("fixture manifest parses");
+    let plugin = PluginId(manifest.plugin.id.clone());
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let budget = pipeline
+        .register_namespaced_manifest(plugin.clone(), &manifest)
+        .expect("fixture plugin registers once");
+
+    let held = budget
+        .try_acquire_owned(BudgetKind::Action)
+        .expect("the declared slot admits the first unit");
+    let elsewhere = Arc::clone(&budget);
+    std::thread::spawn(move || {
+        assert!(elsewhere.try_acquire_owned(BudgetKind::Action).is_none());
+    })
+    .join()
+    .expect("the refusing thread completes");
+    drop(held);
+
+    // No `keystroke`, no `tick`, no `present`: reading health is the only call.
+    assert_eq!(pipeline.health(&plugin).concurrency_refusals.action, 1);
+}
+
+/// Every registered plugin must appear in the report, including one that has
+/// never been throttled: an operator-facing listing that silently omits a
+/// healthy plugin cannot be used to confirm a plugin loaded at all.
+#[test]
+fn the_health_report_covers_every_registered_plugin_with_its_own_refusals() {
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let throttled = register(&mut pipeline, EVERY_KIND_MANIFEST);
+    let healthy = register(&mut pipeline, SIBLING_MANIFEST);
+
+    let budget = pipeline
+        .plugin_budget(&throttled)
+        .expect("registered plugin has a budget")
+        .clone();
+    let held = budget
+        .try_acquire_owned(BudgetKind::Catalog)
+        .expect("the declared slot admits the first unit");
+    assert!(budget.try_acquire_owned(BudgetKind::Catalog).is_none());
+    drop(held);
+
+    let report = pipeline.plugin_health_report();
+    let reported = report
+        .iter()
+        .map(|(plugin, health)| (plugin.clone(), health.concurrency_refusals))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    assert_eq!(
+        reported
+            .get(&throttled)
+            .expect("the throttled plugin is reported")
+            .catalog,
+        1
+    );
+    assert_eq!(
+        reported
+            .get(&healthy)
+            .expect("an unthrottled plugin is still reported")
+            .total(),
+        0
+    );
 }

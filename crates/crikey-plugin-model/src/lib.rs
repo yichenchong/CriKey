@@ -1,9 +1,15 @@
 //! Plugin manifest and permission model (spec 19, 20).
 
+pub mod configuration;
 pub mod manifest;
 pub mod permissions;
 pub mod scheduling;
 
+pub use configuration::{
+    ConfigurationField, ConfigurationKind, ConfigurationSection, FieldViolation, REDACTED, RULE_ALLOWED,
+    RULE_DEFAULT, RULE_DUPLICATE_FIELD, RULE_FIELD_NAME, RULE_MAXIMUM, RULE_MAX_LENGTH, RULE_MINIMUM,
+    RULE_REQUIRED, RULE_TYPE, RULE_UNKNOWN_FIELD,
+};
 pub use manifest::{
     ActivationSection, ConcurrencySection, Manifest, PerformanceSection, PluginSection, PythonSection,
     QuerySection, Runtime, Startup,
@@ -27,6 +33,9 @@ pub enum ManifestError {
         os: String,
         arch: String,
     },
+    /// The `[configuration]` declaration is unusable (spec 21.3): the manifest
+    /// parsed, but a field it declares could never be satisfied.
+    InvalidConfiguration(FieldViolation),
 }
 
 impl std::fmt::Display for ManifestError {
@@ -43,6 +52,9 @@ impl std::fmt::Display for ManifestError {
                 write!(formatter, "invalid query policy field {field}: {problem:?}")
             }
             Self::NoEntrypoint { os, arch } => write!(formatter, "no entrypoint for {os}-{arch}"),
+            Self::InvalidConfiguration(violation) => {
+                write!(formatter, "invalid crikey.toml [configuration]: {violation}")
+            }
         }
     }
 }
@@ -51,6 +63,7 @@ impl std::error::Error for ManifestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Parse(error) => Some(error),
+            Self::InvalidConfiguration(violation) => Some(violation),
             _ => None,
         }
     }
@@ -59,5 +72,11 @@ impl std::error::Error for ManifestError {
 impl From<toml::de::Error> for ManifestError {
     fn from(error: toml::de::Error) -> Self {
         Self::Parse(error)
+    }
+}
+
+impl From<FieldViolation> for ManifestError {
+    fn from(violation: FieldViolation) -> Self {
+        Self::InvalidConfiguration(violation)
     }
 }

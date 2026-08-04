@@ -8,6 +8,7 @@ members = [
     "crates/crikey-result-aggregator",
     "crates/crikey-input-scheduler",
     "crates/crikey-plugin-model",
+    "crates/crikey-config",
     "crates/crikey-plugin-supervisor",
     "crates/crikey-native-protocol",
     "crates/crikey-native-host",
@@ -46,6 +47,7 @@ crikey-catalog = { path = "crates/crikey-catalog", version = "0.1.0" }
 crikey-result-aggregator = { path = "crates/crikey-result-aggregator", version = "0.1.0" }
 crikey-input-scheduler = { path = "crates/crikey-input-scheduler", version = "0.1.0" }
 crikey-plugin-model = { path = "crates/crikey-plugin-model", version = "0.1.0" }
+crikey-config = { path = "crates/crikey-config", version = "0.1.0" }
 crikey-plugin-supervisor = { path = "crates/crikey-plugin-supervisor", version = "0.1.0" }
 crikey-native-protocol = { path = "crates/crikey-native-protocol", version = "0.1.0" }
 crikey-native-host = { path = "crates/crikey-native-host", version = "0.1.0" }
@@ -93,6 +95,34 @@ unicode-general-category = "1.1.0"
 # `deflate` is the only compression method a Keypirinha package uses beyond
 # `stored`.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# HTTP client for the one place CriKey fetches bytes over the network: a plugin
+# package named by URL (spec 23.1). `rustls` rather than the platform TLS stack
+# so the trust decision is identical on every target and needs no system
+# OpenSSL; default features are off so the JSON, cookie and gzip layers of a
+# general-purpose client are not linked into a launcher that only ever performs
+# one GET to a file. Every test injects a fake `PackageFetcher` instead, so no
+# test in this workspace opens a socket.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# Icon decoding (spec 6.4, 18.1, 22.1). Deliberately two narrow decoders rather
+# than the `image` crate: a launcher needs exactly the formats desktop icon
+# themes and application bundles actually ship, and `image` would pull JPEG,
+# TIFF, BMP, GIF, WebP, DDS, HDR and farbfeld into a binary that draws 48x48
+# squares.
+#
+# * `png` covers the raster half. It is also the frame encoding inside every
+#   modern `.ico` and `.icns`, whose containers are parsed by hand in
+#   `crikey-platform` because a container walk is a hundred lines and the
+#   dedicated crates for them would each add a second copy of this decoder.
+# * `resvg` covers the vector half, which on Linux is not a nicety: Adwaita
+#   ships 715 SVGs against 51 PNGs, so a PNG-only backend would find nothing
+#   for most themed icon names. Default features are off, which drops the
+#   `fontdb`/`rustybuzz` text stack, `svgz`, and the raster-image codecs whose
+#   job `png` already does here; SVG text elements are consequently not
+#   rendered, which icon artwork does not use.
+png = "0.18"
+resvg = { version = "0.48", default-features = false }
 
 # Microsoft's generated Win32/COM bindings, used by Windows-specific code
 # (the platform backend and the native named-pipe transport) and pulled in

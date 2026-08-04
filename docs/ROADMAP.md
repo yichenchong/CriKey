@@ -230,11 +230,18 @@ Status snapshot (2026-07-30):
 - Verification limit: this Linux host has no Windows runtime, so §31.11
   (discovery and loading of existing packages *on Windows*) and the Win32 half
   of `keypirinha_wintypes` are exercised only through their honest
-  `windows-only` / `unavailable` reports. §14.11 is partial: an operator may
-  point the layer at a specific interpreter, but nothing yet maps a plugin's
-  declared Python requirement to a runtime profile, so per-version process
-  separation is not demonstrated. Icons round-trip as opaque handles and are
-  classified `partial`; no icon is loaded or rendered.
+  `windows-only` / `unavailable` reports. §14.11 is now satisfied: a plugin's
+  declared `requires-python` selects its interpreter automatically, so two
+  plugins with incompatible requirements run on different interpreters and
+  therefore in different worker processes. *Legacy* icons still round-trip as
+  opaque
+  handles and stay classified `partial`: a legacy `icon_handle` is an in-process
+  Python object, so the compatibility layer deliberately drops it. Catalog icons
+  are loaded and drawn — an XDG theme search on Linux, PNG/SVG/ICO/ICNS decoding,
+  the §11.7 payload limits, a cache under `cache_dir()`, and a texture beside the
+  result row — but plugin-supplied icons are not: neither a modern plugin's
+  package-relative reference nor the native protocol's
+  `ResourceRequest`/`Kind::Icon` has a resolver yet.
 
 ### M4 — Modern Python plugins (§30 Phase 4) — L — done
 
@@ -406,6 +413,78 @@ satisfied**: only the Linux runner is exercised here, while Windows and macOS
 are compile-checked rather than run. Every other listed item is satisfied with
 the evidence named or re-deferred above with a reason. Windows-only legacy
 plugins are labelled as such and never advertised as portable (§31.26, §31.31).
+
+### M6.5 — First-release feature completion — L — done
+
+The milestones above built the engine. This one built the parts a user touches:
+until it landed there was no way to install a plugin or change a setting, which
+is the difference between "the launcher is correct" and "someone can use it".
+
+Five specification sections were unbuilt rather than deferred. Each is now
+implemented and reachable from a shipped command:
+
+- **§21 Configuration.** A seven-layer TOML precedence — built-in defaults,
+  administrator policy, user-global, profile, plugin defaults, user plugin
+  settings, session overrides — where each layer has exactly one source, so
+  precedence is a property of where a value came from rather than of where it
+  sat in a file. Manifests gained a `[configuration]` schema with validation,
+  `secret`, restart requirements and platform restrictions. Live updates
+  coalesce a burst into one delivery of the latest complete state, pushed to
+  native plugins over the `ConfigurationChange` payload that already existed and
+  to modern Python plugins over a new `configuration` frame and
+  `Plugin.on_configuration` hook. `crikey config {list,get,layers}` makes the
+  precedence inspectable, because a layered system that cannot answer "which
+  layer won?" is not diagnosable. Legacy keeps its own Keypirinha-syntax
+  configuration and its own notification contract, untouched (§21.1, §14).
+- **§23 Package management.** Install from a directory, an archive, a URL or an
+  existing Keypirinha package; atomic update with the previous version retained;
+  rollback. The dead `PackageManager` trait and `InstallOutcome` were deleted
+  rather than implemented — nothing referenced them. Two real defects surfaced:
+  `verify_package` never checked the embedded per-member digests, so
+  `crikey package verify` accepted a tampered payload whenever no out-of-band
+  hash was pinned; and the retained previous version was kept *inside* the
+  discovery root, where the launcher would load the superseded copy as a second
+  plugin.
+- **§28 `crikey plugin`.** All seven subcommands, plus
+  `package migrate-keypirinha`. A disabled plugin is skipped by every provider
+  before its worker is spawned and recorded in `unavailable()` with a stated
+  reason, so it does not silently vanish.
+- **§13.5 reporting.** Budgets were already enforced at all four seams; their
+  refusals were invisible. `PluginHealth` now carries a per-kind breakdown, and
+  `crikey plugin doctor` reports it — an operator who cannot tell a refused
+  catalog build from a refused keystroke cannot act on either.
+- **§14.11 runtime profiles.** A declared `requires-python` now selects the
+  interpreter, so incompatible plugins land in separate processes.
+- **Icons (§6.4, §11.7, §18.1, §22.1).** Located through an XDG theme search on
+  Linux, decoded from PNG and SVG, bounded by the §11.7 payload limit, cached
+  under `cache_dir()`, and drawn beside the result row.
+
+Two further live gaps were found and closed while wiring the above: a legacy
+plugin built no catalog and had no working action in `crikey run` — both
+runtimes existed but nothing called them — and legacy items carried no actions
+at all, so pressing Enter on a legacy row did nothing.
+
+Deliberately not built, with the reason rather than an omission:
+
+| Item | Why not |
+| --- | --- |
+| Per-plugin stop across processes (§23.3) | `crikey plugin install` and `crikey run` are separate processes with no IPC. Instead the launcher holds an OS-level exclusive lock for its lifetime and install acquires the same lock for the whole replacement, so a live launcher refuses the install rather than replacing files underneath it. A pid sentinel was rejected: it races with a launcher starting after the check |
+| A manifest field naming a runtime profile | `requires-python` already states the portable constraint. A profile field would either name an absolute interpreter path — a plugin author dictating host layout — or repeat what the host must decide anyway. `CRIKEY_PYTHON` remains the operator override |
+| Plugin-supplied icons | Neither a modern plugin's package-relative reference nor the native protocol's `ResourceRequest`/`Kind::Icon` has a resolver. The host still answers `found: false` |
+| Native and legacy background budgets | No background-task API exists in either protocol. §13.5's background budget applies to the modern Python runtime, which is the only runtime that has the concept |
+
+Verification: 1637 tests pass with warnings denied; clippy, fmt, and the
+Windows and macOS cross-target checks are clean. Smoke-tested end to end
+against the real binary: install, list, disable, `config get` resolving a
+profile layer over user-global, `doctor` reporting all four budgets, and
+remove.
+
+One verification limit this milestone introduced: the URL install source pulls
+`ureq` and therefore `ring`, whose build script needs a C toolchain for the
+target, so `cargo check --workspace --target <other>` no longer completes on
+this host. CI is unaffected — it builds natively on three runners — and the
+cross-target gate is still run over every crate that contains platform-specific
+code, which is where cross-target defects occur.
 
 ### M7 — Optional runtimes and ecosystem (§30 Phase 7) — open-ended
 

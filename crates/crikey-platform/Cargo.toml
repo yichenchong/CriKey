@@ -13,3 +13,21 @@ workspace = true
 
 [dependencies]
 crikey-core.workspace = true
+# Icon decoding lives here rather than in the per-OS backends: turning bytes
+# into pixels is a pure data transformation, and keeping it platform
+# independent is what lets the `.ico` and `.icns` paths -- which no Linux host
+# can reach through a desktop API -- be tested on any host (spec 18.1, 22.1).
+png.workspace = true
+resvg.workspace = true
+
+# `O_NONBLOCK | O_CLOEXEC` for the icon readers. Opening an icon file blindly is
+# how a FIFO planted in a theme directory hangs a launcher forever, and the flag
+# numbers differ per Unix, so they come from the same bindings the backends use
+# rather than from a hard-coded constant that is only right on Linux.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# The fixtures are real encoded images: an oversize-refusal test that hand-rolls
+# its own PNG proves nothing about the decoder the launcher runs.
+png.workspace = true

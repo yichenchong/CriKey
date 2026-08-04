@@ -28,6 +28,7 @@
 //! root is offered to any provider, so the packages are not merely disabled
 //! after loading — they are never discovered.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read as _};
@@ -228,6 +229,45 @@ pub fn admitted_plugin_roots(mode: &StartupMode, roots: &[PathBuf]) -> Vec<PathB
         StartupMode::SafeMode { .. } => Vec::new(),
     }
 }
+
+/// The plugins an operator has switched off (spec 21.2; `crikey plugin disable`).
+///
+/// The companion of [`admitted_plugin_roots`], and the same reasoning: a
+/// decision about what may load is worth nothing until it reaches the loader,
+/// and the only way to prove a plugin was not loaded is for no worker to be
+/// spawned and no registration to happen. Safe mode withholds whole roots
+/// because it distrusts the launch; this withholds named plugins because the
+/// operator asked, so it has to be per-plugin and cannot be a root list.
+///
+/// Membership is keyed on the *namespaced* plugin id the pipeline uses —
+/// `legacy.foo`, `modern.foo`, `native.foo` (spec 10.2). Two runtimes may ship
+/// the same bare id, so the bare id is not a key that identifies one plugin;
+/// resolving what an operator typed to a namespaced id belongs to the command
+/// line, which can see the whole inventory and refuse an ambiguous name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DisabledPlugins(BTreeSet<String>);
+
+impl DisabledPlugins {
+    /// Collects namespaced plugin ids into a disabled set.
+    pub fn from_ids<I>(ids: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        Self(ids.into_iter().collect())
+    }
+
+    /// Whether `plugin` must not be loaded.
+    pub fn blocks(&self, plugin: &PluginId) -> bool {
+        self.0.contains(&plugin.0)
+    }
+}
+
+/// The reason a provider records for a plugin held back by [`DisabledPlugins`].
+///
+/// One spelling, shared by the three providers: an operator grepping the
+/// startup diagnostics for why a plugin is missing must find the same sentence
+/// whichever runtime it belongs to.
+pub const DISABLED_BY_CONFIGURATION: &str = "disabled by configuration (crikey plugin enable to restore)";
 
 /// Distinguishes one save's staging file from every other save's in this
 /// process; the pid distinguishes it from every other process's.

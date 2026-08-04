@@ -3,13 +3,16 @@
 //! Platform-independent crates depend on these traits only; concrete desktop
 //! APIs live in the per-OS backend crates.
 //!
-//! Three pieces of behaviour are shared by every backend and therefore belong
+//! Four pieces of behaviour are shared by every backend and therefore belong
 //! to none of them: [`Accelerator`], which parses the configurable activation
 //! shortcut (spec 6.1); [`encode_target`] and [`decode_target`], which carry a
 //! native path through the `String` field of a catalog item without losing a
-//! unit (spec 18.3, ADR-0007); and [`application_items`], which maps discovered
-//! applications onto catalog items (spec 10.2, 10.3). All are pure functions
-//! over data: no window system, no key grab, no filesystem.
+//! unit (spec 18.3, ADR-0007); [`application_items`], which maps discovered
+//! applications onto catalog items (spec 10.2, 10.3); and the [`icon`] module's
+//! decoding, size limits and cache, which every backend needs and none of them
+//! can test on its own target (spec 6.4, 11.7, 22.1). All are pure functions
+//! over data or plain filesystem work: no window system, no key grab, no
+//! desktop API.
 
 use std::{collections::BTreeMap, fmt};
 
@@ -20,10 +23,16 @@ use crikey_core::{
 
 mod bundle;
 mod directories;
+pub mod icon;
 pub mod window;
 
-pub use bundle::{bundle_display_name, parse_info_plist, AppBundle};
+pub use bundle::{bundle_display_name, bundle_icon_path, parse_info_plist, AppBundle};
 pub use directories::{DirectoryConvention, DirectoryEnvironment, PluginKind, StandardDirectories};
+pub use icon::{
+    decode_icon, IconCache, IconCacheKey, IconError, IconFormat, IconImage, IconLoader, IconProvider,
+    IconSource, PathIconSource, SourceFingerprint, DEFAULT_ICON_SIZE, ICON_CACHE_SCHEMA_VERSION,
+    MAX_ICON_EDGE, MAX_ICON_PAYLOAD_BYTES, MAX_ICON_PIXELS,
+};
 pub use window::{WindowHandle, WindowInfo, WindowService};
 
 /// Optional platform capabilities and their availability (spec 18.2).

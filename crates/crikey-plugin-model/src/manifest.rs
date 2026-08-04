@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::configuration::ConfigurationSection;
 use crate::permissions::Permissions;
 use crate::scheduling::SchedulingProfile;
 use crate::ManifestError;
@@ -29,6 +30,11 @@ pub struct Manifest {
     pub performance: PerformanceSection,
     #[serde(default)]
     pub python: PythonSection,
+    /// The plugin's declared settings schema (spec 21.3). Absent means the
+    /// plugin declares no configuration, which is not the same as declaring an
+    /// empty one only in that the manifest stays shorter.
+    #[serde(default)]
+    pub configuration: ConfigurationSection,
 }
 
 impl Manifest {
@@ -53,6 +59,7 @@ impl Manifest {
             return Err(ManifestError::UnsupportedVersion(manifest.manifest_version));
         }
         manifest.validate_query_policy()?;
+        manifest.configuration.validate_declaration()?;
         Ok(manifest)
     }
 

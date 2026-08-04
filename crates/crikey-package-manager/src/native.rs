@@ -61,11 +61,11 @@ struct SourceMember {
 }
 
 #[derive(Debug)]
-struct ArchiveMember {
-    bytes: Vec<u8>,
-    directory: bool,
+pub(crate) struct ArchiveMember {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) directory: bool,
     #[cfg_attr(not(unix), allow(dead_code))]
-    unix_mode: Option<u32>,
+    pub(crate) unix_mode: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -151,11 +151,21 @@ pub fn inspect_package(archive: &Path) -> Result<NativePackageReport, PackageErr
 
 /// Authenticates a native package and, when supplied, pins its whole-archive
 /// SHA-256 to `expected_hash` (spec 23.3).
+///
+/// "Authenticates" means the same thing here as it does for
+/// [`inspect_package`] and [`install_native`]: every member is checked against
+/// the digest the embedded lock claims for it. An earlier version checked only
+/// the archive's shape and the optional whole-archive hash, which meant
+/// `crikey package verify` accepted an archive whose payload had been swapped
+/// and whose lock no longer described it — the one thing the command exists to
+/// refuse. The optional `expected_hash` is an *additional* out-of-band pin, not
+/// a substitute for the embedded digests.
 pub fn verify_package(
     archive: &Path,
     expected_hash: Option<&str>,
 ) -> Result<NativePackageReport, PackageError> {
     let package = load_package(archive)?;
+    validate_integrity(&package)?;
     if let Some(expected) = expected_hash {
         if !is_hex_sha256(expected) || !constant_time_hex_eq(&package.archive_hash, expected) {
             return Err(PackageError::HashMismatch(format!(
@@ -190,49 +200,144 @@ pub fn install_native(
     }
 
     let staging = temporary_path(parent, install_root, "staging");
-    let stage_result = write_staging(&package, &staging);
-    if let Err(error) = stage_result {
+    if let Err(error) = write_members(&package.members, &staging) {
         remove_directory_if_present(&staging);
         return Err(error);
     }
 
-    let root_state = inspect_install_root(install_root)?;
-    let mut previous = None;
-    let mut removed_empty_root = false;
-    if root_state == InstallRootState::Populated {
-        let backup = temporary_path(parent, install_root, "previous");
-        if let Err(error) = fs::rename(install_root, &backup) {
-            remove_directory_if_present(&staging);
-            return Err(PackageError::Io(error));
-        }
-        previous = Some(backup);
-    } else if root_state == InstallRootState::Empty {
-        if let Err(error) = fs::remove_dir(install_root) {
-            remove_directory_if_present(&staging);
-            return Err(PackageError::Io(error));
-        }
-        removed_empty_root = true;
+    // A native install root is a directory or nothing. Refusing a file or a
+    // symlink here, before anything moves, keeps the swap from quietly
+    // replacing something that was never an installation.
+    if let Err(error) = inspect_install_root(install_root) {
+        remove_directory_if_present(&staging);
+        return Err(error);
     }
 
-    if let Err(error) = fs::rename(&staging, install_root) {
-        remove_directory_if_present(&staging);
-        if let Some(backup) = previous.as_ref() {
-            if let Err(restore) = fs::rename(backup, install_root) {
-                return Err(PackageError::Install(format!(
-                    "replacement failed ({error}) and restoring the previous version failed ({restore})"
-                )));
-            }
-        } else if removed_empty_root {
-            let _ = fs::create_dir(install_root);
+    let backup = temporary_path(parent, install_root, "previous");
+    let previous = match swap_into_place(install_root, &staging, Some(&backup)) {
+        Ok(true) => Some(backup),
+        Ok(false) => None,
+        Err(error) => {
+            remove_directory_if_present(&staging);
+            return Err(error);
         }
-        return Err(PackageError::Io(error));
-    }
+    };
 
     Ok(NativeInstall {
         root: install_root.to_path_buf(),
         previous,
         report: package_report(&package),
     })
+}
+
+/// Replaces `target` with `replacement` in one rename, retaining whatever
+/// `target` held at `previous` (spec 23.4).
+///
+/// This is the single place the crate performs an installation swap. The
+/// replacement is materialised somewhere else and only then becomes the
+/// target, so no half-written tree is ever reachable under `target` and a
+/// failure at any step leaves the previous working version in place.
+///
+/// Returns whether anything was displaced. An absent or empty target displaces
+/// nothing: a first install has no previous version, and retaining an empty
+/// directory would let a later rollback "restore" an installation that never
+/// existed.
+///
+/// `previous` of `None` discards the displaced target rather than retaining
+/// it, which is what a rollback wants — the version being undone is not worth
+/// keeping, and keeping it would make the next rollback undo the undo.
+pub(crate) fn swap_into_place(
+    target: &Path,
+    replacement: &Path,
+    previous: Option<&Path>,
+) -> Result<bool, PackageError> {
+    let parent = install_parent(target)?;
+    if !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent)?;
+    }
+    let hold = match previous {
+        Some(path) => {
+            if let Some(holder) = path.parent().filter(|holder| !holder.as_os_str().is_empty()) {
+                fs::create_dir_all(holder)?;
+            }
+            // One retained previous version per plugin: an older retention is
+            // already superseded by the version about to be displaced.
+            remove_path(path);
+            path.to_path_buf()
+        }
+        None => temporary_path(parent, target, "displaced"),
+    };
+
+    let mut displaced = false;
+    let mut removed_empty_target = false;
+    match inspect_target(target)? {
+        TargetState::Missing => {}
+        TargetState::EmptyDirectory => {
+            fs::remove_dir(target)?;
+            removed_empty_target = true;
+        }
+        TargetState::Present => {
+            fs::rename(target, &hold).map_err(PackageError::Io)?;
+            displaced = true;
+        }
+    }
+
+    if let Err(error) = fs::rename(replacement, target) {
+        if displaced {
+            if let Err(restore) = fs::rename(&hold, target) {
+                return Err(PackageError::Install(format!(
+                    "replacement failed ({error}) and restoring the previous version failed ({restore})"
+                )));
+            }
+        } else if removed_empty_target {
+            let _ = fs::create_dir(target);
+        }
+        return Err(PackageError::Io(error));
+    }
+
+    if displaced && previous.is_none() {
+        remove_path(&hold);
+    }
+    Ok(displaced)
+}
+
+/// What a swap target currently holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetState {
+    Missing,
+    /// A directory with no entries, which is indistinguishable from "not
+    /// installed" and is therefore not worth retaining.
+    EmptyDirectory,
+    Present,
+}
+
+fn inspect_target(target: &Path) -> Result<TargetState, PackageError> {
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(TargetState::Missing),
+        Err(error) => return Err(PackageError::Io(error)),
+    };
+    // A symlink would make the rename replace the link rather than what the
+    // user believes is installed, so it is refused rather than followed.
+    if metadata.file_type().is_symlink() {
+        return Err(PackageError::Install(format!(
+            "{} is a symbolic link, not an installation",
+            target.display()
+        )));
+    }
+    if metadata.is_dir() && fs::read_dir(target)?.next().transpose()?.is_none() {
+        return Ok(TargetState::EmptyDirectory);
+    }
+    Ok(TargetState::Present)
+}
+
+/// Removes a file or a whole directory, whichever is there, ignoring absence.
+pub(crate) fn remove_path(path: &Path) {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+        let _ = fs::remove_dir_all(path);
+    } else {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// Restores the retained previous directory with the same complete-directory
@@ -440,9 +545,24 @@ fn source_archive_name(relative: &Path) -> Result<String, PackageError> {
     Ok(parts.join("/"))
 }
 
-fn load_package(archive: &Path) -> Result<LoadedPackage, PackageError> {
+/// Every member of a ZIP package, with the digest of the archive that held
+/// them.
+#[derive(Debug)]
+pub(crate) struct ArchiveContents {
+    pub(crate) members: BTreeMap<String, ArchiveMember>,
+    pub(crate) hash: String,
+}
+
+/// Reads and safety-checks every member of a ZIP package.
+///
+/// Everything a *container* can be wrong about — a member path that escapes
+/// the destination, a symbolic link, a duplicate name, a directory carrying a
+/// payload, a member nested under a file — is refused here, once, for every
+/// package format the installer understands. Only the manifest rules differ
+/// between formats, so only those live in the format-specific loaders.
+pub(crate) fn read_archive(archive: &Path) -> Result<ArchiveContents, PackageError> {
     let archive_bytes = fs::read(archive)?;
-    let archive_hash = sha256_hex(&archive_bytes);
+    let hash = sha256_hex(&archive_bytes);
     let mut zip = ZipArchive::new(Cursor::new(archive_bytes.as_slice()))
         .map_err(|error| PackageError::MalformedArchive(error.to_string()))?;
     let mut members = BTreeMap::new();
@@ -486,7 +606,12 @@ fn load_package(archive: &Path) -> Result<LoadedPackage, PackageError> {
             )));
         }
     }
+    validate_archive_prefixes(&members)?;
+    Ok(ArchiveContents { members, hash })
+}
 
+/// Reads `MANIFEST_MEMBER` out of already-validated archive members.
+pub(crate) fn archive_manifest(members: &BTreeMap<String, ArchiveMember>) -> Result<Manifest, PackageError> {
     let manifest_member = members
         .get(MANIFEST_MEMBER)
         .ok_or_else(|| PackageError::Manifest(format!("package is missing {MANIFEST_MEMBER}")))?;
@@ -495,7 +620,12 @@ fn load_package(archive: &Path) -> Result<LoadedPackage, PackageError> {
             "{MANIFEST_MEMBER} must be a file"
         )));
     }
-    let manifest = parse_manifest(&manifest_member.bytes)?;
+    parse_manifest(&manifest_member.bytes)
+}
+
+fn load_package(archive: &Path) -> Result<LoadedPackage, PackageError> {
+    let ArchiveContents { members, hash } = read_archive(archive)?;
+    let manifest = archive_manifest(&members)?;
     validate_manifest_shape(&manifest)?;
     let names = members.keys().cloned().collect::<Vec<_>>();
     let directories = members
@@ -504,12 +634,11 @@ fn load_package(archive: &Path) -> Result<LoadedPackage, PackageError> {
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
     validate_manifest_members(&manifest, names, directories)?;
-    validate_archive_prefixes(&members)?;
 
     Ok(LoadedPackage {
         members,
         manifest,
-        archive_hash,
+        archive_hash: hash,
     })
 }
 
@@ -629,16 +758,47 @@ fn ensure_compatible(manifest: &Manifest, os: &str, arch: &str) -> Result<(), Pa
     Ok(())
 }
 
-fn package_report(package: &LoadedPackage) -> NativePackageReport {
-    let unsigned_binary = package.members.iter().any(|(name, member)| {
+/// Whether any executable payload ships without a detached signature.
+///
+/// A `bin/` member with no sibling `<name>.sig` file is unsigned. This is
+/// reported, never refused: CriKey runs no signing authority, and a plugin an
+/// operator built for themselves is legitimately unsigned. What matters is
+/// that the user is told before third-party native code runs (spec 23.3).
+pub(crate) fn unsigned_binary_in(members: &BTreeMap<String, ArchiveMember>) -> bool {
+    members.iter().any(|(name, member)| {
         if !name.starts_with("bin/") || member.directory || name.ends_with(".sig") {
             return false;
         }
-        match package.members.get(&format!("{name}.sig")) {
+        match members.get(&format!("{name}.sig")) {
             Some(signature) => signature.directory,
             None => true,
         }
-    });
+    })
+}
+
+/// Reads a plugin source *directory* into the same member map an archive
+/// yields, so a directory install and an archive install share one staging and
+/// swap path (spec 23.1).
+pub(crate) fn collect_directory_members(
+    plugin_dir: &Path,
+) -> Result<BTreeMap<String, ArchiveMember>, PackageError> {
+    Ok(collect_source_members(plugin_dir, Path::new(""))?
+        .into_iter()
+        .map(|(name, member)| {
+            (
+                name,
+                ArchiveMember {
+                    bytes: member.bytes,
+                    directory: false,
+                    unix_mode: member.unix_mode,
+                },
+            )
+        })
+        .collect())
+}
+
+fn package_report(package: &LoadedPackage) -> NativePackageReport {
+    let unsigned_binary = unsigned_binary_in(&package.members);
     NativePackageReport {
         plugin: package.manifest.plugin.id.clone(),
         version: package.manifest.plugin.version.clone(),
@@ -655,9 +815,15 @@ fn package_report(package: &LoadedPackage) -> NativePackageReport {
     }
 }
 
-fn write_staging(package: &LoadedPackage, staging: &Path) -> Result<(), PackageError> {
+/// Materialises `members` under `staging`, which the caller then swaps into
+/// place. Nothing is written where the installation lives, so an interrupted
+/// write leaves the installed version untouched.
+pub(crate) fn write_members(
+    members: &BTreeMap<String, ArchiveMember>,
+    staging: &Path,
+) -> Result<(), PackageError> {
     fs::create_dir_all(staging)?;
-    for (name, member) in &package.members {
+    for (name, member) in members {
         let destination = staging.join(name);
         if member.directory {
             fs::create_dir_all(&destination)?;
@@ -706,12 +872,12 @@ fn inspect_install_root(root: &Path) -> Result<InstallRootState, PackageError> {
     }
 }
 
-fn install_parent(root: &Path) -> Result<&Path, PackageError> {
+pub(crate) fn install_parent(root: &Path) -> Result<&Path, PackageError> {
     root.parent()
         .ok_or_else(|| PackageError::Install(format!("install root {} has no parent", root.display())))
 }
 
-fn temporary_path(parent: &Path, root: &Path, kind: &str) -> PathBuf {
+pub(crate) fn temporary_path(parent: &Path, root: &Path, kind: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let base = root
         .file_name()

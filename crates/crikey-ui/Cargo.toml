@@ -13,6 +13,11 @@ workspace = true
 
 [dependencies]
 crikey-core.workspace = true
+# Not for a platform service: the UI calls none. `crikey-platform` owns
+# `IconImage`, the decoded-pixel value type a row carries, and it depends on
+# nothing but `crikey-core`, so naming it here adds no desktop API to a crate
+# that must not have one (spec 5.3).
+crikey-platform.workspace = true
 egui = { workspace = true, features = ["default_fonts"] }
 egui-wgpu.workspace = true
 egui-winit = { workspace = true, features = ["clipboard"] }
@@ -20,3 +25,8 @@ pollster.workspace = true
 thiserror.workspace = true
 wgpu = { workspace = true, features = ["dx12", "metal", "wgsl"] }
 winit = { workspace = true, features = ["rwh_06", "wayland", "wayland-dlopen", "x11"] }
+
+[dev-dependencies]
+# The renderer tests build rows carrying real decoded pixels, because the
+# assertion is that those exact bytes reach the frame's texture uploads.
+crikey-platform.workspace = true

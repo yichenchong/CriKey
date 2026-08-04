@@ -43,9 +43,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::Duration;
 
-use crikey_app::{LegacyDriver, LegacyProvider, PipelineConfig, QueryPipeline};
-use crikey_core::{Generation, PluginId};
+use crikey_app::{
+    CatalogBuildResult, DisabledPlugins, LegacyDriver, LegacyProvider, PipelineConfig, PluginActionRouter,
+    QueryPipeline,
+};
+use crikey_core::{ExecutionPolicy, Generation, PluginId};
 use crikey_legacy_compat::{discover_interpreter, LegacyDeadlines};
+use crikey_plugin_supervisor::BudgetKind;
 use crikey_python_host::RuntimeProfile;
 use crikey_ui::ViewModel;
 
@@ -80,6 +84,7 @@ fn legacy_suggestions_cross_pipeline_intake_before_presentation() {
         &[test_plugins_root()],
         cache_root,
         LegacyDeadlines::default(),
+        &DisabledPlugins::default(),
     );
 
     // Discovery honours skip-don't-fail: it must have loaded the well-behaved
@@ -144,6 +149,7 @@ fn legacy_supervisor_publishes_off_the_ui_thread() {
         &[test_plugins_root()],
         cache_root,
         LegacyDeadlines::default(),
+        &DisabledPlugins::default(),
     );
     assert!(
         provider.plugins().contains(&well_behaved),
@@ -218,6 +224,7 @@ fn legacy_driver_rejects_a_delayed_older_generation() {
         &[test_plugins_root()],
         cache_root,
         LegacyDeadlines::default(),
+        &DisabledPlugins::default(),
     );
     assert!(
         provider.plugins().contains(&well_behaved),
@@ -274,6 +281,266 @@ fn legacy_driver_rejects_a_delayed_older_generation() {
         generations.iter().all(|generation| *generation == newer),
         "a delayed older submission must not rewind publication; saw {generations:?}",
     );
+
+    drop(driver);
+}
+
+/// The catalog gap this suite exists to close: `LegacyRuntime::catalog_rebuild`
+/// was implemented and never called from the launcher, so a legacy plugin
+/// published nothing searchable in `crikey run` (spec 14.8).
+///
+/// The rebuild is admitted the way the composition root admits it and then
+/// runs on the supervisor thread, because `on_catalog` executes in the child
+/// interpreter. Deleting the `drive_catalogs` call in `LegacyDriver::spawn`
+/// leaves this test with no catalog result at all.
+#[test]
+fn a_legacy_plugins_catalog_reaches_the_live_driver() {
+    require_legacy_interpreter();
+
+    let well_behaved = PluginId("legacy.well-behaved".to_owned());
+    let cache_root = std::env::temp_dir().join("crikey-legacy-catalog-test-cache");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = LegacyProvider::load(
+        &mut pipeline,
+        &[test_plugins_root()],
+        cache_root,
+        LegacyDeadlines::default(),
+        &DisabledPlugins::default(),
+    );
+    assert!(
+        provider.plugins().contains(&well_behaved),
+        "the well-behaved legacy plugin must load; unavailable: {:?}",
+        provider.unavailable(),
+    );
+    provider
+        .request_catalog_build(&well_behaved, 1, Generation::ZERO)
+        .expect("a loaded legacy plugin admits its first catalog build");
+
+    let driver = LegacyDriver::spawn(provider, pipeline, |_frame| {});
+
+    let mut results = Vec::new();
+    for _ in 0..2_000 {
+        results = driver.take_catalog_results();
+        if !results.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    let result = results
+        .pop()
+        .expect("the supervisor must run the admitted catalog build");
+    let CatalogBuildResult::Complete(build) = result else {
+        panic!("the well-behaved fixture publishes a catalog, got {result:?}");
+    };
+
+    assert_eq!(build.plugin, well_behaved);
+    assert_eq!(build.instance, 1);
+    // `data/catalog.txt` is the committed resource `on_catalog` reads, so the
+    // labels prove the callback genuinely ran in the child rather than the host
+    // inventing an empty catalog.
+    let labels = build
+        .items
+        .iter()
+        .map(|item| item.label.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        labels,
+        vec![
+            "Well Behaved Alpha".to_owned(),
+            "Well Behaved Beta".to_owned(),
+            "Well Behaved Gamma".to_owned(),
+        ],
+        "the catalog the plugin published must reach the launcher intact",
+    );
+    // A catalog row that carried no action could never be launched, so the
+    // host attaches the one action the legacy contract defines.
+    assert!(
+        build.items.iter().all(|item| item
+            .actions
+            .iter()
+            .any(|action| action.execution_policy == ExecutionPolicy::Plugin)),
+        "every legacy catalog item must carry its plugin-owned default action",
+    );
+
+    drop(driver);
+}
+
+/// The action gap: a legacy row had no working action because the provider
+/// registered no [`PluginActionExecutor`], so selecting one in `crikey run`
+/// reached no plugin at all.
+///
+/// Routing goes through the same [`PluginActionRouter`] the composition root
+/// installs, by item id, exactly as `SearchService` routes a row it did not
+/// produce itself. Removing the driver's `action_executor` registration makes
+/// the submit fail with "no action runtime owns plugin".
+#[test]
+fn a_legacy_items_default_action_executes_in_its_owning_plugin() {
+    require_legacy_interpreter();
+
+    let well_behaved = PluginId("legacy.well-behaved".to_owned());
+    let cache_root = std::env::temp_dir().join("crikey-legacy-action-test-cache");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = LegacyProvider::load(
+        &mut pipeline,
+        &[test_plugins_root()],
+        cache_root,
+        LegacyDeadlines::default(),
+        &DisabledPlugins::default(),
+    );
+    assert!(
+        provider.plugins().contains(&well_behaved),
+        "the well-behaved legacy plugin must load; unavailable: {:?}",
+        provider.unavailable(),
+    );
+
+    let published: Arc<Mutex<Option<ViewModel>>> = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&published);
+    let driver = LegacyDriver::spawn(provider, pipeline, move |frame| {
+        *sink.lock().expect("the publish sink is not poisoned") = Some(frame.clone());
+    });
+
+    let mut router = PluginActionRouter::default();
+    router
+        .register(driver.plugins(), driver.action_executor())
+        .expect("the legacy driver owns its plugin ids exactly once");
+
+    // A row must be on offer before it can be launched: the endpoint validates
+    // against the provider's own snapshot, never against a caller's echo.
+    let generation = Generation::from_raw(1);
+    driver.submit(generation, "report", 17, Vec::new(), false, 0);
+    let mut row = None;
+    for _ in 0..2_000 {
+        if let Some(frame) = published
+            .lock()
+            .expect("the publish sink is not poisoned")
+            .clone()
+        {
+            if let Some(candidate) = frame
+                .rows
+                .iter()
+                .find(|row| row.plugin_name == well_behaved.0)
+                .cloned()
+            {
+                row = Some(candidate);
+                break;
+            }
+        }
+        sleep(Duration::from_millis(5));
+    }
+    let row = row.expect("the legacy plugin must offer a suggestion to launch");
+    let action = row
+        .default_action
+        .clone()
+        .expect("a legacy row must present a default action or Enter does nothing");
+    assert_eq!(action.execution_policy, ExecutionPolicy::Plugin);
+
+    let request_id = router
+        .submit_by_item_id(&row.item, &action.action_id, None)
+        .expect("the exact owner admits its own row's default action");
+    assert_eq!(request_id.plugin, well_behaved);
+
+    let mut completion = None;
+    for _ in 0..2_000 {
+        if let Some(next) = router.poll().pop() {
+            completion = Some(next);
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    let completion = completion.expect("the admitted action must produce a terminal completion");
+
+    assert_eq!(completion.request_id, request_id);
+    assert_eq!(completion.plugin, well_behaved);
+    assert_eq!(completion.item_id, row.item);
+    assert!(
+        completion.outcome.is_ok(),
+        "the fixture's `on_execute` succeeds; got {:?}",
+        completion.outcome,
+    );
+
+    drop(driver);
+}
+
+/// An action is a §13.5 unit of work like any other, and a legacy plugin's
+/// declared budget must bind it. The refusal has to be attributable, or an
+/// operator sees a launch that silently did nothing.
+#[test]
+fn a_legacy_action_refused_by_its_budget_is_reported_as_an_action_refusal() {
+    require_legacy_interpreter();
+
+    let well_behaved = PluginId("legacy.well-behaved".to_owned());
+    let cache_root = std::env::temp_dir().join("crikey-legacy-action-budget-test-cache");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = LegacyProvider::load(
+        &mut pipeline,
+        &[test_plugins_root()],
+        cache_root,
+        LegacyDeadlines::default(),
+        &DisabledPlugins::default(),
+    );
+    assert!(provider.plugins().contains(&well_behaved));
+    let budget = provider
+        .plugin_budget(&well_behaved)
+        .expect("a loaded legacy plugin has a budget")
+        .clone();
+
+    let published: Arc<Mutex<Option<ViewModel>>> = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&published);
+    let driver = LegacyDriver::spawn(provider, pipeline, move |frame| {
+        *sink.lock().expect("the publish sink is not poisoned") = Some(frame.clone());
+    });
+    let mut router = PluginActionRouter::default();
+    router
+        .register(driver.plugins(), driver.action_executor())
+        .expect("the legacy driver owns its plugin ids exactly once");
+
+    driver.submit(Generation::from_raw(1), "report", 17, Vec::new(), false, 0);
+    let mut row = None;
+    for _ in 0..2_000 {
+        if let Some(frame) = published
+            .lock()
+            .expect("the publish sink is not poisoned")
+            .clone()
+        {
+            if let Some(candidate) = frame
+                .rows
+                .iter()
+                .find(|row| row.plugin_name == well_behaved.0)
+                .cloned()
+            {
+                row = Some(candidate);
+                break;
+            }
+        }
+        sleep(Duration::from_millis(5));
+    }
+    let row = row.expect("the legacy plugin must offer a suggestion to launch");
+    let action = row
+        .default_action
+        .clone()
+        .expect("a legacy row has a default action");
+
+    // Occupy the single declared action slot the way a still-running action
+    // would, then attempt a second launch.
+    let held = budget
+        .try_acquire_owned(BudgetKind::Action)
+        .expect("the declared action slot admits the first unit");
+    let error = router
+        .submit_by_item_id(&row.item, &action.action_id, None)
+        .expect_err("a second action must be refused while the only slot is held");
+    assert!(
+        error.to_string().contains("action budget is full"),
+        "the refusal must say why: {error}",
+    );
+    assert_eq!(
+        budget.refusals(BudgetKind::Action),
+        1,
+        "the refusal is counted on the shared handle the pipeline also reads",
+    );
+    drop(held);
 
     drop(driver);
 }

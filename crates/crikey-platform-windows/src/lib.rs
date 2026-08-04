@@ -32,17 +32,22 @@
 
 mod applications;
 mod hotkeys;
+mod icons;
 mod process;
 #[cfg(target_os = "windows")]
 mod win32;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::OnceLock};
 
 pub use applications::{split_arguments, ApplicationSet, Shortcut, StartMenuDiscovery};
 #[cfg(not(target_os = "windows"))]
 use crikey_core::CoreError;
-use crikey_platform::{ApplicationDiscovery, Capability, CapabilityState, HotkeyService, ProcessLauncher};
+use crikey_platform::{
+    ApplicationDiscovery, Capability, CapabilityState, HotkeyService, IconLoader, IconProvider,
+    ProcessLauncher, StandardDirectories,
+};
 pub use hotkeys::{HotkeyCode, HotkeyRegistration, HotkeyRegistrations, WindowsHotkeys};
+pub use icons::ShortcutIconSource;
 pub use process::{quote_arguments, ShellLauncher};
 
 /// The Windows backend and the services it stands behind (spec 18.2, 18.4).
@@ -51,6 +56,9 @@ pub struct WindowsBackend {
     applications: StartMenuDiscovery,
     hotkeys: WindowsHotkeys,
     launcher: ShellLauncher,
+    /// Built on first use and cached: resolving the cache directory reads the
+    /// environment, which a constructor that touches nothing should not do.
+    icons: OnceLock<IconLoader<ShortcutIconSource>>,
 }
 
 impl WindowsBackend {
@@ -69,6 +77,7 @@ impl WindowsBackend {
             applications: StartMenuDiscovery::new(),
             hotkeys: WindowsHotkeys::new(),
             launcher: ShellLauncher::new(),
+            icons: OnceLock::new(),
         }
     }
 
@@ -80,6 +89,7 @@ impl WindowsBackend {
             applications: StartMenuDiscovery::with_roots(roots, packaged),
             hotkeys: WindowsHotkeys::new(),
             launcher: ShellLauncher::new(),
+            icons: OnceLock::new(),
         }
     }
 
@@ -103,12 +113,25 @@ impl WindowsBackend {
                     CapabilityState::Unavailable
                 }
             }
+            // A shortcut whose icon location names a real `.ico` or `.png`
+            // resolves; one naming a PE resource (`shell32.dll,-16801`) or a
+            // packaged application (`shell:AppsFolder\...`) does not, because
+            // neither is a file and neither extractor is implemented. `Partial`
+            // is exactly that, and it stays `Partial` on target rather than
+            // becoming `Available` once a Windows kernel is present: the missing
+            // half is missing code, not a missing platform.
+            Capability::Icons => {
+                if cfg!(target_os = "windows") {
+                    CapabilityState::Partial
+                } else {
+                    CapabilityState::Unavailable
+                }
+            }
             Capability::FileSearch
             | Capability::Clipboard
             | Capability::WindowEnumeration
             | Capability::WindowActivation
             | Capability::Notifications
-            | Capability::Icons
             | Capability::FileWatching
             | Capability::SecretStorage
             | Capability::ShellIntegration => CapabilityState::Unavailable,
@@ -124,6 +147,24 @@ impl WindowsBackend {
     /// [`Capability::UriOpen`].
     pub fn process_launcher(&self) -> &dyn ProcessLauncher {
         &self.launcher
+    }
+
+    /// The provider behind [`Capability::Icons`], built on first use.
+    ///
+    /// Answers per reference rather than per session: a shortcut naming a real
+    /// image file gets pixels, one naming a PE resource or a packaged
+    /// application gets `None`. That split is what
+    /// [`CapabilityState::Partial`] reports.
+    pub fn icon_provider(&self) -> &dyn IconProvider {
+        self.icons.get_or_init(|| {
+            let source = ShortcutIconSource::new();
+            match StandardDirectories::for_process() {
+                Ok(directories) => IconLoader::caching(source, Self::NAME, &directories),
+                // A disposable cache with nowhere to live costs a decode per
+                // lookup, not an icon.
+                Err(_) => IconLoader::new(source),
+            }
+        })
     }
 
     /// The hotkey service behind [`Capability::GlobalHotkeys`].

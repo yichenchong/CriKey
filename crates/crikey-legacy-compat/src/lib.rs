@@ -13,6 +13,7 @@ pub mod events;
 pub mod interpreter;
 pub mod lifecycle;
 pub mod matrix;
+pub mod migration;
 pub mod package;
 pub mod worker;
 
@@ -38,6 +39,9 @@ pub use lifecycle::{
 pub use matrix::{
     CompatibilityMatrix, CompatibilityReport, CorpusEntry, MatrixEntry, MatrixError, PluginClassification,
     PluginCorpus,
+};
+pub use migration::{
+    migrate_keypirinha_package, MigrationError, MigrationLimitation, MigrationReport, MIGRATED_VERSION,
 };
 pub use package::{
     LegacyPackage, PackageError, PackageId, PackageLimits, PackageLoader, PackageModule, PackageRoot,

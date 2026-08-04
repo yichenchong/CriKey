@@ -109,6 +109,12 @@ _KIND_SET_CANCEL = "set_cancel"
 KIND_BACKGROUND_ADMIT = "background_admit"
 KIND_BACKGROUND_REFUSE = "background_refuse"
 KIND_BACKGROUND_CANCEL = "background_cancel"
+#: Host → worker configuration delivery (spec 21.4). Deliberately handled on the
+#: MAIN loop rather than by the control-reader thread: it invokes a plugin
+#: callback, and running plugin code on the reader thread would let a slow
+#: ``on_configuration`` stop this worker from ever seeing the next cancellation.
+#: It carries no ``id`` and gets no reply.
+_KIND_CONFIGURATION = "configuration"
 _KIND_SHUTDOWN = "shutdown"
 
 # Worker → host lifecycle events. These are additive frames under the
@@ -741,6 +747,8 @@ class _Worker:
             self._build_catalog(frame)
         elif kind == "execute":
             self._execute(frame)
+        elif kind == _KIND_CONFIGURATION:
+            self._configuration(frame)
         else:
             # Not a request this protocol version defines. Do not answer (a
             # stray reply would desync); note it for a watching developer.
@@ -757,9 +765,45 @@ class _Worker:
                     "build_catalog",
                     "execute",
                     "background-tasks",
+                    "configuration",
                 ],
             }
         )
+
+    def _configuration(self, frame):
+        """Hands the latest complete configuration state to the plugin (spec 21.4).
+
+        No reply, because the frame carries no ``id``: a stray reply would desync
+        the channel. A plugin that does not implement the hook is not an error —
+        every callback is optional — and a plugin that raises is contained here,
+        reported on stderr, and left running: configuration delivery is not a
+        request whose failure a caller is waiting on.
+
+        A malformed frame is refused rather than partially applied. Delivering
+        half a configuration would be indistinguishable, to the plugin, from the
+        user having deleted the other half.
+        """
+        values = frame.get("values")
+        if not isinstance(values, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in values.items()
+        ):
+            _stderr("[err][crikey] configuration values must be a string map; ignored\n")
+            return
+        callback = getattr(self._plugin, "on_configuration", None)
+        if not callable(callback):
+            return
+        _CAPTURE.reset()
+        try:
+            self.run_lifecycle(lambda: callback(dict(values)))
+        except Exception as error:  # noqa: BLE001 -- a plugin bug is not ours
+            _stderr(
+                "[err][crikey] on_configuration raised: {}\n{}".format(
+                    error, traceback.format_exc()
+                )
+            )
+        finally:
+            for line in _CAPTURE.take():
+                _stderr("{}\n".format(line))
 
     def _run_callback(self, context, result):
         """Runs sync or awaitable callback results on the worker's event loop."""

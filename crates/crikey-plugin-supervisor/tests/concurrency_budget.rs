@@ -740,3 +740,40 @@ fn budgets_are_scoped_to_a_single_plugin() {
 
     drop((held, quiet_guard));
 }
+
+/// A refusal recorded against health must keep the kind it was refused for.
+/// Collapsing all four into one total is what makes the diagnostic useless:
+/// "this plugin was refused nine times" cannot tell an operator whether to
+/// raise `max-catalog-tasks` or `max-suggestion-requests`.
+#[test]
+fn recorded_refusals_stay_attributed_to_their_kind_and_saturate() {
+    let id = plugin("dev.example.attribution");
+    let mut supervisor = ready_supervisor(&id);
+
+    supervisor
+        .record_concurrency_refusal(&id, BudgetKind::Catalog, 2)
+        .expect("a refusal is legal in any state");
+    supervisor
+        .record_concurrency_refusal(&id, BudgetKind::Action, 3)
+        .expect("a refusal is legal in any state");
+
+    let refusals = supervisor.health(&id).concurrency_refusals;
+    assert_eq!(refusals.catalog, 2);
+    assert_eq!(refusals.action, 3);
+    assert_eq!(refusals.suggestion, 0);
+    assert_eq!(refusals.background, 0);
+    assert_eq!(refusals.total(), 5);
+    assert_eq!(refusals.of(BudgetKind::Catalog), 2);
+
+    // A plugin refused for its entire lifetime must not read back as healthy,
+    // so the counter saturates instead of wrapping to zero.
+    supervisor
+        .record_concurrency_refusal(&id, BudgetKind::Catalog, u64::MAX)
+        .expect("a refusal is legal in any state");
+    assert_eq!(supervisor.health(&id).concurrency_refusals.catalog, u64::MAX);
+    assert_eq!(
+        supervisor.health(&id).concurrency_refusals.action,
+        3,
+        "saturating one kind must not disturb another"
+    );
+}

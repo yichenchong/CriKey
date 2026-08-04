@@ -46,9 +46,12 @@ use std::thread;
 
 use crikey_core::{CoreError, PlatformPath, Result};
 use crikey_platform::{
-    ApplicationDiscovery, Capability, CapabilityState, DiscoveredApplication, HotkeyService, ProcessLauncher,
-    WindowService,
+    ApplicationDiscovery, Capability, CapabilityState, DiscoveredApplication, HotkeyService, IconLoader,
+    IconProvider, ProcessLauncher, StandardDirectories, WindowService,
 };
+
+pub mod icons;
+pub use icons::XdgIconSource;
 
 pub mod hotkeys;
 pub mod window;
@@ -357,6 +360,11 @@ pub struct LinuxBackend {
     /// timestamp EWMH asks for. Shared here because it is the one thing the two
     /// X connections have to agree about.
     user_time: Arc<AtomicU32>,
+    /// Built on first use and cached, like the window service: flattening the
+    /// icon theme chain stats every directory of every installed theme, which is
+    /// startup work nothing should pay for before an icon is asked for, and the
+    /// answer does not change for the lifetime of the process.
+    icons: OnceLock<IconLoader<icons::XdgIconSource>>,
 }
 
 impl LinuxBackend {
@@ -399,6 +407,7 @@ impl LinuxBackend {
             window: OnceLock::new(),
             hotkeys: None,
             user_time: Arc::new(AtomicU32::new(0)),
+            icons: OnceLock::new(),
         }
     }
 
@@ -439,11 +448,17 @@ impl LinuxBackend {
                 DesktopEnvironment::Wayland => CapabilityState::UnsupportedDesktopEnvironment,
                 DesktopEnvironment::Headless => CapabilityState::Unavailable,
             },
+            // Themed names and absolute paths resolve, PNG and SVG decode, and
+            // the result is cached -- but `.svgz` and `.xpm` theme assets are
+            // not decoded and scaled (HiDPI) theme directories are skipped, so
+            // there are real icon files on a real system that this finds nothing
+            // usable for. `Partial` is what that is; `Available` would be a
+            // claim the `.xpm`-only icons in `/usr/share/pixmaps` disprove.
+            Capability::Icons => CapabilityState::Partial,
             Capability::FileSearch
             | Capability::Clipboard
             | Capability::UriOpen
             | Capability::Notifications
-            | Capability::Icons
             | Capability::FileWatching
             | Capability::SecretStorage
             | Capability::ShellIntegration => CapabilityState::Unavailable,
@@ -458,6 +473,26 @@ impl LinuxBackend {
     /// The launcher behind [`Capability::ProcessLaunch`].
     pub fn process_launcher(&self) -> &dyn ProcessLauncher {
         &self.processes
+    }
+
+    /// The provider behind [`Capability::Icons`], built on first use.
+    ///
+    /// Always a provider, never an `Option`: a session with no installed themes
+    /// resolves nothing and says so per reference, which is the same answer an
+    /// item whose plugin named no icon gets. There is no session-level gate here
+    /// of the kind window control has, so there is nothing for an `Option` to
+    /// express.
+    pub fn icon_provider(&self) -> &dyn IconProvider {
+        self.icons.get_or_init(|| {
+            let source = icons::XdgIconSource::for_session();
+            match StandardDirectories::for_process() {
+                Ok(directories) => IconLoader::caching(source, Self::NAME, &directories),
+                // No resolvable cache directory means decoding on every lookup,
+                // which is slower and completely correct. Refusing to draw icons
+                // because a *disposable* cache has nowhere to live would not be.
+                Err(_) => IconLoader::new(source),
+            }
+        })
     }
 
     /// The service behind [`Capability::WindowEnumeration`] and

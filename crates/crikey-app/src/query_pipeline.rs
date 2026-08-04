@@ -12,8 +12,8 @@ use crikey_input_scheduler::{
 };
 use crikey_plugin_model::{ConcurrencySection, Manifest, Runtime};
 use crikey_plugin_supervisor::{
-    shared_budget_from_section, BudgetKind, CircuitBreakerConfig, MemorySupervisor, OwnedBudgetGuard,
-    PluginBudgetHandle, PluginHealth, Supervisor,
+    shared_budget_from_section, BudgetKind, CircuitBreakerConfig, ConcurrencyRefusals, MemorySupervisor,
+    OwnedBudgetGuard, PluginBudgetHandle, PluginHealth, Supervisor,
 };
 use crikey_result_aggregator::{
     BatchPriority, BatchState, DrainBudget, DrainReport, InboundBatch, InboundResultQueue, IntakePolicy,
@@ -131,6 +131,13 @@ pub struct PipelineTick {
 struct HealthSync {
     stale_results: u64,
     obsolete_requests: u64,
+    /// Per-kind refusal totals already pushed into the supervisor. The budget
+    /// counters are cumulative and are incremented on whichever thread was
+    /// refused, so reconciliation is by delta against this watermark rather
+    /// than by the pipeline counting its own refusals: an action refused on
+    /// the UI thread or a background task refused inside a Python worker
+    /// would otherwise never reach `PluginHealth`.
+    refusals: ConcurrencyRefusals,
 }
 
 /// Deterministic composition of query scheduling, bounded result intake,
@@ -447,10 +454,11 @@ impl QueryPipeline {
                 }
             }
         });
+        // The refusal itself was already counted on the shared budget by the
+        // failed admission above; `sync_health` is the single writer that
+        // carries it into `PluginHealth`. Retire the request here so the
+        // scheduler is not left holding an in-flight entry nobody will answer.
         for (plugin, generation) in refused {
-            self.supervisor
-                .record_concurrency_refusal(&plugin, 1)
-                .expect("scheduler and supervisor plugin registries stay in lockstep");
             let _ = self.finish_completion(&plugin, generation, now);
         }
         self.capture_cancellations();
@@ -672,8 +680,32 @@ impl QueryPipeline {
         self.dropped_errors
     }
 
-    pub fn health(&self, plugin: &PluginId) -> PluginHealth {
+    /// Current diagnostics for one registered plugin (spec 24.3).
+    ///
+    /// Takes `&mut self` because reading is also a reconciliation point:
+    /// action, catalog and background refusals are raised on threads that
+    /// never touch the supervisor, so the shared budget counters are folded
+    /// in here. Without that, `crikey run` would report zero refusals for
+    /// three of the four §13.5 kinds no matter how hard a plugin was throttled.
+    pub fn health(&mut self, plugin: &PluginId) -> PluginHealth {
+        self.sync_concurrency_refusals(plugin);
         self.supervisor.health(plugin)
+    }
+
+    /// Diagnostics for every registered plugin, in registration order.
+    ///
+    /// The composition root has no independent roster of what a provider
+    /// loaded, so iterating the pipeline's own registry is what lets an
+    /// operator-facing report name a throttled plugin it never asked about.
+    pub fn plugin_health_report(&mut self) -> Vec<(PluginId, PluginHealth)> {
+        let registered = self.registered.clone();
+        registered
+            .into_iter()
+            .map(|plugin| {
+                let health = self.health(&plugin);
+                (plugin, health)
+            })
+            .collect()
     }
 
     pub fn trace(&self) -> &[QueryTraceEvent] {
@@ -868,7 +900,53 @@ impl QueryPipeline {
                     .expect("scheduler and supervisor plugin registries stay in lockstep");
                 synced.obsolete_requests = diagnostics.dropped_obsolete_requests;
             }
+
+            Self::reconcile_refusals(
+                &mut self.supervisor,
+                &mut synced.refusals,
+                self.budgets.get(plugin),
+                plugin,
+            );
         }
+    }
+
+    /// Folds one plugin's live budget refusal counters into its health record.
+    fn sync_concurrency_refusals(&mut self, plugin: &PluginId) {
+        let Some(synced) = self.health_sync.get_mut(plugin) else {
+            return;
+        };
+        Self::reconcile_refusals(
+            &mut self.supervisor,
+            &mut synced.refusals,
+            self.budgets.get(plugin),
+            plugin,
+        );
+    }
+
+    /// Carries the difference between the budget's cumulative refusals and
+    /// what has already been reported into the supervisor, one kind at a time.
+    ///
+    /// Free of `self` so the caller can hold a mutable borrow of the health
+    /// watermark and an immutable borrow of the budget registry at once.
+    fn reconcile_refusals(
+        supervisor: &mut MemorySupervisor,
+        synced: &mut ConcurrencyRefusals,
+        budget: Option<&PluginBudgetHandle>,
+        plugin: &PluginId,
+    ) {
+        let Some(budget) = budget else {
+            return;
+        };
+        let observed = budget.refusals_snapshot();
+        for kind in BudgetKind::ALL {
+            let delta = observed.of(kind).saturating_sub(synced.of(kind));
+            if delta != 0 {
+                supervisor
+                    .record_concurrency_refusal(plugin, kind, delta)
+                    .expect("scheduler and supervisor plugin registries stay in lockstep");
+            }
+        }
+        *synced = observed;
     }
 }
 
@@ -961,6 +1039,16 @@ fn result_row(item: Item) -> ResultRow {
         item: item.stable_id,
         label: item.label,
         description: item.description,
+        // Deliberately unresolved. Rows here come from plugins, and a plugin's
+        // icon reference is not a platform reference: it names a file inside the
+        // plugin's own package, or -- for a native plugin -- a resource the host
+        // has to request over the protocol (`ResourceRequest`/`Kind::Icon`).
+        // Neither resolver exists yet, and resolving a package-relative
+        // reference against the desktop's icon themes would find either nothing
+        // or, worse, an unrelated icon of the same name. Catalog rows, whose
+        // references *are* platform references, get their pixels in
+        // `SearchService::result_rows`.
+        icon: None,
         icon_reference: item.icon_reference,
         category: item.category.as_str().to_owned(),
         plugin_name: item.plugin_id.0,

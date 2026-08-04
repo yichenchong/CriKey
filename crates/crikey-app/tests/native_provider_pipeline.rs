@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use crikey_app::{NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, QueryPipeline};
+use crikey_app::{
+    DisabledPlugins, NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, QueryPipeline,
+};
 use crikey_core::{ActionId, Generation, ItemId, PluginId};
 use crikey_ui::ViewModel;
 
@@ -251,8 +253,12 @@ fn native_suggestions_cross_pipeline_intake_under_current_generation() {
     let healthy = native_plugin("healthy");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider =
-        NativeProvider::load_with_collection_window(&mut pipeline, &[plugins_root], ROW_DELIVERY_WINDOW);
+    let mut provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[plugins_root],
+        ROW_DELIVERY_WINDOW,
+        &DisabledPlugins::default(),
+    );
 
     assert!(
         provider.plugins().contains(&healthy),
@@ -321,8 +327,12 @@ fn native_distinct_source_dirs_use_their_own_workers() {
     let alpha = native_plugin("alpha");
     let beta = native_plugin("beta");
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider =
-        NativeProvider::load_with_collection_window(&mut pipeline, &[plugins_root], ROW_DELIVERY_WINDOW);
+    let mut provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[plugins_root],
+        ROW_DELIVERY_WINDOW,
+        &DisabledPlugins::default(),
+    );
     assert!(
         provider.plugins().contains(&alpha) && provider.plugins().contains(&beta),
         "both native plugins must load; unavailable: {:?}",
@@ -367,8 +377,12 @@ fn native_router_rejects_duplicate_stable_ids_across_plugin_owners() {
     write_native_plugin(&plugins_root, "beta", &conformance, "same-id");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider =
-        NativeProvider::load_with_collection_window(&mut pipeline, &[plugins_root], ROW_DELIVERY_WINDOW);
+    let mut provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[plugins_root],
+        ROW_DELIVERY_WINDOW,
+        &DisabledPlugins::default(),
+    );
     assert_eq!(provider.plugins().len(), 2);
     provider
         .drive_query(&mut pipeline, "duplicate", 17)
@@ -400,8 +414,12 @@ fn native_worker_crash_is_contained_and_a_sibling_keeps_serving() {
     let healthy = native_plugin("healthy");
     let crashy = native_plugin("crashy");
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider =
-        NativeProvider::load_with_collection_window(&mut pipeline, &[plugins_root], ROW_DELIVERY_WINDOW);
+    let mut provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[plugins_root],
+        ROW_DELIVERY_WINDOW,
+        &DisabledPlugins::default(),
+    );
     assert!(
         provider.plugins().contains(&healthy) && provider.plugins().contains(&crashy),
         "both native plugins load before the runtime crash; unavailable: {:?}",
@@ -503,7 +521,7 @@ fn native_unavailable_packages_are_recorded_without_aborting_load() {
 
     let healthy = native_plugin("healthy");
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root]);
+    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root], &DisabledPlugins::default());
     assert!(
         provider.plugins().contains(&healthy),
         "a healthy sibling still loads around unavailable packages; unavailable: {:?}",
@@ -546,8 +564,12 @@ fn native_plugin_is_scheduled_under_its_manifest_query_policy() {
 
     let gated = native_plugin("gated");
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider =
-        NativeProvider::load_with_collection_window(&mut pipeline, &[plugins_root], ROW_DELIVERY_WINDOW);
+    let mut provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[plugins_root],
+        ROW_DELIVERY_WINDOW,
+        &DisabledPlugins::default(),
+    );
     assert!(
         provider.plugins().contains(&gated),
         "the gated native plugin must load; unavailable: {:?}",
@@ -601,7 +623,7 @@ fn native_query_returns_without_waiting_for_a_slow_sibling() {
 
     let slow = native_plugin("slow");
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root]);
+    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root], &DisabledPlugins::default());
     assert_eq!(
         provider.unavailable(),
         &[],
@@ -644,8 +666,12 @@ fn native_manifest_hard_deadline_limits_suggest_call() {
 
     let timeout_plugin = native_plugin("timeout");
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider =
-        NativeProvider::load_with_collection_window(&mut pipeline, &[plugins_root], Duration::from_secs(2));
+    let mut provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[plugins_root],
+        Duration::from_secs(2),
+        &DisabledPlugins::default(),
+    );
     assert!(
         provider.plugins().contains(&timeout_plugin),
         "the timeout plugin must load; unavailable: {:?}",
@@ -679,7 +705,7 @@ fn native_driver_refuses_a_superseded_generation_without_blocking_submit() {
     write_native_plugin(&plugins_root, "slow", &conformance, "ignore-cancel:500");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let provider = NativeProvider::load(&mut pipeline, &[plugins_root]);
+    let provider = NativeProvider::load(&mut pipeline, &[plugins_root], &DisabledPlugins::default());
     assert!(
         provider.plugins().contains(&native_plugin("slow")),
         "the slow native plugin must load; unavailable: {:?}",
@@ -772,7 +798,7 @@ fn native_shutdown_reaps_every_child() {
     ];
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root]);
+    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root], &DisabledPlugins::default());
     provider
         .drive_query(&mut pipeline, "shutdown", 17)
         .expect("the children are alive and serve before shutdown");

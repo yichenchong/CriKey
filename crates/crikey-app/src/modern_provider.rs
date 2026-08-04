@@ -58,14 +58,14 @@ use crikey_plugin_model::{Manifest, Runtime};
 use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
 use crikey_python_host::{
     discover_interpreter, sdk_root, BatchState as WorkerBatchState, CancelHandle, ExecuteOutcome,
-    Interpreter, ModernWorker, RequiresPython, RuntimeProfile, SuggestRequest, WorkerOptions,
+    Interpreter, ModernWorker, RequiresPython, RuntimeCatalog, SuggestRequest, WorkerOptions,
     WORKER_ENTRY_FILE,
 };
 use crikey_ui::{ResultRow, ViewModel};
 
 use crate::{
-    ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError, ObsoleteCatalogBuild,
-    PluginActionCompletion, QueryPipeline, ResultBatch,
+    ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError, DisabledPlugins,
+    ObsoleteCatalogBuild, PluginActionCompletion, QueryPipeline, ResultBatch, DISABLED_BY_CONFIGURATION,
 };
 
 /// Bound on the startup handshake with a child interpreter, in milliseconds.
@@ -400,6 +400,7 @@ impl ModernProvider {
         roots: &[PathBuf],
         index_root: Option<PathBuf>,
         cache_root: PathBuf,
+        disabled: &DisabledPlugins,
     ) -> Self {
         let mut provider = Self {
             pool: ModernWorkerPool::default(),
@@ -447,6 +448,12 @@ impl ModernProvider {
         };
         let store = EnvironmentStore::new(cache_root);
 
+        // Probed once for the whole load: mapping each plugin's requires-python
+        // to an interpreter needs to know which versions exist, and that answer
+        // only comes from running them. Per-plugin probing would multiply
+        // startup spawns by the number of interpreters installed (spec 14.11).
+        let runtimes = RuntimeCatalog::for_process();
+
         for root in roots {
             let entries = match fs::read_dir(root) {
                 Ok(entries) => entries,
@@ -469,8 +476,15 @@ impl ModernProvider {
                 .collect();
             dirs.sort();
 
+            let context = ModernLoadContext {
+                index: &index,
+                store: &store,
+                runtimes: &runtimes,
+                sdk: &sdk,
+                disabled,
+            };
             for dir in dirs {
-                provider.register_plugin_dir(pipeline, &index, &store, &sdk, &dir);
+                provider.register_plugin_dir(pipeline, &context, &dir);
             }
         }
 
@@ -491,18 +505,41 @@ impl ModernProvider {
             }
         }
     }
+}
 
+/// Everything a modern plugin load needs that is the same for every candidate
+/// directory.
+///
+/// Grouped rather than passed one by one: these five are resolved once per
+/// `load` and never vary between packages, so threading them individually made
+/// the per-directory signature grow every time a slice needed one more piece of
+/// shared state, which is what a context type is for.
+#[derive(Clone, Copy)]
+struct ModernLoadContext<'a> {
+    index: &'a PackageIndex,
+    store: &'a EnvironmentStore,
+    runtimes: &'a RuntimeCatalog,
+    sdk: &'a Path,
+    disabled: &'a DisabledPlugins,
+}
+
+impl ModernProvider {
     /// Loads one candidate `<dir>/crikey.toml`, resolves its environment, spawns
     /// (or reuses) its worker and registers it with the pipeline. Any failure is
     /// recorded and the function returns without disturbing other plugins.
     fn register_plugin_dir(
         &mut self,
         pipeline: &mut QueryPipeline,
-        index: &PackageIndex,
-        store: &EnvironmentStore,
-        sdk: &Path,
+        context: &ModernLoadContext<'_>,
         dir: &Path,
     ) {
+        let ModernLoadContext {
+            index,
+            store,
+            runtimes,
+            sdk,
+            disabled,
+        } = *context;
         let package = dir
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -530,6 +567,13 @@ impl ModernProvider {
         }
 
         let plugin = PluginId(format!("modern.{}", manifest.plugin.id));
+        // Held back before an environment is materialised and before a worker is
+        // spawned: an operator who disabled a plugin must not pay for its
+        // process or its dependency closure (spec 21.2).
+        if disabled.blocks(&plugin) {
+            self.record_unavailable(package, Some(plugin), DISABLED_BY_CONFIGURATION.to_owned());
+            return;
+        }
 
         let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
         let entrypoint = match manifest.entrypoint_for(os, arch) {
@@ -547,21 +591,28 @@ impl ModernProvider {
             .unwrap_or_else(|| DEFAULT_REQUIRES_PYTHON.to_owned());
         let dependencies = manifest.python.dependencies.clone();
 
-        // The interpreter is discovered per plugin so its own requires-python
-        // gates it; a version that does not satisfy the constraint is a recorded
-        // failure, never a silent fall-through.
-        let interpreter =
-            match discover_interpreter(&RuntimeProfile::Bundled, &RequiresPython(requires_python.clone())) {
-                Ok(interpreter) => interpreter,
-                Err(error) => {
-                    self.record_unavailable(
-                        package,
-                        Some(plugin),
-                        format!("no supported CPython for the modern worker: {error}"),
-                    );
-                    return;
-                }
-            };
+        // The manifest's requires-python selects the interpreter: the catalog
+        // maps it to a runtime profile, and discovery then applies the same
+        // ordered rules (override first) and re-checks the constraint against
+        // the interpreter it actually started. A requirement nothing on this
+        // host satisfies is a recorded failure naming the requirement and the
+        // versions found — never a silent fall-through to the default
+        // interpreter (spec 14.11).
+        let requires = RequiresPython(requires_python.clone());
+        let interpreter = match runtimes
+            .profile_for(&requires)
+            .and_then(|profile| discover_interpreter(&profile, &requires))
+        {
+            Ok(interpreter) => interpreter,
+            Err(error) => {
+                self.record_unavailable(
+                    package,
+                    Some(plugin),
+                    format!("no supported CPython for the modern worker: {error}"),
+                );
+                return;
+            }
+        };
 
         let lockfile = match resolve(&requires_python, &dependencies, index) {
             Ok(lockfile) => lockfile,
@@ -680,6 +731,55 @@ impl ModernProvider {
     /// Distinct from [`Self::unavailable`], which is load-time only.
     pub fn dispatch_failures(&self) -> &[(PluginId, String)] {
         &self.pool.failures
+    }
+
+    /// Delivers each loaded plugin its own complete configuration state (spec 21.4).
+    ///
+    /// Returns one `(plugin, reason)` per plugin that could not be reached, so a
+    /// dead worker is a named diagnostic rather than a configuration change that
+    /// silently did nothing. Delivery continues past a failure: one broken plugin
+    /// must not stop the others from being configured.
+    ///
+    /// A loaded plugin the state does not mention is sent an EMPTY map rather
+    /// than skipped. Skipping would leave it applying whatever it last received,
+    /// which is exactly the stale-state bug the complete-publication rule exists
+    /// to prevent.
+    pub fn publish_configuration(
+        &mut self,
+        configuration: &crate::PluginConfiguration,
+    ) -> Vec<(PluginId, String)> {
+        let mut failures = Vec::new();
+        let empty = BTreeMap::new();
+        let targets: Vec<(PluginId, WorkerKey)> = self
+            .loaded
+            .iter()
+            .map(|loaded| (loaded.plugin.clone(), loaded.key.clone()))
+            .collect();
+        for (plugin, key) in targets {
+            let values = configuration.get(&plugin).unwrap_or(&empty).clone();
+            let Some(worker) = self.pool.workers.get_mut(&key) else {
+                failures.push((plugin, "modern worker is unavailable".to_owned()));
+                continue;
+            };
+            // Caught rather than propagated for the same reason every other
+            // dispatch seam here catches: a panic inside one plugin's transport
+            // must not take down the supervisor thread publishing to the rest.
+            let outcome = catch_unwind(AssertUnwindSafe(|| worker.send_configuration(&values, true)));
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let reason = format!("configuration delivery failed: {error}");
+                    self.pool.record_dispatch_failure(plugin.clone(), reason.clone());
+                    failures.push((plugin, reason));
+                }
+                Err(_) => {
+                    let reason = "configuration delivery panicked".to_owned();
+                    self.pool.record_dispatch_failure(plugin.clone(), reason.clone());
+                    failures.push((plugin, reason));
+                }
+            }
+        }
+        failures
     }
 
     /// Starts one bounded catalog rebuild for an exactly owned plugin.
@@ -1155,6 +1255,14 @@ struct ModernJob {
 #[derive(Debug)]
 struct ModernRequestSlot {
     job: Option<ModernJob>,
+    /// The latest configuration state to publish, if one is waiting.
+    ///
+    /// Single-slot replace-oldest for the same reason the query slot is: only the
+    /// newest complete state matters, and a queue of superseded states would
+    /// publish intermediate configurations the host already decided to coalesce
+    /// away (spec 21.4). Boxed because the map is much larger than a query job
+    /// and the slot is held under the mailbox lock.
+    configuration: Option<Box<crate::PluginConfiguration>>,
     stop: bool,
 }
 
@@ -1179,6 +1287,8 @@ struct ModernActionRequest {
 enum ModernWork {
     Query(ModernJob),
     Action(Box<ModernActionRequest>),
+    /// Publish this complete configuration state to every loaded plugin.
+    Configuration(Box<crate::PluginConfiguration>),
 }
 
 /// Bounded action endpoint retained by the live modern driver.
@@ -1404,6 +1514,10 @@ pub struct ModernDriver {
     mailbox: Arc<(Mutex<ModernRequestSlot>, Condvar)>,
     action_endpoint: Arc<ModernActionEndpoint>,
     catalog_results: Arc<Mutex<Vec<CatalogBuildResult>>>,
+    /// Per-plugin diagnostics refreshed by the supervisor thread after every
+    /// unit of work, so the UI thread can report a throttled plugin without
+    /// reaching into the pipeline it does not own.
+    health: Arc<Mutex<Vec<(PluginId, crikey_plugin_supervisor::PluginHealth)>>>,
     outcome: Arc<Mutex<Option<ViewModel>>>,
     /// Search generation the UI last submitted. The supervisor re-reads it
     /// before publishing and drops any answer that is no longer current.
@@ -1429,12 +1543,14 @@ impl ModernDriver {
         let mailbox = Arc::new((
             Mutex::new(ModernRequestSlot {
                 job: None,
+                configuration: None,
                 stop: false,
             }),
             Condvar::new(),
         ));
         let outcome = Arc::new(Mutex::new(None));
         let catalog_results = Arc::new(Mutex::new(Vec::new()));
+        let health = Arc::new(Mutex::new(Vec::new()));
         let (action_sender, action_receiver) = mpsc::sync_channel(ACTION_QUEUE_CAPACITY);
         let completion_mailbox = Arc::new(Mutex::new(VecDeque::with_capacity(ACTION_COMPLETION_CAPACITY)));
         let action_endpoint = Arc::new(ModernActionEndpoint {
@@ -1452,6 +1568,7 @@ impl ModernDriver {
 
         let thread_mailbox = Arc::clone(&mailbox);
         let thread_catalog_results = Arc::clone(&catalog_results);
+        let thread_health = Arc::clone(&health);
         let thread_outcome = Arc::clone(&outcome);
         let thread_current = Arc::clone(&current);
         let thread_completion_mailbox = Arc::clone(&completion_mailbox);
@@ -1487,6 +1604,12 @@ impl ModernDriver {
                             }
                             if let Ok(request) = action_receiver.try_recv() {
                                 break ModernWork::Action(Box::new(request));
+                            }
+                            // Ahead of a query: a plugin about to answer should
+                            // answer under the configuration the user just
+                            // applied, not the one it is about to lose.
+                            if let Some(configuration) = slot.configuration.take() {
+                                break ModernWork::Configuration(configuration);
                             }
                             if let Some(job) = slot.job.take() {
                                 break ModernWork::Query(job);
@@ -1542,6 +1665,17 @@ impl ModernDriver {
                                 outcome: result,
                             };
                             enqueue_modern_completion(&thread_completion_mailbox, completion);
+                            *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
+                                pipeline.plugin_health_report();
+                            continue;
+                        }
+                        ModernWork::Configuration(configuration) => {
+                            for (plugin, reason) in provider.publish_configuration(&configuration) {
+                                eprintln!(
+                                    "crikey: modern configuration not delivered to {}: {reason}",
+                                    plugin.0
+                                );
+                            }
                             continue;
                         }
                         ModernWork::Query(job) => job,
@@ -1552,6 +1686,8 @@ impl ModernDriver {
                     // thread — never on the caller's. Stale answers are refused
                     // at the pipeline's intake boundary inside `drive_query`.
                     let modern = provider.drive_query(&mut pipeline, &job.query, job.now);
+                    *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
+                        pipeline.plugin_health_report();
 
                     let mut rows = job.builtin_rows;
                     let mut pending = job.builtin_pending;
@@ -1594,6 +1730,7 @@ impl ModernDriver {
                 mailbox,
                 action_endpoint,
                 catalog_results,
+                health,
                 outcome,
                 current,
                 cancellation,
@@ -1604,6 +1741,7 @@ impl ModernDriver {
                 mailbox,
                 action_endpoint,
                 catalog_results,
+                health,
                 outcome,
                 current,
                 cancellation,
@@ -1666,6 +1804,26 @@ impl ModernDriver {
         cvar.notify_one();
     }
 
+    /// Hands the supervisor thread one complete configuration state to publish
+    /// to every modern plugin (spec 21.4).
+    ///
+    /// Returns at once and never blocks the caller: delivery happens on the
+    /// supervisor thread, which is the only thread allowed to touch a modern
+    /// worker. Replace-oldest, so a caller that publishes twice before the
+    /// supervisor gets a turn delivers only the newer state — the same
+    /// coalescing rule the host applied upstream, enforced again here because the
+    /// two are separated by a thread boundary.
+    pub fn publish_configuration(&self, configuration: crate::PluginConfiguration) {
+        let (lock, cvar) = &*self.mailbox;
+        let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if slot.stop {
+            return;
+        }
+        slot.configuration = Some(Box::new(configuration));
+        drop(slot);
+        cvar.notify_one();
+    }
+
     /// Takes the latest merged frame the supervisor produced, if any, for the
     /// UI thread to fold into its retained view model. Single slot,
     /// replace-oldest: only the newest matters.
@@ -1702,6 +1860,15 @@ impl ModernDriver {
     /// budget handles.
     pub fn action_executor(&self) -> Arc<dyn crate::PluginActionExecutor> {
         self.action_endpoint.clone()
+    }
+
+    /// Per-plugin diagnostics (spec 24.3) as of the supervisor thread's last
+    /// unit of work, including the per-kind §13.5 refusal counters.
+    pub fn health_report(&self) -> Vec<(PluginId, crikey_plugin_supervisor::PluginHealth)> {
+        self.health
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 }
 

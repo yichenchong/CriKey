@@ -1,19 +1,23 @@
-//! Native package commands (spec 23.3, 23.4, 28; contract §5.2).
+//! Native package commands and Keypirinha migration (spec 23.3, 23.4, 28;
+//! contract §5.2).
 //!
 //! Archive creation, inspection and verification stay in
-//! `crikey-package-manager`; this module is only argument validation and the
-//! frozen whitespace-safe report surface.
+//! `crikey-package-manager`, and the Keypirinha translation stays in
+//! `crikey-legacy-compat` beside the archive reader it needs; this module is
+//! only argument validation and the frozen whitespace-safe report surface.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crikey_legacy_compat::{migrate_keypirinha_package, MigrationReport};
 use crikey_package_manager::{build_package, inspect_package, verify_package, NativePackageReport};
+
+use crate::legacy_commands::PrivatePackageCache;
 
 const EX_OK: u8 = 0;
 const EX_INVALID: u8 = 1;
 const EX_USAGE: u8 = 64;
-const EX_UNAVAILABLE: u8 = 69;
 
 /// Runs the subcommand following `crikey package`.
 pub(crate) fn run(args: &[String]) -> ExitCode {
@@ -34,18 +38,14 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
             return refuse(&message);
         }
         print_help(command);
-        return if command == "migrate-keypirinha" {
-            ExitCode::from(EX_UNAVAILABLE)
-        } else {
-            ExitCode::from(EX_OK)
-        };
+        return ExitCode::from(EX_OK);
     }
 
     match command {
         "build" => build(&args[1..]),
         "verify" => verify(&args[1..]),
         "inspect" => inspect(&args[1..]),
-        "migrate-keypirinha" => ExitCode::from(EX_UNAVAILABLE),
+        "migrate-keypirinha" => migrate_keypirinha(&args[1..]),
         other => refuse(&format!("unknown package subcommand `{other}`")),
     }
 }
@@ -70,7 +70,11 @@ fn validate_help_args(command: &str, args: &[String]) -> Result<(), String> {
                     || argument.starts_with("--expect-hash=")
             }
             "inspect" => matches!(argument, "--package") || argument.starts_with("--package="),
-            "migrate-keypirinha" => false,
+            "migrate-keypirinha" => {
+                matches!(argument, "--package" | "--out")
+                    || argument.starts_with("--package=")
+                    || argument.starts_with("--out=")
+            }
             _ => return Err(format!("unknown package subcommand `{command}`")),
         };
         if consumes_value {
@@ -176,6 +180,149 @@ fn inspect(args: &[String]) -> ExitCode {
             ExitCode::from(EX_INVALID)
         }
     }
+}
+
+/// Converts a Keypirinha package into a CriKey package directory (spec 23.3).
+///
+/// The report names every fact the source format does not carry, because the
+/// generated manifest deliberately does not claim any of them: an operator who
+/// publishes a migrated package without reading this list ships a `version` of
+/// `0.0.0+keypirinha-migrated`. The migration is therefore a *success* with a
+/// non-empty `limitation.*` list rather than a warning-free conversion.
+fn migrate_keypirinha(args: &[String]) -> ExitCode {
+    let mut package: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    if let Err(message) = parse_migrate_flags(args, &mut package, &mut output) {
+        return refuse(&message);
+    }
+    let Some(package) = package else {
+        return refuse("`package migrate-keypirinha` needs `--package PATH`");
+    };
+    let Some(output) = output else {
+        return refuse("`package migrate-keypirinha` needs `--out DIR`");
+    };
+
+    // Archive extraction happens under a directory only this process can write,
+    // for the reason `PrivatePackageCache` documents: the loader trusts an
+    // already extracted content-addressed directory, and the migration copies
+    // whatever it finds there into the package it is about to hand back.
+    let cache = match PrivatePackageCache::new("migrate-keypirinha") {
+        Ok(cache) => cache,
+        Err(message) => {
+            print_migration_failed(&package, &output);
+            eprintln!("crikey: {message}");
+            return ExitCode::from(EX_INVALID);
+        }
+    };
+
+    match migrate_keypirinha_package(&package, &output, &cache.path) {
+        Ok(report) => {
+            print_migration(&package, &report);
+            ExitCode::from(EX_OK)
+        }
+        Err(error) => {
+            print_migration_failed(&package, &output);
+            eprintln!(
+                "crikey: cannot migrate Keypirinha package `{}`: {error}",
+                package.display()
+            );
+            ExitCode::from(EX_INVALID)
+        }
+    }
+}
+
+/// A migration that did not happen, naming both paths.
+///
+/// `print_invalid` would report the destination under the `package` key, and a
+/// reader who saw a path they never named as `--package` would go looking for a
+/// package that does not exist.
+fn print_migration_failed(source: &Path, destination: &Path) {
+    field("package", &source.display().to_string());
+    field("destination", &destination.display().to_string());
+    field("verdict", "invalid");
+}
+
+fn parse_migrate_flags(
+    args: &[String],
+    package: &mut Option<PathBuf>,
+    output: &mut Option<PathBuf>,
+) -> Result<(), String> {
+    let mut position = 0;
+    while position < args.len() {
+        let argument = args[position].as_str();
+        if let Some(value) = argument.strip_prefix("--package=") {
+            *package = Some(non_empty(value, "--package")?);
+            position += 1;
+        } else if argument == "--package" {
+            let value = args
+                .get(position + 1)
+                .ok_or_else(|| "`package migrate-keypirinha` needs a path after `--package`".to_owned())?;
+            *package = Some(non_empty(value, "--package")?);
+            position += 2;
+        } else if let Some(value) = argument.strip_prefix("--out=") {
+            *output = Some(non_empty(value, "--out")?);
+            position += 1;
+        } else if argument == "--out" {
+            let value = args
+                .get(position + 1)
+                .ok_or_else(|| "`package migrate-keypirinha` needs a path after `--out`".to_owned())?;
+            *output = Some(non_empty(value, "--out")?);
+            position += 2;
+        } else {
+            return Err(format!(
+                "`package migrate-keypirinha` does not understand `{argument}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A path flag's value, refusing the empty string.
+///
+/// An empty path is the one value that would otherwise reach the filesystem as
+/// the current directory, which is never what a caller who typed `--out=` meant.
+fn non_empty(value: &str, flag: &str) -> Result<PathBuf, String> {
+    if value.is_empty() {
+        return Err(format!(
+            "`package migrate-keypirinha {flag}` was given an empty path"
+        ));
+    }
+    Ok(PathBuf::from(value))
+}
+
+/// The migration report as frozen `key=value` lines.
+///
+/// The limitation lines carry the stable code in the key and the prose in the
+/// value, exactly as the §26.2 diagnostics rendering does, so a script greps a
+/// code it can act on and a human reads the sentence beside it.
+fn print_migration(source: &Path, report: &MigrationReport) {
+    field("package", &source.display().to_string());
+    field("destination", &report.destination.display().to_string());
+    field("plugin", &report.id);
+    field("version", crikey_legacy_compat::MIGRATED_VERSION);
+    field("runtime", "legacy-python");
+    field("scheduling_profile", "legacy-strict");
+    field("entrypoint", &report.entrypoint);
+    field("modules", &report.modules.len().to_string());
+    field("resources", &report.resources.len().to_string());
+    for (index, module) in report.modules.iter().enumerate() {
+        println!("module={index} import={}", encode(module));
+    }
+    for (index, resource) in report.resources.iter().enumerate() {
+        println!(
+            "resource={index} path={}",
+            encode(&resource.display().to_string())
+        );
+    }
+    field("limitations", &report.limitations.len().to_string());
+    for limitation in &report.limitations {
+        println!(
+            "limitation.{}={}",
+            limitation.code(),
+            encode(&limitation.message())
+        );
+    }
+    field("verdict", "migrated");
 }
 
 fn parse_flags(
@@ -371,20 +518,27 @@ fn print_help(command: &str) {
              OPTIONS:\n    --package FILE  Archive to inspect.\n\
                  -h, --help      Print this message without inspecting.\n"
         ),
-        "migrate-keypirinha" => {
-            eprintln!("crikey: `package migrate-keypirinha` is not implemented")
-        }
+        "migrate-keypirinha" => print!(
+            "crikey package migrate-keypirinha\n\n\
+             USAGE:\n    crikey package migrate-keypirinha --package PATH --out DIR\n\n\
+             OPTIONS:\n    --package PATH  Keypirinha package archive or directory.\n\
+                 --out DIR       CriKey package directory to create; must not exist.\n\
+                 -h, --help      Print this message without migrating.\n\n\
+             The generated `crikey.toml` declares only what the Keypirinha format\n\
+             carries. Everything it does not is reported as a `limitation.*` line;\n\
+             run `crikey plugin doctor` afterwards for compatibility findings.\n"
+        ),
         _ => print!("{}", package_help()),
     }
 }
 
 fn package_help() -> &'static str {
-    "crikey package - package native plugins\n\n\
+    "crikey package - package native plugins and migrate Keypirinha packages\n\n\
 USAGE:\n\
     crikey package build --plugin DIR [--out FILE]\n\
     crikey package verify --package FILE [--expect-hash HEX]\n\
     crikey package inspect --package FILE\n\
-    crikey package migrate-keypirinha\n\
+    crikey package migrate-keypirinha --package PATH --out DIR\n\
 \n\
 OPTIONS:\n\
     -h, --help  Print this message\n"

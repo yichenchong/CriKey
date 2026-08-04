@@ -22,6 +22,15 @@ pub enum BudgetKind {
 }
 
 impl BudgetKind {
+    /// Every kind, in slot order. A reconciling host must visit all four or a
+    /// whole category of refusal silently never reaches diagnostics.
+    pub const ALL: [BudgetKind; KIND_COUNT] = [
+        BudgetKind::Suggestion,
+        BudgetKind::Action,
+        BudgetKind::Background,
+        BudgetKind::Catalog,
+    ];
+
     /// Index into the fixed per-kind slot arrays. A dense index keeps the
     /// counters in one cache-friendly array instead of a map lookup on every
     /// admission decision.
@@ -32,6 +41,55 @@ impl BudgetKind {
             BudgetKind::Background => 2,
             BudgetKind::Catalog => 3,
         }
+    }
+}
+
+/// Cumulative refusals broken down by the kind of work that was turned away
+/// (spec 13.5, 24.3).
+///
+/// Collapsing the four kinds into one total would make the diagnostic
+/// unactionable: a refused catalog build means the plugin declared too small a
+/// `max-catalog-tasks` for a rebuild the host asked for, while a refused
+/// suggestion means the user's keystrokes are outrunning the plugin. Those call
+/// for opposite responses, so the breakdown is the value and the total is
+/// derived from it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConcurrencyRefusals {
+    pub suggestion: u64,
+    pub action: u64,
+    pub background: u64,
+    pub catalog: u64,
+}
+
+impl ConcurrencyRefusals {
+    /// Refusals recorded for one kind.
+    pub fn of(&self, kind: BudgetKind) -> u64 {
+        match kind {
+            BudgetKind::Suggestion => self.suggestion,
+            BudgetKind::Action => self.action,
+            BudgetKind::Background => self.background,
+            BudgetKind::Catalog => self.catalog,
+        }
+    }
+
+    /// Adds `delta` refusals of `kind`, saturating rather than wrapping so a
+    /// plugin refused for its whole lifetime never reads back as healthy.
+    pub fn add(&mut self, kind: BudgetKind, delta: u64) {
+        let slot = match kind {
+            BudgetKind::Suggestion => &mut self.suggestion,
+            BudgetKind::Action => &mut self.action,
+            BudgetKind::Background => &mut self.background,
+            BudgetKind::Catalog => &mut self.catalog,
+        };
+        *slot = slot.saturating_add(delta);
+    }
+
+    /// Every refusal this plugin has seen, across all four kinds.
+    pub fn total(&self) -> u64 {
+        self.suggestion
+            .saturating_add(self.action)
+            .saturating_add(self.background)
+            .saturating_add(self.catalog)
     }
 }
 
@@ -164,6 +222,19 @@ impl ConcurrencyBudget {
     /// history is the diagnostic.
     pub fn refusals(&self, kind: BudgetKind) -> u64 {
         self.refusals[kind.index()].load(Ordering::Relaxed)
+    }
+
+    /// Every kind's cumulative refusal count read in one pass.
+    ///
+    /// A host that reconciles these counters into per-plugin health needs all
+    /// four together; reading them one at a time would let a concurrent
+    /// refusal land between two loads and be attributed to the wrong poll.
+    pub fn refusals_snapshot(&self) -> ConcurrencyRefusals {
+        let mut snapshot = ConcurrencyRefusals::default();
+        for kind in BudgetKind::ALL {
+            snapshot.add(kind, self.refusals(kind));
+        }
+        snapshot
     }
 }
 

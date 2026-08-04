@@ -117,13 +117,19 @@ fn required_state(environment: DesktopEnvironment, capability: Capability) -> Ca
             DesktopEnvironment::Wayland => CapabilityState::UnsupportedDesktopEnvironment,
             DesktopEnvironment::Headless => CapabilityState::Unavailable,
         },
+        // Icons: an XDG theme search plus PNG, SVG, ICO and ICNS decoding, and
+        // therefore independent of the session -- a headless unit resolves a
+        // themed name exactly as an X11 one does. `Partial` rather than
+        // `Available` because there really are theme assets this build finds
+        // nothing usable for: `.svgz`, `.xpm`, and the scaled (HiDPI) theme
+        // directories it skips.
+        Capability::Icons => CapabilityState::Partial,
         // Nothing else has a Linux implementation behind it yet, so nothing
         // else may be claimed in any session.
         Capability::FileSearch
         | Capability::Clipboard
         | Capability::UriOpen
         | Capability::Notifications
-        | Capability::Icons
         | Capability::FileWatching
         | Capability::SecretStorage
         | Capability::ShellIntegration => CapabilityState::Unavailable,
@@ -131,11 +137,14 @@ fn required_state(environment: DesktopEnvironment, capability: Capability) -> Ca
 }
 
 /// The capabilities that must never be claimed, whatever the session is.
-const UNBACKED: [Capability; 8] = [
+///
+/// Icons are deliberately absent: they have an implementation behind them, and
+/// it is the one capability here that does not depend on a display server at
+/// all.
+const UNBACKED: [Capability; 7] = [
     Capability::Clipboard,
     Capability::SecretStorage,
     Capability::Notifications,
-    Capability::Icons,
     Capability::FileWatching,
     Capability::FileSearch,
     Capability::UriOpen,

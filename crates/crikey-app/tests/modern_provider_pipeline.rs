@@ -49,7 +49,8 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use crikey_app::{
-    CatalogBuildResult, ModernDriver, ModernProvider, PipelineConfig, PluginActionRouter, QueryPipeline,
+    CatalogBuildResult, DisabledPlugins, ModernDriver, ModernProvider, PipelineConfig, PluginActionRouter,
+    QueryPipeline,
 };
 use crikey_core::{
     Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, Generation, HitPolicy, Item, ItemId,
@@ -267,7 +268,13 @@ fn modern_suggestions_cross_pipeline_intake_under_current_generation() {
     let cache_root = scratch.join("cache");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(index_root),
+        cache_root,
+        &DisabledPlugins::default(),
+    );
 
     // Discovery honours skip-don't-fail: the healthy fixture must have loaded and
     // registered with the pipeline (acceptance 31.9).
@@ -338,7 +345,13 @@ fn modern_worker_crash_is_contained_and_a_sibling_keeps_serving() {
     let cache_root = scratch.join("cache");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(index_root),
+        cache_root,
+        &DisabledPlugins::default(),
+    );
 
     // Both plugins load cleanly — the crash is a *runtime* fault in `suggest`,
     // not a load fault — so both are registered before any query.
@@ -420,7 +433,13 @@ fn modern_supervisor_publishes_off_the_ui_thread() {
     let cache_root = scratch.join("cache");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    let provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(index_root),
+        cache_root,
+        &DisabledPlugins::default(),
+    );
     assert!(
         provider.plugins().contains(&healthy),
         "the healthy modern plugin must load and register; unavailable: {:?}",
@@ -532,7 +551,13 @@ fn distinct_source_dirs_do_not_share_a_worker() {
     let cache_root = scratch.join("cache");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(index_root),
+        cache_root,
+        &DisabledPlugins::default(),
+    );
     assert!(
         provider.plugins().contains(&alpha) && provider.plugins().contains(&beta),
         "both plugins must load; unavailable: {:?}",
@@ -591,7 +616,13 @@ fn a_crashed_worker_records_one_failure_and_stays_unavailable() {
     let cache_root = scratch.join("cache");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(index_root),
+        cache_root,
+        &DisabledPlugins::default(),
+    );
     assert!(
         provider.plugins().contains(&healthy) && provider.plugins().contains(&crashy),
         "both plugins load before the crash; unavailable: {:?}",
@@ -662,7 +693,13 @@ fn modern_plugin_is_scheduled_under_its_manifest_query_policy() {
     let cache_root = scratch.join("cache");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(index_root),
+        cache_root,
+        &DisabledPlugins::default(),
+    );
     assert!(
         provider.plugins().contains(&gated),
         "the plugin must load; unavailable: {:?}",
@@ -714,7 +751,13 @@ fn modern_driver_refuses_a_superseded_generation() {
     let cache_root = scratch.join("cache");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    let provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(index_root),
+        cache_root,
+        &DisabledPlugins::default(),
+    );
     assert!(
         provider.plugins().contains(&healthy),
         "the healthy plugin must load; unavailable: {:?}",
@@ -807,6 +850,7 @@ fn modern_driver_cancels_a_superseded_in_flight_callback() {
         &[plugins_root.clone()],
         Some(index_root),
         cache_root,
+        &DisabledPlugins::default(),
     );
     let plugin = modern_plugin("cancellable");
     assert!(
@@ -890,7 +934,13 @@ fn modern_manifest_hard_deadline_limits_suggest_call() {
     let index_root = scratch.subdir("index");
     let cache_root = scratch.join("cache");
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(index_root),
+        cache_root,
+        &DisabledPlugins::default(),
+    );
     let plugin = modern_plugin("timeout");
     assert!(
         provider.plugins().contains(&plugin),
@@ -933,7 +983,13 @@ fn modern_catalog_build_uses_and_releases_the_catalog_budget() {
     let index_root = scratch.subdir("index");
     let cache_root = scratch.join("cache");
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(index_root),
+        cache_root,
+        &DisabledPlugins::default(),
+    );
     assert!(
         provider.plugins().contains(&catalog_plugin),
         "the catalog plugin must load; unavailable: {:?}",
@@ -999,7 +1055,13 @@ fn modern_action_submission_is_nonblocking_and_budgeted() {
     let index_root = scratch.subdir("index");
     let cache_root = scratch.join("cache");
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(index_root),
+        cache_root,
+        &DisabledPlugins::default(),
+    );
     assert!(
         provider.plugins().contains(&action_plugin),
         "the action plugin must load; unavailable: {:?}",
@@ -1109,7 +1171,13 @@ fn modern_router_rejects_duplicate_stable_ids_across_plugin_owners() {
     let index_root = scratch.subdir("index");
     let cache_root = scratch.join("cache");
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
-    let mut provider = ModernProvider::load(&mut pipeline, &[plugins_root], Some(index_root), cache_root);
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(index_root),
+        cache_root,
+        &DisabledPlugins::default(),
+    );
     assert_eq!(provider.plugins().len(), 2);
     provider
         .drive_query(&mut pipeline, "action", 17)

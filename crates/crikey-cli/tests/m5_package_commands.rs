@@ -528,15 +528,22 @@ fn package_commands_reject_nonexistent_paths_with_diagnostics() {
 // Status distinctions and required arguments
 // ---------------------------------------------------------------------------
 
+/// No `package` subcommand answers `EX_UNAVAILABLE` any more.
+///
+/// That status is reserved for a command that is advertised and unbuilt, and
+/// `migrate-keypirinha` is now built. A script that treats 69 as "not
+/// implemented" must never see it from this family again — its own behaviour is
+/// pinned in `m7_plugin_commands.rs`, which owns the migration report.
 #[test]
-fn package_statuses_distinguish_migration_unknown_subcommands_and_missing_flags() {
+fn package_statuses_distinguish_unknown_subcommands_and_missing_flags() {
     let migrate = run(&["package", "migrate-keypirinha"]);
     assert_no_panic(&migrate);
-    assert_eq!(
+    assert_ne!(
         migrate.code,
         Some(EX_UNAVAILABLE),
-        "migration remains unimplemented{migrate}"
+        "migration is implemented, so it may not report itself unavailable{migrate}"
     );
+    assert_usage(&migrate);
 
     let unknown = run(&["package", "not-a-command"]);
     assert_usage(&unknown);

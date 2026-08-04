@@ -1,26 +1,34 @@
 //! `crikey` command-line entrypoint (spec 28).
 
 mod activation_commands;
+mod config_commands;
 mod dev_commands;
 mod legacy_commands;
 mod modern_commands;
 mod native_commands;
 mod package_commands;
+mod plugin_commands;
 
 use crikey_app::{
-    admitted_plugin_roots, ActionSubmission, App, BatchState, LegacyDriver, LegacyProvider, ModernDriver,
-    ModernProvider, NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, QueryPipeline,
-    ResultBatch, SearchService, StartupJournal, StartupMode, StartupStage,
+    admitted_plugin_roots, ActionSubmission, App, BatchState, DisabledPlugins, LegacyDriver, LegacyProvider,
+    ModernDriver, ModernProvider, NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter,
+    QueryPipeline, ResultBatch, SearchService, StartupJournal, StartupMode, StartupStage,
 };
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
 };
 use crikey_catalog::{CatalogCache, FileCatalogCache};
+use crikey_config::{
+    ConfigSourceWatch, ConfigStore, ConfigurationPublisher, KEY_COALESCE_MS, KEY_MAXIMUM_WAIT_MS,
+    KEY_MAX_RESULTS, KEY_RELOAD_INTERVAL_MS,
+};
 use crikey_core::{Generation, Item, PluginId};
 use crikey_input_scheduler::{
     ActivationPolicy, DebouncePolicy, PluginPolicy, QueuePolicy, SchedulingProfile,
 };
 use crikey_legacy_compat::LegacyDeadlines;
+use crikey_package_manager::LauncherLock;
+use crikey_platform::{PluginKind, StandardDirectories};
 use crikey_ui::{
     LauncherViewModel, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, UiEffect, ViewModel,
 };
@@ -28,7 +36,7 @@ use std::cell::RefCell;
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
 crikey - a fast, keyboard-driven application launcher
@@ -38,7 +46,8 @@ USAGE:
 
 COMMANDS:
     run                             Start the launcher (use `crikey run --help`)
-    plugin                          Plugin management (not available yet)
+    plugin                          Plugin management (use `crikey plugin --help`)
+    config                          Configuration inspection (use `crikey config --help`)
     dev                             Developer commands (use `crikey dev --help`)
     package                         Package commands (use `crikey package --help`)
     version                         Print version information
@@ -149,10 +158,8 @@ fn dispatch(args: &[String]) -> ExitCode {
         }
         Some("dev") => dev(&args[1..]),
         Some("package") => package_commands::run(&args[1..]),
-        Some("plugin") => {
-            eprintln!("crikey: `plugin` is not available yet");
-            ExitCode::from(69) // EX_UNAVAILABLE
-        }
+        Some("plugin") => plugin_commands::run(&args[1..]),
+        Some("config") => config_commands::run(&args[1..]),
         Some(other) => {
             eprintln!("crikey: unknown command `{other}`\n\n{USAGE}");
             ExitCode::from(64) // EX_USAGE
@@ -177,6 +184,45 @@ fn run_launcher(args: &[String]) -> ExitCode {
 }
 
 fn run_native_launcher() -> Result<(), String> {
+    // Both of these come before any window, GPU or provider exists, and that
+    // order is load-bearing. The launcher lock decides whether this process may
+    // run at all, and it must refuse a second launcher on a host with no display
+    // just as firmly as on one with a display; reading the disabled set first
+    // also means a launch that dies in renderer startup has already said what it
+    // made of the operator's configuration.
+    // Exactly one launcher per user, held for the life of the process. `crikey
+    // plugin install` replaces a plugin directory in place (spec 23.4), and an
+    // install racing a live launcher would swap the files out from under a
+    // worker mid-query. The guard is bound to a name because dropping it here
+    // would release the lock immediately and prove nothing.
+    let directories = StandardDirectories::for_process()
+        .map_err(|error| format!("cannot resolve the standard directories: {error}"))?;
+    let _launcher_lock = LauncherLock::acquire(&directories).map_err(|error| error.to_string())?;
+    // The layered configuration (spec 21). Loaded ONCE and retained for the life
+    // of the launch: it decides which plugins may load, it bounds the launcher's
+    // own result ceiling, and it is the state published to every plugin below.
+    // Loading it a second time somewhere else would be two sources of truth
+    // separated by a few milliseconds.
+    //
+    // A configuration that cannot be read is reported and the launch continues on
+    // built-in defaults. Refusing the launch would let an unreadable file cost
+    // the operator their launcher, and silently disabling everything would be
+    // worse still.
+    let mut configuration = match LauncherConfiguration::load(&directories) {
+        Ok(configuration) => Some(configuration),
+        Err(message) => {
+            eprintln!("crikey: {message}; this launch uses built-in defaults only");
+            None
+        }
+    };
+    // Which plugins the operator has switched off (spec 21.2). Read from the
+    // same layered store `crikey plugin disable` writes, and consulted at
+    // discovery rather than after loading: the only proof a disabled plugin did
+    // not run is that no provider ever started a worker for it.
+    let disabled = configuration
+        .as_ref()
+        .map(|configuration| DisabledPlugins::from_ids(configuration.store.disabled_plugins()))
+        .unwrap_or_default();
     let launcher = NativeLauncher::new(NativeLauncherConfig::default()).map_err(|error| error.to_string())?;
     let render_handle = launcher.handle();
     let mut search = SearchService::new(App::new());
@@ -236,7 +282,8 @@ fn run_native_launcher() -> Result<(), String> {
     // SearchService remains the synchronous matcher and ranker. Its actual
     // result items still cross the M2 intake and presentation boundary before
     // its richer ranked/highlighted rows become visible.
-    let mut query_pipeline = QueryPipeline::new(PipelineConfig::default());
+    let pipeline_bounds = pipeline_config(configuration.as_ref());
+    let mut query_pipeline = QueryPipeline::new(pipeline_bounds);
     query_pipeline
         .register_plugin(owner.clone(), application_provider_policy())
         .map_err(|error| {
@@ -300,14 +347,31 @@ fn run_native_launcher() -> Result<(), String> {
     // Every third-party runtime is gated, not just the native one: a safe-mode
     // boot that still spawns a legacy or modern interpreter would defeat 24.2.
     let mut active_plugins = vec![owner.clone()];
-    let mut legacy_pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut legacy_pipeline = QueryPipeline::new(pipeline_bounds);
     let legacy_cache_root = legacy_cache_root()?;
-    let legacy_provider = LegacyProvider::load(
+    let mut legacy_provider = LegacyProvider::load(
         &mut legacy_pipeline,
-        &admitted_plugin_roots(&startup_mode, &legacy_package_roots()),
+        &admitted_plugin_roots(
+            &startup_mode,
+            &discovery_roots(PluginKind::Legacy, legacy_package_roots(), &directories),
+        ),
         legacy_cache_root,
         LegacyDeadlines::default(),
+        &disabled,
     );
+    // A legacy plugin publishes its searchable rows from `on_catalog`, so a
+    // launcher that never asks for one serves nothing from it but live
+    // suggestions (spec 14.8). Admission happens here; the callback itself
+    // runs on the supervisor thread the driver spawns below.
+    // The plugin list is copied out before the loop because
+    // `request_catalog_build` needs `&mut legacy_provider`: iterating the
+    // borrowed slice would hold the provider immutably for the whole loop.
+    let legacy_plugins: Vec<PluginId> = legacy_provider.plugins().to_vec();
+    for plugin in &legacy_plugins {
+        if let Err(error) = legacy_provider.request_catalog_build(plugin, 1, crikey_core::Generation::ZERO) {
+            eprintln!("crikey: legacy catalog request refused for {}: {error}", plugin.0);
+        }
+    }
     for entry in legacy_provider.unavailable() {
         eprintln!(
             "crikey: legacy plugin unavailable ({}): {}",
@@ -341,13 +405,17 @@ fn run_native_launcher() -> Result<(), String> {
     // `crikey run` behaves exactly as before on a host with no modern plugins.
     // A crashing interpreter degrades to a recorded diagnostic and never aborts
     // the process (contract §8), so no load failure here is fatal to the launch.
-    let mut modern_pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut modern_pipeline = QueryPipeline::new(pipeline_bounds);
     let cache_root = modern_cache_root()?;
     let mut modern_provider = ModernProvider::load(
         &mut modern_pipeline,
-        &admitted_plugin_roots(&startup_mode, &modern_plugin_roots()),
+        &admitted_plugin_roots(
+            &startup_mode,
+            &discovery_roots(PluginKind::Modern, modern_plugin_roots(), &directories),
+        ),
         modern_index_root(),
         cache_root,
+        &disabled,
     );
     let modern_plugins = modern_provider.plugins().to_vec();
     for plugin in modern_plugins {
@@ -374,10 +442,14 @@ fn run_native_launcher() -> Result<(), String> {
     // Native plugins use the same asynchronous query boundary as the legacy
     // and modern providers. Discovery is intentionally empty unless the
     // operator names native package roots (spec 16.1, 16.6).
-    let mut native_pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut native_pipeline = QueryPipeline::new(pipeline_bounds);
     let mut native_provider = NativeProvider::load(
         &mut native_pipeline,
-        &admitted_plugin_roots(&startup_mode, &native_plugin_roots()),
+        &admitted_plugin_roots(
+            &startup_mode,
+            &discovery_roots(PluginKind::Native, native_plugin_roots(), &directories),
+        ),
+        &disabled,
     );
     let native_plugins = native_provider.plugins().to_vec();
     for plugin in native_plugins {
@@ -403,9 +475,12 @@ fn run_native_launcher() -> Result<(), String> {
     );
     // Plugin-owned actions use the same exact-owner endpoints and budget
     // handles retained by the provider drivers. Registering this router before
-    // the event loop makes `crikey run` execute selected modern/native actions
-    // instead of falling through to host launch handling.
+    // the event loop makes `crikey run` execute selected legacy/modern/native
+    // actions instead of falling through to host launch handling.
     let mut action_router = PluginActionRouter::default();
+    action_router
+        .register(legacy_driver.plugins(), legacy_driver.action_executor())
+        .map_err(|error| format!("cannot register legacy action runtime: {error}"))?;
     action_router
         .register(modern_driver.plugins(), modern_driver.action_executor())
         .map_err(|error| format!("cannot register modern action runtime: {error}"))?;
@@ -413,6 +488,15 @@ fn run_native_launcher() -> Result<(), String> {
         .register(native_driver.plugins(), native_driver.action_executor())
         .map_err(|error| format!("cannot register native action runtime: {error}"))?;
     search.set_plugin_action_router(Arc::new(action_router));
+    // The first publication (spec 21.4). Flushed rather than coalesced: startup is
+    // not a burst of edits, and a plugin whose `on_configuration` decides where to
+    // look for its data must be told before it serves its first query.
+    if let Some(configuration) = configuration.as_mut() {
+        configuration.seed(Instant::now());
+        if let Some(state) = configuration.publisher.flush() {
+            publish_configuration(&modern_driver, &native_driver, state.plugins().clone());
+        }
+    }
     let query_clock = Instant::now();
 
     let activation_handle = render_handle.clone();
@@ -425,8 +509,25 @@ fn run_native_launcher() -> Result<(), String> {
     // first event the loop actually delivers - see `ready_on_first_event`.
     let mut view_model = LauncherViewModel::new();
     let mut retained = RetainedRows::default();
+    // Per-plugin refusal totals already reported, so a growing counter is
+    // announced once per increase rather than on every turn of the loop.
+    let mut reported_refusals: std::collections::BTreeMap<PluginId, crikey_app::ConcurrencyRefusals> =
+        std::collections::BTreeMap::new();
     let outcome = launcher
         .run(ready_on_first_event(Rc::clone(&ledger), move |event| {
+            // Live configuration (spec 21.4). Checked once per turn of the loop:
+            // the reloader re-stats its files at most every
+            // `launcher.configuration-reload-interval-ms`, and the publisher
+            // hands over a state only once the edits have settled. The honest
+            // bound is that an idle launcher with no events pending notices a
+            // change on its next event — which is before it answers the query
+            // the user is about to type, because the provider drivers take a
+            // configuration publication ahead of a queued query.
+            if let Some(configuration) = configuration.as_mut() {
+                if let Some(state) = configuration.poll(Instant::now()) {
+                    publish_configuration(&modern_driver, &native_driver, state);
+                }
+            }
             // Fold any legacy rows the supervisor produced since the last turn
             for completion in search.poll_action_completions() {
                 let message = match completion.outcome {
@@ -480,6 +581,19 @@ fn run_native_launcher() -> Result<(), String> {
             // Catalog outcomes use the same SearchService instance/owner
             // publication edge as persisted slices. Obsolete and failed
             // results are observable but can never replace live state.
+            for result in legacy_driver.take_catalog_results() {
+                match result {
+                    crikey_app::CatalogBuildResult::Complete(build) => {
+                        if let Err(error) = build.publish(&mut search) {
+                            eprintln!("crikey: legacy catalog publication refused: {error}");
+                        }
+                    }
+                    crikey_app::CatalogBuildResult::Failed { reason, .. } => {
+                        eprintln!("crikey: legacy catalog build failed: {reason}");
+                    }
+                    crikey_app::CatalogBuildResult::Obsolete(_) => {}
+                }
+            }
             for result in modern_driver.take_catalog_results() {
                 match result {
                     crikey_app::CatalogBuildResult::Complete(build) => {
@@ -505,6 +619,17 @@ fn run_native_launcher() -> Result<(), String> {
                     }
                     crikey_app::CatalogBuildResult::Obsolete(_) => {}
                 }
+            }
+            // A plugin at its declared `[concurrency]` limit is throttled, not
+            // broken, and the two are indistinguishable from the outside
+            // (spec 13.5, 24.3). Reporting the per-kind counters as they grow
+            // is what lets an operator raise the right budget.
+            for report in [
+                legacy_driver.health_report(),
+                modern_driver.health_report(),
+                native_driver.health_report(),
+            ] {
+                report_concurrency_refusals(&mut reported_refusals, report);
             }
 
             let (command_session, effect) = match event {
@@ -656,6 +781,49 @@ fn report_status(view_model: &mut LauncherViewModel, message: String) {
     }
 }
 
+/// Announces every §13.5 concurrency refusal that has appeared since the last
+/// turn, naming the kind of work that was turned away.
+///
+/// The per-kind breakdown is the point: refused catalog builds mean the plugin
+/// declared too small a `max-catalog-tasks` for the rebuild the launcher asks
+/// for at startup, while refused suggestions mean the user is typing faster
+/// than the plugin can answer. Reporting only a total would tell an operator
+/// that something is throttled without telling them what to change.
+fn report_concurrency_refusals(
+    reported: &mut std::collections::BTreeMap<PluginId, crikey_app::ConcurrencyRefusals>,
+    health: Vec<(PluginId, crikey_app::PluginHealth)>,
+) {
+    for (plugin, health) in health {
+        let observed = health.concurrency_refusals;
+        let previous = reported.get(&plugin).copied().unwrap_or_default();
+        if observed == previous {
+            continue;
+        }
+        for kind in crikey_app::BudgetKind::ALL {
+            let delta = observed.of(kind).saturating_sub(previous.of(kind));
+            if delta != 0 {
+                eprintln!(
+                    "crikey: plugin `{}` refused {delta} {} unit(s) at its declared concurrency limit",
+                    plugin.0,
+                    refusal_kind_name(kind)
+                );
+            }
+        }
+        reported.insert(plugin, observed);
+    }
+}
+
+/// The manifest spelling of a budget kind, so the diagnostic names the key the
+/// operator would edit.
+fn refusal_kind_name(kind: crikey_app::BudgetKind) -> &'static str {
+    match kind {
+        crikey_app::BudgetKind::Suggestion => "suggestion",
+        crikey_app::BudgetKind::Action => "action",
+        crikey_app::BudgetKind::Background => "background",
+        crikey_app::BudgetKind::Catalog => "catalog",
+    }
+}
+
 /// Reads a platform path-list environment variable as plugin roots.
 ///
 /// Empty components are ignored instead of becoming the current directory,
@@ -676,6 +844,192 @@ fn configured_plugin_roots(variable: &str) -> Vec<std::path::PathBuf> {
     roots
 }
 
+/// The launcher's live view of the layered configuration (spec 21).
+///
+/// Holds the store, the plugin schemas registered against it, a watch over the
+/// files it was read from, and the coalescing publisher. One value rather than
+/// four locals because they must stay consistent: a reload replaces the store AND
+/// the watch AND re-registers the schemas, and any one of those left behind would
+/// publish a state that no configuration on disk describes.
+struct LauncherConfiguration {
+    store: ConfigStore,
+    watch: ConfigSourceWatch,
+    publisher: ConfigurationPublisher,
+    /// How often the files may be re-examined. A poll interval rather than a
+    /// filesystem-notification subscription keeps this platform-independent
+    /// (spec 5.3) and costs a handful of `stat` calls.
+    reload_interval: Duration,
+    /// When the files were last re-examined.
+    checked: Instant,
+}
+
+impl LauncherConfiguration {
+    /// Loads the store, registers every discoverable plugin schema, and builds the
+    /// publisher out of the launcher's own configuration keys.
+    ///
+    /// Schema problems are reported and do not fail the load: a plugin whose
+    /// setting is invalid must not cost the operator their launcher, and the
+    /// store has already rejected the offending value in favour of the declared
+    /// default.
+    fn load(directories: &StandardDirectories) -> Result<Self, String> {
+        let mut store = ConfigStore::load(directories)
+            .map_err(|error| format!("cannot load the configuration: {error}"))?;
+        for problem in config_commands::register_schemas(&mut store, directories) {
+            eprintln!("crikey: {problem}");
+        }
+        let watch = store.source_watch();
+        let publisher = ConfigurationPublisher::new(
+            millis(&store, KEY_COALESCE_MS),
+            millis(&store, KEY_MAXIMUM_WAIT_MS),
+        );
+        Ok(Self {
+            reload_interval: millis(&store, KEY_RELOAD_INTERVAL_MS),
+            store,
+            watch,
+            publisher,
+            checked: Instant::now(),
+        })
+    }
+
+    /// Offers the current state to the publisher, without publishing it.
+    fn seed(&mut self, now: Instant) {
+        self.publisher.observe(self.store.configuration_snapshot(), now);
+    }
+
+    /// Re-reads the configuration when its files changed, and returns a state to
+    /// publish once the edits have settled (spec 21.4).
+    ///
+    /// A reload that fails leaves the previous store in force and says so: the
+    /// state a user is halfway through editing is frequently not valid TOML, and
+    /// discarding a working configuration because it was observed mid-save would
+    /// be a worse outcome than waiting for the next poll.
+    fn poll(&mut self, now: Instant) -> Option<crikey_app::PluginConfiguration> {
+        if now.duration_since(self.checked) >= self.reload_interval {
+            self.checked = now;
+            if self.watch.changed() {
+                match StandardDirectories::for_process()
+                    .map_err(|error| error.to_string())
+                    .and_then(|directories| Self::load(&directories))
+                {
+                    Ok(reloaded) => {
+                        self.store = reloaded.store;
+                        self.watch = reloaded.watch;
+                        self.reload_interval = reloaded.reload_interval;
+                        self.seed(now);
+                    }
+                    Err(message) => {
+                        eprintln!(
+                            "crikey: configuration reload failed ({message}); \
+                             the previous configuration stays in force"
+                        );
+                        // Re-stamp the watch so one unreadable save is reported
+                        // once rather than on every poll until it is fixed.
+                        self.watch = self.store.source_watch();
+                    }
+                }
+            }
+        }
+        let coalesced = self.publisher.coalesced();
+        let state = self.publisher.poll(now)?;
+        if coalesced > 0 {
+            eprintln!("crikey: configuration reloaded; {coalesced} intermediate edit(s) coalesced");
+        }
+        Some(state.plugins().clone())
+    }
+}
+
+/// A duration from a millisecond-valued configuration key.
+///
+/// An unparseable value falls back to the built-in default rather than failing the
+/// launch, and says so: a timing hint is not worth refusing to start over.
+fn millis(store: &ConfigStore, key: &str) -> Duration {
+    let built_in = crikey_config::BUILT_IN_DEFAULTS
+        .iter()
+        .find(|(name, _)| *name == key)
+        .and_then(|(_, value)| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    match store.get(key) {
+        None => Duration::from_millis(built_in),
+        Some(text) => match text.parse::<u64>() {
+            Ok(value) => Duration::from_millis(value),
+            Err(_) => {
+                eprintln!("crikey: `{key}` is not a whole number of milliseconds; using {built_in}");
+                Duration::from_millis(built_in)
+            }
+        },
+    }
+}
+
+/// The pipeline bounds this launch runs under, with `launcher.max-results`
+/// applied (spec 21.2).
+///
+/// The one launcher-wide setting that observably changes a running launcher:
+/// it caps the results one query may produce across all plugins, so lowering it
+/// in `config.toml` is visible in the next query's row count. The aggregator's
+/// own default stands when the key is absent, which is why this crate does not
+/// carry a second copy of that number.
+fn pipeline_config(configuration: Option<&LauncherConfiguration>) -> PipelineConfig {
+    let mut config = PipelineConfig::default();
+    let Some(text) = configuration.and_then(|configuration| configuration.store.get(KEY_MAX_RESULTS)) else {
+        return config;
+    };
+    match text.parse::<usize>() {
+        Ok(0) | Err(_) => {
+            eprintln!(
+                "crikey: `{KEY_MAX_RESULTS}` must be a positive whole number; \
+                 using the built-in ceiling of {}",
+                config.limits.max_items_per_query
+            );
+        }
+        Ok(limit) => {
+            config.limits.max_items_per_query = limit;
+            // The intake queue's item capacity is derived from the same ceiling in
+            // `PipelineConfig::default`; leaving it behind would let the queue
+            // accept more than the aggregator will ever merge.
+            config.intake_limits.capacity_items = limit;
+        }
+    }
+    config
+}
+
+/// Hands one complete configuration state to every provider that can carry it.
+///
+/// Modern and native only. The Legacy Compatibility Layer keeps Keypirinha
+/// configuration syntax and its own notification contract (spec 21.1 last line,
+/// spec 14); routing a legacy plugin's settings through this store would change
+/// the format its own configuration path already reads.
+fn publish_configuration(
+    modern: &ModernDriver,
+    native: &NativeDriver,
+    state: crikey_app::PluginConfiguration,
+) {
+    modern.publish_configuration(state.clone());
+    native.publish_configuration(state);
+}
+
+/// Every root a provider scans for `kind`: the operator's `CRIKEY_*_ROOTS`
+/// first, then the standard directory `crikey plugin install` writes to.
+///
+/// Both, in that order, and this is the seam that makes `crikey plugin install`
+/// mean anything: an installed plugin lives under
+/// [`StandardDirectories::plugin_dir`] and would never be discovered if the
+/// launcher only scanned the environment variables. The environment keeps
+/// precedence so a developer pointing the launcher at a working tree still
+/// shadows their installed copy, and duplicates are removed so one path named
+/// twice is not a spurious duplicate-plugin diagnostic.
+pub(crate) fn discovery_roots(
+    kind: PluginKind,
+    configured: Vec<std::path::PathBuf>,
+    directories: &StandardDirectories,
+) -> Vec<std::path::PathBuf> {
+    let mut roots = configured;
+    let installed = directories.plugin_dir(kind);
+    if !roots.iter().any(|root| root == &installed) {
+        roots.push(installed);
+    }
+    roots
+}
+
 /// Directories scanned for legacy packages on the live path (spec 14.3).
 ///
 /// Read from `CRIKEY_LEGACY_PACKAGE_ROOTS` using the platform path-list syntax,
@@ -683,7 +1037,7 @@ fn configured_plugin_roots(variable: &str) -> Vec<std::path::PathBuf> {
 /// Resolving roots from the settings file (spec 14.7) is left to a later
 /// milestone; an unset variable means no legacy roots, which loads nothing
 /// rather than failing.
-fn legacy_package_roots() -> Vec<std::path::PathBuf> {
+pub(crate) fn legacy_package_roots() -> Vec<std::path::PathBuf> {
     configured_plugin_roots("CRIKEY_LEGACY_PACKAGE_ROOTS")
 }
 
@@ -694,7 +1048,7 @@ fn legacy_package_roots() -> Vec<std::path::PathBuf> {
 /// plugin subdirectories (contract §11). An unset variable means no modern
 /// roots, which loads nothing rather than failing — `crikey run` is unchanged
 /// on a host with none.
-fn modern_plugin_roots() -> Vec<std::path::PathBuf> {
+pub(crate) fn modern_plugin_roots() -> Vec<std::path::PathBuf> {
     configured_plugin_roots("CRIKEY_MODERN_PLUGIN_ROOTS")
 }
 
@@ -703,7 +1057,7 @@ fn modern_plugin_roots() -> Vec<std::path::PathBuf> {
 /// The native provider performs manifest and platform/architecture filtering;
 /// this helper only applies the platform path-list syntax and keeps an unset
 /// variable equivalent to an empty discovery set.
-fn native_plugin_roots() -> Vec<std::path::PathBuf> {
+pub(crate) fn native_plugin_roots() -> Vec<std::path::PathBuf> {
     configured_plugin_roots("CRIKEY_NATIVE_PLUGIN_ROOTS")
 }
 
@@ -913,7 +1267,7 @@ fn modern_cache_root() -> Result<std::path::PathBuf, String> {
 /// shared temporary directory would let another local process plant plugin
 /// files before the child interpreter imports them. The default is per-user
 /// and restricted to this account, just like the modern environment cache.
-fn legacy_cache_root() -> Result<std::path::PathBuf, String> {
+pub(crate) fn legacy_cache_root() -> Result<std::path::PathBuf, String> {
     if let Some(value) = std::env::var_os("CRIKEY_LEGACY_CACHE_ROOT").filter(|value| !value.is_empty()) {
         let path = std::path::PathBuf::from(value);
         create_private_dir(&path)?;
@@ -1829,6 +2183,7 @@ mod tests {
             label: label.to_owned(),
             description: String::new(),
             icon_reference: None,
+            icon: None,
             category: String::new(),
             plugin_name: plugin.to_owned(),
             highlights: Vec::new(),
