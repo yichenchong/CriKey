@@ -10,9 +10,10 @@ on other platforms rather than emulated.
 
 ## Status
 
-Milestones M0 through M5 are complete, and M6 is implemented but not fully
-verified. [docs/ROADMAP.md](docs/ROADMAP.md) is the authoritative, measured
-status; this is the summary.
+Milestones M0 through M6.5 are implemented. M7 is active for completing
+capabilities that are currently declaration-only or unavailable, and M8 is
+planned for native Windows/macOS runtime verification. [docs/ROADMAP.md](docs/ROADMAP.md)
+is the authoritative, measured status.
 
 - **M0, M1 — core launcher.** Query engine, catalog with a persistent on-disk
   cache, ranking, result aggregation, native launcher runtime, Linux

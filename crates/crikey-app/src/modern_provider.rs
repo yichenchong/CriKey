@@ -1252,18 +1252,28 @@ struct ModernJob {
 /// overflow. A newer query overwrites an un-started one, so a slow modern plugin
 /// never delays a fast keystroke (acceptance 31.8) and the channel is bounded by
 /// construction.
-#[derive(Debug)]
 struct ModernRequestSlot {
     job: Option<ModernJob>,
     /// The latest configuration state to publish, if one is waiting.
     ///
-    /// Single-slot replace-oldest for the same reason the query slot is: only the
-    /// newest complete state matters, and a queue of superseded states would
-    /// publish intermediate configurations the host already decided to coalesce
-    /// away (spec 21.4). Boxed because the map is much larger than a query job
-    /// and the slot is held under the mailbox lock.
+    /// Single-slot replace-oldest for the same reason the query slot is: only
+    /// the newest complete state matters.
     configuration: Option<Box<crate::PluginConfiguration>>,
     stop: bool,
+}
+
+impl std::fmt::Debug for ModernRequestSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModernRequestSlot")
+            .field("job", &self.job)
+            .field(
+                "configuration",
+                &self.configuration.as_ref().map(|_| "<redacted>"),
+            )
+            .field("stop", &self.stop)
+            .finish()
+    }
 }
 
 const ACTION_QUEUE_CAPACITY: usize = 8;
@@ -1865,13 +1875,25 @@ impl ModernDriver {
     /// Per-plugin diagnostics (spec 24.3) as of the supervisor thread's last
     /// unit of work, including the per-kind §13.5 refusal counters.
     pub fn health_report(&self) -> Vec<(PluginId, crikey_plugin_supervisor::PluginHealth)> {
-        self.health
+        let mut report = self
+            .health
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .clone()
+            .clone();
+        for (plugin, budget) in &self.action_endpoint.budgets {
+            if let Some((_, health)) = report.iter_mut().find(|(id, _)| id == plugin) {
+                health.concurrency_refusals = budget.refusals_snapshot();
+            } else {
+                let health = crikey_plugin_supervisor::PluginHealth {
+                    concurrency_refusals: budget.refusals_snapshot(),
+                    ..crikey_plugin_supervisor::PluginHealth::default()
+                };
+                report.push((plugin.clone(), health));
+            }
+        }
+        report
     }
 }
-
 impl Drop for ModernDriver {
     fn drop(&mut self) {
         // Cancel any callback before signalling shutdown, so a cooperative

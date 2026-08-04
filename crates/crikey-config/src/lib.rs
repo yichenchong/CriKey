@@ -87,11 +87,28 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     /// A file exists and is not valid TOML (spec 21.1).
-    #[error("cannot parse {path}: {source}")]
+    ///
+    /// Deliberately does NOT carry the `toml::de::Error`: both its `Display` and
+    /// its `Debug` reproduce the offending SOURCE LINE. Configuration is parsed
+    /// before any plugin schema registers, so nothing yet knows that `api-key`
+    /// is secret, and a malformed `api-key = hunter2` would reach stderr with the
+    /// token intact — around [`ConfigStore::display_value`] entirely (spec 21.3).
+    /// The path plus a location and the parser's reason are enough to find the
+    /// line, and none of the three can contain a value.
+    #[error("cannot parse {path}{location}: {reason}")]
     Parse {
         path: PathBuf,
-        #[source]
-        source: toml::de::Error,
+        /// ` at line L column C`, or empty when the parser reported no span.
+        location: String,
+        /// The parser's own explanation. It names syntax and keys, never values.
+        reason: String,
+    },
+    /// The selected profile name would escape the profiles directory.
+    #[error("invalid profile `{name}` in {path}: {reason}")]
+    Profile {
+        path: PathBuf,
+        name: String,
+        reason: &'static str,
     },
     /// A value has no textual spelling, such as an array. Named by key so the
     /// user can find the line rather than being told the file is bad.
@@ -125,4 +142,39 @@ pub enum ConfigError {
         #[source]
         source: toml::ser::Error,
     },
+}
+
+impl ConfigError {
+    /// Builds [`ConfigError::Parse`] from a TOML failure without retaining the
+    /// parser's error value.
+    ///
+    /// `text` is consulted only to turn the reported byte span into a line and
+    /// column; not one byte of it is copied into the message. This is the single
+    /// place a `toml::de::Error` is allowed to be observed, so the rule that no
+    /// diagnostic may echo unparsed configuration source cannot be honoured here
+    /// and forgotten at another call site (spec 21.3).
+    pub(crate) fn parse(path: &std::path::Path, text: &str, error: &toml::de::Error) -> Self {
+        let location = match error.span() {
+            Some(span) => {
+                // `span.start` may land on a UTF-8 boundary inside the document;
+                // clamping keeps the slice legal for a truncated or odd span.
+                let mut start = span.start.min(text.len());
+                while start > 0 && !text.is_char_boundary(start) {
+                    start -= 1;
+                }
+                let consumed = &text[..start];
+                let line = consumed.matches('\n').count() + 1;
+                let column = consumed.rsplit('\n').next().unwrap_or_default().chars().count() + 1;
+                format!(" at line {line} column {column}")
+            }
+            None => String::new(),
+        };
+        Self::Parse {
+            path: path.to_path_buf(),
+            location,
+            // `message()` is the reason alone; `Display` would append the
+            // annotated source line, which is exactly what must not escape.
+            reason: error.message().replace('\n', "; "),
+        }
+    }
 }

@@ -28,6 +28,12 @@
 use std::path::Path;
 
 use super::{check_dimensions, IconError, IconImage, MAX_ICON_EDGE, MAX_ICON_PIXELS};
+/// Limits applied to the parsed SVG tree before resvg can allocate its
+/// intermediate layers. The encoded payload limit is not sufficient: filters
+/// and isolated groups can each allocate an off-screen pixmap.
+const MAX_SVG_NODES: usize = 100_000;
+const MAX_SVG_DEPTH: usize = 128;
+const MAX_SVG_OFFSCREEN_PIXELS: u64 = MAX_ICON_PIXELS * 32;
 
 /// The formats this build decodes.
 ///
@@ -219,18 +225,15 @@ fn expand(pixels: &[u8], channels: usize, mut widen: impl FnMut(&[u8], &mut [u8;
 /// A vector source is the one case where the requested size can be honoured
 /// exactly, so it is: the icon is rendered at the size the row will draw it,
 /// which is sharper than scaling a 16x16 raster up and cheaper than scaling a
-/// 512x512 one down on every frame.
-///
-/// `resvg` is built without its text features, so a `<text>` element is not
-/// rendered. That is a deliberate trade recorded in the workspace manifest: icon
-/// artwork is paths, and the font stack the feature pulls in is larger than
-/// everything else here put together.
+/// 512x512 one down on every frame. Parsing and rendering are bounded before
+/// any pixmap is allocated.
 fn decode_svg(reference: &str, bytes: &[u8], size: u32) -> Result<IconImage, IconError> {
     let options = resvg::usvg::Options::default();
     let tree = resvg::usvg::Tree::from_data(bytes, &options).map_err(|error| IconError::Malformed {
         reference: reference.to_owned(),
         detail: error.to_string(),
     })?;
+    preflight_svg(reference, tree.root())?;
 
     let intrinsic = tree.size();
     let longest = intrinsic.width().max(intrinsic.height());
@@ -272,6 +275,45 @@ fn decode_svg(reference: &str, bytes: &[u8], size: u32) -> Result<IconImage, Ico
         ]);
     }
     IconImage::new(reference, width, height, rgba)
+}
+
+fn preflight_svg(reference: &str, root: &resvg::usvg::Group) -> Result<(), IconError> {
+    fn walk(group: &resvg::usvg::Group, depth: usize, nodes: &mut usize, offscreen: &mut u64) -> bool {
+        if depth > MAX_SVG_DEPTH {
+            return false;
+        }
+        for node in group.children() {
+            *nodes = nodes.saturating_add(1);
+            if *nodes > MAX_SVG_NODES {
+                return false;
+            }
+            if let resvg::usvg::Node::Group(child) = node {
+                if child.should_isolate() {
+                    let bounds = child.abs_layer_bounding_box();
+                    let area = (bounds.width().max(0.0) as f64 * bounds.height().max(0.0) as f64) as u64;
+                    *offscreen = offscreen.saturating_add(area);
+                    if *offscreen > MAX_SVG_OFFSCREEN_PIXELS {
+                        return false;
+                    }
+                }
+                if !walk(child, depth + 1, nodes, offscreen) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    let mut nodes = 0;
+    let mut offscreen = 0;
+    if walk(root, 0, &mut nodes, &mut offscreen) {
+        Ok(())
+    } else {
+        Err(IconError::Malformed {
+            reference: reference.to_owned(),
+            detail: "SVG tree exceeds bounded node, depth, or off-screen area budget".to_owned(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

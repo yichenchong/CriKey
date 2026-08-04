@@ -118,10 +118,9 @@ impl ConfigurationPublisher {
 
     /// The state to publish immediately, bypassing both bounds.
     ///
-    /// The "unless explicitly requested" of spec 21.4, and the apply step of an
-    /// explicit save (spec 18.8): a user who pressed Save has already told the
-    /// host the edit is finished, so making them wait out a quiet time built for
-    /// keystrokes would be a delay with nothing to gain.
+    /// The launcher uses this for the initial seed, before its event loop starts
+    /// polling. A future explicit-save surface may use the same operation; no
+    /// separate save command currently signals a running launcher.
     pub fn flush(&mut self) -> Option<ConfigurationSnapshot> {
         self.due?;
         self.take()

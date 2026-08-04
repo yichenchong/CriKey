@@ -416,8 +416,13 @@ macro_rules! field_is_repeated {
 }
 
 macro_rules! impl_simple {
-    ($type:ident { $( $field_name:ident : $fty:ty = $default:expr ),* $(,)? } repeated $repeated:tt encode($this:ident, $out:ident) { $( $enc:tt )* } decode($value:ident, $field:ident, $budget:ident) { $( $number:literal => $body:expr, )* }) => {
-        #[derive(Debug, Clone, PartialEq, Eq)]
+    (no_debug; $($rest:tt)*) => { impl_simple_impl!(; $($rest)*); };
+    ($($rest:tt)*) => { impl_simple_impl!(Debug; $($rest)*); };
+}
+
+macro_rules! impl_simple_impl {
+    ($($debug:ident)?; $type:ident { $( $field_name:ident : $fty:ty = $default:expr ),* $(,)? } repeated $repeated:tt encode($this:ident, $out:ident) { $( $enc:tt )* } decode($value:ident, $field:ident, $budget:ident) { $( $number:literal => $body:expr, )* }) => {
+        #[derive($($debug,)? Clone, PartialEq, Eq)]
         pub struct $type { $( pub $field_name: $fty, )* pub unknown: UnknownFields }
         impl Message for $type {
             fn encode(&self) -> Vec<u8> {
@@ -705,7 +710,7 @@ impl_simple!(ExecuteResult {
     2 => value.error = Some(nested(field, budget)?),
 });
 
-impl_simple!(ConfigurationChange {
+impl_simple!(no_debug; ConfigurationChange {
     values: BTreeMap<String, String> = BTreeMap::new(),
     complete: bool = false
 } repeated [1] encode(this, out) {
@@ -722,6 +727,17 @@ impl_simple!(ConfigurationChange {
     },
     2 => value.complete = decode_field_varint(field)? != 0,
 });
+
+impl std::fmt::Debug for ConfigurationChange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigurationChange")
+            .field("values", &format_args!("<{} redacted values>", self.values.len()))
+            .field("complete", &self.complete)
+            .field("unknown", &self.unknown)
+            .finish()
+    }
+}
 
 impl_simple!(Event {
     kind: EventKind = EventKind::KindUnspecified,

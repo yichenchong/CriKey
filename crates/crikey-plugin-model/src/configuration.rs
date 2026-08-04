@@ -163,7 +163,7 @@ impl ConfigurationKind {
 }
 
 /// One declared setting (spec 21.3).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ConfigurationField {
     /// The field's name, which becomes the last segment of its configuration
@@ -213,6 +213,36 @@ pub struct ConfigurationField {
     /// The complete set of acceptable values. Empty means unrestricted.
     #[serde(default)]
     pub allowed: Vec<String>,
+}
+
+/// Redacts the declared `default` and `allowed` set of a secret field.
+///
+/// Hand-written rather than derived because `default` IS a value of the field
+/// and every `allowed` entry is a valid one. `ConfigurationSection`,
+/// `crikey_config::DiscoveredSchema` and [`crate::Manifest`] all derive `Debug`
+/// and none of them can know which of their fields are secret, so the check has
+/// to live on the only type that does (spec 21.3).
+impl std::fmt::Debug for ConfigurationField {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = formatter.debug_struct("ConfigurationField");
+        out.field("name", &self.name).field("kind", &self.kind);
+        if self.secret {
+            out.field("default", &self.default.as_ref().map(|_| REDACTED));
+            out.field("allowed", &format!("<{} redacted values>", self.allowed.len()));
+        } else {
+            out.field("default", &self.default);
+            out.field("allowed", &self.allowed);
+        }
+        out.field("description", &self.description)
+            .field("secret", &self.secret)
+            .field("requires_restart", &self.requires_restart)
+            .field("platforms", &self.platforms)
+            .field("required", &self.required)
+            .field("minimum", &self.minimum)
+            .field("maximum", &self.maximum)
+            .field("max_length", &self.max_length)
+            .finish()
+    }
 }
 
 /// Rule identifier: the value does not parse as the declared type.
@@ -290,7 +320,7 @@ impl ConfigurationField {
                     rule: RULE_TYPE,
                     detail: format!("{quoted} is not an integer"),
                 })?;
-                Some(integer_as_float(parsed))
+                Some(Numeric::Integer(parsed))
             }
             ConfigurationKind::Float => {
                 let parsed: f64 = value.trim().parse().map_err(|_| FieldViolation {
@@ -305,7 +335,7 @@ impl ConfigurationField {
                         detail: format!("{quoted} is not a finite number"),
                     });
                 }
-                Some(parsed)
+                Some(Numeric::Float(parsed))
             }
             ConfigurationKind::Boolean => {
                 if value.trim() != "true" && value.trim() != "false" {
@@ -320,7 +350,7 @@ impl ConfigurationField {
         };
 
         if let (Some(number), Some(minimum)) = (numeric, self.minimum) {
-            if number < integer_as_float(minimum) {
+            if number.is_below(minimum) {
                 return Err(FieldViolation {
                     field: self.name.clone(),
                     rule: RULE_MINIMUM,
@@ -329,7 +359,7 @@ impl ConfigurationField {
             }
         }
         if let (Some(number), Some(maximum)) = (numeric, self.maximum) {
-            if number > integer_as_float(maximum) {
+            if number.is_above(maximum) {
                 return Err(FieldViolation {
                     field: self.name.clone(),
                     rule: RULE_MAXIMUM,
@@ -349,13 +379,19 @@ impl ConfigurationField {
             }
         }
         if !self.allowed.is_empty() && !self.allowed.iter().any(|candidate| candidate == value) {
+            // Every allowed entry is itself a valid value of this field, so
+            // listing them would hand out the secret set that redacting the
+            // submitted value just protected (spec 21.3). The COUNT is safe to
+            // state; the values are not.
+            let choices = if self.secret {
+                format!("one of the {} declared values", self.allowed.len())
+            } else {
+                format!("one of the declared values: {}", self.allowed.join(", "))
+            };
             return Err(FieldViolation {
                 field: self.name.clone(),
                 rule: RULE_ALLOWED,
-                detail: format!(
-                    "{quoted} is not one of the declared values: {}",
-                    self.allowed.join(", ")
-                ),
+                detail: format!("{quoted} is not {choices}"),
             });
         }
         Ok(())
@@ -370,6 +406,36 @@ impl ConfigurationField {
             REDACTED.to_owned()
         } else {
             format!("`{value}`")
+        }
+    }
+}
+
+/// A parsed numeric value, kept in the width it was declared in.
+///
+/// An `integer` field's value and its `minimum`/`maximum` are all `i64`, so the
+/// comparison stays in `i64`. Widening it to `f64` first would collapse adjacent
+/// integers above 2^53 onto one float and let a value exactly one below the
+/// declared minimum pass. Only a `float` field's value needs its declared bound
+/// widened, and every bound an author can plausibly write for one is exactly
+/// representable.
+#[derive(Debug, Clone, Copy)]
+enum Numeric {
+    Integer(i64),
+    Float(f64),
+}
+
+impl Numeric {
+    fn is_below(self, minimum: i64) -> bool {
+        match self {
+            Self::Integer(value) => value < minimum,
+            Self::Float(value) => value < integer_as_float(minimum),
+        }
+    }
+
+    fn is_above(self, maximum: i64) -> bool {
+        match self {
+            Self::Integer(value) => value > maximum,
+            Self::Float(value) => value > integer_as_float(maximum),
         }
     }
 }
@@ -475,6 +541,40 @@ mod tests {
         declared.validate("200").expect("the bound is inclusive");
     }
 
+    /// The two integers either side of 2^53 collapse onto one `f64`, so a bound
+    /// compared after widening cannot separate them. Both directions are checked
+    /// because a maximum misclassifies in the opposite sense to a minimum.
+    #[test]
+    fn adjacent_integer_bounds_above_two_to_the_fifty_third_still_separate() {
+        const TWO_POW_53: i64 = 9_007_199_254_740_992;
+
+        let mut declared = field("offset", ConfigurationKind::Integer);
+        declared.minimum = Some(TWO_POW_53 + 1);
+        assert_eq!(
+            declared
+                .validate(&TWO_POW_53.to_string())
+                .expect_err("2^53 is one below the declared minimum")
+                .rule,
+            RULE_MINIMUM
+        );
+        declared
+            .validate(&(TWO_POW_53 + 1).to_string())
+            .expect("the bound is inclusive");
+
+        let mut declared = field("offset", ConfigurationKind::Integer);
+        declared.maximum = Some(TWO_POW_53);
+        assert_eq!(
+            declared
+                .validate(&(TWO_POW_53 + 1).to_string())
+                .expect_err("2^53 + 1 is one above the declared maximum")
+                .rule,
+            RULE_MAXIMUM
+        );
+        declared
+            .validate(&TWO_POW_53.to_string())
+            .expect("the bound is inclusive");
+    }
+
     #[test]
     fn a_value_outside_the_declared_set_names_the_allowed_rule() {
         let mut declared = field("theme", ConfigurationKind::String);
@@ -547,13 +647,18 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_fields_allowed_violation_names_the_rule_without_the_value() {
+    fn a_secret_fields_allowed_violation_names_the_rule_without_values() {
         let mut declared = field("api-key", ConfigurationKind::String);
         declared.secret = true;
-        declared.allowed = vec!["alpha".to_owned()];
+        declared.allowed = vec!["sentinel-secret".to_owned()];
         let violation = declared.validate("beta").expect_err("beta was not declared");
         assert_eq!(violation.rule, RULE_ALLOWED);
         assert!(!violation.detail.contains("beta"), "{}", violation.detail);
+        assert!(
+            !violation.detail.contains("sentinel-secret"),
+            "{}",
+            violation.detail
+        );
     }
 
     #[test]

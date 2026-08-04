@@ -36,13 +36,14 @@
 //! where they live. Duplicating even one of them here would give an operator two
 //! places to look and two chances to read a stale answer.
 
-use std::fs;
-use std::io;
+use std::collections::BTreeSet;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crikey_plugin_model::{Manifest, ManifestError};
 
-use crate::package::{LegacyPackage, PackageError, PackageLoader};
+use crate::package::{LegacyPackage, PackageError, PackageLimits, PackageLoader};
 
 /// The version a migrated manifest carries.
 ///
@@ -99,6 +100,15 @@ pub enum MigrationLimitation {
         /// Package-relative path of the extension.
         path: PathBuf,
     },
+    /// A `.py` file the legacy loader does not treat as an importable module:
+    /// a root `__init__.py`, a name no import statement can spell, or the
+    /// losing side of a `lib.py` / `lib/__init__.py` collision. It is copied,
+    /// because the source package has it on disk and may open it as
+    /// package-relative data, but nothing imports it under that name.
+    UnimportableModule {
+        /// Package-relative path of the file.
+        path: PathBuf,
+    },
 }
 
 impl MigrationLimitation {
@@ -113,6 +123,7 @@ impl MigrationLimitation {
             Self::IdSanitized { .. } => "id-sanitized",
             Self::SettingsFile { .. } => "settings-file",
             Self::NativeExtension { .. } => "native-extension",
+            Self::UnimportableModule { .. } => "unimportable-module",
         }
     }
 
@@ -153,6 +164,13 @@ impl MigrationLimitation {
                 "`{}` is a compiled extension module; it was copied, but nothing in the archive \
                  says which platform and architecture it was built for, so no `[platform]` lists \
                  were written",
+                path.display()
+            ),
+            Self::UnimportableModule { path } => format!(
+                "`{}` is a Python file the loader does not expose as an importable module — a root \
+                 `__init__.py`, a name no import statement can spell, or the losing side of a \
+                 `lib.py` / `lib/__init__.py` collision. It was copied verbatim so the package \
+                 keeps whatever it reads as package-relative data, but no `import` resolves to it",
                 path.display()
             ),
         }
@@ -215,6 +233,30 @@ pub enum MigrationError {
         #[source]
         error: io::Error,
     },
+
+    /// One file in the source package is larger than a single package file may
+    /// be. Refused before anything is written, exactly as the archive reader
+    /// refuses an oversized entry: a loose directory is no more trustworthy
+    /// than a ZIP, and a sparse multi-gigabyte file in one would otherwise be
+    /// read whole into the CLI process.
+    #[error("`{}` is {size} bytes, over the {limit} byte limit for one package file", path.display())]
+    FileTooLarge {
+        /// Package-relative path of the offending file.
+        path: PathBuf,
+        /// Its size on disk.
+        size: u64,
+        /// [`PackageLimits::max_entry_bytes`].
+        limit: u64,
+    },
+
+    /// The source package's files total more than a whole package may.
+    #[error("the package holds at least {size} bytes, over the {limit} byte package limit")]
+    PackageTooLarge {
+        /// Bytes counted when the ceiling was passed.
+        size: u64,
+        /// [`PackageLimits::max_total_bytes`].
+        limit: u64,
+    },
 }
 
 /// Converts the Keypirinha package at `source` into a CriKey package directory
@@ -236,7 +278,11 @@ pub fn migrate_keypirinha_package(
         });
     }
 
-    let package = PackageLoader::new(cache_root.to_path_buf()).load(source)?;
+    let loader = PackageLoader::new(cache_root.to_path_buf());
+    let package = loader.load(source)?;
+    // Planned before anything is written and under the loader's own ceilings, so
+    // an oversized loose file is refused with no destination on disk at all.
+    let plan = CopyPlan::of(&package, loader.limits())?;
     let mut limitations = Vec::new();
 
     let original = package.id.as_str().to_owned();
@@ -262,6 +308,9 @@ pub fn migrate_keypirinha_package(
             });
         }
     }
+    for path in &plan.unimportable {
+        limitations.push(MigrationLimitation::UnimportableModule { path: path.clone() });
+    }
 
     let manifest = render_manifest(&id, &package.main_module);
     // Checked before a single byte is written. A generated manifest that does not
@@ -269,7 +318,7 @@ pub fn migrate_keypirinha_package(
     // discover it by running `crikey run` against a half-migrated directory.
     Manifest::parse(&manifest)?;
 
-    copy_package(&package, destination)?;
+    plan.copy(package.root.content_root(), destination, loader.limits())?;
     write_file(&destination.join("crikey.toml"), manifest.as_bytes())?;
 
     Ok(MigrationReport {
@@ -359,21 +408,121 @@ fn render_manifest(id: &str, entrypoint: &str) -> String {
 
 /// Copies every module and resource of `package` into `destination`, preserving
 /// package-relative paths so the entry-point import still resolves.
-fn copy_package(package: &LegacyPackage, destination: &Path) -> Result<(), MigrationError> {
-    let content_root = package.root.content_root();
-    let paths = package
-        .modules
-        .iter()
-        .map(|module| module.relative_path.as_path())
-        .chain(package.resources.iter().map(PathBuf::as_path));
-    for relative in paths {
-        let bytes = fs::read(content_root.join(relative)).map_err(|error| MigrationError::Io {
-            path: content_root.join(relative),
-            error,
-        })?;
-        write_file(&destination.join(relative), &bytes)?;
+/// A complete, bounded plan of the source tree. The loader's classification is
+/// intentionally lossy for `.py` files; migration must not be.
+struct CopyPlan {
+    files: Vec<PathBuf>,
+    unimportable: Vec<PathBuf>,
+}
+
+impl CopyPlan {
+    fn of(package: &LegacyPackage, limits: PackageLimits) -> Result<Self, MigrationError> {
+        let mut files = Vec::new();
+        let mut pending = vec![PathBuf::new()];
+        let root = package.root.content_root();
+        let known: BTreeSet<PathBuf> = package
+            .modules
+            .iter()
+            .map(|module| module.relative_path.clone())
+            .chain(package.resources.iter().cloned())
+            .collect();
+        while let Some(relative_dir) = pending.pop() {
+            let absolute = root.join(&relative_dir);
+            let entries = fs::read_dir(&absolute).map_err(|error| MigrationError::Io {
+                path: absolute.clone(),
+                error,
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|error| MigrationError::Io {
+                    path: absolute.clone(),
+                    error,
+                })?;
+                let ty = entry.file_type().map_err(|error| MigrationError::Io {
+                    path: entry.path(),
+                    error,
+                })?;
+                let relative = relative_dir.join(entry.file_name());
+                if ty.is_dir() {
+                    pending.push(relative);
+                } else if ty.is_file() {
+                    files.push(relative);
+                }
+            }
+        }
+        files.sort();
+        let mut total = 0u64;
+        for relative in &files {
+            let path = root.join(relative);
+            let size = fs::metadata(&path)
+                .map_err(|error| MigrationError::Io {
+                    path: path.clone(),
+                    error,
+                })?
+                .len();
+            if size > limits.max_entry_bytes {
+                return Err(MigrationError::FileTooLarge {
+                    path: relative.clone(),
+                    size,
+                    limit: limits.max_entry_bytes,
+                });
+            }
+            total = total.saturating_add(size);
+            if total > limits.max_total_bytes {
+                return Err(MigrationError::PackageTooLarge {
+                    size: total,
+                    limit: limits.max_total_bytes,
+                });
+            }
+        }
+        let unimportable = files
+            .iter()
+            .filter(|path| {
+                path.extension().and_then(|extension| extension.to_str()) == Some("py")
+                    && !known.contains(*path)
+            })
+            .cloned()
+            .collect();
+        Ok(Self { files, unimportable })
     }
-    Ok(())
+
+    fn copy(
+        &self,
+        content_root: &Path,
+        destination: &Path,
+        limits: PackageLimits,
+    ) -> Result<(), MigrationError> {
+        for relative in &self.files {
+            let source = content_root.join(relative);
+            let mut input = File::open(&source).map_err(|error| MigrationError::Io {
+                path: source.clone(),
+                error,
+            })?;
+            let output = destination.join(relative);
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent).map_err(|error| MigrationError::Io {
+                    path: parent.to_path_buf(),
+                    error,
+                })?;
+            }
+            let mut writer = File::create(&output).map_err(|error| MigrationError::Io {
+                path: output.clone(),
+                error,
+            })?;
+            let mut limited = (&mut input).take(limits.max_entry_bytes.saturating_add(1));
+            let copied = io::copy(&mut limited, &mut writer).map_err(|error| MigrationError::Io {
+                path: source.clone(),
+                error,
+            })?;
+            if copied > limits.max_entry_bytes {
+                return Err(MigrationError::FileTooLarge {
+                    path: relative.clone(),
+                    size: copied,
+                    limit: limits.max_entry_bytes,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Writes `bytes` to `path`, creating parent directories.

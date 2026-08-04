@@ -33,6 +33,8 @@ use std::{
     fmt, fs,
     io::Read,
     path::{Path, PathBuf},
+    sync::Mutex,
+    time::SystemTime,
 };
 
 mod cache;
@@ -283,6 +285,15 @@ pub trait IconProvider {
     fn load(&self, reference: &str, size: u32) -> Result<Option<IconImage>, IconError>;
 }
 
+#[derive(Debug, Clone)]
+struct RecentIcon {
+    path: PathBuf,
+    size: u32,
+    modified: Option<SystemTime>,
+    len: u64,
+    image: IconImage,
+}
+
 /// Reads, size-checks, decodes and caches what an [`IconSource`] locates.
 ///
 /// The backend-independent half of [`IconProvider`], so that every platform
@@ -294,48 +305,57 @@ pub trait IconProvider {
 pub struct IconLoader<S> {
     source: S,
     cache: Option<IconCache>,
+    recent: Mutex<Option<RecentIcon>>,
 }
 
 impl<S: IconSource> IconLoader<S> {
-    /// A loader that decodes every time it is asked.
+    /// A loader that decodes every call unless the source metadata and path
+    /// match the immediately preceding successful load.
     pub fn new(source: S) -> Self {
-        Self { source, cache: None }
+        Self {
+            source,
+            cache: None,
+            recent: Mutex::new(None),
+        }
     }
 
-    /// A loader that keeps decoded pixels under
-    /// [`StandardDirectories::cache_dir`] (spec 22.1).
-    ///
-    /// `backend` names the platform backend whose [`IconSource`] this is. It is
-    /// part of every cache entry because a reference means different things to
-    /// different backends, and because replacing the backend is one of the
-    /// spec 22.4 invalidators.
+    /// A loader that keeps decoded pixels under [`StandardDirectories::cache_dir`].
     pub fn caching(source: S, backend: &'static str, directories: &StandardDirectories) -> Self {
         Self {
             source,
             cache: Some(IconCache::new(directories, backend)),
+            recent: Mutex::new(None),
         }
     }
 
-    /// Reads and decodes one located file.
-    ///
-    /// Ordering matters for the limit: the file is *stat*ed and rejected before
-    /// it is read, the read is capped one byte past the limit so a file that
-    /// grows after the stat is refused rather than followed, and the decoders
-    /// check declared dimensions before allocating. A hostile icon therefore
-    /// never gets an unbounded allocation out of this path.
     fn load_located(&self, reference: &str, size: u32, path: &Path) -> Result<IconImage, IconError> {
-        let fingerprint = SourceFingerprint::probe(path).map_err(|detail| IconError::Unreadable {
-            reference: reference.to_owned(),
-            detail,
-        })?;
-        if fingerprint.len > MAX_ICON_PAYLOAD_BYTES {
-            return Err(IconError::TooLarge {
+        let bytes = match read_capped(reference, path, MAX_ICON_PAYLOAD_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if let Ok(metadata) = fs::metadata(path) {
+                    let recent = self
+                        .recent
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(recent) = recent {
+                        if recent.path == path
+                            && recent.size == size
+                            && recent.len == metadata.len()
+                            && recent.modified == metadata.modified().ok()
+                        {
+                            return Ok(recent.image);
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let fingerprint =
+            SourceFingerprint::probe_with_contents(path, &bytes).map_err(|detail| IconError::Unreadable {
                 reference: reference.to_owned(),
-                limit: MAX_ICON_PAYLOAD_BYTES,
-                found: fingerprint.len,
-                what: "encoded icon payload in bytes",
-            });
-        }
+                detail,
+            })?;
 
         let key = IconCacheKey {
             reference: reference.to_owned(),
@@ -345,17 +365,37 @@ impl<S: IconSource> IconLoader<S> {
         };
         if let Some(cache) = &self.cache {
             if let Some(image) = cache.load(&key) {
+                if let Ok(metadata) = fs::metadata(path) {
+                    *self
+                        .recent
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RecentIcon {
+                        path: path.to_path_buf(),
+                        size,
+                        modified: metadata.modified().ok(),
+                        len: metadata.len(),
+                        image: image.clone(),
+                    });
+                }
                 return Ok(image);
             }
         }
 
-        let bytes = read_capped(reference, path, MAX_ICON_PAYLOAD_BYTES)?;
         let image = decode_icon(reference, &bytes, size)?;
         if let Some(cache) = &self.cache {
-            // A cache is disposable by definition (spec 22): a full disk or a
-            // read-only cache directory must degrade to decoding every time,
-            // not to an item without an icon.
             cache.store(&key, &image);
+        }
+        if let Ok(metadata) = fs::metadata(path) {
+            *self
+                .recent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RecentIcon {
+                path: path.to_path_buf(),
+                size,
+                modified: metadata.modified().ok(),
+                len: metadata.len(),
+                image: image.clone(),
+            });
         }
         Ok(image)
     }

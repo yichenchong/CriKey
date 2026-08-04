@@ -38,7 +38,8 @@ use crate::PackageError;
 /// File whose lock means "a launcher owns the installed plugins".
 const LOCK_FILE: &str = "launcher.lock";
 
-/// File holding the lock holder's pid, for diagnostics only.
+/// A pid is optional diagnostics only. It is created with `create_new`, so an
+/// existing symlink is never followed or truncated.
 const PID_FILE: &str = "launcher.pid";
 
 /// An acquired exclusive launcher lock.
@@ -53,20 +54,14 @@ pub struct LauncherLock {
 }
 
 impl LauncherLock {
-    /// Acquires the launcher lock for this process.
-    ///
-    /// `crikey run` calls this at startup and keeps the value alive for the
-    /// life of the launcher. Installation acquires the same lock, so exactly
-    /// one of the two can be underway at a time.
     pub fn acquire(directories: &StandardDirectories) -> Result<Self, PackageError> {
-        Self::acquire_at(directories.state_dir())
+        let lock = Self::acquire_at(directories.state_dir())?;
+        for kind in crikey_platform::PluginKind::ALL {
+            crate::native::recover_interrupted_swaps(&directories.plugin_dir(kind));
+        }
+        Ok(lock)
     }
 
-    /// Acquires the lock in an explicit state directory.
-    ///
-    /// Separate from [`Self::acquire`] so a test can state the directory it
-    /// means rather than arranging the process environment, which no parallel
-    /// test can do safely.
     pub fn acquire_at(state_dir: &Path) -> Result<Self, PackageError> {
         fs::create_dir_all(state_dir).map_err(|error| {
             PackageError::Install(format!(
@@ -76,7 +71,6 @@ impl LauncherLock {
         })?;
         let path = state_dir.join(LOCK_FILE);
         let pid_path = state_dir.join(PID_FILE);
-
         let file = match open_exclusive(&path) {
             Ok(Held::Acquired(file)) => file,
             Ok(Held::Busy) => {
@@ -91,11 +85,9 @@ impl LauncherLock {
                 )))
             }
         };
-
-        // Best effort: a missing pid costs a less specific message, never
-        // correctness, so it must not fail an acquisition that succeeded.
-        let _ = fs::write(&pid_path, std::process::id().to_string());
-
+        if let Ok(mut pid) = OpenOptions::new().write(true).create_new(true).open(&pid_path) {
+            let _ = std::io::Write::write_all(&mut pid, std::process::id().to_string().as_bytes());
+        }
         Ok(Self {
             pid_path,
             _file: file,
@@ -105,14 +97,9 @@ impl LauncherLock {
 
 impl Drop for LauncherLock {
     fn drop(&mut self) {
-        // The lock itself is released by closing the file. Only the diagnostic
-        // pid is cleaned up here, and only so a later refusal cannot quote a
-        // process that has already exited.
         let _ = fs::remove_file(&self.pid_path);
     }
 }
-
-/// Whether an exclusive open succeeded or found the file already locked.
 enum Held {
     Acquired(File),
     Busy,
@@ -121,7 +108,6 @@ enum Held {
 fn read_pid(path: &Path) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
-
 #[cfg(unix)]
 fn open_exclusive(path: &Path) -> io::Result<Held> {
     use std::os::fd::AsRawFd;

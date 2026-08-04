@@ -236,7 +236,7 @@ fn each_install_source_lands_in_the_root_its_runtime_is_discovered_from() {
         "X = 1\n"
     );
 
-    let keypirinha = write_keypirinha_package(&scratch, "Legacy.keypirinha-package", "PASS = 1\n");
+    let keypirinha = write_keypirinha_package(&scratch, "Legacy.KEYPIRINHA-PACKAGE", "PASS = 1\n");
     let legacy = install(&mut installer, InstallSource::LegacyPackage(keypirinha.clone()));
     assert_eq!(legacy.kind, PluginKind::Legacy);
     assert_eq!(legacy.id, "Legacy");
@@ -371,7 +371,7 @@ fn the_default_installer_uses_the_real_http_fetcher_which_refuses_a_non_http_url
 fn detect_classifies_a_url_a_keypirinha_package_an_archive_and_a_directory() {
     let scratch = Scratch::new("detect");
     let directory = scratch.subdir("tree");
-    let package = write_keypirinha_package(&scratch, "Thing.keypirinha-package", "PASS = 1\n");
+    let package = write_keypirinha_package(&scratch, "Thing.KEYPIRINHA-PACKAGE", "PASS = 1\n");
     let archive = scratch.join("plugin.crikeypkg");
     fs::write(&archive, b"not really an archive").expect("file is writable");
 

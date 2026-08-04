@@ -221,3 +221,25 @@ fn a_session_override_is_never_written_to_disk() {
         "a session override that survived the session would not be one"
     );
 }
+
+#[test]
+fn production_override_loader_reaches_session_layer() {
+    let fixture = Fixture::new("session-production-entry");
+    fixture.user_global("[launcher]\nmax-results = 10\n");
+    let overrides = vec![("launcher.max-results".to_owned(), "1".to_owned())];
+    let store = crikey_config::ConfigStore::load_with_overrides(&fixture.directories(), None, &overrides)
+        .expect("override loader");
+    assert_eq!(
+        store.layer_of("launcher.max-results"),
+        Some(ConfigLayer::SessionOverride)
+    );
+    assert_eq!(store.get("launcher.max-results"), Some("1"));
+}
+
+#[test]
+fn a_profile_name_cannot_escape_the_profiles_directory() {
+    let fixture = Fixture::new("profile-containment");
+    fixture.user_global("[launcher]\nprofile = \"../../outside\"\n");
+    let error = fixture.load().expect_err("escaping profile must be rejected");
+    assert!(error.to_string().contains("invalid profile"));
+}

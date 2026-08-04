@@ -7,7 +7,7 @@
 //! individual files.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +23,43 @@ use crate::PackageError;
 
 const MANIFEST_MEMBER: &str = "crikey.toml";
 const LOCK_MEMBER: &str = "crikey-package.lock";
+
+/// Ceiling on a package file this crate reads whole into memory.
+pub(crate) const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_UNPACKED_BYTES: u64 = MAX_PACKAGE_BYTES;
+const MAX_MEMBERS: usize = 65_536;
+const SWAP_JOURNAL_SUFFIX: &str = ".crikey-swap";
+
+/// A package id is also used as an install-directory name.
+pub(crate) fn safe_id_component(id: &str) -> Result<&str, PackageError> {
+    let invalid = || PackageError::Manifest(format!("plugin id {id:?} is not a safe path component"));
+    if id.is_empty()
+        || id == "."
+        || id == ".."
+        || id.starts_with('.')
+        || id.contains(['/', '\\', ':'])
+        || id.as_bytes().contains(&0)
+    {
+        return Err(invalid());
+    }
+    let mut components = Path::new(id).components();
+    if !matches!(components.next(), Some(Component::Normal(part)) if part.to_str() == Some(id))
+        || components.next().is_some()
+        || is_windows_device_name(id)
+    {
+        return Err(invalid());
+    }
+    Ok(id)
+}
+
+fn is_windows_device_name(id: &str) -> bool {
+    const DEVICES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = id.split('.').next().unwrap_or(id);
+    DEVICES.iter().any(|device| stem.eq_ignore_ascii_case(device))
+}
 
 /// Metadata reported for a validated native package (spec 23.3, 23.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +225,18 @@ pub fn install_native(
     arch: &str,
     stop_running: &mut dyn FnMut(&str) -> Result<(), PackageError>,
 ) -> Result<NativeInstall, PackageError> {
+    install_native_with_retention(archive, install_root, os, arch, stop_running, None)
+}
+
+/// Installs while retaining the displaced version at its final rollback path.
+pub fn install_native_with_retention(
+    archive: &Path,
+    install_root: &Path,
+    os: &str,
+    arch: &str,
+    stop_running: &mut dyn FnMut(&str) -> Result<(), PackageError>,
+    retention: Option<&Path>,
+) -> Result<NativeInstall, PackageError> {
     let package = load_package(archive)?;
     ensure_compatible(&package.manifest, os, arch)?;
     validate_integrity(&package)?;
@@ -213,7 +262,9 @@ pub fn install_native(
         return Err(error);
     }
 
-    let backup = temporary_path(parent, install_root, "previous");
+    let backup = retention
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| temporary_path(parent, install_root, "previous"));
     let previous = match swap_into_place(install_root, &staging, Some(&backup)) {
         Ok(true) => Some(backup),
         Ok(false) => None,
@@ -268,7 +319,7 @@ pub(crate) fn swap_into_place(
         None => temporary_path(parent, target, "displaced"),
     };
 
-    let mut displaced = false;
+    let displaced = false;
     let mut removed_empty_target = false;
     match inspect_target(target)? {
         TargetState::Missing => {}
@@ -277,8 +328,29 @@ pub(crate) fn swap_into_place(
             removed_empty_target = true;
         }
         TargetState::Present => {
-            fs::rename(target, &hold).map_err(PackageError::Io)?;
-            displaced = true;
+            let journal = parent.join(format!(
+                ".{}{SWAP_JOURNAL_SUFFIX}",
+                target.file_name().and_then(|n| n.to_str()).unwrap_or("plugin")
+            ));
+            write_swap_journal(&journal, target, &hold)?;
+            if let Err(error) = fs::rename(target, &hold) {
+                let _ = fs::remove_file(&journal);
+                return Err(PackageError::Io(error));
+            }
+            if let Err(error) = fs::rename(replacement, target) {
+                if let Err(restore) = fs::rename(&hold, target) {
+                    return Err(PackageError::Install(format!(
+                        "replacement failed ({error}) and restoring the previous version failed ({restore})"
+                    )));
+                }
+                let _ = fs::remove_file(&journal);
+                return Err(PackageError::Io(error));
+            }
+            let _ = fs::remove_file(&journal);
+            if previous.is_none() {
+                remove_path(&hold);
+            }
+            return Ok(true);
         }
     }
 
@@ -294,11 +366,83 @@ pub(crate) fn swap_into_place(
         }
         return Err(PackageError::Io(error));
     }
-
     if displaced && previous.is_none() {
         remove_path(&hold);
     }
     Ok(displaced)
+}
+
+fn write_swap_journal(path: &Path, target: &Path, hold: &Path) -> Result<(), PackageError> {
+    let target = target
+        .to_str()
+        .ok_or_else(|| PackageError::Install("swap path is not UTF-8".to_owned()))?;
+    let hold = hold
+        .to_str()
+        .ok_or_else(|| PackageError::Install("swap path is not UTF-8".to_owned()))?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    writeln!(file, "{target}")?;
+    writeln!(file, "{hold}")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn recover_interrupted_swaps(parent: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else { return };
+    for entry in entries.flatten() {
+        let journal = entry.path();
+        let Ok(journal_meta) = fs::symlink_metadata(&journal) else {
+            continue;
+        };
+        if !journal_meta.file_type().is_file() {
+            continue;
+        }
+        let Some(name) = journal.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(SWAP_JOURNAL_SUFFIX) {
+            continue;
+        }
+        let target_name = name
+            .strip_prefix('.')
+            .and_then(|value| value.strip_suffix(SWAP_JOURNAL_SUFFIX))
+            .filter(|value| !value.is_empty());
+        let Some(target_name) = target_name else { continue };
+        let Ok(text) = fs::read_to_string(&journal) else {
+            continue;
+        };
+        let mut lines = text.lines();
+        let (Some(target_text), Some(hold_text)) = (lines.next(), lines.next()) else {
+            continue;
+        };
+        let target = Path::new(target_text);
+        let hold = Path::new(hold_text);
+        let expected_target = parent.join(target_name);
+        let direct_child = |path: &Path| path.parent() == Some(parent);
+        let retained_child = |path: &Path| {
+            path.file_name().is_some_and(|name| name == target_name)
+                && path.parent().and_then(Path::file_name) == parent.file_name()
+                && path
+                    .parent()
+                    .and_then(Path::parent)
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == ".previous")
+                && path.parent().and_then(Path::parent).and_then(Path::parent) == parent.parent()
+        };
+        if target != expected_target
+            || !direct_child(target)
+            || !(direct_child(hold) || retained_child(hold))
+            || fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink())
+            || fs::symlink_metadata(hold).is_ok_and(|m| m.file_type().is_symlink())
+        {
+            continue;
+        }
+        if fs::symlink_metadata(target).is_err() && fs::symlink_metadata(hold).is_ok() {
+            let _ = fs::rename(hold, target);
+        }
+        if fs::symlink_metadata(target).is_ok() {
+            let _ = fs::remove_file(journal);
+        }
+    }
 }
 
 /// What a swap target currently holds.
@@ -377,7 +521,6 @@ pub fn rollback_native(install: &NativeInstall) -> Result<(), PackageError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(PackageError::Io(error)),
     };
-
     let displaced = temporary_path(parent, &install.root, "rollback");
     if current_exists {
         if let Err(error) = fs::rename(&install.root, &displaced) {
@@ -413,6 +556,7 @@ fn validate_manifest_shape(manifest: &Manifest) -> Result<(), PackageError> {
             "plugin id and version must not be empty".to_owned(),
         ));
     }
+    safe_id_component(&manifest.plugin.id)?;
     if manifest.plugin.entrypoint.is_empty() {
         return Err(PackageError::Manifest(
             "native package manifest has no entrypoint".to_owned(),
@@ -461,6 +605,7 @@ fn collect_source_members(
     let output_existing = fs::canonicalize(out).ok();
     let mut pending = vec![plugin_dir.to_path_buf()];
     let mut members = BTreeMap::new();
+    let mut remaining = MAX_UNPACKED_BYTES;
     while let Some(directory) = pending.pop() {
         let mut children = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
         children.sort_by_key(|entry| entry.path());
@@ -503,6 +648,14 @@ fn collect_source_members(
                     "{LOCK_MEMBER} is generated by the package builder"
                 )));
             }
+            let length = fs::metadata(&path)?.len();
+            if length > remaining || members.len() >= MAX_MEMBERS {
+                return Err(PackageError::Manifest(format!(
+                    "{} exceeds the {MAX_UNPACKED_BYTES} byte / {MAX_MEMBERS} member package limit",
+                    plugin_dir.display()
+                )));
+            }
+            remaining -= length;
             let bytes = fs::read(&path)?;
             let unix_mode = file_mode(&path)?;
             if members
@@ -516,6 +669,14 @@ fn collect_source_members(
     Ok(members)
 }
 
+/// Every member of a validated ZIP package, plus the hash of its original
+/// archive bytes.
+#[derive(Debug)]
+pub(crate) struct ArchiveContents {
+    pub(crate) members: BTreeMap<String, ArchiveMember>,
+    pub(crate) hash: String,
+}
+
 fn source_archive_name(relative: &Path) -> Result<String, PackageError> {
     let mut parts = Vec::new();
     for component in relative.components() {
@@ -525,12 +686,9 @@ fn source_archive_name(relative: &Path) -> Result<String, PackageError> {
                 relative.display()
             )));
         };
-        let Some(part) = part.to_str() else {
-            return Err(PackageError::Manifest(format!(
-                "package path {} is not UTF-8",
-                relative.display()
-            )));
-        };
+        let part = part.to_str().ok_or_else(|| {
+            PackageError::Manifest(format!("package path {} is not UTF-8", relative.display()))
+        })?;
         if part.is_empty() || part.contains(['/', '\\', ':']) {
             return Err(PackageError::Manifest(format!(
                 "unsafe package path {}",
@@ -545,30 +703,30 @@ fn source_archive_name(relative: &Path) -> Result<String, PackageError> {
     Ok(parts.join("/"))
 }
 
-/// Every member of a ZIP package, with the digest of the archive that held
-/// them.
-#[derive(Debug)]
-pub(crate) struct ArchiveContents {
-    pub(crate) members: BTreeMap<String, ArchiveMember>,
-    pub(crate) hash: String,
-}
-
-/// Reads and safety-checks every member of a ZIP package.
-///
-/// Everything a *container* can be wrong about — a member path that escapes
-/// the destination, a symbolic link, a duplicate name, a directory carrying a
-/// payload, a member nested under a file — is refused here, once, for every
-/// package format the installer understands. Only the manifest rules differ
-/// between formats, so only those live in the format-specific loaders.
 pub(crate) fn read_archive(archive: &Path) -> Result<ArchiveContents, PackageError> {
+    let size = fs::metadata(archive)?.len();
+    if size > MAX_PACKAGE_BYTES {
+        return Err(PackageError::MalformedArchive(format!(
+            "{} is {size} bytes, over the {MAX_PACKAGE_BYTES} byte package limit",
+            archive.display()
+        )));
+    }
     let archive_bytes = fs::read(archive)?;
     let hash = sha256_hex(&archive_bytes);
     let mut zip = ZipArchive::new(Cursor::new(archive_bytes.as_slice()))
         .map_err(|error| PackageError::MalformedArchive(error.to_string()))?;
+    if zip.len() > MAX_MEMBERS {
+        return Err(PackageError::MalformedArchive(format!(
+            "{} declares {} members, over the {MAX_MEMBERS} member limit",
+            archive.display(),
+            zip.len()
+        )));
+    }
     let mut members = BTreeMap::new();
+    let mut remaining = MAX_UNPACKED_BYTES;
     for index in 0..zip.len() {
         let mut entry = zip
-            .by_index_raw(index)
+            .by_index(index)
             .map_err(|error| PackageError::MalformedArchive(error.to_string()))?;
         let raw_name = entry.name_raw().to_vec();
         let name = std::str::from_utf8(&raw_name)
@@ -582,9 +740,17 @@ pub(crate) fn read_archive(archive: &Path) -> Result<ArchiveContents, PackageErr
             )));
         }
         let mut bytes = Vec::new();
-        entry
+        let read = (&mut entry)
+            .take(remaining + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| PackageError::MalformedArchive(format!("could not read {name}: {error}")))?;
+        if (read as u64) > remaining {
+            return Err(PackageError::MalformedArchive(format!(
+                "{} expands to more than the {MAX_UNPACKED_BYTES} byte package limit",
+                archive.display()
+            )));
+        }
+        remaining -= read as u64;
         if directory && !bytes.is_empty() {
             return Err(PackageError::MalformedArchive(format!(
                 "directory entry {name} has a payload"

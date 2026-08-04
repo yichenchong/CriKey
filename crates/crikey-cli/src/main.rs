@@ -19,8 +19,8 @@ use crikey_benchmarks::{
 };
 use crikey_catalog::{CatalogCache, FileCatalogCache};
 use crikey_config::{
-    ConfigSourceWatch, ConfigStore, ConfigurationPublisher, KEY_COALESCE_MS, KEY_MAXIMUM_WAIT_MS,
-    KEY_MAX_RESULTS, KEY_RELOAD_INTERVAL_MS,
+    administrator_policy_path, ConfigSourceWatch, ConfigStore, ConfigurationPublisher, KEY_COALESCE_MS,
+    KEY_MAXIMUM_WAIT_MS, KEY_MAX_RESULTS, KEY_RELOAD_INTERVAL_MS,
 };
 use crikey_core::{Generation, Item, PluginId};
 use crikey_input_scheduler::{
@@ -28,7 +28,7 @@ use crikey_input_scheduler::{
 };
 use crikey_legacy_compat::LegacyDeadlines;
 use crikey_package_manager::LauncherLock;
-use crikey_platform::{PluginKind, StandardDirectories};
+use crikey_platform::{DirectoryConvention, PluginKind, StandardDirectories};
 use crikey_ui::{
     LauncherViewModel, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, UiEffect, ViewModel,
 };
@@ -66,6 +66,13 @@ TOP-LEVEL OPTIONS:
 const BENCHMARK_QUERIES: usize = 64;
 const BENCHMARK_TOP_K: usize = 20;
 const APPLICATION_CATALOG_PLUGIN: &str = "builtin.crikey.applications";
+fn pipeline_profile(profile: crikey_plugin_model::SchedulingProfile) -> SchedulingProfile {
+    match profile {
+        crikey_plugin_model::SchedulingProfile::LegacyStrict => SchedulingProfile::LegacyStrict,
+        crikey_plugin_model::SchedulingProfile::LegacyOptimized => SchedulingProfile::LegacyOptimized,
+        crikey_plugin_model::SchedulingProfile::Modern => SchedulingProfile::Modern,
+    }
+}
 #[cfg(windows)]
 const DEFAULT_ACTIVATION_HOTKEY: &str = "Ctrl+Alt+Space";
 
@@ -74,9 +81,11 @@ crikey run - start the launcher
 
 USAGE:
     crikey run
+    crikey run --set key=value [--set key=value ...]
     crikey run --help
 
 OPTIONS:
+    --set key=value                 Override a setting for this launch only
     -h, --help                      Print this message without starting the launcher
 ";
 
@@ -166,15 +175,34 @@ fn dispatch(args: &[String]) -> ExitCode {
         }
     }
 }
-
-/// Starts the retained native launcher and wires immediate local search.
 fn run_launcher(args: &[String]) -> ExitCode {
-    if !args.is_empty() {
-        eprintln!("crikey: `run` takes no arguments\n\n{USAGE}");
-        return ExitCode::from(64); // EX_USAGE
+    let mut overrides = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        let value = if argument == "--set" {
+            index += 1;
+            args.get(index).map(String::as_str)
+        } else {
+            argument.strip_prefix("--set=")
+        };
+        let Some(value) = value else {
+            eprintln!("crikey: expected `--set key=value`\n\n{RUN_USAGE}");
+            return ExitCode::from(64);
+        };
+        let Some((key, setting)) = value.split_once('=') else {
+            eprintln!("crikey: expected `--set key=value`, got `{value}`");
+            return ExitCode::from(64);
+        };
+        if key.is_empty() {
+            eprintln!("crikey: `--set` requires a non-empty key");
+            return ExitCode::from(64);
+        }
+        overrides.push((key.to_owned(), setting.to_owned()));
+        index += 1;
     }
 
-    match run_native_launcher() {
+    match run_native_launcher(&overrides) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("crikey: launcher failed: {message}");
@@ -183,7 +211,7 @@ fn run_launcher(args: &[String]) -> ExitCode {
     }
 }
 
-fn run_native_launcher() -> Result<(), String> {
+fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     // Both of these come before any window, GPU or provider exists, and that
     // order is load-bearing. The launcher lock decides whether this process may
     // run at all, and it must refuse a second launcher on a host with no display
@@ -207,8 +235,7 @@ fn run_native_launcher() -> Result<(), String> {
     // A configuration that cannot be read is reported and the launch continues on
     // built-in defaults. Refusing the launch would let an unreadable file cost
     // the operator their launcher, and silently disabling everything would be
-    // worse still.
-    let mut configuration = match LauncherConfiguration::load(&directories) {
+    let mut configuration = match LauncherConfiguration::load(&directories, overrides) {
         Ok(configuration) => Some(configuration),
         Err(message) => {
             eprintln!("crikey: {message}; this launch uses built-in defaults only");
@@ -359,6 +386,16 @@ fn run_native_launcher() -> Result<(), String> {
         LegacyDeadlines::default(),
         &disabled,
     );
+    // Apply persisted profile overrides after discovery. Provider loading owns
+    // registration, so this is the first point at which every runtime's
+    // discovered plugin id is available to the production pipeline.
+    if let Some(configuration) = configuration.as_ref() {
+        for plugin in legacy_provider.plugins() {
+            if let Some(profile) = configuration.store.scheduling_profile(plugin) {
+                let _ = legacy_pipeline.set_scheduling_profile(plugin, pipeline_profile(profile));
+            }
+        }
+    }
     // A legacy plugin publishes its searchable rows from `on_catalog`, so a
     // launcher that never asks for one serves nothing from it but live
     // suggestions (spec 14.8). Admission happens here; the callback itself
@@ -417,6 +454,13 @@ fn run_native_launcher() -> Result<(), String> {
         cache_root,
         &disabled,
     );
+    if let Some(configuration) = configuration.as_ref() {
+        for plugin in modern_provider.plugins() {
+            if let Some(profile) = configuration.store.scheduling_profile(plugin) {
+                let _ = modern_pipeline.set_scheduling_profile(plugin, pipeline_profile(profile));
+            }
+        }
+    }
     let modern_plugins = modern_provider.plugins().to_vec();
     for plugin in modern_plugins {
         if let Err(error) = modern_provider.request_catalog_build(&plugin, 1, crikey_core::Generation::ZERO) {
@@ -451,6 +495,13 @@ fn run_native_launcher() -> Result<(), String> {
         ),
         &disabled,
     );
+    if let Some(configuration) = configuration.as_ref() {
+        for plugin in native_provider.plugins() {
+            if let Some(profile) = configuration.store.scheduling_profile(plugin) {
+                let _ = native_pipeline.set_scheduling_profile(plugin, pipeline_profile(profile));
+            }
+        }
+    }
     let native_plugins = native_provider.plugins().to_vec();
     for plugin in native_plugins {
         if let Err(error) = native_provider.request_catalog_build(&plugin, 1, crikey_core::Generation::ZERO) {
@@ -835,45 +886,35 @@ fn configured_plugin_roots(variable: &str) -> Vec<std::path::PathBuf> {
         return Vec::new();
     };
     let mut roots = Vec::new();
-    for path in std::env::split_paths(&value) {
-        if path.as_os_str().is_empty() || roots.iter().any(|root| root == &path) {
+    for root in std::env::split_paths(&value) {
+        if root.as_os_str().is_empty() || roots.contains(&root) {
             continue;
         }
-        roots.push(path);
+        roots.push(root);
     }
     roots
 }
 
 /// The launcher's live view of the layered configuration (spec 21).
-///
-/// Holds the store, the plugin schemas registered against it, a watch over the
-/// files it was read from, and the coalescing publisher. One value rather than
-/// four locals because they must stay consistent: a reload replaces the store AND
-/// the watch AND re-registers the schemas, and any one of those left behind would
-/// publish a state that no configuration on disk describes.
 struct LauncherConfiguration {
     store: ConfigStore,
     watch: ConfigSourceWatch,
     publisher: ConfigurationPublisher,
-    /// How often the files may be re-examined. A poll interval rather than a
-    /// filesystem-notification subscription keeps this platform-independent
-    /// (spec 5.3) and costs a handful of `stat` calls.
+    /// Session-only `crikey run --set` values reapplied after each reload.
+    session_overrides: Vec<(String, String)>,
     reload_interval: Duration,
-    /// When the files were last re-examined.
     checked: Instant,
 }
 
 impl LauncherConfiguration {
-    /// Loads the store, registers every discoverable plugin schema, and builds the
-    /// publisher out of the launcher's own configuration keys.
-    ///
-    /// Schema problems are reported and do not fail the load: a plugin whose
-    /// setting is invalid must not cost the operator their launcher, and the
-    /// store has already rejected the offending value in favour of the declared
-    /// default.
-    fn load(directories: &StandardDirectories) -> Result<Self, String> {
-        let mut store = ConfigStore::load(directories)
-            .map_err(|error| format!("cannot load the configuration: {error}"))?;
+    fn load(
+        directories: &StandardDirectories,
+        session_overrides: &[(String, String)],
+    ) -> Result<Self, String> {
+        let policy = administrator_policy_path(DirectoryConvention::current());
+        let mut store =
+            ConfigStore::load_with_overrides(directories, Some(policy.as_path()), session_overrides)
+                .map_err(|error| format!("cannot load the configuration: {error}"))?;
         for problem in config_commands::register_schemas(&mut store, directories) {
             eprintln!("crikey: {problem}");
         }
@@ -887,29 +928,22 @@ impl LauncherConfiguration {
             store,
             watch,
             publisher,
+            session_overrides: session_overrides.to_vec(),
             checked: Instant::now(),
         })
     }
 
-    /// Offers the current state to the publisher, without publishing it.
     fn seed(&mut self, now: Instant) {
         self.publisher.observe(self.store.configuration_snapshot(), now);
     }
 
-    /// Re-reads the configuration when its files changed, and returns a state to
-    /// publish once the edits have settled (spec 21.4).
-    ///
-    /// A reload that fails leaves the previous store in force and says so: the
-    /// state a user is halfway through editing is frequently not valid TOML, and
-    /// discarding a working configuration because it was observed mid-save would
-    /// be a worse outcome than waiting for the next poll.
     fn poll(&mut self, now: Instant) -> Option<crikey_app::PluginConfiguration> {
         if now.duration_since(self.checked) >= self.reload_interval {
             self.checked = now;
             if self.watch.changed() {
                 match StandardDirectories::for_process()
                     .map_err(|error| error.to_string())
-                    .and_then(|directories| Self::load(&directories))
+                    .and_then(|directories| Self::load(&directories, &self.session_overrides))
                 {
                     Ok(reloaded) => {
                         self.store = reloaded.store;
@@ -922,8 +956,6 @@ impl LauncherConfiguration {
                             "crikey: configuration reload failed ({message}); \
                              the previous configuration stays in force"
                         );
-                        // Re-stamp the watch so one unreadable save is reported
-                        // once rather than on every poll until it is fixed.
                         self.watch = self.store.source_watch();
                     }
                 }

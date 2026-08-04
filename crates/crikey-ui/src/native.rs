@@ -1622,8 +1622,18 @@ fn icon_texture(context: &egui::Context, icon: &crikey_platform::IconImage) -> T
     if let Some(handle) = cache.by_content.get(&content) {
         return handle.clone();
     }
+    // Keep the existing working set stable. If a result list is one icon over
+    // capacity, evicting (or clearing) would make the next frame miss nearly
+    // every texture; the overflow icon is cheap to upload again and does not
+    // displace screenfuls of reusable handles.
     if cache.by_content.len() >= MAX_ICON_TEXTURES {
-        cache.by_content.clear();
+        let image =
+            ColorImage::from_rgba_unmultiplied([icon.width() as usize, icon.height() as usize], icon.rgba());
+        return context.load_texture(
+            format!("crikey-icon-{content:016x}"),
+            image,
+            TextureOptions::LINEAR,
+        );
     }
     let image =
         ColorImage::from_rgba_unmultiplied([icon.width() as usize, icon.height() as usize], icon.rgba());

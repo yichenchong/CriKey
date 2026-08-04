@@ -332,7 +332,7 @@ plugin actions, Python host-managed background tasks, and native/modern
 catalog builds. The §24.4 OS resource limits are distinct from §13.5 and are
 implemented and reported per platform.
 
-### M6 — Additional platforms (§30 Phase 6) — L — implementation largely complete, closure gated on integration and Windows/macOS runtime verification
+### M6 — Additional platforms (§30 Phase 6) — implementation complete; runtime closure moved to M8
 
 macOS and Linux backends behind the same traits, honest capability reporting
 per desktop environment, cross-platform packaging, portable built-ins, and
@@ -408,11 +408,9 @@ Still owed, each needing a runtime this host does not have:
 | M5 | Windows named-pipe transport, job-object limits, `DuplicateHandle` cloning | Compile-verified only; needs a Windows runtime |
 | M6 | macOS backend runtime behaviour | Compile-verified only; `crikey-platform-macos` is `#![cfg(target_os = "macos")]` and cannot run here. The pure bundle parsing it depends on is tested cross-platform in `crikey-platform` |
 
-Exit criteria: full test suite green on all three CI runners — **not yet
-satisfied**: only the Linux runner is exercised here, while Windows and macOS
-are compile-checked rather than run. Every other listed item is satisfied with
-the evidence named or re-deferred above with a reason. Windows-only legacy
-plugins are labelled as such and never advertised as portable (§31.26, §31.31).
+Exit criteria for implementation are satisfied on Linux and by cross-target
+checks. Runtime evidence that requires Windows or macOS is intentionally
+deferred to M8; it is not treated as complete platform verification.
 
 ### M6.5 — First-release feature completion — L — done
 
@@ -486,11 +484,28 @@ this host. CI is unaffected — it builds natively on three runners — and the
 cross-target gate is still run over every crate that contains platform-specific
 code, which is where cross-target defects occur.
 
-### M7 — Optional runtimes and ecosystem (§30 Phase 7) — open-ended
+### M7 — Capability completion and ecosystem — in progress
 
-WebAssembly runtime, signed packages, public plugin index, restricted C ABI,
-advanced sandboxing, shared-memory transport — each gated on profiling or
-demand evidence, not added speculatively.
+This milestone closes capabilities that are currently declaration-only or
+unavailable: permission enforcement, live performance/deadline policy,
+history/context-backed ranking, Linux composition input, plugin-supplied icon
+resolution, and background-task APIs for runtimes that expose them. It also
+retains the optional ecosystem work previously listed here: WebAssembly,
+signed packages, a public plugin index, restricted C ABI, advanced sandboxing,
+and shared-memory transport. Each capability requires an implementation,
+integration coverage, and a truthful runtime report.
+
+### M8 — Platform runtime verification — planned
+
+This milestone executes the already-implemented platform paths in their native
+environments and closes the evidence gaps carried from M6:
+
+- Win32 hotkey, Start Menu/package discovery, `.lnk` COM resolution, and
+  `ShellExecuteExW` launch.
+- End-to-end Win32 warm activation from hotkey delivery to presented frame on
+  real GPU hardware.
+- Windows named-pipe transport, job-object limits, and `DuplicateHandle`.
+- macOS backend runtime behavior.
 
 ---
 

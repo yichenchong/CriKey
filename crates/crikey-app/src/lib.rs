@@ -980,59 +980,44 @@ impl SearchService {
             .collect()
     }
 
-    /// The pixels behind one icon reference, resolved once per session.
+    /// The pixels behind one icon reference.
     ///
-    /// `None` for every ordinary reason a row has no icon: the platform knows of
-    /// no file for this reference, or the file it knows of would not decode.
-    /// A decode failure is not propagated, because there is nothing a user can
-    /// do about a broken icon in somebody else's package and nothing the
-    /// launcher should do except draw the row.
+    /// The platform loader is consulted on every publication. Its source
+    /// resolution and `IconCache` fingerprint are the invalidation authority:
+    /// a reference can begin resolving after a package install, or continue
+    /// resolving to the same path after an in-place replacement. Returning the
+    /// session memo first would bypass both checks and make stale pixels (or a
     fn icon(&self, reference: &str) -> Option<Arc<IconImage>> {
         let mut resolved = self.icons.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(icon) = resolved.get(reference) {
-            return icon.clone();
-        }
-        // A session that walks a very large catalog must not accumulate every
-        // icon it ever showed. Clearing wholesale rather than evicting one entry
-        // keeps the policy to a single branch; the platform cache is what makes
-        // re-resolving cheap.
         if resolved.len() >= MAX_RESOLVED_ICONS {
             resolved.clear();
         }
-        let icon = self
+        let loaded = self
             .app
             .icon_provider()
             .load(reference, DEFAULT_ICON_SIZE)
             .ok()
             .flatten()
             .map(Arc::new);
-        resolved.insert(reference.to_owned(), icon.clone());
-        icon
+        if let (Some(previous), Some(current)) = (resolved.get(reference), loaded.as_ref()) {
+            if previous
+                .as_ref()
+                .is_some_and(|image| image.as_ref() == current.as_ref())
+            {
+                return previous.clone();
+            }
+        }
+        resolved.insert(reference.to_owned(), loaded.clone());
+        loaded
     }
-
-    /// Installs the exact-owner plugin action endpoints retained by the live
-    /// provider drivers.
-    ///
-    /// The router is configured after providers have loaded and before the UI
-    /// event loop starts. It contains the same budget handles those providers
-    /// use; `SearchService` never constructs or looks up a second budget.
     pub fn set_plugin_action_router(&mut self, router: Arc<PluginActionRouter>) {
         self.plugin_actions = Some(router);
     }
 
-    /// Executes an action from the currently presented result set without an
-    /// additional user argument.
     pub fn execute(&self, item_id: &ItemId, action_id: &ActionId) -> CoreResult<ActionSubmission> {
         self.execute_with_argument(item_id, action_id, None)
     }
 
-    /// Executes an action from the currently presented result set.
-    ///
-    /// Selection is authoritative only for the current ranked result set:
-    /// stale item/action ids, category-inapplicable actions, and argument
-    /// policy violations are refused before any provider or platform call.
-    /// Plugin actions then route by the item's exact owner and remain
-    /// independent of query generations.
     pub fn execute_with_argument(
         &self,
         item_id: &ItemId,
@@ -1041,10 +1026,6 @@ impl SearchService {
     ) -> CoreResult<ActionSubmission> {
         let mut matching_hits = self.results.iter().filter(|hit| &hit.item.stable_id == item_id);
         let Some(hit) = matching_hits.next() else {
-            // Modern/native rows are presented through their asynchronous
-            // drivers rather than this synchronous built-in result cache.
-            // Their exact-owner endpoint retains the current item snapshot,
-            // performs the same policy checks, and rejects stale ids.
             return self
                 .plugin_actions
                 .as_ref()
@@ -1067,7 +1048,6 @@ impl SearchService {
             .ok_or_else(|| {
                 crikey_core::CoreError::Invalid("selected action is no longer available".to_owned())
             })?;
-
         if !action.applicable_categories.is_empty()
             && !action.applicable_categories.contains(&hit.item.category)
         {
@@ -1081,16 +1061,15 @@ impl SearchService {
             ArgumentPolicy::Forbidden if argument.is_some() => {
                 return Err(crikey_core::CoreError::Invalid(
                     "this item does not accept an argument".to_owned(),
-                ));
+                ))
             }
             ArgumentPolicy::Required if argument.is_none_or(str::is_empty) => {
                 return Err(crikey_core::CoreError::Invalid(
                     "this item requires an argument".to_owned(),
-                ));
+                ))
             }
-            ArgumentPolicy::Optional | ArgumentPolicy::Forbidden | ArgumentPolicy::Required => {}
+            _ => {}
         }
-
         match action.execution_policy {
             ExecutionPolicy::HostMediated => {
                 if argument.is_some() {
@@ -1119,26 +1098,22 @@ impl SearchService {
         }
     }
 
-    /// Drains terminal plugin-action outcomes without waiting on any provider.
     pub fn poll_action_completions(&self) -> Vec<PluginActionCompletion> {
         self.plugin_actions
             .as_ref()
             .map_or_else(Vec::new, |router| router.poll())
     }
 
-    /// Requests cancellation of one admitted plugin action.
     pub fn cancel_action(&self, request_id: &ActionRequestId) -> bool {
         self.plugin_actions
             .as_ref()
             .is_some_and(|router| router.cancel(request_id))
     }
 
-    /// Work performed by the most recently accepted query.
     pub fn last_query_stats(&self) -> SearchStats {
         self.last_query_stats
     }
 }
-
 /// Selects the strongest legal result set without cloning every match.
 ///
 /// Each owner is first reduced to its per-plugin quota, then those survivors

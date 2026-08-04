@@ -9,12 +9,12 @@
 //! least uniform.
 //!
 //! The bound this accepts in exchange is honest and stated: a change is noticed
-//! on the next poll, not instantly, and two writes within one filesystem
-//! timestamp tick that leave the file the same length are not distinguished. The
-//! second is not a correctness problem for configuration, because the reloader
-//! re-reads the whole state and the publisher publishes nothing when the state
-//! is unchanged — the worst case is a change noticed at the next poll that does
-//! alter the length or the timestamp.
+//! on the next poll, not instantly. A same-length rewrite inside one filesystem
+//! timestamp tick is NOT excused by that bound, because polling cannot rescue
+//! it — neither the timestamp nor the length would ever move again. So a file
+//! stamp also carries a fingerprint of the file's content, and only a rewrite
+//! that is same-length, same-timestamp AND hash-colliding past the
+//! fingerprint's one-megabyte cap stays invisible.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -29,6 +29,11 @@ enum Stamp {
     File {
         modified: Option<SystemTime>,
         length: u64,
+        /// A hash of the file's first `FINGERPRINT_LIMIT` bytes, or `None` when
+        /// the content could not be read. Present because `modified` and `length`
+        /// alone cannot distinguish a same-length edit made inside one
+        /// filesystem timestamp tick, and no later poll ever could either.
+        fingerprint: Option<u64>,
     },
     /// A directory is stamped by its own timestamp AND its entry count, because
     /// adding a per-plugin file changes one or the other on every filesystem this
@@ -54,9 +59,52 @@ impl Stamp {
             Self::File {
                 modified,
                 length: metadata.len(),
+                fingerprint: fingerprint(path),
             }
         }
     }
+}
+
+/// Cap on the bytes hashed into a file stamp.
+///
+/// A configuration file is a handful of kilobytes, so this never binds in
+/// practice; it exists so a watched path replaced by something enormous costs one
+/// bounded read per poll rather than an unbounded one.
+const FINGERPRINT_LIMIT: u64 = 1 << 20;
+
+/// Hashes the first `FINGERPRINT_LIMIT` bytes of `path`.
+///
+/// `None` when the content cannot be read, which is not the same as an empty
+/// file: a stamp with no fingerprint falls back to the timestamp and length, and
+/// stamping the unreadable case as some fixed value would make an unreadable file
+/// and a specific readable one compare equal.
+///
+/// The hasher only has to be stable for the life of one process — stamps are
+/// compared against stamps this process took — so the standard library's default
+/// hasher is enough and this crate needs no hashing dependency.
+fn fingerprint(path: &Path) -> Option<u64> {
+    use std::hash::Hasher;
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut buffer = [0u8; 8192];
+    let mut remaining = FINGERPRINT_LIMIT;
+    while remaining > 0 {
+        let wanted = buffer
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(buffer.len()));
+        match file.read(&mut buffer[..wanted]) {
+            Ok(0) => break,
+            Ok(read) => {
+                hasher.write(&buffer[..read]);
+                remaining -= read as u64;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(hasher.finish())
 }
 
 /// A snapshot of every file a [`crate::ConfigStore`] was read from.
@@ -144,6 +192,27 @@ mod tests {
         let watch = ConfigSourceWatch::over(&[file.clone()]);
         std::fs::write(&file, "a = 1\nb = 2\n").expect("write");
         assert!(watch.changed());
+    }
+
+    #[test]
+    fn an_equal_length_edit_is_a_change_even_when_mtime_is_restored() {
+        let temp = TempDir::new("equal-length");
+        let file = temp.0.join("config.toml");
+        std::fs::write(&file, "a = 1\n").expect("write");
+        let original = std::fs::metadata(&file)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        let watch = ConfigSourceWatch::over(std::slice::from_ref(&file));
+        std::fs::write(&file, "b = 2\n").expect("same-length rewrite");
+        std::fs::File::open(&file)
+            .expect("open")
+            .set_times(std::fs::FileTimes::new().set_modified(original))
+            .expect("restore mtime");
+        assert!(
+            watch.changed(),
+            "content changed despite identical mtime and length"
+        );
     }
 
     #[test]

@@ -96,11 +96,26 @@ impl DirectoryEnvironment {
     /// An empty value is treated as unset because that is what the XDG
     /// specification requires, and because `FOO=` in a shell profile is how a
     /// user unsets a variable in practice.
-    fn lookup(&self, key: &str) -> Option<&OsStr> {
-        self.variables
+    ///
+    /// Windows environment-variable names are case-insensitive, so under
+    /// [`DirectoryConvention::Windows`] a `crikey_data_dir` an operator typed in
+    /// lowercase is the same variable as `CRIKEY_DATA_DIR`; ignoring it would
+    /// silently root the launcher somewhere the operator did not choose. The
+    /// exact spelling is still tried first, so the ordinary case stays one map
+    /// lookup and an exact match beats a differently-cased one.
+    fn lookup(&self, key: &str, convention: DirectoryConvention) -> Option<&OsStr> {
+        let exact = self
+            .variables
             .get(key)
             .map(OsString::as_os_str)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty());
+        if exact.is_some() || convention != DirectoryConvention::Windows {
+            return exact;
+        }
+        self.variables
+            .iter()
+            .find(|(name, value)| !value.is_empty() && name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_os_str())
     }
 
     /// An absolute path from `key`, judged by `convention`.
@@ -116,7 +131,7 @@ impl DirectoryEnvironment {
     /// and resolving the Windows layout on another host is exactly what the
     /// tests do.
     fn absolute(&self, key: &str, convention: DirectoryConvention) -> Result<Option<PathBuf>> {
-        let Some(value) = self.lookup(key) else {
+        let Some(value) = self.lookup(key, convention) else {
             return Ok(None);
         };
         let path = PathBuf::from(value);
@@ -136,12 +151,21 @@ impl DirectoryEnvironment {
 /// (`\\server\share`). A bare rooted path such as `\x` is deliberately refused:
 /// it is relative to the current drive, so it names a different directory
 /// depending on state this process does not control.
+///
+/// A UNC prefix alone is not enough. `\\`, `\\server` and `\\server\` name no
+/// volume, so a `CRIKEY_*_DIR` override or a platform variable spelled that way
+/// would be accepted here and then handed to configuration, plugin, cache and
+/// state consumers that all try to do I/O beneath it. Both the server and the
+/// share component must therefore be present and non-empty.
 fn is_absolute_for(convention: DirectoryConvention, path: &Path) -> bool {
     let bytes = path.as_os_str().as_encoded_bytes();
     match convention {
         DirectoryConvention::Windows => {
-            if bytes.starts_with(br"\\") {
-                return true;
+            if let Some(rest) = bytes.strip_prefix(br"\\") {
+                let mut components = rest.split(|byte| matches!(byte, b'\\' | b'/'));
+                let server = components.next().unwrap_or_default();
+                let share = components.next().unwrap_or_default();
+                return !server.is_empty() && !share.is_empty();
             }
             matches!(bytes, [drive, b':', separator, ..]
                 if drive.is_ascii_alphabetic() && matches!(separator, b'\\' | b'/'))

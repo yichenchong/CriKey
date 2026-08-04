@@ -12,9 +12,23 @@ use crikey_core::PluginId;
 /// remember rather than a property of the value. It is `PartialEq` because the
 /// publisher's decision to say nothing when nothing changed is an equality test
 /// on exactly this.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ConfigurationSnapshot {
     plugins: BTreeMap<PluginId, BTreeMap<String, String>>,
+}
+
+impl std::fmt::Debug for ConfigurationSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: BTreeMap<&PluginId, Vec<&str>> = self
+            .plugins
+            .iter()
+            .map(|(plugin, values)| (plugin, values.keys().map(String::as_str).collect()))
+            .collect();
+        formatter
+            .debug_struct("ConfigurationSnapshot")
+            .field("plugin_keys", &keys)
+            .finish()
+    }
 }
 
 impl ConfigurationSnapshot {

@@ -55,6 +55,7 @@ pub struct SchemaProblem {
 /// ordinary case.
 pub fn discover_plugin_schemas(roots: &[PathBuf]) -> (Vec<DiscoveredSchema>, Vec<SchemaProblem>) {
     let mut schemas = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     let mut problems = Vec::new();
     for root in roots {
         let Ok(entries) = std::fs::read_dir(root) else {
@@ -65,12 +66,11 @@ pub fn discover_plugin_schemas(roots: &[PathBuf]) -> (Vec<DiscoveredSchema>, Vec
             .map(|entry| entry.path())
             .filter(|path| path.is_dir())
             .collect();
-        // Sorted so two machines with the same plugins register them in the same
-        // order, and a diagnostic naming "the first problem" names the same one.
         packages.sort();
         for package in packages {
             match read_package(&package) {
-                Ok(Some(schema)) => schemas.push(schema),
+                Ok(Some(schema)) if seen.insert(schema.plugin.clone()) => schemas.push(schema),
+                Ok(Some(_shadowed)) => {}
                 Ok(None) => {}
                 Err(reason) => problems.push(SchemaProblem { package, reason }),
             }

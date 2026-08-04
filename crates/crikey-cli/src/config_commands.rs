@@ -121,6 +121,7 @@ fn load() -> Result<ConfigStore, String> {
 pub(crate) fn register_schemas(store: &mut ConfigStore, directories: &StandardDirectories) -> Vec<String> {
     let mut messages = Vec::new();
     let (schemas, problems) = discover_plugin_schemas(&schema_roots(directories));
+    let had_discovery_problem = !problems.is_empty();
     for problem in problems {
         messages.push(format!(
             "plugin schema unavailable ({}): {}",
@@ -132,6 +133,12 @@ pub(crate) fn register_schemas(store: &mut ConfigStore, directories: &StandardDi
         for error in store.register_plugin_schema(&schema.plugin, &schema.section) {
             messages.push(error.to_string());
         }
+    }
+    if had_discovery_problem {
+        // A failed manifest may have declared secrets we cannot inspect. Keep
+        // every key in an unregistered namespace redacted rather than allowing
+        // an unrelated parse error to turn `config get` into a token dump.
+        store.redact_unregistered_plugins();
     }
     messages
 }

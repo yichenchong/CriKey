@@ -80,6 +80,17 @@ pub enum PipelineError {
         plugin: PluginId,
         runtime: Runtime,
     },
+    /// One `[concurrency]` budget handle was offered for a second plugin.
+    ///
+    /// The §13.5 watermark in [`HealthSync`] is per plugin while the refusal
+    /// counters live on the handle, so a handle shared by two ids has every
+    /// refusal reconciled independently into both health records and reported
+    /// twice. Registration refuses the sharing rather than letting the
+    /// double-attribution happen.
+    BudgetAlreadyOwned {
+        plugin: PluginId,
+        owner: PluginId,
+    },
 }
 
 impl std::fmt::Display for PipelineError {
@@ -111,6 +122,12 @@ impl std::fmt::Display for PipelineError {
                 "plugin `{}` declares unsupported runtime `{}`; this build deliberately refuses it because no host is available",
                 plugin.0,
                 runtime_name(*runtime)
+            ),
+            Self::BudgetAlreadyOwned { plugin, owner } => write!(
+                formatter,
+                "plugin `{}` was offered the concurrency budget already owned by plugin `{}`; one \
+                 handle per plugin, or a refusal on it would be attributed to both",
+                plugin.0, owner.0
             ),
         }
     }
@@ -155,6 +172,10 @@ pub struct QueryPipeline {
     unranked_batches: usize,
     registered: Vec<PluginId>,
     health_sync: HashMap<PluginId, HealthSync>,
+    /// Operator-selected scheduling profiles, applied before provider
+    /// registration. Overrides are intentionally one-shot configuration state:
+    /// changing one after registration cannot rewrite admitted work.
+    profile_overrides: HashMap<PluginId, SchedulingProfile>,
     /// One admission gate per registered plugin, resolved from its
     /// `[concurrency]` declaration (spec 13.5). Shared behind an `Arc` so a
     /// caller can hold the same gate a dispatch site consults.
@@ -202,6 +223,7 @@ impl QueryPipeline {
             unranked_batches: 0,
             registered: Vec::new(),
             health_sync: HashMap::new(),
+            profile_overrides: HashMap::new(),
             budgets: HashMap::new(),
             admitted: HashMap::new(),
             active_requests: HashSet::new(),
@@ -218,6 +240,47 @@ impl QueryPipeline {
             presented_pending: None,
             presentation_dirty: false,
         }
+    }
+
+    /// Records the profile override configured for a plugin. Providers must
+    /// call this before registering the plugin.
+    pub fn override_scheduling_profile(&mut self, plugin: PluginId, profile: SchedulingProfile) {
+        self.profile_overrides.insert(plugin, profile);
+    }
+
+    fn effective_policy(&self, plugin: &PluginId, policy: PluginPolicy) -> PluginPolicy {
+        let Some(profile) = self.profile_overrides.get(plugin).copied() else {
+            return policy;
+        };
+        if profile == policy.profile {
+            return policy;
+        }
+        let mut effective = match profile {
+            SchedulingProfile::LegacyStrict => PluginPolicy::legacy_strict(),
+            SchedulingProfile::LegacyOptimized => PluginPolicy::legacy_optimized(),
+            SchedulingProfile::Modern => PluginPolicy::modern(),
+        };
+        effective.activation = policy.activation;
+        effective
+    }
+
+    /// Applies a configured profile to an already-registered plugin. Provider
+    /// discovery often learns the final id only during loading, so callers may
+    /// set the override after registration; queued work is invalidated by the
+    /// scheduler's normal policy transition.
+    pub fn set_scheduling_profile(&mut self, plugin: &PluginId, profile: SchedulingProfile) -> bool {
+        let Some(current) = self.scheduler.plugin_policy(plugin).cloned() else {
+            return false;
+        };
+        let mut policy = match profile {
+            SchedulingProfile::LegacyStrict => PluginPolicy::legacy_strict(),
+            SchedulingProfile::LegacyOptimized => PluginPolicy::legacy_optimized(),
+            SchedulingProfile::Modern => PluginPolicy::modern(),
+        };
+        policy.activation = current.activation;
+        self.scheduler.set_policy(plugin, policy, 0);
+        self.profile_overrides.insert(plugin.clone(), profile);
+        true
     }
 
     pub fn register_plugin(&mut self, plugin: PluginId, policy: PluginPolicy) -> Result<(), PipelineError> {
@@ -250,6 +313,7 @@ impl QueryPipeline {
         if self.health_sync.contains_key(&plugin) {
             return Err(PipelineError::AlreadyRegistered { plugin });
         }
+        let policy = self.effective_policy(&plugin, policy);
         let budget = resolved_budget_for_policy(&policy, concurrency);
         self.register_plugin_with_budget(plugin, policy, intake_policy, budget)
     }
@@ -269,7 +333,14 @@ impl QueryPipeline {
         if self.health_sync.contains_key(&plugin) {
             return Err(PipelineError::AlreadyRegistered { plugin });
         }
-
+        if let Some(owner) = self
+            .budgets
+            .iter()
+            .find_map(|(owner, existing)| Arc::ptr_eq(existing, &budget).then(|| owner.clone()))
+        {
+            return Err(PipelineError::BudgetAlreadyOwned { plugin, owner });
+        }
+        let policy = self.effective_policy(&plugin, policy);
         self.supervisor
             .register(&plugin)
             .expect("a pipeline registers each plugin with its supervisor once");
@@ -325,7 +396,7 @@ impl QueryPipeline {
             return Err(PipelineError::AlreadyRegistered { plugin });
         }
         ensure_supported_runtime(&plugin, manifest.plugin.runtime)?;
-        let policy = plugin_policy_from_manifest(manifest);
+        let policy = self.effective_policy(&plugin, plugin_policy_from_manifest(manifest));
         let budget = resolved_budget_for_policy(&policy, &manifest.concurrency);
         self.register_plugin_with_budget(plugin, policy, self.default_intake_policy, budget.clone())?;
         Ok(budget)
@@ -344,7 +415,7 @@ impl QueryPipeline {
             return Err(PipelineError::AlreadyRegistered { plugin });
         }
         ensure_supported_runtime(&plugin, manifest.plugin.runtime)?;
-        let policy = plugin_policy_from_manifest(manifest);
+        let policy = self.effective_policy(&plugin, plugin_policy_from_manifest(manifest));
         self.register_plugin_with_budget(plugin, policy, self.default_intake_policy, budget)
     }
 
@@ -379,6 +450,10 @@ impl QueryPipeline {
             | PipelineError::QueueRejected { plugin: owner, .. }
             | PipelineError::AggregatorRejected { plugin: owner, .. }
             | PipelineError::UnsupportedRuntime { plugin: owner, .. } => owner != plugin,
+            PipelineError::BudgetAlreadyOwned {
+                plugin: attempted,
+                owner,
+            } => attempted != plugin && owner != plugin,
         });
 
         self.scheduler.unregister_plugin(plugin);

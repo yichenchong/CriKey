@@ -39,6 +39,7 @@
 //! [`Capability::Icons`]: crikey_platform::Capability::Icons
 
 use std::{
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     io::Read,
     os::unix::fs::OpenOptionsExt,
@@ -62,11 +63,11 @@ const DEFAULT_THEME: &str = FALLBACK_THEME;
 const MAX_INDEX_BYTES: u64 = 1024 * 1024;
 
 /// How many themes an inheritance chain may span.
-///
-/// `Inherits` is author-supplied and can name a cycle or a hundred-deep chain;
-/// the visited set already stops a cycle, and this stops the chain from turning
-/// one lookup into an unbounded directory walk.
 const MAX_CHAIN: usize = 16;
+
+/// A malformed index may repeat or fan out inheritance names. Keep the queue
+/// bounded independently of the number of themes actually visited.
+const MAX_PENDING: usize = 64;
 
 /// The section naming the theme itself rather than one of its directories.
 const THEME_SECTION: &str = "Icon Theme";
@@ -221,9 +222,9 @@ impl XdgIconSource {
     pub fn new(theme_roots: Vec<PathBuf>, unthemed: Vec<PathBuf>, theme: &str) -> Self {
         let mut themes = Vec::new();
         let mut visited = Vec::new();
-        let mut pending = vec![theme.to_owned()];
-        while let Some(name) = pending.first().cloned() {
-            pending.remove(0);
+        let mut pending = VecDeque::from([theme.to_owned()]);
+        let mut queued = HashSet::from([theme.to_owned()]);
+        while let Some(name) = pending.pop_front() {
             if visited.iter().any(|seen| *seen == name) || visited.len() >= MAX_CHAIN {
                 continue;
             }
@@ -248,11 +249,14 @@ impl XdgIconSource {
             if !directories.is_empty() {
                 themes.push(Theme { directories });
             }
-            // Breadth first, so a theme's own parents are asked before its
-            // grandparents, which is the order `Inherits` declares.
-            pending.extend(inherits);
+            for inherited in inherits {
+                if queued.len() < MAX_PENDING && queued.insert(inherited.clone()) {
+                    pending.push_back(inherited);
+                }
+            }
             if pending.is_empty() && !visited.iter().any(|seen| seen == FALLBACK_THEME) {
-                pending.push(FALLBACK_THEME.to_owned());
+                pending.push_back(FALLBACK_THEME.to_owned());
+                queued.insert(FALLBACK_THEME.to_owned());
             }
         }
 
@@ -317,15 +321,13 @@ struct Index {
 /// theme's `Directories` and `Inherits`, then one section per directory carrying
 /// its size rule. Only the directories `Directories` lists are returned, and in
 /// that order, because the order is the theme author's preference.
-///
-/// A malformed line is skipped rather than failing the theme: one bad line in a
-/// distribution's index file must not delete every icon on the system.
 fn parse_index(contents: &str) -> Index {
     let sections = split_sections(contents);
-    let theme = sections
+    let section_map: HashMap<&str, &[(&str, &str)]> = sections
         .iter()
-        .find(|(name, _)| name == THEME_SECTION)
-        .map(|(_, keys)| keys);
+        .map(|(name, keys)| (name.as_str(), keys.as_slice()))
+        .collect();
+    let theme = section_map.get(THEME_SECTION).copied();
     let inherits = theme
         .and_then(|keys| value(keys, "Inherits"))
         .map(|value| comma_separated(value).collect())
@@ -338,10 +340,7 @@ fn parse_index(contents: &str) -> Index {
     let directories = listed
         .into_iter()
         .filter_map(|name| {
-            let keys = sections
-                .iter()
-                .find(|(section, _)| *section == name)
-                .map(|(_, keys)| keys)?;
+            let keys = section_map.get(name.as_str()).copied()?;
             Some((name, sizing(keys)?))
         })
         .collect();

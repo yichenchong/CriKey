@@ -1261,18 +1261,27 @@ struct NativeJob {
 }
 
 /// Single-slot replace-oldest mailbox for native queries.
-#[derive(Debug)]
 struct NativeRequestSlot {
     job: Option<NativeJob>,
     /// The latest configuration state to publish, if one is waiting.
     ///
-    /// Single-slot replace-oldest for the same reason the query slot is: only the
-    /// newest complete state matters, and a queue of superseded states would
-    /// publish intermediate configurations the host already decided to coalesce
-    /// away (spec 21.4). Boxed because the map is much larger than a query job
-    /// and the slot is held under the mailbox lock.
+    /// Single-slot replace-oldest: only the newest complete state matters.
     configuration: Option<Box<crate::PluginConfiguration>>,
     stop: bool,
+}
+
+impl std::fmt::Debug for NativeRequestSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeRequestSlot")
+            .field("job", &self.job)
+            .field(
+                "configuration",
+                &self.configuration.as_ref().map(|_| "<redacted>"),
+            )
+            .field("stop", &self.stop)
+            .finish()
+    }
 }
 
 const ACTION_QUEUE_CAPACITY: usize = 8;
@@ -1862,13 +1871,25 @@ impl NativeDriver {
     /// Per-plugin diagnostics (spec 24.3) as of the supervisor thread's last
     /// unit of work, including the per-kind §13.5 refusal counters.
     pub fn health_report(&self) -> Vec<(PluginId, crikey_plugin_supervisor::PluginHealth)> {
-        self.health
+        let mut report = self
+            .health
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .clone()
+            .clone();
+        for (plugin, budget) in &self.action_endpoint.budgets {
+            if let Some((_, health)) = report.iter_mut().find(|(id, _)| id == plugin) {
+                health.concurrency_refusals = budget.refusals_snapshot();
+            } else {
+                let health = crikey_plugin_supervisor::PluginHealth {
+                    concurrency_refusals: budget.refusals_snapshot(),
+                    ..crikey_plugin_supervisor::PluginHealth::default()
+                };
+                report.push((plugin.clone(), health));
+            }
+        }
+        report
     }
 }
-
 impl Drop for NativeDriver {
     fn drop(&mut self) {
         // Cancel in-flight callbacks before joining the supervisor so a

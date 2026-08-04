@@ -44,7 +44,7 @@ use crate::native::{
     self, collect_directory_members, read_archive, remove_path, swap_into_place, temporary_path,
     unsigned_binary_in, write_members,
 };
-use crate::{build_package, inspect_package, install_native, InstallSource, PackageError};
+use crate::{build_package, inspect_package, install_native_with_retention, InstallSource, PackageError};
 
 /// Extension of a Keypirinha package, without the dot.
 ///
@@ -195,10 +195,10 @@ impl PluginInstaller {
         let mut installed = Vec::new();
         for kind in PluginKind::ALL {
             let root = self.directories.plugin_dir(kind);
-            let Ok(entries) = fs::read_dir(&root) else {
-                // A root that does not exist yet holds no plugins. That is the
-                // normal state of a fresh install, not a failure to report.
-                continue;
+            let entries = match fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(PackageError::Io(error)),
             };
             let mut paths = entries
                 .flatten()
@@ -265,6 +265,10 @@ impl PluginInstaller {
                 let members = collect_directory_members(path)?;
                 self.install_modern(members, stop)
             }
+            Runtime::LegacyPython => {
+                let id = native::safe_id_component(&manifest.plugin.id)?;
+                self.install_legacy_source(path, id, &manifest.plugin.version, stop)
+            }
             other => Err(PackageError::Manifest(format!(
                 "{MANIFEST_FILE} declares runtime {other:?}, which is not installable"
             ))),
@@ -299,22 +303,20 @@ impl PluginInstaller {
         stop: &mut dyn FnMut(&str) -> Result<(), PackageError>,
     ) -> Result<InstalledPlugin, PackageError> {
         let report = inspect_package(archive)?;
-        let root = self
-            .directories
-            .plugin_dir(PluginKind::Native)
-            .join(&report.plugin);
-        let install = install_native(archive, &root, std::env::consts::OS, std::env::consts::ARCH, stop)?;
-        if let Some(retained) = install.previous.as_ref() {
-            // The native machinery retains the old version beside the live one,
-            // which is inside the root discovery scans. Move it out, or the
-            // launcher loads the superseded copy as a second plugin.
-            let previous = self.previous_path(PluginKind::Native, &root)?;
-            if let Some(holder) = previous.parent() {
-                fs::create_dir_all(holder)?;
-            }
-            remove_path(&previous);
-            fs::rename(retained, &previous).map_err(PackageError::Io)?;
+        let id = native::safe_id_component(&report.plugin)?;
+        let root = self.directories.plugin_dir(PluginKind::Native).join(id);
+        let previous = self.previous_path(PluginKind::Native, &root)?;
+        if let Some(holder) = previous.parent() {
+            fs::create_dir_all(holder)?;
         }
+        let install = install_native_with_retention(
+            archive,
+            &root,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            stop,
+            Some(&previous),
+        )?;
         Ok(InstalledPlugin {
             id: install.report.plugin.clone(),
             version: install.report.version.clone(),
@@ -330,13 +332,8 @@ impl PluginInstaller {
         stop: &mut dyn FnMut(&str) -> Result<(), PackageError>,
     ) -> Result<InstalledPlugin, PackageError> {
         let manifest = native::archive_manifest(&members)?;
-        if manifest.plugin.id.is_empty() {
-            return Err(PackageError::Manifest("plugin id must not be empty".to_owned()));
-        }
-        let root = self
-            .directories
-            .plugin_dir(PluginKind::Modern)
-            .join(&manifest.plugin.id);
+        let id = native::safe_id_component(&manifest.plugin.id)?;
+        let root = self.directories.plugin_dir(PluginKind::Modern).join(id);
         let unsigned_binary = unsigned_binary_in(&members);
         self.stage_and_swap(PluginKind::Modern, &root, &manifest.plugin.id, stop, |staging| {
             write_members(&members, staging)
@@ -362,7 +359,7 @@ impl PluginInstaller {
         archive: &Path,
         stop: &mut dyn FnMut(&str) -> Result<(), PackageError>,
     ) -> Result<InstalledPlugin, PackageError> {
-        let id = legacy_id(archive)?;
+        let id = native::safe_id_component(&legacy_id(archive)?)?.to_owned();
         let size = fs::metadata(archive)?.len();
         if size > MAX_PACKAGE_BYTES {
             return Err(PackageError::MalformedArchive(format!(
@@ -371,15 +368,41 @@ impl PluginInstaller {
             )));
         }
         read_archive(archive)?;
-
         let root = self
             .directories
             .plugin_dir(PluginKind::Legacy)
             .join(format!("{id}.{LEGACY_EXTENSION}"));
+        let alternate = self.directories.plugin_dir(PluginKind::Legacy).join(&id);
         self.stage_and_swap(PluginKind::Legacy, &root, &id, stop, |staging| {
             fs::copy(archive, staging)?;
             Ok(())
         })?;
+        remove_path(&alternate);
+        Ok(InstalledPlugin {
+            id,
+            version: String::new(),
+            kind: PluginKind::Legacy,
+            root,
+            unsigned_binary: false,
+        })
+    }
+
+    fn install_legacy_members(
+        &mut self,
+        id: &str,
+        members: BTreeMap<String, native::ArchiveMember>,
+        stop: &mut dyn FnMut(&str) -> Result<(), PackageError>,
+    ) -> Result<InstalledPlugin, PackageError> {
+        let id = native::safe_id_component(id)?.to_owned();
+        let root = self.directories.plugin_dir(PluginKind::Legacy).join(&id);
+        let alternate = self
+            .directories
+            .plugin_dir(PluginKind::Legacy)
+            .join(format!("{id}.{LEGACY_EXTENSION}"));
+        self.stage_and_swap(PluginKind::Legacy, &root, &id, stop, |staging| {
+            write_members(&members, staging)
+        })?;
+        remove_path(&alternate);
         Ok(InstalledPlugin {
             id,
             version: String::new(),
@@ -394,7 +417,26 @@ impl PluginInstaller {
         path: &Path,
         stop: &mut dyn FnMut(&str) -> Result<(), PackageError>,
     ) -> Result<InstalledPlugin, PackageError> {
-        let id = legacy_id(path)?;
+        let id = native::safe_id_component(&legacy_id(path)?)?.to_owned();
+        let members = collect_directory_members(path)?;
+        if !members.keys().any(|name| name.ends_with(".py")) {
+            return Err(PackageError::Manifest(format!(
+                "{} has neither a {MANIFEST_FILE} nor any Python module, so it is not a plugin",
+                path.display()
+            )));
+        }
+        self.install_legacy_members(&id, members, stop)
+    }
+
+    /// Installs a migrated legacy-python directory under its manifest id.
+    fn install_legacy_source(
+        &mut self,
+        path: &Path,
+        id: &str,
+        version: &str,
+        stop: &mut dyn FnMut(&str) -> Result<(), PackageError>,
+    ) -> Result<InstalledPlugin, PackageError> {
+        let id = native::safe_id_component(id)?.to_owned();
         let members = collect_directory_members(path)?;
         if !members.keys().any(|name| name.ends_with(".py")) {
             return Err(PackageError::Manifest(format!(
@@ -403,12 +445,17 @@ impl PluginInstaller {
             )));
         }
         let root = self.directories.plugin_dir(PluginKind::Legacy).join(&id);
+        let alternate = self
+            .directories
+            .plugin_dir(PluginKind::Legacy)
+            .join(format!("{id}.{LEGACY_EXTENSION}"));
         self.stage_and_swap(PluginKind::Legacy, &root, &id, stop, |staging| {
             write_members(&members, staging)
         })?;
+        remove_path(&alternate);
         Ok(InstalledPlugin {
-            id,
-            version: String::new(),
+            id: id.to_owned(),
+            version: version.to_owned(),
             kind: PluginKind::Legacy,
             root,
             unsigned_binary: false,
@@ -559,9 +606,15 @@ fn artifact_id(path: &Path) -> Option<String> {
     if name.starts_with('.') {
         return None;
     }
-    Some(match name.strip_suffix(&format!(".{LEGACY_EXTENSION}")) {
-        Some(stem) if !stem.is_empty() => stem.to_owned(),
-        _ => name.to_owned(),
+    let suffix = format!(".{LEGACY_EXTENSION}");
+    let stem = name.len().checked_sub(suffix.len()).and_then(|start| {
+        let stem = name.get(..start)?;
+        let ending = name.get(start..)?;
+        ending.eq_ignore_ascii_case(&suffix).then_some(stem)
+    });
+    Some(match stem.filter(|stem| !stem.is_empty()) {
+        Some(stem) => stem.to_owned(),
+        None => name.to_owned(),
     })
 }
 

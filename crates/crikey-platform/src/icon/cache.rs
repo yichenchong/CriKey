@@ -15,11 +15,13 @@
 //! Of the nine listed invalidators, four can reach an icon, and each is a field
 //! this format compares rather than a signal somebody has to remember to send:
 //!
-//! * **Filesystem events.** The entry records the source file's length and
-//!   modification time. A theme package that replaced `firefox.png` in place
-//!   changes at least one of them, so the entry stops matching. This is what
-//!   makes the cache safe without a file watcher: the check is performed on the
-//!   read that would otherwise use the stale pixels.
+//! * **Filesystem events.** The entry records the source file's length, its
+//!   modification time and a hash of its bytes. A theme package that replaced
+//!   `firefox.png` in place changes at least the hash -- even a restore that
+//!   preserves both the length and the timestamp, which the metadata alone
+//!   cannot tell from the original. This is what makes the cache safe without a
+//!   file watcher: the check is performed on the read that would otherwise use
+//!   the stale pixels.
 //! * **Application-installation changes.** The same mechanism, one level up: an
 //!   install or removal changes which *file* a reference resolves to, so the
 //!   located path changes and the entry the new path hashes to is a different
@@ -55,7 +57,7 @@ use crate::StandardDirectories;
 /// Bump this whenever the entry body, the pixel convention, or the spec 11.7
 /// limits change: an entry written by a build that disagrees about any of them
 /// is not stale data, it is data this build cannot interpret.
-pub const ICON_CACHE_SCHEMA_VERSION: u32 = 1;
+pub const ICON_CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Marks a file as one of ours before a single field of it is trusted.
 const MAGIC: &[u8; 8] = b"CRIKICON";
@@ -66,59 +68,82 @@ const CACHE_SUBDIRECTORY: &str = "icons";
 
 /// What a source file looked like when its pixels were cached.
 ///
-/// Length and modification time together, because either alone misses a real
-/// case: an in-place edit that preserves the size keeps the length, and a
-/// restored backup or an `rsync --archive` copy keeps the timestamp.
+/// Length, modification time and a hash of the contents. The metadata alone is
+/// not proof that the pixels are current: an in-place edit that preserves the
+/// size keeps the length, a restored backup or an `rsync --archive` copy keeps
+/// the timestamp, and a restore that does both -- the ordinary case for an
+/// archive extraction or `cp -p` -- keeps the pair. The content hash is the
+/// only field a replacement cannot leave equal, so it is what decides.
+///
+/// The hash is FNV-1a rather than a cryptographic digest for the same reason
+/// [`IconImage::content_id`] is: nothing here is a trust boundary. The source
+/// file is read on every load anyway -- the cache saves the *decode*, which for
+/// a rasterised SVG is what actually costs -- so hashing it is a pass over
+/// bytes already in hand.
 ///
 /// `modified` is `None` on a filesystem that reports no modification time. Such
-/// a source is never cached: without a timestamp the cache cannot tell a
-/// replaced icon from the original, and serving the wrong icon forever is worse
-/// than decoding every time.
+/// a source is never cached: the timestamp is what bounds how long a hash
+/// collision could serve the wrong pixels, and serving the wrong icon forever
+/// is worse than decoding every time.
+///
+/// [`IconImage::content_id`]: super::IconImage::content_id
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceFingerprint {
     pub len: u64,
     pub modified: Option<(i64, u32)>,
+    pub content: u64,
 }
 
 impl SourceFingerprint {
-    /// Reads `path`'s length and modification time.
-    ///
-    /// # Errors
-    ///
-    /// The stat failure as a message, so the caller can report which icon file
-    /// could not be examined. A *missing* modification time is not an error:
-    /// that is a cacheability question, answered by `modified`.
+    /// Reads `path` and fingerprints its bytes.
     pub fn probe(path: &Path) -> Result<Self, String> {
+        let contents = fs::read(path).map_err(|error| error.to_string())?;
+        Self::probe_with_contents(path, &contents)
+    }
+
+    /// Fingerprints bytes read from `path`.
+    pub fn probe_with_contents(path: &Path, contents: &[u8]) -> Result<Self, String> {
         let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
-        let modified = metadata.modified().ok().map(|modified| {
-            match modified.duration_since(UNIX_EPOCH) {
+        let modified = metadata
+            .modified()
+            .ok()
+            .map(|modified| match modified.duration_since(UNIX_EPOCH) {
                 Ok(since) => (since.as_secs() as i64, since.subsec_nanos()),
-                // A pre-epoch timestamp is unusual but representable, and a
-                // file that carries one still has to be distinguishable from
-                // one that does not.
                 Err(before) => {
                     let before = before.duration();
                     (-(before.as_secs() as i64), before.subsec_nanos())
                 }
-            }
-        });
+            });
         Ok(Self {
-            len: metadata.len(),
+            len: contents.len() as u64,
             modified,
+            content: fnv1a(contents),
         })
     }
 
     /// Appends the fingerprint to an entry body.
-    ///
-    /// A source with no modification time is never stored, so the `(0, 0)`
-    /// fallback is unreachable in production; spelling it out keeps the layout
-    /// fixed-width rather than conditional.
     fn write_into(&self, entry: &mut Vec<u8>) {
         let (secs, nanos) = self.modified.unwrap_or((0, 0));
         entry.extend_from_slice(&self.len.to_le_bytes());
         entry.extend_from_slice(&secs.to_le_bytes());
         entry.extend_from_slice(&nanos.to_le_bytes());
+        entry.extend_from_slice(&self.content.to_le_bytes());
     }
+}
+
+/// FNV-1a over `bytes`.
+const fn fnv1a(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET;
+    let mut index = 0;
+    while index < bytes.len() {
+        hash ^= bytes[index] as u64;
+        hash = hash.wrapping_mul(PRIME);
+        index += 1;
+    }
+    hash
 }
 
 /// Everything that decides whether cached pixels answer this request.
@@ -180,7 +205,11 @@ impl IconCache {
         let len = reader.u64()?;
         let secs = reader.i64()?;
         let nanos = reader.u32()?;
-        if key.fingerprint.len != len || key.fingerprint.modified != Some((secs, nanos)) {
+        let content = reader.u64()?;
+        if key.fingerprint.len != len
+            || key.fingerprint.modified != Some((secs, nanos))
+            || key.fingerprint.content != content
+        {
             return None;
         }
 

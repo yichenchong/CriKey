@@ -15,8 +15,8 @@ mod environment;
 mod native;
 
 pub use native::{
-    build_package, inspect_package, install_native, rollback_native, verify_package, NativeInstall,
-    NativePackageReport,
+    build_package, inspect_package, install_native, install_native_with_retention, rollback_native,
+    verify_package, NativeInstall, NativePackageReport,
 };
 
 mod fetch;

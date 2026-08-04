@@ -62,9 +62,10 @@ use std::time::{Duration, Instant};
 use crikey_core::{Action, ActionId, ArgumentPolicy, ExecutionPolicy, Generation, Item, ItemId, PluginId};
 use crikey_input_scheduler::{Millis, PluginPolicy};
 use crikey_legacy_compat::{
-    discover_interpreter, shim_root, InstanceId, Interpreter, LegacyDeadlines, LegacyOutcome, LegacyPackage,
-    LegacyRequest, LegacyRequestKind, LegacyResponse, LegacyRuntime, LegacyWorker, LegacyWorkerHandle,
-    PackageLoader, TerminateHandle, TerminationReason, WorkerError, WorkerOptions, WORKER_ENTRY_FILE,
+    discover_interpreter, shim_root, InstanceId, Interpreter, LegacyCallback, LegacyDeadlines, LegacyOutcome,
+    LegacyPackage, LegacyRequest, LegacyRequestKind, LegacyResponse, LegacyRuntime, LegacyWorker,
+    LegacyWorkerHandle, PackageLoader, TerminateHandle, TerminationReason, WorkerError, WorkerOptions,
+    WORKER_ENTRY_FILE,
 };
 use crikey_plugin_model::ConcurrencySection;
 use crikey_plugin_supervisor::{
@@ -175,15 +176,15 @@ impl LegacyCallControl {
 
 #[derive(Debug, Default)]
 struct LegacyCancellation {
-    calls: Mutex<BTreeMap<PluginId, Arc<LegacyCallControl>>>,
+    calls: Mutex<BTreeMap<PluginId, (LegacyCallback, Arc<LegacyCallControl>)>>,
 }
 
 impl LegacyCancellation {
-    fn register(&self, plugin: PluginId, control: Arc<LegacyCallControl>) {
+    fn register(&self, plugin: PluginId, callback: LegacyCallback, control: Arc<LegacyCallControl>) {
         self.calls
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(plugin, control);
+            .insert(plugin, (callback, control));
     }
 
     fn unregister(&self, plugin: &PluginId) {
@@ -193,13 +194,27 @@ impl LegacyCancellation {
             .remove(plugin);
     }
 
+    fn signal_suggestions(&self) {
+        let controls = self
+            .calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .filter(|(callback, _)| *callback == LegacyCallback::OnSuggest)
+            .map(|(_, control)| control.clone())
+            .collect::<Vec<_>>();
+        for control in controls {
+            control.signal();
+        }
+    }
+
     fn signal_all(&self) {
         let controls = self
             .calls
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .values()
-            .cloned()
+            .map(|(_, control)| control.clone())
             .collect::<Vec<_>>();
         for control in controls {
             control.signal();
@@ -270,7 +285,7 @@ impl LegacyWorkerHandle for LegacyWorkerPool {
         };
         let control = Arc::new(LegacyCallControl::new());
         self.cancellation
-            .register(request.plugin.clone(), Arc::clone(&control));
+            .register(request.plugin.clone(), request.callback(), Arc::clone(&control));
         let control_for_thread = Arc::clone(&control);
         let handle = worker.terminate_handle();
         control.install(handle);
@@ -359,18 +374,13 @@ pub struct LegacyProvider {
     unavailable: Vec<LegacyUnavailable>,
     cancellation: Arc<LegacyCancellation>,
     /// Catalog rebuilds admitted against the §13.5 catalog budget but not yet
-    /// dispatched. Held here rather than started at request time because the
-    /// callback blocks on a child interpreter and must run on the supervisor
-    /// thread, serialized with every other callback for that instance (§14.5).
+    /// dispatched.
     catalog_requests: Vec<LegacyCatalogTask>,
-    /// The suggestion items currently on offer, by exact owner. An action is
-    /// executed against this snapshot, never against the item the UI echoed
-    /// back, so a superseded row cannot launch a plugin callback.
+    /// Failed `on_catalog` callbacks are retained separately from
+    /// `LegacyRuntime::deliver`, whose lifecycle accounting intentionally
+    /// treats plugin exceptions as accepted callbacks.
+    catalog_failures: BTreeMap<PluginId, String>,
     action_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
-    /// Catalog items each plugin published. Kept apart from the suggestion
-    /// snapshot because a catalog outlives the query that was on screen when
-    /// it was built; clearing it per keystroke would make catalog rows
-    /// unlaunchable a moment after they appeared.
     catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
 }
 
@@ -419,6 +429,7 @@ impl LegacyProvider {
             unavailable: Vec::new(),
             cancellation,
             catalog_requests: Vec::new(),
+            catalog_failures: BTreeMap::new(),
             action_items: Arc::new(Mutex::new(BTreeMap::new())),
             catalog_items: Arc::new(Mutex::new(BTreeMap::new())),
         };
@@ -620,7 +631,10 @@ impl LegacyProvider {
         let mut accepted = Vec::with_capacity(tasks.len());
         for task in tasks {
             match self.runtime.catalog_rebuild(&task.plugin, now) {
-                Ok(()) => accepted.push(task),
+                Ok(()) => {
+                    self.catalog_failures.remove(&task.plugin);
+                    accepted.push(task);
+                }
                 Err(error) => results.push(CatalogBuildResult::Failed {
                     plugin: task.plugin.clone(),
                     instance: task.instance,
@@ -642,6 +656,15 @@ impl LegacyProvider {
         }
 
         for task in accepted {
+            if let Some(reason) = self.catalog_failures.remove(&task.plugin) {
+                results.push(CatalogBuildResult::Failed {
+                    plugin: task.plugin,
+                    instance: task.instance,
+                    generation: task.generation,
+                    reason,
+                });
+                continue;
+            }
             if self.runtime.worker().dead.contains(&task.plugin) {
                 results.push(CatalogBuildResult::Failed {
                     plugin: task.plugin.clone(),
@@ -902,22 +925,26 @@ impl LegacyProvider {
     fn settle(&mut self, now: Millis) {
         let replies = self.runtime.worker_mut().drain_replies();
         for response in replies {
+            if response.callback == LegacyCallback::OnCatalog {
+                if let LegacyOutcome::Failed(error) = &response.outcome {
+                    self.catalog_failures.insert(
+                        response.plugin.clone(),
+                        format!("legacy `on_catalog` callback failed: {error:?}"),
+                    );
+                }
+            }
             let _ = self.runtime.deliver(response, now);
         }
     }
 }
 
-/// Action id of the single plugin-owned action every legacy item carries.
-const LEGACY_EXECUTE_ACTION_ID: &str = "legacy.execute";
-
-/// Gives a legacy item the one action it can actually perform.
-///
-/// The legacy protocol carries no per-item action list: `decode_item` always
 /// yields an empty one, because Keypirinha's actions are a package-level
 /// concept the shim does not model. Without an action the presentation layer
 /// has no default to run, so pressing Enter on a legacy row would do nothing
 /// at all. The host therefore supplies the one action the contract does
 /// define: hand the item back to its owning plugin's `on_execute` (spec 14.5).
+/// Action id of the single plugin-owned action every legacy item carries.
+const LEGACY_EXECUTE_ACTION_ID: &str = "legacy.execute";
 fn with_default_action(mut item: Item) -> Item {
     if !item.actions.is_empty() {
         return item;
@@ -1466,7 +1493,7 @@ impl LegacyDriver {
         }
         // Signal obsolete callbacks before queueing the replacement. The
         // legacy contract is cooperative termination, not a hard cancellation.
-        self.cancellation.signal_all();
+        self.cancellation.signal_suggestions();
 
         let (lock, cvar) = &*self.mailbox;
         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
@@ -1499,10 +1526,6 @@ impl LegacyDriver {
     pub fn has_plugins(&self) -> bool {
         self.has_plugins
     }
-
-    /// Takes the catalog outcomes the supervisor produced. Complete results
-    /// stay instance/generation tagged for the caller's stale-safe catalog
-    /// publication path, exactly as the modern and native drivers do.
     pub fn take_catalog_results(&self) -> Vec<CatalogBuildResult> {
         std::mem::take(
             &mut *self
@@ -1526,10 +1549,23 @@ impl LegacyDriver {
     /// Per-plugin diagnostics (spec 24.3) as of the supervisor thread's last
     /// unit of work, including the per-kind §13.5 refusal counters.
     pub fn health_report(&self) -> Vec<(PluginId, PluginHealth)> {
-        self.health
+        let mut report = self
+            .health
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .clone()
+            .clone();
+        for (plugin, budget) in &self.action_endpoint.budgets {
+            if let Some((_, health)) = report.iter_mut().find(|(id, _)| id == plugin) {
+                health.concurrency_refusals = budget.refusals_snapshot();
+            } else {
+                let health = PluginHealth {
+                    concurrency_refusals: budget.refusals_snapshot(),
+                    ..PluginHealth::default()
+                };
+                report.push((plugin.clone(), health));
+            }
+        }
+        report
     }
 }
 

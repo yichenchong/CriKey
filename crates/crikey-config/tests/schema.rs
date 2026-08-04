@@ -177,6 +177,44 @@ fn every_problem_is_reported_rather_than_only_the_first() {
 }
 
 #[test]
+fn invalid_values_in_adjacent_layers_are_both_removed() {
+    let fixture = Fixture::new("schema-adjacent-invalid");
+    fixture.user_global("[launcher]\nprofile = \"work\"\n");
+    fixture.profile("work", "[plugins.modern.example.settings]\nresult-limit = 0\n");
+    fixture.plugin_settings("modern.example", "[settings]\nresult-limit = -1\n");
+    let mut store = fixture.load().expect("every fixture file is valid");
+    let problems = store.register_plugin_schema_for(
+        &example(),
+        &schema(
+            "[[configuration.field]]\nname = \"result-limit\"\n\
+             type = \"integer\"\nminimum = 1\n",
+        ),
+        "linux",
+    );
+    assert_eq!(
+        problems.len(),
+        2,
+        "both invalid winners must be reported: {problems:?}"
+    );
+    assert!(!store.plugin_values(&example()).contains_key("result-limit"));
+}
+#[test]
+fn a_platform_restricted_configured_value_is_not_delivered() {
+    let fixture = Fixture::new("schema-platform-configured");
+    fixture.plugin_settings("modern.example", "[settings]\nregistry-path = \"shared\"\n");
+    let mut store = fixture.load().expect("an empty tree loads");
+    let section = schema("[[configuration.field]]\nname = \"registry-path\"\nplatforms = [\"windows\"]\n");
+    store.register_plugin_schema_for(&example(), &section, "linux");
+    assert!(!store.plugin_values(&example()).contains_key("registry-path"),);
+    assert!(store
+        .configuration_snapshot()
+        .values_for(&example())
+        .expect("schema plugin is present")
+        .get("registry-path")
+        .is_none());
+}
+
+#[test]
 fn a_field_restricted_to_another_platform_contributes_no_default_here() {
     let fixture = Fixture::new("schema-platform");
     let mut store = fixture.load().expect("an empty tree loads");

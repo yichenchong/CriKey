@@ -8,6 +8,7 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::time::Duration;
 
 use crate::PackageError;
 
@@ -55,16 +56,17 @@ impl HttpFetcher {
 
 impl PackageFetcher for HttpFetcher {
     fn fetch(&self, url: &str, destination: &Path) -> Result<(), PackageError> {
-        // Checked before the client is touched: `file:` and `data:` URLs would
-        // otherwise turn "download this package" into a local file read chosen
-        // by whoever wrote the URL.
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
+        if !url.starts_with("https://") {
             return Err(PackageError::SourceUnavailable(format!(
-                "{url} is not an http or https URL"
+                "{url} is not an http or https URL (HTTPS is required)"
             )));
         }
-
-        let mut response = ureq::get(url).call().map_err(|error| {
+        let agent = ureq::Agent::config_builder()
+            .https_only(true)
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build()
+            .new_agent();
+        let mut response = agent.get(url).call().map_err(|error| {
             PackageError::SourceUnavailable(format!("{url} could not be fetched: {error}"))
         })?;
         let status = response.status();

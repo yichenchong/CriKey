@@ -97,7 +97,7 @@ const SCHEDULING_PROFILE_SUFFIX: &str = ".scheduling-profile";
 /// optional; an absent file contributes nothing. A file that exists but cannot
 /// be read or parsed IS an error, because silently ignoring a user's settings
 /// because of a typo is worse than refusing to start with the reason.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConfigStore {
     layers: [BTreeMap<String, String>; LAYER_COUNT],
     /// Where [`Self::save`] writes. Retained so a store built for a temporary
@@ -108,6 +108,39 @@ pub struct ConfigStore {
     /// Registered `[configuration]` schemas, by plugin id. The only thing that
     /// knows which keys hold secrets.
     schemas: BTreeMap<String, ConfigurationSection>,
+    /// Whether a plugin key with no registered schema must be treated as secret.
+    ///
+    /// Set by [`Self::redact_unregistered_plugins`] when schema discovery was
+    /// incomplete. See that method for why the default is `false`.
+    redact_unregistered: bool,
+}
+
+/// Prints the SHAPE of the store and none of its values.
+///
+/// Hand-written rather than derived because `layers` holds every effective raw
+/// value, including fields a schema marks `secret`, and `{store:?}` in a
+/// diagnostic or a failing assertion would print them without passing through
+/// [`ConfigStore::display_value`] (spec 21.3). Every value is redacted rather
+/// than only the known secrets: a `Debug` rendering is never the way to read
+/// configuration — [`ConfigStore::display_value`] is — so there is nothing to
+/// trade against failing closed, and a store whose schemas have not registered
+/// yet does not even know which keys are secret.
+impl std::fmt::Debug for ConfigStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let keys: Vec<Vec<&str>> = self
+            .layers
+            .iter()
+            .map(|layer| layer.keys().map(String::as_str).collect())
+            .collect();
+        formatter
+            .debug_struct("ConfigStore")
+            .field("config_path", &self.config_path)
+            .field("sources", &self.sources)
+            .field("schemas", &self.schemas.keys().collect::<Vec<_>>())
+            .field("redact_unregistered", &self.redact_unregistered)
+            .field("layer_keys", &keys)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConfigStore {
@@ -132,6 +165,16 @@ impl ConfigStore {
         directories: &StandardDirectories,
         policy: Option<&Path>,
     ) -> Result<Self, ConfigError> {
+        Self::load_with_overrides(directories, policy, &[])
+    }
+
+    /// Loads every layer and applies process-only overrides before selecting a
+    /// profile. This is the production entry point for layer 7.
+    pub fn load_with_overrides(
+        directories: &StandardDirectories,
+        policy: Option<&Path>,
+        overrides: &[(String, String)],
+    ) -> Result<Self, ConfigError> {
         let config_dir = directories.config_dir();
         let config_path = config_dir.join(USER_CONFIG_FILE);
         let mut store = Self {
@@ -139,26 +182,29 @@ impl ConfigStore {
             config_path: config_path.clone(),
             sources: Vec::new(),
             schemas: BTreeMap::new(),
+            redact_unregistered: false,
         };
-
         for (key, value) in BUILT_IN_DEFAULTS {
             store.layers[ConfigLayer::BuiltInDefaults.index()].insert((*key).to_owned(), (*value).to_owned());
         }
-
         if let Some(policy) = policy {
             store.read_file_into(ConfigLayer::AdministratorPolicy, policy, "")?;
         }
         store.read_file_into(ConfigLayer::UserGlobal, &config_path, "")?;
-
-        // The profile is chosen by the layers already loaded, so an
-        // administrator can pin one and a user can select one. A profile file
-        // naming a different profile is NOT followed: one indirection is a
-        // feature, a chain of them is a way to make startup non-terminating.
+        for (key, value) in overrides {
+            store.set_session_override(key, value);
+        }
         if let Some(profile) = store.get(KEY_PROFILE).map(str::to_owned) {
+            if !valid_profile_name(&profile) {
+                return Err(ConfigError::Profile {
+                    path: config_dir.join(PROFILE_DIRECTORY),
+                    name: profile,
+                    reason: "must be one safe path component",
+                });
+            }
             let path = config_dir.join(PROFILE_DIRECTORY).join(format!("{profile}.toml"));
             store.read_file_into(ConfigLayer::Profile, &path, "")?;
         }
-
         store.read_plugin_files(&config_dir.join(PLUGIN_DIRECTORY))?;
         Ok(store)
     }
@@ -180,10 +226,9 @@ impl ConfigStore {
                 })
             }
         };
-        let table: toml::Table = text.parse().map_err(|source| ConfigError::Parse {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let table: toml::Table = text
+            .parse()
+            .map_err(|source: toml::de::Error| ConfigError::parse(path, &text, &source))?;
         let mut flat = BTreeMap::new();
         tomlmap::flatten(&table, prefix, path, &mut flat)?;
         self.layers[layer.index()].extend(flat);
@@ -269,11 +314,17 @@ impl ConfigStore {
     /// back out of its own configuration.
     pub fn plugin_values(&self, plugin: &PluginId) -> BTreeMap<String, String> {
         let prefix = format!("{PLUGINS_PREFIX}{}{SETTINGS_MARKER}", plugin.0);
+        let declared = self.schemas.get(&plugin.0);
         let mut fields = BTreeSet::new();
         for layer in &self.layers {
             for key in layer.keys() {
                 if let Some(field) = key.strip_prefix(&prefix) {
-                    fields.insert(field.to_owned());
+                    if declared
+                        .and_then(|section| section.field(field))
+                        .is_none_or(|field| field.applies_to(std::env::consts::OS))
+                    {
+                        fields.insert(field.to_owned());
+                    }
                 }
             }
         }
@@ -419,25 +470,29 @@ impl ConfigStore {
                     continue;
                 }
             }
-            match self.resolve(&key) {
-                Some((layer, value)) => {
-                    if let Err(violation) = field.validate(value) {
-                        problems.push(ConfigError::Schema {
-                            plugin: plugin.0.clone(),
-                            violation,
-                        });
-                        self.layers[layer.index()].remove(&key);
+            loop {
+                match self.resolve(&key) {
+                    Some((layer, value)) => {
+                        if let Err(violation) = field.validate(value) {
+                            problems.push(ConfigError::Schema {
+                                plugin: plugin.0.clone(),
+                                violation,
+                            });
+                            self.layers[layer.index()].remove(&key);
+                            continue;
+                        }
                     }
+                    None if field.required => problems.push(ConfigError::Schema {
+                        plugin: plugin.0.clone(),
+                        violation: FieldViolation {
+                            field: field.name.clone(),
+                            rule: RULE_REQUIRED,
+                            detail: "is required and no layer supplies a value".to_owned(),
+                        },
+                    }),
+                    None => {}
                 }
-                None if field.required => problems.push(ConfigError::Schema {
-                    plugin: plugin.0.clone(),
-                    violation: FieldViolation {
-                        field: field.name.clone(),
-                        rule: RULE_REQUIRED,
-                        detail: "is required and no layer supplies a value".to_owned(),
-                    },
-                }),
-                None => {}
+                break;
             }
         }
 
@@ -471,19 +526,28 @@ impl ConfigStore {
         problems
     }
 
-    /// Whether `key` names a field its plugin declared `secret` (spec 21.3).
+    /// Whether `key` names a field that must be redacted in diagnostics.
     ///
-    /// A key whose plugin registered no schema is not secret: nothing has
-    /// claimed it is, and inventing secrecy for unknown keys would redact the
-    /// whole store and make `crikey config` useless.
+    /// A namespace whose schema discovery failed is also secret: the host cannot
+    /// prove that an undeclared key is non-secret, and displaying it would turn
+    /// an unrelated manifest error into a token dump (spec 21.3).
     pub fn is_secret(&self, key: &str) -> bool {
         let Some((plugin, field)) = split_setting_key(key) else {
             return false;
         };
-        self.schemas
-            .get(plugin)
-            .and_then(|section| section.field(field))
-            .is_some_and(|declared| declared.secret)
+        match self.schemas.get(plugin).and_then(|section| section.field(field)) {
+            Some(declared) => declared.secret,
+            None => self.redact_unregistered,
+        }
+    }
+
+    /// Fail closed for every namespace without a successfully loaded schema.
+    ///
+    /// Schema discovery is performed by the CLI and launcher after the store
+    /// loads its raw layers. If any package failed to load, unknown namespaces
+    /// are conservatively redacted until their schema is known.
+    pub fn redact_unregistered_plugins(&mut self) {
+        self.redact_unregistered = true;
     }
 
     /// The value of `key` as it may be shown to a human.
@@ -637,6 +701,16 @@ fn parse_scheduling_profile(text: &str) -> Option<SchedulingProfile> {
     .find(|profile| scheduling_profile_name(*profile) == text)
 }
 
+fn valid_profile_name(name: &str) -> bool {
+    if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\', ':']) {
+        return false;
+    }
+    let mut components = std::path::Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;

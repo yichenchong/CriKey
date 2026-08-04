@@ -75,11 +75,14 @@ const PROBE_DIAGNOSTIC_BYTES: usize = 512;
 /// bounded because a candidate that has not answered by then is not going to.
 const PROBE_SCAN_LINES: usize = 16;
 
-/// Maximum time spent probing one interpreter candidate.
+/// Maximum time spent probing one explicitly selected interpreter.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Bound on waiting for a killed probe to be reaped.
+/// Grace period for reaping a killed probe without blocking startup.
 const PROBE_REAP_GRACE: Duration = Duration::from_millis(250);
+/// Maximum time spent probing the whole search-path catalog.
+const CATALOG_PROBE_BUDGET: Duration = Duration::from_secs(5);
+/// A bounded PATH cannot force unbounded child-process probes.
+const MAX_CATALOG_CANDIDATES: usize = 32;
 
 /// Bound on captured probe output. The reader keeps draining after this limit
 /// so a noisy candidate cannot deadlock on a full pipe.
@@ -444,10 +447,15 @@ impl RuntimeCatalog {
             };
         }
 
+        let deadline = Instant::now() + CATALOG_PROBE_BUDGET;
         let interpreters = environment
             .enumerate_search_path()
             .into_iter()
-            .filter_map(|path| probe(&path, InterpreterSource::SearchPath).ok())
+            .take(MAX_CATALOG_CANDIDATES)
+            .filter_map(|path| {
+                let remaining = deadline.checked_duration_since(Instant::now())?;
+                probe_with_timeout(&path, InterpreterSource::SearchPath, remaining).ok()
+            })
             .collect();
 
         Self {
@@ -586,11 +594,15 @@ fn resolve(
 }
 
 /// Executes `path` and reads the version it reports.
-///
-/// The version is never guessed from the file name: `python3.7` may be a
-/// symlink to 3.12 and `python3` may be 3.6, so only the interpreter's own
-/// answer decides whether plugin code may run on it.
 fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, HostError> {
+    probe_with_timeout(path, source, PROBE_TIMEOUT)
+}
+
+fn probe_with_timeout(
+    path: &Path,
+    source: InterpreterSource,
+    timeout: Duration,
+) -> Result<Interpreter, HostError> {
     let mut command = Command::new(path);
     sanitize_python_environment(&mut command);
     command
@@ -616,7 +628,7 @@ fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, HostErro
     let stdout_thread = spawn_probe_drain(stdout, Arc::clone(&stdout_capture));
     let stderr_thread = spawn_probe_drain(stderr, Arc::clone(&stderr_capture));
 
-    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -628,18 +640,15 @@ fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, HostErro
                 if let Some(status) = wait_probe_bounded(&mut child, PROBE_REAP_GRACE) {
                     let _ = status;
                 } else {
-                    // SIGKILL normally makes the child reapable immediately.
-                    // If the kernel still withholds a status, finish the reap
-                    // away from the discovery caller rather than blocking it.
                     reap_probe_in_background(child);
                 }
                 finish_probe_drain(stdout_thread, &stdout_capture);
                 finish_probe_drain(stderr_thread, &stderr_capture);
                 return Err(HostError::Interpreter(format!(
                     "the {source} interpreter candidate {} did not answer its version probe \
-                     within {} seconds and was stopped",
+                     within {:?} and was stopped",
                     path.display(),
-                    PROBE_TIMEOUT.as_secs()
+                    timeout
                 )));
             }
         }
