@@ -1068,9 +1068,11 @@ A plugin manifest, compatibility record, or user override may select:
 
 Plugins requiring incompatible Python versions shall execute in separate processes.
 
-The current implementation exposes explicit runtime-profile selection, but does
-not yet map every plugin's declared Python requirement to a profile
-automatically; see the M3 verification limit in the roadmap.
+The current implementation maps a plugin's declared `requires-python` to a
+runtime profile automatically, selecting an interpreter that satisfies it from
+those installed on the host; `CRIKEY_PYTHON` overrides the mapping. Two plugins
+with incompatible requirements therefore resolve to different interpreters and
+run in different worker processes.
 
 ### 14.12 Compatibility limitations
 
