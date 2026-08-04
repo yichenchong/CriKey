@@ -19,9 +19,11 @@ use crikey_core::{
 };
 
 mod bundle;
+mod directories;
 pub mod window;
 
 pub use bundle::{bundle_display_name, parse_info_plist, AppBundle};
+pub use directories::{DirectoryConvention, DirectoryEnvironment, PluginKind, StandardDirectories};
 pub use window::{WindowHandle, WindowInfo, WindowService};
 
 /// Optional platform capabilities and their availability (spec 18.2).
