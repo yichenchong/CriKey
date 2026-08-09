@@ -78,7 +78,12 @@ jobs:
       - name: Install the WiX v4 toolset
         # Deliberately not vendored, for the reason build.ps1 gives: the MSI is
         # produced by the published toolset, not by a copy in this repository.
-        run: dotnet tool install --global wix
+        # The major version is pinned because `crikey.wxs` declares the v4
+        # schema, and because WiX v6 and later refuse to build at all until an
+        # Open Source Maintenance Fee licence is accepted (WIX7015) - an
+        # unpinned `dotnet tool install wix` fails on that, not on our
+        # authoring.
+        run: dotnet tool install --global wix --version "4.*"
       - name: Build the MSI
         shell: pwsh
         run: ./packaging/windows/build.ps1 -Unsigned -Format msi -OutputDirectory target/packaging/windows
