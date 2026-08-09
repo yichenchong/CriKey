@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  CriKey per-user MSI, WiX v4 (WixToolset.Sdk / the `wix` dotnet tool).
+  CriKey per-user MSI, WiX v5 (WixToolset.Sdk / the `wix` dotnet tool).
 
   WHY v4 AND NOT v3
   =================

@@ -75,15 +75,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build the release executables
         run: cargo build --release --locked --package crikey-cli --package crikey-wasm-host --package crikey-cabi-host
-      - name: Install the WiX v4 toolset
+      - name: Install the WiX toolset
         # Deliberately not vendored, for the reason build.ps1 gives: the MSI is
         # produced by the published toolset, not by a copy in this repository.
-        # The major version is pinned because `crikey.wxs` declares the v4
-        # schema, and because WiX v6 and later refuse to build at all until an
-        # Open Source Maintenance Fee licence is accepted (WIX7015) - an
-        # unpinned `dotnet tool install wix` fails on that, not on our
-        # authoring.
-        run: dotnet tool install --global wix --version "4.*"
+        # The major version is pinned at both ends. `crikey.wxs` harvests the
+        # payload directories with `<Files Include="...">`, which v4 does not
+        # know (WIX0005), and WiX v6 and later refuse to build at all until an
+        # Open Source Maintenance Fee licence is accepted (WIX7015). v5 is the
+        # one version that both understands this authoring and needs no licence
+        # acceptance, so an unpinned `dotnet tool install wix` fails on the
+        # toolset rather than on anything in the tree.
+        run: dotnet tool install --global wix --version "5.*"
       - name: Build the MSI
         shell: pwsh
         run: ./packaging/windows/build.ps1 -Unsigned -Format msi -OutputDirectory target/packaging/windows

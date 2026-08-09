@@ -10,7 +10,7 @@
     both supervised runtime hosts, modern Python plugins and every legacy
     Keypirinha package or one of those runtimes stops loading only when invoked.
 
-    It drives, it does not reimplement. The MSI is produced by the WiX v4
+    It drives, it does not reimplement. The MSI is produced by the WiX v5
     toolset from packaging\windows\crikey.wxs; the MSIX is produced by
     makeappx.exe from packaging\windows\AppxManifest.xml. When the required
     toolchain is not installed the script stops with a named error saying which
@@ -367,10 +367,10 @@ if (-not $Unsigned) {
 }
 
 if ($Format -eq 'msi' -or $Format -eq 'both') {
-    # `wix` is the WiX v4 dotnet tool. It is deliberately not vendored: a
+    # `wix` is the WiX v5 dotnet tool. It is deliberately not vendored: a
     # packaging toolchain installed by the packaging script is a toolchain
     # nobody pinned.
-    $wix = Resolve-RequiredTool -Name 'wix' -ProvidedBy 'the WiX v4 toolset: dotnet tool install --global wix'
+    $wix = Resolve-RequiredTool -Name 'wix' -ProvidedBy 'the WiX v5 toolset: dotnet tool install --global wix --version "5.*"'
 
     $msi = Join-Path $OutputDirectory "CriKey-$Version-x64.msi"
     Write-Note "building $msi"

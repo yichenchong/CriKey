@@ -45,7 +45,7 @@ guarantee a usable `python3`.
 
 | File | What it is |
 | --- | --- |
-| `crikey.wxs` | **WiX v4** per-user MSI. v4, not v3: it is a pinnable `dotnet tool`, and its `Files` element harvests the two Python payload trees without generating an unreviewed `heat.exe` fragment on every build. |
+| `crikey.wxs` | **WiX v5** per-user MSI. Not v3: the toolset is a pinnable `dotnet tool`, and the `Files` element harvests the two Python payload trees without generating an unreviewed `heat.exe` fragment on every build. Not v4, which rejects `Files` (WIX0005), and not v6 or later, which refuse to build without an Open Source Maintenance Fee licence (WIX7015). |
 | `AppxManifest.xml` | MSIX manifest for the modern route. Full-trust Win32 application, one capability. |
 | `build.ps1` | Stages the release layout and drives whichever toolchain is present. |
 | `sign.ps1` | Authenticode signing and verification, parameterised from the environment. |
@@ -320,7 +320,7 @@ which tool is missing and what provides it.
 | Step | Needs | Why |
 | --- | --- | --- |
 | `cargo build --release` for the target | A Windows or macOS host, or a cross toolchain | The platform backends link Win32 / are `cfg(target_os = "macos")`. |
-| `wix build` | Windows | WiX v4 emits an MSI through Windows Installer libraries. |
+| `wix build` | Windows | WiX v5 emits an MSI through Windows Installer libraries. |
 | `wix msi validate` (`build.ps1 -Validate`) | Windows, under an interactive or administrator account | The stock ICEs are custom actions executed through Windows Installer, which the non-interactive service accounts on hosted CI machines cannot do. |
 | `makeappx.exe pack` | Windows SDK on Windows | No cross-platform packer exists. |
 | `signtool sign` / `verify` | Windows SDK on Windows | Authenticode signing and the CryptoAPI trust evaluation. |
