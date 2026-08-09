@@ -153,6 +153,34 @@ pub struct ExecuteRequest {
     pub argument: Option<String>,
 }
 
+/// What a host [`ResourceRequest`] is asking for (spec 16.4).
+///
+/// [`ResourceRequest`]: protocol::message::ResourceRequest
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// Icon pixels for an item the plugin published.
+    Icon,
+    /// An opaque file shipped inside the plugin package.
+    File,
+    /// Configuration data owned by the plugin.
+    Configuration,
+    /// A kind this SDK release does not know. A plugin should decline it
+    /// rather than guess: the host will read the answer as the kind it asked
+    /// for, not the kind the plugin assumed.
+    Unknown,
+}
+
+/// Bytes a plugin serves for one resource reference (spec 16.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginResource {
+    /// The payload itself. The host enforces its own size ceiling, so a
+    /// plugin that serves something enormous gets it dropped, not rendered.
+    pub content: Vec<u8>,
+    /// An IANA media type such as `image/png`, or empty when unknown. The
+    /// host sniffs the content regardless; this is a hint, never a promise.
+    pub media_type: String,
+}
+
 /// The trait a native plugin implements (spec 16.7).
 pub trait Plugin {
     /// Initializes plugin state before requests are served.
@@ -196,5 +224,20 @@ pub trait Plugin {
     /// Notifies the plugin that the host deactivated it (spec 13.2).
     fn on_deactivated(&mut self, _context: &dyn PluginContext) -> Result<()> {
         Ok(())
+    }
+
+    /// Serves one resource the host asked for (spec 16.4).
+    ///
+    /// `Ok(None)` means "I do not have that", which is the default and is not
+    /// an error: a plugin that publishes no icons of its own never needs to
+    /// implement this. The host bounds both the wait and the payload size, so
+    /// an implementation must return promptly and must not stream.
+    fn resource(
+        &mut self,
+        _kind: ResourceKind,
+        _reference: &str,
+        _context: &dyn PluginContext,
+    ) -> Result<Option<PluginResource>> {
+        Ok(None)
     }
 }

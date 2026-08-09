@@ -1268,6 +1268,22 @@ fn safe_relative_path(name: &str) -> Option<PathBuf> {
         if part.is_empty() || part == "." {
             continue;
         }
+        // `..` is refused outright rather than resolved. It is also caught by
+        // the trailing-dot rule below, but relying on that would make a
+        // traversal defence an accident of Windows filename hygiene.
+        if part == ".." {
+            return None;
+        }
+        // A colon makes a Windows path mean something else entirely: `C:evil`
+        // is drive-relative, so `PathBuf::push` REPLACES the extraction root
+        // with it, and `file:stream` names an NTFS alternate data stream that
+        // writes bytes no later reader of `file` can see. Neither is a legal
+        // filename on Windows anyway, so refusing the character everywhere
+        // costs nothing and keeps one package extracting identically on every
+        // host.
+        if part.contains(':') {
+            return None;
+        }
         // Windows trims trailing dots/spaces and reserves DOS device names;
         // accepting either would let two archive paths overwrite one another
         // or make `File::create` open a device on a Windows host. Refuse these

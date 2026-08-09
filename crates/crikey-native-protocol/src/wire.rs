@@ -1,16 +1,99 @@
 //! Proto3 primitive encoding and unknown-field retention (spec 16.3).
 
 use crate::ProtocolError;
-/// Maximum heap budget charged while decoding one message tree. The frame
-/// limit bounds input bytes, while this separate budget also bounds the
-/// number and capacity of decoded repeated fields.
-pub(crate) const DECODE_ALLOCATION_BUDGET: usize = 8 * 1024 * 1024;
+/// Maximum heap budget charged while decoding one message tree.
+///
+/// This is the *decodable* ceiling, and it is the tighter of the protocol's
+/// two limits. [`crate::MAX_FRAME_BYTES`] bounds the bytes that may be put on
+/// the wire; this bounds the heap those bytes may turn into. The two are not
+/// interchangeable: a repeated field costs far more heap than wire, so a
+/// producer that sizes a batch against the frame cap alone can emit a frame
+/// that is accepted on the wire and then refused while decoding.
+///
+/// The budget deliberately does *not* scale with the input. Eight MiB of
+/// two-byte empty `Item` submessages would materialise four million `Item`
+/// values — hundreds of megabytes — so an absolute ceiling is the only thing
+/// standing between a hostile frame and an allocation the host cannot refuse.
+/// Raising it to make every frame-sized batch decodable would trade that
+/// defence away, so the producer side derives from this instead: see
+/// [`RepeatedFieldCharge`] and [`crate::message::max_decodable_items`],
+/// which let a producer size a batch in the decoder's own currency rather
+/// than guess in bytes.
+pub const DECODE_ALLOCATION_BUDGET: usize = 8 * 1024 * 1024;
 const MAX_DECODE_DEPTH: usize = 64;
 
 /// Conservative accounting for one repeated value or map node. It prevents
 /// a legal frame containing millions of empty repeated fields from forcing a
 /// proportional allocation before host-level limits can run.
-const DECODE_REPETITION_OVERHEAD: usize = 64;
+pub const DECODE_REPETITION_OVERHEAD: usize = 64;
+
+/// Capacity a repeated field grows to once it is full at `current`.
+///
+/// The decoder ([`push_decoded`]) and the producer-side estimate
+/// ([`RepeatedFieldCharge`]) both go through this one rule, so the cost a
+/// producer computes cannot drift from the cost the decoder charges.
+/// `None` means the growth arithmetic overflowed.
+pub(crate) fn grown_capacity(current: usize) -> Option<usize> {
+    if current == 0 {
+        return Some(4);
+    }
+    let doubled = current.checked_mul(2)?;
+    let limited = current.checked_add(1024)?;
+    Some(doubled.min(limited))
+}
+
+/// Producer-side mirror of the heap [`push_decoded`] charges for one repeated
+/// field, maintained incrementally so sizing a batch stays O(1) per element.
+///
+/// A producer cannot discover the real ceiling by counting wire bytes, and
+/// it must not have to guess: this is the same arithmetic the decoder runs,
+/// driven from the sending side.
+#[derive(Debug, Clone)]
+pub struct RepeatedFieldCharge {
+    element: usize,
+    capacity: usize,
+    length: usize,
+    charged: usize,
+}
+
+impl RepeatedFieldCharge {
+    /// Accounting for a `Vec<T>` that starts empty.
+    pub fn new<T>() -> Self {
+        Self {
+            element: std::mem::size_of::<T>(),
+            capacity: 0,
+            length: 0,
+            charged: 0,
+        }
+    }
+
+    /// Accounts for appending one more value and returns the running total.
+    pub fn push(&mut self) -> usize {
+        if self.length == self.capacity {
+            let next = grown_capacity(self.capacity).unwrap_or(usize::MAX);
+            self.charged = self
+                .charged
+                .saturating_add(next.saturating_sub(self.capacity).saturating_mul(self.element));
+            self.capacity = next;
+        }
+        self.length = self.length.saturating_add(1);
+        self.charged = self
+            .charged
+            .saturating_add(self.element.saturating_add(DECODE_REPETITION_OVERHEAD));
+        self.charged
+    }
+
+    /// Heap charged for every value appended so far.
+    pub fn charged(&self) -> usize {
+        self.charged
+    }
+}
+
+/// Heap the decoder charges for one decoded map entry, excluding the key and
+/// value bytes themselves.
+pub fn map_entry_charge() -> usize {
+    std::mem::size_of::<(String, String)>().saturating_add(DECODE_REPETITION_OVERHEAD)
+}
 
 #[derive(Debug)]
 pub(crate) struct DecodeBudget {
@@ -38,21 +121,24 @@ impl DecodeBudget {
         self.depth -= 1;
     }
 
+    /// Charging past the budget is reported as [`ProtocolError::DecodeBudgetExceeded`]
+    /// rather than as generic malformedness: the bytes were well formed and
+    /// within the frame cap, and the receiver refused only the heap they
+    /// would become. Saying so is what lets a diagnostic name the real cause
+    /// instead of blaming the producer for bad bytes.
     fn charge(&mut self, amount: usize) -> Result<(), ProtocolError> {
         if amount > self.remaining {
-            return Err(ProtocolError::Malformed(
-                "message decode allocation budget exhausted".to_owned(),
-            ));
+            return Err(ProtocolError::DecodeBudgetExceeded {
+                requested: amount,
+                remaining: self.remaining,
+            });
         }
         self.remaining -= amount;
         Ok(())
     }
 
     pub(crate) fn charge_map_entry(&mut self) -> Result<(), ProtocolError> {
-        let amount = std::mem::size_of::<(String, String)>()
-            .checked_add(DECODE_REPETITION_OVERHEAD)
-            .ok_or_else(|| ProtocolError::Malformed("message decode allocation overflow".to_owned()))?;
-        self.charge(amount)
+        self.charge(map_entry_charge())
     }
 }
 
@@ -64,18 +150,8 @@ pub(crate) fn push_decoded<T>(
     budget: &mut DecodeBudget,
 ) -> Result<(), ProtocolError> {
     let growth = if values.len() == values.capacity() {
-        let target =
-            if values.capacity() == 0 {
-                4
-            } else {
-                let doubled = values.capacity().checked_mul(2).ok_or_else(|| {
-                    ProtocolError::Malformed("message decode allocation overflow".to_owned())
-                })?;
-                let limited = values.capacity().checked_add(1024).ok_or_else(|| {
-                    ProtocolError::Malformed("message decode allocation overflow".to_owned())
-                })?;
-                doubled.min(limited)
-            };
+        let target = grown_capacity(values.capacity())
+            .ok_or_else(|| ProtocolError::Malformed("message decode allocation overflow".to_owned()))?;
         target
             .checked_sub(values.capacity())
             .ok_or_else(|| ProtocolError::Malformed("message decode allocation overflow".to_owned()))?

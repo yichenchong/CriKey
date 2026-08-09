@@ -18,4 +18,7 @@ pub use stream::{
     READER_QUEUE_CAPACITY, READER_QUEUE_MAX_BYTES,
 };
 pub use supervisor::{NativeSupervisor, SupervisorConfig};
-pub use worker::{CancelHandle, ExitKind, ExitRecord, HostError, NativeWorker, PluginHandshake};
+pub use worker::{
+    CancelHandle, ExitKind, ExitRecord, HostError, NativeWorker, PluginHandshake, PluginResource,
+    ResourceKind,
+};

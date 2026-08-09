@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crikey_core::PluginId;
+use crikey_sandbox::SandboxPolicy;
 
 /// Executable and restricted environment used for one native plugin process.
 ///
@@ -17,6 +18,15 @@ pub struct LaunchSpec {
     pub working_dir: Option<PathBuf>,
     /// Extra variables on top of the restricted base environment (spec 16.6).
     pub environment: Vec<(String, String)>,
+    /// Whether the child also inherits this process's environment.
+    ///
+    /// `false` is the default posture and the one the spec describes: the
+    /// child is started from an empty environment plus the handful of
+    /// variables the host puts back. `true` is what `permissions.environment`
+    /// buys — the ambient variables reach the plugin as well. The grant has to
+    /// decide something real, or a manifest that asks for environment access
+    /// and a manifest that does not would produce identical child processes.
+    pub inherit_environment: bool,
 }
 
 /// IPC transport selected for one native worker (spec 16.2).
@@ -175,6 +185,11 @@ pub struct WorkerOptions {
     pub call_timeout_ms: u64,
     pub shutdown_timeout_ms: u64,
     pub limits: ResourceLimits,
+    /// What the child may write to, and whether it may open TCP sockets
+    /// (spec 20.2). The default is scratch space and the usual device files:
+    /// a native plugin is handed no writable directory of its own unless the
+    /// caller names one.
+    pub sandbox: SandboxPolicy,
 }
 
 impl Default for WorkerOptions {
@@ -192,6 +207,7 @@ impl WorkerOptions {
             call_timeout_ms: 5_000,
             shutdown_timeout_ms: 2_000,
             limits: ResourceLimits::default(),
+            sandbox: crikey_sandbox::plugin_policy(Vec::<std::path::PathBuf>::new(), false),
         }
     }
 

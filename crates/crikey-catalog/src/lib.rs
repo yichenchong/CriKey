@@ -1536,13 +1536,33 @@ fn take_item(cursor: &mut Cursor<'_>) -> Option<Item> {
     })
 }
 
-/// Decodes an archive that must belong to `plugin`.
+/// Encodes one slice as a self-contained slice document.
+///
+/// Public because the archive is not only a cache entry: a remote catalog
+/// source publishes exactly these bytes over the network, and the launcher
+/// admits them through the same bounded, field-by-field decoder it uses for a
+/// file it wrote itself (ADR-0016). Exposing the encoder is what lets a
+/// publisher produce a document this decoder accepts without a second format
+/// and a second set of validation rules.
+///
+/// `None` means one field's encoded length overflows the archive's 32 bit
+/// length prefix, which no realistic catalog reaches.
+pub fn encode_slice_document(slice: &CachedSlice) -> Option<Vec<u8>> {
+    encode_archive(slice).ok()
+}
+
+/// Decodes a slice document whose owner is stated by the document itself.
 ///
 /// `None` covers every reason the bytes cannot be trusted: wrong magic, a
-/// foreign schema version, a length that disagrees with the file, a checksum
-/// mismatch, an unknown tag, invalid UTF-8, a short read, trailing bytes, or an
-/// archive recording a different owner.
-fn decode_archive(plugin: &PluginId, bytes: &[u8]) -> Option<CachedSlice> {
+/// foreign schema version, a length that disagrees with the document, a
+/// checksum mismatch, an unknown tag, invalid UTF-8, a short read, trailing
+/// bytes, or an item claiming an owner other than the one the document
+/// records.
+///
+/// The owner is *read* rather than *asserted* here, which is the one thing a
+/// remote document needs that a cache entry does not: the publisher names
+/// itself, and the caller decides whether that name is one it will admit.
+pub fn decode_slice_document(bytes: &[u8]) -> Option<CachedSlice> {
     let mut header = Cursor::new(bytes);
     if header.take_array::<MAGIC_BYTES>()? != MAGIC {
         return None;
@@ -1559,9 +1579,6 @@ fn decode_archive(plugin: &PluginId, bytes: &[u8]) -> Option<CachedSlice> {
 
     let mut cursor = Cursor::new(payload);
     let owner = PluginId(cursor.string()?);
-    if &owner != plugin {
-        return None;
-    }
     let instance = cursor.u64()?;
     let generation = Generation::from_raw(cursor.u64()?);
 
@@ -1589,6 +1606,15 @@ fn decode_archive(plugin: &PluginId, bytes: &[u8]) -> Option<CachedSlice> {
         generation,
         items,
     })
+}
+
+/// Decodes an archive that must belong to `plugin`.
+///
+/// Everything [`decode_slice_document`] refuses, plus an archive recording a
+/// different owner: a cache entry is read from the file named after its owner,
+/// so the name and the contents must agree.
+fn decode_archive(plugin: &PluginId, bytes: &[u8]) -> Option<CachedSlice> {
+    decode_slice_document(bytes).filter(|slice| &slice.plugin == plugin)
 }
 
 // ---------------------------------------------------------------------------

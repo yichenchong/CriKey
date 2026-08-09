@@ -1,0 +1,51 @@
+[package]
+name = "crikey-wasm-host"
+description = "Out-of-process WebAssembly plugin host for CriKey."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "crikey_wasm_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crikey-wasm-host"
+path = "src/main.rs"
+required-features = ["engine"]
+
+[features]
+# The interpreter is a feature so a guest can depend on this crate purely for
+# the shared ABI codec without linking an interpreter into a `wasm32` artefact.
+# The SDK is gated with it because only `guest`, `plugin` and the binary name
+# it: leaving it unconditional pulled the whole native protocol stack --
+# listeners, Unix sockets, named pipes -- into `wasm32` builds that can never
+# use any of it. The `crikey-wasm-host` binary requires the feature and says
+# so via `required-features`.
+default = ["engine"]
+engine = ["dep:wasmi", "dep:crikey-plugin-sdk"]
+
+[dependencies]
+crikey-core.workspace = true
+crikey-plugin-model.workspace = true
+crikey-plugin-sdk = { path = "../../sdk/rust", version = "0.1.0", optional = true }
+
+# The WebAssembly interpreter. `default-features = false` with only `std`
+# deliberately drops wasmi's `wat` feature: with it enabled `Module::new`
+# silently accepts WebAssembly *text*, so a `.wasm` file that is really a WAT
+# source would load. A plugin runtime must accept exactly one input encoding,
+# and dropping the feature also removes seven crates (wat, wast, bumpalo,
+# leb128fmt, memchr, unicode-width, wasm-encoder) from the build. See ADR-0014.
+wasmi = { version = "1.1", default-features = false, features = ["std"], optional = true }
+
+[dev-dependencies]
+# WebAssembly text assembler, used only to build the test fixtures in
+# `tests/`. Keeping it a dev-dependency is what lets the production build
+# refuse text modules outright.
+wat = "1"

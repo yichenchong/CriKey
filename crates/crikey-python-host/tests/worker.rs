@@ -469,6 +469,26 @@ class Fixture(Plugin):
         context.emit(Item(stable_id="foreground", label="foreground", target="foreground"))
 "#;
 
+/// Registers exactly one coroutine whose only effect is a file the test can
+/// see. Whether that file ever appears is the whole observation: a coroutine
+/// the host refused is closed unrun, so the marker's absence is proof the
+/// plugin got no background execution rather than proof it was merely slow.
+const BACKGROUND_MARKER: &str = r#"
+from crikey_sdk.plugin import Item, Plugin
+
+
+class Fixture(Plugin):
+    def suggest(self, query, context):
+        marker = query.text
+
+        async def background():
+            with open(marker, "w") as handle:
+                handle.write("ran")
+
+        context.spawn(background())
+        context.emit(Item(stable_id="foreground", label="foreground", target="foreground"))
+"#;
+
 /// Streams partial suggestion batches without end and never returns a terminal
 /// frame. A correct host bounds the whole call (one aggregate deadline plus a
 /// total-item cap); a host that gives each frame a fresh timeout would loop
@@ -1009,6 +1029,121 @@ fn background_registration_is_budgeted_and_cancellation_releases_the_guard() {
         }),
         "cancellation releases every host guard"
     );
+    worker.shutdown();
+}
+
+/// The interpreter these tests cannot run without. Unlike the discovery-driven
+/// skip above, a permission gate is a security contract: leaving it unproven
+/// because no CPython was found would report a clean run for a check that
+/// never happened, so a missing interpreter fails by name here.
+fn required_host_interpreter() -> Interpreter {
+    host_interpreter().unwrap_or_else(|| {
+        panic!("the background-permission tests need a real CPython {REQUIRES_PYTHON}; none was found")
+    })
+}
+
+#[test]
+fn a_denied_manifest_has_its_background_registration_refused_before_any_slot_is_taken() {
+    // `permissions.background-execution` is enforced by the host or not at
+    // all: the child's shim is plugin-adjacent code a hostile plugin can
+    // replace, so the registration frame arrives whatever the manifest said
+    // and only this side may answer it.
+    let scratch = Scratch::new("background-denied");
+    let dir = write_plugin(&scratch, "denied", BACKGROUND_MARKER);
+    let marker = scratch.join("denied.marker");
+    // A default budget with background slots free, so nothing but the missing
+    // permission can be responsible for the refusal.
+    let budget = shared_budget_from_section(&ConcurrencySection::default());
+    let mut worker = ModernWorker::spawn(
+        &required_host_interpreter(),
+        options("modern.background.denied", &dir)
+            .with_shared_budget(budget.clone())
+            .with_background_execution(false),
+    )
+    .expect("a plugin without the permission still spawns; only its background work is refused");
+
+    let first = worker
+        .suggest(&suggest_request(&marker.to_string_lossy()))
+        .expect("the foreground suggestion answers as usual");
+    assert_eq!(first.state, BatchState::Final);
+    assert!(
+        wait_until(RESPONSE_LIMIT, || {
+            let diagnostics = worker.background_diagnostics();
+            diagnostics.refused >= 1 || diagnostics.admitted >= 1
+        }),
+        "the host reaches an admission decision for the child's registration"
+    );
+    let diagnostics = worker.background_diagnostics();
+    assert_eq!(diagnostics.registered, 1, "the child announced one task");
+    assert_eq!(
+        diagnostics.admitted, 0,
+        "a plugin that never asked for background-execution is admitted nothing: {diagnostics:?}"
+    );
+    assert_eq!(
+        diagnostics.refused, 1,
+        "the refusal is the host's, and it is counted: {diagnostics:?}"
+    );
+    assert_eq!(
+        budget.in_flight(BudgetKind::Background),
+        0,
+        "a refusal that precedes admission takes no budget slot"
+    );
+
+    // A second complete round trip gives the child's background loop every
+    // opportunity to run the coroutine. Only then is the marker's absence
+    // evidence that the work never happened rather than that it was slow.
+    let second = worker
+        .suggest(&suggest_request(&scratch.join("second.marker").to_string_lossy()))
+        .expect("the worker keeps serving after a refusal");
+    assert_eq!(second.state, BatchState::Final);
+    assert!(
+        !marker.exists(),
+        "the refused coroutine never ran, so it never wrote {}",
+        marker.display()
+    );
+
+    worker.shutdown();
+}
+
+#[test]
+fn granting_background_execution_admits_the_registration_the_denial_refused() {
+    // The companion of the refusal above: same fixture, same budget, one
+    // manifest decision different. Without this, a host that refused every
+    // registration would pass the denial test.
+    let scratch = Scratch::new("background-granted");
+    let dir = write_plugin(&scratch, "granted", BACKGROUND_MARKER);
+    let marker = scratch.join("granted.marker");
+    let budget = shared_budget_from_section(&ConcurrencySection::default());
+    let mut worker = ModernWorker::spawn(
+        &required_host_interpreter(),
+        options("modern.background.granted", &dir)
+            .with_shared_budget(budget.clone())
+            .with_background_execution(true),
+    )
+    .expect("a loadable plugin spawns a worker");
+
+    let first = worker
+        .suggest(&suggest_request(&marker.to_string_lossy()))
+        .expect("the foreground suggestion answers as usual");
+    assert_eq!(first.state, BatchState::Final);
+    assert!(
+        wait_until(RESPONSE_LIMIT, || marker.exists()),
+        "the admitted coroutine runs on the host-managed background loop and writes {}",
+        marker.display()
+    );
+    assert!(
+        wait_until(RESPONSE_LIMIT, || {
+            worker.background_diagnostics().completed >= 1
+        }),
+        "the admitted task reports its terminal state to the host"
+    );
+    let diagnostics = worker.background_diagnostics();
+    assert_eq!(
+        diagnostics.admitted, 1,
+        "the granted task is admitted: {diagnostics:?}"
+    );
+    assert_eq!(diagnostics.refused, 0, "nothing was refused: {diagnostics:?}");
+
     worker.shutdown();
 }
 

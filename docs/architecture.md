@@ -29,15 +29,23 @@ graph TB
 ```
 
 The main process owns the launcher window, keyboard input, local catalog
-indexes, ranking, platform services, and the provider drivers. The ranker accepts
-history signals, but the current application has no history store that supplies
-them. Each provider driver owns a query pipeline and its own current generation;
+indexes, ranking, platform services, and the provider drivers. Ranking history
+is durable: `SelectionHistoryStore` is restored before queries are accepted and
+each selection is persisted, while the foreground-window context signal remains
+platform-dependent. Each provider driver owns a query pipeline and its own current generation;
 the provider generations are advanced in step with the launcher query. No
 third-party code runs inside the main process.
 
 The native worker uses the versioned proto3 protocol. The legacy and modern
 Python workers currently use separate bounded newline-delimited JSON protocols;
 they do not speak the native proto3 wire format.
+
+On Linux every one of those three worker processes is Landlock-confined before
+it executes (ADR-0019): it may write only beneath the directories the host
+named for it, and a plugin without the `network` grant cannot `bind` or
+`connect` a TCP socket. Reads, execution and syscalls generally are not
+restricted, and Windows and macOS install no equivalent, so the process
+boundary above remains the primary isolation everywhere.
 
 ## Threads inside the main process
 

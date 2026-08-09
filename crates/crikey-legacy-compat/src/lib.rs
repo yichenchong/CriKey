@@ -48,11 +48,12 @@ pub use package::{
     PACKAGE_ARCHIVE_EXTENSION,
 };
 pub use worker::{
-    shim_root, InstanceId, LegacyOutcome, LegacyRequest, LegacyRequestKind, LegacyResponse, LegacyWorker,
-    PluginException, TerminateHandle, WorkerError, WorkerExit, WorkerOptions, ENV_CACHE_DIR, ENV_MAIN_MODULE,
-    ENV_MAIN_MODULE_PATH, ENV_PACKAGE_ID, ENV_PACKAGE_ROOT, ENV_PLUGIN_ID, ENV_PROTOCOL_VERSION,
-    ENV_SHIM_DIR_OVERRIDE, MAX_FRAME_BYTES, MAX_LOG_LINES, MAX_LOG_LINE_BYTES, MAX_STDERR_TAIL_BYTES,
-    PROTOCOL_VERSION, WORKER_ENTRY_FILE, WORKER_ISOLATION_FLAG,
+    shim_root, InstanceId, LegacyDefaultAction, LegacyHostService, LegacyOutcome, LegacyRequest,
+    LegacyRequestKind, LegacyResponse, LegacyWorker, PluginException, TerminateHandle, WorkerError,
+    WorkerExit, WorkerOptions, ENV_CACHE_DIR, ENV_CACHE_ROOT, ENV_CONFIG_DIR, ENV_INSTALLED_PACKAGE_DIR,
+    ENV_MAIN_MODULE, ENV_MAIN_MODULE_PATH, ENV_PACKAGE_ID, ENV_PACKAGE_ROOT, ENV_PLUGIN_ID,
+    ENV_PROTOCOL_VERSION, ENV_SHIM_DIR_OVERRIDE, MAX_FRAME_BYTES, MAX_LOG_LINES, MAX_LOG_LINE_BYTES,
+    MAX_STDERR_TAIL_BYTES, PROTOCOL_VERSION, WORKER_ENTRY_FILE, WORKER_ISOLATION_FLAG,
 };
 
 use crikey_core::PluginId;

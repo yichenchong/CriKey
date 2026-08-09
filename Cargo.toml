@@ -10,9 +10,17 @@ members = [
     "crates/crikey-plugin-model",
     "crates/crikey-config",
     "crates/crikey-plugin-supervisor",
+    # Kernel-enforced confinement for every supervised plugin child process.
+    "crates/crikey-sandbox",
     "crates/crikey-native-protocol",
     "crates/crikey-native-host",
     "crates/crikey-python-host",
+    # Out-of-process hosts for the two runtimes that must never be loaded into
+    # the launcher: a `.wasm` module and a restricted C-ABI shared library each
+    # run inside their own supervised executable, which speaks the native
+    # protocol on the plugin's behalf (ADR-0014, ADR-0015; acceptance 30).
+    "crates/crikey-wasm-host",
+    "crates/crikey-cabi-host",
     "crates/crikey-legacy-compat",
     "crates/crikey-platform",
     "crates/crikey-platform-windows",
@@ -49,6 +57,7 @@ crikey-input-scheduler = { path = "crates/crikey-input-scheduler", version = "0.
 crikey-plugin-model = { path = "crates/crikey-plugin-model", version = "0.1.0" }
 crikey-config = { path = "crates/crikey-config", version = "0.1.0" }
 crikey-plugin-supervisor = { path = "crates/crikey-plugin-supervisor", version = "0.1.0" }
+crikey-sandbox = { path = "crates/crikey-sandbox", version = "0.1.0" }
 crikey-native-protocol = { path = "crates/crikey-native-protocol", version = "0.1.0" }
 crikey-native-host = { path = "crates/crikey-native-host", version = "0.1.0" }
 crikey-python-host = { path = "crates/crikey-python-host", version = "0.1.0" }
@@ -85,6 +94,33 @@ thiserror = "2"
 # cache-reuse digest, so it uses the algorithm pip and PEP 503 use rather than a
 # hand-rolled hash.
 sha2 = "0.10"
+
+# Ed25519 signatures for plugin package provenance (spec 2.2, 23.2). The
+# per-member digests `sha2` already checks prove a package is internally
+# consistent, not that it came from anyone in particular: a hostile package,
+# rebuilt correctly, verifies. Signatures are the missing half. Ed25519 rather
+# than RSA or ECDSA because the public key and the signature are both short
+# enough to print as a fingerprint a human can compare out of band, and the
+# scheme has no parameter choices left to get wrong at the call site. The
+# `rand_core` feature stays off deliberately: keys are seeded from `getrandom`
+# below and built with `SigningKey::from_bytes`, so the tree carries one
+# random source rather than two that can drift apart.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+
+# The one CSPRNG. Already present transitively; naming it here means key
+# generation, session tokens and endpoint names all draw from the same source
+# instead of each crate opening `/dev/urandom` for itself.
+getrandom = "0.3"
+
+# Dynamic library loading, used by exactly one crate: `crikey-cabi-host`, the
+# separate executable that hosts a restricted C-ABI plugin. It is named here
+# rather than left crate-local because the workspace's most important
+# invariant is about this exact operation — acceptance criterion 30 says the
+# main process never loads arbitrary third-party native libraries — and a
+# reader auditing that claim should find the one consumer from the dependency
+# table instead of grepping for `dlopen`. Any second consumer appearing here is
+# a review failure, not a convenience.
+libloading = "0.8"
 unicode-normalization = "0.1.24"
 unicode-casefold = "0.2.0"
 unicode-general-category = "1.1.0"

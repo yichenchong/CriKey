@@ -296,6 +296,18 @@ impl Listener {
 
     /// Accepts one connection, returning `Timeout` when the optional bound expires.
     pub fn accept(&self, timeout: Option<Duration>) -> Result<Box<dyn Transport>, ProtocolError> {
+        // A target with neither Unix sockets nor named pipes has no listener
+        // kind at all, so there is nothing to match on. `bind` refuses first,
+        // which is why this is unreachable rather than merely unimplemented;
+        // it exists because the crate must still compile for such a target.
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = timeout;
+            return Err(ProtocolError::Malformed(
+                "this platform has no host listener transport".to_owned(),
+            ));
+        }
+        #[cfg(any(unix, windows))]
         match &self.kind {
             #[cfg(unix)]
             ListenerKind::Unix(listener) => {
@@ -414,7 +426,7 @@ fn connect_named_pipe(_name: &str, _timeout: Option<Duration>) -> Result<Box<dyn
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows_pipe {
-    use std::ffi::OsStr;
+    use std::ffi::{c_void, OsStr};
     use std::io::{self, Read, Write};
     use std::os::windows::ffi::OsStrExt;
     use std::sync::Mutex;
@@ -424,8 +436,13 @@ mod windows_pipe {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{
         CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
-        ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, HANDLE,
-        INVALID_HANDLE_VALUE, WIN32_ERROR,
+        ERROR_INSUFFICIENT_BUFFER, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+        ERROR_PIPE_LISTENING, HANDLE, INVALID_HANDLE_VALUE, WIN32_ERROR,
+    };
+    use windows::Win32::Security::{
+        AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
+        SetSecurityDescriptorDacl, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, PSECURITY_DESCRIPTOR,
+        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -433,9 +450,13 @@ mod windows_pipe {
     };
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, SetNamedPipeHandleState, PIPE_NOWAIT,
-        PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
-    use windows::Win32::System::Threading::GetCurrentProcess;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// `SECURITY_DESCRIPTOR_REVISION`, which the Win32 headers define as 1 and
+    /// the `windows` crate does not re-export.
+    const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 
     fn io_error(error: windows::core::Error) -> io::Error {
         match WIN32_ERROR::from_error(&error) {
@@ -623,6 +644,136 @@ mod windows_pipe {
         }
     }
 
+    /// An explicit discretionary ACL naming this user and nobody else, kept
+    /// alive together with the security descriptor that points into it.
+    ///
+    /// Null security attributes make `CreateNamedPipeW` apply the process
+    /// token's *default* DACL. On an ordinary desktop that reaches beyond this
+    /// user, and under some configurations as far as an anonymous logon. The
+    /// listener offers a single instance, so a foreign process that opens it
+    /// first occupies the only connection: the real plugin then finds the pipe
+    /// busy while the host waits for a handshake the intruder cannot produce,
+    /// and whatever the host writes before giving up is read by the intruder.
+    /// The session token the host generates authenticates the peer once it is
+    /// connected; it says nothing about who may open the object at all, so an
+    /// explicit DACL is defence in depth alongside that token, not a
+    /// replacement for it.
+    ///
+    /// Both buffers live in this one value because Win32 stores bare pointers:
+    /// the descriptor points into the ACL and `SECURITY_ATTRIBUTES` points at
+    /// the descriptor, and each must still be valid when `CreateNamedPipeW`
+    /// reads it. `_acl` is therefore held for its address rather than its
+    /// value; both allocations keep that address when this value is moved.
+    struct PipeSecurity {
+        _acl: Vec<u32>,
+        descriptor: Box<SECURITY_DESCRIPTOR>,
+    }
+
+    impl PipeSecurity {
+        fn current_user_only() -> Result<Self, String> {
+            let token_user = current_token_user()?;
+            // `TOKEN_USER` heads the buffer and its `Sid` points into the same
+            // allocation, which is why the buffer is kept until the ACE below
+            // has copied the SID.
+            // SAFETY: `token_user` was filled by GetTokenInformation for
+            // TokenUser and its `u64` elements give TOKEN_USER's alignment.
+            let sid = unsafe { *token_user.as_ptr().cast::<TOKEN_USER>() }.User.Sid;
+            // SAFETY: `sid` points into the live token-user buffer.
+            let sid_length = unsafe { GetLengthSid(sid) } as usize;
+            if sid_length == 0 {
+                return Err("GetLengthSid rejected the token user SID".to_owned());
+            }
+            // ACCESS_ALLOWED_ACE already carries the first DWORD of the SID in
+            // its SidStart member, so only the remaining SID bytes are extra.
+            let acl_length =
+                size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid_length;
+            // u32 elements give the ACL the DWORD alignment Win32 requires of
+            // it; a Vec<u8> would be aligned to one byte.
+            let mut acl = vec![0_u32; acl_length.div_ceil(size_of::<u32>())];
+            let acl_pointer = acl.as_mut_ptr().cast::<ACL>();
+            // SAFETY: `acl` is DWORD-aligned storage of at least `acl_length`
+            // bytes, which is exactly the length declared to InitializeAcl.
+            unsafe { InitializeAcl(acl_pointer, acl_length as u32, ACL_REVISION) }
+                .map_err(|error| format!("InitializeAcl failed: {error}"))?;
+            // Read and write are all a plugin needs of the pipe. No other
+            // trustee appears in the ACL, and an ACL with no matching ACE
+            // denies, so every other account is refused by omission.
+            let access = (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0;
+            // SAFETY: the ACL was just initialised with room for exactly this
+            // one ACE, and `sid` is valid for the duration of the call.
+            unsafe { AddAccessAllowedAce(acl_pointer, ACL_REVISION, access, sid) }
+                .map_err(|error| format!("AddAccessAllowedAce failed: {error}"))?;
+            let mut descriptor = Box::new(SECURITY_DESCRIPTOR::default());
+            let descriptor_pointer = PSECURITY_DESCRIPTOR((&raw mut *descriptor).cast());
+            // SAFETY: `descriptor` is a correctly sized, uniquely owned
+            // SECURITY_DESCRIPTOR.
+            unsafe { InitializeSecurityDescriptor(descriptor_pointer, SECURITY_DESCRIPTOR_REVISION) }
+                .map_err(|error| format!("InitializeSecurityDescriptor failed: {error}"))?;
+            // `bdacldefaulted` is false: this DACL is a deliberate choice, and
+            // saying otherwise would let Windows treat it as replaceable
+            // inherited default.
+            // SAFETY: the descriptor is initialised and the ACL it is given
+            // outlives it, both being owned by the value returned below.
+            unsafe {
+                SetSecurityDescriptorDacl(descriptor_pointer, true, Some(acl_pointer.cast_const()), false)
+            }
+            .map_err(|error| format!("SetSecurityDescriptorDacl failed: {error}"))?;
+            Ok(Self {
+                _acl: acl,
+                descriptor,
+            })
+        }
+
+        fn attributes(&self) -> SECURITY_ATTRIBUTES {
+            SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: (&raw const *self.descriptor).cast_mut().cast::<c_void>(),
+                // The listener handle is never handed to a child process.
+                bInheritHandle: false.into(),
+            }
+        }
+    }
+
+    /// Returns a `TOKEN_USER` for this process's token, in `u64` storage so
+    /// that the structure's interior pointer is correctly aligned.
+    fn current_token_user() -> Result<Vec<u64>, String> {
+        let mut token = HANDLE::default();
+        // SAFETY: `token` is valid writable storage and the handle it receives
+        // is closed on both exits below.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+            .map_err(|error| format!("OpenProcessToken failed: {error}"))?;
+        let user = read_token_user(token);
+        // SAFETY: `token` was opened just above and is closed exactly once.
+        let _ = unsafe { CloseHandle(token) };
+        user
+    }
+
+    fn read_token_user(token: HANDLE) -> Result<Vec<u64>, String> {
+        let mut needed = 0_u32;
+        // The documented size probe: with no buffer the call fails with
+        // ERROR_INSUFFICIENT_BUFFER and writes the required length.
+        // SAFETY: no output buffer is supplied and `needed` is writable.
+        match unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) } {
+            Ok(()) => return Err("GetTokenInformation accepted a zero-length TokenUser buffer".to_owned()),
+            Err(error) if WIN32_ERROR::from_error(&error) == Some(ERROR_INSUFFICIENT_BUFFER) => {}
+            Err(error) => return Err(format!("GetTokenInformation could not size TokenUser: {error}")),
+        }
+        let mut buffer = vec![0_u64; (needed as usize).div_ceil(size_of::<u64>()).max(1)];
+        // SAFETY: `buffer` holds at least `needed` bytes and is aligned for the
+        // pointer TOKEN_USER contains.
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buffer.as_mut_ptr().cast()),
+                needed,
+                &mut needed,
+            )
+        }
+        .map_err(|error| format!("GetTokenInformation failed for TokenUser: {error}"))?;
+        Ok(buffer)
+    }
+
     #[derive(Debug)]
     pub struct PipeListener(Mutex<Option<HANDLE>>);
 
@@ -630,20 +781,26 @@ mod windows_pipe {
         pub fn bind(name: &str) -> Result<Self, String> {
             let path = format!(r"\\.\pipe\{name}");
             let wide = wide(&path);
+            let security = PipeSecurity::current_user_only()?;
+            let attributes = security.attributes();
             // PIPE_NOWAIT lets accept poll for a caller instead of blocking
             // forever; the accepted handle is switched back to PIPE_WAIT.
-            // SAFETY: `wide` is NUL-terminated and remains alive for the
-            // synchronous call; a successful handle is placed in the mutex.
+            // PIPE_REJECT_REMOTE_CLIENTS keeps the listener local: this
+            // endpoint exists for a child on this machine, and a remote opener
+            // could otherwise take the single instance before it.
+            // SAFETY: `wide` is NUL-terminated and `security` owns the
+            // descriptor `attributes` points at; both outlive this synchronous
+            // call. A successful handle is placed in the mutex.
             let handle = unsafe {
                 CreateNamedPipeW(
                     PCWSTR(wide.as_ptr()),
                     PIPE_ACCESS_DUPLEX,
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
                     1,
                     8 * 1024 * 1024,
                     8 * 1024 * 1024,
                     0,
-                    None,
+                    Some(&attributes),
                 )
             };
             if handle == INVALID_HANDLE_VALUE {
@@ -652,16 +809,26 @@ mod windows_pipe {
             Ok(Self(Mutex::new(Some(handle))))
         }
 
+        /// Accepts one client, leaving the listener listening if it times out.
+        ///
+        /// The server handle stays in the slot for the whole polling loop and
+        /// moves into a [`PipeFile`] only once a client is actually connected.
+        /// Taking it up front meant that returning `Timeout` dropped and closed
+        /// the only listening handle, so the very next `accept` answered
+        /// `Closed`: one plugin slow to connect turned a retryable timeout into
+        /// a dead endpoint, and the caller read that as "the plugin never
+        /// started" rather than "the host threw its pipe away". The Unix
+        /// listener keeps its socket across a timeout; this is the same
+        /// contract.
         pub fn accept(&self, timeout: Option<Duration>) -> Result<PipeFile, crate::ProtocolError> {
             let mut guard = self
                 .0
                 .lock()
                 .map_err(|_| crate::ProtocolError::Io("named-pipe listener lock poisoned".to_owned()))?;
-            let handle = guard.take().ok_or(crate::ProtocolError::Closed)?;
-            let file = PipeFile {
-                handle,
-                read_timeout: None,
-            };
+            // `HANDLE` is a copyable handle value, so this is a borrow of the
+            // slot's handle, not ownership of it: the slot still closes it
+            // unless one of the paths below explicitly takes over.
+            let handle = *guard.as_ref().ok_or(crate::ProtocolError::Closed)?;
             let deadline = match timeout {
                 Some(value) => Some(Instant::now().checked_add(value).ok_or(
                     crate::ProtocolError::Malformed("named pipe accept timeout is too large".to_owned()),
@@ -669,22 +836,43 @@ mod windows_pipe {
                 None => None,
             };
             loop {
-                // SAFETY: `file` owns the valid server handle and keeps it
+                // SAFETY: the slot owns this valid server handle and holds it
                 // alive through each non-blocking ConnectNamedPipe call.
-                match unsafe { ConnectNamedPipe(file.handle, None) } {
+                match unsafe { ConnectNamedPipe(handle, None) } {
                     Ok(()) => break,
                     Err(error) => match WIN32_ERROR::from_error(&error) {
                         Some(ERROR_PIPE_CONNECTED) => break,
                         Some(ERROR_PIPE_LISTENING) => {
                             if deadline.is_some_and(|at| Instant::now() >= at) {
+                                // The slot still holds the handle, so the next
+                                // accept resumes polling this same instance.
                                 return Err(crate::ProtocolError::Timeout);
                             }
                             thread::sleep(Duration::from_millis(1));
                         }
-                        _ => return Err(crate::ProtocolError::Io(error.to_string())),
+                        // Any other ConnectNamedPipe failure is terminal: the
+                        // listener is in an unknown state and must not be
+                        // polled again, so the handle is released here and the
+                        // emptied slot makes every later accept answer Closed.
+                        _ => {
+                            *guard = None;
+                            // SAFETY: the handle was just removed from the slot,
+                            // which is the only other owner, so this closes it
+                            // exactly once.
+                            let _ = unsafe { CloseHandle(handle) };
+                            return Err(crate::ProtocolError::Io(error.to_string()));
+                        }
                     },
                 }
             }
+            // A client is connected, so the single instance now belongs to the
+            // accepted file. Emptying the slot before building it keeps exactly
+            // one owner, including on the failure below, where `file` drops.
+            *guard = None;
+            let file = PipeFile {
+                handle,
+                read_timeout: None,
+            };
             // Restore blocking reads for the accepted connection. The
             // timeout path above is implemented by PeekNamedPipe polling.
             // SAFETY: `file.handle` is a connected named-pipe server handle;
@@ -709,6 +897,73 @@ mod windows_pipe {
 
     fn wide(value: &str) -> Vec<u16> {
         OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    /// Windows-only because the object under test is a Win32 security
+    /// descriptor: off Windows this module does not exist, so no Linux suite
+    /// can say anything about who may open the pipe.
+    #[cfg(test)]
+    mod tests {
+        use super::{current_token_user, PipeSecurity, FILE_GENERIC_READ, FILE_GENERIC_WRITE, TOKEN_USER};
+        use windows::Win32::Security::{
+            EqualSid, GetAce, GetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE, PSECURITY_DESCRIPTOR, PSID,
+        };
+
+        /// `ACCESS_ALLOWED_ACE_TYPE` from the Win32 headers, which the
+        /// `windows` crate does not re-export.
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+        /// Every weakening of this descriptor is a way back to the default
+        /// DACL: an absent DACL grants everyone, a defaulted one is the
+        /// inherited default this exists to replace, an extra ACE is an extra
+        /// trustee, and a wrong SID is somebody else's account.
+        #[test]
+        fn the_pipe_dacl_grants_this_user_and_nobody_else() {
+            let security = PipeSecurity::current_user_only().expect("the pipe DACL must be buildable");
+            let descriptor = PSECURITY_DESCRIPTOR((&raw const *security.descriptor).cast_mut().cast());
+            let mut present = windows::core::BOOL(0);
+            let mut dacl = std::ptr::null_mut();
+            let mut defaulted = windows::core::BOOL(0);
+            // SAFETY: `security` owns an initialised descriptor and the three
+            // outputs are valid writable storage.
+            unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+                .expect("the descriptor must carry a readable DACL");
+            assert!(present.as_bool(), "an absent DACL grants every account access");
+            assert!(!dacl.is_null(), "a NULL DACL grants every account access");
+            assert!(
+                !defaulted.as_bool(),
+                "the DACL must be reported as deliberate, not as a replaceable default"
+            );
+            // SAFETY: `dacl` points into the ACL `security` owns.
+            let ace_count = unsafe { (*dacl).AceCount };
+            assert_eq!(ace_count, 1, "exactly one trustee may appear in the pipe DACL");
+
+            let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: the ACL is valid and index 0 exists, as just asserted.
+            unsafe { GetAce(dacl, 0, &mut ace) }.expect("the single ACE must be readable");
+            // SAFETY: an ACE of type ACCESS_ALLOWED_ACE_TYPE, which the next
+            // assertion confirms, has exactly this layout.
+            let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            assert_eq!(
+                ace.Header.AceType, ACCESS_ALLOWED_ACE_TYPE,
+                "the single ACE must be an access-allowed ACE"
+            );
+            assert_eq!(
+                ace.Mask,
+                (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+                "the plugin needs read and write on the pipe and nothing more"
+            );
+
+            let user = current_token_user().expect("the token user must be readable");
+            // SAFETY: the buffer was filled for TokenUser and is aligned for it.
+            let expected = unsafe { *user.as_ptr().cast::<TOKEN_USER>() }.User.Sid;
+            let granted = PSID((&raw const ace.SidStart).cast_mut().cast());
+            assert!(
+                // SAFETY: both SIDs point into live, valid storage.
+                unsafe { EqualSid(granted, expected) }.is_ok(),
+                "the granted trustee must be this process's own user"
+            );
+        }
     }
 }
 

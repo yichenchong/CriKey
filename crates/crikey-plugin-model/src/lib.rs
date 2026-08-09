@@ -14,10 +14,12 @@ pub use manifest::{
     ActivationSection, ConcurrencySection, Manifest, PerformanceSection, PluginSection, PythonSection,
     QuerySection, Runtime, Startup,
 };
-pub use permissions::{ClipboardPermission, FilesystemAccess, FilesystemScope, Permissions};
+pub use permissions::{
+    ClipboardPermission, FilesystemAccess, FilesystemPermission, FilesystemScope, Permissions,
+};
 pub use scheduling::{
-    PolicyProblem, QueryPolicy, SchedulingProfile, MAX_CONCURRENT_REQUESTS, MAX_DEBOUNCE_MS,
-    MAX_MINIMUM_QUERY_LENGTH,
+    PolicyProblem, QueryPolicy, SchedulingProfile, UnhonouredDeclaration, MAX_CONCURRENT_REQUESTS,
+    MAX_DEBOUNCE_MS, MAX_MINIMUM_QUERY_LENGTH,
 };
 
 #[derive(Debug)]

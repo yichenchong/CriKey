@@ -5,6 +5,13 @@
 //! the process environment. The fixtures are real `index.theme` files and real
 //! PNG/SVG files in the directories they declare, because the lookup is defined
 //! entirely in terms of those two things.
+//!
+//! Linux only, like the crate itself: `crikey-platform-linux` is
+//! `#![cfg(target_os = "linux")]`, so on any other target this file would
+//! import from an empty crate root. Every sibling test here carries the same
+//! gate; without it `cargo test --workspace --all-targets` fails to compile on
+//! the Windows and macOS CI runners.
+#![cfg(target_os = "linux")]
 
 use std::{
     fs,

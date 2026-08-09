@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use crikey_app::{PipelineConfig, PipelineError, QueryPipeline};
+use crikey_app::{PipelineConfig, QueryPipeline};
 use crikey_core::PluginId;
 use crikey_input_scheduler::Millis;
 use crikey_plugin_model::Manifest;
@@ -127,6 +127,27 @@ runtime = "wasm"
 entrypoint = "plugin.wasm"
 "#;
 
+/// A `c-abi` package. Its entrypoint is a shared library because the
+/// executable CriKey supervises is `crikey-cabi-host`, not the plugin
+/// (ADR-0015). `concurrency.max-suggestion-requests` is deliberately above one
+/// so the honest-gap report can be asserted.
+const CABI_MANIFEST: &str = r#"
+manifest-version = 1
+
+[plugin]
+id = "dev.crikey.cabi"
+name = "C ABI"
+version = "1.0.0"
+runtime = "c-abi"
+entrypoint = "bin/libplugin.so"
+
+[permissions]
+native-library-loading = true
+
+[concurrency]
+max-suggestion-requests = 4
+"#;
+
 fn register(pipeline: &mut QueryPipeline, text: &str) -> PluginId {
     let manifest = Manifest::parse(text).expect("fixture manifest must parse and validate");
     pipeline
@@ -222,6 +243,8 @@ fn unregister_plugin_drops_registration_and_allows_clean_reload() {
     assert!(pipeline.plugin_diagnostics(&plugin).is_none());
     assert_eq!(pipeline.diagnostics().in_flight_requests, 0);
     drop(held);
+    pipeline.keystroke("after unregister", 0);
+    let _ = pipeline.tick(0);
 
     let replacement = pipeline
         .register_namespaced_manifest(plugin.clone(), &manifest)
@@ -357,8 +380,6 @@ fn a_declared_limit_of_zero_admits_no_suggestion_request_at_all() {
             u64::try_from(index).expect("small index") + 1,
             "every refused request is counted"
         );
-        // The sibling answers each round, so its own budget is never the
-        // reason a later round dispatches nothing.
         pipeline.complete(&sibling, generation, now + 1);
     }
 
@@ -370,41 +391,49 @@ fn a_declared_limit_of_zero_admits_no_suggestion_request_at_all() {
 }
 
 #[test]
-fn unsupported_wasm_registration_is_explicit_and_leaves_no_pipeline_state() {
+fn wasm_registration_is_supported_and_leaves_pipeline_state() {
     let manifest = Manifest::parse(WASM_MANIFEST).expect("wasm fixture must be well-formed");
     let plugin = PluginId(manifest.plugin.id.clone());
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
 
-    let error = pipeline
-        .register_manifest(&manifest)
-        .expect_err("this build has no wasm host and must refuse registration");
-    assert!(matches!(
-        &error,
-        PipelineError::UnsupportedRuntime {
-            plugin: owner,
-            runtime: crikey_plugin_model::Runtime::Wasm,
-        } if owner == &plugin
-    ));
-    let message = error.to_string();
-    assert!(
-        message.contains(&plugin.0),
-        "refusal must name the plugin: {message}"
-    );
-    assert!(
-        message.contains("wasm"),
-        "refusal must name the runtime: {message}"
-    );
-    assert!(
-        message.contains("deliberately refuses"),
-        "refusal must explain that this build has no host: {message}"
-    );
-    assert!(pipeline.plugin_budget(&plugin).is_none());
-    assert!(pipeline.plugin_diagnostics(&plugin).is_none());
-    assert_eq!(pipeline.diagnostics().in_flight_requests, 0);
-
     pipeline
-        .register_plugin(plugin.clone(), crikey_input_scheduler::PluginPolicy::modern())
-        .expect("a refused runtime must leave the id available for a supported registration");
+        .register_manifest(&manifest)
+        .expect("wasm is served by the supervised wasm host");
+    assert!(pipeline.plugin_budget(&plugin).is_some());
+    assert!(pipeline.plugin_diagnostics(&plugin).is_some());
+    assert_eq!(pipeline.diagnostics().in_flight_requests, 0);
+}
+
+#[test]
+fn cabi_registration_succeeds_and_leaves_usable_pipeline_state() {
+    let manifest = Manifest::parse(CABI_MANIFEST).expect("c-abi fixture must be well-formed");
+    let plugin = PluginId(manifest.plugin.id.clone());
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+
+    let registered = pipeline
+        .register_manifest(&manifest)
+        .expect("this build hosts c-abi plugins out of process and must accept the manifest");
+    assert_eq!(registered, plugin);
+    assert!(
+        pipeline.plugin_budget(&plugin).is_some(),
+        "an accepted plugin owns a concurrency budget"
+    );
+    assert!(
+        pipeline.plugin_diagnostics(&plugin).is_some(),
+        "an accepted plugin is observable"
+    );
+
+    // The host serialises every call into one library, so a manifest asking
+    // for four concurrent suggestions gets one and is told so by name rather
+    // than silently granted something it did not ask for (README invariant 7).
+    let unhonoured = manifest.unhonoured_declarations();
+    assert!(
+        unhonoured.iter().any(|declaration| {
+            declaration.field == "concurrency.max-suggestion-requests"
+                && declaration.reason == "c-abi-calls-are-serialised"
+        }),
+        "the serialised-call gap must be reported, not hidden: {unhonoured:?}"
+    );
 }
 
 /// A four-slot manifest that grants exactly one unit of every §13.5 kind, so

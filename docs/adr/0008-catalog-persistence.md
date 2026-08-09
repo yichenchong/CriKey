@@ -39,7 +39,11 @@ enumerate the cache root is returned as a startup error.
 ## Measured evidence
 
 Release measurements on the reference Intel N150 machine, using 64 complete
-labels typed one character at a time through `SearchService::submit_query`:
+labels typed one character at a time through `SearchService::submit_query`.
+They are one dated run on an otherwise idle host: `crikey dev benchmark`
+reproduces them, but only under the same conditions -- a re-run on a loaded
+machine has measured six times the load time and fifty times the query p95,
+which says nothing about the codec.
 
 | Items | Archive | Load | Query p95 | Resident after load | Peak RSS |
 | ---: | ---: | ---: | ---: | ---: | ---: |

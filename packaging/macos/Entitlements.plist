@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for CriKey.app.
+
+  This dictionary is EMPTY, and that is the finding, not an omission. The
+  hardened runtime is enabled (`codesign` with the `runtime` option, see build.sh);
+  entitlements are the holes you punch in it, and the audit below could not
+  justify a single one against the code that exists in this tree today.
+
+  Every entry is a claim about behaviour. Adding one "because a launcher
+  usually needs it" would put a privilege in the signature that no call site
+  redeems, which is exactly the dishonesty README invariant 7 forbids.
+
+  ==================================================================
+  AUDIT: every entitlement considered, and the call site that would
+  redeem it
+  ==================================================================
+
+  com.apple.security.automation.apple-events              NOT DECLARED
+      Would be required to send Apple Events to another application
+      (NSAppleScript, AESendMessage, NSAppleEventDescriptor). The macOS
+      backend, crates/crikey-platform-macos/src/lib.rs, contains no such
+      call: its entire launch path is `Command::new("/usr/bin/open")` in
+      `OpenLauncher`, which is a posix_spawn of a system binary and not an
+      Apple Event. `MacOsBackend::capability` correspondingly reports
+      `Capability::WindowActivation` and `Capability::WindowEnumeration` as
+      `Unavailable`. Window activation is the feature that would eventually
+      need this; when an implementation lands it will arrive with the
+      entitlement, an NSAppleEventsUsageDescription in Info.plist, and the
+      capability flipped to `Available` in the same change.
+
+  Accessibility (AXUIElement / AXIsProcessTrustedWithOptions)  N/A
+      Accessibility is not an entitlement at all on macOS; it is TCC
+      consent granted per-application in System Settings, keyed on the code
+      signature, with no plist key to declare. Listed here because it is the
+      other half of what a hotkey launcher is usually assumed to need. The
+      backend calls no AX API; `Capability::WindowActivation` is
+      `Unavailable`.
+
+  Global hotkeys (RegisterEventHotKey / CGEventTap)         N/A
+      Also not an entitlement. `RegisterEventHotKey` needs nothing;
+      `CGEventTap` needs Input Monitoring TCC consent. Neither is called:
+      `Capability::GlobalHotkeys` is `Unavailable` on this backend, which is
+      also why Info.plist keeps LSUIElement false.
+
+  com.apple.security.cs.disable-library-validation         NOT DECLARED
+      Would be required to load code signed by a different team into this
+      process. Nothing does. Third-party plugins are not dlopened; they are
+      supervised subprocesses over the native, Python and legacy-Python
+      transports, so their code is never mapped into CriKey's address space.
+      A bundled CPython (staged by `stage-python-runtime.sh`, optional) is
+      re-signed with the same identity as the rest of the bundle by
+      `build.sh`, so its extension modules satisfy library validation without
+      a hole. If a future in-process host ever appears, that host, and not this file,
+      is what changes.
+
+  com.apple.security.cs.allow-jit                          NOT DECLARED
+  com.apple.security.cs.allow-unsigned-executable-memory   NOT DECLARED
+      No interpreter, tracing JIT or codegen runs inside CriKey's process.
+      The renderer is wgpu on Metal, whose shader compilation happens in the
+      GPU driver, and every Python interpreter is out of process.
+
+  com.apple.security.cs.allow-dyld-environment-variables   NOT DECLARED
+      Nothing injects DYLD_* into this process, and accepting them would let
+      anything on the machine load a dylib into a signed launcher.
+
+  com.apple.security.cs.debugger                           NOT DECLARED
+      CriKey attaches to nothing. Its plugin supervisor manages children with
+      pipes and signals, not ptrace or task_for_pid.
+
+  keychain-access-groups                                   NOT DECLARED
+      `Capability::SecretStorage` is `Unavailable`; there is no macOS
+      `SecretStore` implementation to share a keychain group with.
+
+  com.apple.security.device.audio-input / camera / etc.    NOT DECLARED
+      No such hardware is touched.
+
+  App Sandbox (com.apple.security.app-sandbox)             NOT DECLARED
+      Deliberately not adopted. CriKey launches arbitrary user-chosen
+      applications and supervises arbitrary user-installed plugin
+      executables; both are categorically outside a sandbox, and the
+      temporary-exception entitlements that would fake it are not accepted
+      for Developer ID distribution anyway. This bundle is notarized
+      Developer ID, not Mac App Store.
+
+  ==================================================================
+  KNOWN, UNFIXED CONSTRAINT
+  ==================================================================
+
+  A native plugin the package manager downloaded carries the com.apple.quarantine
+  attribute and is signed by whoever built it, or not signed at all. Gatekeeper
+  evaluates it on first execution as a separate process; CriKey cannot and does
+  not suppress that, and no entitlement here would change it. The plugin
+  supervisor surfaces the spawn failure rather than pretending the plugin
+  loaded.
+-->
+<plist version="1.0">
+<dict/>
+</plist>

@@ -1197,3 +1197,349 @@ fn modern_router_rejects_duplicate_stable_ids_across_plugin_owners() {
     );
     drop(driver);
 }
+
+#[test]
+fn modern_plugin_icons_resolve_relative_to_the_package_directory() {
+    require_modern_interpreter();
+
+    let scratch = Scratch::new("package-icon");
+    let plugins_root = scratch.subdir("plugins");
+    write_modern_plugin(
+        &plugins_root,
+        "icons",
+        "icon_plugin",
+        "IconPlugin",
+        r#"
+from crikey_sdk.plugin import Item, Plugin
+
+class IconPlugin(Plugin):
+    def suggest(self, query, context):
+        context.emit(Item(
+            stable_id="icon-1",
+            label="icon " + query.text,
+            target="icon",
+            icon_reference="icons/item.svg",
+        ))
+"#,
+    );
+    let package = plugins_root.join("icons");
+    fs::create_dir_all(package.join("icons")).expect("icon directory is creatable");
+    fs::write(
+        package.join("icons/item.svg"),
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="#112233"/></svg>"##,
+    )
+    .expect("package icon is writable");
+
+    let plugin = modern_plugin("icons");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(scratch.subdir("index")),
+        scratch.join("cache"),
+        &DisabledPlugins::default(),
+    );
+    assert!(
+        provider.plugins().contains(&plugin),
+        "the icon plugin must load; unavailable: {:?}",
+        provider.unavailable()
+    );
+
+    let frame = provider
+        .drive_query(&mut pipeline, "icon", 17)
+        .expect("the icon plugin must publish a current frame");
+    let row = frame
+        .rows
+        .iter()
+        .find(|row| row.plugin_name == plugin.0)
+        .expect("the icon plugin row is present");
+    let image = row.icon.as_ref().expect("the package-relative icon resolves");
+    assert_eq!((image.width(), image.height()), (48, 48));
+    assert_eq!(&image.rgba()[..4], &[0x11, 0x22, 0x33, 0xff]);
+    provider.shutdown(180);
+}
+
+/// A plugin that records every interpreter start and then kills the child on
+/// its first `suggest`. The append-only `spawns` file makes the number of
+/// interpreter startups countable from the test process, so a provider that
+/// silently respawns a crashed worker is observable rather than merely slow.
+const CRASH_COUNTER_SOURCE: &str = "\
+import os
+
+from crikey_sdk.plugin import Plugin
+
+with open(os.path.join(os.path.dirname(__file__), \"spawns\"), \"a\") as marker:
+    marker.write(\"x\")
+
+
+class CrashCounter(Plugin):
+    def suggest(self, query, context):
+        os._exit(1)
+";
+
+/// A deliberately slow-starting plugin: the import blocks long enough for the
+/// test to supersede the query that triggered it. `importing` announces that a
+/// startup handshake is under way; `queries` appends the text of every query
+/// the child was actually asked about, so work done for an obsolete generation
+/// is observable after the fact.
+const SLOW_START_SOURCE: &str = "\
+import os
+import time
+
+from crikey_sdk.plugin import Item, Plugin
+
+with open(os.path.join(os.path.dirname(__file__), \"importing\"), \"w\") as marker:
+    marker.write(\"1\")
+time.sleep(1.0)
+
+
+class SlowStart(Plugin):
+    def suggest(self, query, context):
+        with open(os.path.join(os.path.dirname(__file__), \"queries\"), \"a\") as log:
+            log.write(query.text + \"\\n\")
+        context.emit(
+            Item(stable_id=\"slow-1\", label=\"slow \" + query.text, target=\"slow\")
+        )
+";
+
+/// Every frame a driver published, each with the plugins that contributed rows
+/// to it.
+type PublishedFrames = Arc<Mutex<Vec<(Generation, Vec<String>)>>>;
+
+/// Number of interpreter startups the plugin at `dir` has recorded.
+fn recorded_spawns(dir: &Path) -> usize {
+    fs::read_to_string(dir.join("spawns")).map_or(0, |text| text.trim().len())
+}
+
+/// The queries the plugin at `dir` was actually asked about, in order.
+fn recorded_queries(dir: &Path) -> Vec<String> {
+    fs::read_to_string(dir.join("queries"))
+        .map_or_else(|_| Vec::new(), |text| text.lines().map(str::to_owned).collect())
+}
+
+#[test]
+fn a_crashed_worker_is_spawned_once_and_stays_reported_unavailable() {
+    require_modern_interpreter();
+
+    let scratch = Scratch::new("no-respawn");
+    let plugins_root = scratch.subdir("plugins");
+    write_modern_plugin(
+        &plugins_root,
+        "healthy",
+        "healthy_plugin",
+        "Healthy",
+        HEALTHY_SOURCE,
+    );
+    write_modern_plugin(
+        &plugins_root,
+        "crashcounter",
+        "crash_counter_plugin",
+        "CrashCounter",
+        CRASH_COUNTER_SOURCE,
+    );
+
+    let healthy = modern_plugin("healthy");
+    let crashy = modern_plugin("crashcounter");
+    let crashy_dir = plugins_root.join("crashcounter");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(scratch.subdir("index")),
+        scratch.join("cache"),
+        &DisabledPlugins::default(),
+    );
+    assert!(
+        provider.plugins().contains(&healthy) && provider.plugins().contains(&crashy),
+        "both plugins load before the crash; unavailable: {:?}",
+        provider.unavailable(),
+    );
+    assert_eq!(
+        recorded_spawns(&crashy_dir),
+        0,
+        "a default-lazy plugin must not start an interpreter before its first query",
+    );
+
+    // Five keystrokes. The first starts the interpreter and crashes it; every
+    // later one must find the worker retired rather than start it again. This
+    // is the mutation the count kills: dropping the crashed worker from the
+    // pool made the next query's "no worker here" branch indistinguishable from
+    // a lazy plugin that had never started, so each keystroke paid a fresh
+    // interpreter startup and re-ran the plugin's import side effects.
+    for iteration in 0..5 {
+        let now = 100 * (iteration as u64 + 1);
+        let frame = provider.drive_query(&mut pipeline, &format!("report {iteration}"), now);
+        assert!(
+            frame.is_some_and(|frame| frame.rows.iter().any(|row| row.plugin_name == healthy.0)),
+            "the healthy sibling keeps serving on query {iteration} despite the crash",
+        );
+    }
+
+    assert_eq!(
+        recorded_spawns(&crashy_dir),
+        1,
+        "a crashing plugin is started exactly once, not once per keystroke",
+    );
+
+    // Reported for as long as it stays failed, with its reason — not named once
+    // and then quietly retried.
+    let failed = provider.failed_workers();
+    let reason = failed
+        .iter()
+        .find(|(id, _)| id == &crashy)
+        .map(|(_, reason)| reason.clone())
+        .unwrap_or_else(|| panic!("the crashed plugin stays reported as unavailable; saw {failed:?}"));
+    assert!(
+        !reason.trim().is_empty(),
+        "the unavailable report must carry an attributable reason",
+    );
+    assert!(
+        !failed.iter().any(|(id, _)| id == &healthy),
+        "the healthy sibling must never be reported unavailable; saw {failed:?}",
+    );
+
+    // Only an explicit supervised restart may start the plugin again.
+    assert!(
+        provider.restart_worker(&healthy).is_err(),
+        "restarting a plugin whose worker never failed is a caller bug, not a no-op",
+    );
+    provider
+        .restart_worker(&crashy)
+        .expect("a failed worker is restartable under supervision");
+    assert!(
+        provider.failed_workers().iter().all(|(id, _)| id != &crashy),
+        "a supervised restart clears the failed verdict",
+    );
+    provider.drive_query(&mut pipeline, "report again", 600);
+    assert_eq!(
+        recorded_spawns(&crashy_dir),
+        2,
+        "the supervised restart is real: exactly one further interpreter start",
+    );
+    assert!(
+        provider.failed_workers().iter().any(|(id, _)| id == &crashy),
+        "crashing again returns the plugin to the reported-unavailable state",
+    );
+
+    provider.shutdown(700);
+}
+
+#[test]
+fn a_superseded_lazy_startup_abandons_its_obsolete_target_list() {
+    require_modern_interpreter();
+
+    let scratch = Scratch::new("supersede-startup");
+    let plugins_root = scratch.subdir("plugins");
+    let names = ["alpha", "beta", "gamma"];
+    for name in names {
+        write_modern_plugin(
+            &plugins_root,
+            name,
+            "slow_start_plugin",
+            "SlowStart",
+            SLOW_START_SOURCE,
+        );
+    }
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root.clone()],
+        Some(scratch.subdir("index")),
+        scratch.join("cache"),
+        &DisabledPlugins::default(),
+    );
+    for name in names {
+        assert!(
+            provider.plugins().contains(&modern_plugin(name)),
+            "the slow-starting plugin `{name}` must load; unavailable: {:?}",
+            provider.unavailable(),
+        );
+    }
+
+    // Every published frame, with the plugins that contributed rows to it.
+    let published: PublishedFrames = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&published);
+    let driver = ModernDriver::spawn(provider, pipeline, move |frame| {
+        sink.lock().expect("the publish sink is not poisoned").push((
+            frame.generation,
+            frame.rows.iter().map(|row| row.plugin_name.clone()).collect(),
+        ));
+    });
+
+    let older = Generation::from_raw(1);
+    let newer = Generation::from_raw(2);
+    driver.submit(older, "obsolete", 17, Vec::new(), false, 0);
+
+    // Supersede while the first plugin's startup handshake is still blocked in
+    // its import. Bounded poll on the child's own marker, never a sleep used to
+    // order events.
+    let mut starting = false;
+    for _ in 0..2_000 {
+        if names
+            .iter()
+            .any(|name| plugins_root.join(name).join("importing").is_file())
+        {
+            starting = true;
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    assert!(
+        starting,
+        "a lazy startup must be under way before the supersession",
+    );
+    driver.submit(newer, "current", 18, Vec::new(), false, 0);
+
+    let mut newest_rows = None;
+    for _ in 0..4_000 {
+        newest_rows = published
+            .lock()
+            .expect("the publish sink is not poisoned")
+            .iter()
+            .find(|(generation, _)| *generation == newer)
+            .map(|(_, plugins)| plugins.clone());
+        if newest_rows.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+    let newest_rows = newest_rows.expect("the newest generation must be the one that publishes");
+    for name in names {
+        assert!(
+            newest_rows.contains(&modern_plugin(name).0),
+            "the published frame must carry every plugin's rows; saw {newest_rows:?}",
+        );
+    }
+
+    // The heart of it: once superseded, the obsolete generation abandons its
+    // remaining targets instead of starting them and asking them all in turn.
+    // Without that, every plugin answers the obsolete query first and the newest
+    // one queues behind the whole startup chain.
+    for name in names {
+        let asked = recorded_queries(&plugins_root.join(name));
+        assert!(
+            !asked.iter().any(|text| text == "obsolete"),
+            "`{name}` must never be asked the superseded query; asked {asked:?}",
+        );
+        assert_eq!(
+            asked,
+            vec!["current".to_owned()],
+            "`{name}` answers exactly the newest query",
+        );
+    }
+
+    let generations = published
+        .lock()
+        .expect("the publish sink is not poisoned")
+        .iter()
+        .map(|(generation, _)| *generation)
+        .collect::<Vec<_>>();
+    assert!(
+        generations.iter().all(|generation| *generation == newer),
+        "an obsolete generation must never publish; saw {generations:?}",
+    );
+
+    drop(driver);
+}

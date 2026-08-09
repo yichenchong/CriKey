@@ -1630,10 +1630,10 @@ Plugins shall be able to request:
 - Native library loading.
 - Persistent background execution.
 
-### 20.2 Enforcement (target behavior; not implemented in the current release)
+### 20.2 Enforcement (partly implemented; the note below states which parts)
 
-The following is the intended design, not a description of the current
-permission implementation:
+The following is the intended design; the note after it records what the
+current release actually enforces:
 
 - Host-mediated APIs shall enforce permissions directly.
 - Native subprocess plugins shall be restricted using available operating-system
@@ -1642,12 +1642,20 @@ permission implementation:
 - Legacy plugins shall be treated as trusted legacy code unless explicitly
   restricted.
 
-At present, manifest permission fields are recorded as plugin requests, but
-they are not enforced at the host-mediated API boundaries. A third-party
-plugin must therefore not be treated as sandboxed because it declares
-permissions in its manifest. The UI shall not claim that a native plugin is
-fully sandboxed where the operating system does not provide effective
-enforcement.
+As implemented: five permission fields reach a real host-mediated gate
+(`network`, `process`, `background-execution`, `filesystem` at the one read
+the host performs for a plugin, and `environment`), `network-listener` is
+refused at parse time, and the remaining six are reported per plugin as
+declarations the host does not honour. Operating-system confinement exists on
+Linux only: every supervised plugin process — native, WASM, C-ABI, modern
+Python and legacy — is restricted with Landlock so it may write only beneath
+the directories the host named for it, and a plugin without the `network`
+grant has TCP `bind` and `connect` refused by the kernel. Reads, execution,
+UDP, Unix sockets and syscalls generally are not restricted, and Windows and
+macOS install no equivalent. A third-party plugin must therefore still not be
+treated as sandboxed because it declares permissions in its manifest, and the
+UI shall not claim that a native plugin is fully sandboxed where the operating
+system does not provide effective enforcement.
 
 ---
 

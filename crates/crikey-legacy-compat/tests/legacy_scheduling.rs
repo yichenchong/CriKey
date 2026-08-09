@@ -189,7 +189,7 @@ fn call_of(request: &LegacyRequest) -> Call {
         LegacyRequestKind::Start => Call::Start,
         LegacyRequestKind::Catalog => Call::Catalog,
         LegacyRequestKind::InitialSuggest { query } => Call::InitialSuggest(query.clone()),
-        LegacyRequestKind::ArgumentSuggest { query, selected } => {
+        LegacyRequestKind::ArgumentSuggest { query, selected, .. } => {
             Call::ArgumentSuggest(query.clone(), selected.0.clone())
         }
         _ => Call::Other(request.callback()),
@@ -1366,6 +1366,10 @@ fn set_catalog_replaces_the_live_catalog_and_merge_catalog_extends_it() {
         item_ids(runtime.catalog(&of)),
         vec!["notes.a", "notes.b"],
         "spec 14.8: set_catalog() establishes the live catalog"
+    );
+    assert!(
+        runtime.visible_items().is_empty(),
+        "catalog state must not be inserted into query-visible suggestions"
     );
 
     let second = rebuild(&mut runtime, 30);

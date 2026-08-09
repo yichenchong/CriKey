@@ -96,6 +96,7 @@ fn launch(executable: &Path, plugin: &str, mode: &str, extra: &[(String, String)
         arguments: vec![mode.to_owned()],
         working_dir: None,
         environment,
+        inherit_environment: false,
     }
 }
 
@@ -225,6 +226,48 @@ fn spawn_restricts_environment_and_passes_handshake_and_explicit_entries() {
     assert!(values
         .get("CRIKEY_SESSION_TOKEN")
         .is_some_and(|value| value.len() >= 32));
+
+    let exit = worker.shutdown();
+    assert_eq!(exit.kind, ExitKind::Clean);
+    drop(restore);
+}
+
+/// The counterpart of the test above, and the reason `permissions.environment`
+/// is not merely parsed: with the grant the ambient variable that must not
+/// reach an ungranted child does reach a granted one. Without both halves the
+/// declaration would decide nothing, and two manifests that disagree about
+/// environment access would produce byte-identical child processes.
+#[test]
+fn a_granted_environment_declaration_lets_the_child_inherit_ambient_variables() {
+    let (plugin, _) = conformance_binaries();
+    let inherited_key = format!("CRIKEY_HOST_SHARED_{}_{}", std::process::id(), unique_suffix());
+    let inherited_value = OsString::from("reaches-a-granted-child");
+    let restore = EnvironmentRestore {
+        key: inherited_key.clone(),
+        previous: std::env::var_os(&inherited_key),
+    };
+    std::env::set_var(&inherited_key, &inherited_value);
+
+    let mut spec = launch(&plugin, "conformance", "env-witness", &[]);
+    spec.inherit_environment = true;
+    let mut worker = NativeWorker::spawn(spec, options(TransportKind::Stdio))
+        .expect("env-witness plugin completes handshake with an inherited environment");
+    let items = worker
+        .build_catalog()
+        .expect("env-witness returns its child environment as catalog items");
+    let values = env_values(&items);
+
+    assert_eq!(
+        values.get(&inherited_key).map(String::as_str),
+        Some("reaches-a-granted-child"),
+        "the environment grant must actually pass the ambient environment through"
+    );
+    // The host-owned handshake variables are still the host's, not whatever
+    // the ambient environment happened to hold.
+    assert_eq!(
+        values.get("CRIKEY_PLUGIN_ID").map(String::as_str),
+        Some("conformance")
+    );
 
     let exit = worker.shutdown();
     assert_eq!(exit.kind, ExitKind::Clean);
@@ -866,4 +909,36 @@ fn supervisor_restarts_crashes_with_caller_clock_and_keeps_a_sibling_healthy() {
     );
 
     supervisor.shutdown_all();
+}
+
+/// A worker must outlive the thread that spawned it.
+///
+/// Native calls run on short-lived per-query dispatch threads, and Linux
+/// delivers `PR_SET_PDEATHSIG` when the cloning THREAD exits - not when the
+/// host process does. A worker armed from a dispatch thread is therefore
+/// SIGKILLed the instant that query finishes, and every later query pays
+/// restart budget until the circuit breaker opens. Spawning from a thread that
+/// then exits is the whole point of this test: it fails against an inline
+/// spawn and passes only while one long-lived owner clones every child.
+#[test]
+fn a_worker_survives_the_thread_that_spawned_it() {
+    let (conformance, _) = conformance_binaries();
+    let spec = launch(&conformance, "thread.scoped", "echo", &[]);
+    let options = options(TransportKind::UnixSocket);
+
+    let mut worker = std::thread::spawn(move || {
+        NativeWorker::spawn(spec, options).expect("echo conformance plugin starts")
+    })
+    .join()
+    .expect("the spawning thread completes");
+
+    // The spawning thread is gone. A parent-death signal bound to it would have
+    // already been delivered.
+    assert!(worker.is_alive(), "the worker outlives its spawning thread");
+    let suggestions = worker
+        .suggest(&request("after", 1))
+        .expect("the surviving worker still answers");
+    assert_eq!(suggestions.state, BatchState::Final);
+    assert!(!suggestions.items.is_empty());
+    assert_eq!(worker.shutdown().kind, ExitKind::Clean);
 }

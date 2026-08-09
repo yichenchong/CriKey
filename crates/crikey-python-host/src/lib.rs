@@ -17,8 +17,9 @@ mod worker;
 
 pub use host::WorkerPool;
 pub use interpreter::{
-    discover_interpreter, discover_interpreter_in, DiscoveryEnvironment, Interpreter, InterpreterSource,
-    PythonVersion, RequiresPython, RuntimeCatalog, ENV_PYTHON_OVERRIDE,
+    bundled_interpreter_beside, discover_interpreter, discover_interpreter_in, DiscoveryEnvironment,
+    Interpreter, InterpreterSource, PythonVersion, RequiresPython, RuntimeCatalog, BUNDLED_RUNTIME_DIR,
+    ENV_PYTHON_OVERRIDE,
 };
 pub use protocol::{
     MAX_FRAME_BYTES, MAX_LOG_LINES, MAX_LOG_LINE_BYTES, MAX_STDERR_TAIL_BYTES, PROTOCOL_VERSION,
@@ -47,10 +48,11 @@ pub use crikey_package_manager::{EnvironmentId, ImportPath, MaterializedEnvironm
 pub enum RuntimeProfile {
     /// Interpreter kept for legacy compatibility.
     LegacyCompatibility,
-    /// Interpreter bundled with this CriKey build, reached through the search
-    /// path. Also the profile used when `CRIKEY_PYTHON` is set, because that
-    /// override is decisive and a profile naming a path would only compete
-    /// with it.
+    /// No interpreter named explicitly: discovery applies its ordered rules,
+    /// which prefer the runtime staged beside the executable
+    /// ([`BUNDLED_RUNTIME_DIR`]) over one found on the search path. Also the
+    /// profile used when `CRIKEY_PYTHON` is set, because that override is
+    /// decisive and a profile naming a path would only compete with it.
     Bundled,
     /// A specific interpreter, named by [`RuntimeCatalog::profile_for`] from a
     /// plugin's `requires-python`.

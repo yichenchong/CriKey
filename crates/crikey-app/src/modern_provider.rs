@@ -54,7 +54,7 @@ use crikey_input_scheduler::Millis;
 use crikey_package_manager::{
     resolve, EnvironmentInputs, EnvironmentStore, ImportPath, PackageError, PackageIndex,
 };
-use crikey_plugin_model::{Manifest, Runtime};
+use crikey_plugin_model::{Manifest, Permissions, Runtime, Startup};
 use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
 use crikey_python_host::{
     discover_interpreter, sdk_root, BatchState as WorkerBatchState, CancelHandle, ExecuteOutcome,
@@ -64,8 +64,9 @@ use crikey_python_host::{
 use crikey_ui::{ResultRow, ViewModel};
 
 use crate::{
-    ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError, DisabledPlugins,
-    ObsoleteCatalogBuild, PluginActionCompletion, QueryPipeline, ResultBatch, DISABLED_BY_CONFIGURATION,
+    plugin_icons::PluginIconResolver, ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError,
+    DisabledPlugins, ObsoleteCatalogBuild, PluginActionCompletion, QueryPipeline, ResultBatch,
+    DISABLED_BY_CONFIGURATION,
 };
 
 /// Bound on the startup handshake with a child interpreter, in milliseconds.
@@ -114,15 +115,20 @@ pub struct ModernUnavailable {
     pub reason: String,
 }
 
-/// One loaded modern plugin: its host identity, query worker key and the
-/// immutable recipe used to start an independent catalog worker.
+/// One loaded modern plugin: its host identity, query worker key, package
+/// directory for package-relative resources, and the immutable recipe used to
+/// start an independent catalog worker.
 #[derive(Debug, Clone)]
 struct LoadedPlugin {
     plugin: PluginId,
     key: WorkerKey,
+    /// The installed package directory, never a path supplied by plugin output.
+    package_dir: PathBuf,
     interpreter: Interpreter,
     worker_options: WorkerOptions,
     budget: PluginBudgetHandle,
+    soft_timeout: Duration,
+    permissions: Permissions,
 }
 
 /// Maximum number of catalog tasks retained before the host drains results.
@@ -286,6 +292,18 @@ impl ModernCallControl {
 #[derive(Debug, Default)]
 struct ModernCancellation {
     calls: Mutex<BTreeMap<(u64, PluginId), Arc<ModernCallControl>>>,
+    /// Monotonic count of queries the driver's intake has admitted.
+    ///
+    /// Supersession has to be observable by the provider even while it is doing
+    /// work that has no registered call to cancel — a lazy plugin's blocking
+    /// startup handshake. A plain counter is used rather than a search
+    /// generation because the UI's generation and the pipeline's are two
+    /// independent sequences, and the provider only ever sees the latter. Each
+    /// submission stamps its job with the value it produced here, so a provider
+    /// serving a stamp older than the current count is serving an obsolete
+    /// query. It lives on the registry because that is the one piece of
+    /// supersession state the driver and the moved-out provider already share.
+    intake: AtomicU64,
 }
 
 impl ModernCancellation {
@@ -301,6 +319,16 @@ impl ModernCancellation {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&(generation, plugin.clone()));
+    }
+
+    /// Admits one query and returns the stamp identifying it.
+    fn admit(&self) -> u64 {
+        self.intake.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// The stamp of the newest admitted query.
+    fn intake(&self) -> u64 {
+        self.intake.load(Ordering::Acquire)
     }
 
     fn cancel_before(&self, generation: u64) {
@@ -331,6 +359,42 @@ impl ModernCancellation {
     }
 }
 
+/// Lifecycle of one shared modern worker slot.
+///
+/// Modelled explicitly because map occupancy is the wrong thing to decide a
+/// spawn on. A worker that crashes has to stop being dispatched to, and the
+/// obvious way to arrange that — removing it from the map — makes it
+/// indistinguishable from a lazy plugin that has never started, so the very
+/// next keystroke starts it again. A plugin that crashes on every query then
+/// pays interpreter startup, and re-runs its import side effects, on every
+/// keystroke while `recorded` suppresses every diagnostic after the first.
+///
+/// A child may therefore only be spawned from [`Self::NeverStarted`], and
+/// [`Self::Failed`] is left only through an explicit supervised restart
+/// ([`ModernProvider::restart_worker`]).
+enum WorkerLifecycle {
+    /// No child has ever been started for this key. The only state a spawn is
+    /// allowed from.
+    NeverStarted,
+    /// A child is running and may be dispatched to.
+    Live(ModernWorker),
+    /// The child failed to start, crashed, or lost its transport. The plugin
+    /// stays unavailable with this reason until a supervised restart.
+    Failed { reason: String },
+}
+
+impl WorkerLifecycle {
+    /// A short human-readable state used in diagnostics. `ModernWorker` is not
+    /// `Debug`, so the pool's own formatter renders this instead.
+    fn describe(&self) -> String {
+        match self {
+            Self::NeverStarted => "never-started".to_owned(),
+            Self::Live(_) => "live".to_owned(),
+            Self::Failed { reason } => format!("failed: {reason}"),
+        }
+    }
+}
+
 /// Owns one child process per shared worker key and records every runtime
 /// dispatch failure.
 ///
@@ -340,8 +404,10 @@ impl ModernCancellation {
 /// [`EnvironmentStore`], which materialises one directory per environment id.
 #[derive(Default)]
 struct ModernWorkerPool {
-    workers: BTreeMap<WorkerKey, ModernWorker>,
+    workers: BTreeMap<WorkerKey, WorkerLifecycle>,
     failures: Vec<(PluginId, String)>,
+    /// Saturating count of callbacks that exceeded their soft deadline.
+    soft_timeouts: BTreeMap<PluginId, u32>,
     /// Plugins already recorded as a dispatch failure, so a worker that dies is
     /// recorded once rather than every keystroke (this bounds `failures`).
     recorded: std::collections::BTreeSet<PluginId>,
@@ -350,8 +416,16 @@ struct ModernWorkerPool {
 impl std::fmt::Debug for ModernWorkerPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModernWorkerPool")
-            .field("workers", &self.workers.keys().collect::<Vec<_>>())
+            .field(
+                "workers",
+                &self
+                    .workers
+                    .iter()
+                    .map(|(key, state)| (key, state.describe()))
+                    .collect::<Vec<_>>(),
+            )
             .field("failures", &self.failures)
+            .field("soft_timeouts", &self.soft_timeouts)
             .finish()
     }
 }
@@ -364,6 +438,41 @@ impl ModernWorkerPool {
         if self.recorded.insert(plugin.clone()) {
             self.failures.push((plugin, reason));
         }
+    }
+    /// The live child for `key`, or `None` when the slot has never started or
+    /// has failed. Callers dispatch only through this, so a failed slot can
+    /// never be mistaken for a startable one.
+    fn live_mut(&mut self, key: &WorkerKey) -> Option<&mut ModernWorker> {
+        match self.workers.get_mut(key) {
+            Some(WorkerLifecycle::Live(worker)) => Some(worker),
+            Some(WorkerLifecycle::NeverStarted | WorkerLifecycle::Failed { .. }) | None => None,
+        }
+    }
+
+    /// The reason `key`'s worker is in the failed state, if it is.
+    fn failure_reason(&self, key: &WorkerKey) -> Option<&str> {
+        match self.workers.get(key) {
+            Some(WorkerLifecycle::Failed { reason }) => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether `key` has never had a child, and may therefore be spawned.
+    fn never_started(&self, key: &WorkerKey) -> bool {
+        matches!(self.workers.get(key), Some(WorkerLifecycle::NeverStarted) | None)
+    }
+
+    /// Retires `key` into the failed state. Any child held in the slot is
+    /// dropped here, which reaps it, and nothing may dispatch to or respawn
+    /// the slot until a supervised restart.
+    fn fail(&mut self, key: &WorkerKey, reason: String) {
+        self.workers
+            .insert(key.clone(), WorkerLifecycle::Failed { reason });
+    }
+
+    fn record_soft_timeout(&mut self, plugin: PluginId) {
+        let count = self.soft_timeouts.entry(plugin).or_default();
+        *count = count.saturating_add(1);
     }
 }
 
@@ -384,6 +493,11 @@ pub struct ModernProvider {
     /// id. Stable item ids are only unique within an owner.
     action_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     cancellation: Arc<ModernCancellation>,
+    /// Intake stamp of the query currently being served, set by the supervisor
+    /// before each `drive_query`. Zero when nothing drives this provider
+    /// through an intake, in which case the registry's counter is also zero and
+    /// no work is ever considered obsolete.
+    serving_intake: u64,
 }
 
 impl ModernProvider {
@@ -410,6 +524,7 @@ impl ModernProvider {
             unavailable: Vec::new(),
             action_items: Arc::new(Mutex::new(BTreeMap::new())),
             cancellation: Arc::new(ModernCancellation::default()),
+            serving_intake: 0,
         };
 
         // The worker shim must be on disk before any child can speak the
@@ -487,8 +602,25 @@ impl ModernProvider {
                 provider.register_plugin_dir(pipeline, &context, &dir);
             }
         }
+        // Modern plugin icon references are package-relative. Install one
+        // immutable resolver after discovery so failed packages have no origin
+        // and every loaded package is resolved under its own directory.
+        provider.install_icon_resolver(pipeline);
 
         provider
+    }
+    /// Installs package-relative icon origins for every loaded modern plugin.
+    ///
+    /// The resolver never trusts a path emitted by a plugin: it joins only
+    /// references that pass its relative-component check to this directory,
+    /// and only for a plugin whose manifest permits the host-mediated package
+    /// read in the first place.
+    fn install_icon_resolver(&self, pipeline: &mut QueryPipeline) {
+        let mut resolver = PluginIconResolver::default();
+        for loaded in &self.loaded {
+            resolver.insert_package(&loaded.plugin, loaded.package_dir.clone(), &loaded.permissions);
+        }
+        pipeline.set_plugin_icons(Arc::new(resolver));
     }
 
     /// Opens the offline package index, or an empty one when no index root is
@@ -659,10 +791,26 @@ impl ModernProvider {
             dir.to_string_lossy().into_owned(),
         );
         let suggest_timeout_ms = manifest.performance.suggest_hard_timeout_ms.min(CALL_BUDGET_MS);
+        let soft_timeout = Duration::from_millis(
+            manifest
+                .performance
+                .suggest_soft_timeout_ms
+                .min(suggest_timeout_ms),
+        );
         let worker_options = WorkerOptions::new(plugin.clone(), entrypoint, import_path)
             .with_startup_timeout_ms(STARTUP_BUDGET_MS)
             .with_call_timeout_ms(suggest_timeout_ms)
-            .with_shutdown_timeout_ms(SHUTDOWN_BUDGET_MS);
+            .with_shutdown_timeout_ms(SHUTDOWN_BUDGET_MS)
+            .with_background_execution(manifest.permissions.background_execution)
+            .with_environment_inheritance(manifest.permissions.environment)
+            // The host hands a modern plugin no writable directory of its own,
+            // so the policy is scratch space and the usual device files. A
+            // manifest that did not ask for the network gets TCP refused by
+            // the kernel rather than merely undeclared (spec 20.2).
+            .with_sandbox(crikey_sandbox::plugin_policy(
+                Vec::<std::path::PathBuf>::new(),
+                !manifest.permissions.network,
+            ));
 
         // Register first so the pipeline creates the one shared per-plugin
         // budget before any worker runtime is admitted. The exact handle is
@@ -680,9 +828,9 @@ impl ModernProvider {
         };
         let worker_options = worker_options.with_shared_budget(budget.clone());
 
-        // Spawn a worker for this (environment, entrypoint) if none is live yet;
-        // a truly identical plugin already loaded reuses it.
-        if !self.pool.workers.contains_key(&key) {
+        // Spawn only eager workers at load. Lazy workers retain their resolved
+        // interpreter/options and are started on their first query.
+        if manifest.performance.startup == Startup::Eager && self.pool.never_started(&key) {
             let worker = match ModernWorker::spawn(&interpreter, worker_options.clone()) {
                 Ok(worker) => worker,
                 Err(error) => {
@@ -695,16 +843,21 @@ impl ModernProvider {
                     return;
                 }
             };
-            self.pool.workers.insert(key.clone(), worker);
+            self.pool
+                .workers
+                .insert(key.clone(), WorkerLifecycle::Live(worker));
         }
 
         self.plugins.push(plugin.clone());
         self.loaded.push(LoadedPlugin {
             plugin,
             key,
+            package_dir: dir.to_owned(),
             interpreter,
             worker_options,
             budget,
+            soft_timeout,
+            permissions: manifest.permissions,
         });
     }
 
@@ -715,7 +868,93 @@ impl ModernProvider {
             reason,
         });
     }
+    /// Starts `plugin`'s child if its slot has never been started.
+    ///
+    /// Spawning is allowed from `NeverStarted` only: a slot that already failed
+    /// stays failed and is reported through [`Self::failed_workers`] until
+    /// [`Self::restart_worker`] supervises a retry. A failed spawn retires the
+    /// slot here, so the caller cannot leave it startable by accident.
+    fn ensure_worker(&mut self, plugin: &PluginId, key: &WorkerKey) -> Result<(), String> {
+        match self.pool.workers.get(key) {
+            Some(WorkerLifecycle::Live(_)) => return Ok(()),
+            Some(WorkerLifecycle::Failed { reason }) => return Err(reason.clone()),
+            Some(WorkerLifecycle::NeverStarted) | None => {}
+        }
+        let Some((interpreter, options)) = self
+            .loaded
+            .iter()
+            .find(|loaded| &loaded.plugin == plugin && &loaded.key == key)
+            .map(|loaded| (loaded.interpreter.clone(), loaded.worker_options.clone()))
+        else {
+            let reason = "modern plugin is not registered".to_owned();
+            self.pool.fail(key, reason.clone());
+            return Err(reason);
+        };
+        match ModernWorker::spawn(&interpreter, options) {
+            Ok(worker) => {
+                self.pool
+                    .workers
+                    .insert(key.clone(), WorkerLifecycle::Live(worker));
+                Ok(())
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                self.pool.fail(key, reason.clone());
+                Err(reason)
+            }
+        }
+    }
 
+    /// Modern plugins whose worker is currently retired in the failed state,
+    /// each with the reason it failed.
+    ///
+    /// Distinct from [`Self::dispatch_failures`], which is a bounded
+    /// once-per-plugin log: this is live lifecycle state, so a plugin that
+    /// crashed stays reported as unavailable for as long as it stays failed
+    /// rather than being named once and then quietly retried.
+    pub fn failed_workers(&self) -> Vec<(PluginId, String)> {
+        self.loaded
+            .iter()
+            .filter_map(|loaded| {
+                self.pool
+                    .failure_reason(&loaded.key)
+                    .map(|reason| (loaded.plugin.clone(), reason.to_owned()))
+            })
+            .collect()
+    }
+
+    /// Supervised restart of a failed modern worker: the one transition out of
+    /// the failed state.
+    ///
+    /// Clears the failure verdict so the next query may spawn a fresh child,
+    /// and clears the recorded diagnostic so a second failure is attributable
+    /// rather than suppressed by the first. Returns an error when `plugin` is
+    /// not loaded or its worker is not failed, because a caller that restarts
+    /// a healthy or unknown plugin has a bug rather than a no-op.
+    pub fn restart_worker(&mut self, plugin: &PluginId) -> Result<(), String> {
+        let Some(key) = self
+            .loaded
+            .iter()
+            .find(|loaded| &loaded.plugin == plugin)
+            .map(|loaded| loaded.key.clone())
+        else {
+            return Err(format!("modern plugin `{}` is not loaded", plugin.0));
+        };
+        if self.pool.failure_reason(&key).is_none() {
+            return Err(format!("modern plugin `{}` has no failed worker", plugin.0));
+        }
+        self.pool.workers.insert(key, WorkerLifecycle::NeverStarted);
+        self.pool.recorded.remove(plugin);
+        Ok(())
+    }
+
+    /// Manifest grants used by the host-mediated action boundary.
+    pub fn permissions(&self) -> BTreeMap<PluginId, Permissions> {
+        self.loaded
+            .iter()
+            .map(|loaded| (loaded.plugin.clone(), loaded.permissions.clone()))
+            .collect()
+    }
     /// The modern plugins that loaded and are being served through the pipeline.
     pub fn plugins(&self) -> &[PluginId] {
         &self.plugins
@@ -731,6 +970,11 @@ impl ModernProvider {
     /// Distinct from [`Self::unavailable`], which is load-time only.
     pub fn dispatch_failures(&self) -> &[(PluginId, String)] {
         &self.pool.failures
+    }
+    /// Saturating counts of suggestion callbacks that exceeded each manifest's
+    /// soft deadline. Hard timeout failures remain in [`Self::dispatch_failures`].
+    pub fn soft_timeouts(&self) -> &BTreeMap<PluginId, u32> {
+        &self.pool.soft_timeouts
     }
 
     /// Delivers each loaded plugin its own complete configuration state (spec 21.4).
@@ -757,7 +1001,7 @@ impl ModernProvider {
             .collect();
         for (plugin, key) in targets {
             let values = configuration.get(&plugin).unwrap_or(&empty).clone();
-            let Some(worker) = self.pool.workers.get_mut(&key) else {
+            let Some(worker) = self.pool.live_mut(&key) else {
                 failures.push((plugin, "modern worker is unavailable".to_owned()));
                 continue;
             };
@@ -960,10 +1204,15 @@ impl ModernProvider {
         }
 
         let key = loaded.key.clone();
-        let worker = self.pool.workers.get_mut(&key).ok_or_else(|| {
+        let worker = self.pool.live_mut(&key).ok_or_else(|| {
             crikey_core::CoreError::Invalid(format!("modern worker for `{}` is unavailable", plugin.0))
         })?;
         if !worker.is_alive() {
+            // Observing a dead child here retires the slot, exactly as the
+            // suggestion path does: the plugin stays unavailable rather than
+            // being respawned behind the user's back on the next keystroke.
+            self.pool
+                .fail(&key, "the modern worker is no longer alive".to_owned());
             self.pool
                 .record_dispatch_failure(plugin.clone(), "modern worker is no longer alive".to_owned());
             self.action_items
@@ -1079,6 +1328,17 @@ impl ModernProvider {
         frame.filter(|frame| frame.generation == generation)
     }
 
+    /// Records which admitted query the provider is about to serve, so blocking
+    /// work inside [`Self::drive_query`] can notice its own supersession.
+    fn begin_serving(&mut self, intake: u64) {
+        self.serving_intake = intake;
+    }
+
+    /// Whether a newer query has been admitted since the one being served.
+    fn superseded(&self) -> bool {
+        self.cancellation.intake() != self.serving_intake
+    }
+
     /// Cooperative teardown of every modern worker (spec 24.3).
     pub fn shutdown(&mut self, _now: Millis) {
         self.cancellation.cancel_all();
@@ -1087,10 +1347,13 @@ impl ModernProvider {
                 self.pool.record_dispatch_failure(plugin, reason);
             }
         }
-        for (_, worker) in std::mem::take(&mut self.pool.workers) {
+        for (_, state) in std::mem::take(&mut self.pool.workers) {
             // Best effort: the child is reaped on drop even if orderly shutdown
-            // reports an error, so no worker is leaked.
-            let _ = worker.shutdown();
+            // reports an error, so no worker is leaked. A slot that never
+            // started or already failed owns no child to tear down.
+            if let WorkerLifecycle::Live(worker) = state {
+                let _ = worker.shutdown();
+            }
         }
     }
 
@@ -1115,32 +1378,61 @@ impl ModernProvider {
             .unwrap_or_else(|error| error.into_inner())
             .clear();
         // Snapshot the loaded set so the pool can be mutated while iterating.
-        let targets: Vec<(PluginId, WorkerKey)> = self
+        let targets: Vec<(PluginId, WorkerKey, Duration)> = self
             .loaded
             .iter()
-            .map(|loaded| (loaded.plugin.clone(), loaded.key.clone()))
+            .map(|loaded| (loaded.plugin.clone(), loaded.key.clone(), loaded.soft_timeout))
             .collect();
 
         let mut by_plugin: BTreeMap<PluginId, Vec<Item>> = BTreeMap::new();
         let mut dead_plugins = BTreeSet::new();
 
-        for (plugin, key) in targets {
-            // A worker that has already died stays dead: skip it, leave the
-            // plugin cleanly unavailable, and record the failure at most once
-            // rather than re-dispatching to a corpse every keystroke.
-            let alive = match self.pool.workers.get(&key) {
-                Some(worker) => worker.is_alive(),
-                None => {
+        for (plugin, key, soft_timeout) in targets {
+            // An obsolete target list is abandoned rather than worked through.
+            // Nothing this generation produces can be published now, and the
+            // startup below is the one blocking call the provider makes with no
+            // registered call for a newer query to cancel.
+            if self.superseded() {
+                break;
+            }
+            if let Some(reason) = self.pool.failure_reason(&key) {
+                // A failed worker stays failed until a supervised restart, so a
+                // plugin that crashes on every query pays interpreter startup
+                // once rather than on every keystroke. It keeps being reported
+                // as unavailable through `failed_workers` for as long as it
+                // stays in this state.
+                let reason = reason.to_owned();
+                dead_plugins.insert(plugin.clone());
+                self.pool.record_dispatch_failure(plugin, reason);
+                continue;
+            }
+            if self.pool.never_started(&key) {
+                if let Err(reason) = self.ensure_worker(&plugin, &key) {
                     dead_plugins.insert(plugin.clone());
-                    false
+                    self.pool.record_dispatch_failure(plugin, reason);
+                    continue;
                 }
-            };
+                // Startup is bounded at 30 seconds per plugin and targets are
+                // processed in order. A supersession that arrived during the
+                // handshake has to stop the chain here, not after every
+                // remaining plugin has also been started and asked.
+                if self.superseded() {
+                    break;
+                }
+            }
+            // A worker that has died since its last call stays dead: retire the
+            // slot, leave the plugin cleanly unavailable, and record the failure
+            // at most once rather than re-dispatching to a corpse every
+            // keystroke.
+            let alive = self
+                .pool
+                .live_mut(&key)
+                .map(|worker| worker.is_alive())
+                .unwrap_or(false);
             if !alive {
-                self.pool.record_dispatch_failure(
-                    plugin.clone(),
-                    "the modern worker is no longer alive".to_owned(),
-                );
-                self.pool.workers.remove(&key);
+                let reason = "the modern worker is no longer alive".to_owned();
+                self.pool.fail(&key, reason.clone());
+                self.pool.record_dispatch_failure(plugin.clone(), reason);
                 self.action_items
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -1152,11 +1444,10 @@ impl ModernProvider {
             self.cancellation
                 .register(generation.get(), plugin.clone(), Arc::clone(&control));
             let control_for_thread = Arc::clone(&control);
-            let answer = {
+            let (answer, elapsed) = {
                 let worker = self
                     .pool
-                    .workers
-                    .get_mut(&key)
+                    .live_mut(&key)
                     .expect("the worker was live a moment ago");
                 let handle = worker.cancel_handle();
                 // Clear any cancellation left by the prior call before
@@ -1168,21 +1459,26 @@ impl ModernProvider {
                 let watcher = thread::Builder::new()
                     .name(format!("crikey-modern-cancel-{}", plugin.0))
                     .spawn(move || control_for_thread.watch_cancel());
+                let started = Instant::now();
                 let answer = catch_unwind(AssertUnwindSafe(|| worker.suggest_with_cancel_latched(&request)));
+                let elapsed = started.elapsed();
                 control.finish();
                 if let Ok(watcher) = watcher {
                     let _ = watcher.join();
                 }
-                answer
+                (answer, elapsed)
             };
+            if elapsed > soft_timeout {
+                self.pool.record_soft_timeout(plugin.clone());
+            }
             self.cancellation.unregister(generation.get(), &plugin);
             let answer = match answer {
                 Ok(answer) => answer,
                 Err(_) => {
                     dead_plugins.insert(plugin.clone());
-                    self.pool
-                        .record_dispatch_failure(plugin.clone(), "modern worker panicked".to_owned());
-                    self.pool.workers.remove(&key);
+                    let reason = "modern worker panicked".to_owned();
+                    self.pool.fail(&key, reason.clone());
+                    self.pool.record_dispatch_failure(plugin.clone(), reason);
                     self.action_items
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
@@ -1214,14 +1510,14 @@ impl ModernProvider {
                     by_plugin.insert(plugin, items);
                 }
                 Err(error) => {
-                    // A crashed or unresponsive worker is contained: record the
-                    // failure once so a diagnostic can name the plugin, and drop
-                    // the dead worker so the next query skips it rather than
-                    // re-dispatching to a dead process.
+                    // A crashed or unresponsive worker is contained: retire the
+                    // slot so the plugin stays unavailable with this reason
+                    // until a supervised restart, and record the failure once so
+                    // a diagnostic can name the plugin.
                     dead_plugins.insert(plugin.clone());
-                    self.pool
-                        .record_dispatch_failure(plugin.clone(), error.to_string());
-                    self.pool.workers.remove(&key);
+                    let reason = error.to_string();
+                    self.pool.fail(&key, reason.clone());
+                    self.pool.record_dispatch_failure(plugin.clone(), reason);
                     self.action_items
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
@@ -1240,6 +1536,9 @@ impl ModernProvider {
 struct ModernJob {
     generation: Generation,
     query: String,
+    /// Intake stamp minted when this job was admitted. The supervisor hands it
+    /// to the provider so a startup handshake can notice its own supersession.
+    intake: u64,
     now: Millis,
     /// The built-in provider's rows for this generation. Prepended to the modern
     /// rows so the merged frame keeps the built-in path's ordering.
@@ -1523,6 +1822,7 @@ fn enqueue_modern_completion(
 pub struct ModernDriver {
     mailbox: Arc<(Mutex<ModernRequestSlot>, Condvar)>,
     action_endpoint: Arc<ModernActionEndpoint>,
+    permissions: BTreeMap<PluginId, Permissions>,
     catalog_results: Arc<Mutex<Vec<CatalogBuildResult>>>,
     /// Per-plugin diagnostics refreshed by the supervisor thread after every
     /// unit of work, so the UI thread can report a throttled plugin without
@@ -1549,6 +1849,7 @@ impl ModernDriver {
     where
         P: Fn(&ViewModel) + Send + 'static,
     {
+        let permissions = provider.permissions();
         let has_plugins = !provider.plugins().is_empty();
         let mailbox = Arc::new((
             Mutex::new(ModernRequestSlot {
@@ -1691,6 +1992,10 @@ impl ModernDriver {
                         ModernWork::Query(job) => job,
                     };
                     last_now = job.now;
+                    // Tell the provider which admitted query it is serving, so
+                    // a lazy plugin's blocking startup can abandon an obsolete
+                    // target list instead of walking the whole chain.
+                    provider.begin_serving(job.intake);
 
                     // The blocking child interpreter calls happen here, on this
                     // thread — never on the caller's. Stale answers are refused
@@ -1739,6 +2044,7 @@ impl ModernDriver {
             Ok(worker) => Self {
                 mailbox,
                 action_endpoint,
+                permissions,
                 catalog_results,
                 health,
                 outcome,
@@ -1750,6 +2056,7 @@ impl ModernDriver {
             Err(_) => Self {
                 mailbox,
                 action_endpoint,
+                permissions,
                 catalog_results,
                 health,
                 outcome,
@@ -1796,6 +2103,10 @@ impl ModernDriver {
         }
         // Signal superseded in-flight callbacks before queueing the new job.
         self.cancellation.cancel_before(generation_value);
+        // Stamped before the job is queued: any later submission raises the
+        // registry's count past this stamp, so a provider already inside this
+        // job's startup handshake observes the supersession.
+        let intake = self.cancellation.admit();
 
         let (lock, cvar) = &*self.mailbox;
         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
@@ -1805,6 +2116,7 @@ impl ModernDriver {
         slot.job = Some(ModernJob {
             generation,
             query: query.to_owned(),
+            intake,
             now,
             builtin_rows,
             builtin_pending,
@@ -1864,6 +2176,10 @@ impl ModernDriver {
     /// Returns the exact plugin ids owned by this driver's action endpoint.
     pub fn plugins(&self) -> Vec<PluginId> {
         self.action_endpoint.budgets.keys().cloned().collect()
+    }
+    /// Manifest grants used by the host-mediated action boundary.
+    pub fn permissions(&self) -> BTreeMap<PluginId, Permissions> {
+        self.permissions.clone()
     }
 
     /// Returns the bounded action endpoint sharing this driver's per-plugin

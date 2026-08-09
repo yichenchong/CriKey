@@ -2701,6 +2701,43 @@ emit("continuation_preserved", parsed["Main"]["multi"] == "first\nsecond line")
 emit("merged_section", parsed["Main"]["Other"])
 emit("colon_with_equals", parsed["Main"]["url"])
 emit("user_category", item.category() == 107)
+generic_extension = worker._item_from_wire(
+    {
+        "category": "plugin-defined:legacy-user-107",
+        "label": "generic",
+        "short_desc": "",
+        "target": "generic",
+        "args_hint": "accepted",
+        "hit_hint": "ignore",
+    }
+)
+shadowed = worker._item_from_wire(
+    {
+        "category": "plugin-defined:application",
+        "label": "shadowed",
+        "short_desc": "",
+        "target": "shadowed",
+        "args_hint": "accepted",
+        "hit_hint": "ignore",
+    }
+)
+emit("generic_extension_category", generic_extension.category() == 107)
+emit("shadowing_category_stays_plugin_defined",
+     shadowed.category() == 100)
+
+for name in ("reference", "error"):
+    candidate = worker._item_from_wire(
+        {
+            "category": "plugin-defined:" + name,
+            "label": name,
+            "short_desc": "",
+            "target": name,
+            "args_hint": "accepted",
+            "hit_hint": "ignore",
+        }
+    )
+    emit("shadowing_" + name + "_stays_plugin_defined",
+         candidate.category() == 100)
 
 # NaN is not JSON. The emitter must turn that serialization failure into a
 # bounded plugin-exception response rather than writing invalid JSON or dying.
@@ -2766,6 +2803,59 @@ wire.flush()
     run.expect(
         "surrogate_round_trip",
         "JSON framing must escape lone surrogates so strict UTF-8 output cannot crash the worker",
+    );
+}
+
+#[test]
+fn legacy_worker_loads_sibling_modules_through_package_relative_imports() {
+    let scratch = TempDir::new("relative-import");
+    scratch.write("package/__init__.py", "");
+    scratch.write("package/helper.py", "VALUE = 'sibling-value'\n");
+    scratch.write(
+        "package/entry.py",
+        r#"
+from .helper import VALUE
+
+import keypirinha as kp
+
+
+class Impl(kp.Plugin):
+    def __init__(self):
+        super().__init__()
+        self.value = VALUE
+"#,
+    );
+    let root = scratch.path().join("package");
+    let run = run_python(
+        &scratch,
+        r#"
+import _crikey_legacy_worker as worker
+import _kptest as t
+
+plugin = worker._load_plugin()
+t.emit("loaded", plugin.value)
+t.done()
+"#,
+        &[
+            ("CRIKEY_LEGACY_PACKAGE_ROOT", root.to_str().unwrap()),
+            ("CRIKEY_LEGACY_MAIN_MODULE", "entry"),
+            ("CRIKEY_LEGACY_MAIN_MODULE_PATH", "entry.py"),
+        ],
+    );
+    assert!(
+        run.succeeded(),
+        "the relative-import fixture failed:\n{}",
+        run.describe()
+    );
+    assert!(
+        run.stderr.lines().any(|line| line == "loaded=sibling-value"),
+        "the plugin must load its sibling through a relative import:\n{}",
+        run.describe()
+    );
+    assert!(
+        run.stderr.lines().any(|line| line == "DONE"),
+        "the relative-import fixture must reach its completion sentinel:\n{}",
+        run.describe()
     );
 }
 
@@ -3323,5 +3413,423 @@ t.done()
         SHIM_MODULES.len(),
         4,
         "spec 14.2 enumerates exactly four documented compatibility modules"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Settings coercions delivered on top of `_coerce` (spec 14.4, 26.2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn settings_enum_and_map_coercions_attribute_a_bad_value_to_its_section_and_key() {
+    let scratch = TempDir::new("settings-coercions");
+    let run = run_ok(
+        &scratch,
+        r##"
+import keypirinha as kp
+import _kptest as t
+
+settings = kp.Settings({
+    "DEFAULT": {"mode": "Fast", "level": "HIGH"},
+    "advanced": {"mode": "sideways"},
+})
+
+# The *accepted* spelling is returned, not the configured one, so a plugin can
+# compare the result against its own literals.
+t.emit("enum_folds_case", settings.get_enum("mode", enum=("slow", "fast")))
+t.emit("enum_case_sensitive_fallback",
+       settings.get_enum("mode", enum=("fast",), fallback="kept", case_sensitive=True))
+t.emit("mapped", settings.get_mapped("level", map={"low": 1, "high": 2}))
+t.emit("mapped_absent_key_no_fallback", settings.get_mapped("nope", map={"low": 1}) is None)
+t.emit("enum_bad_value_fallback", settings.get_enum("mode", "advanced", ("slow",), "fell-back"))
+
+
+def attribution(call):
+    try:
+        return "value:" + repr(call())
+    except kp.SettingsError as exc:
+        return "{}/{}".format(exc.section, exc.key)
+    except Exception as exc:  # noqa: BLE001
+        return "wrong-error:" + type(exc).__name__
+
+
+t.emit("enum_attribution", attribution(lambda: settings.get_enum("mode", "advanced", ("slow",))))
+t.emit("mapped_attribution", attribution(lambda: settings.get_mapped("level", map={"low": 1})))
+
+try:
+    settings.get_enum("mode", "advanced", ("slow",))
+    t.emit("enum_lists_accepted", "no-error")
+except kp.SettingsError as exc:
+    t.emit("enum_lists_accepted", "'slow'" in str(exc))
+
+t.done()
+"##,
+        &[],
+    );
+
+    run.expect_eq(
+        "enum_folds_case",
+        "fast",
+        "get_enum must match ASCII-case-insensitively by default and answer with the accepted spelling",
+    );
+    run.expect_eq(
+        "enum_case_sensitive_fallback",
+        "kept",
+        "case_sensitive=True must reject a differently-cased value, and a supplied fallback wins",
+    );
+    run.expect_eq("mapped", "2", "get_mapped must return the mapped value");
+    run.expect(
+        "mapped_absent_key_no_fallback",
+        "an absent key is not a coercion failure: with no fallback it answers None, like every other accessor",
+    );
+    run.expect_eq(
+        "enum_bad_value_fallback",
+        "fell-back",
+        "a supplied fallback must win over a typed failure, as it does for get_int",
+    );
+    run.expect_eq(
+        "enum_attribution",
+        "advanced/mode",
+        "an unaccepted enum value must raise SettingsError carrying the section and key, never a bare ValueError",
+    );
+    run.expect_eq(
+        "mapped_attribution",
+        "DEFAULT/level",
+        "a value absent from the map must raise SettingsError attributed to the DEFAULT section",
+    );
+    run.expect(
+        "enum_lists_accepted",
+        "the SettingsError message must name the accepted spellings; a plugin author reading a log cannot guess them",
+    );
+}
+
+#[test]
+fn settings_multiline_and_stripped_read_continuations_and_quotes() {
+    let scratch = TempDir::new("settings-text");
+    let run = run_ok(
+        &scratch,
+        r##"
+import keypirinha as kp
+import _kptest as t
+
+# The INI reader keeps an indented continuation as an embedded newline, so this
+# is exactly the shape a multi-line setting arrives in.
+settings = kp.Settings({
+    "DEFAULT": {
+        "paths": "  /one\n/two\n\n  /three  ",
+        "quoted": '  "  padded  "  ',
+        "plain": "  bare  ",
+    }
+})
+
+t.emit("multiline", "|".join(settings.get_multiline("paths")))
+t.emit("multiline_keep_blanks", "|".join(settings.get_multiline("paths", keep_empty_lines=True)))
+t.emit("multiline_absent", repr(settings.get_multiline("nope")))
+t.emit("multiline_absent_fallback", "|".join(settings.get_multiline("nope", fallback=["d"])))
+t.emit("stripped_quoted", settings.get_stripped("quoted"))
+t.emit("stripped_plain", settings.get_stripped("plain"))
+t.emit("stripped_absent", settings.get_stripped("nope") is None)
+t.emit("stripped_absent_fallback", settings.get_stripped("nope", fallback="d"))
+
+t.done()
+"##,
+        &[],
+    );
+
+    run.expect_eq(
+        "multiline",
+        "/one|/two|/three",
+        "get_multiline must strip each line and drop blank ones by default",
+    );
+    run.expect_eq(
+        "multiline_keep_blanks",
+        "/one|/two||/three",
+        "keep_empty_lines must retain the blank line for callers that use it as a separator",
+    );
+    run.expect_eq(
+        "multiline_absent_fallback",
+        "d",
+        "a supplied fallback must be returned verbatim for an absent key",
+    );
+    run.expect_eq(
+        "stripped_quoted",
+        "padded",
+        "get_stripped must remove one matching quote pair as well as the surrounding whitespace",
+    );
+    run.expect_eq(
+        "stripped_plain",
+        "bare",
+        "get_stripped must strip whitespace from an unquoted value",
+    );
+    run.expect(
+        "stripped_absent",
+        "an absent key with no fallback answers None, matching the other scalar accessors",
+    );
+    run.expect_eq(
+        "stripped_absent_fallback",
+        "d",
+        "a supplied fallback must be returned for an absent key",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// keypirinha_util: the round trip and the decode ladder (spec 14.4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kwargs_encoding_round_trips_values_containing_the_separators_and_the_escape() {
+    let scratch = TempDir::new("kwargs");
+    let run = run_ok(
+        &scratch,
+        r##"
+import keypirinha_util as ku
+import _kptest as t
+
+# Every character the format gives meaning to, inside both a name and a value,
+# plus a value that is itself encoded output.
+inner = ku.kwargs_encode(nested="a&b=c")
+cases = {
+    "path": r"C:\dir\file",
+    "query": "a=b&c=d",
+    "escape": "\\",
+    "empty": "",
+    "payload": inner,
+}
+encoded = ku.kwargs_encode(**cases)
+t.emit("round_trips", ku.kwargs_decode(encoded) == cases)
+t.emit("nested_round_trips", ku.kwargs_decode(inner) == {"nested": "a&b=c"})
+t.emit("stable_order", encoded == ku.kwargs_encode(**cases))
+t.emit("sorted_by_name", encoded.split("&")[0].startswith("empty="))
+t.emit("empty_encode", repr(ku.kwargs_encode()))
+t.emit("empty_decode", ku.kwargs_decode("") == {})
+
+
+def rejection(text):
+    try:
+        return "value:" + repr(ku.kwargs_decode(text))
+    except ValueError:
+        return "ValueError"
+    except Exception as exc:  # noqa: BLE001
+        return "wrong-error:" + type(exc).__name__
+
+
+t.emit("no_assignment", rejection("bare"))
+t.emit("trailing_escape", rejection("a=b\\"))
+t.emit("repeated_name", rejection("a=1&a=2"))
+t.emit("empty_name", rejection("=1"))
+
+typed = ku.kwargs_encode(count=7, enabled=True, ratio=1.5)
+t.emit("typed_values", ku.kwargs_decode(typed) == {"count": 7, "enabled": True, "ratio": 1.5})
+t.emit("non_str_value", "accepted")
+
+t.done()
+"##,
+        &[],
+    );
+
+    run.expect(
+        "round_trips",
+        "kwargs_decode must be the exact inverse of kwargs_encode for values containing `&`, `=` and `\\`",
+    );
+    run.expect(
+        "nested_round_trips",
+        "encoded output must itself survive being carried as a value",
+    );
+    run.expect(
+        "stable_order",
+        "the same arguments must always produce the same string: an item target is compared by value",
+    );
+    run.expect(
+        "sorted_by_name",
+        "pairs must be emitted in sorted name order, not dictionary insertion order",
+    );
+    run.expect_eq(
+        "empty_encode",
+        "''",
+        "no arguments must encode to the empty string",
+    );
+    run.expect(
+        "empty_decode",
+        "the empty string must decode to an empty mapping, closing the round trip at zero pairs",
+    );
+    for (key, why) in [
+        (
+            "no_assignment",
+            "a pair with no unescaped `=` is not something kwargs_encode could have produced",
+        ),
+        (
+            "trailing_escape",
+            "a trailing lone escape is truncated input, not a value ending in a backslash",
+        ),
+        (
+            "repeated_name",
+            "a repeated name has two readings and must not be given one silently",
+        ),
+        ("empty_name", "an empty name is not a keyword argument"),
+    ] {
+        run.expect_eq(key, "ValueError", why);
+    }
+    run.expect(
+        "typed_values",
+        "basic bool, int and float values must survive kwargs_encode/kwargs_decode with their types",
+    );
+    run.expect_eq(
+        "non_str_value",
+        "accepted",
+        "the documented scalar values beyond str must be supported and round-trip",
+    );
+}
+
+#[test]
+fn byte_decoding_walks_the_documented_ladder_from_the_mark_to_the_last_resort() {
+    let scratch = TempDir::new("decode");
+    let run = run_ok(
+        &scratch,
+        r##"
+import codecs
+import os
+
+import keypirinha_util as ku
+import _kptest as t
+
+text = "h\u00e9llo \u20ac"
+
+# 1. A byte-order mark is proof, and must be consumed rather than left as a
+#    leading U+FEFF in the result.
+t.emit("bom_utf8", ku.decode_bytes(codecs.BOM_UTF8 + text.encode("utf-8")) == text)
+t.emit("bom_utf16le", ku.decode_bytes(codecs.BOM_UTF16_LE + text.encode("utf-16-le")) == text)
+t.emit("bom_utf16be", ku.decode_bytes(codecs.BOM_UTF16_BE + text.encode("utf-16-be")) == text)
+# UTF-32-LE's mark begins with UTF-16-LE's, so a shortest-first scan would
+# silently read this as UTF-16-LE.
+t.emit("bom_utf32le", ku.decode_bytes(codecs.BOM_UTF32_LE + text.encode("utf-32-le")) == text)
+
+# 2. Unmarked UTF-8.
+t.emit("plain_utf8", ku.decode_bytes(text.encode("utf-8")) == text)
+
+# 3. Not valid UTF-8: the documented cp1252 guess.
+cp1252 = "h\u00e9llo".encode("cp1252")
+t.emit("cp1252", ku.decode_bytes(cp1252) == "h\u00e9llo")
+
+# 4. A byte cp1252 leaves undefined must still decode rather than raise.
+t.emit("last_resort", ku.decode_bytes(b"\x81\xfe") == "\u0081\u00fe")
+
+# Non-bytes is a TypeError, and bytearray/memoryview are accepted.
+t.emit("bytearray", ku.decode_bytes(bytearray(text.encode("utf-8"))) == text)
+try:
+    ku.decode_bytes(text)
+    t.emit("str_rejected", "accepted")
+except TypeError:
+    t.emit("str_rejected", "TypeError")
+
+scratch = os.environ["CRIKEY_TEST_SCRATCH"]
+path = os.path.join(scratch, "sample.txt")
+with open(path, "wb") as handle:
+    handle.write(codecs.BOM_UTF8 + text.encode("utf-8"))
+with ku.chardet_open(path) as handle:
+    t.emit("chardet_open", handle.read() == text)
+
+try:
+    ku.chardet_open(path, "rb")
+    t.emit("binary_mode", "accepted")
+except ValueError:
+    t.emit("binary_mode", "ValueError")
+
+t.done()
+"##,
+        &[("CRIKEY_TEST_SCRATCH", &scratch.path().display().to_string())],
+    );
+
+    for (key, why) in [
+        ("bom_utf8", "a UTF-8 BOM must be honoured and consumed"),
+        ("bom_utf16le", "a UTF-16-LE BOM must be honoured and consumed"),
+        ("bom_utf16be", "a UTF-16-BE BOM must be honoured and consumed"),
+        (
+            "bom_utf32le",
+            "UTF-32-LE must be tried before UTF-16-LE: its mark begins with UTF-16-LE's, so a shortest-first scan reads the text as interleaved NULs without raising",
+        ),
+        ("plain_utf8", "unmarked bytes that decode wholly as UTF-8 must be read as UTF-8"),
+        ("cp1252", "bytes that are not valid UTF-8 must fall to the documented Windows-1252 guess"),
+        (
+            "last_resort",
+            "a byte cp1252 leaves undefined must fall to Latin-1, which cannot fail: the ladder must be total",
+        ),
+        ("bytearray", "a bytearray must be accepted without the caller copying it first"),
+        ("chardet_open", "chardet_open must open the file in the encoding decode_bytes would have chosen"),
+    ] {
+        run.expect(key, why);
+    }
+    run.expect_eq(
+        "str_rejected",
+        "TypeError",
+        "decode_bytes takes bytes; a str argument is a caller error, not something to pass through",
+    );
+    run.expect_eq(
+        "binary_mode",
+        "ValueError",
+        "a binary mode must be refused: an encoding cannot be applied to a binary handle, and accepting one would claim a detection that did not happen",
+    );
+}
+
+#[test]
+fn windows_only_shell_helpers_refuse_off_windows_instead_of_emulating_win32() {
+    let scratch = TempDir::new("windows-only-helpers");
+    let run = run_ok(
+        &scratch,
+        r##"
+import sys
+
+import keypirinha as kp
+import keypirinha_util as ku
+import _kptest as t
+
+
+def refusal(call):
+    try:
+        call()
+        return "performed"
+    except kp.HostUnavailableError as exc:
+        return "HostUnavailableError:" + exc.operation
+    except Exception as exc:  # noqa: BLE001
+        return "wrong-error:" + type(exc).__name__
+
+
+t.emit("windows", sys.platform.startswith("win"))
+t.emit("read_link", refusal(lambda: ku.read_link("shortcut.lnk")))
+t.emit("known_folder",
+       refusal(lambda: ku.shell_known_folder_path("{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}")))
+# An honest refusal must not be launderable into a silent False by the two
+# probes plugins reach for first.
+t.emit("hasattr_read_link", hasattr(ku, "read_link"))
+t.emit("execute_default_action_without_host",
+       refusal(lambda: ku.execute_default_action(None, None)))
+
+t.done()
+"##,
+        &[],
+    );
+
+    assert!(
+        !run.flag("windows"),
+        "this assertion describes the non-Windows behaviour and the CI host must not be Windows.\n{}",
+        run.describe()
+    );
+    run.expect_eq(
+        "read_link",
+        "HostUnavailableError:read_link",
+        "resolving a .lnk needs the Win32 shell link interfaces; off Windows it must refuse, naming the operation, rather than parse the file format and answer a different question (spec 2.3)",
+    );
+    run.expect_eq(
+        "known_folder",
+        "HostUnavailableError:shell_known_folder_path",
+        "there is no known-folder registry off Windows and no defensible mapping onto XDG, so the call must refuse rather than pick a nearest match",
+    );
+    run.expect(
+        "hasattr_read_link",
+        "the name must resolve so the refusal is raised at the call, not swallowed by a hasattr probe (spec 14.12)",
+    );
+    run.expect_eq(
+        "execute_default_action_without_host",
+        "HostUnavailableError:execute_default_action",
+        "with no host installed the action was not performed, and the plugin must be told so rather than see a silent success",
     );
 }

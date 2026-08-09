@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 use crikey_core::{Item, PluginId};
 use crikey_package_manager::ImportPath;
 use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
+use crikey_sandbox::SandboxPolicy;
 
 use crate::interpreter::sanitize_python_environment;
 use crate::protocol::{
@@ -299,9 +300,36 @@ pub struct WorkerOptions {
     pub entrypoint: String,
     /// The assembled import path handed to the child (spec 15.4).
     pub import_path: ImportPath,
+    /// Whether the manifest granted `background-execution`.
+    ///
+    /// Enforced here, in the host, at background admission: a denied worker
+    /// refuses every `background_register` its child sends before any budget
+    /// slot is taken. The decision is deliberately not exported to the child,
+    /// because the shim that would read it is plugin-adjacent code a hostile
+    /// plugin can replace, and a gate that only the guarded side applies is
+    /// no gate at all.
+    ///
+    /// Direct `WorkerOptions` callers retain the historical capability for
+    /// compatibility; manifest-driven providers explicitly set this value.
+    pub allow_background_execution: bool,
+    /// Whether the manifest granted `environment`.
+    ///
+    /// `false`, the default, starts the child from an empty environment plus
+    /// the restricted base the host puts back; `true` hands it the ambient
+    /// environment as well. The grant has to decide something real, or a
+    /// manifest that asks for environment access and one that does not would
+    /// produce identical interpreters.
+    pub inherit_environment: bool,
     /// The one shared per-plugin budget owner. Background registration refuses
     /// work when this is absent rather than silently bypassing §13.5.
     pub shared_budget: Option<PluginBudgetHandle>,
+    /// What the child may write to, and whether it may open TCP sockets.
+    ///
+    /// A modern plugin is handed no writable directory by the host: its
+    /// package is read-only material and it keeps nothing of its own, so the
+    /// default is scratch space and the usual device files and nothing else.
+    /// Providers narrow or widen this from the manifest.
+    pub sandbox: SandboxPolicy,
     /// Bound on the startup handshake, in milliseconds.
     pub startup_timeout_ms: u64,
     /// Bound on every call, in milliseconds (spec 9.6).
@@ -317,11 +345,20 @@ impl WorkerOptions {
             plugin,
             entrypoint: entrypoint.into(),
             import_path,
+            allow_background_execution: true,
+            inherit_environment: false,
             shared_budget: None,
+            sandbox: crikey_sandbox::plugin_policy(Vec::<std::path::PathBuf>::new(), false),
             startup_timeout_ms: DEFAULT_STARTUP_TIMEOUT_MS,
             call_timeout_ms: DEFAULT_CALL_TIMEOUT_MS,
             shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
         }
+    }
+
+    /// Sets what the child may write to and whether it may open TCP sockets.
+    pub fn with_sandbox(mut self, sandbox: SandboxPolicy) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Bounds the startup handshake.
@@ -346,6 +383,18 @@ impl WorkerOptions {
     /// category, including child-registered background tasks.
     pub fn with_shared_budget(mut self, budget: PluginBudgetHandle) -> Self {
         self.shared_budget = Some(budget);
+        self
+    }
+
+    /// Enables or disables host-admitted background execution.
+    pub fn with_background_execution(mut self, allowed: bool) -> Self {
+        self.allow_background_execution = allowed;
+        self
+    }
+
+    /// Enables or disables inheritance of this process's environment.
+    pub fn with_environment_inheritance(mut self, inherited: bool) -> Self {
+        self.inherit_environment = inherited;
         self
     }
 }
@@ -465,6 +514,13 @@ impl WorkerLink {
     }
 }
 /// Bounded operator-visible counters for child-registered background work.
+///
+/// Every counter here is one the host itself raises, so each is an
+/// observation and not a claim: `registered` is what the child announced,
+/// `admitted`/`refused` are this side's admission decisions, and the three
+/// outcome counters are the terminals the child reported for tasks the host
+/// admitted. A refusal has no outcome counter: it is already counted as a
+/// refusal, and the child's `refused` terminal only acknowledges it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackgroundDiagnostics {
     pub registered: u64,
@@ -473,7 +529,6 @@ pub struct BackgroundDiagnostics {
     pub completed: u64,
     pub cancelled: u64,
     pub failed: u64,
-    pub unknown_completions: u64,
 }
 
 #[derive(Debug, Default)]
@@ -484,11 +539,14 @@ struct BackgroundCounters {
     completed: u64,
     cancelled: u64,
     failed: u64,
-    unknown_completions: u64,
 }
 
 #[derive(Debug)]
 struct BackgroundState {
+    /// The manifest's `permissions.background-execution` decision, checked
+    /// ahead of the budget so a plugin that never asked for the permission
+    /// cannot occupy a slot it is not entitled to.
+    allowed: bool,
     budget: Option<PluginBudgetHandle>,
     guards: Mutex<HashMap<u64, OwnedBudgetGuard>>,
     counters: Mutex<BackgroundCounters>,
@@ -496,8 +554,9 @@ struct BackgroundState {
 }
 
 impl BackgroundState {
-    fn new(budget: Option<PluginBudgetHandle>) -> Self {
+    fn new(budget: Option<PluginBudgetHandle>, allowed: bool) -> Self {
         Self {
+            allowed,
             budget,
             guards: Mutex::new(HashMap::new()),
             counters: Mutex::new(BackgroundCounters::default()),
@@ -514,7 +573,6 @@ impl BackgroundState {
             completed: counters.completed,
             cancelled: counters.cancelled,
             failed: counters.failed,
-            unknown_completions: counters.unknown_completions,
         }
     }
 
@@ -523,7 +581,14 @@ impl BackgroundState {
             let mut counters = self.counters.lock().unwrap_or_else(|error| error.into_inner());
             counters.registered = counters.registered.saturating_add(1);
         }
-        let refused_reason = if self.closed.load(Ordering::Acquire) {
+        // The permission is tested first and before any slot is taken: a
+        // denial is a property of the manifest, so it holds regardless of how
+        // much budget happens to be free, and a refusal that had already
+        // acquired a guard would let an unentitled plugin crowd out an
+        // entitled sibling for as long as the refusal took to travel back.
+        let refused_reason = if !self.allowed {
+            Some("the manifest does not grant permissions.background-execution")
+        } else if self.closed.load(Ordering::Acquire) {
             Some("background dispatch is shutting down")
         } else if self.budget.is_none() {
             Some("no shared per-plugin background budget was supplied")
@@ -582,20 +647,26 @@ impl BackgroundState {
         counters.refused = counters.refused.saturating_add(1);
     }
 
-    fn complete(&self, task_id: u64, status: &str) -> bool {
-        let removed = self
-            .guards
+    /// Retires one task the child reports as finished, releasing the budget
+    /// slot it held.
+    ///
+    /// A `refused` terminal adds to no outcome counter: it is the child
+    /// acknowledging a refusal this side already counted, and a refused task
+    /// never held a slot to release.
+    fn complete(&self, task_id: u64, status: &str) {
+        if status == "refused" {
+            return;
+        }
+        self.guards
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .remove(&task_id)
-            .is_some();
+            .remove(&task_id);
         let mut counters = self.counters.lock().unwrap_or_else(|error| error.into_inner());
         match status {
             "cancelled" => counters.cancelled = counters.cancelled.saturating_add(1),
             "failed" => counters.failed = counters.failed.saturating_add(1),
             _ => counters.completed = counters.completed.saturating_add(1),
         }
-        removed
     }
 
     fn release_all(&self) {
@@ -861,6 +932,30 @@ impl StderrTail {
     }
 }
 
+/// The variables a stripped modern-Python child still needs.
+///
+/// Deliberately the same shape as the native host's restricted base, and for
+/// the same reason: an interpreter started from a genuinely empty environment
+/// cannot find its own shared library on Windows, cannot resolve a home
+/// directory for `expanduser`, and writes temporary files wherever the
+/// platform default happens to point. Everything else — tokens, proxies,
+/// session state, the user's own configuration — stays with the host unless
+/// `permissions.environment` says otherwise.
+fn add_restricted_environment(command: &mut Command) {
+    #[cfg(unix)]
+    const KEYS: [&str; 5] = ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"];
+    #[cfg(windows)]
+    const KEYS: [&str; 6] = ["PATH", "SystemRoot", "SystemDrive", "TEMP", "TMP", "USERPROFILE"];
+    #[cfg(not(any(unix, windows)))]
+    const KEYS: [&str; 1] = ["PATH"];
+
+    for key in KEYS {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+}
+
 fn spawn_stderr_drain(stderr: ChildStderr, tail: Arc<Mutex<StderrTail>>) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
@@ -938,7 +1033,16 @@ impl ModernWorker {
             .map_err(|error| HostError::Spawn(format!("the plugin import path is invalid: {error}")))?;
 
         let mut command = Command::new(interpreter.path());
-        sanitize_python_environment(&mut command);
+        if options.inherit_environment {
+            // The manifest bought the ambient environment. `PYTHON*` is still
+            // the host's to own: those variables select an interpreter's
+            // import path and byte-compilation behaviour, which is worker
+            // configuration and not a plugin capability.
+            sanitize_python_environment(&mut command);
+        } else {
+            command.env_clear();
+            add_restricted_environment(&mut command);
+        }
         command
             .arg(WORKER_ISOLATION_FLAG)
             .arg(&entry)
@@ -969,6 +1073,14 @@ impl ModernWorker {
             command.process_group(0);
         }
 
+        // Confinement is installed last so it covers the finished command, and
+        // it is prepared here rather than in the caller so that the descriptor
+        // the child restricts itself with is built before the fork. An
+        // unavailable sandbox is not a spawn failure: the report says what the
+        // child is actually subject to (spec 20.2).
+        let sandbox = options.sandbox.prepare();
+        sandbox.install(&mut command);
+
         let mut child = command
             .spawn()
             .map_err(|error| HostError::Spawn(format!("the process could not be started: {error}")))?;
@@ -987,7 +1099,10 @@ impl ModernWorker {
             stdin: Mutex::new(Some(stdin_sender)),
             stdin_thread: Mutex::new(Some(stdin_thread)),
         });
-        let background = Arc::new(BackgroundState::new(options.shared_budget.clone()));
+        let background = Arc::new(BackgroundState::new(
+            options.shared_budget.clone(),
+            options.allow_background_execution,
+        ));
         spawn_stdout_reader(stdout, sender, Arc::clone(&link), Arc::clone(&background));
         let tail = Arc::new(Mutex::new(StderrTail::default()));
         let stderr_thread = spawn_stderr_drain(stderr, Arc::clone(&tail));
@@ -1715,6 +1830,14 @@ fn hard_kill(process_id: u32, child: &mut Child) {
 /// the call reads and writes no memory.
 #[cfg(unix)]
 fn kill_process_group(pgid: u32) {
+    // `killpg(0)` signals the CALLER's process group - this launcher, its shell
+    // and its session. Callers pass a live `Child::id()`, and each kill precedes
+    // its reap so the pid cannot have been recycled, but a misdirected group
+    // kill is unrecoverable: refuse the values that could only mean "myself" or
+    // "init".
+    if pgid <= 1 {
+        return;
+    }
     extern "C" {
         fn killpg(pgrp: i32, sig: i32) -> i32;
     }

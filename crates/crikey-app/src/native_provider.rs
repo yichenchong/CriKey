@@ -45,13 +45,16 @@ use std::time::{Duration, Instant};
 use crikey_core::{ActionId, ArgumentPolicy, ExecutionPolicy, Generation, Item, ItemId, PluginId};
 use crikey_input_scheduler::Millis;
 use crikey_native_host::{
-    CancelHandle, ExecuteOutcome, HostError, LaunchSpec, NativeSuggestRequest, NativeSupervisor, Suggestions,
-    SupervisorConfig, WorkerOptions,
+    CancelHandle, ExecuteOutcome, HostError, LaunchSpec, NativeSuggestRequest, NativeSupervisor,
+    ResourceKind, Suggestions, SupervisorConfig, WorkerOptions,
 };
-use crikey_plugin_model::{Manifest, Runtime};
+use crikey_plugin_model::{Manifest, Permissions, Runtime, Startup};
 use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
 use crikey_ui::{ResultRow, ViewModel};
 
+use crate::plugin_icons::{
+    PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
+};
 use crate::{
     ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError, DisabledPlugins,
     ObsoleteCatalogBuild, PluginActionCompletion, QueryPipeline, ResultBatch, DISABLED_BY_CONFIGURATION,
@@ -85,6 +88,8 @@ struct LoadedPlugin {
     launch: LaunchSpec,
     worker_options: WorkerOptions,
     budget: PluginBudgetHandle,
+    soft_timeout: Duration,
+    permissions: Permissions,
 }
 
 /// Maximum number of catalog tasks retained before the host drains results.
@@ -306,6 +311,7 @@ struct DispatchResult {
     generation: u64,
     plugin: PluginId,
     result: Result<Suggestions, HostError>,
+    soft_timeout: bool,
 }
 
 #[derive(Debug)]
@@ -324,6 +330,7 @@ struct InFlightCall {
 struct NativeWorkerPool {
     supervisors: BTreeMap<WorkerKey, Arc<Mutex<NativeSupervisor>>>,
     failures: Vec<(PluginId, String)>,
+    soft_timeouts: BTreeMap<PluginId, u32>,
     /// Plugins already reported as failed. A dead worker must not produce one
     /// diagnostic per later keystroke (contract §11.5).
     recorded: BTreeSet<PluginId>,
@@ -333,6 +340,11 @@ struct NativeWorkerPool {
     result_rx: Receiver<DispatchResult>,
     in_flight: BTreeMap<(u64, PluginId), InFlightCall>,
     cancellation: Arc<NativeCancellation>,
+    /// One lazily started child per plugin that serves resources, kept apart
+    /// from `supervisors` on purpose: an icon is decoration and must never own
+    /// the lock a query needs. Registration is lazy, so a plugin whose icons
+    /// are never asked for pays for no second process.
+    resource_supervisors: BTreeMap<WorkerKey, Arc<Mutex<NativeSupervisor>>>,
 }
 
 impl std::fmt::Debug for NativeWorkerPool {
@@ -341,6 +353,7 @@ impl std::fmt::Debug for NativeWorkerPool {
             .debug_struct("NativeWorkerPool")
             .field("supervisors", &self.supervisors.keys().collect::<Vec<_>>())
             .field("failures", &self.failures)
+            .field("soft_timeouts", &self.soft_timeouts)
             .field("in_flight", &self.in_flight.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -352,11 +365,13 @@ impl Default for NativeWorkerPool {
         Self {
             supervisors: BTreeMap::new(),
             failures: Vec::new(),
+            soft_timeouts: BTreeMap::new(),
             recorded: BTreeSet::new(),
             result_tx,
             result_rx,
             in_flight: BTreeMap::new(),
             cancellation: Arc::new(NativeCancellation::default()),
+            resource_supervisors: BTreeMap::new(),
         }
     }
 }
@@ -378,6 +393,10 @@ impl NativeWorkerPool {
         }
     }
 
+    fn record_soft_timeout(&mut self, plugin: PluginId) {
+        let count = self.soft_timeouts.entry(plugin).or_default();
+        *count = count.saturating_add(1);
+    }
     /// Removes one completed call and joins its short-lived dispatcher thread.
     fn finish_call(&mut self, generation: u64, plugin: &PluginId) {
         let key = (generation, plugin.clone());
@@ -411,12 +430,50 @@ impl NativeWorkerPool {
                 let _ = join.join();
             }
         }
-        for supervisor in self.supervisors.values() {
+        for supervisor in self
+            .supervisors
+            .values()
+            .chain(self.resource_supervisors.values())
+        {
             supervisor
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .shutdown_all();
         }
+    }
+}
+
+/// Serves one native plugin's resources by asking a child of its own.
+///
+/// The supervisor here is deliberately NOT the one query dispatch uses. A
+/// plugin has a whole [`PLUGIN_ICON_DEADLINE`] to answer a resource request
+/// and a native child answers one request at a time, so sharing the query
+/// worker would let a slow or silent icon hold the lock the next query needs
+/// and leave the plugin contributing nothing inside that query's collection
+/// window. Decoration therefore gets its own supervised process, exactly as a
+/// catalog rebuild does. The blocking lock that remains only serializes this
+/// plugin's own icon fetches against each other, which is what the concurrency
+/// bound in `plugin_icons` already assumes.
+#[derive(Debug)]
+struct NativeResourceSource {
+    plugin: PluginId,
+    supervisor: Arc<Mutex<NativeSupervisor>>,
+}
+
+impl PluginResourceSource for NativeResourceSource {
+    fn fetch(&self, reference: &str) -> Option<Vec<u8>> {
+        let mut supervisor = self.supervisor.lock().unwrap_or_else(|error| error.into_inner());
+        let worker = supervisor.worker(&self.plugin, 0).ok()?;
+        worker
+            .request_resource(
+                ResourceKind::Icon,
+                reference,
+                PLUGIN_ICON_DEADLINE,
+                MAX_PLUGIN_ICON_BYTES,
+            )
+            .ok()
+            .flatten()
+            .map(|resource| resource.content)
     }
 }
 
@@ -515,7 +572,52 @@ impl NativeProvider {
             }
         }
 
+        provider.install_icon_resolver(pipeline);
         provider
+    }
+
+    /// Gives the pipeline a resolver that can reach every worker that started.
+    ///
+    /// Installed after discovery rather than per package: the resolver is
+    /// shared immutably once the pipeline holds it, and a package that failed
+    /// to load has no worker to ask for an icon.
+    ///
+    /// Each served origin is backed by a second supervisor built from the same
+    /// immutable launch recipe the catalog path uses. `register` starts no
+    /// process, so this costs a plugin nothing until one of its icons is
+    /// actually asked for; a registration that is refused leaves the plugin
+    /// with no origin, which resolves to no icon rather than to a shared lock.
+    fn install_icon_resolver(&mut self, pipeline: &mut QueryPipeline) {
+        // Disjoint field borrows: the recipes are read while the pool that
+        // retains the new supervisors is written.
+        let Self { pool, loaded, .. } = self;
+        let mut resolver = PluginIconResolver::default();
+        for entry in loaded.iter() {
+            if !pool.supervisors.contains_key(&entry.key) {
+                continue;
+            }
+            let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+            if supervisor
+                .register(entry.launch.clone(), entry.worker_options.clone())
+                .is_err()
+            {
+                continue;
+            }
+            // One worker key belongs to one package directory, so this is
+            // always a fresh entry and the provider is its only owner besides
+            // the resolver it hands to the pipeline.
+            let supervisor = Arc::new(Mutex::new(supervisor));
+            pool.resource_supervisors
+                .insert(entry.key.clone(), Arc::clone(&supervisor));
+            resolver.insert_served(
+                &entry.plugin,
+                Arc::new(NativeResourceSource {
+                    plugin: entry.plugin.clone(),
+                    supervisor,
+                }),
+            );
+        }
+        pipeline.set_plugin_icons(Arc::new(resolver));
     }
 
     /// Loads one candidate package, starts its worker, and registers the
@@ -548,12 +650,20 @@ impl NativeProvider {
             }
         };
 
-        // This provider owns only native packages; other runtimes remain for
-        // their respective providers.
-        if manifest.plugin.runtime != Runtime::Native {
+        // This provider owns native packages and the `c-abi` and `wasm`
+        // packages that `crikey-cabi-host` and `crikey-wasm-host` serve on
+        // their behalf. All three are supervised executables speaking the
+        // native protocol, so they share one worker, one supervisor and one
+        // teardown; only the launch recipe differs (ADR-0014, ADR-0015).
+        // Other runtimes remain for their respective providers.
+        let runtime = manifest.plugin.runtime;
+        if !matches!(runtime, Runtime::Native | Runtime::CAbi | Runtime::Wasm) {
             return;
         }
 
+        // One namespace for all three: a `c-abi` or `wasm` package installs
+        // under the same `native` plugin root and is addressed by the same id
+        // the CLI prints.
         let plugin = PluginId(format!("native.{}", manifest.plugin.id));
         // Held back before the worker process is spawned: an operator who
         // disabled a plugin must not pay for its process, and the only proof
@@ -563,35 +673,77 @@ impl NativeProvider {
             return;
         }
         let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-        let entrypoint = match manifest.entrypoint_for(os, arch) {
-            Ok(entrypoint) => entrypoint.to_owned(),
-            Err(error) => {
-                self.record_unavailable(package, Some(plugin), format!("no usable entrypoint: {error}"));
-                return;
+        let suggest_timeout_ms = manifest
+            .performance
+            .suggest_hard_timeout_ms
+            .min(NATIVE_CALL_TIMEOUT_MS);
+        let (executable, arguments, environment) = match runtime {
+            Runtime::CAbi => {
+                // The launcher never resolves the shared library, let alone
+                // loads it: it starts the host and hands over the package
+                // directory.
+                match crate::cabi_provider::launch_recipe(&manifest, directory, os, arch) {
+                    Ok((executable, arguments)) => (executable, arguments, Vec::new()),
+                    Err(reason) => {
+                        self.record_unavailable(package, Some(plugin), reason);
+                        return;
+                    }
+                }
+            }
+            Runtime::Wasm => {
+                // The launcher never instantiates the module: it starts the
+                // host, names the module and states what the manifest granted.
+                // The enforced deadline travels with it, because fuel metering
+                // inside the guest is what interrupts a spinning module.
+                match crate::wasm_provider::launch_recipe(&manifest, directory, os, arch, suggest_timeout_ms)
+                {
+                    Ok(recipe) => recipe,
+                    Err(reason) => {
+                        self.record_unavailable(package, Some(plugin), reason);
+                        return;
+                    }
+                }
+            }
+            _ => {
+                let entrypoint = match manifest.entrypoint_for(os, arch) {
+                    Ok(entrypoint) => entrypoint.to_owned(),
+                    Err(error) => {
+                        self.record_unavailable(
+                            package,
+                            Some(plugin),
+                            format!("no usable entrypoint: {error}"),
+                        );
+                        return;
+                    }
+                };
+
+                // Manifest entrypoints are paths, not shell command lines.
+                // Resolve a relative path within the package and preserve
+                // absolute paths exactly; never whitespace-split an entrypoint
+                // (contract §11.1).
+                let entrypoint_path = Path::new(&entrypoint);
+                let executable = if entrypoint_path.is_absolute() {
+                    entrypoint_path.to_path_buf()
+                } else {
+                    directory.join(entrypoint_path)
+                };
+                if !executable.is_file() {
+                    self.record_unavailable(
+                        package,
+                        Some(plugin),
+                        format!("native entrypoint is not a file: {}", executable.display()),
+                    );
+                    return;
+                }
+                (executable, Vec::new(), Vec::new())
             }
         };
 
-        // Manifest entrypoints are paths, not shell command lines. Resolve a
-        // relative path within the package and preserve absolute paths exactly;
-        // never whitespace-split an entrypoint (contract §11.1).
-        let executable_path = Path::new(&entrypoint);
-        let executable = if executable_path.is_absolute() {
-            executable_path.to_path_buf()
-        } else {
-            directory.join(executable_path)
-        };
-        if !executable.is_file() {
-            self.record_unavailable(
-                package,
-                Some(plugin),
-                format!("native entrypoint is not a file: {}", executable.display()),
-            );
-            return;
-        }
-
         // Source directory identity is load-bearing even when entrypoint paths
         // are identical. One package gets one worker; no worker is shared
-        // across distinct package directories.
+        // across distinct package directories. For `c-abi` and `wasm` packages
+        // the executable is the same host for every one of them, so the
+        // directory is the only thing that distinguishes their workers.
         let key: WorkerKey = (
             executable.to_string_lossy().into_owned(),
             directory.to_string_lossy().into_owned(),
@@ -599,15 +751,25 @@ impl NativeProvider {
         let launch = LaunchSpec {
             plugin: plugin.clone(),
             executable,
-            arguments: Vec::new(),
+            arguments,
             working_dir: Some(directory.to_path_buf()),
-            environment: Vec::new(),
+            environment,
+            inherit_environment: manifest.permissions.environment,
         };
-        let suggest_timeout_ms = manifest
-            .performance
-            .suggest_hard_timeout_ms
-            .min(NATIVE_CALL_TIMEOUT_MS);
-        let options = WorkerOptions::new().with_call_timeout_ms(suggest_timeout_ms);
+        let soft_timeout = Duration::from_millis(
+            manifest
+                .performance
+                .suggest_soft_timeout_ms
+                .min(suggest_timeout_ms),
+        );
+        let mut options = WorkerOptions::new().with_call_timeout_ms(suggest_timeout_ms);
+        // A native, WASM or C-ABI plugin runs from a read-only package
+        // directory and is given no writable location of its own, so the
+        // policy is scratch space and the usual device files. An undeclared
+        // network permission becomes a kernel refusal instead of a line in a
+        // manifest nothing enforces (spec 20.2).
+        options.sandbox =
+            crikey_sandbox::plugin_policy(Vec::<std::path::PathBuf>::new(), !manifest.permissions.network);
 
         // Register first so this provider receives the exact shared budget
         // handle that the query pipeline stores for the plugin. A worker
@@ -635,18 +797,18 @@ impl NativeProvider {
             let _ = pipeline.unregister_plugin(&plugin);
             return;
         }
-        // `register` is intentionally lazy, but startup is a load-time
-        // boundary for the provider. Obtain the first worker through the
-        // supervisor so a refused handshake is reported as unavailable while
-        // all later workers remain restartable through the same registration.
-        if let Err(error) = supervisor.worker(&plugin, 0) {
-            self.record_unavailable(
-                package,
-                Some(plugin.clone()),
-                format!("native worker did not start: {error}"),
-            );
-            let _ = pipeline.unregister_plugin(&plugin);
-            return;
+        // `register` is intentionally lazy. Eager manifests pay the startup
+        // handshake here; lazy manifests start on their first query.
+        if manifest.performance.startup == Startup::Eager {
+            if let Err(error) = supervisor.worker(&plugin, 0) {
+                self.record_unavailable(
+                    package,
+                    Some(plugin.clone()),
+                    format!("native worker did not start: {error}"),
+                );
+                let _ = pipeline.unregister_plugin(&plugin);
+                return;
+            }
         }
         let supervisor = Arc::new(Mutex::new(supervisor));
         self.pool.supervisors.insert(key.clone(), supervisor);
@@ -658,6 +820,8 @@ impl NativeProvider {
             launch,
             worker_options: options,
             budget,
+            soft_timeout,
+            permissions: manifest.permissions,
         });
     }
 
@@ -725,6 +889,13 @@ impl NativeProvider {
         });
     }
 
+    /// Manifest grants used by the host-mediated action boundary.
+    pub fn permissions(&self) -> BTreeMap<PluginId, Permissions> {
+        self.loaded
+            .iter()
+            .map(|loaded| (loaded.plugin.clone(), loaded.permissions.clone()))
+            .collect()
+    }
     /// The namespaced native plugins that loaded successfully.
     pub fn plugins(&self) -> &[PluginId] {
         &self.plugins
@@ -743,6 +914,12 @@ impl NativeProvider {
     pub fn dispatch_failures(&mut self) -> &[(PluginId, String)] {
         self.drain_completed_results();
         &self.pool.failures
+    }
+    /// Saturating counts of suggestion callbacks that exceeded each manifest's
+    /// soft deadline.
+    pub fn soft_timeouts(&mut self) -> &BTreeMap<PluginId, u32> {
+        self.drain_completed_results();
+        &self.pool.soft_timeouts
     }
 
     /// Starts one bounded catalog rebuild for an exactly owned plugin.
@@ -988,22 +1165,42 @@ impl NativeProvider {
         now: Millis,
     ) -> Option<ViewModel> {
         let generation = pipeline.keystroke(query, now);
-        let (mut suggestions, dead_plugins) = self.collect_suggestions(query, generation, now);
-
         let mut at = now;
         for _ in 0..64 {
+            // Ask the scheduler first. Starting a worker before this tick would
+            // bypass minimum-query, prefix, and debounce gates and spend a
+            // native callback on work the pipeline never admitted.
             let tick = pipeline.tick(at);
             for cancellation in tick.cancellations {
                 let _ = pipeline.complete(&cancellation.plugin, cancellation.generation, at);
             }
 
-            let mut dispatched_current = false;
+            let mut requests = Vec::new();
             for request in tick.dispatches {
-                if request.generation != generation {
+                if request.generation == generation {
+                    requests.push(request);
+                } else {
                     let _ = pipeline.complete(&request.plugin, request.generation, at);
-                    continue;
                 }
-                dispatched_current = true;
+            }
+
+            if requests.is_empty() {
+                match pipeline.next_wakeup() {
+                    Some(next) if next > at => {
+                        at = next;
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+
+            let requested_plugins = requests
+                .iter()
+                .map(|request| request.plugin.clone())
+                .collect::<BTreeSet<_>>();
+            let (mut suggestions, dead_plugins) =
+                self.collect_suggestions(query, generation, at, &requested_plugins);
+            for request in requests {
                 if dead_plugins.contains(&request.plugin) {
                     let _ = pipeline.abort_request(&request.plugin, request.generation, at);
                     continue;
@@ -1019,13 +1216,6 @@ impl NativeProvider {
                     at,
                 );
                 let _ = pipeline.complete(&request.plugin, request.generation, at);
-            }
-            if suggestions.is_empty() && dispatched_current {
-                break;
-            }
-            match pipeline.next_wakeup() {
-                Some(next) if next > at => at = next,
-                _ => break,
             }
         }
 
@@ -1064,12 +1254,10 @@ impl NativeProvider {
         query: &str,
         generation: Generation,
         now: Millis,
+        requested_plugins: &BTreeSet<PluginId>,
     ) -> (BTreeMap<PluginId, Vec<Item>>, BTreeSet<PluginId>) {
         let generation_value = generation.get();
         self.pool.cancel_before(generation_value);
-
-        // First retire completions from superseded calls. Their items are
-        // intentionally discarded, but failures remain actionable diagnostics.
         self.drain_completed_results();
         self.action_items
             .lock()
@@ -1081,15 +1269,16 @@ impl NativeProvider {
             normalized: query.to_owned(),
             selected_item_id: None,
         };
-        let targets: Vec<(PluginId, WorkerKey)> = self
+        let targets: Vec<(PluginId, WorkerKey, Duration)> = self
             .loaded
             .iter()
-            .map(|loaded| (loaded.plugin.clone(), loaded.key.clone()))
+            .filter(|loaded| requested_plugins.contains(&loaded.plugin))
+            .map(|loaded| (loaded.plugin.clone(), loaded.key.clone(), loaded.soft_timeout))
             .collect();
         let mut pending = 0usize;
 
         let mut dead_plugins = BTreeSet::new();
-        for (plugin, key) in targets {
+        for (plugin, key, soft_timeout) in targets {
             if self.pool.has_in_flight(&plugin) {
                 continue;
             }
@@ -1111,7 +1300,7 @@ impl NativeProvider {
             let join = thread::Builder::new()
                 .name(format!("crikey-native-{}", plugin.0))
                 .spawn(move || {
-                    let result = {
+                    let (result, soft_timeout) = {
                         let mut supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
                         match supervisor.worker(&plugin_for_thread, now) {
                             Ok(worker) => {
@@ -1120,20 +1309,23 @@ impl NativeProvider {
                                 let watcher = thread::Builder::new()
                                     .name(format!("crikey-native-cancel-{}", plugin_for_thread.0))
                                     .spawn(move || watch_control.watch_cancel());
+                                let started = Instant::now();
                                 let result = worker.suggest(&request_for_thread);
+                                let soft_timeout = started.elapsed() > soft_timeout;
                                 control_for_thread.finish();
                                 if let Ok(watcher) = watcher {
                                     let _ = watcher.join();
                                 }
-                                result
+                                (result, soft_timeout)
                             }
-                            Err(error) => Err(error),
+                            Err(error) => (Err(error), false),
                         }
                     };
                     let _ = sender.send(DispatchResult {
                         generation: generation_value,
                         plugin: plugin_for_thread,
                         result,
+                        soft_timeout,
                     });
                 });
             let join = match join {
@@ -1175,6 +1367,9 @@ impl NativeProvider {
             let is_current = completion.generation == generation_value;
             self.pool.finish_call(completion.generation, &completion.plugin);
             let plugin = completion.plugin.clone();
+            if completion.soft_timeout {
+                self.pool.record_soft_timeout(plugin.clone());
+            }
             let failed = if is_current {
                 pending = pending.saturating_sub(1);
                 self.apply_dispatch_result(completion.plugin, completion.result, Some(&mut by_plugin))
@@ -1194,6 +1389,10 @@ impl NativeProvider {
     fn drain_completed_results(&mut self) {
         while let Ok(completion) = self.pool.result_rx.try_recv() {
             self.pool.finish_call(completion.generation, &completion.plugin);
+            let plugin = completion.plugin.clone();
+            if completion.soft_timeout {
+                self.pool.record_soft_timeout(plugin);
+            }
             self.apply_dispatch_result(completion.plugin, completion.result, None);
         }
     }
@@ -1307,6 +1506,9 @@ enum NativeWork {
     Action(Box<NativeActionRequest>),
     /// Publish this complete configuration state to every loaded plugin.
     Configuration(Box<crate::PluginConfiguration>),
+    /// Re-present the current generation while a native resource request is
+    /// resolving, so an icon can arrive without another user query.
+    Refresh,
 }
 
 /// Bounded action endpoint retained by the live native driver.
@@ -1513,6 +1715,7 @@ fn enqueue_native_completion(
 pub struct NativeDriver {
     mailbox: Arc<(Mutex<NativeRequestSlot>, Condvar)>,
     action_endpoint: Arc<NativeActionEndpoint>,
+    permissions: BTreeMap<PluginId, Permissions>,
     catalog_results: Arc<Mutex<Vec<CatalogBuildResult>>>,
     /// Per-plugin diagnostics refreshed by the supervisor thread after every
     /// unit of work, so the UI thread can report a throttled plugin without
@@ -1536,6 +1739,7 @@ impl NativeDriver {
         mut pipeline: QueryPipeline,
         publish: Box<dyn Fn(&ViewModel) + Send + 'static>,
     ) -> Self {
+        let permissions = provider.permissions();
         let has_plugins = !provider.plugins().is_empty();
         let mailbox = Arc::new((
             Mutex::new(NativeRequestSlot {
@@ -1576,6 +1780,7 @@ impl NativeDriver {
             .spawn(move || {
                 let (lock, cvar) = &*thread_mailbox;
                 let mut last_now: Millis = 0;
+                let mut last_context: Option<(Generation, String, Vec<ResultRow>, bool, usize)> = None;
                 loop {
                     for result in provider.take_catalog_results() {
                         thread_catalog_results
@@ -1613,10 +1818,13 @@ impl NativeDriver {
                             if let Some(job) = slot.job.take() {
                                 break NativeWork::Query(job);
                             }
-                            slot = cvar
+                            let (next, wait) = cvar
                                 .wait_timeout(slot, Duration::from_millis(10))
-                                .unwrap_or_else(|error| error.into_inner())
-                                .0;
+                                .unwrap_or_else(|error| error.into_inner());
+                            slot = next;
+                            if wait.timed_out() {
+                                break NativeWork::Refresh;
+                            }
                         }
                     };
                     let job = match work {
@@ -1676,12 +1884,50 @@ impl NativeDriver {
                             }
                             continue;
                         }
+                        NativeWork::Refresh => {
+                            let Some((generation, query, builtin_rows, builtin_pending, selected)) =
+                                last_context.as_ref()
+                            else {
+                                continue;
+                            };
+                            let slot = lock.lock().unwrap_or_else(|error| error.into_inner());
+                            if slot.stop
+                                || slot.job.is_some()
+                                || thread_current.load(Ordering::Acquire) != generation.get()
+                            {
+                                continue;
+                            }
+                            let Some(frame) = pipeline.present(last_now) else {
+                                continue;
+                            };
+                            let mut rows = builtin_rows.clone();
+                            rows.extend(frame.rows.iter().cloned());
+                            let merged = ViewModel {
+                                generation: *generation,
+                                query: query.clone(),
+                                rows: rows.into(),
+                                selected: *selected,
+                                pending_plugins: *builtin_pending || frame.pending_plugins,
+                                actions_open: false,
+                            };
+                            *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) =
+                                Some(merged.clone());
+                            publish(&merged);
+                            continue;
+                        }
                         NativeWork::Query(job) => job,
                     };
                     last_now = job.now;
 
                     thread_busy.store(true, Ordering::Release);
                     let native = provider.drive_query(&mut pipeline, &job.query, job.now);
+                    let refresh_context = (
+                        job.generation,
+                        job.query.clone(),
+                        job.builtin_rows.clone(),
+                        job.builtin_pending,
+                        job.selected,
+                    );
                     *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
                         pipeline.plugin_health_report();
                     let mut rows = job.builtin_rows;
@@ -1712,6 +1958,7 @@ impl NativeDriver {
                         continue;
                     }
                     *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) = Some(merged.clone());
+                    last_context = Some(refresh_context);
                     publish(&merged);
                     thread_busy.store(false, Ordering::Release);
                     drop(slot);
@@ -1722,6 +1969,7 @@ impl NativeDriver {
             Ok(worker) => Self {
                 mailbox,
                 action_endpoint,
+                permissions,
                 catalog_results,
                 health,
                 outcome,
@@ -1735,6 +1983,7 @@ impl NativeDriver {
             Err(_) => Self {
                 mailbox,
                 action_endpoint,
+                permissions,
                 catalog_results,
                 health,
                 outcome,
@@ -1860,6 +2109,10 @@ impl NativeDriver {
     /// Returns the exact plugin ids owned by this driver's action endpoint.
     pub fn plugins(&self) -> Vec<PluginId> {
         self.action_endpoint.budgets.keys().cloned().collect()
+    }
+    /// Manifest grants used by the host-mediated action boundary.
+    pub fn permissions(&self) -> BTreeMap<PluginId, Permissions> {
+        self.permissions.clone()
     }
 
     /// Returns the bounded action endpoint sharing this driver's per-plugin

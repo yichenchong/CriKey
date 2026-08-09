@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{Manifest, Runtime};
+use crate::permissions::{ClipboardPermission, FilesystemScope};
 use crate::ManifestError;
 
 /// Largest accepted debounce or maximum-wait declaration, in milliseconds.
@@ -32,6 +33,16 @@ pub enum PolicyProblem {
     Contradictory,
     OutOfRange,
     NotPermitted,
+}
+
+/// One manifest declaration the host accepts but cannot act on, and why.
+///
+/// `reason` is a stable kebab-case token rather than prose: it is printed by
+/// `crikey plugin doctor`, whose output is parsed by operators and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnhonouredDeclaration {
+    pub field: &'static str,
+    pub reason: &'static str,
 }
 
 /// Fully resolved scheduling and admission policy consumed by the host.
@@ -176,6 +187,146 @@ impl Manifest {
         ignored
     }
 
+    /// Declarations this build parses and validates but cannot act on for the
+    /// declared runtime.
+    ///
+    /// Distinct from [`Self::ignored_modern_fields`], which names declarations
+    /// a profile deliberately neutralizes: those are policy, these are honest
+    /// gaps. A declaration listed here is accepted by the manifest and grants
+    /// nothing at runtime, which is precisely the shape of defect an audit
+    /// looks for — a capability advertised with no production consumer — so it
+    /// is reported rather than left for an author to infer from behaviour.
+    ///
+    /// Most of the permission entries below share one cause. A permission can
+    /// only be enforced where the HOST performs the privileged operation for
+    /// the plugin and can decline; spec 20.2 defers operating-system
+    /// confinement, so where the plugin's own process does the work — a
+    /// clipboard write, a notification, a window activation, a keyring read, a
+    /// `dlopen` — the declaration buys the author nothing at all. Saying so is
+    /// the whole point: a permission list that reads like a sandbox and
+    /// confines nothing is worse than no permission list.
+    pub fn unhonoured_declarations(&self) -> Vec<UnhonouredDeclaration> {
+        let mut unhonoured = Vec::new();
+        // The host reads exactly one filesystem region on a plugin's behalf:
+        // the plugin's own package, for icons and other package resources.
+        // Every other scope names files the plugin opens itself.
+        if self
+            .permissions
+            .filesystem
+            .iter()
+            .any(|entry| !matches!(entry.scope, FilesystemScope::Package | FilesystemScope::None))
+        {
+            unhonoured.push(UnhonouredDeclaration {
+                field: "permissions.filesystem",
+                reason: "host-mediates-no-filesystem-access-outside-the-plugin-package",
+            });
+        }
+        if self.permissions.clipboard != ClipboardPermission::None {
+            unhonoured.push(UnhonouredDeclaration {
+                field: "permissions.clipboard",
+                reason: "no-host-mediated-clipboard-api-for-plugins",
+            });
+        }
+        if self.permissions.window_enumeration {
+            unhonoured.push(UnhonouredDeclaration {
+                field: "permissions.window-enumeration",
+                reason: "no-host-mediated-window-api-for-plugins",
+            });
+        }
+        if self.permissions.window_control {
+            unhonoured.push(UnhonouredDeclaration {
+                field: "permissions.window-control",
+                reason: "no-host-mediated-window-api-for-plugins",
+            });
+        }
+        if self.permissions.notifications {
+            unhonoured.push(UnhonouredDeclaration {
+                field: "permissions.notifications",
+                reason: "no-host-mediated-notification-api-for-plugins",
+            });
+        }
+        if self.permissions.secrets {
+            unhonoured.push(UnhonouredDeclaration {
+                field: "permissions.secrets",
+                reason: "no-host-mediated-secret-store-api-for-plugins",
+            });
+        }
+        // The environment grant decides whether the host hands a child the
+        // ambient environment or the stripped one, so it means something only
+        // where the host spawns that child: the modern Python worker, native
+        // worker and dedicated C-ABI host. A builtin, WASM or legacy worker
+        // does not take this grant.
+        if self.permissions.environment
+            && !matches!(
+                self.plugin.runtime,
+                Runtime::Python | Runtime::Native | Runtime::CAbi
+            )
+        {
+            unhonoured.push(UnhonouredDeclaration {
+                field: "permissions.environment",
+                reason: "host-does-not-mediate-child-environment-for-runtime",
+            });
+        }
+        // The dedicated C-ABI host gates loading on this declaration. Other
+        // runtimes either cannot use a native library through a host seam or
+        // load their own dependencies before the host can mediate them.
+        if self.permissions.native_library_loading && self.plugin.runtime != Runtime::CAbi {
+            unhonoured.push(UnhonouredDeclaration {
+                field: "permissions.native-library-loading",
+                reason: "out-of-process-plugin-loads-its-own-libraries",
+            });
+        }
+        // Only the modern Python worker registers background tasks with the
+        // host and gates them on admission (spec 15.8). No other runtime has
+        // an equivalent API, and spec 20.2 defers permission ENFORCEMENT
+        // entirely, so on those runtimes the declaration is inert: it neither
+        // grants the plugin anything nor stops it spawning its own threads.
+        if self.permissions.background_execution && self.plugin.runtime != Runtime::Python {
+            unhonoured.push(UnhonouredDeclaration {
+                field: "permissions.background-execution",
+                reason: "no-background-task-api-for-runtime",
+            });
+        }
+        // `crikey-cabi-host` calls one restricted C entry point at a time on
+        // one library handle: the ABI has no reentrancy contract to lean on
+        // and no way to interrupt a call already inside plugin code, so the
+        // host serialises. A `c-abi` plugin asking for more than one
+        // concurrent suggestion therefore gets exactly one (ADR-0015).
+        if self.plugin.runtime == Runtime::CAbi
+            && self
+                .concurrency
+                .max_suggestion_requests
+                .is_some_and(|value| value > 1)
+        {
+            unhonoured.push(UnhonouredDeclaration {
+                field: "concurrency.max-suggestion-requests",
+                reason: "c-abi-calls-are-serialised",
+            });
+        }
+        unhonoured
+    }
+
+    /// Refuses permission declarations nothing in this host can grant.
+    ///
+    /// Reporting is the honest fallback for a declaration that is merely
+    /// inert. `network-listener` is not merely inert: no build of this host
+    /// offers a plugin an inbound socket and no configuration turns one on, so
+    /// an author who writes it has described a plugin this launcher cannot
+    /// run. That is the same case as `query.network-backed` without
+    /// `permissions.network`, and it gets the same answer — a loud rejection
+    /// at parse time, rather than a doctor note about a plugin already
+    /// serving queries under a confinement it does not have.
+    pub(crate) fn validate_permissions(&self) -> Result<(), ManifestError> {
+        if self.permissions.network_listener {
+            return Err(invalid_with_detail(
+                "permissions.network-listener",
+                PolicyProblem::NotPermitted,
+                "permissions.network-listener cannot be granted: this host offers plugins no inbound socket",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_query_policy(&self) -> Result<(), ManifestError> {
         let profile = self.scheduling_profile();
         let legacy_runtime = matches!(self.plugin.runtime, Runtime::LegacyPython);
@@ -272,7 +423,7 @@ fn default_debounce_ms(runtime: Runtime, network_backed: bool) -> u64 {
         Runtime::Builtin => 0,
         _ if network_backed => NETWORK_DEBOUNCE_MS,
         Runtime::Python | Runtime::LegacyPython => PYTHON_DEBOUNCE_MS,
-        Runtime::Native | Runtime::Wasm => NATIVE_DEBOUNCE_MS,
+        Runtime::Native | Runtime::Wasm | Runtime::CAbi => NATIVE_DEBOUNCE_MS,
     }
 }
 

@@ -376,15 +376,12 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
             let id = wparam.0 as i32;
             let registration = STATE.with(|state| {
                 let state = state.borrow();
-                let Some(state) = state.as_ref() else {
-                    return None;
-                };
-                let registration = state
-                    .pending
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&id);
-                registration
+                let state = state.as_ref()?;
+                // The guard is named rather than left a temporary: an unnamed
+                // one in the tail expression outlives the `Ref` above and the
+                // borrow checker rejects it.
+                let mut pending = state.pending.lock().unwrap_or_else(PoisonError::into_inner);
+                pending.remove(&id)
             });
             match registration {
                 Some(registration) => bind(window, &registration),

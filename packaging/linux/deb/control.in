@@ -1,0 +1,19 @@
+Package: crikey
+Version: @VERSION@
+Architecture: @ARCHITECTURE@
+Maintainer: @MAINTAINER@
+Installed-Size: @INSTALLED_SIZE@
+Section: utils
+Priority: optional
+Homepage: https://github.com/crikey-launcher/crikey
+Depends: @DEPENDS@
+Recommends: libx11-6, libxkbcommon0, libwayland-client0, libvulkan1 | libegl1
+Description: Fast, keyboard-driven application launcher
+ CriKey finds and runs applications, files and plugin commands from a single
+ keyboard-driven prompt. Plugins run as supervised subprocesses, so a slow or
+ crashing plugin cannot stall the launcher.
+ .
+ Plugins written in Python need an interpreter: this package depends on the
+ distribution's python3 unless it was built with a bundled runtime, in which
+ case the interpreter ships inside /usr/lib/crikey and the dependency is
+ dropped.

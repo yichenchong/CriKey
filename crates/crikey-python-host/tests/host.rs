@@ -6,8 +6,9 @@
 //! the modern host must get right, and each is only true of the *real* system:
 //!
 //! * **Discovery order is decisive and reported.** `$CRIKEY_PYTHON` outranks a
-//!   `RuntimeProfile::External`, which outranks `python3` on `PATH` (spec
-//!   14.11), and [`InterpreterSource`] says which rule won. An interpreter that
+//!   `RuntimeProfile::External`, which outranks the runtime staged beside the
+//!   executable, which outranks `python3` on `PATH` (spec 14.11, 15.4),
+//!   and [`InterpreterSource`] says which rule won. An interpreter that
 //!   does not satisfy the plugin's `requires-python` is a named error, never a
 //!   silent fall-through to the next candidate — falling through would run
 //!   plugin code under a Python the plugin declared it cannot run on.
@@ -74,7 +75,9 @@ use crikey_python_host::{
 // requires-python test, and an unconditional import is an unused-import error
 // on Windows under `-D warnings`.
 #[cfg(unix)]
-use crikey_python_host::{HostError, InterpreterSource, PythonVersion};
+use crikey_python_host::{
+    bundled_interpreter_beside, HostError, InterpreterSource, PythonVersion, BUNDLED_RUNTIME_DIR,
+};
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -194,6 +197,16 @@ fn write_executable(path: &Path, script: &str) -> PathBuf {
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).expect("shim is made executable");
     fs::rename(&staging, path).expect("shim is published atomically");
     path.to_path_buf()
+}
+
+/// Lays a stand-in runtime down in the shipped layout: `python-runtime/bin/`
+/// beside the executable, which is where discovery looks with no environment
+/// variable set (spec 14.11).
+#[cfg(unix)]
+fn stage_bundled_runtime(executable_dir: &Path, version: &str) -> PathBuf {
+    let bin = executable_dir.join(BUNDLED_RUNTIME_DIR).join("bin");
+    fs::create_dir_all(&bin).expect("bundled runtime layout is creatable");
+    version_shim(&bin, "python3", version)
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +500,239 @@ fn discovery_falls_back_to_python3_on_the_search_path_when_nothing_overrides_it(
         InterpreterSource::SearchPath,
         "discovery reports that the search path selected the interpreter"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The bundled runtime (spec 14.11)
+//
+// A shipped artefact carries the runtime it needs. These pin the whole
+// precedence chain — override, external profile, bundled, search path — and
+// that a bundled runtime earns its place by passing the same probe and the
+// same `requires-python` gate as any other candidate.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn a_staged_bundled_runtime_is_chosen_with_no_environment_variable_set() {
+    let scratch = Scratch::new("bundled-preferred");
+    let install = scratch.subdir("install");
+    let search = scratch.subdir("bin");
+    let bundled = stage_bundled_runtime(&install, "3.12.4");
+    version_shim(&search, "python3", "3.13.9");
+
+    // The interpreter on the search path is *newer*. It still loses: a shipped
+    // artefact must run on the runtime it was tested with, not on whatever the
+    // machine happens to have.
+    let environment = DiscoveryEnvironment::empty()
+        .with_executable_dir(&install)
+        .with_search_path([search]);
+
+    let interpreter = discover_interpreter_in(
+        &RuntimeProfile::Bundled,
+        &RequiresPython(SATISFIABLE.to_owned()),
+        &environment,
+    )
+    .expect("a staged bundled runtime resolves with nothing configured");
+
+    assert_eq!(
+        interpreter.path(),
+        bundled,
+        "the bundled runtime outranks the search path (spec 14.11)"
+    );
+    assert_eq!(
+        interpreter.version(),
+        PythonVersion::new(3, 12, 4),
+        "the version is read from the bundled interpreter, not assumed from the layout"
+    );
+    assert_eq!(
+        interpreter.source(),
+        InterpreterSource::BundledRuntime,
+        "discovery reports that the bundled runtime selected the interpreter"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_deliberately_chosen_interpreter_still_outranks_the_bundled_runtime() {
+    let scratch = Scratch::new("bundled-outranked");
+    let install = scratch.subdir("install");
+    let search = scratch.subdir("bin");
+    stage_bundled_runtime(&install, "3.12.4");
+    version_shim(&search, "python3", "3.10.3");
+    let override_python = version_shim(&scratch.path, "override-python", "3.11.5");
+    let profile_python = version_shim(&scratch.path, "profile-python", "3.13.2");
+
+    let base = DiscoveryEnvironment::empty()
+        .with_executable_dir(&install)
+        .with_search_path([search]);
+
+    let overridden = discover_interpreter_in(
+        &RuntimeProfile::External(profile_python.clone()),
+        &RequiresPython(SATISFIABLE.to_owned()),
+        &base.clone().with_override(&override_python),
+    )
+    .expect("an override naming a usable interpreter resolves");
+    assert_eq!(
+        overridden.path(),
+        override_python,
+        "CRIKEY_PYTHON is still rule one: an operator's choice beats the shipped runtime"
+    );
+
+    let profiled = discover_interpreter_in(
+        &RuntimeProfile::External(profile_python.clone()),
+        &RequiresPython(SATISFIABLE.to_owned()),
+        &base,
+    )
+    .expect("an external runtime profile naming a usable interpreter resolves");
+    assert_eq!(
+        profiled.path(),
+        profile_python,
+        "an explicitly named interpreter beats the shipped runtime, which beats PATH"
+    );
+    assert_eq!(profiled.source(), InterpreterSource::RuntimeProfile);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_build_with_no_staged_runtime_discovers_exactly_what_it_did_before() {
+    let scratch = Scratch::new("bundled-absent");
+    let install = scratch.subdir("install");
+    let search = scratch.subdir("bin");
+    let chosen = version_shim(&search, "python3", "3.10.3");
+
+    // The executable directory is known; it simply has no runtime staged into
+    // it. That is the unpackaged build, and it must reach PATH unchanged.
+    let environment = DiscoveryEnvironment::empty()
+        .with_executable_dir(&install)
+        .with_search_path([search]);
+
+    let interpreter = discover_interpreter_in(
+        &RuntimeProfile::Bundled,
+        &RequiresPython(SATISFIABLE.to_owned()),
+        &environment,
+    )
+    .expect("with no runtime staged, the search path is still the final rule");
+
+    assert_eq!(interpreter.path(), chosen);
+    assert_eq!(interpreter.source(), InterpreterSource::SearchPath);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_prefix_install_finds_its_runtime_under_lib_crikey() {
+    let scratch = Scratch::new("bundled-prefix");
+    // The `.deb`/`.rpm` shape: `<prefix>/bin/crikey` must not have a runtime
+    // dumped beside it, so it goes under `<prefix>/lib/crikey`.
+    let binaries = scratch.subdir("usr/bin");
+    let staged = stage_bundled_runtime(&scratch.subdir("usr/lib/crikey"), "3.12.4");
+
+    // Resolved, not textual: the lookup reaches the runtime through a `..`
+    // hop out of `bin/`, and what matters is that it lands on the same file.
+    let found = bundled_interpreter_beside(&binaries).expect("the prefix layout is found");
+    assert_eq!(
+        found.canonicalize().expect("the found interpreter exists"),
+        staged.canonicalize().expect("the staged interpreter exists"),
+        "a prefix install resolves its runtime relative to the installed binary"
+    );
+
+    let interpreter = discover_interpreter_in(
+        &RuntimeProfile::Bundled,
+        &RequiresPython(SATISFIABLE.to_owned()),
+        &DiscoveryEnvironment::empty().with_executable_dir(&binaries),
+    )
+    .expect("the prefix-install layout is discoverable with nothing configured");
+    assert_eq!(interpreter.source(), InterpreterSource::BundledRuntime);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bundled_runtime_below_requires_python_is_an_error_not_a_fall_through_to_path() {
+    let scratch = Scratch::new("bundled-too-old");
+    let install = scratch.subdir("install");
+    let search = scratch.subdir("bin");
+    stage_bundled_runtime(&install, "3.10.3");
+    // A satisfying interpreter is on PATH. Falling through to it would run
+    // plugin code on an interpreter the artefact was never validated against
+    // and reintroduce the system dependency bundling removes.
+    version_shim(&search, "python3", "3.13.0");
+
+    let error = discover_interpreter_in(
+        &RuntimeProfile::Bundled,
+        &RequiresPython(">=3.12".to_owned()),
+        &DiscoveryEnvironment::empty()
+            .with_executable_dir(&install)
+            .with_search_path([search]),
+    )
+    .expect_err("a bundled runtime below requires-python cannot resolve");
+
+    match &error {
+        HostError::UnsatisfiedRequiresPython { required, found } => {
+            assert_eq!(required, ">=3.12");
+            assert!(
+                found.contains("3.10.3"),
+                "the failure names the bundled version that was found, got {found:?}"
+            );
+        }
+        other => panic!("an unsatisfying bundled runtime is UnsatisfiedRequiresPython, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bundled_runtime_that_will_not_run_is_an_error_not_a_fall_through_to_path() {
+    let scratch = Scratch::new("bundled-broken");
+    let install = scratch.subdir("install");
+    let search = scratch.subdir("bin");
+    let bin = install.join(BUNDLED_RUNTIME_DIR).join("bin");
+    fs::create_dir_all(&bin).expect("bundled runtime layout is creatable");
+    let broken = write_executable(&bin.join("python3"), "#!/bin/sh\nprintf '3.12.0\\n'\nexit 7\n");
+    version_shim(&search, "python3", "3.13.0");
+
+    let error = discover_interpreter_in(
+        &RuntimeProfile::Bundled,
+        &RequiresPython(SATISFIABLE.to_owned()),
+        &DiscoveryEnvironment::empty()
+            .with_executable_dir(&install)
+            .with_search_path([search]),
+    )
+    .expect_err("a broken staging must fail loudly rather than degrade to the system Python");
+
+    match error {
+        HostError::Interpreter(message) => assert!(
+            message.contains(broken.to_string_lossy().as_ref()),
+            "the failure names the staged interpreter that was tried: {message}"
+        ),
+        other => panic!("a broken bundled runtime is an interpreter error, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_executable_file_in_the_bundled_layout_is_not_a_bundled_runtime() {
+    let scratch = Scratch::new("bundled-not-executable");
+    let install = scratch.subdir("install");
+    let search = scratch.subdir("bin");
+    let bin = install.join(BUNDLED_RUNTIME_DIR).join("bin");
+    fs::create_dir_all(&bin).expect("bundled runtime layout is creatable");
+    // A half-extracted archive, or a tree copied without its permission bits.
+    fs::write(bin.join("python3"), "#!/bin/sh\nprintf '3.12.0\\n'\n").expect("decoy is writable");
+    let chosen = version_shim(&search, "python3", "3.10.3");
+
+    let interpreter = discover_interpreter_in(
+        &RuntimeProfile::Bundled,
+        &RequiresPython(SATISFIABLE.to_owned()),
+        &DiscoveryEnvironment::empty()
+            .with_executable_dir(&install)
+            .with_search_path([search]),
+    )
+    .expect("a file that cannot be executed is not a staged runtime");
+
+    assert_eq!(
+        interpreter.path(),
+        chosen,
+        "the bundled rule claims a candidate only when there is one to run"
+    );
+    assert_eq!(interpreter.source(), InterpreterSource::SearchPath);
 }
 
 #[cfg(unix)]

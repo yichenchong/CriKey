@@ -55,8 +55,56 @@ byte-code caches; explicit `compileall` writes its checked bytecode by design,
 and those outputs are ignored.
 
 Interpreter discovery order is the `CRIKEY_PYTHON` environment variable, then a
-configured external runtime profile, then `python3` on the search path. Set
-`CRIKEY_PYTHON` to test against a specific interpreter.
+configured external runtime profile, then the runtime bundled with the build,
+then `python3` on the search path. Set `CRIKEY_PYTHON` to test against a
+specific interpreter. Each rule is decisive: once a rule names an interpreter,
+one that will not run or does not satisfy a plugin's `requires-python` is an
+error, not a fall-through to the next rule.
+
+## The bundled Python runtime
+
+A released CriKey ships the interpreter it needs (spec §14.11's "current
+bundled runtime" profile), so an installed launcher does not depend on
+whatever Python the machine happens to have and never imports from a
+system-wide `site-packages` (§15.4). A development checkout has no
+bundled runtime and never needs one: discovery falls through to `python3` on
+the search path exactly as it always did.
+
+Discovery looks for the runtime in two places, in order, relative to the
+directory holding the running `crikey` binary:
+
+| Relative location | Install shape |
+| --- | --- |
+| `python-runtime/` | self-contained directory: portable archive, macOS `Contents/MacOS`, `cargo build` output |
+| `../lib/crikey/python-runtime/` | prefix install: `.deb`, `.rpm`, `/usr/local` — `bin/` must not be littered |
+
+Inside either, the interpreter is `bin/python3` on Unix and `python.exe` on
+Windows. Both are relative to the binary rather than to an absolute prefix so
+an installed tree survives being moved or copied.
+
+To stage one:
+
+```sh
+packaging/stage-python-runtime.sh --dest target/debug \
+    --archive ~/Downloads/cpython-3.13.1+20241205-x86_64-unknown-linux-gnu-install_only.tar.gz
+```
+
+`--dest` is the directory the runtime is staged *beside* — the one holding the
+binary for a self-contained tree, or `<prefix>/lib/crikey` for a prefix
+install. The archive is a [python-build-standalone][pbs] `install_only` build
+for the target triple; those are relocatable, which is what lets the staged
+tree be moved. The script never downloads: the runtime that ends up in a
+release artefact is a pinned, reviewed input. It fails loudly, and stages
+nothing, when the archive is missing, when the tree is not a
+python-build-standalone layout, or when the staged interpreter reports a
+`sys.prefix` outside the staged directory — a runtime that resolves back into a
+system prefix is exactly the dependency bundling exists to remove.
+
+Staging is optional and its absence is honest, not hidden: an installer that
+skips it produces an artefact that uses the system interpreter, and must
+declare that dependency in its package metadata.
+
+[pbs]: https://github.com/astral-sh/python-build-standalone
 
 ## Disk use
 

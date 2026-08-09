@@ -544,10 +544,13 @@ struct RetainedAnswer {
 /// Work that can be queued behind an in-flight callback. One-time
 /// initialization is not here: it is owed exactly once per instance and is
 /// tracked by `queued_start`, so it can never be queued twice (spec 14.8).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum WorkKind {
     Catalog,
-    Suggest { query: String, selected: Option<ItemId> },
+    Suggest {
+        query: String,
+        selected: Option<Box<Item>>,
+    },
 }
 
 impl WorkKind {
@@ -568,7 +571,11 @@ impl WorkKind {
             Self::Suggest {
                 query,
                 selected: Some(selected),
-            } => LegacyRequestKind::ArgumentSuggest { query, selected },
+            } => LegacyRequestKind::ArgumentSuggest {
+                selected: selected.stable_id.clone(),
+                selected_item: selected,
+                query,
+            },
         }
     }
 
@@ -576,7 +583,7 @@ impl WorkKind {
         match self {
             Self::Suggest { query, selected } => Some(CacheKey {
                 query: query.clone(),
-                selected: selected.clone(),
+                selected: selected.as_ref().map(|item| item.stable_id.clone()),
             }),
             Self::Catalog => None,
         }
@@ -735,7 +742,7 @@ pub struct LegacyRuntime<W> {
     next_instance: u64,
     current_generation: Generation,
     query: String,
-    selected: Option<(PluginId, ItemId)>,
+    selected: Option<(PluginId, Item)>,
     visible: Vec<Item>,
     visible_generation: Generation,
     shut_down: bool,
@@ -875,7 +882,7 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
                         at_ms,
                         generation,
                         plugin: owner.clone(),
-                        owner_of: item.clone(),
+                        owner_of: item.stable_id.clone(),
                     },
                 );
                 self.intake_suggest(&owner, at_ms, generation, text, Some(&item));
@@ -914,12 +921,13 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
         if self.shut_down {
             return Err(LegacyRuntimeError::ShuttingDown);
         }
-        let owner = self
+        let selected = self
             .visible
             .iter()
             .find(|candidate| &candidate.stable_id == item)
-            .map(|candidate| candidate.plugin_id.clone())
+            .cloned()
             .ok_or_else(|| LegacyRuntimeError::UnknownItem(item.clone()))?;
+        let owner = selected.plugin_id.clone();
         if self
             .plugins
             .get(&owner)
@@ -931,7 +939,7 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
         // A selection restarts the argument text: what follows is an argument
         // to the selected item, not a continuation of the initial query.
         self.query = String::new();
-        self.selected = Some((owner.clone(), item.clone()));
+        self.selected = Some((owner.clone(), selected.clone()));
         let generation = self.mint_generation();
         self.begin_generation(generation, at_ms);
         push_trace(
@@ -941,10 +949,10 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
                 at_ms,
                 generation,
                 plugin: owner.clone(),
-                owner_of: item.clone(),
+                owner_of: selected.stable_id.clone(),
             },
         );
-        self.intake_suggest(&owner, at_ms, generation, "", Some(item));
+        self.intake_suggest(&owner, at_ms, generation, "", Some(&selected));
         Ok(generation)
     }
 
@@ -1505,7 +1513,7 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
     }
 
     pub fn selected_item(&self) -> Option<&ItemId> {
-        self.selected.as_ref().map(|(_, item)| item)
+        self.selected.as_ref().map(|(_, item)| &item.stable_id)
     }
 
     /// Registered plugins in registration order, which is broadcast order.
@@ -1676,11 +1684,11 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
         at_ms: Millis,
         generation: Generation,
         query: &str,
-        selected: Option<&ItemId>,
+        selected: Option<&Item>,
     ) {
         let key = CacheKey {
             query: query.to_owned(),
-            selected: selected.cloned(),
+            selected: selected.map(|item| item.stable_id.clone()),
         };
 
         enum Replay {
@@ -1751,7 +1759,7 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
                     generation,
                     WorkKind::Suggest {
                         query: query.to_owned(),
-                        selected: selected.cloned(),
+                        selected: selected.cloned().map(Box::new),
                     },
                 );
             }
@@ -1761,7 +1769,7 @@ impl<W: LegacyWorkerHandle> LegacyRuntime<W> {
                 generation,
                 WorkKind::Suggest {
                     query: query.to_owned(),
-                    selected: selected.cloned(),
+                    selected: selected.cloned().map(Box::new),
                 },
             ),
         }

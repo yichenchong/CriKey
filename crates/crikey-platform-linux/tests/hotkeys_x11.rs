@@ -737,10 +737,10 @@ fn destroy_input_only_children(display: &str) -> usize {
 /// [`LinuxBackend`] that reaches a real [`X11HotkeyService`], that claim is
 /// backed by nothing a host can call: the shortcut is unreachable in the live
 /// app however well the service itself works. Kills the accessor that does not
-/// exist, the one that never connects, and the one that hands out a service in a
-/// session with no `GrabKey` to offer.
+/// exist, the one that never connects, and the one that hands out a service in
+/// a session with nothing at all to bind against.
 #[test]
-fn the_backend_hands_out_a_working_hotkey_service_under_x11_only() {
+fn the_backend_hands_out_a_working_hotkey_service_under_x11_and_refuses_a_headless_session() {
     let server = XvfbServer::start();
     let previous = std::env::var("DISPLAY").ok();
     std::env::set_var("DISPLAY", server.display());
@@ -759,17 +759,20 @@ fn the_backend_hands_out_a_working_hotkey_service_under_x11_only() {
     }
     outcome.unwrap_or_else(|error| panic!("an X11 backend must hand out a hotkey service: {error}"));
 
-    // A session with no key grabs to offer refuses, naming itself, rather than
+    // A session with nothing to offer refuses, naming itself, rather than
     // handing out a service whose registrations could only be swallowed.
-    for desktop in [DesktopEnvironment::Wayland, DesktopEnvironment::Headless] {
-        let mut backend = LinuxBackend::with_desktop_environment(desktop);
-        match backend.hotkeys() {
-            Ok(_) => panic!("{desktop:?} has no GrabKey and must not hand out a hotkey service"),
-            Err(CoreError::Invalid(message)) => assert!(
-                message.contains(&format!("{desktop:?}")),
-                "the refusal must name the session it refused for, got: {message}"
-            ),
-            Err(other) => panic!("unexpected error kind: {other:?}"),
-        }
+    // Wayland is deliberately not in this loop any more: it has a real route
+    // through the GlobalShortcuts portal (ADR-0011), so whether it refuses
+    // depends on the portal rather than on the session, and `wayland_portal.rs`
+    // pins both answers against a portal it controls.
+    let desktop = DesktopEnvironment::Headless;
+    let mut backend = LinuxBackend::with_desktop_environment(desktop);
+    match backend.hotkeys() {
+        Ok(_) => panic!("{desktop:?} has no display and no portal and must not hand out a hotkey service"),
+        Err(CoreError::Invalid(message)) => assert!(
+            message.contains(&format!("{desktop:?}")),
+            "the refusal must name the session it refused for, got: {message}"
+        ),
+        Err(other) => panic!("unexpected error kind: {other:?}"),
     }
 }

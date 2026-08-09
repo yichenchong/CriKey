@@ -1,0 +1,30 @@
+[package]
+name = "crikey-cabi-host"
+description = "Out-of-process host for restricted C-ABI plugin libraries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crikey-core.workspace = true
+crikey-package-manager.workspace = true
+crikey-plugin-model.workspace = true
+# The published SDK, by path: this host is a native plugin as far as CriKey is
+# concerned, so it serves the supervised protocol through exactly the code a
+# third-party Rust plugin uses. `sdk/rust` is a workspace member but is not in
+# the root workspace dependency table.
+crikey-plugin-sdk = { path = "../../sdk/rust", version = "0.1.0" }
+libloading.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The supervised-boundary tests drive `crikey-cabi-host` the way CriKey does:
+# as a native worker under the real supervisor.
+crikey-native-host.workspace = true
+crikey-plugin-supervisor.workspace = true

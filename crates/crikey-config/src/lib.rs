@@ -52,6 +52,7 @@
 mod discovery;
 mod layer;
 mod publisher;
+mod remote_catalog;
 mod snapshot;
 mod store;
 mod tomlmap;
@@ -62,6 +63,10 @@ use std::path::PathBuf;
 pub use discovery::{discover_plugin_schemas, DiscoveredSchema, SchemaProblem};
 pub use layer::{ConfigLayer, LAYER_COUNT};
 pub use publisher::ConfigurationPublisher;
+pub use remote_catalog::{
+    remote_catalog_sources, RemoteCatalogSource, DEFAULT_REMOTE_INTERVAL_MS, DEFAULT_REMOTE_MAX_BYTES,
+    KEY_REMOTE_CATALOG_PREFIX, MAX_REMOTE_MAX_BYTES,
+};
 pub use snapshot::ConfigurationSnapshot;
 pub use store::{
     administrator_policy_path, ConfigStore, BUILT_IN_DEFAULTS, KEY_COALESCE_MS, KEY_MAXIMUM_WAIT_MS,
@@ -142,6 +147,14 @@ pub enum ConfigError {
         #[source]
         source: toml::ser::Error,
     },
+    /// A host setting is present but not usable as written (ADR-0016).
+    ///
+    /// Named by key and reason, never by value. This crate parses settings
+    /// before any plugin schema registers, so it does not yet know which keys
+    /// are secret, and "that is not a number" is a complaint about the key
+    /// rather than something the value has to be quoted for (spec 21.3).
+    #[error("`{key}` is not usable: {reason}")]
+    Setting { key: String, reason: &'static str },
 }
 
 impl ConfigError {

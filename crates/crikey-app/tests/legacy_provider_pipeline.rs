@@ -44,8 +44,8 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use crikey_app::{
-    CatalogBuildResult, DisabledPlugins, LegacyDriver, LegacyProvider, PipelineConfig, PluginActionRouter,
-    QueryPipeline,
+    CatalogBuildResult, DisabledPlugins, LegacyDirectories, LegacyDriver, LegacyProvider, PipelineConfig,
+    PluginActionRouter, QueryPipeline,
 };
 use crikey_core::{ExecutionPolicy, Generation, PluginId};
 use crikey_legacy_compat::{discover_interpreter, LegacyDeadlines};
@@ -83,6 +83,7 @@ fn legacy_suggestions_cross_pipeline_intake_before_presentation() {
         &mut pipeline,
         &[test_plugins_root()],
         cache_root,
+        LegacyDirectories::default(),
         LegacyDeadlines::default(),
         &DisabledPlugins::default(),
     );
@@ -148,6 +149,7 @@ fn legacy_supervisor_publishes_off_the_ui_thread() {
         &mut pipeline,
         &[test_plugins_root()],
         cache_root,
+        LegacyDirectories::default(),
         LegacyDeadlines::default(),
         &DisabledPlugins::default(),
     );
@@ -223,6 +225,7 @@ fn legacy_driver_rejects_a_delayed_older_generation() {
         &mut pipeline,
         &[test_plugins_root()],
         cache_root,
+        LegacyDirectories::default(),
         LegacyDeadlines::default(),
         &DisabledPlugins::default(),
     );
@@ -305,6 +308,7 @@ fn a_legacy_plugins_catalog_reaches_the_live_driver() {
         &mut pipeline,
         &[test_plugins_root()],
         cache_root,
+        LegacyDirectories::default(),
         LegacyDeadlines::default(),
         &DisabledPlugins::default(),
     );
@@ -386,6 +390,7 @@ fn a_legacy_items_default_action_executes_in_its_owning_plugin() {
         &mut pipeline,
         &[test_plugins_root()],
         cache_root,
+        LegacyDirectories::default(),
         LegacyDeadlines::default(),
         &DisabledPlugins::default(),
     );
@@ -478,6 +483,7 @@ fn a_legacy_action_refused_by_its_budget_is_reported_as_an_action_refusal() {
         &mut pipeline,
         &[test_plugins_root()],
         cache_root,
+        LegacyDirectories::default(),
         LegacyDeadlines::default(),
         &DisabledPlugins::default(),
     );
@@ -543,4 +549,97 @@ fn a_legacy_action_refused_by_its_budget_is_reported_as_an_action_refusal() {
     drop(held);
 
     drop(driver);
+}
+
+/// The presentation gap: a legacy plugin could name an icon and register
+/// alternate actions, and neither reached the renderer — the provider
+/// installed no icon resolver at all, so `icon_reference` travelled with
+/// nothing behind it, and the host's own action was the only one a row had.
+///
+/// Proven end to end, on the real `rich-presentation` fixture: the child
+/// resolves the plugin's handle to a package-relative name, the provider's
+/// [`PluginIconResolver`] reads and decodes the committed PNG, and the row
+/// carries both the pixels and the plugin's two alternates behind the host's
+/// default action. Deleting `install_icon_resolver` leaves `row.icon` empty
+/// while `row.icon_reference` still says there should be one.
+#[test]
+fn a_legacy_items_loaded_icon_and_actions_reach_the_presented_row() {
+    require_legacy_interpreter();
+
+    let rich = PluginId("legacy.rich-presentation".to_owned());
+    let cache_root = std::env::temp_dir().join("crikey-legacy-presentation-test-cache");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = LegacyProvider::load(
+        &mut pipeline,
+        &[test_plugins_root()],
+        cache_root,
+        LegacyDirectories::default(),
+        LegacyDeadlines::default(),
+        &DisabledPlugins::default(),
+    );
+    assert!(
+        provider.plugins().contains(&rich),
+        "the rich-presentation legacy plugin must load; unavailable: {:?}",
+        provider.unavailable(),
+    );
+
+    let frame = provider
+        .drive_query(&mut pipeline, "rich", 17)
+        .expect("the admitted current legacy batch produces a frame");
+    let row = frame
+        .rows
+        .iter()
+        .find(|row| row.plugin_name == rich.0 && row.label == "Rich Presentation Entry")
+        .unwrap_or_else(|| {
+            panic!(
+                "the fixture's icon-bearing row must be presented; got {:?}",
+                frame
+                    .rows
+                    .iter()
+                    .map(|row| (row.plugin_name.as_str(), row.label.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+        });
+
+    assert_eq!(
+        row.icon_reference.as_deref(),
+        Some("icons/badge.png"),
+        "the plugin's icon handle must reach the row as the name the host resolves",
+    );
+    // Pixels, not merely a reference: a row that names an icon nothing decoded
+    // renders blank, which is indistinguishable from a plugin that shipped no
+    // icon at all.
+    let icon = row
+        .icon
+        .as_ref()
+        .expect("the committed package icon must be read and decoded for the row");
+    assert!(
+        icon.width() > 0 && icon.height() > 0 && !icon.rgba().is_empty(),
+        "the decoded icon must carry real pixels, got {}x{} with {} bytes",
+        icon.width(),
+        icon.height(),
+        icon.rgba().len(),
+    );
+
+    // Enter still means "no secondary action chosen"; the plugin's own
+    // registrations are the alternates behind it, in the order it registered
+    // them. Promoting one of them to the default would change what pressing
+    // Enter on a legacy row does.
+    let default_action = row
+        .default_action
+        .as_ref()
+        .expect("a legacy row keeps the host's default action");
+    assert_eq!(default_action.action_id.0, "legacy.execute");
+    assert_eq!(default_action.execution_policy, ExecutionPolicy::Plugin);
+    assert_eq!(
+        row.alternate_actions
+            .iter()
+            .map(|action| action.action_id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["copy", "reveal"],
+        "the alternates a legacy plugin registered must reach the row it published",
+    );
+
+    provider.shutdown(180);
 }

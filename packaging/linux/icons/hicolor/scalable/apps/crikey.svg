@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Scalable only, and drawn with paths alone.
+
+  Scalable, because the hicolor theme resolves a scalable icon at any size a
+  shell asks for, so one file replaces the usual 16/24/32/48/64/128/256 PNG
+  ladder and cannot fall out of step with itself.
+
+  Paths alone, because CriKey renders SVG icons with resvg built without its
+  text stack (see the workspace Cargo.toml): a <text> element would render as
+  nothing in CriKey's own results, which is the one place this icon is
+  guaranteed to appear.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="#1f2430"/>
+  <rect x="10" y="10" width="108" height="108" rx="24" fill="none" stroke="#4c566a" stroke-width="4"/>
+  <path d="M40 42 L64 64 L40 86" fill="none" stroke="#eceff4" stroke-width="11"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="72" y="76" width="26" height="10" rx="5" fill="#88c0d0"/>
+</svg>

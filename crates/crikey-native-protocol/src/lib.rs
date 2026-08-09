@@ -5,7 +5,19 @@
 //! inherited stdio all expose the same [`transport::Transport`] contract.
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest payload that may be put on the wire in one frame.
+///
+/// Deliberately *derived* from [`wire::DECODE_ALLOCATION_BUDGET`] rather than
+/// written out again. What may be sent can never usefully exceed what may be
+/// decoded, and when the two were independent constants that happened to be
+/// equal they still disagreed in practice: the decode budget is charged for
+/// heap, not bytes, so a repeated field exhausts it long before the frame cap
+/// is reached. Tying the byte cap to the budget removes the second number
+/// that could drift; sizing a batch of repeated fields correctly needs the
+/// budget itself, which producers reach through
+/// [`message::max_decodable_items`].
+pub const MAX_FRAME_BYTES: usize = wire::DECODE_ALLOCATION_BUDGET;
 
 /// Environment name carrying the host-created endpoint (spec 16.6).
 pub const ENV_ENDPOINT: &str = "CRIKEY_PLUGIN_ENDPOINT";
@@ -84,6 +96,17 @@ impl Endpoint {
 pub enum ProtocolError {
     #[error("frame of {0} bytes exceeds the {MAX_FRAME_BYTES} byte limit")]
     FrameTooLarge(usize),
+    /// The bytes were legal and within [`MAX_FRAME_BYTES`], but materialising
+    /// them would allocate past [`wire::DECODE_ALLOCATION_BUDGET`]. Distinct
+    /// from [`ProtocolError::FrameTooLarge`] on purpose: the wire cap was
+    /// respected and only the resulting heap was refused, so a diagnostic can
+    /// point at batch sizing instead of at framing.
+    #[error(
+        "decoding would allocate {requested} bytes with {remaining} of the {} byte decode \
+         allocation budget left; size batches with message::max_decodable_items",
+        wire::DECODE_ALLOCATION_BUDGET
+    )]
+    DecodeBudgetExceeded { requested: usize, remaining: usize },
     #[error("unsupported protocol version {0}")]
     UnsupportedVersion(u32),
     #[error("malformed message: {0}")]

@@ -21,11 +21,23 @@ crikey-package-manager.workspace = true
 crikey-platform.workspace = true
 crikey-plugin-model.workspace = true
 crikey-plugin-supervisor.workspace = true
+crikey-sandbox.workspace = true
 crikey-python-host.workspace = true
 crikey-query.workspace = true
 crikey-ranking.workspace = true
 crikey-result-aggregator.workspace = true
 crikey-ui.workspace = true
+# SHA-256 over a fetched remote catalog document (ADR-0016). The same algorithm
+# the package manager verifies a downloaded package with, for the same reason:
+# a digest that decides whether third-party content is admitted is a security
+# claim, not a corruption check.
+sha2.workspace = true
+# The one place this crate touches the network: fetching a configured remote
+# catalog document (ADR-0016). Already `https_only` with `rustls` at the
+# workspace level, and behind the `CatalogFetcher` trait, so no test here opens
+# a socket.
+ureq.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

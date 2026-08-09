@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  CriKey MSIX package manifest.
+
+  WHY THIS EXISTS ALONGSIDE THE MSI
+  =================================
+  The MSI (crikey.wxs) is the route that works on every supported Windows
+  without a certificate the user trusts. MSIX is the modern route: it installs
+  and uninstalls transactionally, it cannot leave files behind, and it is what
+  winget and the Store consume. It is not a superset: an MSIX will not install
+  at all unless it is signed by a certificate the machine already trusts, so
+  both are maintained rather than one replacing the other.
+
+  IDENTITY
+  ========
+  Name and Publisher together form the package identity, and Publisher must be
+  byte-for-byte the Subject of the signing certificate or the package is
+  refused at install time with a misleading "the publisher is invalid" error.
+  It is therefore a token substituted by build.ps1 from the certificate the
+  operator supplies; there is no default, because a wrong default silently
+  produces an uninstallable package. Version is four-part, which MSIX requires
+  and Cargo's three-part version is not, so build.ps1 appends the fourth field.
+
+  CAPABILITIES: WHAT IS DECLARED, AND WHAT IS DELIBERATELY NOT
+  ============================================================
+  runFullTrust is declared, and it is the only one.
+
+    * runFullTrust: CriKey is a Win32 desktop application, not a UWP app. It
+      calls RegisterHotKey, enumerates the Start Menu through IShellItem and
+      FOLDERID_AppsFolder, resolves .lnk files over COM, launches with
+      ShellExecuteExW, and supervises plugin subprocesses over pipes
+      (crates/crikey-platform-windows). None of that is reachable from an
+      AppContainer. EntryPoint="Windows.FullTrustApplication" below is the
+      other half of the same statement.
+
+  Not declared, each for a reason:
+
+    * internetClient: CriKey does open one outbound connection: the package
+      manager fetches a plugin archive named by URL. But a full-trust desktop
+      application does not run in the AppContainer that this capability gates,
+      so declaring it would not be what permits the fetch and would not
+      restrict anything if removed. It would be a declaration with no
+      enforcement behind it, which is the one thing this project does not do.
+
+    * packageQuery: would be needed to call the PackageManager APIs. Packaged
+      application discovery does not use them: it enumerates the
+      FOLDERID_AppsFolder shell namespace with IEnumShellItems and launches via
+      the `shell:AppsFolder\<AppUserModelID>` moniker, which is the ordinary
+      shell namespace and needs nothing.
+
+    * broadFileSystemAccess: would grant the whole user profile. Discovery
+      reads two Start Menu directories, and Capability::FileSearch is reported
+      Unavailable by the Windows backend because no filesystem indexer exists
+      yet. Claiming access to everything to read two folders is not a
+      permission model, it is the absence of one.
+
+    * windows.startupTask: would register CriKey to run at sign-in. There is
+      no autostart implementation in the tree, no configuration key for it and
+      no UI to toggle it, so declaring the extension would put a Startup Apps
+      entry in Settings that corresponds to nothing the program does.
+
+  ASSETS
+  ======
+  MSIX requires the three logo images referenced below; the schema will not
+  validate without Properties/Logo, and the Start menu entry will not render
+  without the VisualElements pair. No artwork is checked into this repository,
+  so build.ps1 requires an assets directory to be supplied for the MSIX route
+  and fails naming the exact files and pixel sizes it needs. Referencing images
+  that are not in the package produces a package that installs and then shows a
+  blank tile, which is worse than refusing to build.
+-->
+<Package
+    xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+    xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+    xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+    xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+    IgnorableNamespaces="uap uap5 rescap">
+
+  <Identity
+      Name="CriKey"
+      Publisher="__CRIKEY_MSIX_PUBLISHER__"
+      Version="__CRIKEY_MSIX_VERSION__"
+      ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>CriKey</DisplayName>
+    <PublisherDisplayName>The CriKey Authors</PublisherDisplayName>
+    <Description>Keyboard launcher with isolated plugin workers.</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <!--
+      10.0.17763 (Windows 10 1809) is the floor because it is the first release
+      where a full-trust MSIX installs without the Desktop Bridge conversion
+      tooling. MaxVersionTested is exactly that: the newest build this package
+      has been installed on, and it moves when someone installs it on a newer
+      one, not before.
+    -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+
+  <!--
+    THE TILE RUNS `crikey-launcher.exe`, NOT `crikey.exe`
+    ====================================================
+    A tile, a Start menu entry and an execution alias all start the declared
+    Executable with no arguments, and the manifest has no key for supplying
+    any. `crikey.exe` is the console CLI: with no arguments it prints usage and
+    exits, so a tile pointed at it would flash a console window and do nothing.
+    `crikey-launcher.exe` is the graphical entry point from the same crate —
+    it takes no arguments, starts the launcher directly, and is built with
+    `#![windows_subsystem = "windows"]` so no console appears beside it.
+
+    `crikey.exe` is still in the package: the execution alias below is what a
+    terminal user gets, and that one is deliberately the CLI.
+  -->
+  <Applications>
+    <Application Id="CriKey" Executable="crikey-launcher.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+          DisplayName="CriKey"
+          Description="Keyboard launcher with isolated plugin workers."
+          BackgroundColor="transparent"
+          Square150x150Logo="Assets\Square150x150Logo.png"
+          Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile ShortName="CriKey" />
+      </uap:VisualElements>
+    </Application>
+
+    <!--
+      The command line, as a second application entry.
+
+      An execution alias resolves to the Executable of the Application that
+      declares it, so the alias cannot live on the tile entry above: it would
+      make `crikey` in a terminal start the GUI. It gets its own Application,
+      whose Executable is the console binary, and that entry is hidden from
+      the Start menu with AppListEntry="none" — one product must not appear
+      twice in the app list, and the CLI is not something a user launches by
+      clicking.
+
+      Inside an MSIX both the MSI's PATH entry and its App Paths key are
+      virtualised away, and an execution alias is the supported replacement.
+    -->
+    <Application Id="CriKeyCli" Executable="crikey.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+          AppListEntry="none"
+          DisplayName="CriKey command line"
+          Description="CriKey command line."
+          BackgroundColor="transparent"
+          Square150x150Logo="Assets\Square150x150Logo.png"
+          Square44x44Logo="Assets\Square44x44Logo.png" />
+
+      <Extensions>
+        <uap5:Extension Category="windows.appExecutionAlias">
+          <uap5:AppExecutionAlias>
+            <uap5:ExecutionAlias Alias="crikey.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

@@ -16,3 +16,8 @@ crikey-core.workspace = true
 crikey-native-protocol.workspace = true
 crikey-plugin-model.workspace = true
 crikey-plugin-supervisor.workspace = true
+crikey-sandbox.workspace = true
+
+# Session tokens and endpoint names come from the workspace's one CSPRNG; see
+# the `getrandom` note in the root manifest.
+getrandom.workspace = true

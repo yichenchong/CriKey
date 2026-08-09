@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+
+[package]
+name = "crikey-wasm-conformance"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+crikey-wasm-host = { path = "../../crates/crikey-wasm-host", default-features = false }
+crikey-core = { path = "../../crates/crikey-core" }
+
+[profile.release]
+opt-level = "z"
+
+# Build with:
+#   cargo build --release --target wasm32-unknown-unknown
+# The host requires the standard exported linear-memory name `memory`.
+# A third-party build pipeline should pass `-C link-arg=--export=memory` to
+# rustc (the exact command is kept in README.md in this directory).

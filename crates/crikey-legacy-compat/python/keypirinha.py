@@ -22,6 +22,14 @@ as a typed :class:`HostUnavailableError` naming the operation, never as an
     package_full_path(plugin) -> str
     package_cache_path(plugin, create) -> str
     package_full_name(plugin) -> str
+    set_actions(plugin, category, actions)
+    load_icon(plugin, sources) -> list[str]
+    set_default_icon(plugin, handle)
+    find_resources(plugin, pattern) -> list[str]
+    user_config_dir() -> str
+    installed_package_dir() -> str
+    package_cache_dir() -> str
+    execute_default_action(plugin, item, action) -> bool
 
 Publication is deliberately fire-and-forget: :meth:`Plugin.set_suggestions`
 and :meth:`Plugin.set_catalog` hand the host *one complete list* per call and
@@ -393,6 +401,49 @@ class Action:
         return "Action(name={!r}, label={!r})".format(self._name, self._label)
 
 
+class IconHandle:
+    """Opaque reference to the icons the host resolved for one plugin.
+
+    A plugin does exactly two things with one: hand it to
+    ``create_item(icon_handle=...)`` or to :meth:`Plugin.set_default_icon`. It
+    carries *names*, never pixels. The package lives on the host's disk and
+    only the host can bound the read and decode the image for the renderer, so
+    a shim that loaded the bytes here would be a second icon path whose output
+    nothing downstream could use.
+    """
+
+    __slots__ = ("_sources", "_references")
+
+    def __init__(self, sources, references):
+        self._sources = tuple(sources)
+        self._references = tuple(references)
+
+    def sources(self):
+        """The source strings the plugin asked for, in the order it gave them."""
+        return self._sources
+
+    def __repr__(self):
+        return "IconHandle(sources={!r})".format(self._sources)
+
+
+def _icon_reference(handle):
+    """The package-relative name the host resolves `handle` through.
+
+    Private to the layer: the worker calls it when an item crosses the process
+    boundary. Only the first source is used, because the host decodes one file
+    at one size — the documented multi-source form exists for multiple
+    resolutions, and claiming to honour the rest would be a claim without an
+    implementation behind it.
+
+    ``None`` for anything this shim did not issue, so a plugin that invented
+    its own handle object gets an item with no icon rather than a forged
+    reference into somebody else's package.
+    """
+    if not isinstance(handle, IconHandle):
+        return None
+    return handle._references[0] if handle._references else None
+
+
 #: Distinguishes "no fallback supplied" from "the fallback is None". Without
 #: it `get_int(key)` could not tell a caller who wants None on failure from
 #: one who wants the typed error.
@@ -533,6 +584,81 @@ class Settings:
             "a boolean (yes/no, true/false, on/off, enable/disable, 1/0)",
         )
 
+    def get_multiline(self, key, section=None, fallback=_UNSET, keep_empty_lines=False):
+        """The value as a list of lines, each stripped of its indentation.
+
+        The INI reader keeps an indented continuation line as an embedded
+        newline, so a multi-line setting arrives here as one string and
+        splitting is the only step left.
+
+        An absent key with no `fallback` answers ``[]`` rather than the ``None``
+        the scalar accessors report. Every documented caller iterates the
+        result, so ``None`` would turn an unset optional list into a
+        ``TypeError`` inside the plugin instead of an empty loop.
+
+        Blank lines are dropped unless `keep_empty_lines` is true: they are
+        layout in the file, not entries, for every caller that does not
+        deliberately use them as separators.
+        """
+        raw = self.get(key, section, unquote=True)
+        if raw is None:
+            return [] if fallback is _UNSET else fallback
+        lines = [line.strip() for line in raw.splitlines()]
+        return lines if keep_empty_lines else [line for line in lines if line]
+
+    def get_stripped(self, key, section=None, fallback=_UNSET):
+        """The value with surrounding whitespace and one quote pair removed.
+
+        The quote pair matters as much as the whitespace: a value written
+        ``" leading space"`` in the file is quoted precisely so the space
+        survives, and stripping without unquoting would throw away the thing
+        the author quoted to keep.
+        """
+        raw = self.get(key, section, unquote=True)
+        if raw is None:
+            return None if fallback is _UNSET else fallback
+        return raw
+
+    def get_enum(self, key, section=None, enum=(), fallback=_UNSET, case_sensitive=False):
+        """The value, required to be one of the spellings in `enum`.
+
+        `enum` is any iterable of accepted spellings; the *accepted* spelling
+        is returned, not the one the file happened to use, so a plugin can
+        compare the result against its own literals without folding case
+        itself. Comparison is ASCII-case-insensitive unless `case_sensitive`.
+
+        An unaccepted value is a :class:`SettingsError` attributed to this
+        section and key, exactly like a malformed integer — a bare
+        ``ValueError`` would reach the plugin naming neither.
+        """
+        accepted = [str(candidate) for candidate in enum]
+        return self._coerce(
+            key,
+            section,
+            fallback,
+            lambda raw: _match_enum(raw, accepted, case_sensitive),
+            _one_of(accepted),
+        )
+
+    def get_mapped(self, key, section=None, map=None, fallback=_UNSET, case_sensitive=False):
+        """The value translated through `map`.
+
+        `map` shadows the builtin because that is the documented parameter
+        name; renaming it would break every caller that passes it by keyword.
+
+        The mapped *value* is returned, so a plugin can turn configuration
+        words straight into its own constants. A key absent from `map` is a
+        :class:`SettingsError` naming this section and key.
+        """
+        table = dict(map or {})
+        return self._coerce(
+            key,
+            section,
+            fallback,
+            lambda raw: _lookup_mapped(raw, table, case_sensitive),
+            _one_of([str(candidate) for candidate in table]),
+        )
+
     def __repr__(self):
         return "Settings(sections={!r})".format(self.sections())
 
@@ -556,6 +682,46 @@ def _parse_float(raw):
     if not math.isfinite(value):
         raise ValueError(raw)
     return value
+
+
+def _one_of(accepted):
+    """The `expected` clause `_coerce` quotes when nothing matched.
+
+    The accepted spellings are listed in the message because a plugin author
+    reading "is not one of the accepted values" in a log still has to go and
+    find out what they are.
+    """
+    if not accepted:
+        return "one of an empty set of accepted values"
+    return "one of {}".format(", ".join(repr(value) for value in accepted))
+
+
+def _match_enum(raw, accepted, case_sensitive):
+    value = raw.strip()
+    if case_sensitive:
+        if value in accepted:
+            return value
+        raise ValueError(raw)
+    folded = _fold(value)
+    for candidate in accepted:
+        if _fold(candidate) == folded:
+            # The accepted spelling wins over the configured one: the caller
+            # compares this against its own literals.
+            return candidate
+    raise ValueError(raw)
+
+
+def _lookup_mapped(raw, table, case_sensitive):
+    value = raw.strip()
+    if case_sensitive:
+        if value in table:
+            return table[value]
+        raise ValueError(raw)
+    folded = _fold(value)
+    for candidate, mapped in table.items():
+        if _fold(str(candidate)) == folded:
+            return mapped
+    raise ValueError(raw)
 
 
 # --------------------------------------------------------------------------
@@ -803,6 +969,85 @@ class Plugin:
             data_bag,
         )
 
+    def create_error_item(self, label, short_desc, target=None):
+        """Builds the documented error item.
+
+        Categorised ``ERROR``, argument-free, and never recorded in usage
+        history: it reports a failure to the user and must not accumulate rank
+        as though it were a result worth returning to. `target` defaults to
+        the label so two different messages keep two distinct host-derived
+        identities (spec 10.2) instead of collapsing onto one row.
+        """
+        return CatalogItem(
+            ItemCategory.ERROR,
+            label,
+            short_desc,
+            label if target is None else target,
+            ItemArgsHint.FORBIDDEN,
+            ItemHitHint.IGNORE,
+        )
+
+    # -- alternate actions and icons ---------------------------------------
+
+    def create_action(self, name, label="", short_desc=""):
+        """Builds one alternate :class:`Action` for :meth:`set_actions`.
+
+        A factory rather than a bare constructor call because that is the
+        documented spelling; what it returns is an ordinary `Action`, so a
+        plugin that already builds them by hand is not a second code path.
+        """
+        if not isinstance(name, str) or not name:
+            raise InvalidItemError(
+                "name", "an action name must be a non-empty string, got {!r}".format(name)
+            )
+        return Action(name, label, short_desc)
+
+    def set_actions(self, category, actions):
+        """Registers the alternate actions every item of `category` offers.
+
+        Per category and replacing: the newest call for one category replaces
+        that category's list and leaves every other category alone, which is
+        what a plugin registering several categories in ``on_start`` depends
+        on. Passing an empty list unregisters the category.
+
+        The host attaches the list when an item crosses the process boundary,
+        so this changes what is published *next* and never rewrites a batch
+        the launcher already holds.
+        """
+        category = _coerce_enum(
+            category, "category", ItemCategory, _KNOWN_CATEGORIES, ItemCategory.USER_BASE
+        )
+        _host_capability("set_actions")(self, category, list(actions))
+
+    def load_icon(self, sources):
+        """Asks the host for a handle naming `sources`.
+
+        `sources` is one string or a sequence of them; each is either a
+        package-relative path or the documented ``res://Package/file`` form.
+        Resolution is the host's — only it can bound the read and decode the
+        image the renderer will draw.
+
+        Raises rather than returning a dud handle when a source cannot be
+        honoured: an item silently drawn without the icon its author asked for
+        is exactly the quiet failure this layer exists to avoid.
+        """
+        requested = [sources] if isinstance(sources, str) else list(sources)
+        return IconHandle(requested, _host_capability("load_icon")(self, requested))
+
+    def set_default_icon(self, handle):
+        """The icon used for this plugin's items that name none.
+
+        ``None`` clears it. A handle this shim did not issue is refused rather
+        than ignored, because ignoring it would leave a plugin believing its
+        items carry an icon they do not.
+        """
+        if handle is not None and not isinstance(handle, IconHandle):
+            raise InvalidItemError(
+                "icon_handle",
+                "set_default_icon expects a handle from load_icon, got {!r}".format(handle),
+            )
+        _host_capability("set_default_icon")(self, handle)
+
     # -- publication (spec 7.1, 14.8) --------------------------------------
 
     def set_catalog(self, items):
@@ -871,6 +1116,20 @@ class Plugin:
         """A packaged resource decoded exactly once, with newlines untouched."""
         return self.load_binary_resource(name).decode(encoding)
 
+    def find_resources(self, pattern):
+        """Package-relative names of this package's files matching `pattern`.
+
+        Glob-style and matched one path segment at a time, so ``data/*`` means
+        one directory deep and ``**`` is the only way to span more. The host
+        does the walking: the pattern is plugin-supplied text, and a name that
+        escaped the package directory would let a package enumerate the user's
+        disk under the plugin's identity.
+
+        The names are sorted, and every one of them is a name
+        :meth:`load_binary_resource` will accept.
+        """
+        return list(_host_capability("find_resources")(self, pattern))
+
     # -- logging (spec 14.4, 26.1) -----------------------------------------
 
     def info(self, *args):
@@ -935,6 +1194,42 @@ def version():
 def version_string():
     """The host version as a dotted string."""
     return ".".join(str(part) for part in _PRODUCT_VERSION)
+
+
+# --------------------------------------------------------------------------
+# Installation directories (spec 14.2)
+#
+# Every one of these is answered by the host, never computed here. CriKey
+# already owns the platform directory convention — XDG on Linux, `%APPDATA%`
+# and `%LOCALAPPDATA%` on Windows, `~/Library` on macOS — and a second copy of
+# that rule in Python would drift the first time one side is corrected, which
+# a plugin would experience as its cache silently moving.
+#
+# They answer CriKey's directories, not Keypirinha's: a legacy package running
+# here is running under this launcher, and pointing it at another product's
+# tree would have it write into an installation that is not there (spec 14.13).
+# --------------------------------------------------------------------------
+
+
+def user_config_dir():
+    """Where this user's CriKey configuration lives."""
+    return _host_capability("user_config_dir")()
+
+
+def installed_package_dir():
+    """Where CriKey installs legacy packages for this user."""
+    return _host_capability("installed_package_dir")()
+
+
+def package_cache_dir():
+    """The cache root shared by every legacy package.
+
+    Installation-wide, unlike :meth:`Plugin.get_package_cache_path`, which is
+    the one subdirectory of this that belongs to the calling package. A plugin
+    that writes directly under this root is writing into its neighbours'
+    space, so the per-package path is what almost every caller wants.
+    """
+    return _host_capability("package_cache_dir")()
 
 
 def __getattr__(name):

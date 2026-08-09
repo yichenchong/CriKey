@@ -29,15 +29,24 @@ nothing here performs network I/O.
 """
 
 import enum
+import codecs
 import ctypes
 
 import fnmatch
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 
 import keypirinha as _keypirinha
+
+#: Captured before :func:`decode_bytes` shadows the builtin with its
+#: documented parameter name. `memoryview` and `bytearray` are accepted
+#: because a plugin that read a file into one should not have to copy it back
+#: just to name the type this layer expects.
+_BYTES_TYPES = (bytes, bytearray, memoryview)
+_AS_BYTES = bytes
 
 __all__ = (
     "UnavailableError",
@@ -52,6 +61,14 @@ __all__ = (
     "open_url",
     "shell_execute",
     "explore_file",
+    "chardet_open",
+    "decode_bytes",
+    "kwargs_encode",
+    "kwargs_decode",
+    "execute_default_action",
+    "web_browser_command",
+    "read_link",
+    "shell_known_folder_path",
 )
 
 #: Hard ceiling on how many entries one :func:`scan_directory` call retains.
@@ -629,6 +646,439 @@ def explore_file(path):
 
 
 # --------------------------------------------------------------------------
+# Text decoding
+#
+# No charset detector is bundled and none is added: every usable one is a
+# third-party package, and a compatibility layer that quietly required one
+# would make the "CPython plus the standard library" interpreter requirement
+# untrue for every host that installs CriKey. What is here is a ladder of
+# *evidence*, and each rung says how much it actually knows.
+# --------------------------------------------------------------------------
+
+#: Byte-order marks, longest first. UTF-32-LE's mark begins with UTF-16-LE's,
+#: so a shortest-first scan would read UTF-32-LE text as UTF-16-LE and produce
+#: a string of interleaved NULs that decodes without raising.
+#:
+#: The codecs are the BOM-consuming spellings (`utf-16`, not `utf-16-le`), so
+#: the mark does not survive into the text as a leading U+FEFF.
+_BOMS = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
+
+#: What unmarked, non-UTF-8 bytes are read as. Windows-1252 is the documented
+#: guess and it is a guess: the legacy corpus is Windows software, and its
+#: hand-edited configuration and data files are cp1252 when they are not
+#: UTF-8. Nothing here can distinguish cp1252 from the other single-byte
+#: encodings, and this docstring is the only honest place to say so.
+_FALLBACK_ENCODING = "cp1252"
+
+#: The last rung. Latin-1 maps all 256 byte values to code points, so it
+#: cannot fail. It is reached only for the five byte values cp1252 leaves
+#: undefined, and it preserves the bytes rather than claiming to know the text.
+_LAST_RESORT_ENCODING = "latin-1"
+
+#: How much of a file :func:`chardet_open` examines before deciding. Detection
+#: must not read a whole file whose first line is all the caller wanted.
+_MAX_DETECTION_BYTES = 1 << 20
+
+
+def _detect_encoding(raw, truncated=False):
+    """The encoding `raw` is in, by the documented ladder.
+
+    `truncated` says `raw` is a bounded prefix of a longer input. A prefix can
+    end in the middle of a multi-byte sequence, and treating that as evidence
+    against UTF-8 would misread a large UTF-8 file as cp1252 purely because of
+    where the probe stopped.
+    """
+    for mark, encoding in _BOMS:
+        if raw.startswith(mark):
+            return encoding
+
+    try:
+        raw.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError as error:
+        # The longest UTF-8 sequence is four bytes, so only a failure inside
+        # the final three can be an artefact of the cut.
+        if truncated and error.start >= len(raw) - 3:
+            return "utf-8"
+
+    try:
+        raw.decode(_FALLBACK_ENCODING)
+        return _FALLBACK_ENCODING
+    except UnicodeDecodeError:
+        return _LAST_RESORT_ENCODING
+
+
+def decode_bytes(bytes):
+    """Decodes `bytes` to text, choosing the encoding as documented below.
+
+    The ladder, in order:
+
+    1. a byte-order mark, which is proof rather than a guess;
+    2. UTF-8, accepted only when the *whole* input decodes, which for any
+       non-trivial input is near-proof: other encodings produce invalid
+       sequences almost immediately;
+    3. Windows-1252, the documented guess for the legacy corpus;
+    4. Latin-1, which cannot fail, for the byte values cp1252 leaves
+       undefined.
+
+    Rungs 3 and 4 are guesses and are labelled as such. This is not
+    statistical charset detection and does not pretend to be — that needs a
+    third-party detector this layer deliberately does not depend on.
+
+    The parameter shadows the builtin because ``bytes`` is the documented
+    parameter name and callers pass it by keyword.
+    """
+    if not isinstance(bytes, _BYTES_TYPES):
+        raise TypeError(
+            "decode_bytes() takes bytes, not {}".format(type(bytes).__name__)
+        )
+    raw = _AS_BYTES(bytes)
+    return raw.decode(_detect_encoding(raw))
+
+
+def chardet_open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, **kwargs):
+    """Opens `file` using the documented evidence-based encoding ladder.
+
+    An explicit `encoding` is honoured; otherwise at most one megabyte is
+    probed using :func:`decode_bytes`'s BOM/UTF-8/cp1252/Latin-1 ladder.
+    """
+    if not isinstance(mode, str):
+        raise TypeError("chardet_open() mode must be a string")
+    if "b" in mode:
+        raise ValueError("chardet_open() opens text, not binary mode {!r}".format(mode))
+    if encoding is None:
+        with open(file, "rb") as probe:
+            raw = probe.read(_MAX_DETECTION_BYTES)
+        selected = _detect_encoding(raw, len(raw) == _MAX_DETECTION_BYTES)
+    else:
+        selected = encoding
+    return open(
+        file,
+        mode,
+        buffering=buffering,
+        encoding=selected,
+        errors=errors,
+        newline=newline,
+        **kwargs
+    )
+
+
+# --------------------------------------------------------------------------
+# Packing keyword arguments into one string
+# --------------------------------------------------------------------------
+
+#: Separates one pair from the next.
+_KWARGS_SEPARATOR = "&"
+
+#: Separates a name from its value.
+_KWARGS_ASSIGNMENT = "="
+
+#: Escapes the separators and itself.
+_KWARGS_ESCAPE = "\\"
+
+_KWARGS_SPECIAL = frozenset((_KWARGS_ESCAPE, _KWARGS_SEPARATOR, _KWARGS_ASSIGNMENT))
+
+
+def _kwargs_escape(text):
+    return "".join(
+        _KWARGS_ESCAPE + char if char in _KWARGS_SPECIAL else char for char in text
+    )
+
+
+def _kwargs_value_encode(value, name):
+    if isinstance(value, bool):
+        return "b:" + ("1" if value else "0")
+    if isinstance(value, int):
+        return "i:" + str(value)
+    if isinstance(value, float):
+        return "f:" + repr(value)
+    if isinstance(value, str):
+        return "s:" + value
+    raise TypeError(
+        "kwargs_encode() value for {!r} is {}; expected bool, int, float or str".format(
+            name, type(value).__name__
+        )
+    )
+
+
+def _kwargs_value_decode(value):
+    if len(value) < 2 or value[1] != ":":
+        raise ValueError("kwargs value has no type tag")
+    tag, payload = value[0], value[2:]
+    try:
+        if tag == "s":
+            return payload
+        if tag == "b" and payload in ("0", "1"):
+            return payload == "1"
+        if tag == "i":
+            return int(payload, 10)
+        if tag == "f":
+            return float(payload)
+    except (TypeError, ValueError):
+        pass
+    raise ValueError("kwargs value has an invalid type tag")
+
+
+def kwargs_encode(**kwargs):
+    """Packs basic bool/int/float/str keyword arguments reversibly.
+
+    Pair separators and escapes are escaped, while a one-character type tag
+    keeps scalar values typed when :func:`kwargs_decode` reverses the string.
+    """
+    return _KWARGS_SEPARATOR.join(
+        _kwargs_escape(name)
+        + _KWARGS_ASSIGNMENT
+        + _kwargs_escape(_kwargs_value_encode(kwargs[name], name))
+        for name in sorted(kwargs)
+    )
+
+
+def kwargs_decode(text):
+    """The exact inverse of :func:`kwargs_encode`, rejecting malformed text."""
+    if not isinstance(text, str):
+        raise TypeError("kwargs_decode() takes a string, not {}".format(type(text).__name__))
+    if not text:
+        return {}
+    pairs = []
+    name = None
+    buffer = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        index += 1
+        if char == _KWARGS_ESCAPE:
+            if index >= len(text):
+                raise ValueError("kwargs text ends with a lone escape character")
+            buffer.append(text[index])
+            index += 1
+        elif char == _KWARGS_ASSIGNMENT:
+            if name is not None:
+                raise ValueError("kwargs pair carries a second unescaped '='")
+            name = "".join(buffer)
+            buffer = []
+        elif char == _KWARGS_SEPARATOR:
+            pairs.append((name, "".join(buffer)))
+            name = None
+            buffer = []
+        else:
+            buffer.append(char)
+    pairs.append((name, "".join(buffer)))
+    decoded = {}
+    for name, value in pairs:
+        if not name:
+            raise ValueError("a kwargs pair carries no name")
+        if name in decoded:
+            raise ValueError("kwargs name {!r} appears twice".format(name))
+        decoded[name] = _kwargs_value_decode(value)
+    return decoded
+
+
+# --------------------------------------------------------------------------
+# Host-mediated execution
+# --------------------------------------------------------------------------
+
+
+def execute_default_action(plugin, item, action=None):
+    """Asks the host to do with `item` what it would do had the user run it.
+
+    The launcher performs the work, not this process, and that is the whole
+    point of routing it through the host object. Two things depend on it: the
+    launcher owns the permission gate on host-mediated process launches, and
+    it owns a process group that outlives this worker — a browser opened by
+    the worker would be killed with it the next time the plugin is reaped or
+    restarted.
+
+    Returns ``True`` when the host performed the action and ``False`` when it
+    declined because `item` carries nothing it knows how to act on. A host
+    that cannot perform host-mediated actions at all, or that refuses this
+    plugin, raises :class:`keypirinha.HostUnavailableError`; it is never a
+    silent no-op.
+    """
+    capability = _keypirinha._host_capability("execute_default_action")
+    return bool(capability(plugin, item, action))
+
+
+# --------------------------------------------------------------------------
+# The web browser
+# --------------------------------------------------------------------------
+
+#: Private-mode and new-window flags, per browser, as ``(private, window)``.
+#:
+#: A table rather than a heuristic. The flags are browser-specific and getting
+#: one wrong opens an ordinary window for a caller who asked for a private
+#: one, which is a privacy failure dressed up as a convenience. An unlisted
+#: browser is refused when either flag is requested, for the same reason.
+_BROWSER_FLAGS = {
+    "firefox": ("-private-window", "-new-window"),
+    "firefox-esr": ("-private-window", "-new-window"),
+    "librewolf": ("-private-window", "-new-window"),
+    "waterfox": ("-private-window", "-new-window"),
+    "chromium": ("--incognito", "--new-window"),
+    "chromium-browser": ("--incognito", "--new-window"),
+    "chrome": ("--incognito", "--new-window"),
+    "google-chrome": ("--incognito", "--new-window"),
+    "google-chrome-stable": ("--incognito", "--new-window"),
+    "brave-browser": ("--incognito", "--new-window"),
+    "vivaldi": ("--incognito", "--new-window"),
+    "vivaldi-stable": ("--incognito", "--new-window"),
+    "opera": ("--private", "--new-window"),
+    "microsoft-edge": ("--inprivate", "--new-window"),
+    "msedge": ("--inprivate", "--new-window"),
+    "epiphany": ("--incognito-mode", "--new-window"),
+}
+
+#: Browsers looked for on ``PATH``, in order, when ``BROWSER`` names none that
+#: exists. Ordered by how likely a desktop is to have made it the default.
+_BROWSER_CANDIDATES = (
+    "firefox",
+    "chromium",
+    "chromium-browser",
+    "google-chrome",
+    "chrome",
+    "brave-browser",
+    "vivaldi",
+    "microsoft-edge",
+    "msedge",
+    "epiphany",
+)
+
+
+def _split_command(entry):
+    """Splits one ``BROWSER`` entry into words, per platform quoting rules."""
+    if sys.platform.startswith("win"):
+        return cmdline_split(entry)
+    return shlex.split(entry)
+
+
+def _browser_entries():
+    """Candidate browser commands, most authoritative first."""
+    for entry in os.environ.get("BROWSER", "").split(os.pathsep):
+        entry = entry.strip()
+        if entry:
+            yield entry
+    for candidate in _BROWSER_CANDIDATES:
+        yield candidate
+
+
+def _browser_key(executable):
+    """The `_BROWSER_FLAGS` key for a resolved browser path."""
+    name = os.path.basename(executable).lower()
+    root, extension = os.path.splitext(name)
+    return root if extension == ".exe" else name
+
+
+def web_browser_command(private_mode=False, new_window=False, url=None, execute=False):
+    """The command line that opens `url` in this user's web browser.
+
+    Returns an argv **list**, not one string. Documented Keypirinha returns a
+    Windows command line; a list is unambiguous on every platform this layer
+    runs on, and :func:`cmdline_quote` is right here for the callers that
+    genuinely need the Windows spelling. This is the one deliberate
+    difference and it is recorded in the compatibility matrix.
+
+    The browser comes from ``BROWSER`` — the POSIX convention: a
+    ``os.pathsep``-separated list of commands, an entry's ``%s`` replaced by
+    the URL — and then from a list of known browsers on ``PATH``.
+
+def web_browser_command(private_mode=None, new_window=None, url=None, execute=False):
+    this layer knows, and *refused* with :class:`UnavailableError` for any
+    other. Launching an unknown browser without the private-mode flag it was
+    asked for would open an ordinary window the caller believes is private.
+
+    `execute` runs the command as well as returning it, and then needs a
+    desktop session like every other helper here.
+    """
+    executable, template = _resolve_browser()
+
+    flags = []
+    if private_mode or new_window:
+        known = _BROWSER_FLAGS.get(_browser_key(executable))
+        if known is None:
+            raise UnavailableError(
+                "web_browser_command",
+                "the resolved browser {!r} is not one whose private-mode and "
+                "new-window flags this layer knows, so the request cannot be "
+                "honoured and is refused rather than dropped".format(executable),
+            )
+        private_flag, new_window_flag = known
+        if private_mode:
+            flags.append(private_flag)
+        if new_window:
+            flags.append(new_window_flag)
+
+    argv = [executable]
+    placed = False
+    for token in template:
+        if url is not None and "%s" in token:
+            argv.append(token.replace("%s", url))
+            placed = True
+        else:
+            argv.append(token)
+    # Flags belong immediately after the executable: a browser reads them as
+    # its own options only before the positional URL.
+    argv[1:1] = flags
+    if url is not None and not placed:
+        argv.append(url)
+
+    if execute:
+        _require_desktop("web_browser_command")
+        _run_helper("web_browser_command", argv)
+    return argv
+
+
+def _resolve_browser():
+    """``(executable, template_arguments)`` for this user's browser."""
+    for entry in _browser_entries():
+        words = _split_command(entry)
+        if not words:
+            continue
+        found = shutil.which(words[0])
+        if found:
+            return found, words[1:]
+    raise UnavailableError(
+        "web_browser_command",
+        "no web browser was found: BROWSER names none that exists and none of "
+        "{} is on PATH".format(", ".join(_BROWSER_CANDIDATES)),
+    )
+
+
+# --------------------------------------------------------------------------
+# Windows shell services
+#
+# Both of these answer questions only the Windows shell can answer. They are
+# refused off Windows rather than approximated: spec 2.3 forbids emulating a
+# Windows API, and an approximation here would answer a *different* question
+# under the same name, which a plugin would then act on (spec 14.12).
+# --------------------------------------------------------------------------
+
+
+def read_link(path):
+    """Compatibility alias for :func:`keypirinha_wintypes.read_link`.
+
+    Legacy packages import this helper from ``keypirinha_util``. The actual
+    Windows-dependent operation is owned by the explicit platform interface;
+    importing it lazily keeps the historical import path and avoids a module
+    cycle during worker startup.
+    """
+    from keypirinha_wintypes import read_link as resolve
+
+    return resolve(path)
+
+
+def shell_known_folder_path(guid):
+    """Compatibility alias for :func:`keypirinha_wintypes.shell_known_folder_path`."""
+    from keypirinha_wintypes import shell_known_folder_path as resolve
+
+    return resolve(guid)
+
+
+# --------------------------------------------------------------------------
 # Win32 implementations
 #
 # `ctypes` is imported lazily, inside these functions only: `ctypes.WinDLL`
@@ -804,6 +1254,201 @@ def _win32_explore_file(path):
         )
 
 
+#: `CLSID_ShellLink`, `IID_IShellLinkW` and `IID_IPersistFile`, in the
+#: registry string form `CLSIDFromString` parses. Written as strings rather
+#: than hand-packed structures because a mistyped byte in a packed GUID fails
+#: as "class not registered" at run time, which is a miserable thing to debug
+#: on a platform this host cannot test on.
+_CLSID_SHELL_LINK = "{00021401-0000-0000-C000-000000000046}"
+_IID_ISHELLLINKW = "{000214F9-0000-0000-C000-000000000046}"
+_IID_IPERSISTFILE = "{0000010B-0000-0000-C000-000000000046}"
+
+#: `CLSCTX_INPROC_SERVER`; the shell link object is an in-process class.
+_CLSCTX_INPROC_SERVER = 0x1
+
+#: `COINIT_APARTMENTTHREADED`. The shell link object is an apartment-model
+#: object, so the thread that creates it must be in an STA.
+_COINIT_APARTMENTTHREADED = 0x2
+
+#: `RPC_E_CHANGED_MODE`: this thread is already initialised, in the other
+#: model. Not an error to us — we simply must not uninitialise a thread whose
+#: apartment we did not enter.
+_RPC_E_CHANGED_MODE = -2147417850
+
+#: `STGM_READ`, and `SLGP_RAWPATH`: the stored path without the shell's
+#: environment-variable expansion, which is what a caller asking to *read* a
+#: link means by its target.
+_STGM_READ = 0x0
+_SLGP_RAWPATH = 0x4
+
+#: `MAX_PATH`. `IShellLinkW::GetPath` will not write more than this however
+#: large the buffer is.
+_MAX_PATH = 260
+
+#: Vtable slots. IUnknown occupies 0..2 in every interface; the rest are
+#: counted from the interface's own declaration order.
+_SLOT_QUERY_INTERFACE = 0
+_SLOT_RELEASE = 2
+_SLOT_PERSIST_FILE_LOAD = 5
+_SLOT_SHELL_LINK_GET_PATH = 3
+
+
+class _WinGuid(ctypes.Structure):
+    """The Win32 `GUID` layout, for the by-reference COM arguments below."""
+
+    _fields_ = (
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    )
+
+
+def _win32_guid(ole32, operation, text):
+    """Parses a registry-form GUID string, or refuses it."""
+    guid = _WinGuid()
+    if ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(guid)) != 0:
+        raise UnavailableError(
+            operation, "{!r} is not a GUID in the form {{...}}".format(text)
+        )
+    return guid
+
+
+def _win32_com_method(interface, slot, *argtypes):
+    """One COM method of `interface`, bound through its vtable."""
+    vtable = ctypes.cast(
+        interface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+    ).contents
+    prototype = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, *argtypes)
+    return prototype(vtable[slot])
+
+
+def _win32_release(interface):
+    if interface:
+        _win32_com_method(interface, _SLOT_RELEASE)(interface)
+
+
+def _win32_read_link(path):
+    ctypes = _win32()
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    ole32.CLSIDFromString.argtypes = (ctypes.c_wchar_p, ctypes.c_void_p)
+    ole32.CLSIDFromString.restype = ctypes.HRESULT
+    ole32.CoInitializeEx.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    ole32.CoCreateInstance.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )
+    ole32.CoCreateInstance.restype = ctypes.HRESULT
+
+    initialized = ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
+    # A thread already in the other apartment model is left exactly as found:
+    # uninitialising someone else's apartment on the way out would break the
+    # code that entered it.
+    entered = initialized >= 0
+
+    link = ctypes.c_void_p()
+    persist = ctypes.c_void_p()
+    try:
+        if initialized < 0 and initialized != _RPC_E_CHANGED_MODE:
+            raise UnavailableError(
+                "read_link", "CoInitializeEx failed with 0x{:08X}".format(initialized & 0xFFFFFFFF)
+            )
+
+        clsid = _win32_guid(ole32, "read_link", _CLSID_SHELL_LINK)
+        iid_link = _win32_guid(ole32, "read_link", _IID_ISHELLLINKW)
+        iid_persist = _win32_guid(ole32, "read_link", _IID_IPERSISTFILE)
+
+        if ole32.CoCreateInstance(
+            ctypes.byref(clsid),
+            None,
+            _CLSCTX_INPROC_SERVER,
+            ctypes.byref(iid_link),
+            ctypes.byref(link),
+        ) != 0:
+            raise UnavailableError(
+                "read_link", "the shell link class could not be created"
+            )
+
+        query = _win32_com_method(
+            link, _SLOT_QUERY_INTERFACE, ctypes.c_void_p, ctypes.c_void_p
+        )
+        if query(link, ctypes.byref(iid_persist), ctypes.byref(persist)) != 0:
+            raise UnavailableError(
+                "read_link", "the shell link does not implement IPersistFile"
+            )
+
+        load = _win32_com_method(
+            persist, _SLOT_PERSIST_FILE_LOAD, ctypes.c_wchar_p, ctypes.c_uint32
+        )
+        if load(persist, ctypes.c_wchar_p(os.path.abspath(path)), _STGM_READ) != 0:
+            raise UnavailableError(
+                "read_link", "{!r} could not be loaded as a shortcut".format(path)
+            )
+
+        buffer = ctypes.create_unicode_buffer(_MAX_PATH)
+        get_path = _win32_com_method(
+            link,
+            _SLOT_SHELL_LINK_GET_PATH,
+            ctypes.c_wchar_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        )
+        # A shortcut to a virtual shell folder — Control Panel, This PC — has
+        # no filesystem path at all. `GetPath` succeeds and leaves the buffer
+        # empty; reporting "" as a path would be a lie, so it is refused.
+        if get_path(link, buffer, _MAX_PATH, None, _SLGP_RAWPATH) < 0 or not buffer.value:
+            raise UnavailableError(
+                "read_link",
+                "{!r} names no filesystem target; it points at a virtual "
+                "shell folder".format(path),
+            )
+        return buffer.value
+    finally:
+        _win32_release(persist)
+        _win32_release(link)
+        if entered:
+            ole32.CoUninitialize()
+
+
+def _win32_known_folder_path(guid):
+    ctypes = _win32()
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    ole32.CLSIDFromString.argtypes = (ctypes.c_wchar_p, ctypes.c_void_p)
+    ole32.CLSIDFromString.restype = ctypes.HRESULT
+    ole32.CoTaskMemFree.argtypes = (ctypes.c_void_p,)
+    ole32.CoTaskMemFree.restype = None
+    shell32.SHGetKnownFolderPath.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )
+    shell32.SHGetKnownFolderPath.restype = ctypes.HRESULT
+
+    folder = _win32_guid(ole32, "shell_known_folder_path", guid)
+    out = ctypes.c_wchar_p()
+    try:
+        if shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder), 0, None, ctypes.byref(out)
+        ) != 0:
+            raise UnavailableError(
+                "shell_known_folder_path",
+                "the shell does not know a folder with GUID {}".format(guid),
+            )
+        return out.value
+    finally:
+        # The shell allocates with the COM task allocator, so the caller frees
+        # with it; `ctypes` does not own this string.
+        if out:
+            ole32.CoTaskMemFree(out)
+
+
 # --------------------------------------------------------------------------
 # The undocumented-internal guard (spec 14.12)
 # --------------------------------------------------------------------------
@@ -812,12 +1457,12 @@ def _win32_explore_file(path):
 def __getattr__(name):
     """Turns a reach for an undelivered helper into an attributable report.
 
-    Several documented Keypirinha helpers are deliberately outside M3
-    (``fuzzy_score``, ``chardet_open``, ``decode_bytes``, ``kwargs_encode``,
-    ``kwargs_decode``, ``execute_default_action``, ``web_browser_command``,
-    ``read_link``). A plugin reaching for one gets the same attributable
-    diagnostic as one reaching for a private internal, rather than an
-    ``AttributeError`` from nowhere in particular.
+    ``fuzzy_score`` remains outside the layer: spec 14.12 exempts exact
+    reproduction of undocumented ranking behaviour, so reproducing it would be
+    guessing at a number other people's results are ordered by. A plugin
+    reaching for it gets the same attributable diagnostic as one reaching for
+    a private internal, rather than an ``AttributeError`` from nowhere in
+    particular.
     """
     if name.startswith("__") and name.endswith("__"):
         raise AttributeError(name)

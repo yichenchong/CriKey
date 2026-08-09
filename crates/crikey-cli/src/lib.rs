@@ -1,6 +1,13 @@
-//! `crikey` command-line entrypoint (spec 28).
+//! The implementation behind CriKey's two executables (spec 28).
+//!
+//! `crikey` is the console command line and `crikey-launcher` is the graphical
+//! entry point; both are thin `main` functions over [`cli_main`] and
+//! [`start_launcher`] here, so the launcher has exactly one composition root
+//! whichever binary started it. See `src/bin/crikey-launcher.rs` for why two
+//! binaries rather than one.
 
 mod activation_commands;
+mod catalog_commands;
 mod config_commands;
 mod dev_commands;
 mod legacy_commands;
@@ -10,9 +17,10 @@ mod package_commands;
 mod plugin_commands;
 
 use crikey_app::{
-    admitted_plugin_roots, ActionSubmission, App, BatchState, DisabledPlugins, LegacyDriver, LegacyProvider,
-    ModernDriver, ModernProvider, NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter,
-    QueryPipeline, ResultBatch, SearchService, StartupJournal, StartupMode, StartupStage,
+    admitted_plugin_roots, ActionSubmission, App, BatchState, DefaultCatalogFetcher, DisabledPlugins,
+    LegacyDriver, LegacyProvider, ModernDriver, ModernProvider, NativeDriver, NativeProvider, PipelineConfig,
+    PluginActionRouter, QueryPipeline, RemoteCatalogService, RemoteSource, ResultBatch, SearchService,
+    SelectionHistoryStore, StartupJournal, StartupMode, StartupStage,
 };
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
@@ -36,7 +44,7 @@ use std::cell::RefCell;
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "\
 crikey - a fast, keyboard-driven application launcher
@@ -48,6 +56,7 @@ COMMANDS:
     run                             Start the launcher (use `crikey run --help`)
     plugin                          Plugin management (use `crikey plugin --help`)
     config                          Configuration inspection (use `crikey config --help`)
+    catalog                         Remote catalog sources (use `crikey catalog --help`)
     dev                             Developer commands (use `crikey dev --help`)
     package                         Package commands (use `crikey package --help`)
     version                         Print version information
@@ -73,7 +82,7 @@ fn pipeline_profile(profile: crikey_plugin_model::SchedulingProfile) -> Scheduli
         crikey_plugin_model::SchedulingProfile::Modern => SchedulingProfile::Modern,
     }
 }
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const DEFAULT_ACTIVATION_HOTKEY: &str = "Ctrl+Alt+Space";
 
 const RUN_USAGE: &str = "\
@@ -118,9 +127,37 @@ USAGE:
     crikey version
 ";
 
-fn main() -> ExitCode {
+/// The `crikey` console entry point: parse argv, run one subcommand.
+pub fn cli_main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     dispatch(&args)
+}
+
+/// Where a launch was started from, which decides where a fatal startup failure
+/// can be seen.
+///
+/// The console entry point has a terminal by construction, so stderr is the
+/// whole answer there. The desktop entry point has none -- `crikey-launcher` is
+/// GUI-subsystem on Windows -- so its stderr is discarded by the operating
+/// system and a failed launch would otherwise be a process that vanishes with
+/// no explanation anywhere. This distinguishes the two rather than logging
+/// unconditionally, so `crikey run` keeps writing exactly what it writes today
+/// and leaves no file behind that the operator did not ask for.
+#[derive(Clone, Copy, Debug)]
+enum LaunchSurface {
+    /// `crikey run`, started from a terminal.
+    Console,
+    /// `crikey-launcher`, started from a shortcut, a tile or a bundle.
+    Desktop,
+}
+
+/// The `crikey-launcher` entry point: start the launcher with no overrides.
+///
+/// The same call `crikey run` makes with an empty `--set` list, deliberately
+/// routed through [`run_launcher`] rather than reaching past it: the two
+/// executables must not be able to drift into two launchers.
+pub fn start_launcher() -> ExitCode {
+    run_launcher(&[], LaunchSurface::Desktop)
 }
 
 fn dispatch(args: &[String]) -> ExitCode {
@@ -154,7 +191,7 @@ fn dispatch(args: &[String]) -> ExitCode {
                 print!("{RUN_USAGE}");
                 ExitCode::SUCCESS
             } else {
-                run_launcher(&args[1..])
+                run_launcher(&args[1..], LaunchSurface::Console)
             }
         }
         Some("help") => {
@@ -169,13 +206,14 @@ fn dispatch(args: &[String]) -> ExitCode {
         Some("package") => package_commands::run(&args[1..]),
         Some("plugin") => plugin_commands::run(&args[1..]),
         Some("config") => config_commands::run(&args[1..]),
+        Some("catalog") => catalog_commands::run(&args[1..]),
         Some(other) => {
             eprintln!("crikey: unknown command `{other}`\n\n{USAGE}");
             ExitCode::from(64) // EX_USAGE
         }
     }
 }
-fn run_launcher(args: &[String]) -> ExitCode {
+fn run_launcher(args: &[String], surface: LaunchSurface) -> ExitCode {
     let mut overrides = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -205,7 +243,16 @@ fn run_launcher(args: &[String]) -> ExitCode {
     match run_native_launcher(&overrides) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("crikey: launcher failed: {message}");
+            let diagnostic = format!("crikey: launcher failed: {message}");
+            eprintln!("{diagnostic}");
+            // On the desktop path that stderr line has nowhere to go, so the
+            // failure is also written somewhere durable and shown to the person
+            // who clicked. The argument-parsing refusals above cannot be reached
+            // from `crikey-launcher`, which takes no arguments, so this is the
+            // only arm that needs the second sink.
+            if matches!(surface, LaunchSurface::Desktop) {
+                report_desktop_startup_failure(&diagnostic);
+            }
             ExitCode::from(70) // EX_SOFTWARE
         }
     }
@@ -270,20 +317,36 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         eprintln!("crikey: catalog cache error during startup load: {error}");
     }
 
-    #[cfg(windows)]
+    // The global activation hotkey, and with it the launcher's reachability
+    // after a dismiss. Registration fails when another application already owns
+    // the accelerator, which is a conflict on the operator's desktop and not a
+    // fault in this launch: on both platforms it is reported and the launch
+    // continues with the window that is already on screen, because refusing to
+    // start would let any program that grabbed Ctrl+Alt+Space first take the
+    // launcher away entirely. `has_activation_source` carries the consequence
+    // to the event loop: the dismiss and execute arms exit the process instead
+    // of hiding the window, since a hidden launcher no key combination can
+    // raise is one the operator can neither use nor see to quit.
+    #[cfg(any(windows, target_os = "linux"))]
     let has_activation_source = {
         let hotkey_handle = render_handle.clone();
-        search
-            .register_activation_hotkey(
-                DEFAULT_ACTIVATION_HOTKEY,
-                Box::new(move |_| {
-                    let _ = hotkey_handle.request_toggle();
-                }),
-            )
-            .map_err(|error| format!("cannot register {DEFAULT_ACTIVATION_HOTKEY}: {error}"))?;
-        true
+        match search.register_activation_hotkey(
+            DEFAULT_ACTIVATION_HOTKEY,
+            Box::new(move |_| {
+                let _ = hotkey_handle.request_toggle();
+            }),
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "crikey: global activation hotkey {DEFAULT_ACTIVATION_HOTKEY} unavailable: \
+                     {error}; this launch ends when the window is dismissed"
+                );
+                false
+            }
+        }
     };
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     let has_activation_source = false;
 
     search
@@ -303,6 +366,38 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     search
         .complete_stage(StartupStage::PersistedCatalog)
         .map_err(|error| error.to_string())?;
+    // Remote catalog sources (spec 2.2, ADR-0016). Built after the persisted
+    // slices are in, because the retained slice of a source that is currently
+    // unreachable is exactly what keeps serving while the refresh below fails.
+    // No source configured means an empty service: no thread, no socket, no
+    // behaviour change of any kind.
+    let mut remote_catalog = remote_catalog_service(&directories, configuration.as_ref());
+    // Monotonic, and independent of the wall clock a user can move: refresh
+    // intervals are durations, not appointments.
+    let remote_clock = Instant::now();
+    // Ranking history is restored before the first query can be accepted, so
+    // the very first result list a user sees already reflects what they picked
+    // last time. Restoring after `AcceptQueries` would leave a window in which
+    // a query is answered from an empty history and then silently reranked.
+    let selection_history = match selection_history_path() {
+        Some(path) => Some(SelectionHistoryStore::new(path)),
+        None => {
+            eprintln!(
+                "crikey: no per-user state directory (set XDG_STATE_HOME or HOME); \
+                 ranking history is not kept across launches"
+            );
+            None
+        }
+    };
+    if let Some(store) = selection_history.as_ref() {
+        search.restore_selection_history(store.load());
+    }
+    // The recency term is scored against this clock, so it has to hold a real
+    // wall-clock time before the first query rather than the zero a fresh
+    // service starts at: at zero, every persisted selection looks like it
+    // happened decades in the future and recency contributes nothing.
+    let mut history_clock = HistoryClock::default();
+    search.set_history_time(history_clock.advance());
     search
         .complete_stage(StartupStage::AcceptQueries)
         .map_err(|error| error.to_string())?;
@@ -383,6 +478,10 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             &discovery_roots(PluginKind::Legacy, legacy_package_roots(), &directories),
         ),
         legacy_cache_root,
+        crikey_app::LegacyDirectories {
+            user_config: Some(directories.config_dir().to_path_buf()),
+            installed_packages: Some(directories.plugin_dir(PluginKind::Legacy)),
+        },
         LegacyDeadlines::default(),
         &disabled,
     );
@@ -533,12 +632,26 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         .register(legacy_driver.plugins(), legacy_driver.action_executor())
         .map_err(|error| format!("cannot register legacy action runtime: {error}"))?;
     action_router
-        .register(modern_driver.plugins(), modern_driver.action_executor())
+        .register_with_permissions(modern_driver.permissions(), modern_driver.action_executor())
         .map_err(|error| format!("cannot register modern action runtime: {error}"))?;
     action_router
-        .register(native_driver.plugins(), native_driver.action_executor())
+        .register_with_permissions(native_driver.permissions(), native_driver.action_executor())
         .map_err(|error| format!("cannot register native action runtime: {error}"))?;
-    search.set_plugin_action_router(Arc::new(action_router));
+    // The discovered-application catalog is the host's own, published under a
+    // builtin owner with no plugin runtime. It still has to appear in the
+    // grant map: the launch gate refuses an owner it does not know, and
+    // without this line `crikey run` would refuse to launch the applications
+    // it discovered itself.
+    action_router
+        .register_host_catalog(PluginId(APPLICATION_CATALOG_PLUGIN.to_owned()))
+        .map_err(|error| format!("cannot register the application catalog grants: {error}"))?;
+    // One `Arc`, shared. The legacy driver needs the same router the search
+    // service uses: a host-mediated action a legacy plugin asks for is gated by
+    // exactly the grants registered above, and a second router would be a
+    // second answer to the same question.
+    let action_router = Arc::new(action_router);
+    legacy_driver.set_plugin_action_router(Arc::clone(&action_router));
+    search.set_plugin_action_router(action_router);
     // The first publication (spec 21.4). Flushed rather than coalesced: startup is
     // not a burst of edits, and a plugin whose `on_configuration` decides where to
     // look for its data must be told before it serves its first query.
@@ -579,8 +692,33 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     publish_configuration(&modern_driver, &native_driver, state);
                 }
             }
+            // Remote catalog sources (spec 2.2, ADR-0016). Both calls return
+            // immediately: `poll` starts a fetch on a thread of its own and
+            // `apply` admits only documents that already finished, through the
+            // same publication edge the provider catalog results below use.
+            // Nothing here is reachable from the query path, and a launcher
+            // with no source configured skips it entirely (README invariant 2).
+            if !remote_catalog.is_idle() {
+                let now_ms = u64::try_from(remote_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+                remote_catalog.poll(now_ms);
+                for report in remote_catalog.apply(&mut search, now_ms) {
+                    eprintln!("crikey: {report}");
+                }
+            }
             // Fold any legacy rows the supervisor produced since the last turn
             for completion in search.poll_action_completions() {
+                let successful = completion.outcome.is_ok();
+                if successful {
+                    // The clock is advanced first: `record_selection` stamps
+                    // the entry with whatever the service currently holds, and
+                    // a selection recorded under the last query's timestamp
+                    // would date an action the user just confirmed to whenever
+                    // they started typing.
+                    search.set_history_time(history_clock.advance());
+                    if search.record_selection(&completion.item_id) {
+                        commit_selection_history(selection_history.as_ref(), &search);
+                    }
+                }
                 let message = match completion.outcome {
                     Ok(()) => format!(
                         "Action completed: {} / {}",
@@ -699,6 +837,14 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
 
             match effect {
                 Some(UiEffect::Query(raw)) => {
+                    // Both ranking inputs are refreshed immediately before the
+                    // query is scored, because both describe the moment the
+                    // user typed: recency is measured from now, and the
+                    // foreground application is whatever they were working in
+                    // when they reached for the launcher. Reading either once
+                    // at startup would freeze it for the life of the process.
+                    search.set_history_time(history_clock.advance());
+                    search.refresh_foreground_category();
                     if let Ok(generation) = search.submit_query(&raw) {
                         let items = search.results().iter().map(|hit| hit.item.clone()).collect();
                         view_model.begin_generation(generation);
@@ -783,6 +929,10 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 }
                 Some(UiEffect::Execute { item, action }) => match search.execute(&item, &action) {
                     Ok(ActionSubmission::Completed) => {
+                        search.set_history_time(history_clock.advance());
+                        if search.record_selection(&item) {
+                            commit_selection_history(selection_history.as_ref(), &search);
+                        }
                         view_model.dismiss();
                         if let Some(session) = command_session {
                             let _ = render_handle.request_hide_session(session);
@@ -893,6 +1043,63 @@ fn configured_plugin_roots(variable: &str) -> Vec<std::path::PathBuf> {
         roots.push(root);
     }
     roots
+}
+
+/// Builds the remote catalog service from configuration (spec 2.2, ADR-0016).
+///
+/// Every failure below degrades to "no remote source" or "no trusted key" and
+/// is reported, never fatal: a launcher that refused to start because a shared
+/// index was misdeclared would be a worse launcher than one that starts without
+/// it. An empty declaration is the default and produces a service that does
+/// nothing at all.
+fn remote_catalog_service(
+    directories: &StandardDirectories,
+    configuration: Option<&LauncherConfiguration>,
+) -> RemoteCatalogService {
+    let idle = |sources| {
+        RemoteCatalogService::new(
+            sources,
+            Arc::new(DefaultCatalogFetcher),
+            Arc::new(crikey_package_manager::TrustStore::empty()),
+        )
+    };
+    let Some(configuration) = configuration else {
+        return idle(Vec::new());
+    };
+    let declared = match crikey_config::remote_catalog_sources(&configuration.store) {
+        Ok(declared) => declared,
+        Err(error) => {
+            eprintln!("crikey: remote catalog sources unavailable: {error}");
+            return idle(Vec::new());
+        }
+    };
+    if declared.is_empty() {
+        return idle(Vec::new());
+    }
+    let sources: Vec<RemoteSource> = declared
+        .iter()
+        .map(|declared| {
+            let mut source = RemoteSource::new(&declared.name, &declared.url);
+            source.interval_ms = declared.interval_ms;
+            source.max_bytes = declared.max_bytes;
+            source.require_signature = declared.require_signature;
+            source.signing_key = declared.signing_key.clone();
+            source
+        })
+        .collect();
+    // An unreadable trust store leaves an empty one, which refuses every source
+    // that requires a signature by name rather than admitting it unchecked.
+    let trust = match crikey_package_manager::TrustStore::load(directories) {
+        Ok(trust) => trust,
+        Err(error) => {
+            eprintln!(
+                "crikey: trusted key store unavailable: {error}; \
+                 remote catalog sources requiring a signature will be refused"
+            );
+            crikey_package_manager::TrustStore::empty()
+        }
+    };
+    RemoteCatalogService::new(sources, Arc::new(DefaultCatalogFetcher), Arc::new(trust))
 }
 
 /// The launcher's live view of the layered configuration (spec 21).
@@ -1056,7 +1263,23 @@ pub(crate) fn discovery_roots(
 ) -> Vec<std::path::PathBuf> {
     let mut roots = configured;
     let installed = directories.plugin_dir(kind);
-    if !roots.iter().any(|root| root == &installed) {
+    // A standard install directory that does not exist is a fresh profile with
+    // nothing installed yet — the ordinary first-run state, not a failure.
+    // Handing it to a provider anyway opened `crikey run` with `cannot scan
+    // modern plugin root: No such file or directory` on a correct install,
+    // which reads as a broken download, contradicts `crikey plugin doctor`
+    // calling the same profile healthy, and drowns the scan failures that do
+    // mean something. `crikey_config::discover_plugin_schemas` already takes
+    // this view of a missing root, so this makes the runtimes agree.
+    //
+    // Only a definite absence is dropped. `try_exists` reports an error when
+    // the answer is unknown — a parent that cannot be traversed, say — and that
+    // root is still handed over, so a permission problem or a file where the
+    // directory should be is reported exactly as loudly as before. A root the
+    // operator named themselves is never dropped either: a directory they named
+    // and does not exist is their mistake to hear about. Nothing is created
+    // here; scanning must not have the side effect of installing.
+    if !roots.iter().any(|root| root == &installed) && installed.try_exists().unwrap_or(true) {
         roots.push(installed);
     }
     roots
@@ -1119,15 +1342,7 @@ fn startup_journal_path() -> Option<std::path::PathBuf> {
     if let Some(value) = std::env::var_os("CRIKEY_STARTUP_JOURNAL").filter(|value| !value.is_empty()) {
         return Some(std::path::PathBuf::from(value));
     }
-    std::env::var_os("XDG_STATE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| std::path::PathBuf::from(home).join(".local").join("state"))
-        })
-        .map(|base| base.join("crikey").join("startup.json"))
+    per_user_state_dir().map(|base| base.join("startup.json"))
 }
 
 /// Persists the journal, degrading to a diagnostic.
@@ -1137,6 +1352,72 @@ fn startup_journal_path() -> Option<std::path::PathBuf> {
 fn commit_startup_journal(journal: &StartupJournal) {
     if let Err(error) = journal.save() {
         eprintln!("crikey: cannot write the startup-recovery journal: {error}");
+    }
+}
+
+/// Where the persistent ranking history lives, read from
+/// `CRIKEY_SELECTION_HISTORY`, else the same per-user state directory the
+/// startup journal uses.
+///
+/// `None` when no per-user location can be determined, for the same reason the
+/// journal refuses one: a shared temporary directory would let any local user
+/// plant a record, and this one steers which results the account is shown.
+/// Losing history for the launch is the smaller failure, and it is announced.
+fn selection_history_path() -> Option<std::path::PathBuf> {
+    if let Some(value) = std::env::var_os("CRIKEY_SELECTION_HISTORY").filter(|value| !value.is_empty()) {
+        return Some(std::path::PathBuf::from(value));
+    }
+    per_user_state_dir().map(|base| base.join("selection-history.json"))
+}
+
+/// Persists the ranking history, degrading to a diagnostic.
+///
+/// Reported rather than swallowed, because the user is entitled to know their
+/// launcher has stopped learning; never fatal, because ranking quality is not
+/// worth a session. A launch with no state directory carries no store and this
+/// is a no-op, so the absence is handled once rather than at each call site.
+fn commit_selection_history(store: Option<&SelectionHistoryStore>, search: &SearchService) {
+    let Some(store) = store else {
+        return;
+    };
+    if let Err(error) = store.save(&search.selection_history_snapshot()) {
+        eprintln!("crikey: cannot write the ranking selection history: {error}");
+    }
+}
+
+/// Wall-clock seconds since the Unix epoch, forbidden from going backwards.
+///
+/// Recency is scored as `now - last_selected`, saturating at zero, so a clock
+/// that steps backwards — an NTP correction, a daylight-saving misconfiguration
+/// repaired mid-session — would make every recent selection look like it
+/// happened in the future and collapse the whole recency term to a flat
+/// maximum. Worse, a selection *recorded* under a rewound clock stays wrong on
+/// disk for as long as the entry lives. Clamping to the highest value already
+/// observed costs a few seconds of frozen recency after a backwards step and
+/// keeps the ordering monotone, which is the property the ranker documents.
+///
+/// A clock the system cannot read at all reads as the epoch, which is the same
+/// answer a fresh history already assumes.
+#[derive(Debug, Default)]
+struct HistoryClock {
+    highest: u64,
+}
+
+impl HistoryClock {
+    /// Samples the system clock and returns the value ranking should use.
+    fn advance(&mut self) -> u64 {
+        let sampled = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since_epoch| since_epoch.as_secs());
+        self.observe(sampled)
+    }
+
+    /// The clamp itself, separated from the sample because a test cannot make
+    /// the host's clock step backwards and the clamp is the part that has to
+    /// be right when it does.
+    fn observe(&mut self, sampled: u64) -> u64 {
+        self.highest = self.highest.max(sampled);
+        self.highest
     }
 }
 
@@ -1232,27 +1513,14 @@ where
 /// temporary directory. The cache contains plugin-supplied catalog data and
 /// is therefore treated as a trust boundary just like the managed environment
 /// and Legacy Compatibility Layer caches.
-fn catalog_cache_root() -> Result<std::path::PathBuf, String> {
+pub(crate) fn catalog_cache_root() -> Result<std::path::PathBuf, String> {
     if let Some(value) = std::env::var_os("CRIKEY_CATALOG_CACHE_ROOT").filter(|value| !value.is_empty()) {
         let path = std::path::PathBuf::from(value);
         create_private_dir(&path)?;
         return Ok(path);
     }
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| std::path::PathBuf::from(home).join(".cache"))
-        })
-        .ok_or_else(|| {
-            "cannot determine a per-user cache directory for the search catalog: set \
-             CRIKEY_CATALOG_CACHE_ROOT, XDG_CACHE_HOME or HOME (refusing to use a \
-             world-writable shared temporary directory as a trust root)"
-                .to_owned()
-        })?;
-    let path = base.join("crikey").join("catalog");
+    let base = per_user_cache_base("the search catalog", "CRIKEY_CATALOG_CACHE_ROOT")?;
+    let path = base.join("catalog");
     create_private_dir(&path)?;
     Ok(path)
 }
@@ -1275,21 +1543,8 @@ fn modern_cache_root() -> Result<std::path::PathBuf, String> {
         create_private_dir(&path)?;
         return Ok(path);
     }
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| std::path::PathBuf::from(home).join(".cache"))
-        })
-        .ok_or_else(|| {
-            "cannot determine a per-user cache directory for modern plugins: set \
-             CRIKEY_MODERN_CACHE_ROOT, XDG_CACHE_HOME or HOME (refusing to use a \
-             world-writable shared temporary directory as a trust root)"
-                .to_owned()
-        })?;
-    let dir = base.join("crikey").join("modern");
+    let base = per_user_cache_base("modern plugins", "CRIKEY_MODERN_CACHE_ROOT")?;
+    let dir = base.join("modern");
     create_private_dir(&dir)?;
     Ok(dir)
 }
@@ -1305,24 +1560,141 @@ pub(crate) fn legacy_cache_root() -> Result<std::path::PathBuf, String> {
         create_private_dir(&path)?;
         return Ok(path);
     }
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| std::path::PathBuf::from(home).join(".cache"))
-        })
-        .ok_or_else(|| {
-            "cannot determine a per-user cache directory for legacy packages: set \
-             CRIKEY_LEGACY_CACHE_ROOT, XDG_CACHE_HOME or HOME (refusing to use a \
-             world-writable shared temporary directory as a trust root)"
-                .to_owned()
-        })?;
-    let path = base.join("crikey").join("legacy");
+    let base = per_user_cache_base("legacy packages", "CRIKEY_LEGACY_CACHE_ROOT")?;
+    let path = base.join("legacy");
     create_private_dir(&path)?;
     Ok(path)
 }
+/// The per-user cache directory CriKey owns, or a message naming what to set.
+///
+/// [`StandardDirectories`] is the one place that knows a platform's layout:
+/// `$XDG_CACHE_HOME/crikey` here, `%LOCALAPPDATA%\CriKey\Cache` on Windows,
+/// `~/Library/Caches/CriKey` on macOS. The XDG walk this replaced resolved
+/// through `HOME`, which a Windows session started from Explorer does not set,
+/// so every cache root below refused and the launcher exited before it could
+/// show a window.
+fn per_user_cache_base(purpose: &str, override_name: &str) -> Result<std::path::PathBuf, String> {
+    StandardDirectories::for_process()
+        .map(|directories| directories.cache_dir().to_path_buf())
+        .map_err(|error| {
+            format!(
+                "cannot determine a per-user cache directory for {purpose}: {error} (set \
+                 {override_name} or CRIKEY_CACHE_DIR; refusing to use a world-writable shared \
+                 temporary directory as a trust root)"
+            )
+        })
+}
+
+/// The per-user state directory CriKey owns, or `None` with the reason left to
+/// the caller to announce.
+///
+/// State is not disposable — it carries the startup-recovery journal and the
+/// ranking history — so it has its own platform-resolved location rather than
+/// living in the cache.
+fn per_user_state_dir() -> Option<std::path::PathBuf> {
+    StandardDirectories::for_process()
+        .ok()
+        .map(|directories| directories.state_dir().to_path_buf())
+}
+
+/// Records a fatal startup failure where a desktop launch can be seen to have
+/// failed: the per-user `startup.log`, and on Windows a dialog naming it.
+///
+/// `crikey-launcher` is GUI-subsystem on Windows, so the stderr line the caller
+/// has already written is discarded by the operating system. Without this the
+/// owner double-clicks a shortcut, nothing appears, and no evidence of why
+/// exists anywhere on the machine — indistinguishable from a corrupt download.
+/// The dialog names the log because a second failure is diagnosed from the
+/// file, not from a box that has already been dismissed.
+fn report_desktop_startup_failure(diagnostic: &str) {
+    let shown = match append_startup_log(diagnostic) {
+        Ok(path) => format!("{diagnostic}\n\nThis was appended to {}.", path.display()),
+        // The log is the durable half and the dialog is the visible half.
+        // Losing the first must not cost the second, so the dialog carries the
+        // reason the log is missing rather than the launch losing both.
+        Err(reason) => format!("{diagnostic}\n\nThe startup log could not be written: {reason}"),
+    };
+    show_startup_failure_dialog(&shown);
+}
+
+/// Appends one timestamped line to `startup.log` in the per-user state
+/// directory and returns the file it wrote.
+///
+/// The state directory rather than a location of its own: it is where the
+/// startup-recovery journal and the ranking history already live, so a failed
+/// launch leaves its evidence beside the state it failed to use, and
+/// [`per_user_state_dir`] remains the single place that decides where that is.
+/// Appended, never truncated, because a launcher that fails every time is
+/// diagnosed from the sequence. The stamp is whole seconds since the Unix
+/// epoch, which distinguishes one launch from the next without this crate
+/// growing a calendar.
+fn append_startup_log(diagnostic: &str) -> Result<std::path::PathBuf, String> {
+    use std::io::Write as _;
+
+    let base =
+        per_user_state_dir().ok_or_else(|| "no per-user state directory could be resolved".to_owned())?;
+    std::fs::create_dir_all(&base).map_err(|error| format!("cannot create `{}`: {error}", base.display()))?;
+    let path = base.join("startup.log");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open `{}`: {error}", path.display()))?;
+    writeln!(file, "[{stamp}] {diagnostic}")
+        .map_err(|error| format!("cannot write `{}`: {error}", path.display()))?;
+    Ok(path)
+}
+
+/// Shows `text` in a modal dialog: on Windows the only channel a GUI-subsystem
+/// process has before it owns a window.
+#[cfg(windows)]
+fn show_startup_failure_dialog(text: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TASKMODAL,
+    };
+
+    let body = nul_terminated_utf16(text);
+    let caption = nul_terminated_utf16("CriKey could not start");
+    // SAFETY: both pointers address NUL-terminated UTF-16 buffers that outlive
+    // the call. A null owner window is what a process with no window of its own
+    // must pass, and `MB_TASKMODAL` with no owner therefore disables this
+    // process's windows rather than an unrelated program's.
+    #[allow(unsafe_code)]
+    let _shown = unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(body.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND,
+        )
+    };
+}
+
+/// Encodes `text` the way `MessageBoxW` demands.
+///
+/// An interior NUL would end the string there and hide everything after it,
+/// which on a path-bearing diagnostic is the half that matters, so it is
+/// dropped rather than allowed to truncate the message. Filtering zero code
+/// units is exactly that: a surrogate pair never contains one.
+#[cfg(windows)]
+fn nul_terminated_utf16(text: &str) -> Vec<u16> {
+    text.encode_utf16()
+        .filter(|unit| *unit != 0)
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// No dialog off Windows. A desktop launch there still has an inherited stderr
+/// when one was started from a terminal, and the `startup.log` entry covers the
+/// launch that had none; standing up a second window system inside the failure
+/// path of the first would be a worse thing to debug than the failure.
+#[cfg(not(windows))]
+fn show_startup_failure_dialog(_text: &str) {}
+
 /// Creates `dir` (and parents) as a private, per-user directory. On unix the
 /// leaf is forced to `0700` so a cache later imported by path can never be
 /// world- or group-writable. Symlink leaves are rejected: following one would
@@ -2440,5 +2812,57 @@ mod tests {
             },
             "refreshing the plugin set repeats the verdict; it never charges a second attempt",
         );
+    }
+
+    /// The failure this clamp exists for. Recency is scored as
+    /// `now - last_selected`, saturating at zero, so a clock that steps
+    /// backwards makes every recent selection look like it happened in the
+    /// future: the subtraction saturates and every item collapses to the same
+    /// maximum recency, which is the ranking going flat exactly when the user
+    /// notices. Kills the obvious implementation, `set_history_time(now())`.
+    #[test]
+    fn a_backwards_clock_step_never_lowers_the_history_time() {
+        let mut clock = HistoryClock::default();
+
+        assert_eq!(clock.observe(1_700_000_000), 1_700_000_000);
+        assert_eq!(
+            clock.observe(1_699_000_000),
+            1_700_000_000,
+            "an NTP correction that moves the clock back must not move ranking back"
+        );
+        assert_eq!(
+            clock.observe(0),
+            1_700_000_000,
+            "a clock that cannot be read at all reads as the epoch and must be ignored"
+        );
+        assert_eq!(
+            clock.observe(1_700_000_042),
+            1_700_000_042,
+            "the clamp must resume tracking once the clock passes the highest value seen"
+        );
+    }
+
+    /// The clock must start from real wall time rather than the zero a fresh
+    /// `SearchService` holds: at zero, every restored selection is dated
+    /// decades in the future and the recency term contributes nothing at all.
+    #[test]
+    fn the_history_clock_starts_from_real_wall_clock_seconds() {
+        // 2020-01-01, comfortably after any plausible build and before any
+        // plausible run, so this cannot rot into a tautology.
+        const AFTER_2020: u64 = 1_577_836_800;
+
+        let mut clock = HistoryClock::default();
+        assert!(
+            clock.advance() > AFTER_2020,
+            "the first sample must be a real Unix timestamp"
+        );
+    }
+
+    /// A launcher with no per-user state directory must simply not persist,
+    /// rather than persisting somewhere shared or failing the launch.
+    #[test]
+    fn committing_history_without_a_store_is_a_silent_no_op() {
+        let search = SearchService::new(App::new());
+        commit_selection_history(None, &search);
     }
 }

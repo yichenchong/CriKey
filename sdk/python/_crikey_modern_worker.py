@@ -504,6 +504,7 @@ class _BackgroundTask:
         "coro",
         "wrapper",
         "decision",
+        "refusal_reason",
         "admission_event",
         "future",
         "cancel_requested",
@@ -518,6 +519,10 @@ class _BackgroundTask:
         # ``None`` means the Rust host has not answered registration yet;
         # ``True``/``False`` are the sole start/refuse decisions.
         self.decision = None
+        # The host's own words for a refusal, so a plugin author reading the
+        # worker's stderr learns WHY a spawn never ran instead of watching it
+        # silently not happen.
+        self.refusal_reason = None
         self.admission_event = None
         self.future = None
         self.cancel_requested = False
@@ -587,6 +592,9 @@ class _Worker:
                 if task is None:
                     return
                 task.decision = kind == KIND_BACKGROUND_ADMIT
+                if not task.decision:
+                    reason = frame.get("reason")
+                    task.refusal_reason = reason if isinstance(reason, str) else None
                 event = task.admission_event
             if event is not None:
                 self._background_loop.call_soon_threadsafe(event.set)
@@ -678,6 +686,18 @@ class _Worker:
                     admitted = task.decision
             if not admitted:
                 status = "refused"
+                with self._background_lock:
+                    reason = task.refusal_reason
+                reason = reason or "the host refused this background task"
+                error = {"message": reason, "traceback": ""}
+                # The refusal decision belongs to the host; all this side can
+                # do is close the coroutine it will never run and make the
+                # host's reason visible to whoever wrote the plugin.
+                _stderr(
+                    "[warn][crikey] background task {} was refused by the host: {}\n".format(
+                        task.task_id, reason
+                    )
+                )
                 task.coro.close()
             else:
                 await task.coro

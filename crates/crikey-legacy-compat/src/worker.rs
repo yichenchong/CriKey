@@ -45,6 +45,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
@@ -54,7 +55,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crikey_core::{Action, ArgumentPolicy, Category, Generation, HitPolicy, Item, ItemId, PluginId};
+use crikey_core::{
+    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, Generation, HitPolicy, Item, ItemId,
+    PluginId,
+};
 use crikey_input_scheduler::Millis;
 use serde_json::{json, Map, Value};
 
@@ -112,6 +116,24 @@ pub const ENV_MAIN_MODULE_PATH: &str = "CRIKEY_LEGACY_MAIN_MODULE_PATH";
 /// location, so `package_cache_path()` never fails for want of host
 /// configuration.
 pub const ENV_CACHE_DIR: &str = "CRIKEY_LEGACY_CACHE_DIR";
+
+/// Carries the user's CriKey configuration directory, when the caller knows it.
+///
+/// Absent when the caller does not, and then `keypirinha.user_config_dir()`
+/// reports that the host cannot answer rather than inventing a path. A
+/// fabricated directory is worse than a refusal: a plugin would write its
+/// configuration into it and the user would never find the file.
+pub const ENV_CONFIG_DIR: &str = "CRIKEY_LEGACY_CONFIG_DIR";
+
+/// Carries the directory CriKey installs legacy packages into.
+pub const ENV_INSTALLED_PACKAGE_DIR: &str = "CRIKEY_LEGACY_INSTALLED_PACKAGE_DIR";
+
+/// Carries the cache root shared by every legacy package.
+///
+/// Distinct from [`ENV_CACHE_DIR`], which is the *one package's* subdirectory
+/// of it. Both are supplied because `keypirinha` documents both, and deriving
+/// one from the other by trimming a path component would be a guess.
+pub const ENV_CACHE_ROOT: &str = "CRIKEY_LEGACY_CACHE_ROOT";
 
 /// Carries [`PROTOCOL_VERSION`] so a mismatched shim can refuse to speak.
 pub const ENV_PROTOCOL_VERSION: &str = "CRIKEY_LEGACY_PROTOCOL_VERSION";
@@ -356,12 +378,13 @@ pub enum LegacyRequestKind {
         /// The user's input.
         query: String,
     },
-    /// `on_suggest` for arguments typed against an already selected item.
     ArgumentSuggest {
         /// The user's input after the selected item.
         query: String,
-        /// The item the user selected.
+        /// The selected item's stable identity.
         selected: ItemId,
+        /// The complete selected item, preserving metadata for `on_suggest`.
+        selected_item: Box<Item>,
     },
     /// `on_execute`: the user launched an item, optionally through an action.
     Execute {
@@ -512,6 +535,47 @@ pub struct WorkerExit {
 }
 
 // ---------------------------------------------------------------------------
+// Host-mediated actions (spec 14.8, 15.4)
+// ---------------------------------------------------------------------------
+
+/// One `keypirinha_util.execute_default_action` request, as it crossed.
+#[derive(Debug, Clone)]
+pub struct LegacyDefaultAction {
+    /// The plugin that asked. Carried so the host can attribute the request
+    /// to an owner and gate it — an unattributable action cannot be gated.
+    pub plugin: PluginId,
+    /// The item the plugin asked the host to act on.
+    pub item: Item,
+    /// The secondary action the plugin chose, or `None` for the item's
+    /// default. The two are distinct: a plugin that named an action it
+    /// defined itself is asking for something only it can perform.
+    pub action: Option<String>,
+}
+
+/// Performs the host-mediated operations a legacy plugin asks the host for.
+///
+/// Installed by the composition root rather than implemented here, because
+/// performing one needs services this crate deliberately does not depend on:
+/// the platform process launcher and the permission gate that decides whether
+/// this plugin may reach it. Doing the work in the child instead would escape
+/// both, and would put the launched program in the worker's process group,
+/// where the supervisor's next reap would kill it.
+///
+/// A worker with no service installed refuses every request, and the refusal
+/// reaches the plugin as `keypirinha.HostUnavailableError`. An unperformed
+/// host action is always reported, never silently dropped.
+pub trait LegacyHostService: fmt::Debug + Send + Sync {
+    /// Does with the item what the launcher would have done had the user run
+    /// it.
+    ///
+    /// `Ok(true)` when the action was performed and `Ok(false)` when the item
+    /// carries nothing the host knows how to act on. A refusal — a denied
+    /// permission, an unusable target — is `Err`, never `Ok(false)`: a plugin
+    /// must not be able to read "you may not" as "there was nothing to do".
+    fn execute_default_action(&self, request: &LegacyDefaultAction) -> Result<bool, String>;
+}
+
+// ---------------------------------------------------------------------------
 // Spawn options
 // ---------------------------------------------------------------------------
 
@@ -524,10 +588,14 @@ pub struct WorkerOptions {
     plugin: PluginId,
     shim_dir: PathBuf,
     cache_dir: Option<PathBuf>,
+    config_dir: Option<PathBuf>,
+    installed_package_dir: Option<PathBuf>,
+    cache_root: Option<PathBuf>,
     startup_timeout_ms: Millis,
     call_timeout_ms: Millis,
     shutdown_timeout_ms: Millis,
     env: Vec<(OsString, OsString)>,
+    host_service: Option<Arc<dyn LegacyHostService>>,
 }
 
 impl WorkerOptions {
@@ -537,10 +605,14 @@ impl WorkerOptions {
             plugin,
             shim_dir: shim_dir.into(),
             cache_dir: None,
+            config_dir: None,
+            installed_package_dir: None,
+            cache_root: None,
             startup_timeout_ms: DEFAULT_STARTUP_TIMEOUT_MS,
             call_timeout_ms: DEFAULT_CALL_TIMEOUT_MS,
             shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
             env: Vec::new(),
+            host_service: None,
         }
     }
 
@@ -565,6 +637,34 @@ impl WorkerOptions {
     /// Sets the directory the child serves `package_cache_path()` from.
     pub fn with_cache_dir(mut self, cache_dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(cache_dir.into());
+        self
+    }
+
+    /// Sets the directory the child serves `keypirinha.user_config_dir()`
+    /// from. Unset means the child reports that the host cannot answer.
+    pub fn with_config_dir(mut self, config_dir: impl Into<PathBuf>) -> Self {
+        self.config_dir = Some(config_dir.into());
+        self
+    }
+
+    /// Sets the directory the child serves
+    /// `keypirinha.installed_package_dir()` from.
+    pub fn with_installed_package_dir(mut self, installed: impl Into<PathBuf>) -> Self {
+        self.installed_package_dir = Some(installed.into());
+        self
+    }
+
+    /// Sets the installation-wide cache root the child serves
+    /// `keypirinha.package_cache_dir()` from.
+    pub fn with_cache_root(mut self, cache_root: impl Into<PathBuf>) -> Self {
+        self.cache_root = Some(cache_root.into());
+        self
+    }
+
+    /// Installs the service that performs this plugin's host-mediated
+    /// actions. Without one every such request is refused, attributably.
+    pub fn with_host_service(mut self, service: Arc<dyn LegacyHostService>) -> Self {
+        self.host_service = Some(service);
         self
     }
 
@@ -1144,6 +1244,19 @@ impl LegacyWorker {
         if let Some(cache_dir) = &options.cache_dir {
             command.env(ENV_CACHE_DIR, cache_dir);
         }
+        // Each of these is exported only when the host actually knows it. An
+        // absent variable makes the matching `keypirinha` accessor report that
+        // the host cannot answer, which is the truth; exporting a placeholder
+        // would have a plugin write its configuration somewhere nobody looks.
+        if let Some(config_dir) = &options.config_dir {
+            command.env(ENV_CONFIG_DIR, config_dir);
+        }
+        if let Some(installed) = &options.installed_package_dir {
+            command.env(ENV_INSTALLED_PACKAGE_DIR, installed);
+        }
+        if let Some(cache_root) = &options.cache_root {
+            command.env(ENV_CACHE_ROOT, cache_root);
+        }
 
         // Own process group so a hard stop can signal the whole subtree, not
         // just the leader: a plugin that forks (subprocess.Popen, os.system,
@@ -1156,6 +1269,24 @@ impl LegacyWorker {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+
+        // A legacy package declares no permissions, so the host applies the
+        // compatibility baseline: scratch space plus the ONE directory the
+        // host tells the plugin to write to, `package_cache_path()`.
+        //
+        // The two other directories the child is told about are deliberately
+        // NOT writable. The installation cache root behind
+        // `package_cache_dir()` is where archive-based packages are extracted,
+        // so granting it would let any plugin rewrite every other plugin's
+        // code; the configuration directory is CriKey's own, and a plugin that
+        // could rewrite it could change which plugins load at all. Both stay
+        // readable, which is all the compatibility API promises.
+        //
+        // TCP is not restricted: Keypirinha plugins fetch over the network as
+        // a matter of course and no manifest exists here to say otherwise
+        // (spec 14, 20.2; ADR-0019).
+        let sandbox = crikey_sandbox::plugin_policy(options.cache_dir.clone(), false).prepare();
+        sandbox.install(&mut command);
 
         let mut child = command.spawn().map_err(|error| WorkerError::PythonUnavailable {
             path: Some(interpreter.path().to_path_buf()),
@@ -1302,14 +1433,85 @@ impl LegacyWorker {
             });
         }
 
-        let line = self.await_frame_duration(remaining, self.options.call_timeout_ms, callback)?;
-        match decode_response(&request, id, line) {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                let _ = self.reap();
-                Err(error)
+        // The child may interleave host requests before its reply. They are
+        // serviced inside the same call budget on purpose: an action the host
+        // performs on the plugin's behalf is time the plugin spent, and giving
+        // it a fresh budget would be a way to outlast the callback bound.
+        loop {
+            let remaining = call_budget
+                .checked_sub(call_started.elapsed())
+                .unwrap_or_default();
+            let line = self.await_frame_duration(remaining, self.options.call_timeout_ms, callback)?;
+
+            match host_request(&line) {
+                Some(asked) => {
+                    let answer = self.serve_host_request(&asked);
+                    let remaining = call_budget
+                        .checked_sub(call_started.elapsed())
+                        .unwrap_or_default();
+                    if self.link.write_frame(&answer, remaining).is_err() {
+                        // The child is blocked waiting for this answer and will
+                        // never speak again, so there is nothing left to wait
+                        // for; reaping now turns a wedge into a report.
+                        let _ = self.reap();
+                        return Err(self.crashed(callback));
+                    }
+                }
+                None => {
+                    return match decode_response(&request, id, line) {
+                        Ok(response) => Ok(response),
+                        Err(error) => {
+                            let _ = self.reap();
+                            Err(error)
+                        }
+                    };
+                }
             }
         }
+    }
+
+    /// Answers one host request with the frame the child is waiting for.
+    ///
+    /// Always answers. The child blocks until it sees a reply, so a request
+    /// this host cannot serve is a refusal frame, never silence — silence
+    /// would hold the plugin until the callback deadline and be reported as
+    /// an uncooperative plugin rather than as a host that said no.
+    fn serve_host_request(&self, asked: &HostRequest) -> Value {
+        let answer = match asked.operation.as_str() {
+            "execute_default_action" => self.execute_default_action(&asked.payload),
+            other => Err(format!(
+                "this host does not implement the legacy host operation `{other}`"
+            )),
+        };
+        match answer {
+            Ok(value) => json!({
+                "host_response": asked.sequence,
+                "ok": true,
+                "value": value,
+            }),
+            Err(reason) => json!({
+                "host_response": asked.sequence,
+                "ok": false,
+                "reason": reason,
+            }),
+        }
+    }
+
+    fn execute_default_action(&self, payload: &Map<String, Value>) -> Result<bool, String> {
+        let Some(service) = self.options.host_service.as_ref() else {
+            return Err(
+                "this host performs no host-mediated legacy actions, so the item was not opened".to_owned(),
+            );
+        };
+        let item = payload
+            .get("item")
+            .and_then(|value| decode_item(&self.plugin, value))
+            .ok_or_else(|| "the item handed to execute_default_action could not be read".to_owned())?;
+        service.execute_default_action(&LegacyDefaultAction {
+            plugin: self.plugin.clone(),
+            item,
+            action: payload.get("action").and_then(Value::as_str).map(str::to_owned),
+        })
     }
 
     /// Stops the child and reaps it, returning how it ended.
@@ -1603,6 +1805,14 @@ fn hard_kill(process_id: u32, child: &mut Child) {
 /// signal; the call reads and writes no memory.
 #[cfg(unix)]
 fn kill_process_group(pgid: u32) {
+    // `killpg(0)` signals the CALLER's process group - this launcher, its shell
+    // and its session. Callers pass a live `Child::id()`, and each kill precedes
+    // its reap so the pid cannot have been recycled, but a misdirected group
+    // kill is unrecoverable: refuse the values that could only mean "myself" or
+    // "init".
+    if pgid <= 1 {
+        return;
+    }
     // `int killpg(int pgrp, int sig)` — POSIX. SIGKILL is 9 on Linux and macOS.
     extern "C" {
         fn killpg(pgrp: i32, sig: i32) -> i32;
@@ -1667,10 +1877,15 @@ fn encode_request(id: u64, request: &LegacyRequest, terminate: bool) -> Value {
             "initial": true,
             "selected_id": Value::Null,
         }),
-        LegacyRequestKind::ArgumentSuggest { query, selected } => json!({
+        LegacyRequestKind::ArgumentSuggest {
+            query,
+            selected,
+            selected_item,
+        } => json!({
             "query": query,
             "initial": false,
             "selected_id": selected.0,
+            "selected_item": encode_item(selected_item),
         }),
         LegacyRequestKind::Execute { item, action } => json!({
             "item": encode_item(item),
@@ -1693,12 +1908,31 @@ fn encode_request(id: u64, request: &LegacyRequest, terminate: bool) -> Value {
     })
 }
 
-/// Renders an item the way the documented legacy API spells it.
+/// Renders an item for the legacy child protocol.
 ///
-/// `icon_handle` is deliberately absent: it is an opaque in-process object and
-/// cannot cross a process boundary. The hint names are the documented
-/// `ItemArgsHint`/`ItemHitHint` member names lowercased, so the shim maps them
-/// back to the enums a plugin actually sees.
+/// Built-in categories keep the documented legacy spelling; plugin-defined
+/// categories use CriKey's injective `plugin-defined:` tag so a name such as
+/// `application` cannot shadow the built-in category. The shim accepts that
+/// tag alongside its `legacy-user-N` extension spelling.
+///
+/// No icon travels this way. A published item carries the *name* of its icon
+/// outbound, but the handle a plugin holds is an in-process object of the
+/// child's, and the host has no way to hand back the very object the plugin
+/// created; reconstructing a look-alike would give `on_execute` an item whose
+/// `icon_handle()` compared unequal to the one it published. Nor do actions:
+/// the action the user chose is a sibling field of this one, and repeating it
+/// inside the item would let the two disagree.
+fn legacy_category_wire_tag(category: &Category) -> String {
+    // These two legacy enum values have no distinct core built-in variant.
+    // Reserve their numeric spelling when a Python item comes back through
+    // the host, while keeping an explicitly generic tag injective.
+    match category {
+        Category::PluginDefined(name) if name == "reference" => "legacy-user-6".to_owned(),
+        Category::PluginDefined(name) if name == "error" => "legacy-user-7".to_owned(),
+        _ => category.wire_tag(),
+    }
+}
+
 fn encode_item(item: &Item) -> Value {
     let args_hint = match item.argument_policy {
         ArgumentPolicy::Forbidden => "forbidden",
@@ -1711,7 +1945,7 @@ fn encode_item(item: &Item) -> Value {
     };
 
     json!({
-        "category": item.category.as_str(),
+        "category": legacy_category_wire_tag(&item.category),
         "label": item.label,
         "short_desc": item.description,
         "target": item.target,
@@ -1733,6 +1967,36 @@ fn encode_action(action: &Action) -> Value {
 // ---------------------------------------------------------------------------
 // Decoding
 // ---------------------------------------------------------------------------
+
+/// One request the child raised while a callback was still running.
+struct HostRequest {
+    /// The child's own counter, echoed so it can match the answer to the
+    /// thread that is blocked on it. Callbacks are serialized per instance,
+    /// but a plugin may ask more than once inside one callback.
+    sequence: u64,
+    operation: String,
+    payload: Map<String, Value>,
+}
+
+/// Reads `line` as a host request, or `None` when it is an ordinary reply.
+///
+/// A distinct key rather than an `outcome` value: the reply decoder is strict
+/// about the shape of a reply, and an interleaved request is not one — it
+/// carries no callback and answers no id.
+fn host_request(line: &str) -> Option<HostRequest> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let frame = value.as_object()?;
+    let operation = frame.get("host_request")?.as_str()?.to_owned();
+    Some(HostRequest {
+        sequence: frame.get("seq").and_then(Value::as_u64).unwrap_or_default(),
+        operation,
+        payload: frame
+            .get("payload")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
 
 /// Turns one reply line into a response, or into the protocol failure it is.
 ///
@@ -1882,6 +2146,14 @@ fn decode_item(plugin: &PluginId, value: &Value) -> Option<Item> {
     let stable_id = ItemId::derived(plugin, &category, &target);
     let argument_policy = decode_argument_policy(object.get("args_hint")?.as_str()?)?;
     let hit_policy = decode_hit_policy(object.get("hit_hint")?.as_str()?)?;
+    let icon_reference = match object.get("icon") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_str()?.to_owned()),
+    };
+    let actions = match object.get("actions") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(value) => decode_actions(value)?,
+    };
 
     Some(Item {
         stable_id,
@@ -1890,34 +2162,54 @@ fn decode_item(plugin: &PluginId, value: &Value) -> Option<Item> {
         label: object.get("label")?.as_str()?.to_owned(),
         description: object.get("short_desc")?.as_str()?.to_owned(),
         target,
-        // A legacy item has no search terms, no icon reference the host can
-        // resolve, no score hint and no metadata of its own. Inventing any of
-        // them here would fabricate ranking input.
+        // A legacy item has no search terms, no score hint and no metadata of
+        // its own. Inventing any of them here would fabricate ranking input.
         search_terms: Vec::new(),
-        icon_reference: None,
+        // The shim resolved the plugin's icon handle to a package-relative
+        // name; the pixels are the host's to read, bound and decode, through
+        // the same package-icon resolver a modern plugin's items use.
+        icon_reference,
         argument_policy,
         hit_policy,
         score_hint: 0,
         metadata: Default::default(),
-        actions: Vec::new(),
+        actions,
     })
+}
+
+/// Builds the alternate actions the plugin registered for this item's category.
+///
+/// Every one is plugin-owned and applies to whatever category the plugin put
+/// it on: `set_actions` is per category already, so the shim has attached only
+/// the applicable list and a second host-side category filter could only ever
+/// disagree with it. A malformed entry fails the whole frame rather than being
+/// dropped, because an item silently missing the action a plugin registered is
+/// a launcher that does nothing when the user presses the key.
+fn decode_actions(value: &Value) -> Option<Vec<Action>> {
+    let entries = value.as_array()?;
+    let mut actions = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let object = entry.as_object()?;
+        let name = object.get("name")?.as_str()?;
+        if name.is_empty() {
+            return None;
+        }
+        actions.push(Action {
+            action_id: ActionId(name.to_owned()),
+            label: object.get("label")?.as_str()?.to_owned(),
+            description: object.get("short_desc")?.as_str()?.to_owned(),
+            applicable_categories: Vec::new(),
+            icon_reference: None,
+            execution_policy: ExecutionPolicy::Plugin,
+        });
+    }
+    Some(actions)
 }
 
 /// An unknown category is a plugin-defined one, never an error: the category
 /// set is extensible by design (spec 10.3).
 fn decode_category(name: &str) -> Category {
-    match name {
-        "application" => Category::Application,
-        "file" => Category::File,
-        "directory" => Category::Directory,
-        "url" => Category::Url,
-        "command" => Category::Command,
-        "expression" => Category::Expression,
-        "keyword" => Category::Keyword,
-        "contact" => Category::Contact,
-        "clipboard-item" => Category::ClipboardItem,
-        other => Category::PluginDefined(other.to_owned()),
-    }
+    Category::from_wire_tag(name)
 }
 
 /// Both the documented legacy spelling and CriKey's own are accepted, because
@@ -1997,6 +2289,23 @@ fn floor_char_boundary(text: &str, limit: usize) -> usize {
 mod tests {
     use super::*;
 
+    fn selected_item() -> Box<Item> {
+        Box::new(Item {
+            stable_id: ItemId("chosen".to_owned()),
+            plugin_id: PluginId("legacy.unit".to_owned()),
+            category: Category::Keyword,
+            label: "Chosen".to_owned(),
+            description: "A keyword".to_owned(),
+            target: "chosen-target".to_owned(),
+            search_terms: Vec::new(),
+            icon_reference: None,
+            argument_policy: ArgumentPolicy::Optional,
+            hit_policy: HitPolicy::Recorded,
+            score_hint: 0,
+            metadata: std::collections::BTreeMap::new(),
+            actions: Vec::new(),
+        })
+    }
     fn request(kind: LegacyRequestKind) -> LegacyRequest {
         LegacyRequest {
             plugin: PluginId("legacy.unit".to_owned()),
@@ -2004,6 +2313,31 @@ mod tests {
             generation: Generation::from_raw(3),
             kind,
         }
+    }
+    #[test]
+    fn category_wire_tags_preserve_plugin_defined_names_and_legacy_numbers() {
+        let mut item = *selected_item();
+        item.category = Category::PluginDefined("application".to_owned());
+        let encoded = encode_item(&item);
+        assert_eq!(encoded["category"], json!("plugin-defined:application"));
+        assert_eq!(
+            decode_category(encoded["category"].as_str().expect("category tag")),
+            Category::PluginDefined("application".to_owned())
+        );
+        for name in ["application", "reference", "error"] {
+            assert_eq!(
+                decode_category(&format!("plugin-defined:{name}")),
+                Category::PluginDefined(name.to_owned())
+            );
+        }
+        assert_eq!(
+            legacy_category_wire_tag(&Category::PluginDefined("reference".to_owned())),
+            "legacy-user-6"
+        );
+        assert_eq!(
+            legacy_category_wire_tag(&Category::PluginDefined("error".to_owned())),
+            "legacy-user-7"
+        );
     }
 
     #[test]
@@ -2165,9 +2499,13 @@ mod tests {
         let asked = request(LegacyRequestKind::ArgumentSuggest {
             query: "line one\nline two".to_owned(),
             selected: ItemId("chosen".to_owned()),
+            selected_item: selected_item(),
         });
 
-        let encoded = serde_json::to_string(&encode_request(1, &asked, false)).expect("a frame serialises");
+        let frame = encode_request(1, &asked, false);
+        let encoded = serde_json::to_string(&frame).expect("a frame serialises");
+        assert_eq!(frame["payload"]["selected_item"]["category"], json!("keyword"));
+        assert_eq!(frame["payload"]["selected_item"]["label"], json!("Chosen"));
         assert!(
             !encoded.contains('\n'),
             "one object per line: an unescaped newline would split one frame into two"

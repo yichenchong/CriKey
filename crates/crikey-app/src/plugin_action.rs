@@ -10,6 +10,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crikey_core::{ActionId, CoreError, Item, ItemId, PluginId, Result as CoreResult};
+use crikey_plugin_model::{FilesystemScope, Permissions};
 
 /// Identifier assigned when a plugin action is admitted to an endpoint.
 ///
@@ -93,15 +94,58 @@ pub trait PluginActionExecutor: Send + Sync {
         ))
     }
 }
+/// One privileged operation the host performs on a plugin's behalf.
+///
+/// The variants are exactly the operations a plugin can reach through the
+/// host today, and no more. A permission with no operation behind it is not
+/// given a variant here: a gate nothing can call would read as enforcement
+/// while enforcing nothing, which is the defect this type exists to close.
+/// Such permissions are named by `Manifest::unhonoured_declarations` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCapability {
+    /// Starting an application through the platform launcher.
+    ProcessLaunch,
+    /// Reading a resource file shipped inside the plugin's own package.
+    PackageFileRead,
+}
+
+impl HostCapability {
+    /// The manifest field an author has to change to grant this.
+    fn permission(self) -> &'static str {
+        match self {
+            Self::ProcessLaunch => "process",
+            Self::PackageFileRead => "filesystem",
+        }
+    }
+
+    /// The operation as an operator reading a refusal would name it.
+    fn operation(self) -> &'static str {
+        match self {
+            Self::ProcessLaunch => "process launch",
+            Self::PackageFileRead => "package resource read",
+        }
+    }
+
+    fn granted_by(self, permissions: &Permissions) -> bool {
+        match self {
+            Self::ProcessLaunch => permissions.process,
+            Self::PackageFileRead => permissions.allows_filesystem_read(FilesystemScope::Package),
+        }
+    }
+}
 
 /// Exact-owner action registry used by [`crate::SearchService`].
 ///
 /// A provider endpoint is registered once for every plugin it loaded. The
 /// lookup is exact on the namespaced `PluginId`; no prefix or fallback routing
-/// is permitted.
+/// is permitted. Every owner carries a [`Permissions`] value, including the
+/// legacy ones that ship no manifest: "no declaration" must not resolve to a
+/// skipped check, so the legacy compatibility baseline is written down and
+/// consulted like any other grant.
 #[derive(Default)]
 pub struct PluginActionRouter {
     providers: BTreeMap<PluginId, Arc<dyn PluginActionExecutor>>,
+    host_permissions: BTreeMap<PluginId, Permissions>,
 }
 
 impl fmt::Debug for PluginActionRouter {
@@ -114,28 +158,120 @@ impl fmt::Debug for PluginActionRouter {
 }
 
 impl PluginActionRouter {
-    /// Registers one endpoint for each exact plugin id it owns.
+    /// Registers a legacy endpoint under the legacy compatibility baseline.
+    ///
+    /// A Keypirinha package has no `crikey.toml` and therefore no author
+    /// declaration. It is still registered with an explicit grant set —
+    /// [`Permissions::legacy_compatibility_baseline`] — rather than with a
+    /// bypass, so a legacy owner travels the same gate as a manifest-governed
+    /// one and an operator can read the posture out of `crikey plugin doctor`.
     pub fn register<I>(&mut self, plugins: I, executor: Arc<dyn PluginActionExecutor>) -> CoreResult<()>
     where
         I: IntoIterator<Item = PluginId>,
+    {
+        self.register_inner(
+            plugins
+                .into_iter()
+                .map(|plugin| (plugin, Permissions::legacy_compatibility_baseline())),
+            executor,
+        )
+    }
+
+    /// Registers a manifest-governed endpoint with its host-mediated grants.
+    ///
+    /// The grants are checked before a plugin-owned result asks the host to
+    /// perform a privileged operation. Keeping this map at the composition
+    /// root prevents a provider worker from bypassing the host decision.
+    pub fn register_with_permissions<I>(
+        &mut self,
+        permissions: I,
+        executor: Arc<dyn PluginActionExecutor>,
+    ) -> CoreResult<()>
+    where
+        I: IntoIterator<Item = (PluginId, Permissions)>,
+    {
+        self.register_inner(permissions, executor)
+    }
+
+    fn register_inner<I>(&mut self, plugins: I, executor: Arc<dyn PluginActionExecutor>) -> CoreResult<()>
+    where
+        I: IntoIterator<Item = (PluginId, Permissions)>,
     {
         let plugins = plugins.into_iter().collect::<Vec<_>>();
         let mut unique = BTreeSet::new();
         if plugins.is_empty() {
             return Ok(());
         }
-        if plugins
-            .iter()
-            .any(|plugin| !unique.insert(plugin) || self.providers.contains_key(plugin))
-        {
+        // A collision on either map is a duplicate: grants can exist without a
+        // provider (a host catalog), so checking only the provider map would
+        // let a plugin registration silently overwrite the host's own entry.
+        if plugins.iter().any(|(plugin, _)| {
+            !unique.insert(plugin)
+                || self.providers.contains_key(plugin)
+                || self.host_permissions.contains_key(plugin)
+        }) {
             return Err(CoreError::Invalid(
                 "plugin action provider is already registered".to_owned(),
             ));
         }
-        for plugin in plugins {
-            self.providers.insert(plugin, Arc::clone(&executor));
+        for (plugin, permissions) in plugins {
+            self.providers.insert(plugin.clone(), Arc::clone(&executor));
+            self.host_permissions.insert(plugin, permissions);
         }
         Ok(())
+    }
+
+    /// Records the grants of a catalog the host itself produces.
+    ///
+    /// Discovered applications are published under a builtin owner that has no
+    /// plugin runtime and must never receive plugin-owned dispatch, so it gets
+    /// no executor here. It still needs an entry: an owner absent from the
+    /// grant map is refused, and refusing the host's own launch action would
+    /// leave the launcher unable to launch anything. Its one grant is
+    /// `process`, written down for the same reason the legacy baseline is —
+    /// so the exception is a line of code an auditor can find.
+    pub fn register_host_catalog(&mut self, plugin: PluginId) -> CoreResult<()> {
+        if self.host_permissions.contains_key(&plugin) {
+            return Err(CoreError::Invalid(format!(
+                "action grants for plugin `{}` are already registered",
+                plugin.0
+            )));
+        }
+        self.host_permissions.insert(
+            plugin,
+            Permissions {
+                process: true,
+                ..Permissions::default()
+            },
+        );
+        Ok(())
+    }
+
+    /// Whether the exact owner may have the host perform `capability`.
+    ///
+    /// An owner this router does not know is denied: an unattributable request
+    /// is refused rather than resolved to some other plugin's grants.
+    pub fn permits(&self, plugin: &PluginId, capability: HostCapability) -> bool {
+        self.host_permissions
+            .get(plugin)
+            .is_some_and(|permissions| capability.granted_by(permissions))
+    }
+
+    /// [`Self::permits`] as the refusal the caller should propagate.
+    ///
+    /// One spelling for every host-mediated seam, so a refusal names the owner
+    /// and the manifest field to change wherever it came from, and so no two
+    /// call sites drift into two different diagnostics for one decision.
+    pub fn authorize(&self, plugin: &PluginId, capability: HostCapability) -> CoreResult<()> {
+        if self.permits(plugin, capability) {
+            return Ok(());
+        }
+        Err(CoreError::Invalid(format!(
+            "plugin `{}` lacks the {} permission for host-mediated {}",
+            plugin.0,
+            capability.permission(),
+            capability.operation()
+        )))
     }
 
     /// Admits an action only to the endpoint registered for `plugin`.
@@ -223,10 +359,12 @@ mod tests {
     use crikey_core::{
         ActionId, ArgumentPolicy, Category, HitPolicy, Item, ItemId, PluginId, Result as CoreResult,
     };
-    use crikey_plugin_model::ConcurrencySection;
+    use crikey_plugin_model::{
+        ConcurrencySection, FilesystemAccess, FilesystemPermission, FilesystemScope, Permissions,
+    };
     use crikey_plugin_supervisor::{shared_budget_from_section, BudgetKind, PluginBudgetHandle};
 
-    use super::{PluginActionExecutor, PluginActionRouter};
+    use super::{HostCapability, PluginActionExecutor, PluginActionRouter};
 
     fn item(plugin: &str) -> Item {
         Item {
@@ -305,6 +443,129 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .as_slice(),
             &[PluginId("modern.alpha".to_owned())]
+        );
+    }
+    #[test]
+    fn host_process_permission_is_enforced_per_manifest_owner() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let modern = PluginId("modern.denied".to_owned());
+        let native = PluginId("native.granted".to_owned());
+        let legacy = PluginId("legacy.trusted".to_owned());
+        let mut router = PluginActionRouter::default();
+        router
+            .register_with_permissions([(modern.clone(), Permissions::default())], executor.clone())
+            .unwrap();
+        router
+            .register_with_permissions(
+                [(
+                    native.clone(),
+                    Permissions {
+                        process: true,
+                        ..Permissions::default()
+                    },
+                )],
+                executor.clone(),
+            )
+            .unwrap();
+        router.register([legacy.clone()], executor).unwrap();
+
+        assert!(!router.permits(&modern, HostCapability::ProcessLaunch));
+        assert!(router.permits(&native, HostCapability::ProcessLaunch));
+        // A legacy package declares nothing, and the baseline the host applies
+        // in its place grants exactly this.
+        assert!(router.permits(&legacy, HostCapability::ProcessLaunch));
+        assert!(!router.permits(&PluginId("unknown".to_owned()), HostCapability::ProcessLaunch));
+
+        let refusal = router
+            .authorize(&modern, HostCapability::ProcessLaunch)
+            .expect_err("a plugin without the process grant must be refused");
+        assert_eq!(
+            refusal.to_string(),
+            "plugin `modern.denied` lacks the process permission for host-mediated process launch",
+            "a refusal must name the owner and the manifest field that would grant it"
+        );
+        router
+            .authorize(&native, HostCapability::ProcessLaunch)
+            .expect("a plugin that declared the process grant must be admitted");
+    }
+
+    /// The refusal has to be attributable to one owner. A router that answered
+    /// per provider endpoint would deny two plugins sharing one worker because
+    /// the stricter of the two declared nothing.
+    #[test]
+    fn a_refusal_is_scoped_to_one_owner_and_not_to_its_provider_endpoint() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let denied = PluginId("modern.denied".to_owned());
+        let granted = PluginId("modern.granted".to_owned());
+        let mut router = PluginActionRouter::default();
+        router
+            .register_with_permissions(
+                [
+                    (denied.clone(), Permissions::default()),
+                    (
+                        granted.clone(),
+                        Permissions {
+                            process: true,
+                            ..Permissions::default()
+                        },
+                    ),
+                ],
+                executor,
+            )
+            .unwrap();
+
+        assert!(router.authorize(&denied, HostCapability::ProcessLaunch).is_err());
+        assert!(router.authorize(&granted, HostCapability::ProcessLaunch).is_ok());
+    }
+
+    /// The one filesystem read the host performs for a plugin. Undeclared must
+    /// keep working, or every plugin written before this gate loses its icons;
+    /// an author who declares `none` and nothing else is taken at their word.
+    #[test]
+    fn the_package_read_grant_is_implicit_but_an_explicit_none_scope_refuses_it() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let silent = PluginId("modern.silent".to_owned());
+        let renouncing = PluginId("modern.renouncing".to_owned());
+        let scoped = PluginId("modern.scoped".to_owned());
+        let mut router = PluginActionRouter::default();
+        router
+            .register_with_permissions(
+                [
+                    (silent.clone(), Permissions::default()),
+                    (
+                        renouncing.clone(),
+                        Permissions {
+                            filesystem: vec![FilesystemPermission {
+                                scope: FilesystemScope::None,
+                                access: FilesystemAccess::Read,
+                            }],
+                            ..Permissions::default()
+                        },
+                    ),
+                    (
+                        scoped.clone(),
+                        Permissions {
+                            filesystem: vec![FilesystemPermission {
+                                scope: FilesystemScope::Package,
+                                access: FilesystemAccess::Read,
+                            }],
+                            ..Permissions::default()
+                        },
+                    ),
+                ],
+                executor,
+            )
+            .unwrap();
+
+        assert!(router.permits(&silent, HostCapability::PackageFileRead));
+        assert!(router.permits(&scoped, HostCapability::PackageFileRead));
+        let refusal = router
+            .authorize(&renouncing, HostCapability::PackageFileRead)
+            .expect_err("a plugin that declared no filesystem scope must be refused");
+        assert_eq!(
+            refusal.to_string(),
+            "plugin `modern.renouncing` lacks the filesystem permission for host-mediated \
+             package resource read"
         );
     }
 

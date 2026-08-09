@@ -19,8 +19,8 @@
 //!   host must drop them and say so rather than silently applying them.
 
 use crikey_plugin_model::{
-    Manifest, ManifestError, PolicyProblem, QueryPolicy, Runtime, SchedulingProfile, MAX_CONCURRENT_REQUESTS,
-    MAX_DEBOUNCE_MS, MAX_MINIMUM_QUERY_LENGTH,
+    Manifest, ManifestError, PolicyProblem, QueryPolicy, Runtime, SchedulingProfile, UnhonouredDeclaration,
+    MAX_CONCURRENT_REQUESTS, MAX_DEBOUNCE_MS, MAX_MINIMUM_QUERY_LENGTH,
 };
 
 /// The manifest example printed in spec 19.1, byte for byte.
@@ -946,4 +946,191 @@ fn omitted_permissions_default_to_restrictive_values() {
     assert!(!permissions.environment);
     assert!(!permissions.native_library_loading);
     assert!(!permissions.background_execution);
+}
+/// Spec 15.8 puts background-task registration in the MODERN PYTHON runtime,
+/// and spec 20.2 defers permission enforcement entirely. So on any other
+/// runtime `permissions.background-execution` is inert: the host grants
+/// nothing, and nothing stops a separate process spawning its own threads.
+/// An inert declaration that reads like a granted capability is the exact
+/// defect shape this project's audits keep finding, so it must be reportable.
+#[test]
+fn a_background_permission_no_runtime_can_honour_is_reported() {
+    let native = parse("native", "[permissions]\nbackground-execution = true\n");
+    assert_eq!(
+        native.unhonoured_declarations(),
+        vec![UnhonouredDeclaration {
+            field: "permissions.background-execution",
+            reason: "no-background-task-api-for-runtime",
+        }],
+    );
+
+    // The one runtime that does implement it must stay silent, or the report
+    // becomes noise an operator learns to ignore.
+    let python = parse("python", "[permissions]\nbackground-execution = true\n");
+    assert!(python.unhonoured_declarations().is_empty());
+
+    // Undeclared is not the same as declared-and-inert.
+    assert!(parse("native", "").unhonoured_declarations().is_empty());
+}
+
+/// Every permission the host cannot enforce must be named, and named
+/// precisely. `Permissions` carries twelve fields; three reach a production
+/// gate (`network`, `process`, `background-execution`), two more reach one
+/// added with this test (`filesystem` at the package read, `environment` at
+/// child spawn), one is refused outright (`network-listener`), and the rest
+/// grant nothing on any runtime. A silently inert permission reads to an
+/// author as a confinement, which is the defect this pins shut.
+#[test]
+fn every_permission_the_host_cannot_enforce_is_named_with_its_reason() {
+    let declared = parse(
+        "native",
+        "[permissions]\n\
+         filesystem = [{ scope = \"home\", access = \"read\" }]\n\
+         clipboard = \"read-write\"\n\
+         window-enumeration = true\n\
+         window-control = true\n\
+         notifications = true\n\
+         secrets = true\n\
+         native-library-loading = true\n",
+    );
+
+    assert_eq!(
+        declared.unhonoured_declarations(),
+        vec![
+            UnhonouredDeclaration {
+                field: "permissions.filesystem",
+                reason: "host-mediates-no-filesystem-access-outside-the-plugin-package",
+            },
+            UnhonouredDeclaration {
+                field: "permissions.clipboard",
+                reason: "no-host-mediated-clipboard-api-for-plugins",
+            },
+            UnhonouredDeclaration {
+                field: "permissions.window-enumeration",
+                reason: "no-host-mediated-window-api-for-plugins",
+            },
+            UnhonouredDeclaration {
+                field: "permissions.window-control",
+                reason: "no-host-mediated-window-api-for-plugins",
+            },
+            UnhonouredDeclaration {
+                field: "permissions.notifications",
+                reason: "no-host-mediated-notification-api-for-plugins",
+            },
+            UnhonouredDeclaration {
+                field: "permissions.secrets",
+                reason: "no-host-mediated-secret-store-api-for-plugins",
+            },
+            UnhonouredDeclaration {
+                field: "permissions.native-library-loading",
+                reason: "out-of-process-plugin-loads-its-own-libraries",
+            },
+        ],
+    );
+
+    // The scope the host really does mediate is not noise. Reporting it would
+    // teach operators to ignore the whole class.
+    assert!(parse(
+        "native",
+        "[permissions]\nfilesystem = [{ scope = \"package\", access = \"read\" }]\n",
+    )
+    .unhonoured_declarations()
+    .is_empty());
+}
+
+/// The environment grant decides the shape of a child process, so it is honest
+/// only where the host spawns one. Reporting it on every runtime would be
+/// noise; reporting it on none would let a `builtin` author believe a
+/// declaration changed something.
+#[test]
+fn the_environment_grant_is_reported_only_on_runtimes_with_no_host_spawned_child() {
+    for runtime in ["python", "native"] {
+        assert!(
+            parse(runtime, "[permissions]\nenvironment = true\n")
+                .unhonoured_declarations()
+                .is_empty(),
+            "{runtime} spawns the child whose environment this grant decides"
+        );
+    }
+
+    assert_eq!(
+        parse("builtin", "[permissions]\nenvironment = true\n").unhonoured_declarations(),
+        vec![UnhonouredDeclaration {
+            field: "permissions.environment",
+            reason: "host-does-not-mediate-child-environment-for-runtime",
+        }],
+    );
+}
+
+/// Nothing in this host can grant an inbound socket, and no configuration adds
+/// one. A declaration that can never be satisfied is refused at parse time
+/// rather than accepted and then reported, exactly as `query.network-backed`
+/// without `permissions.network` already is: the plugin as described cannot
+/// run, so letting it load would be the dishonest answer.
+#[test]
+fn a_network_listener_declaration_nothing_can_grant_is_refused() {
+    let error = reject("native", "[permissions]\nnetwork-listener = true\n");
+    assert_invalid(
+        &error,
+        "permissions.network-listener",
+        PolicyProblem::NotPermitted,
+    );
+    assert!(
+        error.to_string().contains("no inbound socket"),
+        "the refusal must say why nothing can grant it, got: {error}"
+    );
+
+    // The default is not a declaration, and must stay loadable.
+    assert!(parse("native", "[permissions]\nnetwork-listener = false\n")
+        .unhonoured_declarations()
+        .is_empty());
+}
+
+/// The host reads one filesystem region for a plugin, so exactly one scope can
+/// be enforced. The implicit grant keeps every manifest written before the
+/// gate existed working; the explicit `none` is the one way an author can
+/// tighten it, and it has to actually tighten something.
+#[test]
+fn only_the_package_scope_is_readable_on_a_plugins_behalf() {
+    use crikey_plugin_model::{FilesystemScope, Permissions};
+
+    let undeclared = parse("native", "").permissions;
+    assert!(undeclared.allows_filesystem_read(FilesystemScope::Package));
+    assert!(!undeclared.allows_filesystem_read(FilesystemScope::Home));
+
+    let renouncing = parse(
+        "native",
+        "[permissions]\nfilesystem = [{ scope = \"none\", access = \"read\" }]\n",
+    )
+    .permissions;
+    assert!(!renouncing.allows_filesystem_read(FilesystemScope::Package));
+
+    // `any` covers a named scope, and write-only access is not read access.
+    let broad = parse(
+        "native",
+        "[permissions]\nfilesystem = [{ scope = \"any\", access = \"read\" }]\n",
+    )
+    .permissions;
+    assert!(broad.allows_filesystem_read(FilesystemScope::Home));
+    let write_only = parse(
+        "native",
+        "[permissions]\nfilesystem = [{ scope = \"home\", access = \"write\" }]\n",
+    )
+    .permissions;
+    assert!(!write_only.allows_filesystem_read(FilesystemScope::Home));
+
+    // A legacy package declares nothing at all, so the host's own posture has
+    // to be a written-down value rather than an absent one.
+    let legacy = Permissions::legacy_compatibility_baseline();
+    assert!(
+        legacy.process,
+        "the compatibility layer promises execution helpers"
+    );
+    assert!(legacy.allows_filesystem_read(FilesystemScope::Package));
+    assert!(!legacy.allows_filesystem_read(FilesystemScope::Home));
+    assert!(!legacy.secrets);
+    assert!(!legacy.notifications);
+    assert!(!legacy.window_control);
+    assert!(!legacy.background_execution);
+    assert!(!legacy.network_listener);
 }

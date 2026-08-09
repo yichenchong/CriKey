@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata. Software centres and `flatpak install` read this; without
+  it a Flatpak build produces an application with no name, no description and
+  no icon in any graphical installer, and appstream-util refuses the build.
+
+  `metadata_license` covers this file, not the project: CC0-1.0 is what
+  AppStream expects for metadata so that catalogue services may redistribute
+  it. The project licence is stated separately below.
+-->
+<component type="desktop-application">
+  <id>org.crikey.CriKey</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>CriKey</name>
+  <summary>Fast, keyboard-driven application launcher</summary>
+  <description>
+    <p>
+      CriKey finds and runs applications, files and plugin commands from a
+      single keyboard-driven prompt.
+    </p>
+    <p>
+      Plugins run as supervised subprocesses rather than inside the launcher,
+      so a slow, wedged or crashing plugin cannot stall typing or hold up
+      results from any other source.
+    </p>
+  </description>
+  <launchable type="desktop-id">crikey.desktop</launchable>
+  <provides>
+    <binary>crikey</binary>
+  </provides>
+  <url type="homepage">https://github.com/crikey-launcher/crikey</url>
+  <url type="bugtracker">https://github.com/crikey-launcher/crikey/issues</url>
+  <content_rating type="oars-1.1"/>
+</component>

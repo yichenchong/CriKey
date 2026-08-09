@@ -383,3 +383,73 @@ fn packaging_validate_layout_rejects_a_missing_platform_entrypoint_as_config_err
         other => panic!("missing entrypoint returned the wrong error: {other:?}"),
     }
 }
+
+/// Number of items the plugin below hands to a single `emit_batch` call. It
+/// is comfortably past what one decodable frame can carry, which is the
+/// point: the SDK must split rather than emit a frame the receiver refuses.
+const HUGE_CATALOG_ITEMS: usize = 40_000;
+
+/// A well-behaved plugin that simply has a large catalog and emits it in one
+/// call, exactly as the `CatalogSink` contract invites.
+#[derive(Debug, Default)]
+struct HugeCatalogPlugin;
+
+impl Plugin for HugeCatalogPlugin {
+    fn start(&mut self, _context: &dyn PluginContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn build_catalog(&mut self, _context: &dyn PluginContext, sink: &mut dyn CatalogSink) -> Result<()> {
+        let items = (0..HUGE_CATALOG_ITEMS)
+            .map(|index| {
+                ItemBuilder::new(format!("huge.{index:06}"), format!("Huge Item {index:06}"))
+                    .target(format!("/synthetic/app-{index:06}"))
+                    .description("a catalog entry of unremarkable size")
+                    .search_term(format!("huge-{index:06}"))
+                    .build()
+            })
+            .collect();
+        sink.emit_batch(items)?;
+        sink.finish()
+    }
+
+    fn suggest(
+        &mut self,
+        _query: Query,
+        _context: &dyn PluginContext,
+        sink: &mut dyn SuggestionSink,
+    ) -> Result<()> {
+        sink.finish()
+    }
+
+    fn execute(&mut self, _request: ExecuteRequest, _context: &dyn PluginContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn stop(&mut self, _context: &dyn PluginContext) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A catalog larger than one decodable frame arrives whole.
+///
+/// The plugin does nothing wrong: it fills a batch and emits it. Before the
+/// SDK split on `message::max_decodable_items`, that produced one frame that
+/// passed the wire cap and then failed to decode, and the host answered by
+/// disconnecting the plugin. Every item must now arrive, across as many
+/// frames as the decode budget requires.
+#[test]
+fn a_catalog_larger_than_one_decodable_frame_arrives_whole() {
+    let mut harness = TestHarness::start(HugeCatalogPlugin, config()).expect("harness starts");
+    let items = harness
+        .catalog()
+        .expect("a plugin that emits its whole catalog in one call must not be punished for it");
+    assert_eq!(items.len(), HUGE_CATALOG_ITEMS, "the split must lose nothing");
+    assert_eq!(items[0].stable_id.0, "huge.000000");
+    assert_eq!(
+        items[HUGE_CATALOG_ITEMS - 1].stable_id.0,
+        format!("huge.{:06}", HUGE_CATALOG_ITEMS - 1),
+        "order must be preserved across the split"
+    );
+    harness.shutdown().expect("harness shuts down");
+}

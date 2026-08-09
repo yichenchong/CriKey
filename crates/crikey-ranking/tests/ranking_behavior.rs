@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use crikey_core::{ArgumentPolicy, Category, HitPolicy, Item, ItemId, PluginId};
 use crikey_query::{DefaultMatcher, MatchMethod, MatchOutcome, Matcher, NormalizedQuery};
-use crikey_ranking::{DefaultRanker, HistoryPolicy, Ranker, RankingSignals, Score};
+use crikey_ranking::{DefaultRanker, HistoryPolicy, Ranker, RankingSignals, Score, SelectionHistory};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -913,4 +913,132 @@ fn non_prefix_bound_covers_all_optional_signals() {
         actual <= bound,
         "the advertised non-prefix upper bound {bound:?} must cover every optional ranking signal, got {actual:?}"
     );
+}
+
+#[test]
+fn selection_history_augments_frequency_recency_query_and_context() {
+    let mut history = SelectionHistory::default();
+    let selected = item("Firefox");
+    let q = query("fi");
+    history.record(&selected, &q, 100);
+
+    let mut signals = RankingSignals::default();
+    history.augment(&selected, &q, 160, Some(&Category::Application), &mut signals);
+    assert_eq!(signals.selection_frequency, 1);
+    assert_eq!(signals.selection_recency_secs, Some(60));
+    assert!(signals.query_history > 0.0);
+    assert!(signals.context_match);
+
+    let other = item("Terminal");
+    let mut neutral = RankingSignals::default();
+    history.augment(&other, &q, 160, Some(&Category::File), &mut neutral);
+    assert_eq!(neutral.selection_frequency, 0);
+    assert_eq!(neutral.selection_recency_secs, None);
+    assert_eq!(neutral.query_history, 0.0);
+    assert!(!neutral.context_match);
+}
+
+/// A snapshot must carry every field the in-memory store holds, because the
+/// point of persisting it is that the launcher scores the same way after a
+/// restart as before one. Kills a snapshot that keeps frequency and drops the
+/// last-selected timestamp or the per-query affinity — a plausible omission,
+/// since both are stored separately from the frequency counter and neither is
+/// visible in a smoke test that only checks "the item is still remembered".
+#[test]
+fn a_selection_history_survives_a_snapshot_round_trip_with_every_field_intact() {
+    let mut original = SelectionHistory::default();
+    let firefox = item("Firefox");
+    let terminal = item("Terminal");
+    original.record(&firefox, &query("fi"), 1_000);
+    original.record(&firefox, &query("fi"), 1_400);
+    original.record(&firefox, &query("web"), 1_700);
+    original.record(&terminal, &query("te"), 900);
+
+    let restored = SelectionHistory::from_snapshot(original.snapshot());
+
+    for (selected, raw, expected_recency) in [
+        (&firefox, "fi", Some(2_000 - 1_700)),
+        (&firefox, "web", Some(2_000 - 1_700)),
+        (&terminal, "te", Some(2_000 - 900)),
+    ] {
+        let asked = query(raw);
+        let mut before = RankingSignals::default();
+        original.augment(selected, &asked, 2_000, Some(&Category::Application), &mut before);
+        let mut after = RankingSignals::default();
+        restored.augment(selected, &asked, 2_000, Some(&Category::Application), &mut after);
+
+        assert_eq!(
+            after.selection_frequency, before.selection_frequency,
+            "restoring must preserve the selection count for {} via {raw}",
+            selected.label
+        );
+        assert_eq!(
+            after.selection_recency_secs, expected_recency,
+            "restoring must preserve the last-selected timestamp for {} via {raw}",
+            selected.label
+        );
+        assert_eq!(
+            after.query_history, before.query_history,
+            "restoring must preserve the per-query affinity for {} via {raw}",
+            selected.label
+        );
+    }
+}
+
+/// The snapshot itself must be inspectable and complete, not merely
+/// round-trippable: a store that persists it has to see one record per
+/// selected item and one per (item, query) pair, or it will write a file that
+/// is missing exactly what a `from_snapshot` implemented against the same
+/// mistake would not notice.
+#[test]
+fn a_snapshot_exposes_one_record_per_item_and_one_per_query_affinity() {
+    let mut history = SelectionHistory::default();
+    let firefox = item("Firefox");
+    history.record(&firefox, &query("fi"), 10);
+    history.record(&firefox, &query("fi"), 20);
+    history.record(&firefox, &query("web"), 30);
+
+    let snapshot = history.snapshot();
+
+    assert_eq!(snapshot.selections.len(), 1, "one item was ever selected");
+    let selection = &snapshot.selections[0];
+    assert_eq!(selection.item, firefox.stable_id);
+    assert_eq!(selection.plugin, firefox.plugin_id);
+    assert_eq!(selection.frequency, 3);
+    assert_eq!(selection.last_selected_secs, Some(30));
+
+    assert_eq!(
+        snapshot.query_affinities.len(),
+        2,
+        "the item was reached through two distinct queries"
+    );
+    let counts = snapshot
+        .query_affinities
+        .iter()
+        .map(|affinity| (affinity.query.as_str(), affinity.count))
+        .collect::<Vec<_>>();
+    assert!(counts.contains(&("fi", 2)), "counts were {counts:?}");
+    assert!(counts.contains(&("web", 1)), "counts were {counts:?}");
+}
+
+/// A cleared history must snapshot as empty, and an empty snapshot must
+/// restore as an empty history. Otherwise "clear my ranking history" would be
+/// undone by the next save/load pair, which is a privacy failure rather than a
+/// ranking one.
+#[test]
+fn clearing_a_history_leaves_nothing_for_a_snapshot_to_carry() {
+    let mut history = SelectionHistory::default();
+    history.record(&item("Firefox"), &query("fi"), 10);
+    history.clear();
+
+    let snapshot = history.snapshot();
+    assert!(snapshot.selections.is_empty());
+    assert!(snapshot.query_affinities.is_empty());
+
+    let restored = SelectionHistory::from_snapshot(snapshot);
+    let mut signals = RankingSignals::default();
+    restored.augment(&item("Firefox"), &query("fi"), 20, None, &mut signals);
+    assert_eq!(signals.selection_frequency, 0);
+    assert_eq!(signals.selection_recency_secs, None);
+    assert_eq!(signals.query_history, 0.0);
 }

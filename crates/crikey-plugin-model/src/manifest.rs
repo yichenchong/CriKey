@@ -59,6 +59,7 @@ impl Manifest {
             return Err(ManifestError::UnsupportedVersion(manifest.manifest_version));
         }
         manifest.validate_query_policy()?;
+        manifest.validate_permissions()?;
         manifest.configuration.validate_declaration()?;
         Ok(manifest)
     }
@@ -198,6 +199,13 @@ pub enum Runtime {
     Python,
     Native,
     Wasm,
+    /// A restricted C-ABI shared library, declared as `c-abi`.
+    ///
+    /// The library is never loaded by the launcher. `crikey-cabi-host` is a
+    /// separate executable that loads it and speaks the supervised native
+    /// protocol on its behalf, so the entrypoint declared here is the library
+    /// rather than a program (ADR-0015; spec 2.2, 2.3, acceptance 30).
+    CAbi,
     Builtin,
 }
 

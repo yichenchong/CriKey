@@ -145,20 +145,20 @@ notes = "Level-triggered and read afresh on every call; the optional delay waits
 [[api]]
 module = "keypirinha"
 symbol = "user_config_dir"
-status = "planned"
-notes = "Legacy configuration reaches plugins through Plugin.load_settings in M3; the module-level directory helpers land with the legacy configuration layout."
+status = "behavioural-difference"
+notes = "Answers CriKey's own per-user configuration directory, resolved by the launcher from the platform convention (XDG on Linux, %APPDATA% on Windows, ~/Library on macOS) and handed to the worker. It is deliberately not a Keypirinha installation path: a legacy package running here is configured by this launcher (spec 14.13). A worker the launcher did not tell reports HostUnavailableError rather than guessing a path."
 
 [[api]]
 module = "keypirinha"
 symbol = "installed_package_dir"
-status = "planned"
-notes = "Plugin.package_full_path covers the only documented use M3 needs; the installation-wide directory is deferred."
+status = "behavioural-difference"
+notes = "Answers CriKey's installed-legacy-plugin directory rather than a Keypirinha InstalledPackage folder, and the packages in it are CriKey package directories. Same resolution and same honest refusal as user_config_dir."
 
 [[api]]
 module = "keypirinha"
 symbol = "package_cache_dir"
-status = "planned"
-notes = "Plugin.get_package_cache_path covers the per-plugin case; the installation-wide cache directory is deferred."
+status = "behavioural-difference"
+notes = "Answers the launcher's legacy cache root, which is also where archive packages are extracted; Plugin.get_package_cache_path remains the per-package subdirectory. Not a Keypirinha cache path. Same resolution and same honest refusal as user_config_dir."
 
 # ---------------------------------------------------------------------------
 # keypirinha.Settings
@@ -213,24 +213,26 @@ status = "full"
 [[api]]
 module = "keypirinha"
 symbol = "Settings.get_multiline"
-status = "planned"
-notes = "Widely used by published packages; not shipped in M3, so a plugin calling it raises AttributeError. Tracked as a one-line source workaround (get + splitlines)."
+status = "behavioural-difference"
+notes = "Splits the stored value on line breaks, stripping each line and dropping blank ones unless keep_empty_lines is set; an absent key with no fallback answers an empty list. Extended interpolation is not performed first, so `${section:key}` and `${env:VARIABLE}` references remain unresolved text in each line."
 
 [[api]]
 module = "keypirinha"
 symbol = "Settings.get_stripped"
-status = "planned"
-notes = "Not shipped in M3. Equivalent to get() plus str.strip() and an unquote step, so it is a documented gap rather than a behavioural one."
+status = "behavioural-difference"
+notes = "Strips whitespace and one matching quote pair from the stored value. Extended interpolation is not performed first, so `${section:key}` and `${env:VARIABLE}` references remain unresolved text."
 
 [[api]]
 module = "keypirinha"
 symbol = "Settings.get_enum"
-status = "planned"
+status = "behavioural-difference"
+notes = "Matches the stored value against the accepted spellings, ASCII-case-insensitively unless case_sensitive is set, and returns the *accepted* spelling so a plugin can compare it against its own literals. An unaccepted value raises SettingsError attributed to the section and key. Extended interpolation is not performed first, so `${section:key}` and `${env:VARIABLE}` references remain unresolved text and would therefore fail to match."
 
 [[api]]
 module = "keypirinha"
 symbol = "Settings.get_mapped"
-status = "planned"
+status = "behavioural-difference"
+notes = "Translates the stored value through the supplied map, ASCII-case-insensitively unless case_sensitive is set; a value absent from the map raises SettingsError attributed to the section and key. Extended interpolation is not performed first, so `${section:key}` and `${env:VARIABLE}` references remain unresolved text and would therefore fail to match."
 
 # ---------------------------------------------------------------------------
 # keypirinha.CatalogItem
@@ -275,12 +277,18 @@ status = "full"
 module = "keypirinha"
 symbol = "CatalogItem.icon_handle"
 status = "partial"
-notes = "The handle a plugin supplies is stored and returned by identity, but M3 has no legacy icon registry: nothing resolves a Win32 resource reference such as \"@C:/app.exe,0\" into a rendered icon, so items display without one. Plugin.load_icon, which produces such handles, is itself planned."
+notes = "The handle Plugin.load_icon issues is carried on the item and resolved by the host against the package directory, so a packaged icon reaches the renderer. A Win32 resource reference such as \"@C:/app.exe,0\" is not a package-relative name and is refused rather than resolved, so an item that names one displays without an icon."
 
 [[api]]
 module = "keypirinha"
 symbol = "CatalogItem.data_bag"
 status = "full"
+
+[[api]]
+module = "keypirinha"
+symbol = "IconHandle"
+status = "behavioural-difference"
+notes = "Keypirinha's load_icon returns an opaque handle with no documented class name; CriKey's is keypirinha.IconHandle and exposes sources() as well as the identity the documented API relies on. A plugin that only passes the value to create_item or set_default_icon, which is the whole documented contract, cannot observe the difference."
 
 [[api]]
 module = "keypirinha"
@@ -424,38 +432,35 @@ notes = "Same log channel and prefix convention as Plugin.info; always emitted r
 [[api]]
 module = "keypirinha"
 symbol = "Plugin.set_actions"
-status = "planned"
-notes = "Per-category action lists are not shipped in M3, so on_execute receives None for the action. Published packages use this heavily; it is the largest single M3 gap."
+status = "partial"
+notes = "Registers one category's alternate actions; the launcher offers them on every row of that category and hands the chosen keypirinha.Action to on_execute. Two documented differences: the registration is refused above 32 actions per category and 64 categories rather than being unbounded, and the name \"legacy.execute\" is reserved by the host for the default action, so a plugin action spelled that way is refused instead of silently shadowing Enter."
 
 [[api]]
 module = "keypirinha"
 symbol = "Plugin.create_action"
-status = "planned"
-notes = "Deferred with Plugin.set_actions; keypirinha.Action itself exists so on_execute can already be handed one."
+status = "full"
 
 [[api]]
 module = "keypirinha"
 symbol = "Plugin.load_icon"
-status = "planned"
-notes = "Requires an icon registry and Win32 resource extraction; deferred with CatalogItem.icon_handle resolution."
+status = "partial"
+notes = "Package-relative paths and the documented res://Package/file form both resolve, against the package that loaded the plugin. Three documented limits: a source naming another package is refused, because a legacy icon is resolved against its own plugin's directory and nothing can reach another's; a source above 256 KiB is refused rather than truncated; and when several sources are given only the first is resolved, because the host decodes one file at one size."
 
 [[api]]
 module = "keypirinha"
 symbol = "Plugin.set_default_icon"
-status = "planned"
-notes = "Deferred with Plugin.load_icon."
+status = "full"
 
 [[api]]
 module = "keypirinha"
 symbol = "Plugin.create_error_item"
-status = "planned"
-notes = "A plugin can publish an ordinary item to report an error meanwhile, so this is a convenience gap rather than a functional one."
+status = "full"
 
 [[api]]
 module = "keypirinha"
 symbol = "Plugin.find_resources"
-status = "planned"
-notes = "Resource enumeration is deferred; Plugin.load_text_resource and Plugin.load_binary_resource cover access by name."
+status = "partial"
+notes = "Enumerates the package's own files, sorted and package-relative. Matching is segment by segment, so \"*\" stops at a directory boundary and \"**\" is the way to span depth; a pattern that is absolute, holds \"..\" or holds a backslash is refused rather than normalised, and a walk that would report more than 4096 names or examine more than 65536 entries is refused rather than truncated."
 
 # ---------------------------------------------------------------------------
 # keypirinha_util (spec 14.2)
@@ -541,48 +546,38 @@ notes = "Spec 14.12 makes exact reproduction of the undocumented legacy ranking 
 [[api]]
 module = "keypirinha_util"
 symbol = "chardet_open"
-status = "planned"
+status = "behavioural-difference"
+notes = "Opens the file in the encoding decode_bytes would choose. No statistical charset detector is bundled — every usable one is a third-party package the layer refuses to require — so detection is a documented ladder of evidence: byte-order mark, then whole-input UTF-8 validation, then Windows-1252, then Latin-1. Detection reads at most the first megabyte. Binary modes are refused with ValueError rather than silently opened undetected."
 
 [[api]]
 module = "keypirinha_util"
 symbol = "decode_bytes"
-status = "planned"
+status = "behavioural-difference"
+notes = "Same ladder as chardet_open: byte-order mark, whole-input UTF-8, Windows-1252, then Latin-1, which cannot fail. The last two rungs are guesses and the docstring says so; text a statistical detector would have identified as some other single-byte encoding is decoded as cp1252 here."
 
 [[api]]
 module = "keypirinha_util"
 symbol = "kwargs_encode"
-status = "planned"
-notes = "Used by published packages to pack structured data into an item target; deferred with kwargs_decode so the pair lands together and round-trips."
-
+status = "behavioural-difference"
+notes = "Round-trips exactly with kwargs_decode for every basic bool, int, float and string value, including strings containing the separators: pairs are `name=value` joined by `&`, with `\\\\`, `&` and `=` backslash-escaped inside both, and emitted in sorted name order so an item target is stable. Type tags preserve scalar types. Keypirinha's own packing format is undocumented, so a string produced by Keypirinha is not guaranteed to decode here."
 [[api]]
 module = "keypirinha_util"
 symbol = "kwargs_decode"
-status = "planned"
-notes = "Deferred with kwargs_encode."
+status = "behavioural-difference"
+notes = "The exact inverse of this layer's kwargs_encode. Text that encode could not have produced — a pair with no unescaped `=`, an empty or repeated name, a trailing lone escape — raises ValueError rather than being given an invented reading. See kwargs_encode for the format difference from Keypirinha."
 
 [[api]]
 module = "keypirinha_util"
 symbol = "execute_default_action"
-status = "planned"
-notes = "Depends on the per-category action lists that Plugin.set_actions will bring."
+status = "partial"
+notes = "The item's default action is performed by the launcher, over a host request the worker blocks on, gated by the same `process` permission as every other host-mediated launch and run in the launcher's process group so it survives a worker restart. A refusal (no permission, an unusable target, no answer) raises HostUnavailableError in the plugin. The partial part is the `action` argument: a plugin-defined secondary action means nothing to the launcher, so the call answers False and leaves it to the plugin, which is what its own on_execute is for."
 
 [[api]]
 module = "keypirinha_util"
 symbol = "web_browser_command"
-status = "planned"
-notes = "Building a browser command line with private-mode and new-window flags is deferred; keypirinha_util.open_url covers plain opening today, which is a one-line substitution for most callers."
+status = "behavioural-difference"
+notes = "Returns an argv list rather than a Windows command-line string; cmdline_quote turns one into the other for callers that need it. The browser is resolved from BROWSER (POSIX convention, `%s` substituted) and then from a list of known browsers on PATH, not from a Windows registry association. private_mode and new_window are honoured only for browsers whose flags this layer knows and are refused with UnavailableError for any other, because opening an ordinary window for a caller who asked for a private one is a privacy failure, not a graceful degradation."
 
-[[api]]
-module = "keypirinha_util"
-symbol = "read_link"
-status = "planned"
-notes = "Resolving a Windows .lnk shortcut needs the Win32 shell interfaces; it will be windows-only when it lands."
-
-[[api]]
-module = "keypirinha_util"
-symbol = "shell_known_folder_path"
-status = "planned"
-notes = "Win32 known-folder GUID resolution; it will be windows-only when it lands."
 
 # ---------------------------------------------------------------------------
 # keypirinha_net (spec 14.2)
@@ -676,6 +671,18 @@ status = "full"
 module = "keypirinha_wintypes"
 symbol = "is_available"
 status = "full"
+
+[[api]]
+module = "keypirinha_wintypes"
+symbol = "read_link"
+status = "windows-only"
+notes = "The legacy import path is keypirinha_util.read_link, but its operation is owned by this explicit platform interface. It is backed by the Win32 shell link interfaces (IShellLinkW plus IPersistFile). Off Windows the alias raises keypirinha.HostUnavailableError: resolving a shortcut runs the shell's own link tracking, and a hand-written .lnk parser elsewhere would answer a different question under the same name (spec 2.3). A shortcut naming a virtual shell folder rather than a file is also refused rather than reported as an empty path."
+
+[[api]]
+module = "keypirinha_wintypes"
+symbol = "shell_known_folder_path"
+status = "windows-only"
+notes = "The legacy import path is keypirinha_util.shell_known_folder_path, but its operation is owned by this explicit platform interface. It is backed by SHGetKnownFolderPath. Off Windows the alias raises keypirinha.HostUnavailableError: there is no known-folder registry to consult and no defensible mapping onto XDG or ~/Library, so a nearest match would send a plugin's writes somewhere the user never agreed to. keypirinha.user_config_dir and its siblings are the portable answer."
 
 [[api]]
 module = "keypirinha_wintypes"

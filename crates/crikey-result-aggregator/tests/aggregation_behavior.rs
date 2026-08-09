@@ -103,6 +103,43 @@ fn started(tracker: &GenerationTracker, limits: ResultLimits) -> (MemoryResultAg
     aggregator.begin_frame();
     (aggregator, generation)
 }
+#[test]
+fn manifest_result_limits_override_global_plugin_ceilings() {
+    let tracker = GenerationTracker::new();
+    let (mut aggregator, generation) = started(&tracker, limits(8, 8, 8));
+    let owner = plugin("dev.crikey.manifest-limited");
+    aggregator.set_plugin_limits(owner.clone(), 3, 2);
+
+    assert_eq!(
+        aggregator.accept(partial(
+            generation,
+            &owner,
+            vec![
+                item(&owner, "one", "One"),
+                item(&owner, "two", "Two"),
+                item(&owner, "three", "Three"),
+            ],
+        )),
+        Err(RejectReason::QuotaExceeded),
+        "the manifest batch ceiling rejects a whole oversized publication"
+    );
+    aggregator
+        .accept(partial(
+            generation,
+            &owner,
+            vec![item(&owner, "one", "One"), item(&owner, "two", "Two")],
+        ))
+        .expect("the first manifest-sized batch fits");
+    assert_eq!(
+        aggregator.accept(partial(
+            generation,
+            &owner,
+            vec![item(&owner, "three", "Three"), item(&owner, "four", "Four")],
+        )),
+        Err(RejectReason::QuotaExceeded),
+        "the manifest query ceiling rejects the breaching publication"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Accepting the active generation.

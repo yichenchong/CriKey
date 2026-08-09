@@ -23,6 +23,9 @@ Mode selection is identical in both binaries: `CRIKEY_CONFORMANCE_MODE`, then
 |  | `crash-on-start` | Aborts from `start`. |
 |  | `fail-suggest` | Returns a plugin error from `suggest`. |
 |  | `sequence` | Uses `CRIKEY_SEQUENCE_FILE` as a launch-count file: the first and third processes abort in `suggest`, while the second behaves like `echo`. |
+|  | `icon` | Suggests one item per icon outcome and serves their references: `served.svg` immediately, `absent.svg` not at all, `oversized.svg` above any host limit, `late.svg` after 400 ms. |
+|  | `icon-slow` | Suggests one item whose `after-window.svg` reference is served after 150 ms — past a 100 ms result collection window, inside a 250 ms icon deadline. |
+|  | `icon-silent` | Suggests one item whose `never.svg` reference is withheld for ten seconds, so no host icon deadline can ever receive it. |
 | `crikey-misbehaving-plugin` | `oversized` | Writes a frame length above `MAX_FRAME_BYTES`. |
 |  | `flood` | Sends result batches without respecting host credits. |
 |  | `stderr-flood` | Writes several MiB to standard error before sending a final result. |

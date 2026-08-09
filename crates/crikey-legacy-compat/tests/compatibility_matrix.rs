@@ -178,11 +178,15 @@ const M3_DELIVERED_APIS: &[(&str, &str)] = &[
     ("keypirinha", "Events"),
     ("keypirinha", "Settings"),
     ("keypirinha", "CatalogItem"),
+    ("keypirinha", "IconHandle"),
     ("keypirinha", "Plugin"),
     ("keypirinha", "name"),
     ("keypirinha", "version"),
     ("keypirinha", "version_string"),
     ("keypirinha", "should_terminate"),
+    ("keypirinha", "user_config_dir"),
+    ("keypirinha", "installed_package_dir"),
+    ("keypirinha", "package_cache_dir"),
     // keypirinha.Settings
     ("keypirinha", "Settings.DEFAULT_SECTION"),
     ("keypirinha", "Settings.get"),
@@ -192,6 +196,10 @@ const M3_DELIVERED_APIS: &[(&str, &str)] = &[
     ("keypirinha", "Settings.sections"),
     ("keypirinha", "Settings.keys"),
     ("keypirinha", "Settings.has"),
+    ("keypirinha", "Settings.get_multiline"),
+    ("keypirinha", "Settings.get_stripped"),
+    ("keypirinha", "Settings.get_enum"),
+    ("keypirinha", "Settings.get_mapped"),
     // keypirinha.CatalogItem
     ("keypirinha", "CatalogItem.category"),
     ("keypirinha", "CatalogItem.label"),
@@ -215,6 +223,12 @@ const M3_DELIVERED_APIS: &[(&str, &str)] = &[
     ("keypirinha", "Plugin.on_deactivated"),
     ("keypirinha", "Plugin.on_events"),
     ("keypirinha", "Plugin.create_item"),
+    ("keypirinha", "Plugin.create_error_item"),
+    ("keypirinha", "Plugin.set_actions"),
+    ("keypirinha", "Plugin.create_action"),
+    ("keypirinha", "Plugin.load_icon"),
+    ("keypirinha", "Plugin.set_default_icon"),
+    ("keypirinha", "Plugin.find_resources"),
     ("keypirinha", "Plugin.set_catalog"),
     ("keypirinha", "Plugin.merge_catalog"),
     ("keypirinha", "Plugin.set_suggestions"),
@@ -244,6 +258,12 @@ const M3_DELIVERED_APIS: &[(&str, &str)] = &[
     ("keypirinha_util", "open_url"),
     ("keypirinha_util", "shell_execute"),
     ("keypirinha_util", "explore_file"),
+    ("keypirinha_util", "chardet_open"),
+    ("keypirinha_util", "decode_bytes"),
+    ("keypirinha_util", "kwargs_encode"),
+    ("keypirinha_util", "kwargs_decode"),
+    ("keypirinha_util", "execute_default_action"),
+    ("keypirinha_util", "web_browser_command"),
     // keypirinha_net
     ("keypirinha_net", "InvalidUrlError"),
     ("keypirinha_net", "Request"),
@@ -256,37 +276,27 @@ const M3_DELIVERED_APIS: &[(&str, &str)] = &[
     ("keypirinha_net", "Request.timeout"),
     ("keypirinha_net", "Request.user_agent"),
     ("keypirinha_net", "Request.get_header"),
-    // keypirinha_wintypes. These four resolve normally on Linux — they are
-    // the honest-unavailability surface itself, not Win32 calls — so they are
-    // classified on their own merits. Everything else in the module falls
-    // through the `"*"` row.
+    // keypirinha_wintypes. The availability surface and the two legacy
+    // compatibility aliases resolve normally on Linux; actual Win32 names
+    // are classified windows-only, with the wildcard covering any future
+    // symbol that is not enumerated here.
     ("keypirinha_wintypes", "WINDOWS_ONLY"),
     ("keypirinha_wintypes", "WINDOWS_ONLY_SYMBOLS"),
     ("keypirinha_wintypes", "WindowsOnlyError"),
     ("keypirinha_wintypes", "is_available"),
+    ("keypirinha_wintypes", "read_link"),
+    ("keypirinha_wintypes", "shell_known_folder_path"),
     ("keypirinha_wintypes", "*"),
 ];
 
-/// Documented Keypirinha APIs M3 deliberately does *not* ship.
+/// Documented Keypirinha APIs the layer deliberately does *not* ship.
 ///
 /// They must still appear in the matrix: spec 14.10 classifies *each*
 /// documented legacy API, and silently omitting a gap is exactly the
 /// dishonesty this file exists to prevent. `fuzzy_score` is the canonical
 /// case — spec 14.12 exempts "exact reproduction of undocumented ranking
 /// behavior", so it is a documented non-goal, not an oversight.
-const M3_DEFERRED_APIS: &[(&str, &str)] = &[
-    ("keypirinha", "user_config_dir"),
-    ("keypirinha", "installed_package_dir"),
-    ("keypirinha", "package_cache_dir"),
-    ("keypirinha_util", "fuzzy_score"),
-    ("keypirinha_util", "chardet_open"),
-    ("keypirinha_util", "decode_bytes"),
-    ("keypirinha_util", "kwargs_encode"),
-    ("keypirinha_util", "kwargs_decode"),
-    ("keypirinha_util", "execute_default_action"),
-    ("keypirinha_util", "web_browser_command"),
-    ("keypirinha_util", "read_link"),
-];
+const M3_DEFERRED_APIS: &[(&str, &str)] = &[("keypirinha_util", "fuzzy_score")];
 
 /// The names in the shim's `keypirinha_wintypes.WINDOWS_ONLY_SYMBOLS`.
 ///

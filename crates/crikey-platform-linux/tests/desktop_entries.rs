@@ -834,9 +834,10 @@ fn capabilities_without_a_linux_implementation_report_unavailable() {
         Capability::SecretStorage,
         Capability::ShellIntegration,
     ];
-    // Global shortcuts rest on X11 `GrabKey` alone; window control additionally
-    // needs an EWMH window manager, which the session label cannot promise, so
-    // X11 claims it only as `Partial` (spec 18.2, 18.6).
+    // Global shortcuts rest on X11 `GrabKey`, or on the `GlobalShortcuts`
+    // portal under Wayland (ADR-0011); window control additionally needs an
+    // EWMH window manager, which the session label cannot promise, so X11
+    // claims it only as `Partial` (spec 18.2, 18.6).
     let hotkeys_only = [Capability::GlobalHotkeys];
     let window_control = [Capability::WindowEnumeration, Capability::WindowActivation];
     // Icons need no display server at all, so the answer is the same in every
@@ -844,24 +845,36 @@ fn capabilities_without_a_linux_implementation_report_unavailable() {
     // `.xpm` and scaled theme directories are not decoded.
     let icons = [Capability::Icons];
 
-    for (environment, expected_hotkeys, expected_windows) in [
+    // The portal answer is injected rather than probed: a Wayland row that
+    // consulted the build host's session bus would assert something about the
+    // runner, which is the same trap `with_desktop_environment` exists for.
+    for (environment, portal, expected_hotkeys, expected_windows) in [
         (
             DesktopEnvironment::X11,
+            false,
             CapabilityState::Available,
             CapabilityState::Partial,
         ),
         (
             DesktopEnvironment::Wayland,
+            true,
+            CapabilityState::Available,
             CapabilityState::UnsupportedDesktopEnvironment,
+        ),
+        (
+            DesktopEnvironment::Wayland,
+            false,
+            CapabilityState::Unavailable,
             CapabilityState::UnsupportedDesktopEnvironment,
         ),
         (
             DesktopEnvironment::Headless,
+            false,
             CapabilityState::Unavailable,
             CapabilityState::Unavailable,
         ),
     ] {
-        let backend = LinuxBackend::with_desktop_environment(environment);
+        let backend = LinuxBackend::with_desktop_environment_and_portal(environment, portal);
         for capability in unimplemented {
             assert_eq!(
                 backend.capability(capability),

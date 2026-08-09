@@ -94,7 +94,7 @@ impl StartupJournal {
     /// Never fails: a boot-time recovery mechanism that can refuse to load is a
     /// boot failure no recovery path can catch.
     pub fn load(path: &Path) -> Self {
-        let recovered = read_bounded(path).and_then(|text| parse(&text));
+        let recovered = read_bounded(path, Self::MAX_BYTES).and_then(|text| parse(&text));
         let (consecutive_failures, active) = recovered.unwrap_or((0, Vec::new()));
         Self {
             path: path.to_path_buf(),
@@ -273,8 +273,8 @@ pub const DISABLED_BY_CONFIGURATION: &str = "disabled by configuration (crikey p
 /// process; the pid distinguishes it from every other process's.
 static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Reads at most [`StartupJournal::MAX_BYTES`] from `path`, or `None` if the
-/// file is absent, non-regular, unreadable, not UTF-8, or larger than that.
+/// Reads at most `max_bytes` from `path`, or `None` if the file is absent,
+/// non-regular, unreadable, not UTF-8, or larger than that.
 ///
 /// The ceiling is applied to the *reader*, not to a stat of the path: a size
 /// read before the open is a guess about a file another process may still be
@@ -282,22 +282,25 @@ static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// handle type, so a path swapped to a symlink or named pipe cannot hang boot.
 /// Taking the reader bounds the allocation whatever a regular file's contents
 /// turn out to be.
-fn read_bounded(path: &Path) -> Option<String> {
-    let file = open_journal(path)?;
+///
+/// Shared with the selection history store: both are per-user state files read
+/// during startup, and both must be incapable of failing one.
+pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> Option<String> {
+    let file = open_regular_file(path)?;
     if !file.metadata().ok()?.file_type().is_file() {
         return None;
     }
     let mut text = String::new();
     let read = file
-        .take(StartupJournal::MAX_BYTES.saturating_add(1))
+        .take(max_bytes.saturating_add(1))
         .read_to_string(&mut text)
         .ok()?;
     u64::try_from(read)
-        .is_ok_and(|read| read <= StartupJournal::MAX_BYTES)
+        .is_ok_and(|read| read <= max_bytes)
         .then_some(text)
 }
 
-fn open_journal(path: &Path) -> Option<fs::File> {
+fn open_regular_file(path: &Path) -> Option<fs::File> {
     #[cfg(unix)]
     {
         fs::OpenOptions::new()
@@ -324,8 +327,13 @@ fn open_journal(path: &Path) -> Option<fs::File> {
 // and one is not worth adding for this, so the writer and a parser for exactly
 // this shape live here. The parser is strict on purpose: anything it does not
 // recognize is corruption, and corruption loads as a fresh journal.
+//
+// [`write_json_string`] and [`Cursor`] are crate-visible because the selection
+// history store persists the same way for the same reason, and a second
+// hand-rolled JSON reader in the same crate would be a second set of escaping
+// and truncation bugs to find.
 
-fn write_json_string(out: &mut String, value: &str) {
+pub(crate) fn write_json_string(out: &mut String, value: &str) {
     out.push('"');
     for character in value.chars() {
         match character {
@@ -376,27 +384,27 @@ fn parse(text: &str) -> Option<(u32, Vec<PluginId>)> {
     }
 }
 
-struct Cursor<'a> {
+pub(crate) struct Cursor<'a> {
     text: &'a str,
     at: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(text: &'a str) -> Self {
+    pub(crate) fn new(text: &'a str) -> Self {
         Self { text, at: 0 }
     }
 
-    fn rest(&self) -> &'a str {
+    pub(crate) fn rest(&self) -> &'a str {
         &self.text[self.at..]
     }
 
-    fn skip_whitespace(&mut self) {
+    pub(crate) fn skip_whitespace(&mut self) {
         let trimmed = self.rest().trim_start_matches([' ', '\t', '\n', '\r']);
         self.at = self.text.len() - trimmed.len();
     }
 
     /// Consumes `expected` if it is the next non-space character.
-    fn consume(&mut self, expected: char) -> bool {
+    pub(crate) fn consume(&mut self, expected: char) -> bool {
         self.skip_whitespace();
         match self.rest().strip_prefix(expected) {
             Some(remainder) => {
@@ -407,11 +415,31 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    fn expect(&mut self, expected: char) -> Option<()> {
+    pub(crate) fn expect(&mut self, expected: char) -> Option<()> {
         self.consume(expected).then_some(())
     }
 
-    fn number(&mut self) -> Option<u32> {
+    /// Consumes the literal `null`, which is how an absent optional field is
+    /// written. Omitting the key instead would leave a strict parser unable to
+    /// tell a legitimately empty field from a truncated record.
+    pub(crate) fn null(&mut self) -> bool {
+        self.skip_whitespace();
+        match self.rest().strip_prefix("null") {
+            Some(remainder) => {
+                self.at = self.text.len() - remainder.len();
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn number(&mut self) -> Option<u32> {
+        u32::try_from(self.number_u64()?).ok()
+    }
+
+    /// Reads an unsigned decimal integer, rejecting one too large to represent
+    /// rather than saturating: a saturated count is a fabricated one.
+    pub(crate) fn number_u64(&mut self) -> Option<u64> {
         self.skip_whitespace();
         let digits = self.rest();
         let end = digits
@@ -424,7 +452,7 @@ impl<'a> Cursor<'a> {
         digits[..end].parse().ok()
     }
 
-    fn string(&mut self) -> Option<String> {
+    pub(crate) fn string(&mut self) -> Option<String> {
         self.expect('"')?;
         let mut value = String::new();
         let mut characters = self.rest().char_indices();

@@ -29,8 +29,8 @@ use crikey_native_protocol::transport::Transport;
 use crikey_native_protocol::{Capabilities, Endpoint, ProtocolError, RequestId, PROTOCOL_VERSION};
 
 use crate::{
-    CancellationToken, CatalogSink, ExecuteRequest, LogLevel, Plugin, PluginContext, PluginEvent, Query,
-    SdkError, SuggestionSink,
+    CancellationToken, CatalogSink, ExecuteRequest, LogLevel, Plugin, PluginContext, PluginEvent,
+    PluginResource, Query, ResourceKind, SdkError, SuggestionSink,
 };
 
 /// Maximum number of decoded control frames retained while a plugin callback
@@ -763,6 +763,17 @@ fn protocol_log_level(level: LogLevel) -> message::LogLevel {
     })
 }
 
+/// Maps the wire enum onto the SDK's, keeping a kind this release does not
+/// know distinguishable from one it does rather than folding it onto `Icon`.
+fn resource_kind(kind: &message::ResourceKind) -> ResourceKind {
+    match kind.as_i32() {
+        1 => ResourceKind::Icon,
+        2 => ResourceKind::File,
+        3 => ResourceKind::Configuration,
+        _ => ResourceKind::Unknown,
+    }
+}
+
 impl PluginContext for RuntimeContext {
     fn plugin_id(&self) -> &PluginId {
         &self.plugin_id
@@ -1005,6 +1016,48 @@ fn serve_requests(
                             queue_depth: input.queue_depth(),
                             in_flight: metrics.in_flight.load(Ordering::Acquire),
                             detail: "memory_bytes=unavailable".to_owned(),
+                            unknown: Default::default(),
+                        })),
+                        unknown: Default::default(),
+                    },
+                )?;
+            }
+            Payload::ResourceRequest(request) => {
+                let kind = resource_kind(&request.kind);
+                let reference = request.reference;
+                let callback_result = {
+                    let _in_flight = metrics.enter();
+                    invoke_callback(|| plugin.resource(kind, &reference, &request_context))
+                };
+                if let Some(error) = request_context.take_log_error() {
+                    return Err(error);
+                }
+                // A refusal is answered, never dropped. The host is holding a
+                // deadline open for this reference; letting it expire would
+                // cost the user the wait and tell the host nothing it could
+                // not already assume.
+                let (resource, error) = match callback_result {
+                    Ok(Ok(resource)) => (resource, None),
+                    Ok(Err(error)) => (None, Some(structured_error(&error.to_string(), request_id))),
+                    Err(detail) => (None, Some(structured_error(&detail, request_id))),
+                };
+                let (found, content, media_type) = match resource {
+                    Some(PluginResource { content, media_type }) => (true, content, media_type),
+                    None => (false, Vec::new(), String::new()),
+                };
+                send_envelope(
+                    transport,
+                    Envelope {
+                        connection_id: request_context.connection_id,
+                        request_id,
+                        generation,
+                        deadline_ms: 0,
+                        payload: Some(Payload::ResourceResponse(message::ResourceResponse {
+                            reference,
+                            found,
+                            content,
+                            media_type,
+                            error,
                             unknown: Default::default(),
                         })),
                         unknown: Default::default(),
@@ -1386,10 +1439,42 @@ impl<'a> SuggestionSinkImpl<'a> {
         Ok(())
     }
 
+    /// `ResultBatch` carries the same repeated `Item` field as `CatalogBatch`
+    /// and is bounded the same way: by what the receiver can decode, not by
+    /// `MAX_FRAME_BYTES`. A partial batch is therefore split into as many
+    /// decodable frames as it needs. Terminal states always carry no items,
+    /// so they are unaffected.
     fn send_batch(
         &mut self,
         state: BatchState,
         items: Vec<Item>,
+        error: Option<StructuredError>,
+    ) -> Result<()> {
+        let proto_items: Vec<message::Item> = items
+            .iter()
+            .map(crikey_native_protocol::convert::to_proto_item)
+            .collect();
+        let mut remaining = proto_items.as_slice();
+        loop {
+            let take = if remaining.is_empty() {
+                0
+            } else {
+                message::max_decodable_items(remaining)
+            };
+            let (chunk, rest) = remaining.split_at(take);
+            remaining = rest;
+            let last = remaining.is_empty();
+            self.send_one(state, chunk.to_vec(), if last { error.clone() } else { None })?;
+            if last {
+                return Ok(());
+            }
+        }
+    }
+
+    fn send_one(
+        &mut self,
+        state: BatchState,
+        proto_items: Vec<message::Item>,
         error: Option<StructuredError>,
     ) -> Result<()> {
         let partial = state.as_i32() == 1;
@@ -1402,19 +1487,6 @@ impl<'a> SuggestionSinkImpl<'a> {
             self.cancelled_error = true;
             return Err(CoreError::Cancelled);
         }
-        self.send_batch_wire(state, items, error)
-    }
-
-    fn send_batch_wire(
-        &mut self,
-        state: BatchState,
-        items: Vec<Item>,
-        error: Option<StructuredError>,
-    ) -> Result<()> {
-        let proto_items = items
-            .iter()
-            .map(crikey_native_protocol::convert::to_proto_item)
-            .collect();
         let envelope = Envelope {
             connection_id: self.connection_id,
             request_id: self.request_id,
@@ -1590,12 +1662,48 @@ impl<'a> CatalogSinkImpl<'a> {
         Ok(())
     }
 
+    /// Emits `items` as one or more `CatalogBatch` frames.
+    ///
+    /// Splitting is not an optimisation. A batch is bounded by what the
+    /// receiver can decode, not by `MAX_FRAME_BYTES`, and the two are far
+    /// apart for repeated items; a plugin that handed the whole catalog to
+    /// one frame would produce a frame the host accepts on the wire and then
+    /// refuses while decoding, and would be disconnected for it.
+    /// `message::max_decodable_items` is the protocol's own answer to how
+    /// many fit, so the SDK asks rather than guesses.
     fn send(&mut self, items: Vec<Item>, done: bool, error: Option<StructuredError>) -> Result<()> {
-        self.wait_for_credit()?;
-        let proto_items = items
+        let proto_items: Vec<message::Item> = items
             .iter()
             .map(crikey_native_protocol::convert::to_proto_item)
             .collect();
+        let mut remaining = proto_items.as_slice();
+        loop {
+            let take = if remaining.is_empty() {
+                0
+            } else {
+                message::max_decodable_items(remaining)
+            };
+            let (chunk, rest) = remaining.split_at(take);
+            remaining = rest;
+            let last = remaining.is_empty();
+            self.send_one(
+                chunk.to_vec(),
+                done && last,
+                if last { error.clone() } else { None },
+            )?;
+            if last {
+                return Ok(());
+            }
+        }
+    }
+
+    fn send_one(
+        &mut self,
+        proto_items: Vec<message::Item>,
+        done: bool,
+        error: Option<StructuredError>,
+    ) -> Result<()> {
+        self.wait_for_credit()?;
         let envelope = Envelope {
             connection_id: self.connection_id,
             request_id: self.request_id,

@@ -17,8 +17,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crikey_package_manager::{
-    build_package, HttpFetcher, InstallSource, InstalledPlugin, LauncherLock, PackageError, PackageFetcher,
-    PluginInstaller,
+    build_package, sign_package, signature_path_for, HttpFetcher, InstallSource, InstalledPlugin,
+    LauncherLock, PackageError, PackageFetcher, PackageSigningKey, PluginInstaller, SignatureError,
+    SignaturePolicy, TrustStore, UnsignedPolicy,
 };
 use crikey_platform::{DirectoryConvention, DirectoryEnvironment, PluginKind, StandardDirectories};
 
@@ -195,6 +196,37 @@ impl PackageFetcher for RecordingFetcher {
             .unwrap_or_else(|error| error.into_inner())
             .push(url.to_owned());
         fs::copy(&self.payload, destination)?;
+        Ok(())
+    }
+}
+
+/// A fetcher that serves an archive and, optionally, its sibling signature.
+///
+/// The absent case is the point: a publisher who never signed the package
+/// serves no `<url>.sig`, and the fetch has to fail the way a real 404 does
+/// rather than quietly produce an empty file that would read as a malformed
+/// signature.
+#[derive(Debug)]
+struct ServingFetcher {
+    archive: PathBuf,
+    signature: Option<PathBuf>,
+    requested: Arc<Mutex<Vec<String>>>,
+}
+
+impl PackageFetcher for ServingFetcher {
+    fn fetch(&self, url: &str, destination: &Path) -> Result<(), PackageError> {
+        self.requested
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(url.to_owned());
+        let payload = if url.ends_with(".sig") {
+            self.signature
+                .as_ref()
+                .ok_or_else(|| PackageError::SourceUnavailable(format!("{url} is not published (404)")))?
+        } else {
+            &self.archive
+        };
+        fs::copy(payload, destination)?;
         Ok(())
     }
 }
@@ -433,6 +465,148 @@ fn an_unsigned_native_binary_is_marked_on_the_installed_plugin_and_stays_marked_
         .find(|plugin| plugin.id == "dev.example.signed")
         .expect("the signed plugin is listed");
     assert!(!signed_listed.unsigned_binary);
+}
+
+/// The provenance policy an operator configured has to reach the installer.
+///
+/// `unsigned_binary` above is a shape marker — "this package ships an
+/// executable with no `bin/<name>.sig` beside it" — and answers nothing about
+/// who produced the bytes. This is the other question: under
+/// [`UnsignedPolicy::Refuse`], a native archive with no `<package>.sig` must
+/// not be installed at all, and one signed by a key the operator trusts must.
+#[test]
+fn a_native_archive_with_no_detached_signature_is_refused_under_the_default_policy() {
+    let scratch = Scratch::new("provenance");
+    let directories = scratch.directories();
+    let source = write_native_source(&scratch, "native", "dev.example.provenance", "1.0.0", b"payload");
+    let archive = build_native_archive(&scratch, &source, "provenance.crikeypkg");
+
+    let mut installer = PluginInstaller::new(&directories).with_signature_policy(SignaturePolicy::enforced(
+        UnsignedPolicy::Refuse,
+        TrustStore::empty(),
+    ));
+    let refusal = installer
+        .install(&InstallSource::Archive(archive.clone()), &mut |_plugin| Ok(()))
+        .expect_err("an unsigned archive is refused under `refuse`");
+    assert!(
+        matches!(refusal, PackageError::Signature(SignatureError::Unsigned { .. })),
+        "expected an unsigned-package refusal, got {refusal}"
+    );
+    assert!(
+        entries(&directories.plugin_dir(PluginKind::Native)).is_empty(),
+        "a refused package must leave nothing installed"
+    );
+
+    // A signature by a key nobody trusts is a refusal too, and a different one:
+    // an installer that accepted the key shipped in the `.sig` would be trusting
+    // whoever wrote the package.
+    let key = PackageSigningKey::generate().expect("entropy");
+    sign_package(&archive, &key, &signature_path_for(&archive)).expect("the fixture signs");
+    let untrusted = installer
+        .install(&InstallSource::Archive(archive.clone()), &mut |_plugin| Ok(()))
+        .expect_err("an unknown signer is refused");
+    assert!(
+        matches!(
+            untrusted,
+            PackageError::Signature(SignatureError::UntrustedSigner { .. })
+        ),
+        "expected an untrusted-signer refusal, got {untrusted}"
+    );
+    assert!(entries(&directories.plugin_dir(PluginKind::Native)).is_empty());
+
+    let mut trusting = TrustStore::empty();
+    trusting
+        .add("publisher", key.public_key())
+        .expect("a first key is trusted");
+    let mut installer = PluginInstaller::new(&directories)
+        .with_signature_policy(SignaturePolicy::enforced(UnsignedPolicy::Refuse, trusting));
+    let installed = install(&mut installer, InstallSource::Archive(archive));
+    assert_eq!(installed.id, "dev.example.provenance");
+    assert!(installed.root.join("bin").join(BINARY_NAME).is_file());
+}
+
+/// A source directory is the one native install the policy cannot govern.
+///
+/// The archive is built by the install call itself, milliseconds before it is
+/// read, so no publisher could ever have signed it; refusing it would ban
+/// source-tree installs rather than establish provenance. ADR-0012 records the
+/// split, and this pins it, because the alternative — a `refuse` default that
+/// silently makes `crikey plugin install ./my-plugin` impossible — is exactly
+/// the failure a reader of the ADR would otherwise have to discover by hand.
+#[test]
+fn a_native_source_directory_still_installs_under_the_refusing_default() {
+    let scratch = Scratch::new("provenance-directory");
+    let directories = scratch.directories();
+    let source = write_native_source(&scratch, "native", "dev.example.tree", "1.0.0", b"payload");
+
+    let mut installer = PluginInstaller::new(&directories).with_signature_policy(SignaturePolicy::enforced(
+        UnsignedPolicy::Refuse,
+        TrustStore::empty(),
+    ));
+    let installed = install(&mut installer, InstallSource::Directory(source));
+    assert_eq!(installed.id, "dev.example.tree");
+    assert!(installed.root.join("bin").join(BINARY_NAME).is_file());
+}
+
+/// A URL install fetches the sibling `<url>.sig`, or it is unsigned.
+///
+/// Provenance is decided from what sits beside the package *on disk*, so a URL
+/// install that fetched only the archive could never be anything but unsigned
+/// however carefully the publisher signed it. Both halves are pinned here: the
+/// sidecar is requested and honoured, and a publisher who serves none produces
+/// a refusal under the default rather than a silent `Unchecked`.
+#[test]
+fn a_url_source_fetches_and_honours_the_sibling_signature() {
+    let scratch = Scratch::new("url-signature");
+    let directories = scratch.directories();
+    let source = write_native_source(&scratch, "native", "dev.example.urlsig", "1.0.0", b"fetched");
+    let archive = build_native_archive(&scratch, &source, "urlsig.crikeypkg");
+    let key = PackageSigningKey::generate().expect("entropy");
+    let detached = scratch.join("urlsig.crikeypkg.sig");
+    sign_package(&archive, &key, &detached).expect("the fixture signs");
+    let mut trusting = TrustStore::empty();
+    trusting
+        .add("publisher", key.public_key())
+        .expect("a first key is trusted");
+
+    const URL: &str = "https://example.invalid/packages/plugin.crikeypkg";
+    let requested = Arc::new(Mutex::new(Vec::new()));
+    let served = |sidecar: Option<PathBuf>| ServingFetcher {
+        archive: archive.clone(),
+        signature: sidecar,
+        requested: Arc::clone(&requested),
+    };
+
+    let mut installer =
+        PluginInstaller::with_fetcher(&directories, Box::new(served(Some(detached)))).with_signature_policy(
+            SignaturePolicy::enforced(UnsignedPolicy::Refuse, trusting.clone()),
+        );
+    let installed = install(&mut installer, InstallSource::Url(URL.to_owned()));
+    assert_eq!(installed.id, "dev.example.urlsig");
+    assert_eq!(
+        requested
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_slice(),
+        [URL.to_owned(), format!("{URL}.sig")],
+        "the archive and its sibling signature are both requested, in that order"
+    );
+
+    // The same package from a publisher who never signed it: the sidecar 404s,
+    // and the policy — not a transport error, and not `Unchecked` — decides.
+    requested
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    let mut installer = PluginInstaller::with_fetcher(&directories, Box::new(served(None)))
+        .with_signature_policy(SignaturePolicy::enforced(UnsignedPolicy::Refuse, trusting));
+    let refusal = installer
+        .install(&InstallSource::Url(URL.to_owned()), &mut |_plugin| Ok(()))
+        .expect_err("a URL with no published signature is refused under `refuse`");
+    assert!(
+        matches!(refusal, PackageError::Signature(SignatureError::Unsigned { .. })),
+        "a missing sidecar is an unsigned package, not a transport failure: {refusal}"
+    );
 }
 
 #[test]

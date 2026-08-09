@@ -310,6 +310,11 @@ fn inspect(options: Options) -> Result<Report, String> {
         arguments: Vec::new(),
         working_dir,
         environment: options.environment.clone(),
+        // `inspect` is a diagnostic harness, not a manifest-governed load, so
+        // it takes the same stripped environment a plugin with no
+        // `permissions.environment` grant would get: what it reports must be
+        // what the launcher would actually do.
+        inherit_environment: false,
     };
     let mut worker_options = WorkerOptions::new();
     worker_options.transport = options.transport;

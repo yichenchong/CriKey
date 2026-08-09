@@ -215,7 +215,7 @@ Status snapshot (2026-07-30):
   registers them with `QueryPipeline` under `PluginPolicy::legacy_strict()`, and
   drives them on a dedicated supervisor thread, so the UI thread never blocks on
   a plugin and a late answer cannot surface under a newer generation.
-- The compatibility matrix (114 rows) and the referenced plugin corpus (11
+- The compatibility matrix (115 rows) and the referenced plugin corpus (11
   packages, never vendored) are parsed and asserted as typed data, and
   `crikey dev compatibility-report` publishes their classification.
 - Verification: 183 M3 tests pass with warnings denied — 167 across nine
@@ -253,8 +253,9 @@ have aggregate deadlines and byte/item caps; plugin faults, crashes, stale
 generations, and cooperative cancellation remain contained at the worker
 boundary.
 
-Evidence on Linux: the current workspace baseline is 1268 tests passing with
-warnings denied, and the M4 integration suite proves conflicting managed
+Evidence on Linux, as measured when this milestone closed: the workspace
+baseline was 1268 tests passing with warnings denied, and the M4 integration
+suite proves conflicting managed
 dependency versions, crash containment, cancellation followed by worker reuse,
 catalog-error diagnostics, and distinct same-environment plugins. A live
 `crikey dev run` and `crikey dev test` smoke against
@@ -288,8 +289,9 @@ which drives ONE supervised plugin built from `compatibility/native-conformance`
 lifecycle and checks the child pid differs from the host's and changes across
 the restart.
 
-Evidence on Linux: the current workspace baseline is 1268 tests passing with
-warnings denied, and the native integration suite proves the conformance
+Evidence on Linux, as measured when this milestone closed: the workspace
+baseline was 1268 tests passing with warnings denied, and the native integration
+suite proves the conformance
 lifecycle. Windows and macOS runtime behavior is not verified on this host;
 their compile checks are tracked under M6. Live smoke: `crikey dev
 inspect-protocol` against the out-of-tree plugin reports `verdict=conformant`
@@ -323,6 +325,32 @@ non-empty action category set containing both
 `ExecutionPolicy::Plugin`; it asserts all fields after the subprocess
 round-trip.
 
+One further defect of the same "the mechanism does not mean what it reads
+like" class was found later, in the orphan guard itself. `PR_SET_PDEATHSIG`
+is THREAD-scoped: Linux delivers the signal when the thread that cloned the
+child exits, not when the parent process does. The host armed it from
+`NativeWorker::spawn`, which runs on the provider's short-lived per-query
+dispatch thread, so every native worker was `SIGKILL`ed the moment the query
+that happened to start it finished. The first query answered, the second found
+a dead child, and the third onwards burned restart budget until the circuit
+breaker opened with "restart budget or circuit breaker is open" — a
+plugin-blaming diagnostic for a host bug. Deleting the guard would have traded
+a live defect for a silent loss of §24.3, so instead one long-lived
+`crikey-native-spawner` thread now owns every `fork`/`exec`; it can only exit
+with the process, which is exactly the lifetime the death signal is meant to
+track. Defended by `a_worker_survives_the_thread_that_spawned_it`, which
+spawns from a thread it then joins, and by
+`native_healthy_worker_survives_repeated_queries` at the provider level.
+
+The five `killpg` call sites (the native, Python and legacy hosts, plus the two
+interpreter probes) now refuse a pgid of 0 or 1. No caller can reach that
+today — each passes a live `Child::id()` and every kill precedes its reap, so
+the pid cannot have been recycled — but `killpg(0)` signals the launcher's own
+process group, which on a developer machine is the shell and its login session.
+That failure is unrecoverable and indistinguishable after the fact from an
+unrelated crash, so it is refused at the syscall boundary rather than argued
+about at each call site.
+
 Verification limits, honestly: the Windows named-pipe transport, job-object
 limits and `DuplicateHandle` cloning are compile-verified only — this host
 cannot run them. §24.2 startup recovery and safe mode were carried to M6 and
@@ -345,10 +373,8 @@ explicit live integration of those backends.
   Windows contract, and a reader thread delivering activations. Delivery is
   proven by synthetic XTEST key presses against a real Xvfb server, not
   asserted by construction. The backend is reachable through
-  `LinuxBackend::hotkeys()` and `App::register_activation_hotkey`, but the
-  current `crikey run` entry point registers the live global shortcut only
-  under its Windows configuration. Linux live activation registration remains
-  open.
+  `LinuxBackend::hotkeys()` and `App::register_activation_hotkey`; `crikey run`
+  registers the live global shortcut under both Windows and Linux/X11.
 - **Linux window control (§18.1).** A `WindowService` trait plus an EWMH
   `X11WindowService`: a three-part handshake (typed `_NET_SUPPORTED` atom list,
   required hints present, two-sided `_NET_SUPPORTING_WM_CHECK`), enumeration
@@ -386,16 +412,18 @@ constructed outside its own test, `is_portable` with no caller, and
 Windows-only. Also found: a quadratic entity decoder in the plist parser (a
 1 MiB bundle took 338 s, now 412 ms), a hotkey `Drop` that hung forever when
 its wake window was destroyed, an unbounded journal read, a shared staging
-filename, and an enumeration test that pinned the wrong behaviour. The
-backend and capability defects were partly corrected. Linux live shortcut
-registration remains open. The catalog persistence wiring was open at that
+filename, and an enumeration test that pinned the wrong behaviour. The backend
+and capability defects were partly corrected. Linux live shortcut
+registration is now wired into `crikey run` under X11 and is exercised by the
+live XTEST delivery tests. The catalog persistence wiring was open at that
 point and has since been closed: `crikey run` now constructs the cache, loads
 slices at startup and writes a completed catalog, covered by an end-to-end test.
 The other fixes are defended by tests.
 
 Evidence at that point: 1166 tests passed on Linux with warnings denied. A
 later full-repository audit round raised this to 1268 tests, also with warnings
-denied and stable across three consecutive runs. Windows and macOS runtime
+denied and stable across three consecutive runs. Both figures are snapshots of
+the suite as it stood then, not of the current one. Windows and macOS runtime
 behaviour is still not verified on this host; the compile checks are reported
 separately below.
 
@@ -468,10 +496,10 @@ Deliberately not built, with the reason rather than an omission:
 | --- | --- |
 | Per-plugin stop across processes (§23.3) | `crikey plugin install` and `crikey run` are separate processes with no IPC. Instead the launcher holds an OS-level exclusive lock for its lifetime and install acquires the same lock for the whole replacement, so a live launcher refuses the install rather than replacing files underneath it. A pid sentinel was rejected: it races with a launcher starting after the check |
 | A manifest field naming a runtime profile | `requires-python` already states the portable constraint. A profile field would either name an absolute interpreter path — a plugin author dictating host layout — or repeat what the host must decide anyway. `CRIKEY_PYTHON` remains the operator override |
-| Plugin-supplied icons | Neither a modern plugin's package-relative reference nor the native protocol's `ResourceRequest`/`Kind::Icon` has a resolver. The host still answers `found: false` |
 | Native and legacy background budgets | No background-task API exists in either protocol. §13.5's background budget applies to the modern Python runtime, which is the only runtime that has the concept |
 
-Verification: 1637 tests pass with warnings denied; clippy, fmt, and the
+Verification, as measured when this milestone closed: 1637 tests passed with
+warnings denied; clippy, fmt, and the
 Windows and macOS cross-target checks are clean. Smoke-tested end to end
 against the real binary: install, list, disable, `config get` resolving a
 profile layer over user-global, `doctor` reporting all four budgets, and
@@ -484,16 +512,110 @@ this host. CI is unaffected — it builds natively on three runners — and the
 cross-target gate is still run over every crate that contains platform-specific
 code, which is where cross-target defects occur.
 
-### M7 — Capability completion and ecosystem — in progress
+### M7 — Capability completion and ecosystem — done
 
-This milestone closes capabilities that are currently declaration-only or
-unavailable: permission enforcement, live performance/deadline policy,
-history/context-backed ranking, Linux composition input, plugin-supplied icon
-resolution, and background-task APIs for runtimes that expose them. It also
-retains the optional ecosystem work previously listed here: WebAssembly,
-signed packages, a public plugin index, restricted C ABI, advanced sandboxing,
-and shared-memory transport. Each capability requires an implementation,
-integration coverage, and a truthful runtime report.
+The first implementation audit found several manifest and runtime capabilities
+that were parsed or declared but not consumed. The following are now wired:
+
+- Manifest process permission is enforced at the host-mediated action boundary
+  for every provider — modern, native and legacy — per owner, through one
+  `PluginActionRouter::authorize` seam. A legacy package declares nothing, so
+  the host applies an explicit compatibility baseline instead of skipping the
+  check, and `crikey plugin doctor` prints that posture.
+- The manifest filesystem permission is enforced at the one filesystem read the
+  host performs for a plugin: its own package directory, for icons and other
+  package resources. `permissions.environment` decides whether a spawned native
+  or modern-Python child inherits the ambient environment or the stripped one.
+  `permissions.network-listener` is refused at parse time, because nothing in
+  this host can grant an inbound socket. The six permissions that describe work
+  the plugin's own process does — clipboard, window enumeration, window
+  control, notifications, secrets, native-library loading — are named with a
+  reason by `Manifest::unhonoured_declarations`, since the host performs none of
+  them and therefore has nothing to decline (§20.2).
+- Python background execution and network-backed query policy are also enforced
+  where those APIs exist.
+- Manifest soft and hard suggestion deadlines, result limits, startup mode, and
+  per-lifecycle concurrency limits reach the live providers and supervisor.
+- Selection history, recency/frequency, query-specific history, context, and
+  user preference feed the ranking path.
+- Plugin-supplied icons resolve package-relative modern references and native
+  `ResourceRequest`/`Kind::Icon` responses asynchronously, with bounded reads
+  and memoized decoded pixels.
+
+The capability evidence that was open here is now closed:
+
+- **Live Linux IME evidence.** `crates/crikey-ui/tests/ime_x11.rs` drives the
+  shipped `NativeLauncher` under a private Xvfb and types a real
+  `Multi_key a e` compose sequence through XTEST. Writing it found a real
+  defect: `egui-winit` 0.29 discards every `WindowEvent::Ime` on Linux
+  (egui #5008), so a composed character never reached the query at all. The
+  Linux branch now forwards `Ime::Commit` into egui, anchored with
+  `ImeEvent::Enabled` because egui refuses a commit whose caret left the
+  composition anchor and X11 sends only `Preedit("", None)` beforehand. Live
+  coverage is commit plus the empty preedit; a non-empty preedit is unit-level
+  only, because Xlib's built-in input method — the only one on this host —
+  never emits one. Both mutations of the fix were shown to fail the live test.
+
+The ecosystem work that was listed as remaining is built, each with its own
+decision record: WebAssembly (ADR-0014, `crikey-wasm-host` plus the
+out-of-workspace `compatibility/wasm-conformance` guest), the restricted C ABI
+(ADR-0015, `crikey-cabi-host` plus `compatibility/cabi-conformance`), signed
+packages (ADR-0012), the signed plugin index and its client (ADR-0013),
+Wayland global shortcuts through the portal (ADR-0011), and remote catalog
+sources (ADR-0016).
+
+Advanced sandboxing is built and deliberately narrow (ADR-0019). Every
+supervised plugin child on Linux — native, WASM, C-ABI, modern Python and
+legacy — is confined with Landlock before it executes: it may write only
+beneath the directories the host named for it, and a manifest without the
+`network` grant has TCP `bind`/`connect` refused by the kernel. Reads,
+execution, UDP, Unix sockets and syscalls are NOT restricted, and Windows and
+macOS install nothing equivalent; the Windows job object remains a resource
+limit, not a sandbox. `crikey plugin doctor` prints the posture per plugin and
+`CRIKEY_PLUGIN_SANDBOX=off` disables it. Evidence: 13 tests in
+`crikey-sandbox` spawn real children and observe the kernel's answer —
+a write outside the allowlist fails while the same write from the parent
+succeeds, deletes and renames are refused, reads still work, a grandchild
+inherits the confinement, and a TCP client is refused where an otherwise
+identical one connects.
+
+Shared-memory transport has left that list without being built. ADR-0004
+deferred it behind a profiling gate, and `benchmarks/transport/native_transport_probe.rs`
+now measures that gate: the shipping length-delimited transport is 2.7–3.0 % of
+what a 500,000-item catalog costs end to end, and a shared region can return at
+most 1.5–1.8 % of it. ADR-0017 upholds the deferral and names the numbers that
+would reopen it.
+
+The background-task concern is closed after re-reading the specification rather
+than inventing an API. Spec 15.8 places background-task registration in the
+*modern Python runtime*, and spec 20.2 defers permission enforcement generally.
+No native background-task API is owed, and adding one would have meant new
+protocol payloads for a capability nothing asks for. What was real is narrower
+and is the audits' recurring shape: `permissions.background-execution` parses
+on every runtime and has exactly one consumer, so on a native manifest it read
+like a granted capability while granting nothing. `Manifest::unhonoured_declarations`
+now names such declarations and `crikey plugin doctor` prints them as a note —
+a report, not a defect, since the plugin is healthy and only that line is inert.
+This also gives the previously test-only reporting seam a production consumer.
+
+### M7.5 — Distribution — done
+
+One script per platform produces every artefact from one staged tree, so the
+four Linux formats cannot disagree about what an installation contains:
+`packaging/linux/build.sh` (staged tree, tarball, `.deb`, `.rpm`, and a Flatpak
+built from the repository source inside the freedesktop SDK), plus
+`packaging/windows/build.ps1` (MSI via WiX, MSIX) and `packaging/macos/build.sh`
+with its notarisation and distribution helpers. Every artefact carries
+`LICENSE` and `NOTICE.md` (§14.13), installs both supervised runtime hosts
+beside the launcher, and stages the modern SDK and legacy shim where the
+resolvers look — checked by 52 shell contracts in
+`packaging/linux/tests/build.test.sh` and 12 declaration tests in
+`crates/crikey-cli/tests/packaging_artefacts.rs`.
+
+Verification limits: `flatpak-builder`, `dpkg-shlibdeps`-less hosts, WiX and
+`pwsh` are not installed here, so the Flatpak target was exercised with a
+capturing builder stub and a real relocatable Python fixture, and the Windows
+packagers are gated by a PowerShell parser check in CI rather than by a build.
 
 ### M8 — Platform runtime verification — planned
 
@@ -522,6 +644,8 @@ graph LR
   M4 --> M6
   M5 --> M6
   M6 --> M7[M7 ecosystem]
+  M7 --> M75[M7.5 distribution]
+  M75 --> M8[M8 platform runtime verification]
 ```
 
 M3, M4 and M5 are independent once M2 lands: they share only the protocol and
@@ -572,10 +696,17 @@ Tracked as ADRs. Provisional ones carry an explicit revisit trigger.
 | [0001](adr/0001-workspace-layout.md) | Workspace layout and dependency direction | Accepted |
 | [0002](adr/0002-ui-stack.md) | UI stack: winit + wgpu with an egui widget layer | Accepted (revisit if warm activation misses 30 ms p95) |
 | [0003](adr/0003-concurrency-model.md) | Threading and async model | Accepted |
-| [0004](adr/0004-plugin-ipc.md) | Protobuf wire format and local transports (encoding amended by ADR-0010) | Accepted, amended |
+| [0004](adr/0004-plugin-ipc.md) | Protobuf wire format and local transports (encoding amended by ADR-0010; shared-memory deferral upheld by ADR-0017) | Accepted, amended |
 | [0005](adr/0005-python-hosting.md) | Out-of-process CPython workers, no in-process interpreter | Accepted |
 | [0006](adr/0006-legacy-scheduling.md) | Obsolete-work replacement for `legacy-strict` | Accepted |
 | [0007](adr/0007-path-representation.md) | Lossless platform paths across IPC | Accepted |
 | [0008](adr/0008-catalog-persistence.md) | Versioned per-plugin catalog archive with owned decode | Accepted for M1; production integration landed |
 | [0009](adr/0009-branding-and-attribution.md) | Branding and attribution rules | Accepted |
 | [0010](adr/0010-protobuf-codec.md) | Hand-written proto3 codec instead of generated bindings | Accepted; amends ADR-0004 |
+| [0011](adr/0011-wayland-backend.md) | Wayland global shortcuts through the `GlobalShortcuts` portal; window control stays unsupported | Accepted |
+| [0012](adr/0012-package-signing.md) | Ed25519 detached signatures over a canonical member manifest, an operator-curated trust store, and an unsigned-package policy defaulting to `refuse` | Accepted |
+| [0013](adr/0013-plugin-index.md) | Signed JSON plugin index; client, cache and commands only, no hosted service and no default index URL | Accepted |
+| [0014](adr/0014-wasm-runtime.md) | Out-of-process WebAssembly runtime using wasmi; fuel plus supervisor watchdog enforce deadlines | Accepted |
+| [0015](adr/0015-restricted-c-abi.md) | Restricted C-ABI libraries load only in supervised `crikey-cabi-host`; the launcher never loads third-party native libraries | Accepted |
+| [0016](adr/0016-remote-indexing.md) | Remote catalog sources are ordinary per-owner slices: catalog-archive documents fetched off the query path, digest- and optionally signature-verified, no source configured by default | Accepted |
+| [0017](adr/0017-shared-memory-transport.md) | Shared-memory transport stays deferred; ADR-0004's profiling gate measured at 2.7–3.0 % of a 500k catalog transfer and not met | Rejected for v1 (reopen below ~400 MB/s local IPC, or once encode+decode for 500k drops under ~200 ms) |

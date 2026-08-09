@@ -1,0 +1,363 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  CriKey per-user MSI, WiX v4 (WixToolset.Sdk / the `wix` dotnet tool).
+
+  WHY v4 AND NOT v3
+  =================
+  v3 is in maintenance and needs candle.exe and light.exe from a machine-wide
+  installer; v4 is a `dotnet tool` the build script can install into the
+  repository and pin. The `Files` harvesting element used below for the two
+  Python payload trees is also v4-only: under v3 the same job needs `heat.exe`
+  to generate a fragment on every build, and a generated fragment that nobody
+  reviews is exactly where an unwanted file gets shipped from.
+
+  WHY PER-USER
+  ============
+  Scope="perUser" installs under %LOCALAPPDATA%\Programs\CriKey, needs no
+  elevation, and matches where the launcher's own data already lives
+  (`StandardDirectories::windows` puts config in %APPDATA%\CriKey and cache in
+  %LOCALAPPDATA%\CriKey). A launcher is a per-user tool: it registers a global
+  hotkey for one desktop session, discovers that user's Start Menu, and runs
+  that user's plugins. There is nothing in it a machine-wide install would
+  share, and asking for an administrator prompt to get it buys the user
+  nothing.
+
+  WHAT VALIDATION SAYS ABOUT THAT, AND WHY IT IS STILL PER-USER
+  =============================================================
+  `wix build`, the .NET tool this repository drives, does not run ICE
+  validation: only an MSBuild .wixproj validates automatically, and the .NET
+  tool exposes validation as the separate `wix msi validate` subcommand
+  (https://docs.firegiant.com/wix/tools/validation/). The build below
+  therefore produces an .msi as written. `build.ps1 -Validate` runs that
+  subcommand afterwards, and it names two suppressions, because two ICEs
+  describe a package this one cannot be:
+
+    * ICE38 wants every component installed under the user profile keyed on an
+      HKCU registry value rather than on a file, so that repairing one user's
+      install cannot lay files into another user's profile. Every component
+      authored by hand below now is — the same rule StartMenuShortcut already
+      followed, applied to the six file components too. The components the
+      `Files` element generates for the Python trees cannot be: WiX gives each
+      generated component a File key path and offers no way to supply a
+      registry one. Suppressing ICE38 covers only those, and a perUser package
+      has exactly one profile for a repair to reach into.
+
+    * ICE64 wants every directory created in the user profile listed in the
+      RemoveFile table. The four this file creates are listed, in
+      InstallFolderRemoval below. The subdirectories the harvested trees bring
+      with them are not, because their names are not known here. The concern
+      ICE64 encodes is a per-machine install seeding directories into profiles
+      it will never clean up; this package installs into one profile and
+      removes what it put there.
+
+  The alternative WiX recommends — Scope="perUserOrMachine" under
+  ProgramFiles6432Folder — is ICE-clean, and it is deliberately not taken. It
+  makes the default install a machine-wide one behind a UAC prompt, and it
+  moves the App Paths key and the PATH entry to HKLM for a program whose
+  hotkey, Start Menu view and plugins all belong to one user. Buying silence
+  from a lint that does not describe this package with an elevation prompt the
+  user gains nothing from is the wrong trade.
+
+  WHY THE PAYLOAD DIRECTORIES AND SUPERVISED HOSTS ARE NOT OPTIONAL
+  ================================================================
+  `sdk_root()` and `shim_root()` look for the Python trees beside the running
+  executable. The WASM and C-ABI providers likewise look for
+  `crikey-wasm-host.exe` and `crikey-cabi-host.exe` beside the launcher and
+  never search PATH. An install that omits any of these leaves a runtime
+  unavailable only when that plugin type is invoked, so all four executables
+  and both payload trees are in the always-installed feature.
+
+  WHAT UNINSTALL REMOVES, AND WHAT IT DOES NOT
+  ============================================
+  Removes: everything under %LOCALAPPDATA%\Programs\CriKey that this package
+  installed and the directories it created to hold it, the Start Menu folder
+  and shortcut, the App Paths registration, and the per-user PATH entry
+  (Part="last", Permanent="no", so the value is removed from PATH and the rest
+  of PATH is left as found).
+
+  Deliberately keeps: %APPDATA%\CriKey (configuration, plugin state, the
+  startup journal) and %LOCALAPPDATA%\CriKey (icon and catalog caches). No
+  RemoveFile, RemoveFolder or RemoveRegistryKey element in this file names
+  either path, and none names %LOCALAPPDATA%\Programs either, which every
+  other per-user install on the machine shares. Uninstalling a launcher and
+  reinstalling it must not silently discard the user's configured plugins and
+  hotkeys; a user who wants that gone can delete two directories, and a user
+  who did not want it gone cannot get it back.
+
+  BUILD
+  =====
+    wix build packaging\windows\crikey.wxs -d Version=0.1.0 -d StageDir=<stage>
+  StageDir must contain crikey.exe, crikey-launcher.exe, crikey-wasm-host.exe,
+  crikey-cabi-host.exe, LICENSE.txt, NOTICE.md, modern-sdk\ and legacy-shim\,
+  and python-runtime\ when -d PythonRuntime=1 is also passed.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="CriKey"
+      Manufacturer="The CriKey Authors"
+      Version="$(var.Version)"
+      UpgradeCode="D5DB5199-A3AB-4B97-80BC-199D68D4839E"
+      Scope="perUser"
+      Compressed="yes"
+      Codepage="65001">
+
+    <!--
+      An upgrade replaces the previous version in place. Scheduled after
+      InstallValidate so the old files are removed before the new ones are laid
+      down, which avoids the case where a file that was dropped between
+      versions survives into the new install.
+    -->
+    <MajorUpgrade
+        Schedule="afterInstallValidate"
+        DowngradeErrorMessage="A newer version of CriKey is already installed. Uninstall it first if you really want this older one." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!--
+      Add/Remove Programs metadata. No ARPPRODUCTICON: no icon is checked into
+      this repository, and pointing the entry at an icon that is not there
+      produces a broken entry rather than the default one.
+    -->
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/crikey-launcher/crikey" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <!--
+        %LOCALAPPDATA%\Programs is the convention Windows itself uses for
+        per-user application installs. Note that it is a sibling of, not the
+        same as, %LOCALAPPDATA%\CriKey, which holds the cache the uninstaller
+        leaves behind.
+      -->
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="CriKey">
+          <Directory Id="ModernSdkFolder" Name="modern-sdk" />
+          <Directory Id="LegacyShimFolder" Name="legacy-shim" />
+<?ifdef PythonRuntime ?>
+          <Directory Id="PythonRuntimeFolder" Name="python-runtime" />
+<?endif?>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ShortcutFolder" Name="CriKey" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="CriKey" Level="1" AllowAbsent="no">
+      <ComponentGroupRef Id="Executable" />
+      <ComponentGroupRef Id="Legal" />
+      <ComponentGroupRef Id="ModernSdk" />
+      <ComponentGroupRef Id="LegacyShim" />
+<?ifdef PythonRuntime ?>
+      <ComponentGroupRef Id="PythonRuntime" />
+<?endif?>
+      <ComponentGroupRef Id="Registration" />
+    </Feature>
+
+    <!--
+      Four executables, in one directory. `crikey.exe` is the console
+      command line; `crikey-launcher.exe` is the graphical entry point; the
+      other two are supervised runtime workers selected by the WASM and C-ABI
+      providers. All providers resolve their worker beside the running
+      executable and never search PATH.
+
+      Each component is keyed on an HKCU value rather than on its file. That
+      is the per-user rule the header records for ICE38, and it is the same
+      one StartMenuShortcut follows: a component installed into the user's
+      profile and keyed on a file there is reinstalled by repair for every
+      other user of the machine. A registry key path also means an explicit
+      component GUID, because WiX only generates one for a file key path.
+    -->
+    <ComponentGroup Id="Executable" Directory="INSTALLFOLDER">
+      <Component Id="CrikeyExecutable" Guid="C059B4CD-53BF-4EF9-A016-7DD26C5C0810">
+        <File Id="CrikeyExe" Source="$(var.StageDir)\crikey.exe" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\CriKey\Installed"
+                       Name="CrikeyExecutable"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+      <Component Id="CrikeyLauncherExecutable" Guid="F842C361-F5E7-4B63-80FD-94ED55428A1F">
+        <File Id="CrikeyLauncherExe" Source="$(var.StageDir)\crikey-launcher.exe" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\CriKey\Installed"
+                       Name="CrikeyLauncherExecutable"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+      <Component Id="CrikeyWasmHostExecutable" Guid="C1D48A63-EEF6-4485-9246-3080E72A2C2E">
+        <File Id="CrikeyWasmHostExe" Source="$(var.StageDir)\crikey-wasm-host.exe" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\CriKey\Installed"
+                       Name="CrikeyWasmHostExecutable"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+      <Component Id="CrikeyCAbiHostExecutable" Guid="727C10DC-A529-43F1-A22E-579DF6BC3796">
+        <File Id="CrikeyCAbiHostExe" Source="$(var.StageDir)\crikey-cabi-host.exe" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\CriKey\Installed"
+                       Name="CrikeyCAbiHostExecutable"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!--
+      Spec 14.13: the licence and the attribution notice ship with the artefact.
+      LICENSE has no extension in the repository and is renamed on the way in,
+      because a Windows user who double-clicks an extensionless file gets the
+      "how do you want to open this" dialog instead of the licence.
+    -->
+    <ComponentGroup Id="Legal" Directory="INSTALLFOLDER">
+      <Component Id="LicenseFile" Guid="7E46121A-E02B-4B28-9DF8-DEDB6E38F02E">
+        <File Id="LicenseTxt" Source="$(var.StageDir)\LICENSE.txt" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\CriKey\Installed"
+                       Name="LicenseFile"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+      <Component Id="NoticeFile" Guid="0AEBB15A-11AD-4A43-A8C1-5BE2A32BF1C6">
+        <File Id="NoticeMd" Source="$(var.StageDir)\NOTICE.md" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\CriKey\Installed"
+                       Name="NoticeFile"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!--
+      Harvested rather than listed. These two trees are the Python worker
+      entry points and the compatibility shim; their file lists change whenever
+      the shim grows a module, and a hand-maintained list that falls one file
+      behind produces an install that fails only when a plugin happens to
+      import the missing module.
+
+      The base directory of each Include is the path before the first wildcard,
+      so relative subdirectories are preserved under the target folder.
+      build.ps1 stages these directories with __pycache__ already removed:
+      bytecode compiled by whatever interpreter last ran in the source tree is
+      stale on a user's machine.
+    -->
+    <ComponentGroup Id="ModernSdk" Directory="ModernSdkFolder">
+      <Files Include="$(var.StageDir)\modern-sdk\**" />
+    </ComponentGroup>
+
+    <ComponentGroup Id="LegacyShim" Directory="LegacyShimFolder">
+      <Files Include="$(var.StageDir)\legacy-shim\**" />
+    </ComponentGroup>
+
+<?ifdef PythonRuntime ?>
+    <!--
+      Only present when build.ps1 was given a python-build-standalone archive.
+      Without it CriKey falls back to an interpreter already on the machine;
+      the installer does not claim to provide one it did not stage.
+    -->
+    <ComponentGroup Id="PythonRuntime" Directory="PythonRuntimeFolder">
+      <Files Include="$(var.StageDir)\python-runtime\**" />
+    </ComponentGroup>
+<?endif?>
+
+    <ComponentGroup Id="Registration">
+      <!--
+        The shortcut targets `crikey-launcher.exe` and passes no arguments.
+        `crikey.exe` is the console CLI — bare, it prints usage and exits, and
+        being a console-subsystem binary it would also flash a console window
+        beside the launcher. `crikey-launcher.exe` is the GUI-subsystem entry
+        point from the same crate (crates/crikey-cli/src/bin/crikey-launcher.rs)
+        and does neither.
+      -->
+      <Component Id="StartMenuShortcut" Directory="ShortcutFolder" Guid="2C96F878-CBB7-49CF-AF9E-47A02704ACFD">
+        <Shortcut Id="CrikeyShortcut"
+                  Name="CriKey"
+                  Description="Keyboard launcher"
+                  Target="[#CrikeyLauncherExe]"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveShortcutFolder" Directory="ShortcutFolder" On="uninstall" />
+        <!--
+          A shortcut cannot be a component key path, so the component needs
+          one of its own. HKCU is also what makes this a valid per-user
+          component: a per-user component keyed on a file under the user's
+          profile is reinstalled by repair for every other user of the
+          machine.
+        -->
+        <RegistryValue Root="HKCU"
+                       Key="Software\CriKey\Installed"
+                       Name="StartMenuShortcut"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+
+      <!--
+        `App Paths` is how `Win+R` then `crikey` and ShellExecute find the
+        executable without touching PATH; the PATH entry is for a terminal.
+        Both are per-user (HKCU, System="no") to match the install scope, and
+        both are removed on uninstall: the registry key because MSI removes
+        registry values it created, the PATH fragment because Permanent="no"
+        and Part="last" mean the Environment table subtracts exactly what it
+        added.
+      -->
+      <Component Id="AppPathsRegistration" Directory="INSTALLFOLDER" Guid="2D043DA9-E0BA-4AE2-8B72-D0C5245213D8">
+        <RegistryValue Root="HKCU"
+                       Key="Software\Microsoft\Windows\CurrentVersion\App Paths\crikey.exe"
+                       Value="[#CrikeyExe]"
+                       Type="string"
+                       KeyPath="yes" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\Microsoft\Windows\CurrentVersion\App Paths\crikey.exe"
+                       Name="Path"
+                       Value="[INSTALLFOLDER]"
+                       Type="string" />
+      </Component>
+
+      <Component Id="PathEntry" Directory="INSTALLFOLDER" Guid="25AE5A80-A528-408F-8B86-D3D0B94CBA6F">
+        <Environment Id="UserPath"
+                     Name="PATH"
+                     Value="[INSTALLFOLDER]"
+                     Action="set"
+                     Part="last"
+                     System="no"
+                     Permanent="no" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\CriKey\Installed"
+                       Name="PathEntry"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+
+      <!--
+        The directories this package creates in the user's profile, listed so
+        that an uninstall does not leave an empty tree behind: that listing is
+        what ICE64 asks for, and Windows Installer removes each of these only
+        once it is already empty. ProgramsFolder is deliberately absent —
+        %LOCALAPPDATA%\Programs is shared with every other per-user install on
+        the machine — and so are %APPDATA%\CriKey and %LOCALAPPDATA%\CriKey,
+        which this package never created and must not delete.
+      -->
+      <Component Id="InstallFolderRemoval" Directory="INSTALLFOLDER" Guid="ABD5C77B-ADDE-4D70-84CB-BF076538415C">
+        <RemoveFolder Id="RemoveModernSdkFolder" Directory="ModernSdkFolder" On="uninstall" />
+        <RemoveFolder Id="RemoveLegacyShimFolder" Directory="LegacyShimFolder" On="uninstall" />
+<?ifdef PythonRuntime ?>
+        <RemoveFolder Id="RemovePythonRuntimeFolder" Directory="PythonRuntimeFolder" On="uninstall" />
+<?endif?>
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\CriKey\Installed"
+                       Name="InstallFolderRemoval"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Package>
+</Wix>

@@ -1194,6 +1194,14 @@ fn hostile_archive_path_spellings_are_refused_before_extraction() {
         ("backslash-entry", "lib\\outside.py"),
         ("windows-device-entry", "CON.txt"),
         ("trailing-dot-entry", "payload.py."),
+        // `PathBuf::push` on Windows REPLACES the accumulated path when the
+        // pushed component carries a drive prefix, so a drive-relative name
+        // extracts outside the cache root entirely.
+        ("drive-relative-entry", "C:evil.dll"),
+        ("drive-absolute-entry", "C:/evil.dll"),
+        // An NTFS alternate data stream writes bytes that no later reader of
+        // the visible file can see.
+        ("alternate-data-stream-entry", "payload.py:hidden"),
     ] {
         let tree = TempTree::new(label);
         let archive_path = tree.root("archived").join(archive_file_name(label));

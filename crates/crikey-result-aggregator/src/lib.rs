@@ -118,19 +118,26 @@ pub struct MemoryResultAggregator {
     /// The only generation whose batches may merge. `None` before the first
     /// `begin_generation`, and again once the active generation is retired.
     active: Option<Generation>,
-    /// Retained items, in first-acceptance order.
-    items: Vec<Item>,
-    /// Submitting plugin and stable id to their position in `items`.
-    index: HashMap<PluginId, HashMap<ItemId, usize>>,
-    /// Composite identities each submitting plugin caused to be retained this
-    /// generation. Enrichment of an existing identity consumes no extra quota.
+    /// Items retained by each plugin in the active generation.
     per_plugin: HashMap<PluginId, usize>,
+    /// Identity indexes grouped by owner.
+    index: HashMap<PluginId, HashMap<ItemId, usize>>,
+    /// Per-plugin result ceilings resolved from manifest performance policy.
+    plugin_limits: HashMap<PluginId, PluginResultLimits>,
+    /// Items retained in first-acceptance order.
+    items: Vec<Item>,
     /// Most recent accepted stream state for each plugin this generation.
     batch_states: HashMap<PluginId, BatchState>,
     /// At most one whole-list repaint is ever owed to the UI (spec 11.7).
     pending_ui_update: bool,
     /// Number of snapshots the UI may still take in the current frame.
     ui_updates_remaining: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PluginResultLimits {
+    max_items_per_batch: usize,
+    max_items_per_query: usize,
 }
 
 impl MemoryResultAggregator {
@@ -146,9 +153,31 @@ impl MemoryResultAggregator {
             items: Vec::new(),
             index: HashMap::new(),
             per_plugin: HashMap::new(),
+            plugin_limits: HashMap::new(),
             batch_states: HashMap::new(),
             pending_ui_update: false,
         }
+    }
+
+    /// Applies manifest-declared result ceilings to a registered plugin.
+    pub fn set_plugin_limits(
+        &mut self,
+        plugin: PluginId,
+        max_items_per_query: usize,
+        max_items_per_batch: usize,
+    ) {
+        self.plugin_limits.insert(
+            plugin,
+            PluginResultLimits {
+                max_items_per_batch: max_items_per_batch.max(1),
+                max_items_per_query: max_items_per_query.max(1),
+            },
+        );
+    }
+
+    /// Removes a plugin's manifest-derived result ceilings.
+    pub fn remove_plugin_limits(&mut self, plugin: &PluginId) {
+        self.plugin_limits.remove(plugin);
     }
 
     /// Makes `generation` the one mergeable generation and drops everything a
@@ -320,7 +349,11 @@ impl ResultAggregator for MemoryResultAggregator {
         {
             return Err(RejectReason::StreamTerminated);
         }
-        if items.len() > self.limits.max_items_per_batch {
+        let plugin_limits = self.plugin_limits.get(&plugin).copied();
+        let max_items_per_batch = plugin_limits.map_or(self.limits.max_items_per_batch, |limits| {
+            limits.max_items_per_batch
+        });
+        if items.len() > max_items_per_batch {
             return Err(RejectReason::QuotaExceeded);
         }
         self.validate_payloads(&plugin, &items)?;
@@ -338,9 +371,11 @@ impl ResultAggregator for MemoryResultAggregator {
             .len()
             .checked_add(new_identities)
             .ok_or(RejectReason::QuotaExceeded)?;
-        if plugin_total > self.limits.max_items_per_plugin_per_query
-            || query_total > self.limits.max_items_per_query
-        {
+        let max_items_per_query = plugin_limits
+            .map_or(self.limits.max_items_per_plugin_per_query, |limits| {
+                limits.max_items_per_query
+            });
+        if plugin_total > max_items_per_query || query_total > self.limits.max_items_per_query {
             return Err(RejectReason::QuotaExceeded);
         }
 

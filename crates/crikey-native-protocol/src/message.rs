@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 
 pub use crate::wire::UnknownFields;
 use crate::wire::{
-    decode_bytes, decode_field_varint, decode_string, expect_wire, push_decoded, put_bytes, put_message,
-    put_string, put_varint, read_field, DecodeBudget, WireType,
+    decode_bytes, decode_field_varint, decode_string, expect_wire, map_entry_charge, push_decoded, put_bytes,
+    put_message, put_string, put_varint, read_field, DecodeBudget, RepeatedFieldCharge, WireType,
+    DECODE_ALLOCATION_BUDGET,
 };
 use crate::{Message, ProtocolError, MAX_FRAME_BYTES};
 
@@ -563,6 +564,127 @@ impl_simple!(CatalogBatch {
     4 => value.error = Some(nested(field, budget)?),
 });
 
+// --- producer-side sizing -------------------------------------------------
+//
+// `MAX_FRAME_BYTES` is what a producer naturally sizes a batch against, and
+// for a batch of repeated messages it is the wrong number: the receiver's
+// `DECODE_ALLOCATION_BUDGET` is charged for heap, and one `Item` costs
+// hundreds of bytes of heap for a few dozen bytes of wire. A batch filled to
+// just under the frame cap therefore encodes, transfers, and *then* fails to
+// decode — which the host records as a protocol violation and answers by
+// disconnecting a plugin that did nothing wrong.
+//
+// The budget is not raised to close that gap. It is the only thing bounding
+// what a hostile frame can make the host allocate (see its documentation), so
+// the producer side is what gives way: the functions below let a producer
+// compute, in the decoder's own currency and without encoding anything, how
+// many items one batch may carry.
+
+/// Heap headroom reserved for everything wrapping a batch's items: the
+/// `Envelope` and `CatalogBatch` scalar fields, a terminal `StructuredError`,
+/// and any unknown fields a future peer adds. Small in absolute terms, and it
+/// keeps [`max_decodable_items`] from returning a count that only fits when
+/// the batch carries nothing else.
+pub const BATCH_OVERHEAD_RESERVE: usize = 64 * 1024;
+
+/// Upper bound on the heap `UnknownFields` charges for `len` retained bytes.
+///
+/// The retaining vector grows by doubling, so its final capacity is under
+/// twice what it holds.
+fn unknown_charge(unknown: &UnknownFields) -> usize {
+    unknown.as_bytes().len().saturating_mul(2)
+}
+
+impl Action {
+    /// Heap the decoder charges to materialise this action's own fields.
+    pub fn decode_charge(&self) -> usize {
+        let mut charge = self.action_id.len();
+        for text in [
+            &self.label,
+            &self.description,
+            &self.icon_reference,
+            &self.execution_policy,
+        ] {
+            charge = charge.saturating_add(text.len());
+        }
+        let mut categories = RepeatedFieldCharge::new::<String>();
+        for category in &self.applicable_categories {
+            categories.push();
+            charge = charge.saturating_add(category.len());
+        }
+        charge
+            .saturating_add(categories.charged())
+            .saturating_add(unknown_charge(&self.unknown))
+    }
+}
+
+impl Item {
+    /// Heap the decoder charges to materialise this item's own fields.
+    ///
+    /// Excludes the repeated-field bookkeeping the containing batch pays for
+    /// holding the item; [`max_decodable_items`] adds that.
+    pub fn decode_charge(&self) -> usize {
+        let mut charge = self.stable_id.len();
+        for text in [
+            &self.label,
+            &self.description,
+            &self.target,
+            &self.category,
+            &self.icon_reference,
+            &self.argument_policy,
+            &self.hit_policy,
+        ] {
+            charge = charge.saturating_add(text.len());
+        }
+        let mut terms = RepeatedFieldCharge::new::<String>();
+        for term in &self.search_terms {
+            terms.push();
+            charge = charge.saturating_add(term.len());
+        }
+        charge = charge.saturating_add(terms.charged());
+        for (key, value) in &self.metadata {
+            charge = charge
+                .saturating_add(map_entry_charge())
+                .saturating_add(key.len())
+                .saturating_add(value.len());
+        }
+        let mut actions = RepeatedFieldCharge::new::<Action>();
+        for action in &self.actions {
+            actions.push();
+            charge = charge.saturating_add(action.decode_charge());
+        }
+        charge
+            .saturating_add(actions.charged())
+            .saturating_add(unknown_charge(&self.unknown))
+    }
+}
+
+/// Length of the longest prefix of `items` that one batch may carry and still
+/// be decodable by the receiver.
+///
+/// This — not [`crate::MAX_FRAME_BYTES`] — is the real ceiling a producer of
+/// `CatalogBatch` or `ResultBatch` must respect. Splitting on it is how a
+/// producer emits several decodable frames instead of one frame that is
+/// accepted on the wire and rejected on arrival.
+///
+/// Never returns zero for a non-empty slice: a single item too large for the
+/// whole budget cannot be sent in any batch, so it is handed on alone and
+/// refused with [`crate::ProtocolError::DecodeBudgetExceeded`], which names
+/// the real cause, rather than silently stalling the producer.
+pub fn max_decodable_items(items: &[Item]) -> usize {
+    let ceiling = DECODE_ALLOCATION_BUDGET.saturating_sub(BATCH_OVERHEAD_RESERVE);
+    let mut vector = RepeatedFieldCharge::new::<Item>();
+    let mut contents = 0_usize;
+    for (index, item) in items.iter().enumerate() {
+        let held = vector.push();
+        contents = contents.saturating_add(item.decode_charge());
+        if held.saturating_add(contents) > ceiling {
+            return index.max(1);
+        }
+    }
+    items.len()
+}
+
 impl_simple!(SuggestRequest {
     text: String = String::new(),
     normalized_text: String = String::new(),
@@ -876,6 +998,10 @@ impl_simple!(Shutdown {
 mod tests {
     use super::*;
 
+    /// The hostile-count discipline: a frame that is legal bytes, well within
+    /// the wire cap, and claims a repetition count whose decoded form would
+    /// dwarf it, is refused — and the refusal is now the budget saying so by
+    /// name rather than a generic malformedness.
     #[test]
     fn hostile_repeated_items_hit_decode_budget() {
         // Each pair is an empty `ResultBatch.items` message. The input remains
@@ -885,12 +1011,15 @@ mod tests {
         for _ in 0..100_000 {
             encoded.extend_from_slice(&[0x12, 0x00]);
         }
+        assert!(encoded.len() <= MAX_FRAME_BYTES);
 
         let error = ResultBatch::decode(&encoded).expect_err("repetition must be bounded");
-        assert!(matches!(
-            error,
-            ProtocolError::Malformed(detail)
-                if detail.contains("allocation budget exhausted")
-        ));
+        let ProtocolError::DecodeBudgetExceeded { requested, remaining } = error else {
+            panic!("the refusal must name the decode budget, got {error:?}");
+        };
+        assert!(
+            requested <= DECODE_ALLOCATION_BUDGET && remaining < requested,
+            "the decoder must refuse one bounded step rather than allocate to the claim"
+        );
     }
 }

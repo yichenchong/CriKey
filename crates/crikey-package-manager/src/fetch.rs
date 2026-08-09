@@ -52,6 +52,16 @@ impl HttpFetcher {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// A fetcher refusing anything over `max_bytes`.
+    ///
+    /// The default ceiling is sized for a plugin package. A caller fetching
+    /// something with a much smaller natural size — a plugin index document,
+    /// say — passes its own, so a hostile host cannot make it buffer a package's
+    /// worth of bytes before the reader that would have rejected them runs.
+    pub fn with_max_bytes(max_bytes: u64) -> Self {
+        Self { max_bytes }
+    }
 }
 
 impl PackageFetcher for HttpFetcher {

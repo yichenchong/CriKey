@@ -1,0 +1,116 @@
+# Flatpak manifest for CriKey. Required tools: flatpak-builder, plus the
+# runtime, SDK and Rust SDK extension named below, installed from Flathub:
+#
+#   flatpak install flathub org.freedesktop.Platform//24.08 \
+#       org.freedesktop.Sdk//24.08 org.freedesktop.Sdk.Extension.rust-stable//24.08
+#   packaging/linux/build.sh --targets flatpak --python-archive /path/to/python.tar.gz
+#
+# The Flatpak target always receives a pinned python-build-standalone archive.
+# `org.freedesktop.Platform` does not promise a usable `python3`; the build
+# driver validates the archive, injects it as a local source and stages it with
+# `packaging/stage-python-runtime.sh` inside the SDK sandbox.
+# WHAT THIS BUILD CAN AND CANNOT DO
+#
+# Read this before shipping the result anywhere. A Flatpak CriKey runs, draws,
+# and runs its own plugins. It does NOT enumerate or start the host's
+# applications, which is most of what a launcher is for: CriKey launches by
+# `Command::new` (crates/crikey-platform-linux/src/lib.rs), which inside a
+# sandbox spawns inside the sandbox. Making that work needs the application to
+# route launches through `flatpak-spawn --host`, which it does not yet do.
+#
+# The permissions below are therefore the set that lets CriKey run honestly,
+# not the set that would make it *look* complete. In particular `--filesystem=host-os`
+# is deliberately absent: granting it would fill the results list with host
+# applications that CriKey would then fail to start, which is worse than
+# showing nothing.
+app-id: org.crikey.CriKey
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+# `flatpak run org.crikey.CriKey` passes no arguments, and bare `crikey` prints
+# usage; `crikey-launcher` is the no-argument entrypoint that starts the UI.
+command: crikey-launcher
+
+finish-args:
+  # The launcher window itself, on either display server.
+  - --socket=wayland
+  # X11 only when the session is not Wayland; a blanket --socket=x11 would hand
+  # every Wayland user's session an X11 socket they do not use.
+  - --socket=fallback-x11
+  # X11's shared-memory transport needs the host IPC namespace; without it an
+  # X11 session falls back to a wire-copy of every frame.
+  - --share=ipc
+  # GPU access: the renderer is wgpu, which needs a Vulkan or GLES device.
+  - --device=dri
+  # Spec 23.1: installing a plugin package named by URL is the one place CriKey
+  # fetches bytes, and network-backed plugins need it too.
+  - --share=network
+  # The Notifications platform service is a DBus call to the shell's daemon.
+  - --talk-name=org.freedesktop.Notifications
+  # The SecretStore platform service is the Secret Service API.
+  - --talk-name=org.freedesktop.secrets
+  # Plugin packages, configuration and the catalog cache live under the
+  # per-application XDG directories the sandbox already provides, so no
+  # --filesystem is needed for CriKey's own data.
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/crikey/cargo
+  # Cargo must reach crates.io during the build. Flathub forbids this, so a
+  # submission there must first vendor the dependencies (`cargo vendor` plus a
+  # generated cargo-sources.json) and drop this line. Stating that plainly
+  # beats a manifest that appears Flathub-ready and is rejected on upload.
+  build-args:
+    - --share=network
+
+modules:
+  - name: crikey
+    buildsystem: simple
+    sources:
+      # The build driver stages both inputs below the generated manifest, so
+      # Flatpak-builder's local-source boundary check can see them.
+      - type: dir
+        path: __CRIKEY_REPOSITORY_SOURCE__
+      - type: file
+        path: __CRIKEY_PYTHON_ARCHIVE_SOURCE__
+        dest-filename: __CRIKEY_PYTHON_ARCHIVE_NAME__
+        sha256: __CRIKEY_PYTHON_ARCHIVE_SHA256__
+    build-commands:
+      - cargo build --release --locked --package crikey-cli --package crikey-wasm-host --package crikey-cabi-host
+      # All three supervised runtime hosts are installed beside the launcher.
+      # The providers deliberately do not search PATH, so omitting either host
+      # would make packaged WASM or C-ABI plugins unavailable.
+      - install -Dm755 target/release/crikey /app/lib/crikey/crikey
+      - install -Dm755 target/release/crikey-launcher /app/lib/crikey/crikey-launcher
+      - install -Dm755 target/release/crikey-wasm-host /app/lib/crikey/crikey-wasm-host
+      - install -Dm755 target/release/crikey-cabi-host /app/lib/crikey/crikey-cabi-host
+      # The archive is a local file source named predictably above. Validate
+      # and stage it inside the sandbox so discovery never falls back to the
+      # runtime host's potentially absent Python.
+      - packaging/stage-python-runtime.sh --dest /app/lib/crikey --archive __CRIKEY_PYTHON_ARCHIVE_NAME__
+      - mkdir -p /app/bin
+      - ln -sf ../lib/crikey/crikey /app/bin/crikey
+      - ln -sf ../lib/crikey/crikey-launcher /app/bin/crikey-launcher
+      - cp -a sdk/python /app/lib/crikey/modern-sdk
+      - cp -a crates/crikey-legacy-compat/python /app/lib/crikey/legacy-shim
+      - find /app/lib/crikey -name '__pycache__' -type d -prune -exec rm -rf {} +
+      # Flatpak requires the desktop entry and the AppStream metadata to be
+      # named after the application id, so the repository's `crikey.desktop`
+      # is renamed here rather than kept as a second, divergent copy.
+      - install -Dm644 packaging/linux/crikey.desktop
+        /app/share/applications/org.crikey.CriKey.desktop
+      - install -Dm644 packaging/linux/icons/hicolor/scalable/apps/crikey.svg
+        /app/share/icons/hicolor/scalable/apps/org.crikey.CriKey.svg
+      - sed -i -e 's,^Icon=crikey$,Icon=org.crikey.CriKey,'
+        /app/share/applications/org.crikey.CriKey.desktop
+      - sed -i -e 's,crikey\.desktop,org.crikey.CriKey.desktop,'
+        packaging/linux/org.crikey.CriKey.metainfo.xml
+      - install -Dm644 packaging/linux/org.crikey.CriKey.metainfo.xml
+        /app/share/metainfo/org.crikey.CriKey.metainfo.xml
+      # Spec 14.13: the licence and the attribution notice ship in every
+      # artefact, this one included.
+      - install -Dm644 LICENSE /app/share/doc/crikey/LICENSE
+      - install -Dm644 NOTICE.md /app/share/doc/crikey/NOTICE.md

@@ -25,6 +25,10 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets
+      # `--all-targets` excludes doc tests, and several crates document their
+      # contract with runnable examples. Without this step a doc example can
+      # stop compiling and nothing notices until someone reads the docs.
+      - run: cargo test --workspace --doc
       - name: Check out-of-workspace native conformance fixture
         run: cargo check --manifest-path compatibility/native-conformance/Cargo.toml --all-targets
 
@@ -47,3 +51,125 @@ jobs:
         # Include the tracked synthetic legacy plugins as well as the two
         # interpreter workers; every repository-owned Python source is checked.
         run: python -m compileall -q sdk/python crates/crikey-legacy-compat/python compatibility/test-plugins
+
+  shell-syntax:
+    # The packaging scripts are the only executable code in the tree that no
+    # compiler ever reads, so a typo in one survives every other job and first
+    # surfaces while a release is being cut. `bash -n` parses without
+    # executing, which is the only safe way to check scripts whose whole job is
+    # to build and install artefacts.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse every tracked shell script
+        # The list is discovered rather than written down, because a written
+        # list stops covering the tree the moment somebody adds a script and
+        # does so silently. The empty-set guard exists for the same reason: a
+        # discovery that matches nothing must fail loudly, not pass vacuously.
+        run: |
+          mapfile -d '' -t scripts < <(git ls-files -z -- '*.sh')
+          if [ "${#scripts[@]}" -eq 0 ]; then
+            echo "::error::no shell scripts were discovered; the gate is checking nothing"
+            exit 1
+          fi
+          for script in "${scripts[@]}"; do
+            bash -n "$script"
+            echo "checked $script"
+          done
+
+  powershell-syntax:
+    # The same argument as the shell scripts, for the Windows packaging
+    # scripts. This gate catches exactly the class of defect that was found and
+    # fixed by hand here — an unterminated block comment and an unbalanced
+    # brace — neither of which any other job in this workflow would notice.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse every Windows packaging script
+        # ParseFile is the parser PowerShell itself uses, so it reports the
+        # same errors the runner would hit at invocation time, without running
+        # a single statement of a script that signs and packages binaries.
+        shell: pwsh
+        run: |
+          $scripts = @(Get-ChildItem -Path packaging/windows -Recurse -Filter *.ps1)
+          if ($scripts.Count -eq 0) {
+            Write-Host "::error::no PowerShell scripts were discovered; the gate is checking nothing"
+            exit 1
+          }
+          $failed = $false
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              foreach ($parseError in $errors) {
+                Write-Host "::error file=$($script.FullName)::$($parseError.Message)"
+              }
+            } else {
+              Write-Host "checked $($script.FullName)"
+            }
+          }
+          if ($failed) { exit 1 }
+
+  linux-packaging:
+    # `packaging/linux/build.sh` makes promises that nothing else in the suite
+    # can observe: NOTICE.md is in every artefact, a package that bundles no
+    # interpreter declares a dependency on the system python3, and a missing
+    # tool is a loud failure rather than a quietly absent file. Its contract
+    # tests assert those against real artefacts and need dpkg-deb and python3,
+    # so they get a Linux job of their own rather than widening the
+    # cross-platform matrix with steps two thirds of it would skip.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the Linux packaging contract tests
+        # No Rust toolchain is set up because the script never invokes cargo:
+        # it packages stand-in executables, since every contract under test is
+        # about the packaging and not about the program. The zstd and
+        # flatpak-builder sub-checks print a `skip` line naming the missing
+        # tool instead of passing quietly. The run ends with `N passed, M
+        # failed` and exits non-zero if M is not zero.
+        run: packaging/linux/tests/build.test.sh
+
+  wasm-conformance:
+    # `compatibility/wasm-conformance` is deliberately outside the Cargo
+    # workspace, because that is how a third party builds a plugin. Nothing in
+    # `cargo test --workspace` compiles it, and it is the only thing in the
+    # tree built for wasm32-unknown-unknown, so it is also the only place a
+    # target-specific compilation break can be caught.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the out-of-workspace WASM conformance fixture
+        # The `--export=memory` link argument is not optional: the host reaches
+        # the guest's linear memory through the standard `memory` export, and a
+        # module built without it is rejected at load time. `-D warnings` is
+        # repeated here because a step-level RUSTFLAGS replaces the
+        # workflow-level one rather than adding to it.
+        env:
+          RUSTFLAGS: -D warnings -C link-arg=--export=memory
+        run: cargo build --manifest-path compatibility/wasm-conformance/Cargo.toml --release --target wasm32-unknown-unknown
+
+  cabi-conformance:
+    # `compatibility/cabi-conformance` builds with make and a C11 compiler
+    # against the published header alone, again the way a third party would.
+    # crates/crikey-cabi-host/tests/out_of_tree_cabi.rs already drives this
+    # Makefile on Unix, but a breakage there is reported as a Rust test
+    # failure; this job exists so that the failure names the fixture. Both
+    # runners are used because the Makefile picks the shared-library flags and
+    # the manifest entrypoint per platform, and only building on both proves
+    # either branch still works.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the out-of-workspace C-ABI conformance fixture
+        run: make -C compatibility/cabi-conformance

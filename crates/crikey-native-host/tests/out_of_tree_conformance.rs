@@ -89,6 +89,7 @@ fn launch_spec(executable: &Path, mode: &str) -> LaunchSpec {
         arguments: Vec::new(),
         working_dir: None,
         environment: vec![("CRIKEY_CONFORMANCE_MODE".to_owned(), mode.to_owned())],
+        inherit_environment: false,
     }
 }
 

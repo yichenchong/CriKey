@@ -54,6 +54,21 @@ fn listener_rejects_stdio_endpoint() {
         Err(ProtocolError::Malformed(_))
     ));
 }
+
+/// ADR-0017 rejected a shared-memory transport for v1 after measuring
+/// ADR-0004's profiling gate, so no endpoint spelling may name one. A partial
+/// implementation that teaches `Endpoint` about shared memory before the
+/// transport exists would let the host advertise a capability it does not
+/// have; this test makes that a compile-and-fail rather than a silent claim.
+#[test]
+fn endpoint_vocabulary_names_no_shared_memory_transport() {
+    for spec in ["shm:/dev/shm/crikey", "shm:crikey", "shared:crikey", "shm"] {
+        assert!(
+            matches!(Endpoint::parse(spec), Err(ProtocolError::Malformed(_))),
+            "{spec:?} must not parse: shared memory is rejected for v1 by ADR-0017"
+        );
+    }
+}
 #[test]
 fn stdio_survives_read_timeout_request() {
     let mut connection = transport::stdio();
@@ -64,6 +79,86 @@ fn stdio_survives_read_timeout_request() {
     connection
         .set_read_timeout(None)
         .expect("clearing an unsupported timeout must remain harmless");
+}
+
+/// A unique endpoint of whatever kind this platform actually uses for native
+/// plugins, so the test below drives the real listener rather than a portable
+/// stand-in for it.
+#[cfg(unix)]
+fn native_endpoint() -> Endpoint {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "crikey-accept-retry-{}-{}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&path);
+    Endpoint::UnixSocket(path)
+}
+
+#[cfg(windows)]
+fn native_endpoint() -> Endpoint {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    Endpoint::NamedPipe(format!(
+        "crikey-accept-retry-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+#[cfg(any(unix, windows))]
+fn remove_endpoint(endpoint: &Endpoint) {
+    if let Endpoint::UnixSocket(path) = endpoint {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// A timeout is a retryable answer, not the end of the listener.
+///
+/// `accept` is the host's only way to meet a plugin that is slow to start, and
+/// the worker calls it once per startup attempt. A listener that gave up its
+/// endpoint on the first expired deadline would turn "this plugin was slow
+/// once" into "this endpoint can never accept anyone", and the caller would
+/// report that as a plugin that never connected. The Windows named-pipe
+/// listener used to do exactly that, taking its only handle out of the slot
+/// before polling and dropping it on the way out; the Unix listener never has.
+/// One test for both, because it is one contract of [`transport::Listener`].
+#[cfg(any(unix, windows))]
+#[test]
+fn a_timed_out_accept_leaves_the_listener_able_to_accept_a_later_client() {
+    let endpoint = native_endpoint();
+    let listener = transport::Listener::bind(&endpoint).expect("bind the platform's native endpoint");
+
+    assert!(
+        matches!(
+            listener.accept(Some(Duration::from_millis(50))),
+            Err(ProtocolError::Timeout)
+        ),
+        "an accept with no client waiting must report Timeout"
+    );
+
+    let client_endpoint = endpoint.clone();
+    let client = std::thread::spawn(move || {
+        let mut connection = transport::connect(&client_endpoint, Some(Duration::from_secs(5)))
+            .expect("a client must still be able to reach the endpoint after the accept timed out");
+        connection.send(&envelope(41)).expect("client send");
+    });
+
+    let mut accepted = listener
+        .accept(Some(Duration::from_secs(5)))
+        .expect("the listener must still accept after a timeout, not report Closed");
+    assert_eq!(
+        accepted.recv().expect("server receive").encode(),
+        envelope(41).encode(),
+        "the connection accepted on the retry must be the real client's"
+    );
+    client.join().expect("client thread must finish");
+
+    drop(accepted);
+    remove_endpoint(&endpoint);
 }
 
 #[cfg(unix)]

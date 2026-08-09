@@ -51,6 +51,7 @@
 //! the process.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -59,24 +60,30 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crikey_core::{Action, ActionId, ArgumentPolicy, ExecutionPolicy, Generation, Item, ItemId, PluginId};
+use crikey_core::{
+    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, Generation, Item, ItemId, PlatformPath,
+    PluginId,
+};
 use crikey_input_scheduler::{Millis, PluginPolicy};
 use crikey_legacy_compat::{
-    discover_interpreter, shim_root, InstanceId, Interpreter, LegacyCallback, LegacyDeadlines, LegacyOutcome,
-    LegacyPackage, LegacyRequest, LegacyRequestKind, LegacyResponse, LegacyRuntime, LegacyWorker,
-    LegacyWorkerHandle, PackageLoader, TerminateHandle, TerminationReason, WorkerError, WorkerOptions,
-    WORKER_ENTRY_FILE,
+    discover_interpreter, shim_root, InstanceId, Interpreter, LegacyCallback, LegacyDeadlines,
+    LegacyDefaultAction, LegacyHostService, LegacyOutcome, LegacyPackage, LegacyRequest, LegacyRequestKind,
+    LegacyResponse, LegacyRuntime, LegacyWorker, LegacyWorkerHandle, PackageLoader, TerminateHandle,
+    TerminationReason, WorkerError, WorkerOptions, WORKER_ENTRY_FILE,
 };
-use crikey_plugin_model::ConcurrencySection;
+use crikey_platform::{application_arguments, application_working_directory};
+use crikey_plugin_model::{ConcurrencySection, Permissions};
 use crikey_plugin_supervisor::{
     shared_budget_from_section, BudgetKind, OwnedBudgetGuard, PluginBudgetHandle, PluginHealth,
 };
 use crikey_python_host::RuntimeProfile;
 use crikey_ui::{ResultRow, ViewModel};
 
+use crate::plugin_icons::PluginIconResolver;
 use crate::{
     ActionRequestId, BatchState, CatalogBuild, CatalogBuildResult, CatalogDispatchError, DisabledPlugins,
-    PluginActionCompletion, QueryPipeline, ResultBatch, DISABLED_BY_CONFIGURATION,
+    HostCapability, PluginActionCompletion, PluginActionRouter, QueryPipeline, ResultBatch,
+    DISABLED_BY_CONFIGURATION,
 };
 
 /// Bound on the startup handshake with a child interpreter, in milliseconds.
@@ -360,6 +367,105 @@ impl LegacyWorkerHandle for LegacyWorkerPool {
         Ok(())
     }
 }
+
+/// Performs the host-mediated actions legacy plugins ask the launcher for.
+///
+/// One instance is shared by every legacy worker and is created before the
+/// plugin action router exists — the router is built *from* the drivers, so it
+/// cannot be a constructor argument. The slot is filled in by
+/// [`LegacyProvider::set_plugin_action_router`], and until it is, every
+/// request is refused: an ungated launch is not one this host will perform,
+/// and a plugin that could act during the window before the router arrived
+/// would be a hole in the gate rather than a convenience.
+///
+/// The work happens here rather than in the child for two reasons that both
+/// bite. A child-side launch escapes the permission gate entirely, and it
+/// lands in the worker's process group, which the supervisor kills on
+/// circuit-break, timeout and shutdown — a plugin that opened the user's
+/// browser would take it down on its next restart.
+#[derive(Default)]
+struct LegacyHostActions {
+    router: Mutex<Option<Arc<PluginActionRouter>>>,
+}
+
+impl fmt::Debug for LegacyHostActions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let installed = self.router.lock().map(|slot| slot.is_some()).unwrap_or(false);
+        formatter
+            .debug_struct("LegacyHostActions")
+            .field("router_installed", &installed)
+            .finish()
+    }
+}
+
+impl LegacyHostActions {
+    fn install(&self, router: Arc<PluginActionRouter>) {
+        *self.router.lock().unwrap_or_else(|error| error.into_inner()) = Some(router);
+    }
+}
+
+impl LegacyHostService for LegacyHostActions {
+    fn execute_default_action(&self, request: &LegacyDefaultAction) -> Result<bool, String> {
+        let installed = self
+            .router
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        // Spelled exactly as the router's own refusal, so the diagnostic a
+        // plugin sees does not disclose whether it was denied, unregistered,
+        // or asking before the router was wired.
+        let denied = || {
+            format!(
+                "plugin `{}` lacks the process permission for host-mediated process launch",
+                request.plugin.0
+            )
+        };
+        let Some(router) = installed else {
+            return Err(denied());
+        };
+        router
+            .authorize(&request.plugin, HostCapability::ProcessLaunch)
+            .map_err(|_| denied())?;
+
+        // A plugin-defined secondary action means nothing to the launcher: only
+        // the plugin knows what its own action does, so this is "nothing I can
+        // act on" rather than a refusal, and the plugin handles it itself.
+        if request.action.is_some() {
+            return Ok(false);
+        }
+        perform_default_action(&request.item).map(|()| true)
+    }
+}
+
+/// Opens `item` the way the launcher would have, on the launcher's own
+/// process group.
+///
+/// The backend is built per action rather than held: an action is a rare,
+/// user-initiated event, and holding a platform backend on the legacy
+/// supervisor thread for the life of the process would be a second live
+/// backend for the sake of something that happens seconds apart at most.
+fn perform_default_action(item: &Item) -> Result<(), String> {
+    let backend = crate::Backend::new();
+    let launcher = backend.process_launcher();
+
+    if item.category == Category::Url {
+        return launcher
+            .open_uri(&item.target)
+            .map_err(|error| format!("the launcher could not open `{}`: {error}", item.target));
+    }
+
+    // A legacy target is whatever string the plugin put there, never CriKey's
+    // encoded target form, so it is taken literally rather than through
+    // `decode_target` — which would reject a perfectly good path containing a
+    // per cent sign and accept an escape the plugin never wrote.
+    let target = PlatformPath::new(item.target.as_str());
+    let arguments = application_arguments(item).map_err(|error| error.to_string())?;
+    let working_directory = application_working_directory(item).map_err(|error| error.to_string())?;
+    launcher
+        .launch_in(&target, &arguments, working_directory.as_ref())
+        .map_err(|error| format!("the launcher could not start `{}`: {error}", item.target))
+}
+
 /// Composes legacy discovery, the legacy runtime and the app's query pipeline.
 ///
 /// Constructed once at startup with [`LegacyProvider::load`], then driven per
@@ -382,6 +488,25 @@ pub struct LegacyProvider {
     catalog_failures: BTreeMap<PluginId, String>,
     action_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    /// Content root of each loaded package, so the icon resolver can read the
+    /// files a plugin's `load_icon` named (spec 11.7, 14.4).
+    package_dirs: BTreeMap<PluginId, PathBuf>,
+    /// Shared by every worker, so one router installation reaches them all.
+    host_actions: Arc<LegacyHostActions>,
+}
+
+/// Installation directories a legacy plugin may ask the host about.
+///
+/// Every field is optional and an absent one is *reported* as unavailable to
+/// the plugin rather than guessed at: only the composition root knows CriKey's
+/// platform directory convention, and a worker that invented a path would send
+/// a plugin's configuration somewhere the launcher never reads.
+#[derive(Debug, Clone, Default)]
+pub struct LegacyDirectories {
+    /// Where this user's CriKey configuration lives.
+    pub user_config: Option<PathBuf>,
+    /// Where CriKey installs legacy packages for this user.
+    pub installed_packages: Option<PathBuf>,
 }
 
 /// One admitted, not-yet-dispatched legacy catalog rebuild.
@@ -403,7 +528,12 @@ impl LegacyProvider {
     /// Never returns an error: a failure at any step becomes a recorded
     /// [`LegacyUnavailable`] and the remaining packages are loaded anyway
     /// (acceptance 31.9, 31.10). `cache_root` is where archive packages are
-    /// extracted (spec 14.3); it is not created unless an archive is met.
+    /// extracted (spec 14.3); it is not created unless an archive is met, and
+    /// it is also what `keypirinha.package_cache_dir()` answers.
+    ///
+    /// `directories` carries the rest of what a legacy plugin may ask the host
+    /// about. Anything absent from it is reported to the plugin as unavailable
+    /// rather than guessed at.
     ///
     /// On return, every registered plugin's one-time `on_start` has completed,
     /// so the caller may truthfully advance
@@ -412,6 +542,7 @@ impl LegacyProvider {
         pipeline: &mut QueryPipeline,
         roots: &[PathBuf],
         cache_root: PathBuf,
+        directories: LegacyDirectories,
         deadlines: LegacyDeadlines,
         disabled: &DisabledPlugins,
     ) -> Self {
@@ -432,6 +563,8 @@ impl LegacyProvider {
             catalog_failures: BTreeMap::new(),
             action_items: Arc::new(Mutex::new(BTreeMap::new())),
             catalog_items: Arc::new(Mutex::new(BTreeMap::new())),
+            package_dirs: BTreeMap::new(),
+            host_actions: Arc::new(LegacyHostActions::default()),
         };
 
         // A host that cannot run CPython cannot run any legacy plugin, and
@@ -463,7 +596,7 @@ impl LegacyProvider {
             return provider;
         }
 
-        let loader = PackageLoader::new(cache_root);
+        let loader = PackageLoader::new(cache_root.clone());
         let packages = match loader.discover(roots) {
             Ok(packages) => packages,
             Err(error) => {
@@ -477,8 +610,21 @@ impl LegacyProvider {
         };
 
         for package in &packages {
-            provider.register_package(pipeline, &interpreter, &shim, package, disabled);
+            provider.register_package(
+                pipeline,
+                &interpreter,
+                &shim,
+                package,
+                &cache_root,
+                &directories,
+                disabled,
+            );
         }
+
+        // After registration, so only packages that actually loaded have an
+        // origin: a plugin that never started must resolve to no icon rather
+        // than to a directory nothing is serving from.
+        provider.install_icon_resolver(pipeline);
 
         // Run the one-time `on_start` for every registered instance before any
         // query can arrive: `on_suggest` is serialized behind it (spec 14.8),
@@ -490,12 +636,25 @@ impl LegacyProvider {
         provider
     }
 
+    /// Installs the gate every host-mediated legacy action must pass.
+    ///
+    /// A setter rather than a constructor argument because the router is built
+    /// *from* the drivers — it registers the plugins this provider loaded — so
+    /// it does not exist when the workers are started. Until it is installed
+    /// every host-mediated request is refused.
+    pub fn set_plugin_action_router(&mut self, router: Arc<PluginActionRouter>) {
+        self.host_actions.install(router);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn register_package(
         &mut self,
         pipeline: &mut QueryPipeline,
         interpreter: &Interpreter,
         shim: &std::path::Path,
         package: &LegacyPackage,
+        cache_root: &std::path::Path,
+        directories: &LegacyDirectories,
         disabled: &DisabledPlugins,
     ) {
         let plugin = plugin_of(package);
@@ -515,9 +674,17 @@ impl LegacyProvider {
         // provider-owned handle before starting the worker, then pass the same
         // Arc into the pipeline registration.
         let budget = shared_budget_from_section(&ConcurrencySection::default());
-        let options = WorkerOptions::new(plugin.clone(), shim.to_path_buf())
+        let mut options = WorkerOptions::new(plugin.clone(), shim.to_path_buf())
             .with_startup_timeout_ms(STARTUP_BUDGET_MS)
-            .with_call_timeout_ms(CALL_BUDGET_MS);
+            .with_call_timeout_ms(CALL_BUDGET_MS)
+            .with_cache_root(cache_root)
+            .with_host_service(Arc::clone(&self.host_actions) as Arc<dyn LegacyHostService>);
+        if let Some(user_config) = &directories.user_config {
+            options = options.with_config_dir(user_config);
+        }
+        if let Some(installed) = &directories.installed_packages {
+            options = options.with_installed_package_dir(installed);
+        }
 
         let worker = match LegacyWorker::spawn(interpreter, package, options) {
             Ok(worker) => worker,
@@ -553,7 +720,33 @@ impl LegacyProvider {
         self.runtime.worker_mut().insert(plugin.clone(), worker);
         self.runtime.register(plugin.clone(), package.id.clone());
         self.budgets.insert(plugin.clone(), budget);
+        self.package_dirs
+            .insert(plugin.clone(), package.root.content_root().to_path_buf());
         self.plugins.push(plugin);
+    }
+
+    /// Points the pipeline's icon resolver at every loaded package directory.
+    ///
+    /// The same [`PluginIconResolver`] the modern provider installs, not a
+    /// legacy-only icon path: a legacy `load_icon` reference is a
+    /// package-relative name exactly as a modern plugin's is, and the resolver
+    /// already owns the containment check, the byte ceiling and the memoised
+    /// decode that make reading one safe.
+    ///
+    /// The grants are the same explicit legacy compatibility baseline the
+    /// action router applies (see [`Permissions::legacy_compatibility_baseline`]),
+    /// not `Permissions::default()`. A legacy package has no manifest to
+    /// declare anything, so the host's posture is the only answer there is, and
+    /// it has to be the same value everywhere it is consulted — otherwise
+    /// `crikey plugin doctor` would be describing a posture the icon path does
+    /// not actually use.
+    fn install_icon_resolver(&self, pipeline: &mut QueryPipeline) {
+        let baseline = Permissions::legacy_compatibility_baseline();
+        let mut resolver = PluginIconResolver::default();
+        for (plugin, directory) in &self.package_dirs {
+            resolver.insert_package(plugin, directory.clone(), &baseline);
+        }
+        pipeline.set_plugin_icons(Arc::new(resolver));
     }
 
     /// The legacy plugins that loaded and are being served through the pipeline.
@@ -938,27 +1131,48 @@ impl LegacyProvider {
     }
 }
 
-/// yields an empty one, because Keypirinha's actions are a package-level
-/// concept the shim does not model. Without an action the presentation layer
-/// has no default to run, so pressing Enter on a legacy row would do nothing
-/// at all. The host therefore supplies the one action the contract does
-/// define: hand the item back to its owning plugin's `on_execute` (spec 14.5).
-/// Action id of the single plugin-owned action every legacy item carries.
+/// Action id of the single host-supplied action every legacy item carries.
+///
+/// A legacy item names no default action of its own. Without one the
+/// presentation layer has nothing to run, so pressing Enter on a legacy row
+/// would do nothing at all. The host therefore supplies the one action the
+/// contract does define: hand the item back to its owning plugin's
+/// `on_execute` with no action chosen (spec 14.5).
 const LEGACY_EXECUTE_ACTION_ID: &str = "legacy.execute";
+
+/// Puts the host's default action first, ahead of whatever the plugin
+/// registered with `set_actions`.
+///
+/// Position is the contract: `result_row` makes `actions[0]` the row's default
+/// and the rest its alternates. Keypirinha's `set_actions` registers
+/// *alternates* — Enter still means "execute with no action chosen" — so
+/// appending the host action instead of prepending it would promote the
+/// plugin's first alternate to Enter and silently change what the launcher
+/// does. The shim refuses to register an action under this id, so the guard
+/// below is only reached on a re-entry with an item that has already been
+/// through here.
 fn with_default_action(mut item: Item) -> Item {
-    if !item.actions.is_empty() {
+    if item
+        .actions
+        .first()
+        .is_some_and(|action| action.action_id.0 == LEGACY_EXECUTE_ACTION_ID)
+    {
         return item;
     }
-    item.actions.push(Action {
-        action_id: ActionId(LEGACY_EXECUTE_ACTION_ID.to_owned()),
-        label: "Execute".to_owned(),
-        description: "Hand this result back to the legacy plugin that produced it".to_owned(),
-        // Legacy plugins classify their own items and the host must not second
-        // guess the classification, so the action applies to every category.
-        applicable_categories: Vec::new(),
-        icon_reference: None,
-        execution_policy: ExecutionPolicy::Plugin,
-    });
+    item.actions.insert(
+        0,
+        Action {
+            action_id: ActionId(LEGACY_EXECUTE_ACTION_ID.to_owned()),
+            label: "Execute".to_owned(),
+            description: "Hand this result back to the legacy plugin that produced it".to_owned(),
+            // Legacy plugins classify their own items and the host must not
+            // second guess the classification, so the action applies to every
+            // category.
+            applicable_categories: Vec::new(),
+            icon_reference: None,
+            execution_policy: ExecutionPolicy::Plugin,
+        },
+    );
     item
 }
 
@@ -1223,6 +1437,9 @@ pub struct LegacyDriver {
     current: Arc<AtomicU64>,
     cancellation: Arc<LegacyCancellation>,
     has_plugins: bool,
+    /// Cloned out of the provider before it moves onto the supervisor thread,
+    /// so the router can still be installed after the driver owns everything.
+    host_actions: Arc<LegacyHostActions>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -1257,6 +1474,7 @@ impl LegacyDriver {
         let health = Arc::new(Mutex::new(Vec::new()));
         let current = Arc::new(AtomicU64::new(0));
         let cancellation = Arc::clone(&provider.cancellation);
+        let host_actions = Arc::clone(&provider.host_actions);
         let (action_sender, action_receiver) = mpsc::sync_channel(ACTION_QUEUE_CAPACITY);
         let completion_mailbox = Arc::new(Mutex::new(VecDeque::with_capacity(ACTION_COMPLETION_CAPACITY)));
         let action_endpoint = Arc::new(LegacyActionEndpoint {
@@ -1442,6 +1660,7 @@ impl LegacyDriver {
                 current,
                 cancellation,
                 has_plugins,
+                host_actions,
                 worker: Some(worker),
             },
             Err(_) => Self {
@@ -1453,9 +1672,19 @@ impl LegacyDriver {
                 current,
                 cancellation,
                 has_plugins: false,
+                host_actions,
                 worker: None,
             },
         }
+    }
+
+    /// Installs the gate every host-mediated legacy action must pass.
+    ///
+    /// Mirrors [`LegacyProvider::set_plugin_action_router`], which the driver
+    /// can no longer reach: the provider has moved onto the supervisor thread
+    /// by the time the composition root has a router to install.
+    pub fn set_plugin_action_router(&self, router: Arc<PluginActionRouter>) {
+        self.host_actions.install(router);
     }
 
     /// Submits a query for asynchronous legacy processing and returns at once;

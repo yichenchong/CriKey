@@ -7,14 +7,27 @@
 //!
 //! 1. the `CRIKEY_PYTHON` environment override,
 //! 2. the interpreter named by [`RuntimeProfile::External`],
-//! 3. `python3` on the search path.
+//! 3. the runtime bundled beside the running executable,
+//! 4. `python3` on the search path.
+//!
+//! Rule 3 is what makes a shipped artefact self-contained (spec 14.11): an
+//! installer that stages a relocatable CPython into [`BUNDLED_RUNTIME_DIR`]
+//! beside the binary gets it chosen with no configuration at all, so the
+//! product does not silently inherit whatever Python the machine happens to
+//! have — and a machine with none still runs plugins that declare a
+//! `requires-python`. It sits *below* the override and an explicitly named
+//! interpreter because both of those are somebody's deliberate choice, and
+//! *above* the search path because the search path is nobody's.
 //!
 //! Each rule is *decisive*. Once a rule names a candidate, that candidate is
 //! the answer: if it cannot run, or does not satisfy the plugin's
 //! `requires-python`, discovery fails — it never falls through to the next
 //! rule. Falling through would run plugin code under an interpreter the plugin
 //! declared it cannot run on, or one the operator did not choose, which is
-//! worse than not starting at all (spec 15.2, §4).
+//! worse than not starting at all (spec 15.2, §4). A bundled runtime is held
+//! to exactly that standard: it is probed, version-gated and started with the
+//! same isolation as any other candidate, so a broken staging is a loud
+//! failure rather than a quiet downgrade to the system interpreter.
 //!
 //! # Which profile a plugin gets
 //!
@@ -50,6 +63,50 @@ use crate::RuntimeProfile;
 
 /// Environment variable that overrides every other discovery rule (spec 14.11).
 pub const ENV_PYTHON_OVERRIDE: &str = "CRIKEY_PYTHON";
+
+/// Name of the directory a shipped artefact stages its own CPython into
+/// (spec 14.11).
+pub const BUNDLED_RUNTIME_DIR: &str = "python-runtime";
+
+/// Where [`BUNDLED_RUNTIME_DIR`] is looked for, relative to the directory
+/// holding the running executable, in order.
+///
+/// Relative to the binary rather than an absolute install prefix so the layout
+/// survives being moved, copied or run from a portable directory — the same
+/// reasoning, and the same shape, as the `modern-sdk` sibling that `sdk_root`
+/// looks for. Two locations because two install shapes are real and neither
+/// can be derived from the other: a self-contained directory (portable
+/// archive, macOS `Contents/MacOS`, a `cargo build` output) puts the runtime
+/// beside the binary, while a prefix install (`.deb`, `.rpm`, `/usr/local`)
+/// cannot litter `bin/` and puts it under `lib/crikey/`.
+const BUNDLED_RUNTIME_ROOTS: &[&str] = &[BUNDLED_RUNTIME_DIR, "../lib/crikey/python-runtime"];
+
+/// Interpreter locations inside a staged runtime, in order, expressed relative
+/// to it. Slash-separated because `Path::join` accepts `/` on every platform
+/// this ships on, and a python-build-standalone tree keeps its interpreter at
+/// `bin/python3` on Unix and at the prefix root on Windows.
+#[cfg(windows)]
+const BUNDLED_INTERPRETER_PATHS: &[&str] = &["python.exe", "python3.exe"];
+#[cfg(not(windows))]
+const BUNDLED_INTERPRETER_PATHS: &[&str] = &["bin/python3"];
+
+/// The staged runtime's interpreter for an executable in `executable_dir`, if
+/// one is there.
+///
+/// Existence and executability only: the version is never inferred from the
+/// layout, because a staged runtime that reports the wrong version has to fail
+/// the same probe every other candidate faces.
+pub fn bundled_interpreter_beside(executable_dir: &Path) -> Option<PathBuf> {
+    BUNDLED_RUNTIME_ROOTS
+        .iter()
+        .flat_map(|root| {
+            let root = executable_dir.join(root);
+            BUNDLED_INTERPRETER_PATHS
+                .iter()
+                .map(move |relative| root.join(relative))
+        })
+        .find(|candidate| is_executable_file(candidate))
+}
 
 /// Executable names tried, in order, when the search path is the deciding rule.
 #[cfg(windows)]
@@ -193,6 +250,8 @@ pub enum InterpreterSource {
     EnvironmentOverride,
     /// [`RuntimeProfile::External`].
     RuntimeProfile,
+    /// The runtime staged beside the running executable (spec 14.11).
+    BundledRuntime,
     /// `python3` found on the search path.
     SearchPath,
 }
@@ -202,6 +261,7 @@ impl InterpreterSource {
         match self {
             Self::EnvironmentOverride => "environment-override",
             Self::RuntimeProfile => "runtime-profile",
+            Self::BundledRuntime => "bundled-runtime",
             Self::SearchPath => "search-path",
         }
     }
@@ -263,33 +323,54 @@ impl fmt::Display for Interpreter {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveryEnvironment {
     python_override: Option<PathBuf>,
+    /// Directory holding the running executable, which is where a shipped
+    /// artefact's bundled runtime sits. `None` means "no bundled runtime is
+    /// reachable", which is what an unconfigured test environment wants and
+    /// what a host whose own path cannot be read has to assume.
+    executable_dir: Option<PathBuf>,
     search_path: Vec<PathBuf>,
 }
 
 impl DiscoveryEnvironment {
-    /// No override and no search path: only [`RuntimeProfile::External`] can
-    /// resolve against this.
+    /// Nothing ambient at all: no override, no bundled runtime and no search
+    /// path, so only [`RuntimeProfile::External`] can resolve against this.
     pub fn empty() -> Self {
         Self::default()
     }
 
-    /// Reads `CRIKEY_PYTHON` and `PATH` from the ambient process environment.
+    /// Reads `CRIKEY_PYTHON`, the running executable's directory and `PATH`
+    /// from the ambient process environment.
     pub fn from_process() -> Self {
         let python_override = std::env::var_os(ENV_PYTHON_OVERRIDE)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
+        // A host that cannot say where its own executable is simply has no
+        // bundled runtime; that is a fall-through to the search path, not an
+        // error, because the same host worked this way before bundling
+        // existed.
+        let executable_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
         let search_path = std::env::var_os("PATH")
             .map(|path| std::env::split_paths(&path).collect())
             .unwrap_or_default();
 
         Self {
             python_override,
+            executable_dir,
             search_path,
         }
     }
 
     pub fn with_override(mut self, path: impl AsRef<Path>) -> Self {
         self.python_override = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Treats `directory` as the one holding the running executable, and so as
+    /// the parent of any bundled runtime.
+    pub fn with_executable_dir(mut self, directory: impl AsRef<Path>) -> Self {
+        self.executable_dir = Some(directory.as_ref().to_path_buf());
         self
     }
 
@@ -300,6 +381,17 @@ impl DiscoveryEnvironment {
 
     pub fn python_override(&self) -> Option<&Path> {
         self.python_override.as_deref()
+    }
+
+    pub fn executable_dir(&self) -> Option<&Path> {
+        self.executable_dir.as_deref()
+    }
+
+    /// The bundled runtime's interpreter, when this build was shipped with one.
+    pub fn bundled_interpreter(&self) -> Option<PathBuf> {
+        self.executable_dir
+            .as_deref()
+            .and_then(bundled_interpreter_beside)
     }
 
     pub fn search_path(&self) -> &[PathBuf] {
@@ -423,6 +515,11 @@ pub struct RuntimeCatalog {
     /// [`discover_interpreter_in`], so the mapping must not name a competing
     /// interpreter and the scan is skipped entirely.
     overridden: bool,
+    /// The runtime shipped beside the executable, when it is present *and*
+    /// runnable. Kept apart from `interpreters` because it maps to
+    /// [`RuntimeProfile::Bundled`] rather than to a path, which is what keeps
+    /// discovery reporting `bundled-runtime` as the winning rule.
+    bundled: Option<Interpreter>,
     interpreters: Vec<Interpreter>,
 }
 
@@ -439,15 +536,25 @@ impl RuntimeCatalog {
     /// the decisive rules of [`discover_interpreter_in`] no plugin asked for
     /// this particular file. A broken `python3.9` beside a working `python3.13`
     /// must not stop the host from offering 3.13.
+    ///
+    /// The bundled runtime is probed as one more candidate, and dropped on the
+    /// same terms. Dropping it does not hide the breakage: the mapping then
+    /// names a host interpreter by path, so discovery reports `runtime-profile`
+    /// rather than claiming a shipped runtime that does not work.
     pub fn probe_in(environment: &DiscoveryEnvironment) -> Self {
         if environment.python_override().is_some() {
             return Self {
                 overridden: true,
+                bundled: None,
                 interpreters: Vec::new(),
             };
         }
 
         let deadline = Instant::now() + CATALOG_PROBE_BUDGET;
+        let bundled = environment.bundled_interpreter().and_then(|path| {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            probe_with_timeout(&path, InterpreterSource::BundledRuntime, remaining).ok()
+        });
         let interpreters = environment
             .enumerate_search_path()
             .into_iter()
@@ -460,6 +567,7 @@ impl RuntimeCatalog {
 
         Self {
             overridden: false,
+            bundled,
             interpreters,
         }
     }
@@ -472,8 +580,16 @@ impl RuntimeCatalog {
     fn of(interpreters: Vec<Interpreter>) -> Self {
         Self {
             overridden: false,
+            bundled: None,
             interpreters,
         }
+    }
+
+    /// A catalog whose bundled runtime is `bundled`, bypassing the scan.
+    #[cfg(test)]
+    fn with_bundled(mut self, bundled: Interpreter) -> Self {
+        self.bundled = Some(bundled);
+        self
     }
 
     /// Maps a declared `requires-python` onto the profile whose interpreter
@@ -493,6 +609,19 @@ impl RuntimeCatalog {
             // `Bundled` names no path, so discovery's first rule — the
             // override — stays decisive and the operator's choice is what runs
             // (and what the `requires` gate reports on).
+            return Ok(RuntimeProfile::Bundled);
+        }
+
+        // A shipped artefact must not depend on a system-wide runtime
+        // (spec 14.11), so a bundled interpreter that satisfies the declaration
+        // wins even when the host happens to have a newer one installed. The
+        // "newest wins" rule below only arbitrates between interpreters that
+        // are all equally the machine's, not the product's.
+        if self
+            .bundled
+            .as_ref()
+            .is_some_and(|bundled| requires.is_satisfied_by(&bundled.version))
+        {
             return Ok(RuntimeProfile::Bundled);
         }
 
@@ -518,14 +647,16 @@ impl RuntimeCatalog {
     /// unsatisfiable requirement if the diagnostic says which interpreters were
     /// considered and what versions they reported.
     fn describe_found(&self) -> String {
-        if self.interpreters.is_empty() {
+        let found: Vec<String> = self
+            .bundled
+            .iter()
+            .chain(&self.interpreters)
+            .map(Interpreter::to_string)
+            .collect();
+        if found.is_empty() {
             return format!("no {} on the search path", SEARCH_PATH_CANDIDATES.join(" or "));
         }
-        self.interpreters
-            .iter()
-            .map(Interpreter::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
+        found.join(", ")
     }
 }
 
@@ -542,10 +673,10 @@ pub fn discover_interpreter(
 /// (spec 14.11).
 ///
 /// The order is `CRIKEY_PYTHON`, then [`RuntimeProfile::External`], then the
-/// search path. Each rule is *decisive*: once a rule names a candidate, a
-/// candidate that cannot be used — because it will not run or because it does
-/// not satisfy `requires` — is the answer, an error, and the remaining rules
-/// are never consulted.
+/// runtime bundled beside the executable, then the search path. Each rule is
+/// *decisive*: once a rule names a candidate, a candidate that cannot be used
+/// — because it will not run or because it does not satisfy `requires` — is
+/// the answer, an error, and the remaining rules are never consulted.
 pub fn discover_interpreter_in(
     profile: &RuntimeProfile,
     requires: &RequiresPython,
@@ -555,18 +686,25 @@ pub fn discover_interpreter_in(
         return resolve(path, InterpreterSource::EnvironmentOverride, requires);
     }
 
-    // `Bundled` names no path here: a bundled runtime is laid down by the
-    // installer and reached through the search path like any other, so it falls
-    // to the last rule rather than inventing a location (spec 14.11).
+    // `Bundled` names no path: it is the absence of an explicitly chosen
+    // interpreter, so the remaining rules decide.
     if let RuntimeProfile::External(path) = profile {
         return resolve(path, InterpreterSource::RuntimeProfile, requires);
+    }
+
+    // Present *and* decisive: once a build ships its own runtime, silently
+    // preferring the machine's reintroduces exactly the system-wide dependency
+    // bundling exists to remove, so a staged runtime that will not run is a
+    // failure rather than an invisible downgrade.
+    if let Some(path) = environment.bundled_interpreter() {
+        return resolve(&path, InterpreterSource::BundledRuntime, requires);
     }
 
     match environment.find_on_search_path() {
         Some(path) => resolve(&path, InterpreterSource::SearchPath, requires),
         None => Err(HostError::Interpreter(format!(
-            "no {} on the search path, and neither {ENV_PYTHON_OVERRIDE} nor an external \
-             runtime profile named one",
+            "no {} on the search path, no {BUNDLED_RUNTIME_DIR} runtime beside the executable, \
+             and neither {ENV_PYTHON_OVERRIDE} nor an external runtime profile named one",
             SEARCH_PATH_CANDIDATES.join(" or "),
         ))),
     }
@@ -780,6 +918,11 @@ fn hard_kill_probe(process_id: u32, child: &mut Child) {
 
 #[cfg(unix)]
 fn kill_probe_process_group(process_id: u32) {
+    // `killpg(0)` would signal this launcher's own process group; the probe pid
+    // is always a live `Child::id()`, so treat "myself"/"init" as impossible.
+    if process_id <= 1 {
+        return;
+    }
     extern "C" {
         fn killpg(pgrp: i32, sig: i32) -> i32;
     }
@@ -940,6 +1083,65 @@ mod tests {
             found("/usr/bin/python3.12", 3, 12, 7),
             found("/usr/bin/python3.13", 3, 13, 1),
         ])
+    }
+
+    /// A staged runtime entry, so the mapping rule can be tested without a
+    /// real installation tree beside the test binary.
+    fn staged(path: &str, major: u32, minor: u32, patch: u32) -> Interpreter {
+        Interpreter {
+            path: PathBuf::from(path),
+            version: PythonVersion::new(major, minor, patch),
+            source: InterpreterSource::BundledRuntime,
+        }
+    }
+
+    #[test]
+    fn a_satisfying_bundled_runtime_is_mapped_ahead_of_a_newer_interpreter_on_the_search_path() {
+        // 3.13.1 is installed on this host and 3.12.4 is what the artefact
+        // ships. The shipped one wins: bundling is about not depending on the
+        // machine, and "newest wins" only arbitrates between the machine's own.
+        let profile = host_with_three_versions()
+            .with_bundled(staged("/opt/crikey/python-runtime/bin/python3", 3, 12, 4))
+            .profile_for(&RequiresPython(">=3.12".to_owned()))
+            .expect("the bundled 3.12.4 satisfies >=3.12");
+
+        assert_eq!(
+            profile,
+            RuntimeProfile::Bundled,
+            "a satisfying shipped runtime is mapped to the bundled profile, not to a host path"
+        );
+    }
+
+    #[test]
+    fn a_bundled_runtime_that_cannot_satisfy_the_requirement_does_not_hide_one_that_can() {
+        // Honest degradation: the artefact ships 3.10, the plugin needs 3.13,
+        // and the host has 3.13. Refusing here would fail a plugin that can
+        // demonstrably run, so the mapping names the host interpreter — and
+        // because the profile then names a path, discovery reports it as the
+        // runtime-profile rule rather than pretending it was bundled.
+        let profile = host_with_three_versions()
+            .with_bundled(staged("/opt/crikey/python-runtime/bin/python3", 3, 10, 3))
+            .profile_for(&RequiresPython(">=3.13".to_owned()))
+            .expect("the host's 3.13.1 satisfies >=3.13 even though the bundled runtime does not");
+
+        assert_eq!(
+            profile,
+            RuntimeProfile::External(PathBuf::from("/usr/bin/python3.13"))
+        );
+    }
+
+    #[test]
+    fn an_unsatisfiable_requirement_quotes_the_bundled_runtime_among_what_was_found() {
+        let error = RuntimeCatalog::of(Vec::new())
+            .with_bundled(staged("/opt/crikey/python-runtime/bin/python3", 3, 10, 3))
+            .profile_for(&RequiresPython(">=3.13".to_owned()))
+            .expect_err("neither the bundled runtime nor the empty host satisfies >=3.13");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("python-runtime") && message.contains("3.10.3"),
+            "an operator cannot fix the staging unless the diagnostic names it: {message}"
+        );
     }
 
     #[test]

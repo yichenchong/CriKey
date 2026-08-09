@@ -109,7 +109,7 @@ source = "https://github.com/ronan696/keypirinha-tldr"
 revision = "b78cd016473b007127a84c9adea54c3ffe1a9d79"
 licence = "MIT"
 classification = "blocked-missing-apis"
-notes = "Static audit of src/tldr.py: calls Plugin.set_actions and Plugin.create_action in on_start, Plugin.create_error_item throughout on_suggest, and keypirinha_util.web_browser_command on execute. All four are `planned`, and the first pair fails during startup rather than in a branch, so the plugin cannot load at all. Nothing here is a behavioural mismatch - it is the M3 actions and error-item gap."
+notes = "Static audit of src/tldr.py: calls Plugin.set_actions and Plugin.create_action in on_start, Plugin.create_error_item throughout on_suggest, and keypirinha_util.web_browser_command on execute. The first three are delivered, so the package now loads and lists; web_browser_command is still `planned`, so executing a hit is what fails. Nothing here is a behavioural mismatch."
 
 [[package]]
 id = "s-oram.keypirinha-recent-items"
@@ -125,7 +125,7 @@ source = "https://github.com/ueffel/Keypirinha-WindowsApps"
 revision = "439c84ac45e0158acc5f978d9a13034497358109"
 licence = "MIT"
 classification = "blocked-missing-apis"
-notes = "Static audit of windowsapps.py and lib/helper.py: uses Plugin.load_icon, Plugin.set_actions, Plugin.create_action and Settings.get_enum, all `planned`. It also enumerates Universal Windows Apps through PowerShell and the Windows package manifests, so it is Windows-only; the classification records the API gap because that is what blocks it first."
+notes = "Static audit of windowsapps.py and lib/helper.py: uses Plugin.load_icon, Plugin.set_actions, Plugin.create_action and Settings.get_enum. The first three are delivered; Settings.get_enum is still `planned` and is read during on_start, so the plugin still cannot load. It also enumerates Universal Windows Apps through PowerShell and the Windows package manifests, so it is Windows-only regardless; the classification records the API gap because that is what blocks it first."
 
 # ---------------------------------------------------------------------------
 # Referenced, not yet audited (honest and still counted)

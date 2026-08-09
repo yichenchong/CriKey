@@ -115,8 +115,10 @@ fn runtime_namespace(runtime: Runtime) -> Option<&'static str> {
         Runtime::Native => Some("native"),
         // Legacy keeps its own configuration path and syntax (spec 21.1, 14).
         Runtime::LegacyPython => None,
-        // No host executes these, so nothing would ever read their settings.
-        Runtime::Wasm | Runtime::Builtin => None,
+        // No host reads their settings today: `c-abi` plugins receive no
+        // configuration publication because the restricted ABI has no
+        // configuration entry point (ADR-0015).
+        Runtime::Wasm | Runtime::CAbi | Runtime::Builtin => None,
     }
 }
 

@@ -60,8 +60,9 @@
 //!   would leak into every concurrent test and be unsound besides. No test in
 //!   this file mutates the process environment.
 //! * Discovery order is fixed and total: `CRIKEY_PYTHON`, then
-//!   `RuntimeProfile::External(path)`, then `python3` on `PATH` (spec 14.11).
-//!   An override that names a broken interpreter is a hard failure, never a
+//!   `RuntimeProfile::External(path)`, then the runtime staged beside the
+//!   executable (spec 14.11), then `python3` on `PATH`. An
+//!   override that names a broken interpreter is a hard failure, never a
 //!   silent fall-through to the next candidate.
 //! * `LegacyWorker::spawn(&Interpreter, &LegacyPackage, WorkerOptions)`,
 //!   `call(&mut self, LegacyRequest) -> Result<LegacyResponse, WorkerError>`,
@@ -113,6 +114,8 @@ use crikey_legacy_compat::{
 #[cfg(unix)]
 use crikey_legacy_compat::{InterpreterSource, PythonVersion};
 use crikey_python_host::RuntimeProfile;
+#[cfg(unix)]
+use crikey_python_host::BUNDLED_RUNTIME_DIR;
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -687,6 +690,136 @@ fn search_path_skips_directories_and_non_executable_candidates() {
     let interpreter = discover_interpreter_in(&RuntimeProfile::LegacyCompatibility, &environment)
         .expect("search discovery skips unusable name matches");
     assert_eq!(interpreter.path(), usable_path);
+}
+
+// ---------------------------------------------------------------------------
+// The bundled runtime (spec 14.11)
+//
+// The legacy layer resolves interpreters too, and it must resolve them by the
+// *same* rule as the modern host: one policy, not two. These pin that a
+// runtime staged beside the executable is preferred over PATH here as well,
+// and that it faces the same minimum-version gate.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn a_staged_bundled_runtime_is_chosen_with_no_environment_variable_set() {
+    let scratch = Scratch::new("discovery-bundled");
+    let install = scratch.subdir("install");
+    let bin = install.join(BUNDLED_RUNTIME_DIR).join("bin");
+    fs::create_dir_all(&bin).expect("bundled runtime layout is creatable");
+    let bundled = version_shim(&bin, "python3", "3.12.4");
+
+    // Newer on PATH, and it still loses: a shipped artefact runs on the
+    // runtime it was tested with, not on whatever the machine happens to have.
+    let search = scratch.subdir("bin");
+    version_shim(&search, "python3", "3.13.9");
+
+    let environment = DiscoveryEnvironment::empty()
+        .with_executable_dir(&install)
+        .with_search_path([search]);
+
+    let interpreter = discover_interpreter_in(&RuntimeProfile::LegacyCompatibility, &environment)
+        .expect("a staged bundled runtime resolves with nothing configured");
+
+    assert_eq!(
+        interpreter.path(),
+        bundled,
+        "the legacy layer prefers the shipped runtime over PATH, exactly as the modern host does"
+    );
+    assert_eq!(interpreter.version(), PythonVersion::new(3, 12, 4));
+    assert_eq!(
+        interpreter.source(),
+        InterpreterSource::BundledRuntime,
+        "discovery reports that the bundled runtime selected the interpreter"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_override_and_an_external_profile_both_still_outrank_the_bundled_runtime() {
+    let scratch = Scratch::new("discovery-bundled-outranked");
+    let install = scratch.subdir("install");
+    let bin = install.join(BUNDLED_RUNTIME_DIR).join("bin");
+    fs::create_dir_all(&bin).expect("bundled runtime layout is creatable");
+    version_shim(&bin, "python3", "3.12.4");
+    let override_python = version_shim(&scratch.path, "override-python", "3.11.5");
+    let profile_python = version_shim(&scratch.path, "profile-python", "3.13.2");
+
+    let base = DiscoveryEnvironment::empty().with_executable_dir(&install);
+
+    let overridden = discover_interpreter_in(
+        &RuntimeProfile::External(profile_python.clone()),
+        &base.clone().with_override(&override_python),
+    )
+    .expect("an override naming a usable interpreter resolves");
+    assert_eq!(
+        overridden.path(),
+        override_python,
+        "CRIKEY_PYTHON is still rule one"
+    );
+
+    let profiled = discover_interpreter_in(&RuntimeProfile::External(profile_python.clone()), &base)
+        .expect("an external runtime profile naming a usable interpreter resolves");
+    assert_eq!(
+        profiled.path(),
+        profile_python,
+        "an explicitly named interpreter still outranks the shipped runtime"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_build_with_no_staged_runtime_discovers_exactly_what_it_did_before() {
+    let scratch = Scratch::new("discovery-bundled-absent");
+    let install = scratch.subdir("install");
+    let search = scratch.subdir("bin");
+    let chosen = version_shim(&search, "python3", "3.10.3");
+
+    let environment = DiscoveryEnvironment::empty()
+        .with_executable_dir(&install)
+        .with_search_path([search]);
+
+    let interpreter = discover_interpreter_in(&RuntimeProfile::LegacyCompatibility, &environment)
+        .expect("with no runtime staged, the search path is still the final rule");
+
+    assert_eq!(interpreter.path(), chosen);
+    assert_eq!(interpreter.source(), InterpreterSource::SearchPath);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bundled_runtime_below_the_minimum_version_is_an_error_not_a_fall_through_to_path() {
+    let scratch = Scratch::new("discovery-bundled-old");
+    let install = scratch.subdir("install");
+    let bin = install.join(BUNDLED_RUNTIME_DIR).join("bin");
+    fs::create_dir_all(&bin).expect("bundled runtime layout is creatable");
+    let bundled = version_shim(&bin, "python3", "3.7.9");
+
+    // A supported interpreter is on PATH. Falling through to it would run
+    // legacy plugin code on a runtime the artefact was never validated with.
+    let search = scratch.subdir("bin");
+    version_shim(&search, "python3", "3.12.1");
+
+    let error = discover_interpreter_in(
+        &RuntimeProfile::LegacyCompatibility,
+        &DiscoveryEnvironment::empty()
+            .with_executable_dir(&install)
+            .with_search_path([search]),
+    )
+    .expect_err("a bundled runtime below the minimum cannot resolve");
+
+    match &error {
+        WorkerError::UnsupportedVersion { path, found, minimum } => {
+            assert_eq!(
+                path, &bundled,
+                "the failure names the staged interpreter it probed"
+            );
+            assert_eq!(*found, PythonVersion::new(3, 7, 9));
+            assert_eq!(*minimum, MINIMUM_SUPPORTED_PYTHON);
+        }
+        other => panic!("an old bundled runtime is UnsupportedVersion, got {other:?}"),
+    }
 }
 #[cfg(unix)]
 #[test]
@@ -1798,4 +1931,248 @@ fn shutdown_reaps_the_child_process_and_leaves_no_orphan() {
         Some(true),
         "shutdown reaps the child; pid {child} is still in the process table"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The presentation APIs (spec 11.7, 14.4)
+//
+// Alternate actions, icon handles, error items and resource enumeration are
+// the four APIs the real-plugin corpus is actually blocked on, and all four
+// are only observable across the process boundary: the plugin registers them
+// in the child and the host has to receive them on the items it decodes. The
+// committed `rich-presentation` fixture is the peer, so these tests pin what a
+// real package sees rather than what a purpose-built string of Python does.
+// ---------------------------------------------------------------------------
+
+/// The committed synthetic package `compatibility/test-plugins/<name>`.
+///
+/// Loaded from the repository rather than written into scratch space: these
+/// contracts are about files that ship — an icon with real bytes, resources in
+/// a subdirectory — and a fixture invented per test could not prove the
+/// committed one still works.
+fn committed_package(scratch: &Scratch, name: &str) -> LegacyPackage {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("the crate lives two directories below the workspace root")
+        .join("compatibility/test-plugins")
+        .join(name);
+    assert!(
+        root.is_dir(),
+        "the synthetic legacy package `{name}` is missing from {}; these tests do not skip",
+        root.display()
+    );
+
+    PackageLoader::new(scratch.join("package-cache"))
+        .load(&root)
+        .expect("a committed synthetic package is loadable")
+}
+
+const RICH: &str = "legacy.rich-presentation";
+
+/// Starts the fixture and returns what one `on_suggest` published.
+///
+/// `on_start` first, and not merely for tidiness: the fixture registers its
+/// actions and its icon there, exactly as published packages do, so a host
+/// that dropped the registration between callbacks would produce bare items
+/// here.
+fn rich_suggestions(worker: &mut LegacyWorker) -> Vec<Item> {
+    call_ok(worker, request(RICH, 1, LegacyRequestKind::Start));
+    let response = call_ok(
+        worker,
+        request(
+            RICH,
+            2,
+            LegacyRequestKind::InitialSuggest {
+                query: "rich".to_owned(),
+            },
+        ),
+    );
+    match response.outcome {
+        LegacyOutcome::Suggestions(items) => items,
+        other => panic!("the fixture publishes suggestions, got {other:?}"),
+    }
+}
+
+fn item_with_target<'a>(items: &'a [Item], target: &str) -> &'a Item {
+    items
+        .iter()
+        .find(|item| item.target == target)
+        .unwrap_or_else(|| {
+            panic!(
+                "the fixture publishes an item targeting `{target}`; got {:?}",
+                items.iter().map(|item| item.target.as_str()).collect::<Vec<_>>()
+            )
+        })
+}
+
+#[test]
+fn registered_actions_reach_every_item_of_their_category_and_no_other() {
+    let scratch = Scratch::new("legacy-actions");
+    let package = committed_package(&scratch, "rich-presentation");
+    let mut worker = LegacyWorker::spawn(&host_interpreter(), &package, options(RICH))
+        .expect("the committed fixture spawns a worker");
+
+    let items = rich_suggestions(&mut worker);
+    let entry = item_with_target(&items, "rich-presentation/entry");
+
+    assert_eq!(
+        entry
+            .actions
+            .iter()
+            .map(|action| action.action_id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["copy", "reveal"],
+        "the actions arrive in the order the plugin registered them, or the row's \
+         alternates are offered in an order the author did not choose",
+    );
+    assert_eq!(entry.actions[1].label, "Reveal");
+    assert_eq!(entry.actions[1].description, "Show where the target lives");
+    assert!(
+        entry
+            .actions
+            .iter()
+            .all(|action| action.execution_policy == ExecutionPolicy::Plugin),
+        "a legacy action is run by the plugin that registered it, never by the host",
+    );
+
+    // The error item is categorised ERROR, and `set_actions` registered
+    // against KEYWORD only. A host that attached the list to every item would
+    // offer "Copy" and "Reveal" on a failure message.
+    let refusal = item_with_target(&items, "rich-presentation/escape-refused");
+    assert!(
+        refusal.actions.is_empty(),
+        "actions are registered per category; the error item is in another one",
+    );
+
+    worker.shutdown().expect("the worker shuts down cleanly");
+}
+
+#[test]
+fn executing_a_registered_action_hands_the_plugin_that_action_and_not_the_default() {
+    let scratch = Scratch::new("legacy-action-execute");
+    let package = committed_package(&scratch, "rich-presentation");
+    let mut worker = LegacyWorker::spawn(&host_interpreter(), &package, options(RICH))
+        .expect("the committed fixture spawns a worker");
+
+    let items = rich_suggestions(&mut worker);
+    let entry = item_with_target(&items, "rich-presentation/entry").clone();
+    let reveal = entry
+        .actions
+        .iter()
+        .find(|action| action.action_id == ActionId("reveal".to_owned()))
+        .expect("the fixture registered `reveal`")
+        .clone();
+
+    let chosen = call_ok(
+        &mut worker,
+        request(
+            RICH,
+            3,
+            LegacyRequestKind::Execute {
+                item: Box::new(entry.clone()),
+                action: Some(reveal),
+            },
+        ),
+    );
+    assert!(
+        matches!(chosen.outcome, LegacyOutcome::Executed),
+        "`on_execute` completed, got {:?}",
+        chosen.outcome,
+    );
+    // The fixture echoes the action it was handed. Asserting on the echo, not
+    // merely on "the callback ran", is what distinguishes delivering the right
+    // action from delivering any action at all.
+    assert!(
+        chosen.log.iter().any(|line| line.contains("action=reveal")),
+        "the plugin must receive the action the user chose; log: {:?}",
+        chosen.log,
+    );
+
+    // `None` is the documented spelling of "the default action was taken", and
+    // a plugin branches on it. It must not arrive as a synthesised action.
+    let default = call_ok(
+        &mut worker,
+        request(
+            RICH,
+            4,
+            LegacyRequestKind::Execute {
+                item: Box::new(entry),
+                action: None,
+            },
+        ),
+    );
+    assert!(
+        default.log.iter().any(|line| line.contains("action=<default>")),
+        "no chosen action must reach `on_execute` as None; log: {:?}",
+        default.log,
+    );
+
+    worker.shutdown().expect("the worker shuts down cleanly");
+}
+
+#[test]
+fn a_loaded_icon_crosses_as_a_package_relative_reference_the_host_can_resolve() {
+    let scratch = Scratch::new("legacy-icon");
+    let package = committed_package(&scratch, "rich-presentation");
+    let mut worker = LegacyWorker::spawn(&host_interpreter(), &package, options(RICH))
+        .expect("the committed fixture spawns a worker");
+
+    let items = rich_suggestions(&mut worker);
+
+    assert_eq!(
+        item_with_target(&items, "rich-presentation/entry")
+            .icon_reference
+            .as_deref(),
+        Some("icons/badge.png"),
+        "an item built with an icon handle must name the file the host will read",
+    );
+    // `set_default_icon` is not decoration: an item that names no handle of its
+    // own inherits it, which is the only way a package gives all its rows one
+    // picture without repeating the handle on every item.
+    assert_eq!(
+        item_with_target(&items, "rich-presentation/resources")
+            .icon_reference
+            .as_deref(),
+        Some("icons/badge.png"),
+        "an item with no handle of its own inherits the plugin's default icon",
+    );
+    // The reference is package-relative and nothing else: an absolute path
+    // would resolve against the host's filesystem rather than the package.
+    assert!(
+        !Path::new("icons/badge.png").is_absolute(),
+        "the reference the host resolves is relative to the package directory",
+    );
+
+    worker.shutdown().expect("the worker shuts down cleanly");
+}
+
+#[test]
+fn find_resources_reports_package_relative_names_and_refuses_to_leave_the_package() {
+    let scratch = Scratch::new("legacy-resources");
+    let package = committed_package(&scratch, "rich-presentation");
+    let mut worker = LegacyWorker::spawn(&host_interpreter(), &package, options(RICH))
+        .expect("the committed fixture spawns a worker");
+
+    let items = rich_suggestions(&mut worker);
+
+    assert_eq!(
+        item_with_target(&items, "rich-presentation/resources").description,
+        "icons/badge.png",
+        "the names are package-relative, sorted, and exactly what the pattern matches",
+    );
+
+    // The escape probe publishes one of two mutually exclusive rows. Asserting
+    // both directions is what stops this passing on a plugin that raised for
+    // some unrelated reason, or on a `find_resources` that answered nothing.
+    item_with_target(&items, "rich-presentation/escape-refused");
+    assert!(
+        !items
+            .iter()
+            .any(|item| item.target == "rich-presentation/escape-escaped"),
+        "a `..` pattern must be refused, never walked; got {:?}",
+        items.iter().map(|item| item.target.as_str()).collect::<Vec<_>>(),
+    );
+
+    worker.shutdown().expect("the worker shuts down cleanly");
 }

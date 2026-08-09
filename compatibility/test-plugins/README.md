@@ -41,6 +41,7 @@ actually read rather than by a file nobody opens.
 | `caches-dynamic-suggestions` | `caches-dynamic-suggestions.py` | `caches-dynamic-suggestions.ini` |
 | `windows-only` | `windows-only.py` | `windows-only.ini` |
 | `catalog-only` | `catalog-only.py` | `catalog-only.ini`, `data/descriptions.txt` |
+| `rich-presentation` | `rich-presentation.py` | `rich-presentation.ini`, `icons/badge.png` |
 
 ## What each fixture proves
 
@@ -132,6 +133,31 @@ identities distinct (spec 10.2).
 Item labels live in the module and nowhere else; only the *descriptions* come
 from `data/descriptions.txt`, so a resource that failed to load can never
 disturb the string the encoding test depends on.
+
+### `rich-presentation` — what a row carries
+
+The control for *presentation*, as `well-behaved` is the control for
+scheduling. It registers two alternate actions for one category with
+`set_actions`, loads `icons/badge.png` through `load_icon` (both as a
+package-relative path and in the documented `res://Package/file` form), makes
+it the plugin's default icon, and publishes rows that carry both. `on_execute`
+writes the name of the action it was handed to the log the worker returns, so
+which action the host delivered is observable without a side effect.
+
+Two of its rows are probes. One reports what `find_resources("icons/*.png")`
+found; the other tries `find_resources("../*/*.py")` and publishes a
+`create_error_item` saying the pattern was refused. The failing spelling of
+that probe is a *different* label, so a test cannot pass on an empty result.
+
+Defends spec 14.4 and 11.7: alternate actions, icon handles, error items and
+resource enumeration are the APIs published packages actually block on, and
+the escape probe is the containment rule that keeps resource enumeration from
+becoming a file browser. It breaks no scheduling rule and must pass every
+conformance check.
+
+The resource pattern is one directory deep on purpose. A `**` pattern would
+also match a `__pycache__` an interpreter happened to write into the package,
+and the fixture's output would then depend on whether bytecode was cached.
 
 ## House rules for anything added here
 

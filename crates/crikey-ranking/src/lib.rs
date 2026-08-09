@@ -14,9 +14,9 @@
 //! active signals: switching a signal off removes exactly its own
 //! contribution and rescales nothing else.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::BTreeMap};
 
-use crikey_core::{Category, Item};
+use crikey_core::{Category, Item, ItemId, PluginId};
 use crikey_query::{MatchMethod, MatchOutcome, MatchSummary, NormalizedQuery};
 
 // ---------------------------------------------------------------------------
@@ -103,8 +103,180 @@ pub struct RankingSignals {
     pub query_history: f32,
     /// The item suits the foreground application context.
     pub context_match: bool,
+
     /// Configured preference for this item, clamped to `0.0..=1.0`.
     pub user_preference: f32,
+}
+/// A bounded, deterministic record of selections used by ranking (spec 11.3).
+///
+/// The store is deliberately owned by the application rather than persisted
+/// by the ranker. Callers decide when a selection is durable and provide the
+/// current query and clock value, which keeps tests and replay deterministic.
+#[derive(Debug, Clone, Default)]
+pub struct SelectionHistory {
+    entries: BTreeMap<(PluginId, ItemId), HistoryEntry>,
+    query_counts: BTreeMap<(PluginId, ItemId, String), u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HistoryEntry {
+    frequency: u32,
+    last_selected_secs: Option<u64>,
+}
+
+/// One item's selection record, as it crosses a persistence boundary.
+///
+/// The in-memory store is keyed maps, which is the right shape for lookup and
+/// the wrong shape for a file: a caller writing it out must be able to walk
+/// every record without the ranker deciding what a record looks like on disk.
+/// So the snapshot flattens the key into the record and stops there — the
+/// encoding stays entirely with whoever owns the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionRecord {
+    pub plugin: PluginId,
+    pub item: ItemId,
+    pub frequency: u32,
+    pub last_selected_secs: Option<u64>,
+}
+
+/// One (item, query) affinity count, the second half of the history.
+///
+/// Separate from [`SelectionRecord`] because it is separately keyed: the same
+/// item carries one count per query that ever selected it, and collapsing the
+/// two into one record would either lose counts or invent them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryAffinityRecord {
+    pub plugin: PluginId,
+    pub item: ItemId,
+    pub query: String,
+    pub count: u32,
+}
+
+/// A lossless copy of a [`SelectionHistory`].
+///
+/// Lossless is the whole contract: a snapshot restored into a fresh history
+/// must score identically to the one it came from, or persistence would
+/// silently rewrite the user's ranking every launch. Every field of every
+/// record therefore appears here, including the per-query affinity that a
+/// frequency-only snapshot would quietly drop.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectionHistorySnapshot {
+    pub selections: Vec<SelectionRecord>,
+    pub query_affinities: Vec<QueryAffinityRecord>,
+}
+
+impl SelectionHistory {
+    /// Records one successful item selection.
+    pub fn record(&mut self, item: &Item, query: &NormalizedQuery, now_secs: u64) {
+        let entry = self
+            .entries
+            .entry((item.plugin_id.clone(), item.stable_id.clone()))
+            .or_default();
+        entry.frequency = entry.frequency.saturating_add(1);
+        entry.last_selected_secs = Some(now_secs);
+
+        let query_key = (
+            item.plugin_id.clone(),
+            item.stable_id.clone(),
+            query.normalized.clone(),
+        );
+        let count = self.query_counts.entry(query_key).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    /// Applies the recorded history and foreground category to dynamic signals.
+    ///
+    /// Future timestamps are treated as zero age rather than underflowing. A
+    /// missing history entry leaves all history fields neutral.
+    pub fn augment(
+        &self,
+        item: &Item,
+        query: &NormalizedQuery,
+        now_secs: u64,
+        foreground_category: Option<&Category>,
+        signals: &mut RankingSignals,
+    ) {
+        if let Some(entry) = self
+            .entries
+            .get(&(item.plugin_id.clone(), item.stable_id.clone()))
+        {
+            signals.selection_frequency = entry.frequency;
+            signals.selection_recency_secs = entry
+                .last_selected_secs
+                .map(|selected| now_secs.saturating_sub(selected));
+        }
+        signals.query_history = self
+            .query_counts
+            .get(&(
+                item.plugin_id.clone(),
+                item.stable_id.clone(),
+                query.normalized.clone(),
+            ))
+            .copied()
+            .map_or(0.0, |count| saturating_rise(count as f32, FREQUENCY_HALF_LIFE));
+        signals.context_match = foreground_category.is_some_and(|category| category == &item.category);
+    }
+
+    /// Removes all records. Useful when the user clears ranking history.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.query_counts.clear();
+    }
+
+    /// Copies every record out, in the store's own deterministic key order.
+    ///
+    /// Ordering is the `BTreeMap`'s, so two runs that recorded the same
+    /// selections produce byte-identical snapshots. That is what lets a caller
+    /// compare or diff a persisted history instead of only overwriting it.
+    pub fn snapshot(&self) -> SelectionHistorySnapshot {
+        SelectionHistorySnapshot {
+            selections: self
+                .entries
+                .iter()
+                .map(|((plugin, item), entry)| SelectionRecord {
+                    plugin: plugin.clone(),
+                    item: item.clone(),
+                    frequency: entry.frequency,
+                    last_selected_secs: entry.last_selected_secs,
+                })
+                .collect(),
+            query_affinities: self
+                .query_counts
+                .iter()
+                .map(|((plugin, item, query), count)| QueryAffinityRecord {
+                    plugin: plugin.clone(),
+                    item: item.clone(),
+                    query: query.clone(),
+                    count: *count,
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuilds a history from a snapshot.
+    ///
+    /// Duplicate keys keep the last record rather than being rejected: the
+    /// snapshot may have come off disk, where nothing prevents a damaged or
+    /// hand-edited file from repeating a key, and a ranking store has no
+    /// business refusing to start over an ambiguity it can resolve.
+    pub fn from_snapshot(snapshot: SelectionHistorySnapshot) -> Self {
+        let mut history = Self::default();
+        for record in snapshot.selections {
+            history.entries.insert(
+                (record.plugin, record.item),
+                HistoryEntry {
+                    frequency: record.frequency,
+                    last_selected_secs: record.last_selected_secs,
+                },
+            );
+        }
+        for record in snapshot.query_affinities {
+            history
+                .query_counts
+                .insert((record.plugin, record.item, record.query), record.count);
+        }
+        history
+    }
 }
 
 /// Final ordering key. Candidate identity supplies any deterministic tie-break.
@@ -241,20 +413,39 @@ impl DefaultRanker {
         Score::new(sanitize(total, MIN_SCORE, MAX_SCORE))
     }
 
+    /// Scores allocation-free match data with caller-provided dynamic signals.
+    pub fn score_match_with_signals(
+        &self,
+        item: &Item,
+        summary: MatchSummary,
+        mut signals: RankingSignals,
+    ) -> Score {
+        signals.match_quality = summary.score;
+        signals.exact_prefix = summary.method == MatchMethod::ExactPrefix;
+        signals.match_position = summary.match_position;
+        signals.category_weight = category_weight(&item.category);
+        signals.plugin_score_hint = item.score_hint;
+        self.score_signals(signals)
+    }
+
+    /// Scores a published outcome with caller-provided dynamic signals.
+    pub fn score_outcome_with_signals(
+        &self,
+        item: &Item,
+        outcome: &MatchOutcome,
+        mut signals: RankingSignals,
+    ) -> Score {
+        signals.match_quality = outcome.score;
+        signals.exact_prefix = outcome.method == MatchMethod::ExactPrefix;
+        signals.match_position = earliest_highlight(&item.label, &outcome.highlights);
+        signals.category_weight = category_weight(&item.category);
+        signals.plugin_score_hint = item.score_hint;
+        self.score_signals(signals)
+    }
+
     /// Scores allocation-free match data produced during bounded selection.
     pub fn score_match(&self, item: &Item, summary: MatchSummary) -> Score {
-        self.score_signals(RankingSignals {
-            match_quality: summary.score,
-            exact_prefix: summary.method == MatchMethod::ExactPrefix,
-            match_position: summary.match_position,
-            category_weight: category_weight(&item.category),
-            plugin_score_hint: item.score_hint,
-            selection_frequency: 0,
-            selection_recency_secs: None,
-            query_history: 0.0,
-            context_match: false,
-            user_preference: 0.0,
-        })
+        self.score_match_with_signals(item, summary, RankingSignals::default())
     }
 
     /// Highest score this item can earn without a label-prefix match.

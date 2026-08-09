@@ -1,7 +1,11 @@
 //! The `crikey plugin` command family (spec 28; 21.2, 23, 26).
 //!
-//! Seven subcommands over one inventory: `list`, `install`, `remove`, `enable`,
-//! `disable`, `doctor` and `scheduling-profile`.
+//! Ten subcommands over two sources of truth. Seven work on the local
+//! inventory — `list`, `install`, `remove`, `enable`, `disable`, `doctor` and
+//! `scheduling-profile` — and three work on the configured plugin indexes:
+//! `search`, `show` and `index update` (spec 2.2). `install` spans both: it
+//! takes a path or a URL as it always has, and resolves anything shaped like a
+//! bare plugin id through the index.
 //!
 //! # One id, and it is the namespaced one
 //!
@@ -48,13 +52,18 @@ use crikey_core::PluginId;
 use crikey_legacy_compat::{
     discover_interpreter, LegacyPackage, PackageLoader, Severity, PACKAGE_ARCHIVE_EXTENSION,
 };
-use crikey_package_manager::{InstallSource, InstalledPlugin, PluginInstaller};
+use crikey_package_manager::{
+    index_max_age, index_urls, search as index_search, Freshness, IndexEntry, IndexOutcome, IndexSnapshot,
+    InstallSource, InstalledPlugin, PluginIndexClient, PluginInstaller, SignaturePolicy,
+    KEY_INDEX_MAX_AGE_SECONDS, KEY_INDEX_URLS,
+};
 use crikey_platform::{PluginKind, StandardDirectories};
 use crikey_plugin_model::{ConcurrencySection, Manifest, Runtime, SchedulingProfile};
 use crikey_plugin_supervisor::{shared_budget_from_section, BudgetKind};
 use crikey_python_host::RuntimeProfile;
 
 use crate::legacy_commands::{compatibility_diagnostics, scan_windows_only_dependency, LegacyObservations};
+use crate::package_commands::signature_policy;
 
 /// A completed operation that found nothing wrong.
 const EX_OK: u8 = 0;
@@ -66,7 +75,10 @@ const EX_USAGE: u8 = 64;
 /// Runs the subcommand following `crikey plugin`.
 pub(crate) fn run(args: &[String]) -> ExitCode {
     let Some(command) = args.first().map(String::as_str) else {
-        return refuse("`plugin` needs list, install, remove, enable, disable, doctor or scheduling-profile");
+        return refuse(
+            "`plugin` needs list, search, show, index, install, remove, enable, disable, doctor or \
+             scheduling-profile",
+        );
     };
 
     if command == "-h" || command == "--help" {
@@ -88,6 +100,9 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 
     match command {
         "list" => list(rest),
+        "search" => search(rest),
+        "show" => show(rest),
+        "index" => index_command(rest),
         "install" => install(rest),
         "remove" => remove(rest),
         "enable" => set_enabled(rest, true),
@@ -105,6 +120,14 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 /// refused beside anything else. An unknown option silently swallowed by `--help`
 /// is how a typo becomes a command that appears to work and does nothing.
 fn validate_help_args(command: &str, args: &[String]) -> Result<(), String> {
+    // `install` is the one subcommand carrying an option, so `--help` beside it
+    // must recognise that option rather than report a typo — while every option
+    // that is not it is still refused below.
+    let args = if command == "install" {
+        take_unsigned_policy(args)?.1
+    } else {
+        args.to_vec()
+    };
     let positionals = args
         .iter()
         .filter(|argument| *argument != "-h" && *argument != "--help")
@@ -113,6 +136,7 @@ fn validate_help_args(command: &str, args: &[String]) -> Result<(), String> {
         "list" => 0,
         "install" | "remove" | "enable" | "disable" => 1,
         "doctor" => 1,
+        "search" | "show" | "index" => 1,
         "scheduling-profile" => 2,
         other => return Err(format!("unknown plugin subcommand `{other}`")),
     };
@@ -485,15 +509,21 @@ fn namespaced(kind: PluginKind, id: &str) -> PluginId {
 
 /// The plugin kind a declared manifest runtime belongs to.
 ///
-/// `wasm` and `builtin` have no installable kind: `wasm` is unimplemented and a
-/// built-in is compiled into the launcher, so neither can appear under a plugin
-/// root as something this command family manages.
+/// `c-abi` shares the `native` kind and the `native` plugin root: a restricted
+/// C-ABI package is a native package whose entrypoint happens to be a shared
+/// library rather than a program, and `crikey-cabi-host` is the executable
+/// CriKey actually supervises (ADR-0015).
+///
+/// `wasm` shares them for the same reason: `crikey-wasm-host` is the supervised
+/// executable and the module ships inside a package of the same shape
+/// (ADR-0014). A `builtin` has no installable kind at all, because it is
+/// compiled into the launcher and cannot appear under a plugin root.
 fn manifest_kind(runtime: Runtime) -> Option<PluginKind> {
     match runtime {
         Runtime::LegacyPython => Some(PluginKind::Legacy),
         Runtime::Python => Some(PluginKind::Modern),
-        Runtime::Native => Some(PluginKind::Native),
-        Runtime::Wasm | Runtime::Builtin => None,
+        Runtime::Native | Runtime::CAbi | Runtime::Wasm => Some(PluginKind::Native),
+        Runtime::Builtin => None,
     }
 }
 
@@ -578,33 +608,132 @@ fn report_unreadable(inventory: &Inventory) {
 // install and remove
 // ---------------------------------------------------------------------------
 
+/// Installs a plugin, under the operator's provenance policy (ADR-0012).
 fn install(args: &[String]) -> ExitCode {
-    let arguments = match positional("install", args, 1) {
+    let (unsigned, rest) = match take_unsigned_policy(args) {
+        Ok(split) => split,
+        Err(message) => return refuse(&message),
+    };
+    let arguments = match positional("install", &rest, 1) {
         Ok(arguments) => arguments,
         Err(message) => return refuse(&message),
     };
-    let Some(source) = arguments.first() else {
-        return refuse("`plugin install` needs a directory, archive, URL or `.keypirinha-package`");
+    let Some(wanted) = arguments.first() else {
+        return refuse(
+            "`plugin install` needs a directory, archive, URL, `.keypirinha-package` or an indexed id",
+        );
     };
-    let (directories, _) = match open_host() {
+    let (directories, config) = match open_host() {
         Ok(host) => host,
         Err(message) => return fail(&message),
     };
-    let source = match InstallSource::detect(source) {
-        Ok(source) => source,
-        Err(error) => return fail(&format!("cannot install `{source}`: {error}")),
-    };
+    // A path or a URL installs exactly as it always did. Only an argument that
+    // is neither — and is shaped like a plugin id rather than a mistyped path —
+    // is resolved through the configured index, so adding the index cannot
+    // change what an existing invocation means.
+    match InstallSource::detect(wanted) {
+        Ok(source) => {
+            let policy = match signature_policy(unsigned.as_deref()) {
+                Ok(policy) => policy,
+                Err(message) => return fail(&message),
+            };
+            install_source(&directories, &source, policy)
+        }
+        Err(unavailable) => {
+            if !is_plugin_id(wanted) {
+                return fail(&format!("cannot install `{wanted}`: {unavailable}"));
+            }
+            // Refused rather than accepted and ignored: an indexed install
+            // answers the provenance question with the index's own signature,
+            // so there is no unsigned-package decision left for the flag to
+            // make, and a flag that silently does nothing is how an operator
+            // concludes a policy is in force when it is not.
+            if let Some(given) = unsigned.as_deref() {
+                return fail(&format!(
+                    "`--unsigned-policy {given}` applies to an archive or a URL; `{wanted}` is an \
+                     indexed id, whose provenance comes from the trusted index signature that pins \
+                     its package digest"
+                ));
+            }
+            install_from_index(&directories, &config, wanted)
+        }
+    }
+}
 
-    let mut installer = PluginInstaller::new(&directories);
+/// Splits `--unsigned-policy VALUE` out of `plugin install`'s arguments.
+///
+/// A hand-rolled split rather than a flag table, because this is the family's
+/// only option and everything it does not consume still reaches [`positional`],
+/// which refuses options — so a mistyped flag cannot be swallowed here.
+fn take_unsigned_policy(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    const FLAG: &str = "--unsigned-policy";
+    let mut policy: Option<String> = None;
+    let mut rest = Vec::new();
+    let mut position = 0;
+    while position < args.len() {
+        let argument = args[position].as_str();
+        let value = if argument == FLAG {
+            let value = args
+                .get(position + 1)
+                .ok_or_else(|| format!("`plugin install` needs a value after `{FLAG}`"))?;
+            position += 2;
+            value.as_str()
+        } else if let Some(value) = argument
+            .strip_prefix(FLAG)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            position += 1;
+            value
+        } else {
+            rest.push(argument.to_owned());
+            position += 1;
+            continue;
+        };
+        if value.is_empty() {
+            return Err(format!("`plugin install {FLAG}` was given an empty value"));
+        }
+        if policy.is_some() {
+            return Err(format!("`plugin install` was given `{FLAG}` twice"));
+        }
+        policy = Some(value.to_owned());
+    }
+    Ok((policy, rest))
+}
+
+/// Runs the one install pipeline, whatever produced `source`.
+///
+/// An indexed install differs from a URL install in exactly one place — the
+/// digest check that happens before this is called — and shares the lock, the
+/// staging, the validation and the rollback with every other install, because a
+/// second installation path is a second set of atomicity bugs.
+///
+/// `policy` decides what happens to a native archive carrying no
+/// `<package>.sig`. It reaches the installer here and nowhere else, which is
+/// what makes the configured `packages.unsigned-policy` mean anything at
+/// install time rather than only under `crikey package verify`.
+fn install_source(
+    directories: &StandardDirectories,
+    source: &InstallSource,
+    policy: SignaturePolicy,
+) -> ExitCode {
+    let mut installer = PluginInstaller::new(directories).with_signature_policy(policy);
     // Nothing to stop: this process is not the launcher, and a live launcher is
     // refused by the installer's exclusive lock rather than asked to quit.
-    match installer.install(&source, &mut |_| Ok(())) {
+    match installer.install(source, &mut |_| Ok(())) {
         Ok(installed) => {
             print_installed(&installed, "installed");
             ExitCode::from(EX_OK)
         }
         Err(error) => fail(&format!("installation failed: {error}")),
     }
+}
+
+/// Whether `value` is shaped like a plugin id rather than a path.
+fn is_plugin_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn remove(args: &[String]) -> ExitCode {
@@ -663,6 +792,293 @@ fn print_installed(plugin: &InstalledPlugin, verdict: &str) {
         if plugin.unsigned_binary { "true" } else { "false" },
     );
     field("verdict", verdict);
+}
+
+// ---------------------------------------------------------------------------
+// The plugin index
+// ---------------------------------------------------------------------------
+
+/// The index client this host's configuration describes.
+///
+/// Nothing is configured by default, and nothing is guessed when nothing is
+/// configured: a launcher that reached for a hardcoded host the moment a user
+/// typed `plugin search` would be making a network request nobody asked for, to
+/// a service this project does not run.
+fn open_index(directories: &StandardDirectories, config: &ConfigStore) -> Result<PluginIndexClient, String> {
+    let urls = index_urls(config.get(KEY_INDEX_URLS));
+    if urls.is_empty() {
+        return Err(format!(
+            "no plugin index is configured; set `{KEY_INDEX_URLS}` to a comma-separated list of \
+             index URLs in {}",
+            config.config_path().display()
+        ));
+    }
+    let max_age = index_max_age(config.get(KEY_INDEX_MAX_AGE_SECONDS));
+    PluginIndexClient::new(directories, urls, max_age)
+        .map_err(|error| format!("the plugin index is unusable: {error}"))
+}
+
+/// Prints one line per configured index and returns the usable snapshots and
+/// whether any index was refused.
+///
+/// Every index is reported before any of them is read, for the same reason
+/// `list` reports unreadable roots: a search across three indexes of which one
+/// was refused otherwise looks exactly like a complete answer.
+fn report_indexes(outcomes: Vec<IndexOutcome>) -> (Vec<IndexSnapshot>, bool) {
+    field("indexes", &outcomes.len().to_string());
+    let mut snapshots = Vec::new();
+    let mut refused = false;
+    for (position, outcome) in outcomes.into_iter().enumerate() {
+        match outcome.snapshot {
+            Ok(snapshot) => {
+                let (age, reason) = match &snapshot.freshness {
+                    Freshness::Fresh => ("-".to_owned(), "-".to_owned()),
+                    Freshness::Stale { age_seconds, reason } => (age_seconds.to_string(), reason.clone()),
+                };
+                println!(
+                    "index={position} url={} signer={} fingerprint={} freshness={} age_seconds={age} \
+                     generated_at={} plugins={} status=ok reason={}",
+                    encode(&snapshot.url),
+                    encode(&snapshot.signer.name),
+                    encode(&snapshot.signer.fingerprint),
+                    snapshot.freshness.as_str(),
+                    encode(&snapshot.document.generated_at),
+                    snapshot.document.plugins.len(),
+                    encode(&reason),
+                );
+                snapshots.push(snapshot);
+            }
+            Err(error) => {
+                refused = true;
+                println!(
+                    "index={position} url={} signer=- fingerprint=- freshness=unavailable age_seconds=- \
+                     generated_at=- plugins=0 status=refused reason={}",
+                    encode(&outcome.url),
+                    encode(&error.to_string()),
+                );
+            }
+        }
+    }
+    (snapshots, refused)
+}
+
+/// The exit status for a report whose indexes were all readable, or not.
+fn index_status(refused: bool) -> ExitCode {
+    if refused {
+        ExitCode::from(EX_INVALID)
+    } else {
+        ExitCode::from(EX_OK)
+    }
+}
+
+fn search(args: &[String]) -> ExitCode {
+    let arguments = match positional("search", args, 1) {
+        Ok(arguments) => arguments,
+        Err(message) => return refuse(&message),
+    };
+    let Some(query) = arguments.first() else {
+        return refuse("`plugin search` needs a query");
+    };
+    let (directories, config) = match open_host() {
+        Ok(host) => host,
+        Err(message) => return fail(&message),
+    };
+    let client = match open_index(&directories, &config) {
+        Ok(client) => client,
+        Err(message) => return fail(&message),
+    };
+
+    field("query", query);
+    let (snapshots, refused) = report_indexes(client.load(false));
+    let hits = index_search(&snapshots, query);
+    field("matches", &hits.len().to_string());
+    for (position, hit) in hits.iter().enumerate() {
+        println!(
+            "match={position} id={} name={} version={} runtime={} quality={} index_url={} summary={}",
+            encode(&hit.entry.id),
+            encode(&hit.entry.name),
+            encode(&hit.entry.version),
+            encode(&hit.entry.runtime),
+            hit.quality.as_str(),
+            encode(&hit.index_url),
+            encode(&hit.entry.summary),
+        );
+    }
+    index_status(refused)
+}
+
+fn show(args: &[String]) -> ExitCode {
+    let arguments = match positional("show", args, 1) {
+        Ok(arguments) => arguments,
+        Err(message) => return refuse(&message),
+    };
+    let Some(wanted) = arguments.first() else {
+        return refuse("`plugin show` needs a plugin id");
+    };
+    let (directories, config) = match open_host() {
+        Ok(host) => host,
+        Err(message) => return fail(&message),
+    };
+    let client = match open_index(&directories, &config) {
+        Ok(client) => client,
+        Err(message) => return fail(&message),
+    };
+
+    field("plugin", wanted);
+    let (snapshots, refused) = report_indexes(client.load(false));
+    let listings: Vec<(&IndexSnapshot, &IndexEntry)> = snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.document.entry(wanted).map(|entry| (snapshot, entry)))
+        .collect();
+    if listings.is_empty() {
+        return fail(&format!("`{wanted}` is not listed by any configured index"));
+    }
+    field("listings", &listings.len().to_string());
+    for (position, (snapshot, entry)) in listings.iter().enumerate() {
+        print_listing(position, entry, snapshot);
+    }
+    index_status(refused)
+}
+
+/// One index entry, in full. Every field the format carries is printed: `show`
+/// exists so an operator can decide whether to install something, and a field
+/// omitted from the report is a field they cannot weigh.
+fn print_listing(position: usize, entry: &IndexEntry, snapshot: &IndexSnapshot) {
+    println!(
+        "listing={position} id={} name={} version={} runtime={} licence={} homepage={} \
+         download_url={} package_digest={} signer_fingerprint={} index_url={} freshness={} summary={}",
+        encode(&entry.id),
+        encode(&entry.name),
+        encode(&entry.version),
+        encode(&entry.runtime),
+        encode(entry.licence.as_deref().unwrap_or("-")),
+        encode(entry.homepage.as_deref().unwrap_or("-")),
+        encode(&entry.download_url),
+        encode(&entry.package_digest),
+        encode(&entry.signer_fingerprint),
+        encode(&snapshot.url),
+        snapshot.freshness.as_str(),
+        encode(&entry.summary),
+    );
+}
+
+fn index_command(args: &[String]) -> ExitCode {
+    let arguments = match positional("index", args, 1) {
+        Ok(arguments) => arguments,
+        Err(message) => return refuse(&message),
+    };
+    let Some(action) = arguments.first() else {
+        return refuse("`plugin index` needs update");
+    };
+    if action != "update" {
+        return refuse(&format!("unknown `plugin index` action `{action}`"));
+    }
+    let (directories, config) = match open_host() {
+        Ok(host) => host,
+        Err(message) => return fail(&message),
+    };
+    let client = match open_index(&directories, &config) {
+        Ok(client) => client,
+        Err(message) => return fail(&message),
+    };
+
+    let (snapshots, refused) = report_indexes(client.load(true));
+    // An update that fell back to a cached copy did not update. It is reported
+    // as a bad verdict rather than a success, because a script that treats
+    // "refreshed" and "served you yesterday's catalogue" alike will install
+    // yesterday's catalogue believing it is today's.
+    let stale = snapshots
+        .iter()
+        .any(|snapshot| snapshot.freshness != Freshness::Fresh);
+    index_status(refused || stale)
+}
+
+/// Installs the plugin an index lists under `wanted`.
+///
+/// The digest is checked before the installer is told anything exists: an
+/// archive that does not hash to what the index published is deleted and the
+/// refusal names both digests, so an operator can tell a corrupted download
+/// from a stale index from a substituted package.
+fn install_from_index(directories: &StandardDirectories, config: &ConfigStore, wanted: &str) -> ExitCode {
+    let client = match open_index(directories, config) {
+        Ok(client) => client,
+        Err(message) => return fail(&message),
+    };
+    let (snapshots, _) = report_indexes(client.load(false));
+    let listings: Vec<&IndexSnapshot> = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.document.entry(wanted).is_some())
+        .collect();
+    let snapshot = match listings.as_slice() {
+        [] => return fail(&format!("`{wanted}` is not listed by any configured index")),
+        [only] => *only,
+        // Two publishers offering the same id are two different sets of bytes,
+        // and picking one would be picking for the operator.
+        many => {
+            let urls: Vec<&str> = many.iter().map(|snapshot| snapshot.url.as_str()).collect();
+            return fail(&format!(
+                "`{wanted}` is listed by {} configured indexes ({}); install it by download URL to \
+                 say which one you mean",
+                many.len(),
+                urls.join(", ")
+            ));
+        }
+    };
+    let entry = snapshot
+        .document
+        .entry(wanted)
+        .expect("the snapshot was selected because it lists this id");
+
+    if entry.parsed_runtime().is_none() {
+        return fail(&format!(
+            "cannot install `{wanted}`: unsupported runtime `{}` in the plugin index",
+            entry.runtime
+        ));
+    }
+    let staging = directories.cache_dir().join("plugin-index").join("downloads");
+    if let Err(error) = std::fs::create_dir_all(&staging) {
+        return fail(&format!("{} could not be created: {error}", staging.display()));
+    }
+    let downloaded = staging.join(format!("{wanted}-{}", std::process::id()));
+    println!(
+        "resolved={} version={} index_url={} download_url={} package_digest={}",
+        encode(&entry.id),
+        encode(&entry.version),
+        encode(&snapshot.url),
+        encode(&entry.download_url),
+        encode(&entry.package_digest),
+    );
+    if let Err(error) = client.download_package(entry, &downloaded) {
+        return fail(&format!("cannot install `{wanted}`: {error}"));
+    }
+
+    // The runtime the index declares decides which of the installer's two
+    // archive shapes the bytes are, because a Keypirinha package and a modern
+    // one are told apart by extension and a downloaded file has none. An
+    // unknown runtime is searchable metadata, never permission to guess an
+    // installation format.
+    let source = match entry.parsed_runtime() {
+        Some(Runtime::LegacyPython) => InstallSource::LegacyPackage(downloaded.clone()),
+        Some(Runtime::Python | Runtime::Native | Runtime::CAbi | Runtime::Wasm) => {
+            InstallSource::Archive(downloaded.clone())
+        }
+        Some(Runtime::Builtin) | None => {
+            let _ = std::fs::remove_file(&downloaded);
+            return fail(&format!(
+                "cannot install `{wanted}`: unsupported runtime `{}` in the plugin index",
+                entry.runtime
+            ));
+        }
+    };
+    // Provenance is established already and by something stronger than a
+    // sidecar: the index document was verified against the trust store before
+    // this entry was read, and `download_package` refused any bytes that did
+    // not hash to the digest that signed document pins. Applying the
+    // unsigned-package policy on top would refuse a package a trusted key has
+    // already vouched for, over a `<url>.sig` nothing fetches.
+    let status = install_source(directories, &source, SignaturePolicy::unchecked());
+    let _ = std::fs::remove_file(&downloaded);
+    status
 }
 
 // ---------------------------------------------------------------------------
@@ -896,6 +1312,38 @@ fn doctor(args: &[String]) -> ExitCode {
                 encode(departure)
             );
         }
+        // Declarations the manifest is allowed to carry and this build cannot
+        // act on. Reported, never degrading: the plugin works, one line of its
+        // manifest simply buys it nothing, and an author has no other way to
+        // discover that.
+        for unhonoured in entry
+            .manifest
+            .as_ref()
+            .map(Manifest::unhonoured_declarations)
+            .unwrap_or_default()
+        {
+            println!(
+                "note={index} plugin={} unhonoured_declaration={} reason={}",
+                encode(&entry.plugin.0),
+                encode(unhonoured.field),
+                encode(unhonoured.reason),
+            );
+        }
+        // A legacy package ships no manifest, so the loop above has nothing to
+        // report for it — and "nothing reported" would read as "nothing
+        // granted", which is the opposite of the truth. Keypirinha plugins
+        // were written for a host with no permission model at all, so the host
+        // applies a posture of its own and names it here.
+        if matches!(entry.kind, PluginKind::Legacy) {
+            println!(
+                "note={index} plugin={} legacy_permission_posture={} host_mediated_grants={} \
+                 unconfined={}",
+                encode(&entry.plugin.0),
+                encode("compatibility-baseline"),
+                encode("process,filesystem-package-read"),
+                encode("clipboard,network,filesystem-in-child-interpreter"),
+            );
+        }
         // Two copies of one plugin id is a load failure waiting to happen: the
         // owning provider registers the id once and records the second copy
         // unavailable, so which of them serves depends on discovery order. Not
@@ -944,6 +1392,36 @@ fn doctor(args: &[String]) -> ExitCode {
             );
             budget_line += 1;
         }
+
+        // What the operating system will enforce on this plugin's process,
+        // probed in THIS process rather than read out of a running launcher.
+        // The policy is built by the same function the hosts use and prepared
+        // for real, so an unavailable kernel feature or a disabled override
+        // shows up here rather than being discovered when a plugin misbehaves.
+        // Two limits follow from where it runs, and `probe=this-process` is
+        // there to say so: `CRIKEY_PLUGIN_SANDBOX` is read from this command's
+        // environment, not the launcher's, and only the baseline writable set
+        // is probed, because the extra directory a legacy worker is given
+        // exists per launcher instance and inventing a path here would report
+        // a policy no worker uses. A legacy package declares no permissions
+        // and therefore keeps the compatibility baseline, which does not
+        // restrict the network.
+        let sandbox = crikey_sandbox::plugin_policy(
+            Vec::<std::path::PathBuf>::new(),
+            entry
+                .manifest
+                .as_ref()
+                .is_some_and(|manifest| !manifest.permissions.network),
+        )
+        .prepare();
+        let report = sandbox.report();
+        println!(
+            "sandbox={index} plugin={} probe=this-process filesystem_write={} tcp_network={} reads={}",
+            encode(&entry.plugin.0),
+            encode(&report.filesystem_write.to_string()),
+            encode(&report.tcp_network.to_string()),
+            encode("unrestricted"),
+        );
 
         // Legacy compatibility findings (spec 26.2), from the one store that
         // owns them. Anything blocking makes the plugin degraded; a `warning`
@@ -1116,11 +1594,41 @@ fn print_help(command: &str) {
              Reports every installed plugin and every plugin on the live discovery\n\
              roots, with its id, version, kind, enabled state and scheduling profile.\n"
         ),
+        "search" => print!(
+            "crikey plugin search\n\n\
+             USAGE:\n    crikey plugin search <QUERY>\n\n\
+             Searches every configured plugin index, best match first: an exact id, an\n\
+             id prefix, an id substring, then a name or summary substring. Reports each\n\
+             index's signer and whether its cached copy is fresh or stale. Exits 1 when\n\
+             an index was refused, and reports that no index is configured when none is.\n"
+        ),
+        "show" => print!(
+            "crikey plugin show\n\n\
+             USAGE:\n    crikey plugin show <ID>\n\n\
+             Reports every field a configured index publishes for ID: version, runtime,\n\
+             licence, homepage, download URL, package digest and signer fingerprint.\n\
+             Exits 1 when no configured index lists ID.\n"
+        ),
+        "index" => print!(
+            "crikey plugin index\n\n\
+             USAGE:\n    crikey plugin index update\n\n\
+             Fetches every configured index, verifies its detached signature against the\n\
+             trust store, and replaces the cached copy only once it verifies. Exits 1\n\
+             when an index was refused or could only be served from the cache.\n"
+        ),
         "install" => print!(
             "crikey plugin install\n\n\
-             USAGE:\n    crikey plugin install <SOURCE>\n\n\
+             USAGE:\n    crikey plugin install [--unsigned-policy POLICY] <SOURCE>\n\n\
              SOURCE is a plugin directory, a `.crikey-package` archive, an `http(s)://`\n\
-             URL or a `.keypirinha-package` file. Refused while a launcher is running.\n"
+             URL, a `.keypirinha-package` file, or a plugin id a configured index lists.\n\
+             An indexed install refuses a package that does not hash to the digest the\n\
+             index published. Refused while a launcher is running.\n\n\
+             OPTIONS:\n    --unsigned-policy POL   refuse (default), warn or allow, for a\n\
+                 native archive with no `<package>.sig` beside it. Overrides\n\
+                 `packages.unsigned-policy`. A URL install fetches `<url>.sig` to answer\n\
+                 it. A source directory is packed by this command and carries no\n\
+                 publisher signature, so the policy does not apply to it; nor to an\n\
+                 indexed id, whose provenance is the index signature.\n"
         ),
         "remove" => print!(
             "crikey plugin remove\n\n\
@@ -1144,8 +1652,9 @@ fn print_help(command: &str) {
              USAGE:\n    crikey plugin doctor [<ID>]\n\n\
              Reports per-plugin health: manifest validity, enabled state, scheduling\n\
              profile, the declared concurrency budgets with an admission probe of each\n\
-             work kind, and the compatibility findings for a legacy package. Exits 1\n\
-             when any plugin is degraded.\n"
+             work kind, the operating-system confinement the plugin's process will\n\
+             actually be subject to, and the compatibility findings for a legacy\n\
+             package. Exits 1 when any plugin is degraded.\n"
         ),
         "scheduling-profile" => print!(
             "crikey plugin scheduling-profile\n\n\
@@ -1163,7 +1672,10 @@ fn plugin_help() -> &'static str {
     "crikey plugin - manage plugins\n\n\
 USAGE:\n\
     crikey plugin list\n\
-    crikey plugin install <SOURCE>\n\
+    crikey plugin search <QUERY>\n\
+    crikey plugin show <ID>\n\
+    crikey plugin index update\n\
+    crikey plugin install [--unsigned-policy POLICY] <SOURCE>\n\
     crikey plugin remove <ID>\n\
     crikey plugin enable <ID>\n\
     crikey plugin disable <ID>\n\

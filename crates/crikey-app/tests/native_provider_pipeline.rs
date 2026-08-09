@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use crikey_app::{
     DisabledPlugins, NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, QueryPipeline,
+    PLUGIN_ICON_DEADLINE,
 };
 use crikey_core::{ActionId, Generation, ItemId, PluginId};
 use crikey_ui::ViewModel;
@@ -831,4 +832,366 @@ fn native_shutdown_reaps_every_child() {
     }
     // On targets without a portable process-table query, the portable shutdown
     // call above remains exercised; Linux provides the orphan-sensitive proof.
+}
+
+#[test]
+fn native_plugin_icons_round_trip_through_resource_request() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("icons");
+    let plugins_root = scratch.subdir("plugins");
+    write_native_plugin(&plugins_root, "icons", &conformance, "icon");
+    let owner = native_plugin("icons");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[plugins_root],
+        ROW_DELIVERY_WINDOW,
+        &DisabledPlugins::default(),
+    );
+    assert!(provider.plugins().contains(&owner));
+
+    // One query must produce the initial row and, after the supervised child
+    // answers ResourceRequest, a later driver refresh must publish the icon.
+    // No second query is submitted: the refresh is the only re-presentation.
+    /// One observed publication: its generation, whether the served icon row
+    /// was present, and that icon's dimensions with its first pixel.
+    type IconObservation = (Generation, bool, Option<(u32, u32, [u8; 4])>);
+    let published: Arc<Mutex<Vec<IconObservation>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&published);
+    let driver = NativeDriver::spawn(
+        provider,
+        pipeline,
+        Box::new(move |frame: &ViewModel| {
+            let icon = frame.rows.iter().find(|row| {
+                row.plugin_name == owner.0 && row.icon_reference.as_deref() == Some("served.svg")
+            });
+            let pixels = icon.and_then(|row| {
+                row.icon.as_ref().and_then(|image| {
+                    let rgba = image.rgba();
+                    (rgba.len() >= 4).then(|| {
+                        (
+                            image.width(),
+                            image.height(),
+                            [rgba[0], rgba[1], rgba[2], rgba[3]],
+                        )
+                    })
+                })
+            });
+            sink.lock().expect("the publish sink is not poisoned").push((
+                frame.generation,
+                icon.is_some(),
+                pixels,
+            ));
+        }),
+    );
+    driver.submit(Generation::from_raw(1), "icon", 17, Vec::new(), false, 0);
+
+    for _ in 0..1_000 {
+        let ready = published
+            .lock()
+            .expect("the publish sink is not poisoned")
+            .iter()
+            .any(|(_, has_icon_row, pixels)| *has_icon_row && pixels.is_some());
+        if ready {
+            break;
+        }
+        sleep(Duration::from_millis(5));
+    }
+
+    let entries = published
+        .lock()
+        .expect("the publish sink is not poisoned")
+        .clone();
+    assert!(
+        entries.iter().any(|(_, has_icon_row, _)| *has_icon_row),
+        "the native row carries the resource reference: {entries:?}"
+    );
+    let pixels = entries
+        .iter()
+        .find_map(|(_, _, pixels)| *pixels)
+        .expect("the driver refresh must publish decoded ResourceRequest pixels");
+    assert_eq!((pixels.0, pixels.1), (48, 48));
+    assert_eq!(pixels.2, [0x33, 0x66, 0xcc, 0xff]);
+    assert!(
+        entries
+            .iter()
+            .all(|(generation, _, _)| *generation == Generation::from_raw(1)),
+        "only the submitted generation is presented: {entries:?}"
+    );
+    drop(driver);
+}
+#[test]
+fn native_healthy_worker_survives_repeated_queries() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("repeat");
+    let plugins_root = scratch.subdir("plugins");
+    write_native_plugin(&plugins_root, "healthy", &conformance, "echo");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[plugins_root],
+        ROW_DELIVERY_WINDOW,
+        &DisabledPlugins::default(),
+    );
+
+    for iteration in 0..3 {
+        let frame = provider
+            .drive_query(
+                &mut pipeline,
+                &format!("repeat {iteration}"),
+                100 * (iteration + 1),
+            )
+            .expect("healthy native worker publishes every repeated query");
+        assert_eq!(frame.rows.len(), 2);
+        assert!(frame
+            .rows
+            .iter()
+            .all(|row| row.plugin_name == native_plugin("healthy").0));
+    }
+    assert!(provider.dispatch_failures().is_empty());
+    provider.shutdown(0);
+}
+
+/// Collection window for the icon-isolation tests.
+///
+/// Deliberately shorter than the fixture's 150 ms icon answer. The subject is
+/// that an outstanding icon fetch costs the NEXT query nothing, and that is
+/// only observable while the window is narrow enough that a fetch which had
+/// consumed it would show up as a query with no rows at all. Both packages
+/// start eagerly, so no measured query pays child startup.
+const ICON_ISOLATION_WINDOW: Duration = Duration::from_millis(60);
+
+/// How far past the collection window a batch may still be called on time.
+///
+/// Covers driver wake-up, one warm pipe round trip and frame assembly on a
+/// loaded machine. It stays well below the fixture's 150 ms icon answer, so a
+/// batch that waited for the icon can never pass for a batch that did not.
+const BATCH_PUBLICATION_SLACK: Duration = Duration::from_millis(60);
+
+/// Writes a native package whose worker is started at load time.
+///
+/// The icon-isolation tests measure one query against a short collection
+/// window, and child startup is not what they are measuring.
+fn write_eager_native_plugin(root: &Path, id: &str, binary: &Path, mode: &str) -> PathBuf {
+    let directory = root.join(id);
+    fs::create_dir_all(&directory).expect("native plugin directory is creatable");
+    let manifest = format!(
+        "manifest-version = 1\n\n\
+         [plugin]\n\
+         id = \"{id}\"\n\
+         name = \"{id}\"\n\
+         version = \"1.0.0\"\n\
+         runtime = \"native\"\n\
+         entrypoint = \"{entrypoint}\"\n\n\
+         [performance]\n\
+         startup = \"eager\"\n",
+        entrypoint = toml_string(&binary.to_string_lossy())
+    );
+    fs::write(directory.join("crikey.toml"), manifest).expect("native manifest is writable");
+    fs::write(directory.join("conformance-mode"), mode).expect("native mode witness is writable");
+    directory
+}
+
+/// One observed publication: when it reached the sink, its generation, whether
+/// the plugin's row was in it, and whether that row carried decoded pixels.
+type IconTiming = (Instant, Generation, bool, bool);
+
+/// Spawns a driver that timestamps every publication mentioning `owner`.
+fn spawn_icon_timing_driver(
+    provider: NativeProvider,
+    pipeline: QueryPipeline,
+    owner: PluginId,
+) -> (NativeDriver, Arc<Mutex<Vec<IconTiming>>>) {
+    let published: Arc<Mutex<Vec<IconTiming>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&published);
+    let driver = NativeDriver::spawn(
+        provider,
+        pipeline,
+        Box::new(move |frame: &ViewModel| {
+            let row = frame.rows.iter().find(|row| row.plugin_name == owner.0);
+            sink.lock().expect("the publish sink is not poisoned").push((
+                Instant::now(),
+                frame.generation,
+                row.is_some(),
+                row.is_some_and(|row| row.icon.is_some()),
+            ));
+        }),
+    );
+    (driver, published)
+}
+
+/// Returns the first publication satisfying `predicate`, or fails by name.
+///
+/// A missing publication is the failure this reports, never a silent skip: the
+/// defect these tests cover looks exactly like a row that never arrives.
+fn await_publication(
+    published: &Mutex<Vec<IconTiming>>,
+    expectation: &str,
+    predicate: impl Fn(&IconTiming) -> bool,
+) -> IconTiming {
+    let deadline = Instant::now() + ROW_DELIVERY_WINDOW;
+    loop {
+        let seen = published
+            .lock()
+            .expect("the publish sink is not poisoned")
+            .clone();
+        if let Some(entry) = seen.iter().copied().find(&predicate) {
+            return entry;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no publication was {expectation}: {seen:?}"
+        );
+        sleep(Duration::from_millis(2));
+    }
+}
+
+/// A slow icon must not be paid for out of a query's collection window.
+///
+/// The fetch used to run on the same supervisor lock the query dispatcher
+/// takes, so a plugin that spent its resource deadline answering an icon made
+/// the next query time out with no rows at all — the plugin vanished because
+/// one of its pictures was slow. The icon itself is decoration and is expected
+/// late: a later refresh republishes the same generation once it lands.
+#[test]
+fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("icon-slow");
+    let plugins_root = scratch.subdir("plugins");
+    let package = write_eager_native_plugin(&plugins_root, "slowicon", &conformance, "icon-slow");
+    let owner = native_plugin("slowicon");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[plugins_root],
+        ICON_ISOLATION_WINDOW,
+        &DisabledPlugins::default(),
+    );
+    assert!(provider.plugins().contains(&owner));
+    let (driver, published) = spawn_icon_timing_driver(provider, pipeline, owner);
+
+    // The first query is what puts the icon reference on a row, and the row is
+    // what starts the fetch. Everything measured below happens while that
+    // fetch is still outstanding.
+    driver.submit(Generation::from_raw(1), "icon one", 17, Vec::new(), false, 0);
+    let opening = await_publication(&published, "a first-generation row", |(_, generation, row, _)| {
+        *generation == Generation::from_raw(1) && *row
+    });
+    assert!(
+        !opening.3,
+        "the batch that first names the icon cannot already carry it"
+    );
+
+    let submitted = Instant::now();
+    driver.submit(Generation::from_raw(2), "icon two", 200, Vec::new(), false, 0);
+    let batch = await_publication(
+        &published,
+        "a second-generation row",
+        |(_, generation, row, _)| *generation == Generation::from_raw(2) && *row,
+    );
+    let batch_delay = batch.0.duration_since(submitted);
+    assert!(
+        batch_delay <= ICON_ISOLATION_WINDOW + BATCH_PUBLICATION_SLACK,
+        "the batch waited {batch_delay:?} for a {ICON_ISOLATION_WINDOW:?} collection window"
+    );
+    assert!(
+        !batch.3,
+        "the on-time batch is published without the icon that has not arrived"
+    );
+
+    let decorated = await_publication(
+        &published,
+        "a second-generation row carrying its icon",
+        |(_, generation, _, icon)| *generation == Generation::from_raw(2) && *icon,
+    );
+    assert!(
+        decorated.0 > batch.0,
+        "the icon reaches the same generation by a later refresh, not by holding the batch"
+    );
+    let icon_delay = decorated.0.duration_since(submitted);
+    assert!(
+        icon_delay > ICON_ISOLATION_WINDOW,
+        "the icon genuinely arrived after the collection window closed, not inside it"
+    );
+
+    // The icon arriving proves a resource child ran; teardown owes the same
+    // reaping the query child gets. Both children share this working
+    // directory, so its absence covers the pair.
+    let observable = process_table_contains_working_dir(&package).is_some();
+    drop(driver);
+    if observable {
+        assert!(
+            wait_for_process_table_absence(&package),
+            "the resource child is reaped with the provider; package cwd remains: {}",
+            package.display()
+        );
+    }
+}
+
+/// A plugin that never answers a resource request must cost queries nothing.
+///
+/// Silence is bounded by the host's own icon deadline and by nothing the
+/// plugin does, so the queries either side of it are published on time and the
+/// abandoned request leaves nothing behind for a later query to queue behind.
+#[test]
+fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("icon-silent");
+    let plugins_root = scratch.subdir("plugins");
+    write_eager_native_plugin(&plugins_root, "silenticon", &conformance, "icon-silent");
+    let owner = native_plugin("silenticon");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[plugins_root],
+        ICON_ISOLATION_WINDOW,
+        &DisabledPlugins::default(),
+    );
+    assert!(provider.plugins().contains(&owner));
+    let (driver, published) = spawn_icon_timing_driver(provider, pipeline, owner);
+
+    driver.submit(Generation::from_raw(1), "icon one", 17, Vec::new(), false, 0);
+    await_publication(&published, "a first-generation row", |(_, generation, row, _)| {
+        *generation == Generation::from_raw(1) && *row
+    });
+
+    let submitted = Instant::now();
+    driver.submit(Generation::from_raw(2), "icon two", 200, Vec::new(), false, 0);
+    let during = await_publication(
+        &published,
+        "a second-generation row",
+        |(_, generation, row, _)| *generation == Generation::from_raw(2) && *row,
+    );
+    let during_delay = during.0.duration_since(submitted);
+    assert!(
+        during_delay <= ICON_ISOLATION_WINDOW + BATCH_PUBLICATION_SLACK,
+        "a query issued while the request is unanswered waited {during_delay:?}"
+    );
+
+    // Past the host's own deadline the request is abandoned. Nothing may
+    // remain of it that a later query could be made to queue behind.
+    sleep(PLUGIN_ICON_DEADLINE + BATCH_PUBLICATION_SLACK);
+    let resubmitted = Instant::now();
+    driver.submit(Generation::from_raw(3), "icon three", 900, Vec::new(), false, 0);
+    let after = await_publication(&published, "a third-generation row", |(_, generation, row, _)| {
+        *generation == Generation::from_raw(3) && *row
+    });
+    let after_delay = after.0.duration_since(resubmitted);
+    assert!(
+        after_delay <= ICON_ISOLATION_WINDOW + BATCH_PUBLICATION_SLACK,
+        "a query issued after the abandoned request waited {after_delay:?}"
+    );
+
+    assert!(
+        published
+            .lock()
+            .expect("the publish sink is not poisoned")
+            .iter()
+            .all(|(_, _, _, icon)| !*icon),
+        "a reference the plugin never answers stays undecorated"
+    );
+    drop(driver);
 }

@@ -1,0 +1,18 @@
+[package]
+name = "crikey-sandbox"
+description = "Kernel-enforced confinement for supervised CriKey plugin processes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# No dependencies on purpose. The whole crate is two Linux syscalls and a
+# policy description; a crate wrapping them would be a second, unreviewed copy
+# of the same ABI, and this file is the one place in the tree that decides what
+# a plugin process may write to.
+[dependencies]

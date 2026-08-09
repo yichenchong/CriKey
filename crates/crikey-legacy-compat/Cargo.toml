@@ -16,6 +16,7 @@ crikey-core.workspace = true
 crikey-input-scheduler.workspace = true
 crikey-plugin-model.workspace = true
 crikey-python-host.workspace = true
+crikey-sandbox.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true

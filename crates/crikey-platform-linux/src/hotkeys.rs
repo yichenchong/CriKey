@@ -196,7 +196,7 @@ pub fn x11_binding(accelerator: &Accelerator) -> Result<(u32, String)> {
 }
 
 /// The keysym an accelerator's key names, or the shared refusal.
-fn keysym_of(accelerator: &Accelerator) -> Result<(&'static str, u32)> {
+pub(crate) fn keysym_of(accelerator: &Accelerator) -> Result<(&'static str, u32)> {
     keysym(accelerator.key()).ok_or_else(|| {
         CoreError::Invalid(format!(
             "{} names no X11 keysym this backend can grab",
@@ -255,12 +255,14 @@ struct Shared {
 
 /// Locks through poisoning: a panicking handler must not turn every later
 /// registration into a panic of its own.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Reports an X failure as the shared error type, naming what was attempted.
-fn invalid(context: &str, error: impl fmt::Display) -> CoreError {
+/// Reports a backend failure as the shared error type, naming what was
+/// attempted. Shared with the portal service so an X11 refusal and a Wayland
+/// one read the same way to whoever ends up looking at the log.
+pub(crate) fn invalid(context: &str, error: impl fmt::Display) -> CoreError {
     CoreError::Invalid(format!("{context}: {error}"))
 }
 
@@ -867,7 +869,7 @@ impl Drop for X11HotkeyService {
 
 /// Parses the accelerator a binding names, reporting the shared parser's own
 /// reason for refusing it.
-fn parse(binding: &HotkeyBinding) -> Result<Accelerator> {
+pub(crate) fn parse(binding: &HotkeyBinding) -> Result<Accelerator> {
     Accelerator::parse(&binding.accelerator).map_err(|error| {
         CoreError::Invalid(format!(
             "{:?} is not a usable hotkey: {error}",

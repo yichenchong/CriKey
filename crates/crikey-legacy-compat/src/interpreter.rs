@@ -2,16 +2,25 @@
 //!
 //! Legacy plugins never execute inside CriKey: they execute in a child process
 //! (spec 4.2), and the first thing the host has to decide is *which*
-//! interpreter that child runs. The rule is fixed, total and ordered:
+//! interpreter that child runs. The rule is fixed, total and ordered, and it
+//! is deliberately the *same* rule the modern host applies — there is one
+//! interpreter-selection policy in this product, not two:
 //!
 //! 1. the `CRIKEY_PYTHON` environment override,
 //! 2. the interpreter named by [`RuntimeProfile::External`],
-//! 3. `python3` on the search path.
+//! 3. the runtime bundled beside the running executable (spec 14.11),
+//! 4. `python3` on the search path.
+//!
+//! Rule 3 is shared code, not a parallel implementation: the location is
+//! resolved by [`crikey_python_host::bundled_interpreter_beside`], so a change
+//! to the shipped layout cannot leave the legacy layer looking somewhere else.
 //!
 //! An override that names a broken interpreter is a hard failure, never a
 //! silent fall-through to the next rule. Falling through would run plugin code
 //! under an interpreter the operator did not choose, which is worse than not
-//! starting at all.
+//! starting at all. A bundled runtime is decisive on the same terms: once a
+//! build ships its own Python, quietly preferring the machine's reintroduces
+//! the system-wide dependency bundling exists to remove.
 //!
 //! # Why discovery takes the environment as a value
 //!
@@ -34,7 +43,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crikey_python_host::RuntimeProfile;
+use crikey_python_host::{bundled_interpreter_beside, RuntimeProfile, BUNDLED_RUNTIME_DIR};
 
 use crate::worker::WorkerError;
 
@@ -124,6 +133,8 @@ pub enum InterpreterSource {
     EnvironmentOverride,
     /// [`RuntimeProfile::External`].
     RuntimeProfile,
+    /// The runtime staged beside the running executable (spec 14.11).
+    BundledRuntime,
     /// `python3` found on the search path.
     SearchPath,
 }
@@ -133,6 +144,7 @@ impl InterpreterSource {
         match self {
             Self::EnvironmentOverride => "environment-override",
             Self::RuntimeProfile => "runtime-profile",
+            Self::BundledRuntime => "bundled-runtime",
             Self::SearchPath => "search-path",
         }
     }
@@ -193,33 +205,54 @@ impl fmt::Display for Interpreter {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveryEnvironment {
     python_override: Option<PathBuf>,
+    /// Directory holding the running executable, which is where a shipped
+    /// artefact's bundled runtime sits. `None` means "no bundled runtime is
+    /// reachable", which is what an unconfigured test environment wants and
+    /// what a host whose own path cannot be read has to assume.
+    executable_dir: Option<PathBuf>,
     search_path: Vec<PathBuf>,
 }
 
 impl DiscoveryEnvironment {
-    /// No override and no search path: only [`RuntimeProfile::External`] can
-    /// resolve against this.
+    /// Nothing ambient at all: no override, no bundled runtime and no search
+    /// path, so only [`RuntimeProfile::External`] can resolve against this.
     pub fn empty() -> Self {
         Self::default()
     }
 
-    /// Reads `CRIKEY_PYTHON` and `PATH` from the ambient process environment.
+    /// Reads `CRIKEY_PYTHON`, the running executable's directory and `PATH`
+    /// from the ambient process environment.
     pub fn from_process() -> Self {
         let python_override = std::env::var_os(ENV_PYTHON_OVERRIDE)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
+        // A host that cannot say where its own executable is simply has no
+        // bundled runtime; that is a fall-through to the search path, not an
+        // error, because the same host worked this way before bundling
+        // existed.
+        let executable_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf));
         let search_path = std::env::var_os("PATH")
             .map(|path| std::env::split_paths(&path).collect())
             .unwrap_or_default();
 
         Self {
             python_override,
+            executable_dir,
             search_path,
         }
     }
 
     pub fn with_override(mut self, path: impl AsRef<Path>) -> Self {
         self.python_override = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Treats `directory` as the one holding the running executable, and so as
+    /// the parent of any bundled runtime.
+    pub fn with_executable_dir(mut self, directory: impl AsRef<Path>) -> Self {
+        self.executable_dir = Some(directory.as_ref().to_path_buf());
         self
     }
 
@@ -230,6 +263,20 @@ impl DiscoveryEnvironment {
 
     pub fn python_override(&self) -> Option<&Path> {
         self.python_override.as_deref()
+    }
+
+    pub fn executable_dir(&self) -> Option<&Path> {
+        self.executable_dir.as_deref()
+    }
+
+    /// The bundled runtime's interpreter, when this build was shipped with one.
+    ///
+    /// Delegates to the modern host so the two layers cannot disagree about
+    /// where a shipped runtime lives.
+    pub fn bundled_interpreter(&self) -> Option<PathBuf> {
+        self.executable_dir
+            .as_deref()
+            .and_then(bundled_interpreter_beside)
     }
 
     pub fn search_path(&self) -> &[PathBuf] {
@@ -261,9 +308,9 @@ pub fn discover_interpreter(profile: &RuntimeProfile) -> Result<Interpreter, Wor
 /// Resolves the interpreter for `profile` against `environment` (spec 14.11).
 ///
 /// The order is `CRIKEY_PYTHON`, then [`RuntimeProfile::External`], then the
-/// search path. Each rule is *decisive*: once a rule names a candidate, a
-/// candidate that cannot be used is the answer — an error — and the remaining
-/// rules are never consulted.
+/// runtime bundled beside the executable, then the search path. Each rule is
+/// *decisive*: once a rule names a candidate, a candidate that cannot be used
+/// is the answer — an error — and the remaining rules are never consulted.
 pub fn discover_interpreter_in(
     profile: &RuntimeProfile,
     environment: &DiscoveryEnvironment,
@@ -272,11 +319,14 @@ pub fn discover_interpreter_in(
         return probe(path, InterpreterSource::EnvironmentOverride);
     }
 
-    // `Bundled` names no path here: a bundled runtime is laid down by the
-    // installer and reached through the search path like any other, so it falls
-    // to the last rule rather than inventing a location (spec 14.11).
+    // `Bundled` names no path: it is the absence of an explicitly chosen
+    // interpreter, so the remaining rules decide.
     if let RuntimeProfile::External(path) = profile {
         return probe(path, InterpreterSource::RuntimeProfile);
+    }
+
+    if let Some(path) = environment.bundled_interpreter() {
+        return probe(&path, InterpreterSource::BundledRuntime);
     }
 
     match environment.find_on_search_path() {
@@ -284,8 +334,9 @@ pub fn discover_interpreter_in(
         None => Err(WorkerError::PythonUnavailable {
             path: None,
             reason: format!(
-                "no {} on the search path, and neither {ENV_PYTHON_OVERRIDE} nor an external \
-                 runtime profile named one",
+                "no {} on the search path, no {BUNDLED_RUNTIME_DIR} runtime beside the \
+                 executable, and neither {ENV_PYTHON_OVERRIDE} nor an external runtime profile \
+                 named one",
                 SEARCH_PATH_CANDIDATES.join(" or "),
             ),
         }),
@@ -415,6 +466,11 @@ fn hard_kill_probe(process_id: u32, child: &mut Child) {
 
 #[cfg(unix)]
 fn kill_probe_process_group(pgid: u32) {
+    // `killpg(0)` would signal this launcher's own process group; the probe pid
+    // is always a live `Child::id()`, so treat "myself"/"init" as impossible.
+    if pgid <= 1 {
+        return;
+    }
     extern "C" {
         fn killpg(pgrp: i32, sig: i32) -> i32;
     }

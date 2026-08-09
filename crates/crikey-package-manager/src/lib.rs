@@ -13,10 +13,17 @@ use std::path::{Path, PathBuf};
 
 mod environment;
 mod native;
+mod signature;
 
 pub use native::{
-    build_package, inspect_package, install_native, install_native_with_retention, rollback_native,
-    verify_package, NativeInstall, NativePackageReport,
+    build_package, inspect_package, install_native, install_native_with_policy,
+    install_native_with_retention, rollback_native, sign_package, verify_installed_member, verify_package,
+    verify_package_with_policy, NativeInstall, NativePackageReport, PackageSignatureReport,
+};
+pub use signature::{
+    evaluate, read_signature_file, signature_path_for, verify_detached, verify_signed_manifest,
+    PackageSigningKey, PublicKey, Signature, SignatureError, SignaturePolicy, SignatureState, SignedManifest,
+    TrustStore, TrustedSigner, UnsignedPolicy, KEY_UNSIGNED_POLICY, TRUST_STORE_FILE,
 };
 
 mod fetch;
@@ -25,6 +32,7 @@ mod index;
 mod installer;
 mod launcher_lock;
 mod lockfile;
+mod plugin_index;
 mod resolve;
 
 pub use environment::{EnvironmentId, EnvironmentInputs, EnvironmentStore, MaterializedEnvironment};
@@ -34,6 +42,12 @@ pub use index::PackageIndex;
 pub use installer::{InstalledPlugin, PluginInstaller};
 pub use launcher_lock::LauncherLock;
 pub use lockfile::{LockedPackage, Lockfile};
+pub use plugin_index::{
+    index_max_age, index_urls, package_digest, search, Freshness, IndexEntry, IndexOutcome, IndexSnapshot,
+    IndexTransport, MatchQuality, PluginIndexClient, PluginIndexDocument, SearchHit, DEFAULT_INDEX_MAX_AGE,
+    INDEX_FORMAT_VERSION, INDEX_MAX_BYTES, KEY_INDEX_MAX_AGE_SECONDS, KEY_INDEX_URLS, MAX_INDEX_ENTRIES,
+    PACKAGE_MAX_BYTES,
+};
 pub use resolve::resolve;
 
 /// Where a package to install comes from (spec 23.1).
@@ -108,6 +122,13 @@ pub enum PackageError {
     Manifest(String),
     #[error("native package installation failed: {0}")]
     Install(String),
+    /// Provenance: a signature that does not verify, a signer nobody trusts, or
+    /// an unsigned package under a policy that refuses one (spec 2.2, 23.3;
+    /// ADR 0012). Never softened into a warning by this crate: whether an
+    /// unsigned package is tolerated is the operator's [`UnsignedPolicy`], and
+    /// by the time it reaches here that decision has already been made.
+    #[error("{0}")]
+    Signature(#[from] crate::signature::SignatureError),
     /// A launcher holds the exclusive lock, so replacing installed files would
     /// be replacing them underneath running plugins (spec 23.3). The pid is
     /// diagnostic text; the lock, not the pid, is what makes this safe.
@@ -120,6 +141,11 @@ pub enum PackageError {
     InvalidImportPath(String),
     #[error("package source unavailable: {0}")]
     SourceUnavailable(String),
+    /// A plugin index could not be shown to have been signed by a key the user
+    /// trusts (spec 2.2; ADR 0012, ADR 0013). Never softened into a warning: an
+    /// index decides which bytes get installed.
+    #[error("plugin index signature refused: {0}")]
+    IndexSignature(String),
     #[error("malformed package index: {0}")]
     MalformedIndex(String),
     #[error("io error: {0}")]

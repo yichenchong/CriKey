@@ -44,13 +44,14 @@ const PID_FILE: &str = "launcher.pid";
 
 /// An acquired exclusive launcher lock.
 ///
-/// Held for as long as the value lives; the operating system releases it when
-/// the file is closed, including when the process dies without unwinding.
+/// Held for as long as the value lives, and released when it is dropped or when
+/// the process dies without unwinding.
 #[derive(Debug)]
 pub struct LauncherLock {
     pid_path: PathBuf,
-    /// Retained because closing the file is what releases the lock. Never read.
-    _file: File,
+    /// The locked file. Retained because the lock lives on this descriptor's
+    /// open file description, and read only to release it.
+    file: File,
 }
 
 impl LauncherLock {
@@ -88,18 +89,64 @@ impl LauncherLock {
         if let Ok(mut pid) = OpenOptions::new().write(true).create_new(true).open(&pid_path) {
             let _ = std::io::Write::write_all(&mut pid, std::process::id().to_string().as_bytes());
         }
-        Ok(Self {
-            pid_path,
-            _file: file,
-        })
+        Ok(Self { pid_path, file })
     }
 }
 
 impl Drop for LauncherLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.pid_path);
+        release(&self.file);
     }
 }
+
+/// Releases the lock explicitly, rather than leaving it to the closing
+/// descriptor.
+///
+/// Closing is *not* enough on its own, and this must not be simplified back to
+/// relying on it. A `flock` lock belongs to the open file *description*, not to
+/// the descriptor: `flock(2)` releases it only on an explicit `LOCK_UN` or when
+/// every descriptor referring to that description has been closed. `fork`
+/// duplicates every description, and a launcher holds this lock for the life of
+/// the process while spawning a worker for each plugin, so from that fork until
+/// the child's `exec` there is a second reference to this one. Leaving release
+/// to the closing descriptor therefore keeps the lock alive for a window this
+/// process can neither see nor bound, and the next acquisition reads a launcher
+/// that has already released as still running. Unlocking through this
+/// descriptor releases the description's lock at once, however many references
+/// it has.
+///
+/// Windows needs no counterpart, and a symmetrical unlock there would be
+/// pretending to do something: exclusivity is the handle's share mode rather
+/// than an advisory lock, `CreateProcess` inherits only the handles it is told
+/// to, and Rust marks this one non-inheritable, so closing the file is already
+/// exact.
+#[cfg(unix)]
+fn release(file: &File) {
+    use std::os::fd::AsRawFd;
+
+    #[link(name = "c")]
+    #[allow(unsafe_code)]
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_UN: i32 = 8;
+
+    // The result is discarded because there is no recovery and nothing to
+    // report: the only documented failures are a bad descriptor or a bad
+    // operation, neither of which can happen here, and a drop cannot refuse.
+    //
+    // SAFETY: `file` owns a valid open descriptor for the whole call, and
+    // `flock` reads only the descriptor and the flag word.
+    #[allow(unsafe_code)]
+    let _ = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+}
+
+/// Nothing to release: see [`release`] for why the Windows share mode makes
+/// closing the handle exact.
+#[cfg(not(unix))]
+fn release(_file: &File) {}
+
 enum Held {
     Acquired(File),
     Busy,
@@ -170,3 +217,45 @@ fn open_exclusive(path: &Path) -> io::Result<Held> {
 
 #[cfg(not(any(unix, windows)))]
 compile_error!("the launcher lock needs either flock (unix) or an exclusive share mode (windows)");
+
+// Here rather than in `tests/`: the invariant below is about a second reference
+// to the guard's own descriptor, and nothing outside this file can obtain one.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Dropping the guard releases the lock even when another descriptor still
+    /// refers to the same open file description.
+    ///
+    /// `Command::spawn` forks, and a launcher spawns a worker for every plugin
+    /// while holding this lock, so that second reference exists in production
+    /// for as long as it takes the child to reach `exec`. `try_clone` is `dup`,
+    /// which produces exactly the same sharing without the race, so the
+    /// consequence of leaving release to the closing descriptor — a lock the
+    /// guard no longer owns and the next installation is refused by — is a
+    /// deterministic failure here rather than an occasional one under load.
+    ///
+    /// Unix only because the mechanism is: Windows exclusivity is the handle's
+    /// share mode, and Rust marks the handle non-inheritable, so there is no
+    /// second reference to release.
+    #[test]
+    fn dropping_the_guard_releases_a_lock_a_duplicated_descriptor_still_refers_to() {
+        let state_dir = std::env::temp_dir().join(format!("crikey-launcher-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&state_dir);
+
+        let lock = LauncherLock::acquire_at(&state_dir).expect("a first lock is acquired");
+        let inherited = lock.file.try_clone().expect("the descriptor duplicates");
+        drop(lock);
+
+        let reacquired = LauncherLock::acquire_at(&state_dir);
+        assert!(
+            reacquired.is_ok(),
+            "a dropped guard must leave no lock behind, got {:?}",
+            reacquired.err()
+        );
+
+        drop(inherited);
+        drop(reacquired);
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+}

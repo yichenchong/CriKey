@@ -10,15 +10,23 @@
 //! distinguish `Available`, `Unavailable`, `PermissionGated`, `Partial` and
 //! `UnsupportedDesktopEnvironment`, and spec 18.6 makes window control optional
 //! on Linux. A blanket answer therefore fails the specification twice over: a
-//! Wayland session must be told that global hotkeys and window control are not
-//! offered by the *session* (`UnsupportedDesktopEnvironment`), not that CriKey
-//! lacks them (`Unavailable`), because only the first tells a plugin author
-//! that the missing feature is not a CriKey bug and not a permission prompt
-//! away.
+//! Wayland session must be told that window control is not offered by the
+//! *session* (`UnsupportedDesktopEnvironment`), not that CriKey lacks it
+//! (`Unavailable`), because only the first tells a plugin author that the
+//! missing feature is not a CriKey bug and not a permission prompt away.
+//!
+//! Global shortcuts under Wayland are the one answer that is not a function of
+//! the session label at all. The compositor withholds key grabs, and the
+//! `GlobalShortcuts` portal grants them back (ADR-0011), so the truthful answer
+//! depends on whether a portal is installed -- `Available` when one answers and
+//! `Unavailable` when nothing does. These tests inject that probe rather than
+//! consulting the build host's session bus, for exactly the reason they inject
+//! the environment: a reporting test that passes only on a developer's desktop
+//! is not pinning anything.
 //!
 //! Deliberate non-goals: no test here grabs a key, opens a display or talks to
-//! a compositor. This is the reporting surface only; the X11 grab path is
-//! pinned by the hotkey tests.
+//! a real portal. This is the reporting surface only; the X11 grab path is
+//! pinned by the hotkey tests and the portal path by `wayland_portal.rs`.
 
 #![cfg(target_os = "linux")]
 
@@ -93,16 +101,19 @@ fn index_of(capability: Capability) -> usize {
 /// The state the Linux backend is required to report, capability by capability
 /// and session by session. This is the contract table, written out rather than
 /// derived, so that an implementation cannot satisfy it by construction.
-fn required_state(environment: DesktopEnvironment, capability: Capability) -> CapabilityState {
+fn required_state(environment: DesktopEnvironment, portal: bool, capability: Capability) -> CapabilityState {
     match capability {
         // No display server needed: honest everywhere.
         Capability::ApplicationDiscovery | Capability::ProcessLaunch => CapabilityState::Available,
         // Global shortcuts: optional on Linux (spec 18.6). `GrabKey` is core X
         // protocol, so an X11 session delivers them whether or not anything
-        // else is running on the display.
+        // else is running on the display. Under Wayland they exist exactly when
+        // the `GlobalShortcuts` portal does, which is a fact about the
+        // installation rather than about the compositor.
         Capability::GlobalHotkeys => match environment {
             DesktopEnvironment::X11 => CapabilityState::Available,
-            DesktopEnvironment::Wayland => CapabilityState::UnsupportedDesktopEnvironment,
+            DesktopEnvironment::Wayland if portal => CapabilityState::Available,
+            DesktopEnvironment::Wayland => CapabilityState::Unavailable,
             DesktopEnvironment::Headless => CapabilityState::Unavailable,
         },
         // Window control: also optional (spec 18.6), but it needs an EWMH
@@ -276,32 +287,58 @@ fn an_x11_session_claims_hotkeys_outright_and_window_control_only_partially() {
     }
 }
 
-/// Wayland withholds them by protocol, which is a session fact, not a gap in
+/// Wayland reports what the portal can actually do, and keeps window control
+/// a session fact rather than a CriKey gap.
+///
+/// Kills two bugs at once. Reporting `UnsupportedDesktopEnvironment` for
+/// global shortcuts on a session that has a portal sends a plugin author
+/// looking for a compositor limitation that is not there, and reporting
+/// `Available` on a session with no portal is a claim nothing can honour. Both
+/// answers come from the same session label, so only the probe can separate
+/// them (spec 18.2, ADR-0011).
+#[test]
+fn a_wayland_session_claims_hotkeys_only_when_a_portal_answers() {
+    let with_portal = LinuxBackend::with_desktop_environment_and_portal(DesktopEnvironment::Wayland, true);
+    assert_eq!(
+        with_portal.capability(Capability::GlobalHotkeys),
+        CapabilityState::Available,
+        "a Wayland session with a GlobalShortcuts portal really does offer global hotkeys"
+    );
+
+    let without_portal =
+        LinuxBackend::with_desktop_environment_and_portal(DesktopEnvironment::Wayland, false);
+    assert_eq!(
+        without_portal.capability(Capability::GlobalHotkeys),
+        CapabilityState::Unavailable,
+        "with no portal there is nothing behind the claim, and the session type cannot supply one"
+    );
+}
+
+/// Window control under Wayland is withheld by the session, not missing from
 /// CriKey.
 ///
-/// Kills the bug this whole slice exists for: reporting `Unavailable` under
-/// Wayland. `Unavailable` tells a plugin author "CriKey does not do this";
-/// `UnsupportedDesktopEnvironment` tells them "this session does not offer it",
-/// and only the second is true and actionable (spec 18.2).
+/// Kills the bug where the portal work is taken as licence to claim the rest:
+/// no Wayland protocol lets an ordinary client enumerate another client's
+/// windows, and `UnsupportedDesktopEnvironment` says that while `Unavailable`
+/// would blame CriKey for it (spec 18.2).
 #[test]
-fn a_wayland_session_reports_hotkeys_and_window_control_as_unsupported_by_the_desktop() {
-    let backend = LinuxBackend::with_desktop_environment(DesktopEnvironment::Wayland);
-    for capability in [
-        Capability::GlobalHotkeys,
-        Capability::WindowEnumeration,
-        Capability::WindowActivation,
-    ] {
-        let state = backend.capability(capability);
-        assert_eq!(
-            state,
-            CapabilityState::UnsupportedDesktopEnvironment,
-            "{capability:?} is withheld by the compositor, not missing from CriKey (spec 18.2)"
-        );
-        assert_ne!(
-            state,
-            CapabilityState::Unavailable,
-            "{capability:?} under Wayland must not be flattened onto the generic 'not implemented' answer"
-        );
+fn a_wayland_session_reports_window_control_as_unsupported_by_the_desktop() {
+    for portal in [true, false] {
+        let backend = LinuxBackend::with_desktop_environment_and_portal(DesktopEnvironment::Wayland, portal);
+        for capability in [Capability::WindowEnumeration, Capability::WindowActivation] {
+            let state = backend.capability(capability);
+            assert_eq!(
+                state,
+                CapabilityState::UnsupportedDesktopEnvironment,
+                "{capability:?} is withheld by the compositor, not missing from CriKey (spec 18.2)"
+            );
+            assert_ne!(
+                state,
+                CapabilityState::Unavailable,
+                "{capability:?} under Wayland must not be flattened onto the generic 'not \
+                 implemented' answer, whatever the portal offers"
+            );
+        }
     }
 }
 
@@ -322,29 +359,51 @@ fn a_headless_session_reports_hotkeys_and_window_control_as_unavailable() {
     }
 }
 
-/// The three sessions must give genuinely different answers.
+/// The sessions must give genuinely different answers.
 ///
 /// Kills the stub that returns one constant for everything: no single
-/// `CapabilityState` can satisfy all three of these at once.
+/// `CapabilityState` satisfies window control across the three sessions, and
+/// no session-only answer satisfies global hotkeys across the two Wayland
+/// installations -- same compositor, opposite truths.
 #[test]
-fn the_three_sessions_disagree_about_global_hotkeys() {
-    let x11 =
-        LinuxBackend::with_desktop_environment(DesktopEnvironment::X11).capability(Capability::GlobalHotkeys);
-    let wayland = LinuxBackend::with_desktop_environment(DesktopEnvironment::Wayland)
-        .capability(Capability::GlobalHotkeys);
-    let headless = LinuxBackend::with_desktop_environment(DesktopEnvironment::Headless)
-        .capability(Capability::GlobalHotkeys);
+fn the_sessions_disagree_about_what_they_can_carry() {
+    let x11 = LinuxBackend::with_desktop_environment(DesktopEnvironment::X11);
+    let wayland = LinuxBackend::with_desktop_environment_and_portal(DesktopEnvironment::Wayland, true);
+    let headless = LinuxBackend::with_desktop_environment(DesktopEnvironment::Headless);
 
+    for (left, right, reason) in [
+        (
+            &x11,
+            &wayland,
+            "X11 and Wayland cannot share one window-control answer",
+        ),
+        (
+            &wayland,
+            &headless,
+            "a compositor refusal is not the same as no display",
+        ),
+        (
+            &x11,
+            &headless,
+            "X11 and headless cannot share one window-control answer",
+        ),
+    ] {
+        assert_ne!(
+            left.capability(Capability::WindowEnumeration),
+            right.capability(Capability::WindowEnumeration),
+            "{reason}"
+        );
+    }
+
+    let portalless = LinuxBackend::with_desktop_environment_and_portal(DesktopEnvironment::Wayland, false);
     assert_ne!(
-        x11, wayland,
-        "X11 and Wayland cannot share one global-hotkey answer"
+        wayland.capability(Capability::GlobalHotkeys),
+        portalless.capability(Capability::GlobalHotkeys),
+        "the same session type with and without a portal cannot share one global-hotkey answer"
     );
     assert_ne!(
-        wayland, headless,
-        "a compositor refusal is not the same as no display"
-    );
-    assert_ne!(
-        x11, headless,
+        x11.capability(Capability::GlobalHotkeys),
+        headless.capability(Capability::GlobalHotkeys),
         "X11 and headless cannot share one global-hotkey answer"
     );
 }
@@ -405,14 +464,17 @@ fn every_capability_has_a_deliberate_answer_in_every_session() {
     }
 
     for environment in ALL_ENVIRONMENTS {
-        let label = format!("{environment:?}");
-        let backend = LinuxBackend::with_desktop_environment(environment);
-        for capability in ALL_CAPABILITIES {
-            assert_eq!(
-                backend.capability(capability),
-                required_state(environment, capability),
-                "{capability:?} under {label} does not match the reporting table (spec 18.2)"
-            );
+        for portal in [true, false] {
+            let label = format!("{environment:?}");
+            let backend = LinuxBackend::with_desktop_environment_and_portal(environment, portal);
+            for capability in ALL_CAPABILITIES {
+                assert_eq!(
+                    backend.capability(capability),
+                    required_state(environment, portal, capability),
+                    "{capability:?} under {label} with portal={portal} does not match the \
+                     reporting table (spec 18.2)"
+                );
+            }
         }
     }
 }

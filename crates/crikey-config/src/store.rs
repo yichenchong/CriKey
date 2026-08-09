@@ -59,6 +59,9 @@ pub const BUILT_IN_DEFAULTS: &[(&str, &str)] = &[
     (KEY_MAXIMUM_WAIT_MS, "1000"),
     (KEY_RELOAD_INTERVAL_MS, "500"),
 ];
+/// Keys under this prefix are operator-pinned: a user may supply a source
+/// declaration, but cannot redirect one an administrator has specified.
+const ADMINISTRATOR_PINNED_PREFIX: &str = "catalog.remote.";
 
 const PLUGINS_PREFIX: &str = "plugins.";
 const SETTINGS_MARKER: &str = ".settings.";
@@ -289,8 +292,16 @@ impl ConfigStore {
         self.resolve(key).map(|(layer, _)| layer)
     }
 
-    /// The single precedence walk both [`Self::get`] and [`Self::layer_of`] use.
+    /// The administrator owns remote-catalog routing when it declares it.
+    /// This is intentionally narrower than the ordinary layer order: a
+    /// machine policy must be able to pin a trusted index against a user's
+    /// replacement, while unrelated settings retain the documented order.
     fn resolve(&self, key: &str) -> Option<(ConfigLayer, &str)> {
+        if key.starts_with(ADMINISTRATOR_PINNED_PREFIX) {
+            if let Some(value) = self.layers[ConfigLayer::AdministratorPolicy.index()].get(key) {
+                return Some((ConfigLayer::AdministratorPolicy, value.as_str()));
+            }
+        }
         ConfigLayer::ALL.iter().rev().find_map(|layer| {
             self.layers[layer.index()]
                 .get(key)

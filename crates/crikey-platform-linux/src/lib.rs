@@ -20,7 +20,11 @@
 //! Global shortcuts and window control are reported against the detected
 //! session rather than in the abstract, because on Linux they are optional
 //! (spec 18.6) and the reason they are missing differs: a Wayland compositor
-//! withholds them, a headless unit has nothing to withhold.
+//! withholds them, a headless unit has nothing to withhold. Wayland gets its
+//! shortcuts back through the `GlobalShortcuts` desktop portal (ADR-0011),
+//! which is a separate service and is therefore probed rather than assumed;
+//! window control there stays unavailable, because no Wayland protocol lets an
+//! ordinary client enumerate another client's windows.
 //!
 //! A root is only as trustworthy as whatever last wrote into it, so a
 //! candidate is stat checked and read through a cap before it is parsed:
@@ -54,9 +58,11 @@ pub mod icons;
 pub use icons::XdgIconSource;
 
 pub mod hotkeys;
+pub mod wayland;
 pub mod window;
 
 pub use hotkeys::{x11_binding, X11HotkeyService, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_SUPER};
+pub use wayland::WaylandHotkeyService;
 pub use window::X11WindowService;
 
 /// The only group a launchable entry is read from.
@@ -304,7 +310,8 @@ impl ProcessLauncher for CommandLauncher {
 pub enum DesktopEnvironment {
     /// An X11 server, where a client may grab keys and inspect other windows.
     X11,
-    /// A Wayland compositor, which withholds both from ordinary clients.
+    /// A Wayland compositor, where window control is withheld from ordinary
+    /// clients but global shortcuts may be granted through the portal.
     Wayland,
     /// No display server at all: a unit, a container or an SSH login.
     Headless,
@@ -355,6 +362,18 @@ pub struct LinuxBackend {
     /// rather than behind a `OnceLock`: [`HotkeyService`] registration takes
     /// `&mut self`, which a shared cell cannot hand out.
     hotkeys: Option<hotkeys::X11HotkeyService>,
+    /// The Wayland half of the same thing, held for the same reason. Two
+    /// fields rather than one boxed trait object because the two services
+    /// share no state and a `Box<dyn HotkeyService>` would cost this struct
+    /// its derived `Debug`.
+    portal_hotkeys: Option<wayland::WaylandHotkeyService>,
+    /// Whether the `GlobalShortcuts` portal answers, probed on first ask and
+    /// then cached. Under Wayland the honest answer to
+    /// [`Capability::GlobalHotkeys`] cannot be derived from the session label
+    /// alone -- the portal is a separate service that may not be installed --
+    /// so this is the one place capability reporting reaches outside the
+    /// process, and it reaches exactly once.
+    portal: OnceLock<bool>,
     /// The X server time of the last user action, written by the hotkey
     /// reader and read by the window service so that an activation carries the
     /// timestamp EWMH asks for. Shared here because it is the one thing the two
@@ -399,6 +418,20 @@ impl LinuxBackend {
         Self::build(DesktopEntryScanner::new(xdg_application_roots()), desktop)
     }
 
+    /// Reports for `desktop` with the portal probe already answered, instead
+    /// of asking the running session bus.
+    ///
+    /// The seam the capability tests need: under Wayland the truthful answer
+    /// for global shortcuts depends on a portal, and a test that consulted the
+    /// build host's bus would pass or fail on whether that host runs a desktop.
+    /// Only the *reporting* is injected -- [`Self::hotkeys`] still connects for
+    /// real and still refuses by name when nothing answers.
+    pub fn with_desktop_environment_and_portal(desktop: DesktopEnvironment, portal: bool) -> Self {
+        let backend = Self::with_desktop_environment(desktop);
+        let _ = backend.portal.set(portal);
+        backend
+    }
+
     fn build(applications: DesktopEntryScanner, desktop: DesktopEnvironment) -> Self {
         Self {
             applications,
@@ -406,6 +439,8 @@ impl LinuxBackend {
             desktop,
             window: OnceLock::new(),
             hotkeys: None,
+            portal_hotkeys: None,
+            portal: OnceLock::new(),
             user_time: Arc::new(AtomicU32::new(0)),
             icons: OnceLock::new(),
         }
@@ -418,29 +453,46 @@ impl LinuxBackend {
     /// inheriting a wildcard.
     ///
     /// Window control and global shortcuts are the session-dependent three
-    /// (spec 18.6). Under Wayland they report
+    /// (spec 18.6). Under Wayland window control reports
     /// [`CapabilityState::UnsupportedDesktopEnvironment`] rather than
     /// [`CapabilityState::Unavailable`], because the two say different things
     /// to a plugin author: the first is "this session does not offer it", which
     /// is a fact about the compositor and not a CriKey defect to report or a
     /// permission prompt away.
     ///
+    /// Global shortcuts under Wayland are the one answer this function cannot
+    /// derive from the session label, and the one place it reaches outside the
+    /// process. The compositor withholds key grabs, but the
+    /// `GlobalShortcuts` portal grants them back (ADR-0011) -- and the portal
+    /// is a separate service that may not be installed. So the portal is
+    /// probed, once, and `Available` means it answered while `Unavailable`
+    /// means nothing did. Reporting `UnsupportedDesktopEnvironment` for a
+    /// session that does offer shortcuts would send a plugin author looking for
+    /// a compositor limitation that is not there.
+    ///
     /// The two window capabilities are [`CapabilityState::Partial`] under X11
-    /// rather than `Available`, and the difference is not hedging. This function
-    /// is a pure function of the detected session, deliberately: it must not
-    /// open a display to answer. But window control additionally needs an EWMH
-    /// *window manager*, which is a separate program that may not be running --
-    /// on a bare X server [`Self::window_service`] hands out nothing. "The
-    /// session type supports it, subject to a runtime gate" is exactly what
-    /// `Partial` says, and it is the strongest claim this function can back.
-    /// Global shortcuts stay `Available`: `GrabKey` is core protocol, so an X11
-    /// display with no window manager still delivers them.
+    /// rather than `Available`, and the difference is not hedging. That answer
+    /// stays a pure function of the detected session: it must not open a
+    /// display. But window control additionally needs an EWMH *window
+    /// manager*, which is a separate program that may not be running -- on a
+    /// bare X server [`Self::window_service`] hands out nothing. "The session
+    /// type supports it, subject to a runtime gate" is exactly what `Partial`
+    /// says, and it is the strongest claim that can be backed without
+    /// connecting. Global shortcuts stay `Available` under X11: `GrabKey` is
+    /// core protocol, so an X11 display with no window manager still delivers
+    /// them.
     pub fn capability(&self, capability: Capability) -> CapabilityState {
         match capability {
             Capability::ApplicationDiscovery | Capability::ProcessLaunch => CapabilityState::Available,
             Capability::GlobalHotkeys => match self.desktop {
                 DesktopEnvironment::X11 => CapabilityState::Available,
-                DesktopEnvironment::Wayland => CapabilityState::UnsupportedDesktopEnvironment,
+                DesktopEnvironment::Wayland => {
+                    if self.portal_answers() {
+                        CapabilityState::Available
+                    } else {
+                        CapabilityState::Unavailable
+                    }
+                }
                 DesktopEnvironment::Headless => CapabilityState::Unavailable,
             },
             Capability::WindowEnumeration | Capability::WindowActivation => match self.desktop {
@@ -517,8 +569,22 @@ impl LinuxBackend {
             .map(|service| service as &dyn WindowService)
     }
 
+    /// Whether the `GlobalShortcuts` portal answers, asked once.
+    ///
+    /// Cached because a capability query is cheap by contract and a bus round
+    /// trip is not, and because an answer that changed between two queries
+    /// would let one plugin be told the launcher has hotkeys while the next is
+    /// told it does not.
+    fn portal_answers(&self) -> bool {
+        *self.portal.get_or_init(wayland::portal_is_available)
+    }
+
     /// The service behind [`Capability::GlobalHotkeys`], connecting on first
     /// use.
+    ///
+    /// X11 grabs keys itself; Wayland asks the portal for them (ADR-0011).
+    /// Both are real bindings and both arrive through the same callback
+    /// contract, so a caller never has to know which session it is in.
     ///
     /// `&mut` all the way down because [`HotkeyService::register`] is: a grab is
     /// exclusive server state, and two callers taking one concurrently is not a
@@ -526,29 +592,44 @@ impl LinuxBackend {
     ///
     /// # Errors
     ///
-    /// [`CoreError::Invalid`] naming the session when it is not X11 -- a
-    /// compositor or a headless unit has no `GrabKey` to offer -- and the
-    /// connection's own refusal when the display will not carry a service. The
-    /// failure is never softened into a service that swallows registrations.
+    /// [`CoreError::Invalid`] naming the session when it can offer nothing --
+    /// a headless unit has neither a display to grab against nor a desktop
+    /// portal to ask -- and the display's or the portal's own refusal
+    /// otherwise. The failure is never softened into a service that swallows
+    /// registrations.
     pub fn hotkeys(&mut self) -> Result<&mut dyn HotkeyService> {
-        if self.desktop != DesktopEnvironment::X11 {
-            return Err(CoreError::Invalid(format!(
-                "global hotkeys need an X11 session; this one is {:?}, which offers no GrabKey",
+        match self.desktop {
+            DesktopEnvironment::X11 => {
+                if self.hotkeys.is_none() {
+                    self.hotkeys = Some(hotkeys::X11HotkeyService::connect_sharing(
+                        None,
+                        Arc::clone(&self.user_time),
+                    )?);
+                }
+                let Some(service) = self.hotkeys.as_mut() else {
+                    return Err(CoreError::Invalid(
+                        "the X11 hotkey service disappeared before it could be returned".to_owned(),
+                    ));
+                };
+                Ok(service)
+            }
+            DesktopEnvironment::Wayland => {
+                if self.portal_hotkeys.is_none() {
+                    self.portal_hotkeys = Some(wayland::WaylandHotkeyService::connect()?);
+                }
+                let Some(service) = self.portal_hotkeys.as_mut() else {
+                    return Err(CoreError::Invalid(
+                        "the Wayland hotkey service disappeared before it could be returned".to_owned(),
+                    ));
+                };
+                Ok(service)
+            }
+            DesktopEnvironment::Headless => Err(CoreError::Invalid(format!(
+                "global hotkeys need an X11 display or a desktop portal; this one is {:?}, which \
+                 offers neither",
                 self.desktop
-            )));
+            ))),
         }
-        if self.hotkeys.is_none() {
-            self.hotkeys = Some(hotkeys::X11HotkeyService::connect_sharing(
-                None,
-                Arc::clone(&self.user_time),
-            )?);
-        }
-        let Some(service) = self.hotkeys.as_mut() else {
-            return Err(CoreError::Invalid(
-                "the X11 hotkey service disappeared before it could be returned".to_owned(),
-            ));
-        };
-        Ok(service)
     }
 }
 

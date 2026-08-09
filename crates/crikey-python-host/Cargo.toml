@@ -16,6 +16,7 @@ crikey-core.workspace = true
 crikey-native-protocol.workspace = true
 crikey-plugin-model.workspace = true
 crikey-plugin-supervisor.workspace = true
+crikey-sandbox.workspace = true
 crikey-package-manager.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

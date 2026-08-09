@@ -22,6 +22,8 @@ use crikey_result_aggregator::{
 };
 use crikey_ui::{ResultRow, ViewModel};
 
+use crate::plugin_icons::PluginIconResolver;
+
 /// Bounds and fairness policy for one composed query pipeline.
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineConfig {
@@ -196,6 +198,10 @@ pub struct QueryPipeline {
     visible_generation: Option<Generation>,
     presented_pending: Option<bool>,
     presentation_dirty: bool,
+    /// Resolver for the icon references plugins put on their own items, set by
+    /// whichever provider owns this pipeline. Absent until a provider installs
+    /// one, and absent forever for a pipeline with no plugin rows.
+    icons: Option<Arc<PluginIconResolver>>,
 }
 
 impl QueryPipeline {
@@ -239,6 +245,7 @@ impl QueryPipeline {
             visible_generation: None,
             presented_pending: None,
             presentation_dirty: false,
+            icons: None,
         }
     }
 
@@ -398,7 +405,12 @@ impl QueryPipeline {
         ensure_supported_runtime(&plugin, manifest.plugin.runtime)?;
         let policy = self.effective_policy(&plugin, plugin_policy_from_manifest(manifest));
         let budget = resolved_budget_for_policy(&policy, &manifest.concurrency);
-        self.register_plugin_with_budget(plugin, policy, self.default_intake_policy, budget.clone())?;
+        self.register_plugin_with_budget(plugin.clone(), policy, self.default_intake_policy, budget.clone())?;
+        self.aggregator.set_plugin_limits(
+            plugin,
+            manifest.performance.maximum_results_per_query,
+            manifest.performance.maximum_results_per_batch,
+        );
         Ok(budget)
     }
 
@@ -416,7 +428,13 @@ impl QueryPipeline {
         }
         ensure_supported_runtime(&plugin, manifest.plugin.runtime)?;
         let policy = self.effective_policy(&plugin, plugin_policy_from_manifest(manifest));
-        self.register_plugin_with_budget(plugin, policy, self.default_intake_policy, budget)
+        self.register_plugin_with_budget(plugin.clone(), policy, self.default_intake_policy, budget)?;
+        self.aggregator.set_plugin_limits(
+            plugin,
+            manifest.performance.maximum_results_per_query,
+            manifest.performance.maximum_results_per_batch,
+        );
+        Ok(())
     }
 
     /// Rolls back a plugin registration whose runtime failed to start.
@@ -459,6 +477,7 @@ impl QueryPipeline {
         self.scheduler.unregister_plugin(plugin);
         self.intake.unregister(plugin);
         self.supervisor.unregister(plugin);
+        self.aggregator.remove_plugin_limits(plugin);
         self.health_sync.remove(plugin);
         self.budgets.remove(plugin);
         self.registered.retain(|registered| registered != plugin);
@@ -666,8 +685,15 @@ impl QueryPipeline {
         let mut rows_changed = false;
 
         if let Some(items) = update {
-            self.rows = items.into_iter().map(result_row).collect::<Vec<_>>().into();
+            let icons = self.icons.clone();
+            self.rows = items
+                .into_iter()
+                .map(|item| result_row(item, icons.as_ref()))
+                .collect::<Vec<_>>()
+                .into();
             self.visible_generation = Some(self.generation);
+            rows_changed = true;
+        } else if self.fill_pending_icons() {
             rows_changed = true;
         }
 
@@ -696,6 +722,51 @@ impl QueryPipeline {
             pending_plugins,
             actions_open: false,
         })
+    }
+
+    /// Installs the resolver for plugin-supplied icon references.
+    ///
+    /// Called once by the provider that owns this pipeline, after discovery,
+    /// so the resolver knows every plugin that actually loaded.
+    pub fn set_plugin_icons(&mut self, icons: Arc<PluginIconResolver>) {
+        self.icons = Some(icons);
+    }
+
+    /// Fills in icons that had not arrived when their rows were built.
+    ///
+    /// A native plugin's icon comes over the protocol, so a row is published
+    /// without pixels rather than holding a finished frame. This is the edge
+    /// that lets the icon appear on a later frame instead of only after the
+    /// next query. Returns whether any row changed.
+    fn fill_pending_icons(&mut self) -> bool {
+        let Some(icons) = self.icons.clone() else {
+            return false;
+        };
+        if !self
+            .rows
+            .iter()
+            .any(|row| row.icon.is_none() && row.icon_reference.is_some())
+        {
+            return false;
+        }
+        let mut rows = self.rows.to_vec();
+        let mut changed = false;
+        for row in &mut rows {
+            if row.icon.is_some() {
+                continue;
+            }
+            let Some(reference) = row.icon_reference.as_deref() else {
+                continue;
+            };
+            if let Some(image) = icons.resolve(&row.plugin_name, reference) {
+                row.icon = Some(image);
+                changed = true;
+            }
+        }
+        if changed {
+            self.rows = rows.into();
+        }
+        changed
     }
 
     pub fn rows(&self) -> &[ResultRow] {
@@ -1040,14 +1111,21 @@ fn resolved_budget_for_policy(policy: &PluginPolicy, concurrency: &ConcurrencySe
     });
     shared_budget_from_section(&resolved)
 }
-fn ensure_supported_runtime(plugin: &PluginId, runtime: Runtime) -> Result<(), PipelineError> {
-    if runtime == Runtime::Wasm {
-        return Err(PipelineError::UnsupportedRuntime {
-            plugin: plugin.clone(),
-            runtime,
-        });
+
+/// Refuses a runtime this build has no host for.
+///
+/// Exhaustive on purpose: a new `Runtime` variant must decide here, so adding
+/// one can never make it silently supported. WASM is accepted only because
+/// `native_provider` registers it as a supervised `crikey-wasm-host` worker;
+/// the launcher itself never instantiates a module (ADR-0014).
+fn ensure_supported_runtime(_plugin: &PluginId, runtime: Runtime) -> Result<(), PipelineError> {
+    match runtime {
+        Runtime::LegacyPython | Runtime::Python | Runtime::Native | Runtime::Builtin => Ok(()),
+        Runtime::Wasm => Ok(()),
+        // `c-abi` is served by the supervised `crikey-cabi-host` executable
+        // and registered by `native_provider` (ADR-0015).
+        Runtime::CAbi => Ok(()),
     }
-    Ok(())
 }
 
 fn runtime_name(runtime: Runtime) -> &'static str {
@@ -1056,6 +1134,7 @@ fn runtime_name(runtime: Runtime) -> &'static str {
         Runtime::Python => "python",
         Runtime::Native => "native",
         Runtime::Wasm => "wasm",
+        Runtime::CAbi => "c-abi",
         Runtime::Builtin => "builtin",
     }
 }
@@ -1101,7 +1180,16 @@ pub(crate) fn plugin_policy_from_manifest(manifest: &Manifest) -> PluginPolicy {
     }
 }
 
-fn result_row(item: Item) -> ResultRow {
+/// Builds one renderer row from a plugin item.
+///
+/// The icon reference is resolved through `icons` rather than the platform's
+/// icon provider. A plugin's reference is not a platform reference -- it names
+/// a file inside the plugin's own package, or a resource only a native plugin
+/// can produce -- and handing it to the desktop's theme lookup would find
+/// nothing or, worse, an unrelated icon of the same name. Catalog rows, whose
+/// references *are* platform references, get their pixels in
+/// `SearchService::result_rows`.
+fn result_row(item: Item, icons: Option<&Arc<PluginIconResolver>>) -> ResultRow {
     let argument_hint = match item.argument_policy {
         ArgumentPolicy::Forbidden => None,
         ArgumentPolicy::Optional => Some("optional argument".to_owned()),
@@ -1109,21 +1197,15 @@ fn result_row(item: Item) -> ResultRow {
     };
     let mut actions = item.actions.into_iter();
     let default_action = actions.next();
+    let icon = icons
+        .zip(item.icon_reference.as_deref())
+        .and_then(|(resolver, reference)| resolver.resolve(&item.plugin_id.0, reference));
 
     ResultRow {
         item: item.stable_id,
         label: item.label,
         description: item.description,
-        // Deliberately unresolved. Rows here come from plugins, and a plugin's
-        // icon reference is not a platform reference: it names a file inside the
-        // plugin's own package, or -- for a native plugin -- a resource the host
-        // has to request over the protocol (`ResourceRequest`/`Kind::Icon`).
-        // Neither resolver exists yet, and resolving a package-relative
-        // reference against the desktop's icon themes would find either nothing
-        // or, worse, an unrelated icon of the same name. Catalog rows, whose
-        // references *are* platform references, get their pixels in
-        // `SearchService::result_rows`.
-        icon: None,
+        icon,
         icon_reference: item.icon_reference,
         category: item.category.as_str().to_owned(),
         plugin_name: item.plugin_id.0,

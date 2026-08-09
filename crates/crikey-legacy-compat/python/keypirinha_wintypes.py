@@ -48,6 +48,8 @@ __all__ = (
     "WINDOWS_ONLY_SYMBOLS",
     "WindowsOnlyError",
     "is_available",
+    "read_link",
+    "shell_known_folder_path",
 )
 
 #: This module is classified windows-only on every platform, Windows included.
@@ -107,6 +109,38 @@ def is_available():
     for why ``hasattr`` and ``getattr(..., default)`` do not.
     """
     return sys.platform.startswith("win")
+
+
+def read_link(path):
+    """Resolve a Windows ``.lnk`` through the explicit Win32 seam.
+
+    The compatibility alias remains in :mod:`keypirinha_util` because legacy
+    plugins import it there, but the platform-dependent operation is owned by
+    this module. The import is lazy so merely importing the platform interface
+    never loads the portable utility module or touches a Windows DLL.
+    """
+    if not is_available():
+        raise _keypirinha.HostUnavailableError(
+            "read_link",
+            "resolving a Windows .lnk shortcut needs the Win32 shell link "
+            "interfaces, which platform {} does not have".format(sys.platform),
+        )
+    from keypirinha_util import _win32_read_link
+
+    return _win32_read_link(path)
+
+
+def shell_known_folder_path(guid):
+    """Resolve a Windows known-folder GUID through the Win32 platform seam."""
+    if not is_available():
+        raise _keypirinha.HostUnavailableError(
+            "shell_known_folder_path",
+            "known-folder GUIDs are a Win32 shell concept and platform {} has "
+            "no registry of them".format(sys.platform),
+        )
+    from keypirinha_util import _win32_known_folder_path
+
+    return _win32_known_folder_path(guid)
 
 
 #: `GUID` field layout, kept beside the structure it describes.

@@ -19,6 +19,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::index::constant_time_hex_eq;
+use crate::signature::{PackageSigningKey, SignaturePolicy, SignatureState};
 use crate::PackageError;
 
 const MANIFEST_MEMBER: &str = "crikey.toml";
@@ -29,6 +30,14 @@ pub(crate) const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = MAX_PACKAGE_BYTES;
 const MAX_MEMBERS: usize = 65_536;
 const SWAP_JOURNAL_SUFFIX: &str = ".crikey-swap";
+
+/// The first line of the byte string a package signature covers.
+///
+/// Versioned and domain-separated: a signature over a CriKey package can never
+/// be replayed as a signature over anything else CriKey signs, and a future
+/// change to the manifest layout gets a new preamble rather than silently
+/// meaning something different to an older verifier.
+const CANONICAL_MANIFEST_PREAMBLE: &str = "crikey-package-signature-v1";
 
 /// A package id is also used as an install-directory name.
 pub(crate) fn safe_id_component(id: &str) -> Result<&str, PackageError> {
@@ -70,7 +79,13 @@ pub struct NativePackageReport {
     pub arch: Vec<String>,
     pub entries: Vec<(String, u64)>,
     pub hash: String,
-    pub signed: bool,
+    /// Whether provenance was established, and by whom (spec 2.2; ADR 0012).
+    ///
+    /// [`SignatureState::Unchecked`] is not a synonym for "unsigned": it means
+    /// this report came from an entry point that was given no
+    /// [`SignaturePolicy`] and therefore never looked. Reporting `unsigned`
+    /// there would be a claim about the package that nothing had established.
+    pub signature: SignatureState,
     pub unsigned_binary: bool,
 }
 
@@ -81,6 +96,23 @@ pub struct NativeInstall {
     pub root: PathBuf,
     pub previous: Option<PathBuf>,
     pub report: NativePackageReport,
+}
+
+/// What `crikey package sign` produced (spec 2.2; ADR 0012).
+///
+/// Carries the fingerprint rather than the public key: the fingerprint is what
+/// an operator compares against the one a publisher advertises, and it is what
+/// every message about this package will quote from now on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageSignatureReport {
+    pub plugin: String,
+    pub version: String,
+    /// SHA-256 of the archive that was signed.
+    pub hash: String,
+    /// Fingerprint of the key that signed it.
+    pub fingerprint: String,
+    /// Where the detached signature was written.
+    pub signature: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -180,10 +212,15 @@ pub fn build_package(plugin_dir: &Path, out: &Path) -> Result<NativePackageRepor
 }
 
 /// Inspects and authenticates every member of a native package archive.
+///
+/// Inspection is not verification of provenance: the returned report says
+/// [`SignatureState::Unchecked`], because no trust store was supplied and
+/// therefore nothing was decided. Use [`verify_package_with_policy`] to ask
+/// who signed a package.
 pub fn inspect_package(archive: &Path) -> Result<NativePackageReport, PackageError> {
     let package = load_package(archive)?;
     validate_integrity(&package)?;
-    Ok(package_report(&package))
+    Ok(package_report(&package, SignatureState::Unchecked))
 }
 
 /// Authenticates a native package and, when supplied, pins its whole-archive
@@ -197,9 +234,31 @@ pub fn inspect_package(archive: &Path) -> Result<NativePackageReport, PackageErr
 /// and whose lock no longer described it — the one thing the command exists to
 /// refuse. The optional `expected_hash` is an *additional* out-of-band pin, not
 /// a substitute for the embedded digests.
+///
+/// What none of that establishes is *provenance*. A lock authenticates the
+/// archive against itself, so a hostile party who rebuilds the archive and
+/// rewrites the lock to match produces a package that passes every check here.
+/// This entry point therefore reports [`SignatureState::Unchecked`];
+/// [`verify_package_with_policy`] is the one that answers "signed by whom".
 pub fn verify_package(
     archive: &Path,
     expected_hash: Option<&str>,
+) -> Result<NativePackageReport, PackageError> {
+    verify_package_with_policy(archive, expected_hash, &SignaturePolicy::unchecked())
+}
+
+/// Authenticates a native package and establishes its provenance under
+/// `policy` (spec 2.2, 23.3; ADR 0012).
+///
+/// Order matters and is deliberate: the archive is validated against its own
+/// embedded lock *first*, then the signature is checked over the canonical
+/// manifest of those validated members. Checking the signature first would mean
+/// verifying a signature over digests that had not yet been shown to describe
+/// the bytes on disk.
+pub fn verify_package_with_policy(
+    archive: &Path,
+    expected_hash: Option<&str>,
+    policy: &SignaturePolicy,
 ) -> Result<NativePackageReport, PackageError> {
     let package = load_package(archive)?;
     validate_integrity(&package)?;
@@ -211,7 +270,85 @@ pub fn verify_package(
             )));
         }
     }
-    Ok(package_report(&package))
+    let signature = evaluate_package_signature(archive, &package, policy)?;
+    Ok(package_report(&package, signature))
+}
+
+/// Signs a package: what `crikey package sign` does once the archive is built.
+///
+/// The package is authenticated against its embedded lock before anything is
+/// signed. Signing an archive without checking it first would let a plugin
+/// author put their name on bytes they had not looked at, which is the one
+/// thing a signature is supposed to rule out.
+pub fn sign_package(
+    archive: &Path,
+    key: &PackageSigningKey,
+    signature_out: &Path,
+) -> Result<PackageSignatureReport, PackageError> {
+    let package = load_package(archive)?;
+    validate_integrity(&package)?;
+    let payload = canonical_manifest(&package);
+    let manifest = key.detached(&payload);
+    crate::signature::write_signature_file(signature_out, &manifest)?;
+    Ok(PackageSignatureReport {
+        plugin: package.manifest.plugin.id.clone(),
+        version: package.manifest.plugin.version.clone(),
+        hash: package.archive_hash,
+        fingerprint: manifest.key.fingerprint(),
+        signature: signature_out.to_path_buf(),
+    })
+}
+
+/// Applies `policy` to the detached signature beside `archive`.
+fn evaluate_package_signature(
+    archive: &Path,
+    package: &LoadedPackage,
+    policy: &SignaturePolicy,
+) -> Result<SignatureState, PackageError> {
+    if matches!(policy, SignaturePolicy::Unchecked) {
+        return Ok(SignatureState::Unchecked);
+    }
+    let signature_path = crate::signature::signature_path_for(archive);
+    let payload = canonical_manifest(package);
+    let artefact = archive.display().to_string();
+    Ok(crate::signature::evaluate(
+        &artefact,
+        &signature_path,
+        &payload,
+        policy,
+    )?)
+}
+
+/// The exact bytes a package signature covers.
+///
+/// Every member's name and digest, not one file: a signature over the payload
+/// alone would leave the manifest and the lock free to be rewritten, and a
+/// signature over the raw archive bytes would break on any re-zip that changed
+/// nothing that matters.
+///
+/// Every field is length-prefixed, so no member name — whatever bytes a
+/// publisher chose for it — can be spliced to make one package's manifest read
+/// as another's. Members come from a [`BTreeMap`], so the order is the archive's
+/// sorted member order and two builds of the same package produce identical
+/// bytes here.
+fn canonical_manifest(package: &LoadedPackage) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(CANONICAL_MANIFEST_PREAMBLE.as_bytes());
+    out.push(b'\n');
+    let mut field = |value: &str| {
+        out.extend_from_slice(value.len().to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(value.as_bytes());
+        out.push(b'\n');
+    };
+    field(&package.manifest.plugin.id);
+    field(&package.manifest.plugin.version);
+    field(&package.members.len().to_string());
+    for (name, member) in &package.members {
+        field(name);
+        field(&sha256_hex(&member.bytes));
+    }
+    out
 }
 
 /// Installs a validated native package by swapping complete directories.  The
@@ -229,6 +366,9 @@ pub fn install_native(
 }
 
 /// Installs while retaining the displaced version at its final rollback path.
+///
+/// Establishes no provenance: see [`install_native_with_policy`], which this
+/// delegates to with [`SignaturePolicy::unchecked`].
 pub fn install_native_with_retention(
     archive: &Path,
     install_root: &Path,
@@ -237,9 +377,35 @@ pub fn install_native_with_retention(
     stop_running: &mut dyn FnMut(&str) -> Result<(), PackageError>,
     retention: Option<&Path>,
 ) -> Result<NativeInstall, PackageError> {
+    install_native_with_policy(
+        archive,
+        install_root,
+        os,
+        arch,
+        stop_running,
+        retention,
+        &SignaturePolicy::unchecked(),
+    )
+}
+
+/// Installs under a provenance `policy` (spec 2.2, 23.3; ADR 0012).
+///
+/// The signature decision is made before `stop_running` is called and therefore
+/// before anything at all moves: a package that will be refused must not have
+/// cost the operator a running plugin first.
+pub fn install_native_with_policy(
+    archive: &Path,
+    install_root: &Path,
+    os: &str,
+    arch: &str,
+    stop_running: &mut dyn FnMut(&str) -> Result<(), PackageError>,
+    retention: Option<&Path>,
+    policy: &SignaturePolicy,
+) -> Result<NativeInstall, PackageError> {
     let package = load_package(archive)?;
     ensure_compatible(&package.manifest, os, arch)?;
     validate_integrity(&package)?;
+    let signature = evaluate_package_signature(archive, &package, policy)?;
 
     stop_running(&package.manifest.plugin.id)?;
 
@@ -277,7 +443,7 @@ pub fn install_native_with_retention(
     Ok(NativeInstall {
         root: install_root.to_path_buf(),
         previous,
-        report: package_report(&package),
+        report: package_report(&package, signature),
     })
 }
 
@@ -546,9 +712,18 @@ fn parse_manifest(bytes: &[u8]) -> Result<Manifest, PackageError> {
 }
 
 fn validate_manifest_shape(manifest: &Manifest) -> Result<(), PackageError> {
-    if manifest.plugin.runtime != Runtime::Native {
+    // `c-abi` and `wasm` share this package format. Their payload is a shared
+    // library or a `.wasm` module rather than a program, and the executable
+    // CriKey supervises is `crikey-cabi-host` or `crikey-wasm-host`, but the
+    // archive, the lock and the atomic install are identical. A second
+    // nearly-identical format would be a second place to get member
+    // authentication wrong (ADR-0014, ADR-0015).
+    if !matches!(
+        manifest.plugin.runtime,
+        Runtime::Native | Runtime::CAbi | Runtime::Wasm
+    ) {
         return Err(PackageError::Manifest(
-            "native packages require plugin.runtime = \"native\"".to_owned(),
+            "native packages require plugin.runtime = \"native\", \"c-abi\" or \"wasm\"".to_owned(),
         ));
     }
     if manifest.plugin.id.is_empty() || manifest.plugin.version.is_empty() {
@@ -924,12 +1099,17 @@ fn ensure_compatible(manifest: &Manifest, os: &str, arch: &str) -> Result<(), Pa
     Ok(())
 }
 
-/// Whether any executable payload ships without a detached signature.
+/// Whether any `bin/` payload ships without a sibling `<name>.sig` file.
 ///
-/// A `bin/` member with no sibling `<name>.sig` file is unsigned. This is
-/// reported, never refused: CriKey runs no signing authority, and a plugin an
-/// operator built for themselves is legitimately unsigned. What matters is
-/// that the user is told before third-party native code runs (spec 23.3).
+/// A *shape* check, and nothing more: no signature file's contents are read
+/// here, no key is consulted, and nothing is refused. It predates package
+/// signing and is kept because `crikey plugin list` reports it, but it is not
+/// provenance and must never be read as any.
+///
+/// Provenance is [`SignatureState`], established by
+/// [`verify_package_with_policy`] from the detached `<package>.sig` beside the
+/// archive and the operator's trust store (ADR 0012). The two facts are reported
+/// under two names precisely so neither is mistaken for the other.
 pub(crate) fn unsigned_binary_in(members: &BTreeMap<String, ArchiveMember>) -> bool {
     members.iter().any(|(name, member)| {
         if !name.starts_with("bin/") || member.directory || name.ends_with(".sig") {
@@ -963,7 +1143,71 @@ pub(crate) fn collect_directory_members(
         .collect())
 }
 
-fn package_report(package: &LoadedPackage) -> NativePackageReport {
+/// Re-authenticates one file inside an *installed* package directory against
+/// the `crikey-package.lock` installation wrote beside it (spec 23.3, 23.4).
+///
+/// Installation already validated the whole archive, but a directory on disk
+/// can be edited afterwards. A host that is about to load third-party code out
+/// of that directory checks the one member it is about to load rather than
+/// trusting the install that happened at some earlier date. The lock is
+/// re-canonicalised exactly as [`inspect_package`] does, so a rewritten or
+/// reordered lock is refused before any digest is compared.
+///
+/// This authenticates the *bytes*; it says nothing about who produced them.
+/// The lock is not a signature.
+pub fn verify_installed_member(package_dir: &Path, member: &str) -> Result<(), PackageError> {
+    let lock_path = package_dir.join(LOCK_MEMBER);
+    let lock_bytes = read_file_capped(&lock_path, MAX_PACKAGE_BYTES)?;
+    let lock_text = std::str::from_utf8(&lock_bytes)
+        .map_err(|error| PackageError::HashMismatch(format!("{LOCK_MEMBER} is not UTF-8: {error}")))?;
+    let lock: PackageLock = toml::from_str(lock_text)
+        .map_err(|error| PackageError::HashMismatch(format!("invalid {LOCK_MEMBER}: {error}")))?;
+    let canonical_lock = toml::to_string(&lock)
+        .map_err(|error| PackageError::HashMismatch(format!("could not encode {LOCK_MEMBER}: {error}")))?;
+    if lock_text.as_bytes() != canonical_lock.as_bytes() {
+        return Err(PackageError::HashMismatch(format!(
+            "{LOCK_MEMBER} is not in canonical form"
+        )));
+    }
+    let expected = lock
+        .entries
+        .get(member)
+        .ok_or_else(|| PackageError::HashMismatch(format!("{LOCK_MEMBER} has no digest for {member}")))?;
+    let bytes = read_file_capped(&package_dir.join(member), MAX_PACKAGE_BYTES)?;
+    let actual = sha256_hex(&bytes);
+    if !is_hex_sha256(expected) || !constant_time_hex_eq(expected, &actual) {
+        return Err(PackageError::HashMismatch(format!(
+            "digest mismatch for installed member {member}"
+        )));
+    }
+    Ok(())
+}
+
+/// Reads a whole file, refusing anything past `limit` instead of allocating
+/// it. The read itself is capped rather than the metadata length: a file that
+/// grows between the two is refused, not truncated.
+fn read_file_capped(path: &Path, limit: u64) -> Result<Vec<u8>, PackageError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(PackageError::Install(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(PackageError::Install(format!(
+            "{} is larger than {limit} bytes",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn package_report(package: &LoadedPackage, signature: SignatureState) -> NativePackageReport {
     let unsigned_binary = unsigned_binary_in(&package.members);
     NativePackageReport {
         plugin: package.manifest.plugin.id.clone(),
@@ -976,7 +1220,7 @@ fn package_report(package: &LoadedPackage) -> NativePackageReport {
             .map(|(name, member)| (name.clone(), member.bytes.len() as u64))
             .collect(),
         hash: package.archive_hash.clone(),
-        signed: false,
+        signature,
         unsigned_binary,
     }
 }

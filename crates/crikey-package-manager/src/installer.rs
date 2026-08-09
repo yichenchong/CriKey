@@ -44,7 +44,8 @@ use crate::native::{
     self, collect_directory_members, read_archive, remove_path, swap_into_place, temporary_path,
     unsigned_binary_in, write_members,
 };
-use crate::{build_package, inspect_package, install_native_with_retention, InstallSource, PackageError};
+use crate::signature::SignaturePolicy;
+use crate::{build_package, inspect_package, install_native_with_policy, InstallSource, PackageError};
 
 /// Extension of a Keypirinha package, without the dot.
 ///
@@ -85,6 +86,7 @@ pub struct InstalledPlugin {
 pub struct PluginInstaller {
     directories: StandardDirectories,
     fetcher: Box<dyn PackageFetcher>,
+    signatures: SignaturePolicy,
 }
 
 // Hand-written because a `PackageFetcher` is not required to be `Debug`: the
@@ -113,7 +115,38 @@ impl PluginInstaller {
         Self {
             directories: directories.clone(),
             fetcher,
+            // Deliberately `Unchecked` rather than the conservative
+            // `UnsignedPolicy::Refuse`: constructing an installer must not
+            // silently start enforcing a policy the caller never chose, and a
+            // caller that has not read the trust store has no basis on which to
+            // refuse anything. `crikey plugin install` resolves the operator's
+            // policy from `--unsigned-policy` and `packages.unsigned-policy`
+            // and calls [`Self::with_signature_policy`]; there is exactly one
+            // place the decision is made, and it is the place that read the
+            // configuration.
+            signatures: SignaturePolicy::unchecked(),
         }
+    }
+
+    /// Installs native packages under `policy` (spec 2.2; ADR 0012).
+    ///
+    /// Applies to a native *archive* — a distributed artefact a publisher could
+    /// have signed — and to nothing else. A modern source tree and a legacy
+    /// Keypirinha package have no canonical member manifest to sign, so
+    /// claiming to have checked their provenance would be a claim about
+    /// nothing; and a native source *directory* is packed into a scratch
+    /// archive by this very call, so no third party could ever have signed it
+    /// and asking the policy about it would refuse every source-tree install
+    /// rather than protect against anything. See ADR-0012.
+    #[must_use]
+    pub fn with_signature_policy(mut self, policy: SignaturePolicy) -> Self {
+        self.signatures = policy;
+        self
+    }
+
+    /// The provenance policy native installs are subject to.
+    pub fn signature_policy(&self) -> &SignaturePolicy {
+        &self.signatures
     }
 
     /// Installs or upgrades the package `source` names (spec 23.1, 23.3).
@@ -230,10 +263,34 @@ impl PluginInstaller {
             InstallSource::Url(url) => {
                 let fetched = scratch.path.join(url_file_name(url));
                 self.fetcher.fetch(url, &fetched)?;
+                self.fetch_sibling_signature(url, &fetched);
                 // A fetched file is a candidate archive and nothing more: it
                 // is classified and validated exactly as a local one is.
                 self.install_archive(&fetched, stop)
             }
+        }
+    }
+
+    /// Fetches `<url>.sig` beside the archive already fetched to `archive`.
+    ///
+    /// A detached signature travels beside the package, and provenance is
+    /// established by looking beside the package *on disk*, so a URL install
+    /// that fetched only the archive could never be anything but unsigned. The
+    /// second request is made only when someone is going to read the answer.
+    ///
+    /// A failure here is not an installation failure. A publisher who never
+    /// signed the package serves no `<url>.sig`, and that is exactly the state
+    /// [`UnsignedPolicy`](crate::UnsignedPolicy) exists to decide about — the
+    /// default refuses it. Leaving a partial or absent file behind would turn
+    /// a transport error into a malformed-signature error and hide which of
+    /// the two happened, so the sidecar is removed unless it arrived whole.
+    fn fetch_sibling_signature(&self, url: &str, archive: &Path) {
+        if matches!(self.signatures, SignaturePolicy::Unchecked) {
+            return;
+        }
+        let sidecar = crate::signature::signature_path_for(archive);
+        if self.fetcher.fetch(&format!("{url}.sig"), &sidecar).is_err() {
+            remove_path(&sidecar);
         }
     }
 
@@ -250,14 +307,22 @@ impl PluginInstaller {
         }
         let manifest = read_manifest(&manifest_path)?;
         match manifest.plugin.runtime {
-            Runtime::Native => {
+            Runtime::Native | Runtime::CAbi | Runtime::Wasm => {
                 // Built into an archive first, so a directory install takes the
                 // same path a published package does: the builder writes the
                 // lock and installation then authenticates every member.
+                //
+                // Provenance is explicitly unchecked, and that is not an
+                // oversight: the archive being installed was produced by the
+                // line above, milliseconds ago, from the operator's own
+                // directory. No publisher could have signed it, so the
+                // unsigned-package policy has no question to ask here and
+                // `refuse` would ban source-tree installs outright rather than
+                // establish anything. ADR-0012 records the same split.
                 let scratch = Scratch::new(&self.directories)?;
                 let archive = scratch.path.join("package.crikey");
-                let installed =
-                    build_package(path, &archive).and_then(|_| self.install_native_archive(&archive, stop));
+                let installed = build_package(path, &archive)
+                    .and_then(|_| self.install_native_archive(&archive, stop, &SignaturePolicy::unchecked()));
                 scratch.discard();
                 installed
             }
@@ -286,7 +351,10 @@ impl PluginInstaller {
         let members = read_archive(path)?.members;
         let manifest = native::archive_manifest(&members)?;
         match manifest.plugin.runtime {
-            Runtime::Native => self.install_native_archive(path, stop),
+            Runtime::Native | Runtime::CAbi | Runtime::Wasm => {
+                let policy = self.signatures.clone();
+                self.install_native_archive(path, stop, &policy)
+            }
             Runtime::Python => self.install_modern(members, stop),
             other => Err(PackageError::Manifest(format!(
                 "{MANIFEST_FILE} declares runtime {other:?}, which is not installable"
@@ -297,10 +365,16 @@ impl PluginInstaller {
     /// Native packages (spec 23.3): platform, architecture and every embedded
     /// digest are checked before the running plugin is stopped and the
     /// directory is replaced.
+    ///
+    /// `policy` is passed rather than read from `self` because the two callers
+    /// answer the provenance question differently: an archive is a distributed
+    /// artefact subject to the operator's policy, while a source directory is
+    /// packed here and cannot carry a publisher's signature at all.
     fn install_native_archive(
         &mut self,
         archive: &Path,
         stop: &mut dyn FnMut(&str) -> Result<(), PackageError>,
+        policy: &SignaturePolicy,
     ) -> Result<InstalledPlugin, PackageError> {
         let report = inspect_package(archive)?;
         let id = native::safe_id_component(&report.plugin)?;
@@ -309,13 +383,14 @@ impl PluginInstaller {
         if let Some(holder) = previous.parent() {
             fs::create_dir_all(holder)?;
         }
-        let install = install_native_with_retention(
+        let install = install_native_with_policy(
             archive,
             &root,
             std::env::consts::OS,
             std::env::consts::ARCH,
             stop,
             Some(&previous),
+            policy,
         )?;
         Ok(InstalledPlugin {
             id: install.report.plugin.clone(),

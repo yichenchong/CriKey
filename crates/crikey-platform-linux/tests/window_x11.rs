@@ -412,6 +412,12 @@ impl Ewmh {
         self.flush();
     }
 
+    /// Publishes `_NET_ACTIVE_WINDOW` as the `WINDOW/32` value EWMH declares,
+    /// which is how a manager announces which window has the focus.
+    fn publish_active_window(&self, window: Window) {
+        self.set_words(self.root, self.net_active_window, AtomEnum::WINDOW, &[window]);
+    }
+
     /// Selects `mask` on the root window, as a manager does, so that events sent
     /// to the root naming any of those bits reach this client.
     fn watch_root(&self, mask: EventMask) {
@@ -1126,5 +1132,103 @@ fn a_handle_from_enumeration_round_trips_into_activation() {
     assert!(
         fixture.await_active_window_message(window).is_some(),
         "the handle enumeration returned must address the window it described"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reading the focused window
+// ---------------------------------------------------------------------------
+
+/// The positive case: the manager names a window and the service describes it.
+///
+/// `WM_CLASS` is the field that matters to the caller — ranking matches it
+/// against the application catalog — so the class, not just the handle, is
+/// asserted. Kills a reader that returns the handle and leaves the description
+/// empty, which would silently switch the context signal off forever.
+#[test]
+fn the_focused_window_is_read_from_the_managers_active_window_property() {
+    let (server, fixture) = ewmh_server();
+
+    let window = fixture.create_window();
+    fixture.set_net_wm_name(window, "Inbox — Mail");
+    fixture.set_wm_class(window, "mail", "Mail");
+    fixture.publish_active_window(window);
+
+    let focused = server
+        .service()
+        .foreground_window()
+        .expect("reading the active window")
+        .unwrap_or_else(|| panic!("the published active window was not reported"));
+
+    assert_eq!(focused.handle, WindowHandle(u64::from(window)));
+    assert_eq!(focused.title, "Inbox — Mail");
+    assert_eq!(focused.application.as_deref(), Some("Mail"));
+}
+
+/// EWMH spells "nothing is focused" as the zero window id, and a manager that
+/// has not focused anything yet leaves the property unset. Both must be
+/// `Ok(None)`: a caller that received `WindowHandle(0)` would look up window
+/// zero and get whatever a stale handle gets.
+#[test]
+fn an_unfocused_desktop_reports_no_foreground_window() {
+    let (server, fixture) = ewmh_server();
+    let service = server.service();
+
+    assert_eq!(
+        service.foreground_window().expect("reading an unset property"),
+        None,
+        "a manager that never wrote the property has focused nothing"
+    );
+
+    fixture.publish_active_window(0);
+    assert_eq!(
+        service.foreground_window().expect("reading the None window"),
+        None,
+        "EWMH's zero window id means no window is focused"
+    );
+}
+
+/// Any client may write any bytes to a root-window property, so the declared
+/// type is checked before the value is believed. Kills the reader that trusts
+/// four bytes of text as a window id and hands the host a fabricated handle.
+#[test]
+fn an_active_window_property_of_the_wrong_type_reports_no_foreground_window() {
+    let (server, fixture) = ewmh_server();
+
+    fixture.set_text(
+        fixture.root,
+        fixture.net_active_window,
+        AtomEnum::STRING.into(),
+        b"not a window id",
+    );
+
+    assert_eq!(
+        server
+            .service()
+            .foreground_window()
+            .expect("reading a wrongly typed property"),
+        None
+    );
+}
+
+/// Focus moves asynchronously and windows are destroyed by the programs that
+/// own them, so the property routinely names a window that is already gone.
+/// Reporting it would put a dead handle and an empty description in front of
+/// the ranker as if it were the user's current application.
+#[test]
+fn an_active_window_that_has_been_destroyed_reports_no_foreground_window() {
+    let (server, fixture) = ewmh_server();
+
+    let window = fixture.create_window();
+    fixture.set_wm_class(window, "gone", "Gone");
+    fixture.publish_active_window(window);
+    fixture.destroy_window(window);
+
+    assert_eq!(
+        server
+            .service()
+            .foreground_window()
+            .expect("reading a stale active window"),
+        None
     );
 }

@@ -30,3 +30,11 @@ winit = { workspace = true, features = ["rwh_06", "wayland", "wayland-dlopen", "
 # The renderer tests build rows carrying real decoded pixels, because the
 # assertion is that those exact bytes reach the frame's texture uploads.
 crikey-platform.workspace = true
+
+# `winit` refuses to build an event loop off the process main thread and allows
+# exactly one per process, and libtest runs `#[test]` functions on worker
+# threads. Driving the shipped `NativeLauncher` from a test therefore requires
+# owning `main`, which is what `harness = false` gives.
+[[test]]
+name = "ime_x11"
+harness = false

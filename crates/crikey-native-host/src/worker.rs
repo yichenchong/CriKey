@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use crikey_core::{ActionId, Item, ItemId, PluginId};
 use crikey_native_protocol::convert::from_proto_item;
@@ -33,6 +35,10 @@ const SOCKET_POLL_MS: u64 = 20;
 const CONTROL_WRITE_TIMEOUT_MS: u64 = 200;
 const STDERR_TAIL_BYTES: usize = 8 * 1024;
 const CHILD_REAP_TIMEOUT_MS: u64 = 2_000;
+/// `CREATE_SUSPENDED`: the child is created with its primary thread suspended
+/// so containment can be established before it executes any of its own code.
+#[cfg(windows)]
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
 static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ENDPOINT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -103,6 +109,38 @@ pub struct PluginHandshake {
     pub sdk_version: String,
     pub protocol_version: u32,
     pub capabilities: Capabilities,
+}
+
+/// Bytes a plugin served in answer to one [`NativeWorker::request_resource`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginResource {
+    /// The reference the plugin echoed back.
+    pub reference: String,
+    /// The payload, already checked against the caller's byte ceiling.
+    pub content: Vec<u8>,
+    /// The plugin's media-type hint, empty when it gave none.
+    pub media_type: String,
+}
+
+/// What a host resource request is asking a plugin for (spec 16.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// Icon pixels for an item the plugin published.
+    Icon,
+    /// An opaque file shipped inside the plugin package.
+    File,
+    /// Configuration data owned by the plugin.
+    Configuration,
+}
+
+impl ResourceKind {
+    fn to_proto(self) -> message::ResourceKind {
+        message::ResourceKind::from_i32(match self {
+            Self::Icon => 1,
+            Self::File => 2,
+            Self::Configuration => 3,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -379,11 +417,12 @@ pub struct NativeWorker {
     stderr_reader: Option<JoinHandle<()>>,
     exit: Option<ExitRecord>,
     diagnostics: StreamDiagnostics,
+    sandbox_report: crikey_sandbox::SandboxReport,
     next_request_id: u64,
     call_succeeded: bool,
     failure_kind: Option<crikey_plugin_supervisor::FailureKind>,
     #[cfg(windows)]
-    job_handle: Option<usize>,
+    job: Option<OwnedJob>,
 }
 
 impl NativeWorker {
@@ -454,19 +493,43 @@ impl NativeWorker {
         if let Some(dir) = &spec.working_dir {
             command.current_dir(dir);
         }
-        command.env_clear();
+        // Stripped unless the manifest bought the ambient environment. A
+        // plugin that never declared `permissions.environment` must not learn
+        // the user's tokens, proxies and paths just by being spawned by us.
+        if !spec.inherit_environment {
+            command.env_clear();
+        }
         add_restricted_environment(&mut command, &spec, &endpoint, &token);
         #[cfg(unix)]
         command.process_group(0);
         #[cfg(target_os = "linux")]
-        configure_parent_death(&mut command).map_err(HostError::Spawn)?;
+        configure_parent_death(&mut command);
         configure_command(&mut command, &options).map_err(HostError::Spawn)?;
-        let mut child = command
-            .spawn()
-            .map_err(|error| HostError::Spawn(error.to_string()))?;
+        // Prepared here, in the parent, because building the rule set opens
+        // descriptors and allocates; the child runs two syscalls on the result
+        // between fork and exec. An unavailable sandbox is reported, not
+        // fatal (spec 20.2).
+        let sandbox = options.sandbox.prepare();
+        sandbox.install(&mut command);
+        let sandbox_report = sandbox.report().clone();
+        // Windows children start suspended so their job object is already in
+        // force when they run their first instruction. `AssignProcessToJobObject`
+        // does not examine memory the process allocated before assignment, and a
+        // descendant created before assignment is never pulled into the job
+        // afterwards - so a plugin spawned running could pass the memory cap and
+        // leave a survivor that `TerminateJobObject` cannot reach, while
+        // diagnostics still reported the limits as enforced. Unix is unchanged:
+        // `process_group(0)` above already covers the whole tree from creation.
         #[cfg(windows)]
-        let job_handle = match create_job_for_child(&child, &options.limits) {
-            Ok(handle) => Some(handle),
+        command.creation_flags(CREATE_SUSPENDED);
+        let mut child = spawn_child(command).map_err(|error| HostError::Spawn(error.to_string()))?;
+        // Held as an owner, not a raw handle: every early return below this
+        // point drops it, which closes the job and - through
+        // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` - kills descendants that the
+        // direct `child.kill()` cannot see.
+        #[cfg(windows)]
+        let job = match contain_child(&child, &options.limits) {
+            Ok(value) => value,
             Err(error) => {
                 terminate_and_reap(&mut child);
                 return Err(HostError::Spawn(error));
@@ -640,17 +703,26 @@ impl NativeWorker {
             stderr_reader: Some(stderr_reader),
             exit: None,
             diagnostics: StreamDiagnostics::default(),
+            sandbox_report,
             next_request_id: 1,
             call_succeeded: false,
             failure_kind: None,
             #[cfg(windows)]
-            job_handle,
+            job: Some(job),
         })
     }
 
     /// Returns self-reported handshake diagnostics.
     pub fn handshake(&self) -> &PluginHandshake {
         &self.handshake
+    }
+
+    /// What the kernel actually enforces on this plugin's process (spec 20.2).
+    ///
+    /// Read from the sandbox that was installed on the child, so a caller
+    /// reporting it is reporting what happened rather than what was asked for.
+    pub fn sandbox_report(&self) -> &crikey_sandbox::SandboxReport {
+        &self.sandbox_report
     }
 
     /// Returns host-authoritative plugin identity.
@@ -1114,6 +1186,97 @@ impl NativeWorker {
         }
     }
 
+    /// Asks the live plugin to serve one resource (spec 16.4).
+    ///
+    /// `Ok(None)` covers every way a plugin can decline: it does not have the
+    /// reference, it answered with an error, it served more than `max_bytes`,
+    /// or it said nothing before `timeout`. None of those kills the worker,
+    /// and that asymmetry with the query path is deliberate. A resource is
+    /// decoration -- an item's icon, in practice -- so taking the process down
+    /// over one would cost the user working suggestions to punish a missing
+    /// picture. Transport death is still an error: that is not the plugin
+    /// declining, it is the channel being gone.
+    pub fn request_resource(
+        &mut self,
+        kind: ResourceKind,
+        reference: &str,
+        timeout: Duration,
+        max_bytes: usize,
+    ) -> Result<Option<PluginResource>, HostError> {
+        self.ensure_alive()?;
+        let request_id = self.begin_request(0);
+        self.send_control(&Envelope {
+            connection_id: self.link.connection_id,
+            request_id,
+            generation: 0,
+            deadline_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            payload: Some(Payload::ResourceRequest(message::ResourceRequest {
+                kind: kind.to_proto(),
+                reference: reference.to_owned(),
+                unknown: Default::default(),
+            })),
+            unknown: Default::default(),
+        })?;
+
+        let end = deadline(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
+        loop {
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let envelope = match self.link.recv(remaining) {
+                Ok(ReaderEvent::Envelope(envelope)) => envelope,
+                Ok(ReaderEvent::Failure(failure)) => return Err(self.transport_error(failure)),
+                Err(RecvTimeoutError::Timeout) => return Ok(None),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(self.transport_error(ReaderFailure {
+                        error: ProtocolError::Closed,
+                        protocol_violation: self.link.protocol_violation(),
+                        resource_limit: self.link.resource_limit.load(Ordering::Acquire),
+                    }))
+                }
+            };
+            if let Some(Payload::ResourceRequest(request)) = envelope.payload.as_ref() {
+                self.answer_resource_request(&envelope, request)?;
+                continue;
+            }
+            if envelope.request_id != request_id {
+                // Whatever else is still in the reader queue belongs to a call
+                // that already returned. Streaming payloads still owe a credit
+                // back or the plugin stalls on the next query.
+                if matches!(
+                    envelope.payload,
+                    Some(Payload::Results(_)) | Some(Payload::CatalogBatch(_))
+                ) {
+                    self.replenish_credit()?;
+                }
+                continue;
+            }
+            match envelope.payload {
+                Some(Payload::ResourceResponse(response)) => {
+                    self.mark_call_succeeded();
+                    if !response.found
+                        || response.error.is_some()
+                        || response.content.len() > max_bytes
+                        || response.content.is_empty()
+                    {
+                        return Ok(None);
+                    }
+                    return Ok(Some(PluginResource {
+                        reference: response.reference,
+                        content: response.content,
+                        media_type: response.media_type,
+                    }));
+                }
+                Some(Payload::Log(log)) => self.record_log(log.message),
+                // An `Error` here is the SDK's answer for a plugin that does
+                // not implement resources at all, which is a decline, not a
+                // violation.
+                Some(Payload::Error(_)) | Some(_) | None => return Ok(None),
+            }
+        }
+    }
+
     /// Returns a clonable out-of-band cancellation handle.
     pub fn cancel_handle(&self) -> CancelHandle {
         CancelHandle {
@@ -1255,8 +1418,8 @@ impl NativeWorker {
 
     fn terminate_owned_tree(&mut self) {
         #[cfg(windows)]
-        if let Some(handle) = self.job_handle {
-            terminate_job_handle(handle);
+        if let Some(job) = self.job.as_ref() {
+            job.terminate();
         }
         if let Some(child) = self.child.as_mut() {
             terminate_child_tree(child);
@@ -1265,9 +1428,9 @@ impl NativeWorker {
 
     #[cfg(windows)]
     fn release_job(&mut self) {
-        if let Some(handle) = self.job_handle.take() {
-            close_job_handle(handle);
-        }
+        // Dropping the owner is the close; taking it here puts that close at
+        // the point shutdown expects rather than at worker drop.
+        drop(self.job.take());
     }
 
     #[cfg(not(windows))]
@@ -1363,6 +1526,15 @@ impl NativeWorker {
             }
             match self.link.recv(remaining) {
                 Ok(ReaderEvent::Envelope(envelope)) => {
+                    // A resource response for another request id answers a
+                    // fetch the host already abandoned at its own deadline.
+                    // Recording it as an echo mismatch would blame the plugin
+                    // for the host's impatience, so it is simply dropped.
+                    if matches!(envelope.payload, Some(Payload::ResourceResponse(_)))
+                        && envelope.request_id != request_id
+                    {
+                        continue;
+                    }
                     if is_stale(&envelope, request_id, generation) {
                         let request_mismatch = envelope.request_id != request_id;
                         let generation_mismatch = generation != 0 && envelope.generation != generation;
@@ -1984,6 +2156,7 @@ fn legal_plugin_payload(envelope: &Envelope) -> bool {
             | Some(Payload::Log(_))
             | Some(Payload::HealthReport(_))
             | Some(Payload::ResourceRequest(_))
+            | Some(Payload::ResourceResponse(_))
     )
 }
 
@@ -2010,6 +2183,12 @@ fn is_protocol_violation_error(error: &ProtocolError) -> bool {
     matches!(
         error,
         ProtocolError::FrameTooLarge(_)
+            // The frame was legal on the wire and only its decoded size was
+            // refused. Still the plugin's fault -- the decodable ceiling is
+            // discoverable through `message::max_decodable_items`, and the
+            // shipped SDKs split on it -- but the error names batch sizing
+            // rather than framing, so the diagnostic points at the real cause.
+            | ProtocolError::DecodeBudgetExceeded { .. }
             | ProtocolError::UnsupportedVersion(_)
             | ProtocolError::Malformed(_)
             | ProtocolError::Rejected(_)
@@ -2146,26 +2325,92 @@ fn add_restricted_environment(command: &mut Command, spec: &LaunchSpec, endpoint
     command.env("CRIKEY_PROTOCOL_VERSION", PROTOCOL_VERSION.to_string());
 }
 
+/// Spawns one native child from the process-wide spawner thread.
+///
+/// `PR_SET_PDEATHSIG` is thread-scoped: the kernel signals the child when the
+/// *thread* that cloned it exits, not when this process does. Native calls run
+/// on short-lived per-query dispatch threads, so spawning inline would arm a
+/// `SIGKILL` that fires the moment the query which happened to start the plugin
+/// finishes - the worker would die between keystrokes and every later query
+/// would spend restart budget. One long-lived owner thread, which can only exit
+/// with this process, makes the parent-death signal mean what it says.
+#[cfg(target_os = "linux")]
+fn spawn_child(command: Command) -> std::io::Result<Child> {
+    spawner::spawn(command)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_child(mut command: Command) -> std::io::Result<Child> {
+    command.spawn()
+}
+
+#[cfg(target_os = "linux")]
+mod spawner {
+    use std::process::{Child, Command};
+    use std::sync::mpsc::{self, SyncSender};
+    use std::sync::LazyLock;
+    use std::thread;
+
+    struct Request {
+        command: Command,
+        reply: SyncSender<std::io::Result<Child>>,
+    }
+
+    /// The one thread allowed to clone a plugin process.
+    ///
+    /// This serializes `fork`/`exec` across plugins. Process creation costs
+    /// milliseconds against per-plugin call budgets measured in hundreds, and
+    /// nothing waits on the queue except the spawn it submitted, so the shared
+    /// owner is not a throughput bound.
+    static REQUESTS: LazyLock<SyncSender<Request>> = LazyLock::new(|| {
+        let (sender, receiver) = mpsc::sync_channel::<Request>(0);
+        thread::Builder::new()
+            .name("crikey-native-spawner".to_owned())
+            .spawn(move || {
+                for request in receiver {
+                    let mut command = request.command;
+                    let _ = request.reply.send(command.spawn());
+                }
+            })
+            .expect("the native spawner thread starts");
+        sender
+    });
+
+    pub(super) fn spawn(command: Command) -> std::io::Result<Child> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        REQUESTS
+            .send(Request { command, reply })
+            .map_err(|_| std::io::Error::other("the native spawner thread is gone"))?;
+        answer
+            .recv()
+            .map_err(|_| std::io::Error::other("the native spawner thread dropped a spawn"))?
+    }
+}
+
+/// Arms `SIGKILL` on host death so a plugin cannot outlive its launcher
+/// (spec 24.3). The request is recorded on the command and takes effect in the
+/// child, which [`spawn_child`] clones from a thread that outlives every query.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn configure_parent_death(command: &mut Command) -> Result<(), String> {
+fn configure_parent_death(command: &mut Command) {
     const PR_SET_PDEATHSIG: i32 = 1;
     const SIGKILL: usize = 9;
     let launcher_pid = std::process::id() as i32;
-    // SAFETY: these declarations match the Linux libc ABI and the closure
-    // executes in the child before exec, where no Rust allocation or locking
-    // is performed.
+    // SAFETY: these declarations match the Linux libc ABI.
     unsafe extern "C" {
         fn getppid() -> i32;
         fn prctl(option: i32, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> i32;
     }
-    // SAFETY: `pre_exec` is deliberately used for the child-only parent-death
-    // setup; the closure captures only a copy of the launcher's pid.
+    // SAFETY: `pre_exec` runs in the child between fork and exec. The closure
+    // captures one `Copy` pid and calls two async-signal-safe syscalls; it
+    // performs no allocation, locking, or Rust I/O.
     unsafe {
         command.pre_exec(move || {
             if prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // The launcher can die between fork and here, in which case the
+            // death signal was already delivered and missed.
             if getppid() != launcher_pid {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
@@ -2175,7 +2420,6 @@ fn configure_parent_death(command: &mut Command) -> Result<(), String> {
             Ok(())
         });
     }
-    Ok(())
 }
 
 fn session_token() -> Result<String, String> {
@@ -2211,30 +2455,16 @@ fn private_endpoint_directory() -> Result<std::path::PathBuf, String> {
     Err("private Unix endpoint directories are unavailable on this platform".to_owned())
 }
 
+/// Fills `bytes` from the operating system's CSPRNG.
+///
+/// One source for the whole tree (the workspace names `getrandom` for exactly
+/// this), rather than a per-platform hand-rolled call. The previous Windows
+/// arm passed a null algorithm handle to `BCryptGenRandom` without
+/// `BCRYPT_USE_SYSTEM_PREFERRED_RNG`, which the API rejects with
+/// `STATUS_INVALID_HANDLE`: every session token and endpoint name on Windows
+/// would have failed to generate, and no test on a Unix host could see it.
 fn fill_csprng(bytes: &mut [u8]) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        let mut source = std::fs::File::open("/dev/urandom").map_err(|error| error.to_string())?;
-        source.read_exact(bytes).map_err(|error| error.to_string())?;
-        return Ok(());
-    }
-    #[cfg(windows)]
-    {
-        use std::ffi::c_void;
-        #[link(name = "bcrypt")]
-        extern "system" {
-            fn BCryptGenRandom(algorithm: *mut c_void, buffer: *mut u8, length: u32, flags: u32) -> i32;
-        }
-        #[allow(unsafe_code)]
-        let status =
-            unsafe { BCryptGenRandom(std::ptr::null_mut(), bytes.as_mut_ptr(), bytes.len() as u32, 0) };
-        if status == 0 {
-            return Ok(());
-        }
-        return Err(format!("BCryptGenRandom failed with status {status}"));
-    }
-    #[allow(unreachable_code)]
-    Err("no operating-system CSPRNG is available on this platform".to_owned())
+    getrandom::fill(bytes).map_err(|error| format!("the operating system CSPRNG failed: {error}"))
 }
 
 fn next_connection_id() -> u64 {
@@ -2361,9 +2591,138 @@ fn terminate_and_reap(child: &mut Child) {
     );
 }
 
+/// Sole owner of one Windows job-object handle; `Drop` closes it.
+///
+/// Startup has half a dozen early returns between `AssignProcessToJobObject`
+/// and a constructed [`NativeWorker`], and a raw `usize` made every one of them
+/// a place to forget the `CloseHandle`. The leak is not merely a handle-table
+/// entry: the job carries `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so while any
+/// handle to it remains open the kill never fires and descendants that the
+/// direct `child.kill()` cannot reach keep running. An owner makes the release
+/// unforgettable, because the compiler emits it on every path.
+#[cfg(windows)]
+#[derive(Debug)]
+struct OwnedJob(usize);
+
+#[cfg(windows)]
+impl OwnedJob {
+    /// Kills every process still in the job, without giving up ownership.
+    fn terminate(&self) {
+        terminate_job_handle(self.0);
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedJob {
+    fn drop(&mut self) {
+        close_job_handle(self.0);
+    }
+}
+
+/// Binds a freshly created, still-suspended child to its job and then lets it
+/// run.
+///
+/// The order is the whole point, so it lives in one function rather than in a
+/// sequence of statements a later edit could reorder: the job is created and
+/// the process assigned to it while the child is frozen, and only then is the
+/// primary thread resumed. A child that cannot be resumed is not left frozen -
+/// returning here drops the job owner, whose close fires
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` on the whole tree, and the caller
+/// additionally reaps the direct child.
+#[cfg(windows)]
+fn contain_child(child: &Child, limits: &crate::launch::ResourceLimits) -> Result<OwnedJob, String> {
+    let job = create_job_for_child(child, limits)?;
+    resume_primary_thread(child.id())?;
+    Ok(job)
+}
+
+/// Resumes the threads of a child created with `CREATE_SUSPENDED`.
+///
+/// `std::process::Child` does not surface the primary thread handle, so the
+/// thread is found the documented way: a `TH32CS_SNAPTHREAD` Toolhelp snapshot
+/// lists every thread on the system together with the process that owns it. A
+/// process created suspended has exactly one thread and that thread cannot
+/// exit, and the caller still holds the process handle so the identifier cannot
+/// have been reused - the entry matched here is that primary thread. Resuming
+/// nothing is an error rather than a shrug: it would leave a plugin that never
+/// runs and a handshake that can only time out.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn create_job_for_child(child: &Child, limits: &crate::launch::ResourceLimits) -> Result<usize, String> {
+fn resume_primary_thread(process_id: u32) -> Result<(), String> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct ThreadEntry32 {
+        size: u32,
+        usage: u32,
+        thread_id: u32,
+        owner_process_id: u32,
+        base_priority: i32,
+        delta_priority: i32,
+        flags: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
+        fn Thread32First(snapshot: *mut c_void, entry: *mut ThreadEntry32) -> i32;
+        fn Thread32Next(snapshot: *mut c_void, entry: *mut ThreadEntry32) -> i32;
+        fn OpenThread(access: u32, inherit: i32, thread_id: u32) -> *mut c_void;
+        fn ResumeThread(thread: *mut c_void) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+    // `ResumeThread` reports failure as (DWORD)-1, not as zero: zero is the
+    // legitimate "was not suspended" previous count.
+    const RESUME_FAILED: u32 = u32::MAX;
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot.is_null() || snapshot as isize == -1 {
+        return Err("CreateToolhelp32Snapshot failed".to_owned());
+    }
+    let mut entry = ThreadEntry32 {
+        size: std::mem::size_of::<ThreadEntry32>() as u32,
+        usage: 0,
+        thread_id: 0,
+        owner_process_id: 0,
+        base_priority: 0,
+        delta_priority: 0,
+        flags: 0,
+    };
+    let mut resumed = 0_u32;
+    let mut failure: Option<String> = None;
+    // SAFETY: `snapshot` is a live Toolhelp handle and `entry` is valid
+    // writable storage whose `size` field was set before the first call. The
+    // loop closes the snapshot on every exit.
+    let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while more && failure.is_none() {
+        if entry.owner_process_id == process_id {
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.thread_id) };
+            if thread.is_null() {
+                failure = Some("OpenThread failed for the suspended child's thread".to_owned());
+            } else {
+                if unsafe { ResumeThread(thread) } == RESUME_FAILED {
+                    failure = Some("ResumeThread failed for the suspended child's thread".to_owned());
+                } else {
+                    resumed += 1;
+                }
+                let _ = unsafe { CloseHandle(thread) };
+            }
+        }
+        more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if resumed == 0 {
+        return Err("the suspended child had no thread to resume".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn create_job_for_child(child: &Child, limits: &crate::launch::ResourceLimits) -> Result<OwnedJob, String> {
     use std::ffi::c_void;
     #[repr(C)]
     struct IoCounters {
@@ -2478,12 +2837,12 @@ fn create_job_for_child(child: &Child, limits: &crate::launch::ResourceLimits) -
         unsafe { CloseHandle(job) };
         return Err("SetInformationJobObject failed".to_owned());
     }
-    let process = child.as_raw_handle() as *mut c_void;
+    let process = child.as_raw_handle();
     if unsafe { AssignProcessToJobObject(job, process) } == 0 {
         unsafe { CloseHandle(job) };
         return Err("AssignProcessToJobObject failed".to_owned());
     }
-    Ok(job as usize)
+    Ok(OwnedJob(job as usize))
 }
 
 #[cfg(windows)]
@@ -2522,6 +2881,14 @@ fn terminate_child_tree(child: &mut Child) {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn kill_process_group(pid: u32) {
+    // `killpg(0)` signals the CALLER's process group - this launcher, its shell
+    // and its session. Every caller passes a live `Child::id()`, and each kill
+    // precedes its reap so the pid cannot have been recycled, but a misdirected
+    // group kill is unrecoverable: refuse the values that could only ever mean
+    // "myself" or "init".
+    if pid <= 1 {
+        return;
+    }
     unsafe extern "C" {
         fn killpg(pgrp: i32, sig: i32) -> i32;
     }
@@ -2590,5 +2957,85 @@ impl ExitKind {
         } else {
             Self::Crashed
         }
+    }
+}
+
+/// Windows-only because the code under test is Win32 itself: off Windows
+/// neither the job object nor `CREATE_SUSPENDED` exists, so no Linux suite can
+/// say anything about them. This is where the containment order and the job
+/// owner's release are pinned by behaviour rather than by inspection.
+#[cfg(all(test, windows))]
+mod windows_containment {
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::time::{Duration, Instant};
+
+    use super::{contain_child, CommandExt, CREATE_SUSPENDED};
+    use crate::launch::ResourceLimits;
+
+    /// Creates a frozen child the same way [`super::NativeWorker::spawn_inner`]
+    /// does, so these tests exercise the real starting state.
+    fn suspended(arguments: &[&str]) -> Child {
+        let mut command = Command::new("cmd.exe");
+        command.args(arguments);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.creation_flags(CREATE_SUSPENDED);
+        command.spawn().expect("cmd.exe must be spawnable on Windows")
+    }
+
+    fn wait_bounded(child: &mut Child, within: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + within;
+        loop {
+            match child.try_wait().expect("try_wait must not fail") {
+                Some(status) => return Some(status),
+                None if Instant::now() >= deadline => return None,
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    /// The child stays frozen until the job is assigned and only then runs, so
+    /// a plugin cannot allocate or spawn ahead of the limits the host reports.
+    /// Drop the resume and the child never reaches its own exit code; drop the
+    /// suspension and the first assertion sees it already gone.
+    #[test]
+    fn a_contained_child_is_resumed_only_after_the_job_is_assigned() {
+        let mut child = suspended(&["/c", "exit", "3"]);
+        assert_eq!(
+            wait_bounded(&mut child, Duration::from_millis(300)),
+            None,
+            "a child created suspended must not run before it is contained"
+        );
+        let job = contain_child(&child, &ResourceLimits::default()).expect("containment must succeed");
+        let status =
+            wait_bounded(&mut child, Duration::from_secs(10)).expect("a resumed child must reach its exit");
+        assert_eq!(
+            status.code(),
+            Some(3),
+            "the contained child must go on to run its own code"
+        );
+        drop(job);
+    }
+
+    /// Dropping the owner closes the last job handle, and
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` then kills whatever is still inside
+    /// it. A startup path that returned early holding a bare `usize` left this
+    /// child running instead.
+    #[test]
+    fn dropping_the_job_owner_kills_the_contained_child() {
+        let mut child = suspended(&["/c", "ping", "-n", "60", "127.0.0.1"]);
+        let job = contain_child(&child, &ResourceLimits::default()).expect("containment must succeed");
+        assert_eq!(
+            wait_bounded(&mut child, Duration::from_millis(300)),
+            None,
+            "the contained child must still be running before the job is released"
+        );
+        drop(job);
+        assert!(
+            wait_bounded(&mut child, Duration::from_secs(10)).is_some(),
+            "closing the last job handle must kill every process left in the job"
+        );
     }
 }

@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  CriKey.app property list.
+
+  `packaging/macos/build.sh` copies this file to
+  `CriKey.app/Contents/Info.plist` and substitutes `__CRIKEY_VERSION__`. The
+  token is left in the checked-in copy on purpose: a hard-coded version here
+  would silently disagree with the workspace version the moment either moved,
+  and a bundle whose CFBundleVersion lies is a bundle whose update checks and
+  crash reports lie with it.
+
+  Keys are here only when something needs them. In particular there is no
+  NSAppleEventsUsageDescription and no CFBundleURLTypes: the macOS backend
+  sends no Apple Events and registers no URL scheme (see Entitlements.plist for
+  the call-by-call audit), and a usage-description string for a permission the
+  program never requests is a prompt the user can never satisfy.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <!--
+      Reverse-DNS under the namespace the rest of the project already uses for
+      identity (`dev.crikey.*`, as in the plugin manifests). This string is the
+      key TCC, Launch Services, the Keychain and the notary service all file
+      the application under, so it is fixed for the lifetime of the product and
+      must never be edited to match a build variant.
+    -->
+    <key>CFBundleIdentifier</key>
+    <string>dev.crikey.CriKey</string>
+
+    <key>CFBundleName</key>
+    <string>CriKey</string>
+    <key>CFBundleDisplayName</key>
+    <string>CriKey</string>
+
+    <!--
+      Contents/MacOS/crikey-launcher: the GUI entry point from
+      crates/crikey-cli, NOT the `crikey` command-line binary that sits beside
+      it in the same directory.
+
+      Launch Services starts a bundle's main executable with no arguments and
+      has no key for supplying any, and bare `crikey` prints usage and exits —
+      a double click would show nothing at all. `crikey-launcher` takes no
+      arguments and starts the launcher directly, which is the whole reason it
+      is a separate binary rather than a flag on the first one.
+
+      Both are staged under Contents/MacOS because `sdk_root()` and
+      `shim_root()` resolve `modern-sdk`/`legacy-shim` beside the *running*
+      executable, so whichever of the two is launched has to be in that
+      directory.
+    -->
+    <key>CFBundleExecutable</key>
+    <string>crikey-launcher</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>__CRIKEY_VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__CRIKEY_VERSION__</string>
+
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+
+    <!--
+      11.0, because the build ships an arm64 slice and Big Sur is the first
+      release that exists on Apple silicon. Nothing in the tree calls an API
+      newer than that, so raising the floor further would exclude working
+      Intel machines for no benefit; lowering it would advertise support for
+      systems no arm64 slice can run on.
+    -->
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+
+    <!--
+      LSUIElement is FALSE, which is the opposite of what a hotkey launcher
+      normally wants, and the reason is a capability that does not exist yet.
+
+      `MacOsBackend::capability` (crates/crikey-platform-macos/src/lib.rs)
+      reports `Capability::GlobalHotkeys` as `Unavailable`: there is no Carbon
+      `RegisterEventHotKey` or `CGEventTap` registration in the macOS backend,
+      only the Windows one has a live hotkey path. An agent-style bundle
+      (LSUIElement true) has no Dock icon, no menu bar and no application
+      switcher entry, so with no global hotkey the window could be summoned
+      only from a terminal. That is not a launcher; it is an unreachable
+      process.
+
+      So the Dock icon stays until the hotkey backend lands. Flip this to
+      `<true/>` in the same change that makes
+      `MacOsBackend::capability(Capability::GlobalHotkeys)` return
+      `Available`: not before, and not separately.
+    -->
+    <key>LSUIElement</key>
+    <false/>
+
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <!--
+      The renderer is wgpu on Metal and the result list is text at whatever
+      point size the user chose, so the bundle declares itself Retina-aware
+      rather than being scaled up from a 1x backing store.
+    -->
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright The CriKey Authors. Licensed under the Apache License, Version 2.0. See NOTICE.md in this bundle's Resources for attribution.</string>
+
+    <!--
+      No CFBundleIconFile key: no `.icns` is checked into this repository, and
+      naming a resource that is not there produces a bundle with a broken icon
+      reference rather than the system's generic one. Passing an `.icns`
+      file to build.sh through its icon option copies the artwork in and adds
+      the key; without it the bundle honestly has no icon.
+    -->
+</dict>
+</plist>

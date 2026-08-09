@@ -39,6 +39,7 @@ resource read and an outgoing frame all have explicit caps, documented at the
 constant that names each one.
 """
 
+import fnmatch
 import importlib.util
 import io
 import json
@@ -48,6 +49,7 @@ import sys
 import tempfile
 import threading
 import traceback
+import types
 
 # --------------------------------------------------------------------------
 # stdout hygiene: FIRST, before anything else can write a byte
@@ -97,6 +99,9 @@ ENV_PACKAGE_ID = "CRIKEY_LEGACY_PACKAGE_ID"
 ENV_MAIN_MODULE = "CRIKEY_LEGACY_MAIN_MODULE"
 ENV_MAIN_MODULE_PATH = "CRIKEY_LEGACY_MAIN_MODULE_PATH"
 ENV_CACHE_DIR = "CRIKEY_LEGACY_CACHE_DIR"
+ENV_CONFIG_DIR = "CRIKEY_LEGACY_CONFIG_DIR"
+ENV_INSTALLED_PACKAGE_DIR = "CRIKEY_LEGACY_INSTALLED_PACKAGE_DIR"
+ENV_CACHE_ROOT = "CRIKEY_LEGACY_CACHE_ROOT"
 
 #: Control frames. Neither is a plugin callback: `set_terminate` is answered by
 #: no frame at all, and `shutdown` by process exit.
@@ -134,6 +139,44 @@ _MAX_FRAME_BYTES = 8 * 1024 * 1024
 _MAX_SETTINGS_BYTES = 1 << 20
 _MAX_SETTINGS_ENTRIES = 4096
 _MAX_RESOURCE_BYTES = 32 << 20
+
+#: Ceiling on one icon a plugin may name, in bytes. The host applies the same
+#: ceiling when it actually reads the file (`crikey-app`'s
+#: `MAX_PLUGIN_ICON_BYTES`); this copy exists so `load_icon` refuses at the
+#: call site, where the plugin can still report the problem, rather than
+#: leaving an item silently iconless several frames later.
+_MAX_ICON_BYTES = 256 * 1024
+
+#: Bounds on the per-category action registry. Its contents are attached to
+#: every published item, so an unbounded registry is an unbounded frame.
+_MAX_ACTION_CATEGORIES = 64
+_MAX_ACTIONS_PER_CATEGORY = 32
+
+#: Longest a callback will block waiting for the launcher to answer a
+#: host-mediated request.
+#:
+#: A bound rather than an indefinite wait: the host services these inside the
+#: callback deadline and will reap this process if it overruns, but a host
+#: that broke its side of the exchange must not be able to wedge the plugin
+#: thread here with nothing to report. Exceeding it raises
+#: `HostUnavailableError`, so the plugin learns the action did not happen.
+_HOST_REQUEST_TIMEOUT_SECONDS = 60.0
+
+#: Bounds on one `find_resources` walk: names reported, and directory entries
+#: examined. A package of unknown provenance must not be able to make either
+#: side of the boundary hold an unbounded list, and overflow is a refusal —
+#: a truncated answer would read as "the package has no such file".
+_MAX_FOUND_RESOURCES = 4096
+_MAX_SCANNED_ENTRIES = 65536
+
+#: The action name the host reserves for "the user pressed Enter": the
+#: `legacy.execute` action `crikey-app` attaches to every legacy row. A plugin
+#: action spelled the same way would reach `on_execute` as the *default*
+#: action — that is, as `None` — instead of as itself, so it is refused.
+_RESERVED_ACTION_NAME = "legacy.execute"
+
+#: Scheme of the documented cross-package icon reference form.
+_RES_SCHEME = "res://"
 
 #: Sentinel the reader thread queues when it has reached an input protocol
 #: error. The main thread exits non-zero so the host reports a broken peer
@@ -355,7 +398,15 @@ _WIRE_TO_HIT_HINT = {
 def _category_from_wire(value):
     """Decodes built-in and plugin-defined category spellings."""
     folded = value.lower() if isinstance(value, str) else ""
-    known = _WIRE_TO_CATEGORY.get(folded)
+    # CriKey's generic category tag is injective. The legacy API's own
+    # extension spelling remains ``legacy-user-N``; accepting both lets a
+    # selected item cross the host boundary without turning a plugin-defined
+    # name such as ``application`` into the built-in category.
+    generic_prefix = "plugin-defined:"
+    explicitly_plugin_defined = folded.startswith(generic_prefix)
+    if explicitly_plugin_defined:
+        folded = folded[len(generic_prefix) :]
+    known = None if explicitly_plugin_defined else _WIRE_TO_CATEGORY.get(folded)
     if known is not None:
         return known
     prefix = "legacy-user-"
@@ -381,17 +432,29 @@ def _category_to_wire(value):
     return known if known is not None else "legacy-user-{}".format(value)
 
 
-def _item_to_wire(item):
+def _item_to_wire(item, actions, default_icon):
     """One :class:`keypirinha.CatalogItem` as a JSON-ready dict.
 
-    ``icon_handle`` is deliberately absent: it is an opaque in-process object
-    and a copy of it would not name the same icon. ``plugin_id`` and
-    ``stable_id`` are absent because identity is the host's to assign — a
-    plugin able to name another plugin's id could inject items into its
-    catalog (spec 10.2).
+    ``icon`` is the *name* behind the item's handle, never the handle itself:
+    the handle is an in-process object, and the host is the side that owns the
+    package directory and the only side that can bound, read and decode the
+    file. An item that names no icon inherits the plugin's default, which is
+    the whole purpose of ``set_default_icon``.
+
+    ``actions`` is the plugin's registration for this item's category,
+    attached to the item rather than shipped as a registry frame of its own.
+    The channel answers exactly one frame per request, so an item that
+    travelled without its actions would reach the launcher unlaunchable in the
+    very request that published it.
+
+    ``plugin_id`` and ``stable_id`` are absent because identity is the host's
+    to assign — a plugin able to name another plugin's id could inject items
+    into its catalog (spec 10.2).
     """
+    category = _category_to_wire(item.category())
+    icon = keypirinha._icon_reference(item.icon_handle())
     return {
-        "category": _category_to_wire(item.category()),
+        "category": category,
         "label": item.label(),
         "short_desc": item.short_desc(),
         "target": item.target(),
@@ -399,6 +462,8 @@ def _item_to_wire(item):
         "hit_hint": _HIT_HINT_TO_WIRE.get(item.hit_hint(), "keepall"),
         "loop_on_suggest": item.loop_on_suggest(),
         "data_bag": item.data_bag(),
+        "icon": default_icon if icon is None else icon,
+        "actions": actions.get(category, []),
     }
 
 
@@ -440,6 +505,230 @@ def _action_from_wire(payload):
 
 
 # --------------------------------------------------------------------------
+# Containment of plugin-supplied names
+#
+# Every string below arrives from plugin code and names a file. The rule for
+# all of them is the same: refuse, never normalise. Normalising is how a
+# traversal check becomes a traversal — `a/../../etc/passwd` only looks
+# harmless once you have already resolved it — and refusal is the one answer
+# that cannot be subtly wrong.
+# --------------------------------------------------------------------------
+
+
+def _package_relative(operation, name):
+    """One plugin-supplied name as a package-relative POSIX path.
+
+    Backslash is refused rather than treated as a separator: it separates
+    components on Windows and is an ordinary filename character here, and one
+    spelling that means two different files on two hosts is a containment hole
+    on whichever host loses the argument.
+    """
+    if not isinstance(name, str) or not name:
+        raise keypirinha.HostUnavailableError(
+            operation, "a package resource name must be a non-empty string, got {!r}".format(name)
+        )
+    if "\x00" in name or "\\" in name:
+        raise keypirinha.HostUnavailableError(
+            operation,
+            "{!r} holds a backslash or a NUL; package resource names are POSIX-style "
+            "and package-relative".format(name),
+        )
+    if name.startswith("/") or os.path.isabs(name) or os.path.splitdrive(name)[0]:
+        raise keypirinha.HostUnavailableError(
+            operation, "{!r} is absolute; package resource names are package-relative".format(name)
+        )
+    parts = [part for part in name.split("/") if part not in ("", ".")]
+    if not parts or ".." in parts:
+        raise keypirinha.HostUnavailableError(
+            operation,
+            "{!r} would leave the package directory; a legacy package may only name "
+            "its own files".format(name),
+        )
+    return "/".join(parts)
+
+
+def _icon_source_reference(package_id, source):
+    """The package-relative name behind one documented icon source.
+
+    Two spellings are documented: a package-relative path, and
+    ``res://Package/path``. The second is honoured only when it names *this*
+    package. Cross-package icon loading is refused by name because the host
+    resolves a legacy reference against the directory of the plugin that
+    published the item and has no way to reach another package's — resolving
+    it against this package instead would hand back the wrong picture and call
+    it a success.
+    """
+    if not isinstance(source, str) or not source:
+        raise keypirinha.HostUnavailableError(
+            "load_icon", "an icon source must be a non-empty string, got {!r}".format(source)
+        )
+    if source[: len(_RES_SCHEME)].lower() != _RES_SCHEME:
+        return _package_relative("load_icon", source)
+
+    package, separator, relative = source[len(_RES_SCHEME) :].partition("/")
+    if not separator or not relative:
+        raise keypirinha.HostUnavailableError(
+            "load_icon", "{!r} is not a `res://Package/file` reference".format(source)
+        )
+    if keypirinha._fold(package) != keypirinha._fold(package_id):
+        raise keypirinha.HostUnavailableError(
+            "load_icon",
+            "{!r} names the package {!r}; CriKey resolves a legacy icon only inside "
+            "the package that loaded it".format(source, package),
+        )
+    return _package_relative("load_icon", relative)
+
+
+def _pattern_segments(pattern):
+    """`pattern` split into path segments, refused if it could leave the package.
+
+    A pattern is matched against package-relative names, so one that could
+    only match something outside the package is a plugin bug worth naming
+    rather than an empty result to puzzle over.
+    """
+    if not isinstance(pattern, str) or not pattern:
+        raise keypirinha.HostUnavailableError(
+            "find_resources", "a resource pattern must be a non-empty string, got {!r}".format(pattern)
+        )
+    if "\x00" in pattern or "\\" in pattern:
+        raise keypirinha.HostUnavailableError(
+            "find_resources",
+            "{!r} holds a backslash or a NUL; resource patterns are POSIX-style and "
+            "package-relative".format(pattern),
+        )
+    if pattern.startswith("/") or os.path.isabs(pattern) or os.path.splitdrive(pattern)[0]:
+        raise keypirinha.HostUnavailableError(
+            "find_resources", "{!r} is absolute; resource patterns are package-relative".format(pattern)
+        )
+    segments = [segment for segment in pattern.split("/") if segment not in ("", ".")]
+    if not segments or ".." in segments:
+        raise keypirinha.HostUnavailableError(
+            "find_resources",
+            "{!r} would leave the package directory; a legacy package may only "
+            "enumerate its own files".format(pattern),
+        )
+    return segments
+
+
+def _matches(segments, parts):
+    """Whether the path `parts` matches the pattern `segments`.
+
+    Segment by segment rather than `fnmatch` over the whole path, because
+    `fnmatch`'s ``*`` crosses ``/``: ``data/*`` would then also match
+    ``data/nested/file``, and a pattern that says one directory deep has to
+    mean one directory deep. ``**`` is the explicit way to span any number of
+    segments, including none.
+    """
+    if not segments:
+        return not parts
+    if segments[0] == "**":
+        return any(_matches(segments[1:], parts[index:]) for index in range(len(parts) + 1))
+    if not parts:
+        return False
+    return fnmatch.fnmatchcase(parts[0], segments[0]) and _matches(segments[1:], parts[1:])
+
+
+
+# --------------------------------------------------------------------------
+# Asking the launcher to do something (spec 14.8, 15.4)
+# --------------------------------------------------------------------------
+
+
+class _HostChannel:
+    """A blocking question to the launcher, asked from inside a callback.
+
+    Publication is fire-and-forget because it is a statement. A host-mediated
+    action is a *question*: the plugin must be told whether the launcher
+    performed it, and cannot be unless the answer travels back.
+
+    The callback thread blocks here while the reader thread — the only thread
+    that reads stdin — matches the answer by sequence number and wakes it. The
+    sequence is per-request rather than per-callback because one callback may
+    ask more than once.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._next = 0
+        self._waiting = {}
+
+    def request(self, operation, payload):
+        with self._lock:
+            self._next += 1
+            sequence = self._next
+            slot = {"event": threading.Event(), "frame": None}
+            self._waiting[sequence] = slot
+
+        try:
+            self._write(
+                operation,
+                {"host_request": operation, "seq": sequence, "payload": payload},
+            )
+            answered = slot["event"].wait(_HOST_REQUEST_TIMEOUT_SECONDS)
+            frame = slot["frame"]
+        finally:
+            with self._lock:
+                self._waiting.pop(sequence, None)
+
+        if not answered or frame is None:
+            raise keypirinha.HostUnavailableError(
+                operation,
+                "the launcher did not answer within {:g} seconds, so the "
+                "action was not performed".format(_HOST_REQUEST_TIMEOUT_SECONDS),
+            )
+        if not frame.get("ok"):
+            raise keypirinha.HostUnavailableError(
+                operation,
+                frame.get("reason") or "the launcher refused without saying why",
+            )
+        return frame.get("value")
+
+    def _write(self, operation, frame):
+        """Writes one request line.
+
+        Deliberately not :func:`_emit`: that function's failure path replaces
+        an unserialisable frame with a *response* frame, which here would
+        answer a request id that is not being asked about and desynchronise
+        the channel. A request that cannot be encoded is the plugin's problem
+        and is reported to the plugin.
+        """
+        try:
+            line = _encode(frame)
+        except BaseException as error:
+            raise keypirinha.HostUnavailableError(
+                operation,
+                "the request could not be encoded: {}".format(error),
+            ) from None
+        if len(line.encode("utf-8", "replace")) > _MAX_FRAME_BYTES:
+            raise keypirinha.HostUnavailableError(
+                operation,
+                "the request exceeds the {} byte protocol frame bound".format(
+                    _MAX_FRAME_BYTES
+                ),
+            )
+        _PROTOCOL.write(line)
+        _PROTOCOL.flush()
+
+    def deliver(self, frame):
+        """Whether `frame` was an answer, and has been routed if so."""
+        sequence = frame.get("host_response")
+        if not isinstance(sequence, int) or isinstance(sequence, bool):
+            return False
+        with self._lock:
+            slot = self._waiting.get(sequence)
+        if slot is not None:
+            slot["frame"] = frame
+            slot["event"].set()
+        # A late answer to a request that already gave up is dropped, not
+        # queued as a request: the caller has already been told the launcher
+        # did not answer, and handing this to the dispatcher would make it a
+        # protocol error over something the host did nothing wrong in.
+        return True
+
+
+_HOST_CHANNEL = _HostChannel()
+
+# --------------------------------------------------------------------------
 # The host object the shim talks to
 # --------------------------------------------------------------------------
 
@@ -447,11 +736,14 @@ def _action_from_wire(payload):
 class _Host:
     """Implements the documented host protocol for one plugin instance.
 
-    Every optional capability is served *here in the child*, from the package
-    root the worker was given, rather than by a request back to the Rust side.
-    A round trip inside a callback would need a second frame on a channel whose
-    contract is exactly one response per request, and the host cannot answer
-    while it is blocked waiting for that response anyway.
+    Nearly every optional capability is served *here in the child*, from the
+    package root the worker was given, rather than by a request back to the
+    Rust side: the round trip costs a frame and the answer is already here.
+
+    The exception is anything the launcher must *do* rather than merely know.
+    Those go over :class:`_HostChannel`, because performing them here would
+    escape the launcher's permission gate and would put whatever was launched
+    in this worker's process group, where the next reap would kill it.
     """
 
     def __init__(self, terminate):
@@ -464,6 +756,13 @@ class _Host:
             tempfile.gettempdir(), "crikey-legacy-cache", self._package_id
         )
         self._settings = None
+
+        #: Alternate actions per wire category, from `set_actions`. Survives
+        #: the request that registered it: published packages register in
+        #: `on_start` and publish from `on_catalog` and `on_suggest`.
+        self._actions = {}
+        #: Package-relative icon name inherited by items that name none.
+        self._default_icon = None
 
         #: Set by the publication capabilities and read once per request.
         self.publication = None
@@ -496,15 +795,156 @@ class _Host:
     # -- publication (spec 7.1, 14.8) --------------------------------------
 
     def publish_catalog(self, plugin, items, merge):
-        self.publication = ("set_catalog", [_item_to_wire(item) for item in items], bool(merge))
+        self.publication = ("set_catalog", self._to_wire(items), bool(merge))
 
     def publish_suggestions(self, plugin, suggestions, match_method, sort_method):
         self.publication = (
             "suggestions",
-            [_item_to_wire(item) for item in suggestions],
+            self._to_wire(suggestions),
             int(match_method),
             int(sort_method),
         )
+
+    def _to_wire(self, items):
+        """Renders a publication, stamping each item with what it inherits.
+
+        Read at publication time, not at construction time: a plugin that
+        registers actions or a default icon and only then publishes must see
+        both applied, and one that re-registers afterwards must not have its
+        already-published batch rewritten underneath it.
+        """
+        return [_item_to_wire(item, self._actions, self._default_icon) for item in items]
+
+    # -- alternate actions and icons (spec 14.4) ---------------------------
+
+    def set_actions(self, plugin, category, actions):
+        """Registers one category's alternate action list.
+
+        Replacing per category, never merging: Keypirinha's own call replaces,
+        and a plugin that rebuilds a category's actions would otherwise
+        accumulate every earlier spelling of them.
+        """
+        wire = _category_to_wire(category)
+        if len(actions) > _MAX_ACTIONS_PER_CATEGORY:
+            raise keypirinha.HostUnavailableError(
+                "set_actions",
+                "{} actions for category {}; the layer carries at most {} per "
+                "category".format(len(actions), wire, _MAX_ACTIONS_PER_CATEGORY),
+            )
+        encoded = []
+        for action in actions:
+            if not isinstance(action, keypirinha.Action):
+                raise keypirinha.HostUnavailableError(
+                    "set_actions",
+                    "set_actions takes keypirinha.Action values from create_action, "
+                    "got {!r}".format(action),
+                )
+            if action.name() == _RESERVED_ACTION_NAME:
+                raise keypirinha.HostUnavailableError(
+                    "set_actions",
+                    "{!r} is the host's own default-action name; an action spelled that "
+                    "way would reach on_execute as the default action instead of as "
+                    "itself".format(_RESERVED_ACTION_NAME),
+                )
+            encoded.append(
+                {
+                    "name": action.name(),
+                    "label": action.label(),
+                    "short_desc": action.short_desc(),
+                }
+            )
+        if not encoded:
+            self._actions.pop(wire, None)
+            return
+        if wire not in self._actions and len(self._actions) >= _MAX_ACTION_CATEGORIES:
+            raise keypirinha.HostUnavailableError(
+                "set_actions",
+                "actions are already registered for {} categories, the layer's "
+                "ceiling".format(_MAX_ACTION_CATEGORIES),
+            )
+        self._actions[wire] = encoded
+
+    def load_icon(self, plugin, sources):
+        """Validates every icon source and returns the names the host resolves.
+
+        The file is confirmed to exist inside the package and to be within the
+        icon ceiling *here*, so a plugin learns at the call site that its icon
+        will not load. The host checks again when it reads the bytes; that is
+        the check that actually protects the launcher, and this one is what
+        makes the failure attributable.
+        """
+        if not sources:
+            raise keypirinha.HostUnavailableError("load_icon", "no icon source was supplied")
+        references = []
+        for source in sources:
+            reference = _icon_source_reference(self._package_id, source)
+            path = os.path.join(self._root, *reference.split("/"))
+            if not os.path.isfile(path):
+                raise keypirinha.HostUnavailableError(
+                    "load_icon", "{!r} is not a file inside the package".format(source)
+                )
+            try:
+                size = os.path.getsize(path)
+            except OSError as error:
+                raise keypirinha.HostUnavailableError(
+                    "load_icon", "{!r} could not be read: {}".format(source, error)
+                ) from None
+            if size > _MAX_ICON_BYTES:
+                raise keypirinha.HostUnavailableError(
+                    "load_icon",
+                    "{!r} is {} bytes, above the {} byte icon ceiling; the layer refuses "
+                    "an oversized icon rather than truncating it".format(
+                        source, size, _MAX_ICON_BYTES
+                    ),
+                )
+            references.append(reference)
+        return references
+
+    def set_default_icon(self, plugin, handle):
+        """Records the icon items with no handle of their own inherit."""
+        self._default_icon = keypirinha._icon_reference(handle)
+
+    def find_resources(self, plugin, pattern):
+        """Package-relative names matching `pattern`, sorted, never escaping.
+
+        Two independent containment checks, because either alone is
+        insufficient: the pattern cannot name anything outside the package,
+        and every candidate is re-resolved before it is reported, which is
+        what catches a *symlinked file* inside the package pointing out of it.
+        Directory symlinks are simply not followed, so the walk cannot leave
+        the tree and cannot loop.
+        """
+        segments = _pattern_segments(pattern)
+        root = os.path.realpath(self._root)
+        found = []
+        scanned = 0
+        for directory, subdirectories, files in os.walk(root, followlinks=False):
+            subdirectories.sort()
+            for name in sorted(files):
+                scanned += 1
+                if scanned > _MAX_SCANNED_ENTRIES:
+                    raise keypirinha.HostUnavailableError(
+                        "find_resources",
+                        "the package holds more than {} entries; the walk is bounded "
+                        "and refuses rather than reporting a partial "
+                        "answer".format(_MAX_SCANNED_ENTRIES),
+                    )
+                absolute = os.path.join(directory, name)
+                resolved = os.path.realpath(absolute)
+                if resolved != root and not resolved.startswith(root + os.sep):
+                    continue
+                relative = os.path.relpath(absolute, root).replace(os.sep, "/")
+                if not _matches(segments, relative.split("/")):
+                    continue
+                if len(found) >= _MAX_FOUND_RESOURCES:
+                    raise keypirinha.HostUnavailableError(
+                        "find_resources",
+                        "{!r} matches more than {} names; the layer refuses rather than "
+                        "reporting a truncated list".format(pattern, _MAX_FOUND_RESOURCES),
+                    )
+                found.append(relative)
+        found.sort()
+        return found
 
     # -- package data ------------------------------------------------------
 
@@ -584,6 +1024,47 @@ class _Host:
         # `keypirinha.Settings` already answers "not configured" for a missing
         # key, and the plugins fall back to their own defaults.
         return {}
+
+    # -- installation directories ------------------------------------------
+
+    def _directory(self, operation, variable):
+        """One launcher-supplied directory, or an honest refusal.
+
+        Never a computed fallback. CriKey owns the platform directory
+        convention and this process was not told the answer; guessing one
+        would have the plugin write its configuration into a directory the
+        launcher never reads and the user cannot find.
+        """
+        value = os.environ.get(variable)
+        if not value:
+            raise keypirinha.HostUnavailableError(
+                operation,
+                "the launcher did not tell this worker where that directory is",
+            )
+        return value
+
+    def user_config_dir(self):
+        return self._directory("user_config_dir", ENV_CONFIG_DIR)
+
+    def installed_package_dir(self):
+        return self._directory("installed_package_dir", ENV_INSTALLED_PACKAGE_DIR)
+
+    def package_cache_dir(self):
+        return self._directory("package_cache_dir", ENV_CACHE_ROOT)
+
+    # -- host-mediated actions ---------------------------------------------
+
+    def execute_default_action(self, plugin, item, action):
+        """Asks the launcher to act on `item` and reports what it did."""
+        return bool(
+            _HOST_CHANNEL.request(
+                "execute_default_action",
+                {
+                    "item": self._to_wire([item])[0],
+                    "action": None if action is None else action.name(),
+                },
+            )
+        )
 
 
 def _parse_ini(path):
@@ -685,6 +1166,18 @@ def _module_key(name):
     return sanitized or "legacy_plugin"
 
 
+def _package_key(root):
+    """Returns a private import name for a package content root.
+
+    A number of real Keypirinha packages keep helpers beside the plugin and
+    use relative imports (``from .helper import ...``). Loading the entry
+    file as a top-level module makes those imports fail even though the same
+    files work when the package is imported normally. The root name is only a
+    hint, so the prefix keeps it from colliding with the compatibility shim.
+    """
+    return "_crikey_legacy_package_" + _module_key(os.path.basename(os.path.normpath(root)))
+
+
 def _load_plugin():
     """Imports the package's main module and instantiates its plugin.
 
@@ -708,8 +1201,33 @@ def _load_plugin():
     # from the shim directory or the standard library.
     if root and root not in sys.path:
         sys.path.insert(0, root)
-
-    key = _module_key(main_module or os.path.splitext(os.path.basename(relative))[0])
+    main_key = _module_key(main_module or os.path.splitext(os.path.basename(relative))[0])
+    package_key = _package_key(root) if root else ""
+    if package_key:
+        package_init = os.path.join(root, "__init__.py")
+        if os.path.isfile(package_init):
+            package_spec = importlib.util.spec_from_file_location(
+                package_key,
+                package_init,
+                submodule_search_locations=[root],
+            )
+            if package_spec is None or package_spec.loader is None:
+                raise ImportError("the legacy package {!r} could not be located".format(root))
+            package = importlib.util.module_from_spec(package_spec)
+            sys.modules[package_key] = package
+            package_spec.loader.exec_module(package)
+        else:
+            # Namespace-style package roots are common in loose development
+            # packages. A synthetic package gives their sibling modules the
+            # same relative-import semantics without executing absent init code.
+            package = types.ModuleType(package_key)
+            package.__file__ = package_init
+            package.__path__ = [root]
+            package.__package__ = package_key
+            sys.modules[package_key] = package
+        key = package_key + "." + main_key
+    else:
+        key = main_key
     spec = importlib.util.spec_from_file_location(key, path)
     if spec is None or spec.loader is None:
         raise ImportError("the legacy main module {!r} could not be located".format(path))
@@ -780,24 +1298,12 @@ def _dispatch(plugin, host, callback, payload):
         return _OUTCOME_ABANDONED, {}
 
     if callback == "on_suggest":
-        selected = payload.get("selected_id")
-        # The host sends the selected item's id, not the item: an id is what
-        # the scheduler retains for an in-flight query, and shipping a whole
-        # item would let a stale copy of it reach the plugin.
-        chain = (
-            []
-            if selected is None
-            else [
-                keypirinha.CatalogItem(
-                    category=int(_CATEGORY.REFERENCE),
-                    label=selected,
-                    short_desc="",
-                    target=selected,
-                    args_hint=int(_ARGS_HINT.ACCEPTED),
-                    hit_hint=int(_HIT_HINT.IGNORE),
-                )
-            ]
-        )
+        selected = payload.get("selected_item")
+        # The host sends the selected item's complete wire representation. The
+        # callback contract exposes its category, label, target, and hints; an
+        # id-only placeholder loses that metadata and makes valid plugins such
+        # as epoch reject argument suggestions.
+        chain = [] if selected is None else [_item_from_wire(selected)]
         plugin.on_suggest(payload.get("query", ""), chain)
         published = host.publication
         if published is not None and published[0] == "suggestions":
@@ -1087,6 +1593,12 @@ def _read_stdin(stream, pending, terminate):
         if not isinstance(frame, dict):
             protocol_error("request line was not an object")
             return
+
+        # Answers are routed here, not queued: the callback thread is blocked
+        # on this frame, and the request queue is drained only by that same
+        # thread once the callback returns — queueing it would deadlock.
+        if _HOST_CHANNEL.deliver(frame):
+            continue
 
         if frame.get("callback") == _CALLBACK_SET_TERMINATE:
             payload = frame.get("payload")

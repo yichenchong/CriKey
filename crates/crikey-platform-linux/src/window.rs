@@ -557,6 +557,67 @@ impl WindowService for X11WindowService {
         Ok(infos)
     }
 
+    /// Reads `_NET_ACTIVE_WINDOW` from the root window and describes it.
+    ///
+    /// EWMH puts the focused window in a root-window property rather than
+    /// making clients ask the server: `GetInputFocus` answers with whatever
+    /// window currently owns keyboard input, which during a launcher's own
+    /// activation is the launcher, and which for a client with subwindows is
+    /// some inner window nobody has a name for. The manager's property is the
+    /// only answer that means "the application the user is working in".
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Invalid`] when the root property cannot be read at all,
+    /// which means the connection is gone. Everything else is `Ok(None)`: a
+    /// manager that has not written the property yet, a property of the wrong
+    /// type, the EWMH "no window is focused" value of zero, and a window that
+    /// was destroyed between the read and its description. None of those is an
+    /// error, and none of them may be turned into a window that is not focused.
+    fn foreground_window(&self) -> Result<Option<WindowInfo>> {
+        let reply = self
+            .connection
+            .get_property(
+                false,
+                self.root,
+                self.atoms.net_active_window,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )
+            .map_err(|error| invalid("reading _NET_ACTIVE_WINDOW", error))?
+            .reply()
+            .map_err(|error| invalid("reading _NET_ACTIVE_WINDOW", error))?;
+
+        // Same reasoning as `enumerate`: EWMH declares `WINDOW[]/32`, and bytes
+        // stored under any other type are not a window id however plausible
+        // their width. Any client may write this property.
+        if reply.type_ != u32::from(AtomEnum::WINDOW) || reply.format != 32 {
+            return Ok(None);
+        }
+        let Some(window) = reply.value32().and_then(|mut words| words.next()) else {
+            return Ok(None);
+        };
+        // EWMH spells "nothing is focused" as `None`, the zero window id.
+        if window == 0 {
+            return Ok(None);
+        }
+
+        let title = self.title(window);
+        let application = self.application(window);
+        // Last, exactly as in `enumerate`: a window destroyed at any point
+        // during its own description is reported as absent rather than as an
+        // untitled live one.
+        if !self.is_alive(window) {
+            return Ok(None);
+        }
+        Ok(Some(WindowInfo {
+            handle: WindowHandle(u64::from(window)),
+            title,
+            application,
+        }))
+    }
+
     /// Sends `_NET_ACTIVE_WINDOW` to the root window and flushes it.
     ///
     /// # Errors

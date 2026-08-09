@@ -1047,3 +1047,94 @@ class Impl(Plugin):
         "expected a crashed-worker error, got {error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The `environment` permission (spec 20)
+// ---------------------------------------------------------------------------
+
+/// `permissions.environment` has to decide the shape of the child, or it is a
+/// manifest field that reads like a confinement and confines nothing.
+///
+/// Both halves are the test. Stripped-by-default is what makes the grant worth
+/// declaring; inherited-when-granted is what makes it honest. A build where
+/// both settings produced the same interpreter would pass any test that only
+/// checked one of them.
+#[test]
+fn the_environment_grant_decides_whether_the_child_sees_the_hosts_own_variables() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("environment-grant");
+    let src = scratch.subdir("source");
+    write_file(
+        &src.join("entry.py"),
+        r#"
+import os
+
+from crikey_sdk import Plugin, Item
+
+
+class Impl(Plugin):
+    def suggest(self, query, context):
+        context.emit(
+            Item(
+                stable_id="env-1",
+                label=os.environ.get(query.text, "absent"),
+                target="t",
+            )
+        )
+"#,
+    );
+    let site = scratch.subdir("empty-site");
+    let env = MaterializedEnvironment {
+        id: EnvironmentId("env-environment-grant".to_owned()),
+        site_dir: site.clone(),
+    };
+    let import_path = ImportPath::assemble(&src, &[], &env, &sdk_python_dir());
+    let interpreter = host_interpreter().expect("host interpreter was checked at test entry");
+
+    // A name no other process can be holding, so "absent" can only mean the
+    // host stripped it rather than that the host never had it.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let key = format!(
+        "CRIKEY_HOST_ONLY_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    std::env::set_var(&key, "host-only-value");
+
+    let label = |inherited: bool| {
+        let options = WorkerOptions::new(
+            PluginId("modern.environment".to_owned()),
+            "entry:Impl".to_owned(),
+            import_path.clone(),
+        )
+        .with_shared_budget(shared_budget_from_section(&ConcurrencySection::default()))
+        .with_startup_timeout_ms(STARTUP_BUDGET_MS)
+        .with_call_timeout_ms(CALL_BUDGET_MS)
+        .with_shutdown_timeout_ms(SHUTDOWN_BUDGET_MS)
+        .with_environment_inheritance(inherited);
+        let mut worker = ModernWorker::spawn(&interpreter, options)
+            .unwrap_or_else(|error| panic!("the env fixture spawns a worker, got {error}"));
+        let reply = suggest(&mut worker, &key);
+        assert_eq!(
+            reply.state,
+            BatchState::Final,
+            "environment fixture must return a final batch: {reply:?}"
+        );
+        let label = reply.items[0].label.clone();
+        worker.shutdown();
+        label
+    };
+
+    assert_eq!(
+        label(false),
+        "absent",
+        "a plugin that never declared `permissions.environment` must not inherit the host's variables"
+    );
+    assert_eq!(
+        label(true),
+        "host-only-value",
+        "the grant must actually pass the ambient environment through"
+    );
+
+    std::env::remove_var(&key);
+}

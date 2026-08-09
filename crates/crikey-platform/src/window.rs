@@ -56,6 +56,24 @@ pub trait WindowService {
     /// the whole enumeration would make the switcher intermittently empty.
     fn enumerate(&self) -> Result<Vec<WindowInfo>>;
 
+    /// The window the desktop currently focuses, or `None` when there is none.
+    ///
+    /// Ranking uses this as an application-context signal, so the distinction
+    /// between the two negative answers matters and both are `None` here: an
+    /// empty desktop and a session whose focus this backend cannot observe are
+    /// equally "no evidence". What must never happen is a *positive* answer
+    /// that was inferred rather than read — a fabricated foreground window
+    /// would silently promote the wrong category of result on every query, and
+    /// nothing downstream could tell it from a real one.
+    ///
+    /// # Errors
+    ///
+    /// Only when the connection to the window system itself failed. A focus
+    /// property that is absent, malformed, or names a window that has since
+    /// been destroyed is `Ok(None)`: other programs mutate focus concurrently,
+    /// so a torn read is the normal case and not an error.
+    fn foreground_window(&self) -> Result<Option<WindowInfo>>;
+
     /// Raises and focuses one window.
     ///
     /// An error means the request could not be *delivered* -- the handle names

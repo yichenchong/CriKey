@@ -41,4 +41,5 @@ not cost one IPC round trip per candidate.
 - **Cap'n Proto / FlatBuffers.** Zero-copy reads are attractive; rejected for v1
   because the ecosystem breadth for unofficial SDKs is narrower than protobuf.
 - **Shared memory from day one.** Deferred per §16.8: added only if profiling
-  proves local IPC insufficient.
+  proves local IPC insufficient. That profile was run; ADR-0017 records the
+  measurement, upholds the deferral, and states what would reopen it.

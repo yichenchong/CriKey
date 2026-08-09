@@ -961,6 +961,37 @@ where
                     graphics.window.request_redraw();
                 }
             }
+            // `egui-winit` discards every `WindowEvent::Ime` when it is built
+            // for Linux (egui #5008), where an input method that echoes plain
+            // keys would otherwise insert their text twice. That reasoning
+            // does not cover a character an X input method *composed*: winit
+            // emits either a `KeyboardInput` or an `Ime::Commit` for one key
+            // event and never both (`x11/event_processor.rs`, the
+            // `keycode != 0 && !is_composing` branch returns before the commit
+            // path), and the press that finishes a compose sequence is
+            // filtered, so the commit is the only delivery of those bytes.
+            // Dropping it loses the character outright.
+            //
+            // The `Enabled` that precedes it is not decoration. egui only
+            // accepts a commit whose caret still sits where the composition
+            // was anchored (`text_edit/builder.rs`, `ImeEvent::Commit`), and
+            // the X11 stream carries no `Ime::Enabled` before a commit -- only
+            // `Ime::Preedit("", None)`, which is a preedit *clear*, not an
+            // anchor. Anchoring here means the composed text replaces the
+            // selection and lands at the caret.
+            //
+            // Preedit is deliberately not forwarded: egui expects the
+            // Windows/macOS ordering, in which the anchor precedes the
+            // composition, and replaying X11's `Preedit("", None)` before a
+            // commit moves the caret off that anchor and drops the character.
+            // A Linux composition is therefore invisible until it commits,
+            // which is a display limitation, not a lost keystroke.
+            #[cfg(target_os = "linux")]
+            if let WindowEvent::Ime(Ime::Commit(text)) = &event {
+                let events = &mut graphics.egui_state.egui_input_mut().events;
+                events.push(egui::Event::Ime(egui::ImeEvent::Enabled));
+                events.push(egui::Event::Ime(egui::ImeEvent::Commit(text.clone())));
+            }
             match &event {
                 WindowEvent::Resized(size) => graphics.resize(size.width, size.height),
                 WindowEvent::ScaleFactorChanged { .. } => {

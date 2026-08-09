@@ -1,0 +1,38 @@
+[Desktop Entry]
+# `Version` is the version of the desktop-entry specification this file
+# conforms to, not CriKey's version. It is deliberately not templated.
+Version=1.5
+Type=Application
+Name=CriKey
+GenericName=Application Launcher
+Comment=Find and run applications, files and plugin commands from the keyboard
+# `crikey` is the command-line entrypoint: bare, it prints usage and exits, and
+# the UI is behind its `run` subcommand. `crikey-launcher` takes no arguments
+# and starts the launcher, which is what a menu entry, a file-manager
+# double-click and a session autostart all invoke -- none of which can pass one.
+Exec=crikey-launcher
+TryExec=crikey-launcher
+Icon=crikey
+Terminal=false
+# Utility is the main category; System reflects that a launcher is part of the
+# desktop shell rather than a document application.
+Categories=Utility;System;
+Keywords=launcher;search;run;command;application;keyboard;
+# The window is created hidden and mapped on the activation hotkey, so there is
+# no window for the shell's startup notification to match; leaving this true
+# would leave a spinner running until the desktop's timeout.
+StartupNotify=false
+# winit sets WM_CLASS from argv[0], so the X11 class is the name of the
+# executable this entry runs -- `crikey-launcher`, not `crikey`. It does NOT
+# match on Wayland: winit sets an app_id only when the application asks for
+# one, and CriKey does not yet, so a Wayland compositor cannot associate the
+# window with this entry. See packaging/README.md.
+StartupWMClass=crikey-launcher
+# Deliberately visible. A launcher is normally reached by its hotkey, which
+# argues for hiding it, but the hotkey only exists once the process is running,
+# and nothing else starts it: hiding the entry would leave a freshly installed
+# CriKey with no discoverable way to launch. The cost is that CriKey's own
+# application catalog lists CriKey, since the scanner skips NoDisplay entries
+# and this is not one.
+NoDisplay=false
+SingleMainWindow=true

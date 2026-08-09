@@ -462,7 +462,8 @@ fn load_and_run(command: &str, options: &Options) -> Result<Report, String> {
     let worker_options = WorkerOptions::new(plugin_id, entrypoint, import_path)
         .with_startup_timeout_ms(STARTUP_BUDGET_MS)
         .with_call_timeout_ms(CALL_BUDGET_MS)
-        .with_shutdown_timeout_ms(SHUTDOWN_BUDGET_MS);
+        .with_shutdown_timeout_ms(SHUTDOWN_BUDGET_MS)
+        .with_background_execution(manifest.permissions.background_execution);
 
     // Spawn loads the plugin's entrypoint class during the handshake, so a
     // missing class or an import-time raise fails here — an unloadable plugin,

@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use crikey_core::{CoreError, Result};
 use crikey_plugin_sdk::{
-    serve, CatalogSink, ExecuteRequest, ItemBuilder, Plugin, PluginContext, Query, SdkError, ServeConfig,
-    SuggestionSink,
+    serve, CatalogSink, ExecuteRequest, ItemBuilder, Plugin, PluginContext, PluginResource, Query,
+    ResourceKind, SdkError, ServeConfig, SuggestionSink,
 };
 
 const MODE_ENV: &str = "CRIKEY_CONFORMANCE_MODE";
@@ -38,6 +38,9 @@ enum Mode {
     CrashOnStart,
     FailSuggest,
     Sequence,
+    Icon,
+    IconSlow,
+    IconSilent,
 }
 
 fn candidate(value: Option<String>) -> Option<String> {
@@ -67,6 +70,9 @@ fn parse_mode(spec: &str) -> Mode {
         "crash-on-start" => Mode::CrashOnStart,
         "fail-suggest" => Mode::FailSuggest,
         "sequence" => Mode::Sequence,
+        "icon" => Mode::Icon,
+        "icon-slow" => Mode::IconSlow,
+        "icon-silent" => Mode::IconSilent,
         _ if spec.starts_with("stream:") => Mode::Stream(
             spec.strip_prefix("stream:")
                 .and_then(|value| value.parse::<usize>().ok())
@@ -166,6 +172,89 @@ fn result_item(stable_id: impl Into<String>, label: impl Into<String>) -> crikey
 /// caller can prove the plugin ran outside the host process (§31.30).
 fn pid_item() -> crikey_core::Item {
     item("pid", "conformance process", pid_target())
+}
+
+/// The reference that resolves to a real icon.
+const ICON_SERVED: &str = "served.svg";
+/// The reference the fixture has no icon for.
+const ICON_MISSING: &str = "absent.svg";
+/// The reference whose icon is valid but larger than any host will accept.
+const ICON_OVERSIZED: &str = "oversized.svg";
+/// The reference the fixture answers correctly, but only after the host has
+/// already stopped waiting.
+const ICON_LATE: &str = "late.svg";
+
+/// How long [`ICON_LATE`] withholds its answer.
+///
+/// Comfortably past any host icon deadline and comfortably inside the
+/// suggestion deadline, so this fixture proves the host gives up on a slow
+/// resource without also proving it kills a plugin that is merely busy.
+const ICON_LATE_DELAY: Duration = Duration::from_millis(400);
+
+/// The reference an `icon-slow` plugin answers, but only once the host's
+/// result collection window has closed.
+const ICON_AFTER_WINDOW: &str = "after-window.svg";
+/// The reference an `icon-silent` plugin never answers.
+const ICON_NEVER: &str = "never.svg";
+
+/// How long [`ICON_AFTER_WINDOW`] withholds its answer.
+///
+/// Deliberately between the host's 100 ms result collection window and its
+/// 250 ms icon deadline. The icon therefore cannot reach the batch that named
+/// it and must still arrive afterwards, which is what makes "results first,
+/// picture later" observable at all. A host that widened its collection window
+/// past this value would collapse the two events into one and this fixture
+/// would stop distinguishing them.
+const ANSWERS_AFTER_THE_COLLECTION_WINDOW: Duration = Duration::from_millis(150);
+
+/// How long [`ICON_NEVER`] withholds its answer.
+///
+/// Far past the host's 250 ms icon deadline and past any plausible growth of
+/// it, so the host must abandon the request rather than ever receive a reply.
+/// The fixture sleeps rather than returning nothing on purpose: declining is a
+/// prompt answer, and this case is about a plugin that gives none.
+const NEVER_ANSWERS: Duration = Duration::from_secs(10);
+
+/// A real, decodable icon, written as SVG so the fixture needs no image codec.
+fn icon_bytes(padding: usize) -> Vec<u8> {
+    let mut svg = String::with_capacity(padding + 256);
+    svg.push_str(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 16 16\">",
+    );
+    if padding > 0 {
+        // Padding lives in a comment *after* the root element opens: the host
+        // sniffs `<svg` inside a bounded prologue, so a document padded at the
+        // front would be rejected as "not an icon" instead of "too large",
+        // which is a different test.
+        svg.push_str("<!--");
+        svg.push_str(&"p".repeat(padding));
+        svg.push_str("-->");
+    }
+    svg.push_str("<rect width=\"16\" height=\"16\" fill=\"#3366cc\"/></svg>");
+    svg.into_bytes()
+}
+
+/// One item naming one icon reference, so a host's icon behaviour is
+/// attributable to exactly one row.
+fn icon_item(stable_id: &str, reference: &str) -> crikey_core::Item {
+    ItemBuilder::new(stable_id, stable_id)
+        .target(format!("conformance://{stable_id}"))
+        .icon(reference)
+        .build()
+}
+
+/// One item per host-observable icon outcome, so a single query exercises the
+/// whole matrix against the real process boundary.
+fn icon_items() -> Vec<crikey_core::Item> {
+    [
+        ("icon-served", ICON_SERVED),
+        ("icon-missing", ICON_MISSING),
+        ("icon-oversized", ICON_OVERSIZED),
+        ("icon-late", ICON_LATE),
+    ]
+    .into_iter()
+    .map(|(stable_id, reference)| icon_item(stable_id, reference))
+    .collect()
 }
 
 fn wait_for_cancellation(context: &dyn PluginContext, milliseconds: u64) -> bool {
@@ -362,11 +451,51 @@ impl Plugin for ConformancePlugin {
             Mode::CrashOnStart => Err(invalid("crash-on-start should not receive suggest")),
             Mode::FailSuggest => Err(invalid("conformance fail-suggest requested")),
             Mode::Sequence => Err(invalid("sequence mode must be resolved before serving")),
+            Mode::Icon => emit_final(sink, icon_items()),
+            Mode::IconSlow => emit_final(sink, vec![icon_item("icon-after-window", ICON_AFTER_WINDOW)]),
+            Mode::IconSilent => emit_final(sink, vec![icon_item("icon-never", ICON_NEVER)]),
         }
     }
 
     fn execute(&mut self, _request: ExecuteRequest, _context: &dyn PluginContext) -> Result<()> {
         Ok(())
+    }
+
+    /// Serves the icon references the icon modes publish, one behaviour per
+    /// reference. Every other mode leaves the SDK default in place, which is
+    /// the "plugin serves no resources" case the host must also survive.
+    fn resource(
+        &mut self,
+        kind: ResourceKind,
+        reference: &str,
+        _context: &dyn PluginContext,
+    ) -> Result<Option<PluginResource>> {
+        if !matches!(self.mode, Mode::Icon | Mode::IconSlow | Mode::IconSilent)
+            || kind != ResourceKind::Icon
+        {
+            return Ok(None);
+        }
+        let content = match reference {
+            ICON_SERVED => icon_bytes(0),
+            ICON_OVERSIZED => icon_bytes(512 * 1024),
+            ICON_LATE => {
+                thread::sleep(ICON_LATE_DELAY);
+                icon_bytes(0)
+            }
+            ICON_AFTER_WINDOW => {
+                thread::sleep(ANSWERS_AFTER_THE_COLLECTION_WINDOW);
+                icon_bytes(0)
+            }
+            ICON_NEVER => {
+                thread::sleep(NEVER_ANSWERS);
+                icon_bytes(0)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(PluginResource {
+            content,
+            media_type: "image/svg+xml".to_owned(),
+        }))
     }
 
     fn stop(&mut self, _context: &dyn PluginContext) -> Result<()> {

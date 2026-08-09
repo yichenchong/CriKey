@@ -1,6 +1,6 @@
 [package]
 name = "crikey-cli"
-description = "The `crikey` command-line entrypoint."
+description = "The `crikey` command line and the `crikey-launcher` graphical entry point."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,9 +11,18 @@ authors.workspace = true
 [lints]
 workspace = true
 
+# Two binaries over one library. `crikey` must stay console-subsystem so its
+# subcommands can print; `crikey-launcher` must be GUI-subsystem on Windows so
+# no console appears beside the launcher, and must need no arguments because a
+# macOS bundle and an MSIX tile cannot pass any. Both are thin `main`s over
+# `crikey_cli`, so there is one launcher implementation, not two.
 [[bin]]
 name = "crikey"
-path = "src/main.rs"
+path = "src/bin/crikey.rs"
+
+[[bin]]
+name = "crikey-launcher"
+path = "src/bin/crikey-launcher.rs"
 
 [dependencies]
 crikey-app.workspace = true
@@ -47,4 +56,29 @@ crikey-platform.workspace = true
 # `ConcurrencyBudget` (spec 13.5): `crikey plugin doctor` builds a plugin's
 # declared budgets and probes admission of each of the four work kinds.
 crikey-plugin-supervisor.workspace = true
+crikey-sandbox.workspace = true
 crikey-ui.workspace = true
+
+# `crikey-launcher` is GUI-subsystem on Windows, so a fatal startup failure has
+# no console to be printed to. `MessageBoxW` is the one channel a process with
+# no window of its own has to say why it is about to exit. Only the Windows
+# target links Win32; every other build of this crate downloads nothing.
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    # The crate's own default, restored explicitly because the workspace
+    # declaration turns defaults off to keep the feature list auditable.
+    "std",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[dev-dependencies]
+# The integration tests build signed plugin-index fixtures (ADR-0013): a
+# signing key, a trust store and the digest the client will recompute. A test
+# that hand-rolled Ed25519 would be testing its own crypto, not the client's.
+crikey-package-manager.workspace = true
+# `crikey catalog` tests publish a remote catalog document and the SHA-256 the
+# client will recompute for it (ADR-0016). Computing the digest with the same
+# algorithm the client uses is the point; a hand-rolled one would only agree
+# with itself.
+sha2.workspace = true

@@ -9,29 +9,49 @@
 //! engine, the ranker and the result aggregator, and turns typed text into a
 //! ranked answer.
 
+mod cabi_provider;
 mod legacy_provider;
 mod modern_provider;
 mod native_provider;
 mod plugin_action;
+mod plugin_icons;
 mod query_pipeline;
+mod remote_catalog;
+mod selection_history_store;
 mod startup_recovery;
+mod wasm_provider;
 
 /// Re-exported so the composition root can report per-plugin diagnostics
 /// without depending on the supervisor crate directly; the driver accessors
 /// that return these live here.
 pub use crikey_plugin_supervisor::{BudgetKind, ConcurrencyRefusals, PluginHealth};
+/// Re-exported so a host can persist ranking history without naming the
+/// ranking crate: [`SelectionHistoryStore`] speaks in exactly these types.
+pub use crikey_ranking::{QueryAffinityRecord, SelectionHistorySnapshot, SelectionRecord};
 pub use crikey_result_aggregator::{
     BatchPriority, BatchState, DrainBudget, DrainReport, InboundBatch, IntakePolicy, MergedBatch,
     OverflowPolicy, ProducerState, QueueDepth, QueueDiagnostics, QueueEvent, QueueEventKind, QueueLimits,
     QueueReject, RejectReason, ResultBatch, ResultLimits,
 };
-pub use legacy_provider::{LegacyDriver, LegacyProvider, LegacyUnavailable, LegacyWorkerPool};
+pub use legacy_provider::{
+    LegacyDirectories, LegacyDriver, LegacyProvider, LegacyUnavailable, LegacyWorkerPool,
+};
 pub use modern_provider::{ModernDriver, ModernProvider, ModernUnavailable};
 pub use native_provider::{NativeDriver, NativeProvider, NativeUnavailable};
 pub use plugin_action::{
-    ActionRequestId, ActionSubmission, PluginActionCompletion, PluginActionExecutor, PluginActionRouter,
+    ActionRequestId, ActionSubmission, HostCapability, PluginActionCompletion, PluginActionExecutor,
+    PluginActionRouter,
+};
+pub use plugin_icons::{
+    PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
 };
 pub use query_pipeline::{PipelineConfig, PipelineError, PipelineTick, QueryPipeline};
+pub use remote_catalog::{
+    fetch_source, remote_owner, CatalogFetcher, DefaultCatalogFetcher, RemoteCatalogError,
+    RemoteCatalogService, RemoteManifest, RemoteOutcome, RemoteReport, RemoteSlice, RemoteSource,
+    RemoteSourceStatus, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES, REMOTE_OWNER_PREFIX,
+};
+pub use selection_history_store::SelectionHistoryStore;
 pub use startup_recovery::{
     admitted_plugin_roots, DisabledPlugins, StartupJournal, StartupMode, DISABLED_BY_CONFIGURATION,
     SAFE_MODE_AFTER_FAILURES,
@@ -61,19 +81,19 @@ use crikey_catalog::{
     CacheError, CachedSlice, CatalogCache, CatalogError, CatalogStore, CatalogUpdate, MemoryCatalog,
 };
 use crikey_core::{
-    ActionId, ArgumentPolicy, ExecutionPolicy, Generation, GenerationTracker, Item, ItemId, PluginId,
-    Result as CoreResult,
+    ActionId, ArgumentPolicy, Category, ExecutionPolicy, Generation, GenerationTracker, Item, ItemId,
+    PluginId, Result as CoreResult,
 };
 use crikey_platform::{
     application_arguments, application_items, application_working_directory, decode_target, IconImage,
-    IconProvider, APPLICATION_LAUNCH_ACTION_ID, DEFAULT_ICON_SIZE,
+    IconProvider, WindowInfo, APPLICATION_LAUNCH_ACTION_ID, DEFAULT_ICON_SIZE,
 };
 #[cfg(any(windows, target_os = "linux"))]
 use crikey_platform::{HotkeyActivationHandler, HotkeyBinding};
 use crikey_query::{
     DefaultMatcher, DefaultNormalizer, MatchMethod, MatchOutcome, NormalizedQuery, Normalizer, PreparedLabel,
 };
-use crikey_ranking::{DefaultRanker, Ranker, Score};
+use crikey_ranking::{DefaultRanker, RankingSignals, Score, SelectionHistory};
 use crikey_result_aggregator::{MemoryResultAggregator, ResultAggregator};
 use crikey_ui::ResultRow;
 
@@ -283,6 +303,35 @@ impl App {
         self.backend.icon_provider()
     }
 
+    /// The window the desktop currently focuses, when this build's backend can
+    /// observe one.
+    ///
+    /// `None` covers every negative answer, and they are genuinely equivalent
+    /// to the one caller: no window is focused, the session withholds window
+    /// control (a Wayland compositor, or an X display with no EWMH manager),
+    /// or this target has no window service at all. The one thing that must
+    /// not happen is a positive answer nothing read, so nothing here falls
+    /// back to a guess when the backend declines.
+    ///
+    /// A read error is folded into `None` rather than propagated: the caller
+    /// is a ranking signal that runs before every query, and a broken X
+    /// connection must degrade the ranking, not fail the query.
+    pub fn foreground_window(&self) -> Option<WindowInfo> {
+        #[cfg(target_os = "linux")]
+        {
+            self.backend
+                .window_service()
+                .and_then(|service| service.foreground_window().ok().flatten())
+        }
+        // Windows and macOS have no `WindowService` implementation in this
+        // build, so there is nothing to ask. Reporting `None` is the honest
+        // answer; synthesising one from the process list would not be.
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// Discovers the current platform's applications and maps them into one
     /// catalog slice owned by `plugin`.
     pub fn discover_application_items(&self, plugin: &PluginId) -> CoreResult<Vec<Item>> {
@@ -295,9 +344,10 @@ impl App {
     ///
     /// Compiled for the targets whose backend has a real global-shortcut
     /// implementation behind [`Capability::GlobalHotkeys`]: Win32
-    /// `RegisterHotKey` and X11 `GrabKey`. A target without one has no method
-    /// here at all, so a host that calls it fails to build rather than being
-    /// handed a shortcut nothing can deliver.
+    /// `RegisterHotKey`, X11 `GrabKey`, and Linux Wayland's portal-backed
+    /// GlobalShortcuts service. A target without one has no method here at all,
+    /// so a host that calls it fails to build rather than being handed a
+    /// shortcut nothing can deliver.
     ///
     /// [`Capability::GlobalHotkeys`]: crikey_platform::Capability::GlobalHotkeys
     #[cfg(any(windows, target_os = "linux"))]
@@ -453,6 +503,9 @@ struct SearchPlan<'a> {
     non_prefix_upper: &'a HashMap<PluginId, Score>,
     query: &'a NormalizedQuery,
     previous: Option<&'a PositionCache>,
+    history: &'a SelectionHistory,
+    foreground_category: Option<&'a Category>,
+    now_secs: u64,
     per_plugin_limit: usize,
     global_limit: usize,
     batch_limit: usize,
@@ -463,6 +516,9 @@ struct PluginSelection<'items, 'query> {
     matcher: &'query DefaultMatcher,
     ranker: &'query DefaultRanker,
     query: &'query NormalizedQuery,
+    history: &'query SelectionHistory,
+    foreground_category: Option<&'query Category>,
+    now_secs: u64,
     match_spans: Vec<(usize, usize)>,
     matched_positions: Vec<usize>,
     stats: SearchStats,
@@ -471,22 +527,21 @@ struct PluginSelection<'items, 'query> {
 }
 
 impl<'items, 'query> PluginSelection<'items, 'query> {
-    fn new(
-        matcher: &'query DefaultMatcher,
-        ranker: &'query DefaultRanker,
-        query: &'query NormalizedQuery,
-        limit: usize,
-        candidate_capacity: usize,
-    ) -> Self {
+    /// Takes the whole plan rather than eight positional arguments: every field
+    /// it needs is already grouped there, and `SearchPlan` is `Copy`.
+    fn new(plan: SearchPlan<'query>, candidate_capacity: usize) -> Self {
         Self {
-            matcher,
-            ranker,
-            query,
+            matcher: plan.matcher,
+            ranker: plan.ranker,
+            query: plan.query,
+            history: plan.history,
+            foreground_category: plan.foreground_category,
+            now_secs: plan.now_secs,
             match_spans: Vec::new(),
             matched_positions: Vec::with_capacity(candidate_capacity),
             stats: SearchStats::default(),
-            retained: BinaryHeap::with_capacity(limit),
-            limit,
+            retained: BinaryHeap::with_capacity(plan.per_plugin_limit),
+            limit: plan.per_plugin_limit,
         }
     }
 
@@ -500,10 +555,18 @@ impl<'items, 'query> PluginSelection<'items, 'query> {
         };
         self.matched_positions.push(position);
         self.stats.matches_found = self.stats.matches_found.saturating_add(1);
+        let mut signals = RankingSignals::default();
+        self.history.augment(
+            item,
+            self.query,
+            self.now_secs,
+            self.foreground_category,
+            &mut signals,
+        );
         retain_best(
             &mut self.retained,
             RankedCandidate {
-                score: self.ranker.score_match(item, summary),
+                score: self.ranker.score_match_with_signals(item, summary, signals),
                 item,
                 prepared_label,
             },
@@ -627,6 +690,14 @@ pub struct SearchService {
     last_query_stats: SearchStats,
     candidate_cache: Option<CandidateCache>,
     non_prefix_upper: HashMap<PluginId, Score>,
+    /// Successful selections used to improve future generations.
+    history: SelectionHistory,
+    /// Optional foreground application category supplied by the platform layer.
+    foreground_category: Option<Category>,
+    /// Deterministic clock value used for recency scoring.
+    now_secs: u64,
+    /// Query that was active when the current results were published.
+    last_query: Option<NormalizedQuery>,
     /// Exact-owner runtime endpoints for plugin-owned actions.
     plugin_actions: Option<Arc<PluginActionRouter>>,
     /// Icons already resolved for this session, keyed by reference.
@@ -649,16 +720,148 @@ impl SearchService {
             aggregator,
             normalizer: DefaultNormalizer::default(),
             matcher: DefaultMatcher::default(),
-            ranker: DefaultRanker::default(),
+            ranker: DefaultRanker::new(crikey_ranking::HistoryPolicy { enabled: true }),
             results: Vec::new(),
             catalog_cache: None,
             cache_error: None,
             last_query_stats: SearchStats::default(),
             candidate_cache: None,
             non_prefix_upper: HashMap::new(),
+            history: SelectionHistory::default(),
+            foreground_category: None,
+            now_secs: 0,
+            last_query: None,
             plugin_actions: None,
             icons: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Sets the clock used for deterministic recency scoring.
+    pub fn set_history_time(&mut self, now_secs: u64) {
+        self.now_secs = now_secs;
+    }
+
+    /// Supplies the foreground category used by context-aware ranking.
+    ///
+    /// # Where this signal is inert
+    ///
+    /// The context term is only ever non-neutral where the platform can name
+    /// the focused window, and today that is X11 alone. Wayland sessions
+    /// withhold window control by design, and neither the Windows nor the
+    /// macOS backend implements [`WindowService`] at all, so
+    /// [`Self::refresh_foreground_category`] resolves to `None` on all three
+    /// and every candidate scores with `context_match` false. Ranking is
+    /// therefore *correct* on those platforms and *no better than
+    /// context-free* — read a context-aware ranking claim as X11-only until a
+    /// backend there grows a focused-window query.
+    ///
+    /// [`WindowService`]: crikey_platform::WindowService
+    pub fn set_foreground_category(&mut self, category: Option<Category>) {
+        self.foreground_category = category;
+    }
+
+    /// The category context-aware ranking is currently scoring against.
+    pub fn foreground_category(&self) -> Option<&Category> {
+        self.foreground_category.as_ref()
+    }
+
+    /// Reads the foreground window from the platform backend and sets the
+    /// context signal from it.
+    ///
+    /// A no-op in effect on any backend that cannot name the focused window —
+    /// see [`Self::set_foreground_category`] for which those are. The read and
+    /// the interpretation are separate methods because only the read depends
+    /// on the host's desktop: this one is what `crikey run` calls and cannot
+    /// be pinned by a test that must pass on a headless builder, while
+    /// [`Self::set_foreground_from_window`] is a pure function of a window and
+    /// the catalog and is pinned exhaustively.
+    pub fn refresh_foreground_category(&mut self) {
+        let window = self.app.foreground_window();
+        self.set_foreground_from_window(window.as_ref());
+    }
+
+    /// Sets the context signal to the category of the catalog item `window`'s
+    /// owning program names.
+    ///
+    /// The catalog is the only thing in the process that knows what a window
+    /// belongs to. A window reports the program that owns it (`WM_CLASS` on
+    /// X11), and the launcher already holds a catalog of programs, so the two
+    /// are matched by name and the *item's* category is the answer. Deriving a
+    /// category from the window alone would mean hard-coding a category for
+    /// every program in the world, and getting it wrong silently.
+    ///
+    /// Every unknown resolves to `None`, which switches the context term off
+    /// rather than pointing it somewhere: no window at all (a backend that
+    /// cannot answer, or an empty desktop), a window whose owner the window
+    /// system will not name, and an owner that matches nothing in the catalog.
+    /// Guessing [`Category::Application`] because "windows belong to
+    /// applications" would promote every application row on every query on a
+    /// desktop this launcher understands nothing about.
+    pub fn set_foreground_from_window(&mut self, window: Option<&WindowInfo>) {
+        // Resolved into a local first: the closure borrows `self` to read the
+        // catalog, and that borrow must be released before the field is written.
+        let category = window.and_then(|window| self.category_of(window));
+        self.foreground_category = category;
+    }
+
+    /// The category of the catalog item `window`'s owning program names.
+    ///
+    /// Case-insensitive equality, and nothing looser: `WM_CLASS` carries a
+    /// program name and catalog labels are program names, so an exact match is
+    /// available and a substring rule would let "Files" claim "Files
+    /// (Nautilus)" and every other row containing the word. Search terms are
+    /// consulted alongside the label because a plugin declares them for
+    /// exactly this — the aliases its item is also known by.
+    fn category_of(&self, window: &WindowInfo) -> Option<Category> {
+        let application = window.application.as_ref()?;
+        self.owners
+            .iter()
+            .flat_map(|owner| self.catalog.items(owner))
+            .find(|item| {
+                std::iter::once(&item.label)
+                    .chain(item.search_terms.iter())
+                    .any(|name| name.eq_ignore_ascii_case(application))
+            })
+            .map(|item| item.category.clone())
+    }
+
+    /// A lossless copy of the ranking history, for a caller that persists it.
+    pub fn selection_history_snapshot(&self) -> SelectionHistorySnapshot {
+        self.history.snapshot()
+    }
+
+    /// Replaces the ranking history with a previously taken snapshot.
+    ///
+    /// Replaces rather than merges: the snapshot is the whole history, and a
+    /// merge would double every count on a host that restored twice. Callers
+    /// restore once, before queries are accepted.
+    pub fn restore_selection_history(&mut self, snapshot: SelectionHistorySnapshot) {
+        self.history = SelectionHistory::from_snapshot(snapshot);
+    }
+
+    /// Clears all selection and query affinity records.
+    pub fn clear_selection_history(&mut self) {
+        self.history.clear();
+    }
+
+    /// Records a successful execution of the currently visible item.
+    ///
+    /// Selection is recorded only after the caller confirms execution
+    /// succeeded; stale or non-visible item ids are ignored.
+    pub fn record_selection(&mut self, item_id: &ItemId) -> bool {
+        let Some(item) = self
+            .results
+            .iter()
+            .find(|hit| &hit.item.stable_id == item_id)
+            .map(|hit| hit.item.clone())
+        else {
+            return false;
+        };
+        let Some(query) = self.last_query.as_ref() else {
+            return false;
+        };
+        self.history.record(&item, query, self.now_secs);
+        true
     }
 
     /// Attaches the persistent catalog cache used for completed publications.
@@ -834,6 +1037,12 @@ impl SearchService {
     /// visible results untouched. An accepted query always replaces them, even
     /// when the new answer is empty: an empty answer is still an answer.
     pub fn submit_query(&mut self, raw: &str) -> Result<Generation, SearchError> {
+        self.submit_query_at(raw, self.now_secs)
+    }
+
+    /// Accepts a query at an explicit clock value for deterministic ranking.
+    pub fn submit_query_at(&mut self, raw: &str, now_secs: u64) -> Result<Generation, SearchError> {
+        self.now_secs = now_secs;
         if !self.app.can_accept_queries() {
             return Err(SearchError::NotAcceptingQueries {
                 pending: self.app.stage(),
@@ -844,6 +1053,7 @@ impl SearchService {
         self.aggregator.begin_generation(generation);
 
         let query = self.normalizer.normalize(raw);
+        self.last_query = Some(query.clone());
         let per_plugin_limit = self
             .app
             .limits()
@@ -867,6 +1077,9 @@ impl SearchService {
                 non_prefix_upper: &self.non_prefix_upper,
                 query: &query,
                 previous: incremental.map(|cached| &cached.by_owner),
+                history: &self.history,
+                foreground_category: self.foreground_category.as_ref(),
+                now_secs: self.now_secs,
                 per_plugin_limit,
                 global_limit,
                 batch_limit,
@@ -909,7 +1122,15 @@ impl SearchService {
             else {
                 continue;
             };
-            let score = self.ranker.score(&query, item, &outcome);
+            let mut signals = RankingSignals::default();
+            self.history.augment(
+                item,
+                &query,
+                self.now_secs,
+                self.foreground_category.as_ref(),
+                &mut signals,
+            );
+            let score = self.ranker.score_outcome_with_signals(item, &outcome, signals);
             hits.push(SearchHit {
                 item: item.clone(),
                 score,
@@ -1083,6 +1304,15 @@ impl SearchService {
                         action.action_id.0
                     )));
                 }
+                // Per owner, through the one grant map. A build with no action
+                // registry has no plugin runtimes either, so every item it can
+                // hold was produced by the host; once a registry exists, an
+                // owner it does not know is refused rather than assumed
+                // host-owned, which is why the composition root registers its
+                // own builtin catalogs there too.
+                if let Some(router) = self.plugin_actions.as_ref() {
+                    router.authorize(&hit.item.plugin_id, HostCapability::ProcessLaunch)?;
+                }
                 self.app
                     .launch_application(&hit.item)
                     .map(|()| ActionSubmission::Completed)
@@ -1126,7 +1356,6 @@ fn select_best<'items>(
     plan: SearchPlan<'_>,
 ) -> (Vec<RankedCandidate<'items>>, SearchStats, PositionCache, bool) {
     let SearchPlan {
-        matcher,
         ranker,
         non_prefix_upper,
         query,
@@ -1134,6 +1363,7 @@ fn select_best<'items>(
         per_plugin_limit,
         global_limit,
         batch_limit,
+        ..
     } = plan;
     let mut stats = SearchStats::default();
     let mut global = BinaryHeap::with_capacity(global_limit);
@@ -1144,16 +1374,9 @@ fn select_best<'items>(
     if per_plugin_limit == 0 || global_limit == 0 || batch_limit == 0 {
         return (Vec::new(), stats, matched_by_owner, cache_complete);
     }
-
     for plugin in owners {
         let prior = previous.and_then(|by_owner| by_owner.get(plugin));
-        let mut selection = PluginSelection::new(
-            matcher,
-            ranker,
-            query,
-            per_plugin_limit,
-            prior.map_or(0, |positions| positions.len()),
-        );
+        let mut selection = PluginSelection::new(plan, prior.map_or(0, |positions| positions.len()));
         let prefix_token = query.tokens.first().filter(|token| {
             token.chars().take(2).count() == 2
                 && token

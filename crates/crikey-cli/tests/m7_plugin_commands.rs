@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crikey_package_manager::{
+    build_package, sign_package, signature_path_for, PackageSigningKey, TrustStore,
+};
+
 /// The binary under test, as built by cargo for this integration target.
 const CRIKEY: &str = env!("CARGO_BIN_EXE_crikey");
 
@@ -56,6 +60,23 @@ impl Host {
         let path = self.path.join(name);
         fs::create_dir_all(&path).expect("fixture subdirectory is creatable");
         path
+    }
+
+    /// Trusts `key` under `name` in this host's own trust store.
+    ///
+    /// Written directly rather than through `crikey package trust-add`, so a
+    /// provenance test fails for a broken installer and not for a broken
+    /// unrelated command.
+    fn trust(&self, name: &str, key: &PackageSigningKey) {
+        let mut store = TrustStore::empty();
+        store
+            .add(name, key.public_key())
+            .expect("the first key is distinct");
+        let config = self.path.join("config");
+        fs::create_dir_all(&config).expect("the config directory is creatable");
+        store
+            .save_to(&config.join("trusted-keys.toml"))
+            .expect("the trust store is writable");
     }
 
     /// Runs `crikey` with this host's directories and no discovery roots.
@@ -262,7 +283,7 @@ fn modern_plugin(root: &Path, id: &str, extra: &str) -> PathBuf {
 }
 
 /// Writes `<root>/<id>/crikey.toml` for a native plugin.
-fn native_plugin(root: &Path, id: &str) -> PathBuf {
+fn native_plugin(root: &Path, id: &str, extra: &str) -> PathBuf {
     let directory = root.join(id);
     fs::create_dir_all(&directory).expect("plugin directory is creatable");
     fs::write(
@@ -274,10 +295,39 @@ fn native_plugin(root: &Path, id: &str) -> PathBuf {
              name = \"{id}\"\n\
              version = \"0.4.0\"\n\
              runtime = \"native\"\n\
-             entrypoint = \"bin/{id}\"\n"
+             entrypoint = \"bin/{id}\"\n{extra}"
         ),
     )
     .expect("manifest is writable");
+    directory
+}
+
+/// A native plugin tree that `package build` accepts and `plugin install` can
+/// install: a per-platform entrypoint for the host and a real payload under
+/// `bin/`, which [`native_plugin`] deliberately omits because discovery only
+/// ever reads the manifest.
+fn buildable_native_plugin(root: &Path, id: &str) -> PathBuf {
+    let directory = root.join(id);
+    let bin = directory.join("bin");
+    fs::create_dir_all(&bin).expect("bin directory is creatable");
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    fs::write(
+        directory.join("crikey.toml"),
+        format!(
+            "manifest-version = 1\n\n\
+             [plugin]\n\
+             id = \"{id}\"\n\
+             name = \"{id}\"\n\
+             version = \"0.4.0\"\n\
+             runtime = \"native\"\n\
+             entrypoint.{os}-{arch} = \"bin/{id}\"\n\n\
+             [platform]\n\
+             os = [\"{os}\"]\n\
+             arch = [\"{arch}\"]\n"
+        ),
+    )
+    .expect("manifest is writable");
+    fs::write(bin.join(id), b"payload").expect("binary is writable");
     directory
 }
 
@@ -323,7 +373,7 @@ fn list_reports_id_version_kind_enabled_state_and_scheduling_profile_for_every_r
     let native_root = host.subdir("native");
     legacy_package(&legacy_root, "Notes");
     modern_plugin(&modern_root, "notes", "");
-    native_plugin(&native_root, "tool");
+    native_plugin(&native_root, "tool", "");
 
     let run = host.run_with(
         &["plugin", "list"],
@@ -543,6 +593,84 @@ fn installing_a_source_that_is_not_a_plugin_fails_with_a_named_reason() {
         run.stdout.is_empty(),
         "a failed install must print no success report; {run}"
     );
+}
+
+/// `plugin install` enforces the operator's unsigned-package policy (ADR-0012).
+///
+/// End to end through the real binary, because the defect this pins was not a
+/// wrong policy but an unreachable one: the installer had the capability and no
+/// command ever handed it the operator's decision, so every `plugin install`
+/// ran with provenance unexamined while the documentation said `refuse` was the
+/// default. The escape hatch is asserted with it, since a default that cannot
+/// be overridden is a different bug.
+#[test]
+fn installing_a_native_archive_enforces_the_unsigned_package_policy() {
+    let host = Host::new("install-provenance");
+    let source = buildable_native_plugin(&host.subdir("source"), "provenance");
+    let archive = host.path.join("provenance.crikeypkg");
+    build_package(&source, &archive).expect("the fixture package builds");
+    let path = archive.to_str().expect("utf-8 path");
+    let native_root = host.path.join("data").join("plugins").join("native");
+
+    let refused = host.run(&["plugin", "install", path]);
+    assert_completed(&refused, EX_INVALID);
+    assert!(
+        refused.stderr.contains("carries no detached signature"),
+        "the default refuses an unsigned package and says why; {refused}"
+    );
+    assert!(
+        !native_root.join("provenance").exists(),
+        "a refused package installs nothing; {refused}"
+    );
+
+    // Signed, but by a key this operator has never trusted. Accepting the key
+    // the package ships would make the signature self-certifying.
+    let key = PackageSigningKey::generate().expect("entropy");
+    sign_package(&archive, &key, &signature_path_for(&archive)).expect("the fixture signs");
+    let untrusted = host.run(&["plugin", "install", path]);
+    assert_completed(&untrusted, EX_INVALID);
+    assert!(
+        untrusted.stderr.contains(&key.public_key().fingerprint()),
+        "an untrusted signer is named by fingerprint; {untrusted}"
+    );
+    assert!(!native_root.join("provenance").exists(), "{untrusted}");
+
+    host.trust("publisher", &key);
+    let accepted = host.run(&["plugin", "install", path]);
+    assert_completed(&accepted, EX_OK);
+    let parsed = parse(&accepted);
+    assert_eq!(
+        field(&summary(&accepted, &parsed), "plugin", &accepted),
+        "native.provenance"
+    );
+    assert!(
+        native_root.join("provenance").join("crikey.toml").is_file(),
+        "a trusted package is actually installed; {accepted}"
+    );
+
+    // `--unsigned-policy allow` is the documented way past the default, and it
+    // has to work on the same command line the refusal came from.
+    fs::remove_file(signature_path_for(&archive)).expect("the signature is removable");
+    let allowed = host.run(&["plugin", "install", "--unsigned-policy", "allow", path]);
+    assert_completed(&allowed, EX_OK);
+}
+
+/// The flag is refused where it would do nothing rather than accepted silently.
+#[test]
+fn an_unsigned_policy_on_an_indexed_id_is_refused_rather_than_ignored() {
+    let host = Host::new("install-policy-indexed");
+
+    let run = host.run(&["plugin", "install", "--unsigned-policy", "allow", "clock"]);
+    assert_completed(&run, EX_INVALID);
+    assert!(
+        run.stderr.contains("--unsigned-policy allow") && run.stderr.contains("indexed id"),
+        "the refusal explains where the flag does and does not apply; {run}"
+    );
+
+    let empty = host.run(&["plugin", "install", "--unsigned-policy", "", "clock"]);
+    assert_completed(&empty, EX_USAGE);
+    let missing = host.run(&["plugin", "install", "--unsigned-policy"]);
+    assert_completed(&missing, EX_USAGE);
 }
 
 /// `remove` owns only the directories CriKey installed into.
@@ -1243,5 +1371,174 @@ fn migrate_keypirinha_statuses_separate_a_bad_source_from_a_bad_argument_list() 
     assert!(
         help.stdout.contains("--out"),
         "the help must document both required flags; {help}"
+    );
+}
+/// A declaration the host cannot act on must be said out loud, not inferred.
+///
+/// `permissions.background-execution` parses on every runtime, but only the
+/// modern Python worker registers and admits background tasks (spec 15.8);
+/// spec 20.2 defers enforcement everywhere else. A native author who writes it
+/// gets nothing, and without this note has no way to discover that short of
+/// reading the host's source. It is reported, never degrading: the plugin is
+/// healthy, one line of its manifest is simply inert.
+#[test]
+fn doctor_names_a_manifest_declaration_the_runtime_cannot_honour() {
+    let host = Host::new("doctor-unhonoured");
+    let native_root = host.subdir("native");
+    let modern_root = host.subdir("modern");
+    native_plugin(
+        &native_root,
+        "tool",
+        "\n[permissions]\nbackground-execution = true\n",
+    );
+    // The runtime that does implement it must produce no note at all.
+    modern_plugin(
+        &modern_root,
+        "notes",
+        "\n[permissions]\nbackground-execution = true\n",
+    );
+
+    let run = host.run_with(
+        &["plugin", "doctor"],
+        &[
+            ("CRIKEY_NATIVE_PLUGIN_ROOTS", &native_root),
+            ("CRIKEY_MODERN_PLUGIN_ROOTS", &modern_root),
+        ],
+    );
+    assert_completed(&run, EX_OK);
+    let parsed = parse(&run);
+
+    let notes: Vec<_> = records(&run, &parsed, "note")
+        .into_iter()
+        .filter(|record| record.field("plugin", &run) == "native.tool")
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "the inert native declaration must be reported exactly once; {run}"
+    );
+    assert_eq!(
+        notes[0].field("unhonoured_declaration", &run),
+        "permissions.background-execution",
+        "{run}"
+    );
+    assert_eq!(
+        notes[0].field("reason", &run),
+        "no-background-task-api-for-runtime",
+        "{run}"
+    );
+
+    assert!(
+        records(&run, &parsed, "note")
+            .iter()
+            .all(|record| record.field("plugin", &run) != "modern.notes"),
+        "the Python runtime honours this permission, so it must produce no note; {run}"
+    );
+
+    let summary = summary(&run, &parsed);
+    assert_eq!(
+        field(&summary, "degraded", &run),
+        "0",
+        "an inert declaration is not a defect; {run}"
+    );
+    assert_eq!(field(&summary, "verdict", &run), "healthy", "{run}");
+}
+
+/// Reporting is the honest fallback for a permission the host cannot enforce
+/// (§20.2), so the reports have to reach an operator. This walks the whole
+/// unenforceable set through the real command: a manifest that reads like a
+/// confinement and confines nothing is the defect, and it is invisible unless
+/// `doctor` says so per plugin and per field.
+#[test]
+fn doctor_names_every_permission_the_host_cannot_enforce() {
+    let host = Host::new("doctor-permissions");
+    let native_root = host.subdir("native");
+    native_plugin(
+        &native_root,
+        "tool",
+        "\n[permissions]\n\
+         filesystem = [{ scope = \"home\", access = \"read\" }]\n\
+         clipboard = \"read-write\"\n\
+         window-enumeration = true\n\
+         window-control = true\n\
+         notifications = true\n\
+         secrets = true\n\
+         native-library-loading = true\n",
+    );
+
+    let run = host.run_with(
+        &["plugin", "doctor", "native.tool"],
+        &[("CRIKEY_NATIVE_PLUGIN_ROOTS", &native_root)],
+    );
+    assert_completed(&run, EX_OK);
+    let parsed = parse(&run);
+
+    let reported: Vec<String> = records(&run, &parsed, "note")
+        .into_iter()
+        .filter(|record| record.get("unhonoured_declaration").is_some())
+        .map(|record| {
+            format!(
+                "{}={}",
+                record.field("unhonoured_declaration", &run),
+                record.field("reason", &run)
+            )
+        })
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            "permissions.filesystem=host-mediates-no-filesystem-access-outside-the-plugin-package",
+            "permissions.clipboard=no-host-mediated-clipboard-api-for-plugins",
+            "permissions.window-enumeration=no-host-mediated-window-api-for-plugins",
+            "permissions.window-control=no-host-mediated-window-api-for-plugins",
+            "permissions.notifications=no-host-mediated-notification-api-for-plugins",
+            "permissions.secrets=no-host-mediated-secret-store-api-for-plugins",
+            "permissions.native-library-loading=out-of-process-plugin-loads-its-own-libraries",
+        ],
+        "{run}"
+    );
+    assert_eq!(
+        field(&summary(&run, &parsed), "verdict", &run),
+        "healthy",
+        "{run}"
+    );
+}
+
+/// A legacy package declares nothing, and "declares nothing" must not read as
+/// "is confined" or as "may do anything". Keypirinha plugins predate any
+/// permission model, so the host's own posture is the only answer there is and
+/// an operator has to be able to read it out of `doctor`.
+#[test]
+fn doctor_states_the_permission_posture_the_host_applies_to_a_legacy_package() {
+    let host = Host::new("doctor-legacy-posture");
+    let legacy_root = host.subdir("legacy");
+    legacy_package(&legacy_root, "Notes");
+
+    let run = host.run_with(
+        &["plugin", "doctor", "legacy.Notes"],
+        &[("CRIKEY_LEGACY_PACKAGE_ROOTS", &legacy_root)],
+    );
+    assert_completed(&run, EX_OK);
+    let parsed = parse(&run);
+
+    let posture = records(&run, &parsed, "note")
+        .into_iter()
+        .find(|record| record.get("legacy_permission_posture").is_some())
+        .unwrap_or_else(|| panic!("a legacy entry must state its permission posture; {run}"));
+    assert_eq!(posture.field("plugin", &run), "legacy.Notes", "{run}");
+    assert_eq!(
+        posture.field("legacy_permission_posture", &run),
+        "compatibility-baseline",
+        "{run}"
+    );
+    assert_eq!(
+        posture.field("host_mediated_grants", &run),
+        "process,filesystem-package-read",
+        "the posture must name what the host will actually do for the package; {run}"
+    );
+    assert_eq!(
+        posture.field("unconfined", &run),
+        "clipboard,network,filesystem-in-child-interpreter",
+        "and what nothing in the host confines; {run}"
     );
 }
