@@ -1,0 +1,184 @@
+name: release
+
+# Cut a GitHub release from a tag, with one artefact set per platform.
+#
+# WHY THIS EXISTS
+#
+# `ci.yml` proves the tree is healthy on three operating systems; it produces
+# nothing a user can install. The packaging scripts produce installable
+# artefacts but two of the three only run on the platform they package for:
+# WiX, makeappx and signtool are Windows binaries, and codesign, lipo and
+# plutil ship with the Xcode command line tools. A release therefore has to be
+# built on three runners and collected afterwards, which is what this workflow
+# does. It drives the same scripts a human would run by hand - it never
+# reimplements the packaging, so a defect here cannot make the released
+# artefact differ from a locally built one.
+#
+# SIGNING
+#
+# No certificate is stored in this repository, so the Windows and macOS
+# artefacts are built with the scripts' own `-Unsigned` / `--unsigned` paths and
+# the release notes say so. That is a distribution limitation, not a hidden
+# one: an unsigned MSI warns about an unknown publisher and an unsigned .app is
+# refused by Gatekeeper on any machine but the one that built it. When
+# certificates exist, drop the unsigned flag and pass the credentials the
+# scripts already read from the environment.
+
+on:
+  push:
+    tags: ["v*"]
+  # A tag that was pushed before this workflow existed still needs a release,
+  # and a failed publish needs a retry that does not require moving a tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and release
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the packaging tools the script requires
+        # `dpkg-deb` is present on the runner; `rpmbuild` is not, and the script
+        # fails loudly rather than skipping the target, so install it here.
+        run: sudo apt-get update && sudo apt-get install -y rpm desktop-file-utils
+      - name: Build the Linux artefacts
+        # Flatpak is deliberately absent: it is built from the repository source
+        # inside the freedesktop SDK and needs flatpak-builder plus a runtime
+        # download, which is a different pipeline from packaging a built tree.
+        run: packaging/linux/build.sh --targets stage,tarball,deb,rpm target/packaging/linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          if-no-files-found: error
+          path: |
+            target/packaging/linux/*.tar.gz
+            target/packaging/linux/*.deb
+            target/packaging/linux/*.rpm
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the release executables
+        run: cargo build --release --locked --package crikey-cli --package crikey-wasm-host --package crikey-cabi-host
+      - name: Install the WiX v4 toolset
+        # Deliberately not vendored, for the reason build.ps1 gives: the MSI is
+        # produced by the published toolset, not by a copy in this repository.
+        run: dotnet tool install --global wix
+      - name: Build the MSI
+        shell: pwsh
+        run: ./packaging/windows/build.ps1 -Unsigned -Format msi -OutputDirectory target/packaging/windows
+      - name: Archive the staged tree as a portable zip
+        # The MSI is a per-user install; the zip is what someone who wants to
+        # run CriKey without installing it needs, and it is the same staged tree
+        # the MSI packages rather than a second layout invented here.
+        shell: pwsh
+        run: Compress-Archive -Path target/packaging/windows/stage/* -DestinationPath target/packaging/windows/crikey-windows-x86_64-portable.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          if-no-files-found: error
+          path: |
+            target/packaging/windows/*.msi
+            target/packaging/windows/*.zip
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both architecture slices
+        # Two slices rather than one: the bundle is assembled with `lipo` into a
+        # universal binary, so one download runs on Apple silicon and Intel.
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --target "$target" \
+              --package crikey-cli --package crikey-wasm-host --package crikey-cabi-host
+          done
+      - name: Assemble CriKey.app
+        run: |
+          packaging/macos/build.sh --unsigned --output target/packaging/macos \
+            --binary target/aarch64-apple-darwin/release/crikey \
+            --binary target/x86_64-apple-darwin/release/crikey \
+            --launcher-binary target/aarch64-apple-darwin/release/crikey-launcher \
+            --launcher-binary target/x86_64-apple-darwin/release/crikey-launcher \
+            --wasm-host-binary target/aarch64-apple-darwin/release/crikey-wasm-host \
+            --wasm-host-binary target/x86_64-apple-darwin/release/crikey-wasm-host \
+            --cabi-host-binary target/aarch64-apple-darwin/release/crikey-cabi-host \
+            --cabi-host-binary target/x86_64-apple-darwin/release/crikey-cabi-host
+      - name: Archive the bundle
+        # `ditto` rather than `zip`, because it preserves the bundle's symlinks
+        # and extended attributes; a zipped .app that loses them will not launch.
+        run: ditto -c -k --sequesterRsrc --keepParent target/packaging/macos/CriKey.app target/packaging/macos/crikey-macos-universal.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          if-no-files-found: error
+          path: target/packaging/macos/*.zip
+
+  publish:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: artefacts
+      - name: Collect the artefacts and checksum them
+        # One flat directory with one checksum file: a user who downloads an
+        # artefact can verify it without knowing which runner produced it.
+        run: |
+          mkdir -p upload
+          find artefacts -type f -exec mv {} upload/ \;
+          cd upload
+          sha256sum * > SHA256SUMS
+          ls -l
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        # The notes are written to a file rather than inlined into the `gh`
+        # invocation: a heredoc closing delimiter cannot be indented, and an
+        # indented body would put ten leading spaces on every line, which
+        # Markdown renders as a code block.
+        run: |
+          {
+            printf 'CriKey %s, built from this tag by `.github/workflows/release.yml`.\n\n' "$TAG"
+            printf '| Platform | Artefact |\n| --- | --- |\n'
+            printf '| Linux | `crikey-*-linux.tar.gz`, `.deb`, `.rpm` |\n'
+            printf '| Windows | `CriKey-*.msi` (per-user), `crikey-windows-x86_64-portable.zip` |\n'
+            printf '| macOS | `crikey-macos-universal.zip` (CriKey.app, universal) |\n\n'
+            printf 'Verify a download against `SHA256SUMS`.\n\n'
+            printf '**These artefacts are unsigned.** No code-signing certificate exists for\n'
+            printf 'this project yet, so Windows SmartScreen reports an unknown publisher and\n'
+            printf 'macOS Gatekeeper refuses the bundle until it is opened through the context\n'
+            printf 'menu. The Linux artefacts are unaffected.\n\n'
+            printf 'Platform runtime verification (M8) is still open: the Windows and macOS\n'
+            printf 'backends compile and are covered by portable tests, but their native\n'
+            printf 'runtime paths have not been exercised on real hardware. See\n'
+            printf '`docs/ROADMAP.md` for the measured status.\n'
+          } > release-notes.md
+          gh release create "$TAG" --title "CriKey $TAG" --notes-file release-notes.md upload/*

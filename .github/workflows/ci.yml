@@ -2,7 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # `master` is this repository's default branch; `main` is kept so a rename
+    # does not silently stop running the gates on every pushed commit.
+    branches: [master, main]
   pull_request:
 
 env:
