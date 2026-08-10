@@ -55,9 +55,18 @@ impl Scratch {
 
     /// Standard directories whose every root is inside this scratch directory,
     /// so a cache test writes nowhere near the running user's own cache.
+    ///
+    /// Resolved under the host's own convention rather than a fixed one: a
+    /// scratch path under `temp_dir()` is `C:\...` on Windows, which the XDG
+    /// rule rightly refuses as not absolute. Windows reads its base layout
+    /// from `APPDATA` and `LOCALAPPDATA`, so those name the scratch directory
+    /// too and every root stays inside it whichever convention answers.
     fn directories(&self) -> StandardDirectories {
-        let environment = DirectoryEnvironment::new().set("HOME", &self.path);
-        StandardDirectories::resolve(DirectoryConvention::Xdg, &environment)
+        let environment = DirectoryEnvironment::new()
+            .set("HOME", &self.path)
+            .set("APPDATA", &self.path)
+            .set("LOCALAPPDATA", &self.path);
+        StandardDirectories::resolve(DirectoryConvention::current(), &environment)
             .expect("scratch directories resolve")
     }
 }

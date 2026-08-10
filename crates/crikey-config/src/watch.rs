@@ -205,7 +205,12 @@ mod tests {
             .expect("mtime");
         let watch = ConfigSourceWatch::over(std::slice::from_ref(&file));
         std::fs::write(&file, "b = 2\n").expect("same-length rewrite");
-        std::fs::File::open(&file)
+        // Opened for writing, not merely reopened: Windows resolves
+        // `SetFileTime` against the handle's access mask, so a read-only
+        // handle fails with "Access is denied" where Unix does not care.
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
             .expect("open")
             .set_times(std::fs::FileTimes::new().set_modified(original))
             .expect("restore mtime");

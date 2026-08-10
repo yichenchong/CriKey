@@ -352,22 +352,47 @@ impl PyRun {
 /// helpers). In particular `DISPLAY` and `WAYLAND_DISPLAY` are absent by
 /// construction, which is what makes the desktop-unavailability assertions
 /// deterministic rather than dependent on how the suite was launched.
+///
+/// `HOME` and `TMPDIR` are POSIX spellings, so the same two directories are
+/// pinned again under the names Windows reads: CPython's `ntpath.expanduser`
+/// consults `USERPROFILE`, then `HOMEDRIVE`/`HOMEPATH`, and never `HOME`, so
+/// on Windows the POSIX name isolates nothing. The system variables below are
+/// passed through for exactly the reason `PATH` is — they are how a Windows
+/// process finds the system it runs on, and a child cleared of them fails
+/// before it reaches an assertion. None of them exists on a Unix host, so
+/// nothing is added there.
 fn child_env(scratch: &TempDir) -> Vec<(String, String)> {
     let scratch_path = scratch.path().display().to_string();
-    vec![
+    let mut environment = vec![
         ("PYTHONPATH".to_string(), shim_dir().display().to_string()),
         ("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string()),
         ("PYTHONIOENCODING".to_string(), "utf-8".to_string()),
         ("PYTHONUTF8".to_string(), "1".to_string()),
         ("LC_ALL".to_string(), "C.UTF-8".to_string()),
         ("HOME".to_string(), scratch_path.clone()),
-        ("TMPDIR".to_string(), scratch_path),
+        ("TMPDIR".to_string(), scratch_path.clone()),
         ("CRIKEY_SHIM_DIR".to_string(), shim_dir().display().to_string()),
         (
             "PATH".to_string(),
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
         ),
-    ]
+    ];
+    for name in ["USERPROFILE", "TEMP", "TMP"] {
+        environment.push((name.to_string(), scratch_path.clone()));
+    }
+    for name in [
+        "SystemRoot",
+        "SystemDrive",
+        "windir",
+        "COMSPEC",
+        "PATHEXT",
+        "NUMBER_OF_PROCESSORS",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            environment.push((name.to_string(), value));
+        }
+    }
+    environment
 }
 
 /// Runs `source` under the pinned isolation flags and returns the raw result.

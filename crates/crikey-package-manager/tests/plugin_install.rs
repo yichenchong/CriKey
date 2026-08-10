@@ -69,14 +69,22 @@ impl Scratch {
     ///
     /// Every root is stated with a `CRIKEY_*_DIR` override rather than left to
     /// the host's conventions, so the test asserts about paths it named.
+    /// `HOME`, `APPDATA` and `LOCALAPPDATA` are pinned as well because the base
+    /// layout is computed from them before the overrides are applied.
     fn directories(&self) -> StandardDirectories {
         let environment = DirectoryEnvironment::new()
             .set("HOME", &self.path)
+            .set("APPDATA", &self.path)
+            .set("LOCALAPPDATA", &self.path)
             .set("CRIKEY_CONFIG_DIR", self.join("config"))
             .set("CRIKEY_DATA_DIR", self.join("data"))
             .set("CRIKEY_CACHE_DIR", self.join("cache"))
             .set("CRIKEY_STATE_DIR", self.join("state"));
-        StandardDirectories::resolve(DirectoryConvention::Xdg, &environment)
+        // The host's own convention, not a fixed one: a scratch path under
+        // `temp_dir()` is `C:\...` on Windows, which the XDG rule rightly
+        // refuses as not absolute, and every test here would then fail for a
+        // reason that has nothing to do with installing a plugin.
+        StandardDirectories::resolve(DirectoryConvention::current(), &environment)
             .expect("scratch directories resolve")
     }
 }

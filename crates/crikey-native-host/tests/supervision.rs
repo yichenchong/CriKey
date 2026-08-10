@@ -924,7 +924,16 @@ fn supervisor_restarts_crashes_with_caller_clock_and_keeps_a_sibling_healthy() {
 fn a_worker_survives_the_thread_that_spawned_it() {
     let (conformance, _) = conformance_binaries();
     let spec = launch(&conformance, "thread.scoped", "echo", &[]);
-    let options = options(TransportKind::UnixSocket);
+    // The platform's own socket transport, not a fixed one: a Unix socket and
+    // a Windows named pipe are the same rung of the design — a private,
+    // non-stdio endpoint — and the host refuses the foreign one by name, so
+    // naming `UnixSocket` outright would fail this test on Windows at spawn
+    // instead of on the thread-lifetime contract it exists to defend.
+    let options = options(if cfg!(windows) {
+        TransportKind::NamedPipe
+    } else {
+        TransportKind::UnixSocket
+    });
 
     let mut worker = std::thread::spawn(move || {
         NativeWorker::spawn(spec, options).expect("echo conformance plugin starts")

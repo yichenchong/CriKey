@@ -270,8 +270,13 @@ fn a_second_ensure_with_the_same_inputs_reuses_the_environment() {
     // second materialisation would replace it; successful reuse preserves it.
     let module = first.site_dir.join("acme").join("__init__.py");
     let witness_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
-    fs::File::open(&module)
-        .expect("the materialised module is readable")
+    // Opened for writing, not merely reopened: Windows resolves `SetFileTime`
+    // against the handle's access mask, so a read-only handle fails with
+    // "Access is denied" where Unix does not care.
+    fs::File::options()
+        .write(true)
+        .open(&module)
+        .expect("the materialised module is writable")
         .set_times(fs::FileTimes::new().set_modified(witness_time))
         .expect("the materialised module timestamp is writable");
 

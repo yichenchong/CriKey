@@ -359,10 +359,17 @@ fn a_signature_document_with_the_wrong_version_or_shape_is_refused() {
 fn the_trust_store_round_trips_through_the_config_root() {
     let scratch = Scratch::new("store");
     let config = scratch.join("config");
+    // The host's own convention, not a fixed one: a scratch path under
+    // `temp_dir()` is `C:\...` on Windows, which the XDG rule rightly refuses
+    // as not absolute. `APPDATA` and `LOCALAPPDATA` are pinned because the
+    // Windows base layout is computed from them before the `CRIKEY_CONFIG_DIR`
+    // override is applied.
     let directories = StandardDirectories::resolve(
-        DirectoryConvention::Xdg,
+        DirectoryConvention::current(),
         &DirectoryEnvironment::new()
             .set("HOME", &scratch.path)
+            .set("APPDATA", &scratch.path)
+            .set("LOCALAPPDATA", &scratch.path)
             .set("CRIKEY_CONFIG_DIR", &config),
     )
     .expect("directories resolve");

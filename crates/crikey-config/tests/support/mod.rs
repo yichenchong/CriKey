@@ -46,9 +46,13 @@ impl Fixture {
     /// consults the real `HOME` and one test cannot see another's files. `HOME`
     /// is pinned as well because the base layout is computed before the
     /// overrides are applied, and it must not be the developer's own.
+    /// `APPDATA` and `LOCALAPPDATA` are pinned for the same reason: they are
+    /// what the Windows base layout is computed from.
     pub fn directories(&self) -> StandardDirectories {
         let environment = [
             "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
             "CRIKEY_CONFIG_DIR",
             "CRIKEY_DATA_DIR",
             "CRIKEY_CACHE_DIR",
@@ -58,7 +62,11 @@ impl Fixture {
         .fold(DirectoryEnvironment::new(), |environment, variable| {
             environment.set(variable, self.root.as_os_str())
         });
-        StandardDirectories::resolve(DirectoryConvention::Xdg, &environment)
+        // The host's own convention, not a fixed one: `temp_dir()` answers
+        // `C:\...` on Windows, which the XDG rule rightly refuses as not
+        // absolute, and the fixture would fail for a reason that has nothing
+        // to do with configuration.
+        StandardDirectories::resolve(DirectoryConvention::current(), &environment)
             .expect("every directory is pinned by an override")
     }
 

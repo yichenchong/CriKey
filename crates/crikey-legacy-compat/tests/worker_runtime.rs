@@ -93,7 +93,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -137,11 +137,18 @@ const HARD_BOUND_MS: Millis = 2_000;
 /// Bound on the startup handshake.
 const STARTUP_BUDGET_MS: Millis = 30_000;
 
-/// Environment variable carrying a rendezvous fifo to a fixture plugin. Test
+/// Environment variable carrying a rendezvous path to a fixture plugin. Test
 /// scaffolding, not part of the worker contract — it travels through the
 /// caller-supplied `WorkerOptions` environment like any plugin's own settings
 /// would, which is also what pins that such variables reach the child at all.
-const FIFO_VAR: &str = "CRIKEY_TEST_FIFO";
+const RENDEZVOUS_VAR: &str = "CRIKEY_TEST_RENDEZVOUS";
+
+/// How often the rendezvous watcher looks for the plugin's announcement.
+///
+/// Not a timing assertion: it bounds how long after the callback started the
+/// termination flag is raised, and the tests assert what the plugin observed,
+/// never how quickly it observed it.
+const ANNOUNCEMENT_POLL: Duration = Duration::from_millis(1);
 
 // ---------------------------------------------------------------------------
 // Scratch space
@@ -389,12 +396,19 @@ fn catalog(response: &LegacyResponse) -> &[Item] {
 // Rendezvous
 // ---------------------------------------------------------------------------
 
-/// A fifo a fixture plugin opens to announce that its callback is running.
+/// A file a fixture plugin creates to announce that its callback is running.
 ///
 /// This is how the tests that signal a *live* callback stay deterministic
-/// without sleeping: opening a fifo for writing blocks until the reader
-/// arrives and the read returns when the writer closes, so "the callback has
-/// started" is an event, not a guess.
+/// without sleeping: the plugin creates the file as the first statement of the
+/// callback, so the file appearing *is* the event "the callback has started",
+/// and the watcher below reacts to it rather than to a guessed delay.
+///
+/// A named pipe would carry the same event on Unix and is what this used to
+/// be, but `mkfifo` is a POSIX tool that Windows has neither as a program nor
+/// as a filesystem object, so the fixture would have failed there on the
+/// rendezvous rather than on the cancellation contract it exists to defend.
+/// Mere existence is the whole signal, so no content is ever read and there is
+/// no torn-write window to lose the event through.
 #[derive(Debug)]
 struct Rendezvous {
     path: PathBuf,
@@ -403,11 +417,12 @@ struct Rendezvous {
 impl Rendezvous {
     fn new(scratch: &Scratch) -> Self {
         let path = scratch.join("callback-started");
-        let status = Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .expect("mkfifo is available on a POSIX host");
-        assert!(status.success(), "mkfifo could not create {}", path.display());
+        assert!(
+            !path.exists(),
+            "the rendezvous must not exist before the plugin creates it, or the watcher \
+             would fire before the callback ran: {}",
+            path.display()
+        );
 
         Self { path }
     }
@@ -421,8 +436,16 @@ impl Rendezvous {
         let path = self.path.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            // Returns exactly when the plugin has opened, written and closed.
-            let _announced = fs::read(&path);
+            // Bounded by the same ceiling as every other rendezvous here, so a
+            // plugin that never announces fails the test that is waiting on
+            // this channel instead of leaving a thread parked forever.
+            let deadline = Instant::now() + RESPONSE_LIMIT;
+            while !path.exists() {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                thread::sleep(ANNOUNCEMENT_POLL);
+            }
             then();
             // A failed send only means the test already gave up.
             let _ = sender.send(());
@@ -460,7 +483,7 @@ fn process_table_contains(pid: u32) -> Option<bool> {
 
 fn source(body: &str) -> String {
     body.replace("__PACKAGE_ROOT__", ENV_PACKAGE_ROOT)
-        .replace("__FIFO__", FIFO_VAR)
+        .replace("__RENDEZVOUS__", RENDEZVOUS_VAR)
 }
 
 /// Reports the pid the plugin itself is running under.
@@ -1597,9 +1620,9 @@ class Fixture(kp.Plugin):
     def on_catalog(self):
         # Announce that the callback is running, then spin until the host asks
         # for it to stop. The announcement is what lets the host signal a
-        # callback that is genuinely in flight.
-        with open(os.environ["__FIFO__"], "w") as handle:
-            handle.write("started")
+        # callback that is genuinely in flight. Creating the file is the whole
+        # signal, so the host never has to read it.
+        open(os.environ["__RENDEZVOUS__"], "w").close()
         while not kp.should_terminate():
             pass
         self.set_catalog([
@@ -1619,7 +1642,7 @@ class Fixture(kp.Plugin):
     let mut worker = LegacyWorker::spawn(
         &host_interpreter(),
         &package,
-        options("legacy.cooperative").with_env(FIFO_VAR, rendezvous.path.as_os_str()),
+        options("legacy.cooperative").with_env(RENDEZVOUS_VAR, rendezvous.path.as_os_str()),
     )
     .expect("a loadable package spawns a worker");
 
@@ -1679,8 +1702,7 @@ class Fixture(kp.Plugin):
         pass
 
     def on_catalog(self):
-        with open(os.environ["__FIFO__"], "w") as handle:
-            handle.write("started")
+        open(os.environ["__RENDEZVOUS__"], "w").close()
         # Never consults should_terminate(). Cooperation cannot be assumed, so
         # the host needs a bound that does not depend on it.
         while True:
@@ -1694,7 +1716,7 @@ class Fixture(kp.Plugin):
         &package,
         options("legacy.uncooperative")
             .with_call_timeout_ms(HARD_BOUND_MS)
-            .with_env(FIFO_VAR, rendezvous.path.as_os_str()),
+            .with_env(RENDEZVOUS_VAR, rendezvous.path.as_os_str()),
     )
     .expect("a loadable package spawns a worker");
     let child = worker.process_id();

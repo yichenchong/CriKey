@@ -540,7 +540,11 @@ fn a_plugin_directory_installs_appears_in_the_list_and_removes_again() {
     assert_eq!(field(&installed_summary, "id", &installed), "notes");
     assert_eq!(field(&installed_summary, "kind", &installed), "modern");
     assert_eq!(field(&installed_summary, "verdict", &installed), "installed");
-    let root = PathBuf::from(field(&installed_summary, "root", &installed));
+    // Decoded before it is used as a path: the output contract percent-encodes
+    // everything outside the unreserved set, and `\` is not in it, so on
+    // Windows every separator arrives as `%5C` and the raw field names a file
+    // that cannot exist.
+    let root = PathBuf::from(decode(field(&installed_summary, "root", &installed)));
     assert!(
         root.join("crikey.toml").is_file(),
         "the install must actually place the manifest, looked in `{}`; {installed}",
