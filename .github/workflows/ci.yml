@@ -18,13 +18,21 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # The GitHub Linux runner has no GPU, so every wgpu surface the launcher
+      # tests create is served by Mesa's llvmpipe/lavapipe software
+      # rasterisers. This pins the GL backend to software rather than letting
+      # it find a stub driver and fail late inside the renderer; it is
+      # meaningless on the Windows and macOS runners, which have a real
+      # driver, so it costs nothing to set for the whole matrix.
+      LIBGL_ALWAYS_SOFTWARE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.86.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install the X libraries the launcher loads at run time
+      - name: Install the X and GPU libraries the launcher loads at run time
         # Several tests start the real launcher under a private `Xvfb`, and the
         # launcher's window stack loads `libxkbcommon-x11.so` by name at run
         # time rather than linking it, so a missing package is not a build
@@ -32,8 +40,38 @@ jobs:
         # feature under test being broken. `xdotool` drives the X11 IME and
         # hotkey tests through XTEST for the same reason: those tests fail
         # loudly on a missing tool rather than skipping.
+        #
+        # The Mesa packages are what let `tests/ime_x11.rs` run at all. That
+        # test drives the shipped launcher, which creates a real wgpu surface,
+        # and this runner has no GPU: without a Vulkan loader plus the lavapipe
+        # ICD, and without the Mesa DRI/EGL/GLX modules, wgpu builds an
+        # instance with *no* live backend and reports "Failed to create surface
+        # for any enabled backend: {}". Installing the software rasterisers
+        # keeps that test running end to end, which matters because it is the
+        # only live evidence that the IME commit reaches the query.
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y xvfb xdotool libxkbcommon-x11-0 libxkbcommon0
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xdotool libxkbcommon-x11-0 libxkbcommon0 \
+            libvulkan1 mesa-vulkan-drivers libgl1-mesa-dri libglx-mesa0 libegl-mesa0 libegl1
+      - name: Prove the software rasterisers are actually installed
+        # A missing software rasteriser must be a named failure here rather
+        # than a surface-creation panic a thousand log lines later that reads
+        # like a renderer bug. If Ubuntu ever renames these packages, apt still
+        # succeeds and this step is the thing that says why the GPU vanished.
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          icd=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          if [ ! -f "$icd" ]; then
+            echo "::error::lavapipe ICD $icd is missing; wgpu has no software Vulkan backend on this runner"
+            exit 1
+          fi
+          if [ ! -f /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so ] && \
+             [ ! -f /usr/lib/x86_64-linux-gnu/dri/kms_swrast_dri.so ]; then
+            echo "::error::no Mesa software DRI module; wgpu has no software GL backend on this runner"
+            exit 1
+          fi
+          echo "software rasterisers present: $icd and Mesa swrast"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets
