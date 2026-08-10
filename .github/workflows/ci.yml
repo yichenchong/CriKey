@@ -61,17 +61,24 @@ jobs:
         # succeeds and this step is the thing that says why the GPU vanished.
         if: matrix.os == 'ubuntu-latest'
         run: |
-          icd=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          if [ ! -f "$icd" ]; then
-            echo "::error::lavapipe ICD $icd is missing; wgpu has no software Vulkan backend on this runner"
+          # The ICD file is discovered rather than named: Mesa dropped the
+          # `.x86_64` architecture infix from its ICD manifests between the
+          # 24.04 release version and the 25.2 update the runner actually
+          # installs, and hard-coding either spelling turns a working runner
+          # into a red build.
+          icds=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null || true)
+          if [ -z "$icds" ]; then
+            echo "::error::no lavapipe ICD in /usr/share/vulkan/icd.d; wgpu has no software Vulkan backend on this runner"
+            ls -la /usr/share/vulkan/icd.d || true
             exit 1
           fi
           if [ ! -f /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so ] && \
              [ ! -f /usr/lib/x86_64-linux-gnu/dri/kms_swrast_dri.so ]; then
             echo "::error::no Mesa software DRI module; wgpu has no software GL backend on this runner"
+            ls -la /usr/lib/x86_64-linux-gnu/dri || true
             exit 1
           fi
-          echo "software rasterisers present: $icd and Mesa swrast"
+          echo "software rasterisers present: $icds and Mesa swrast"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets
