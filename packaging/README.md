@@ -69,12 +69,34 @@ stdout or stderr, and a GUI-subsystem process has no console to write to.
 appearing beside it. Neither is a copy of the other: both call one
 implementation in the `crikey-cli` library.
 
+**Upgrades.** No `ProductCode` is authored, so `wix build` generates a fresh
+one per build and a version bump is a major upgrade: `FindRelatedProducts`
+matches the installed product on `UpgradeCode` and `RemoveExistingProducts`
+takes it away. Re-running an `.msi` that is already installed finds its own
+`ProductCode` registered and offers maintenance mode, which is the correct
+answer and not an upgrade failure. `AllowSameVersionUpgrades="yes"` because
+rebuilding an already-released version number is normal while a release is
+being repaired, and without it MSI treats same version plus different
+`ProductCode` as two products: two Add/Remove Programs entries over one
+directory, and removing either leaves the files behind because the other still
+references the same components. `RemoveExistingProducts` is scheduled
+`afterInstallInitialize` rather than `afterInstallValidate`; both remove the
+installed product before the new one is laid down, but a failed upgrade under
+the latter leaves the machine with neither version installed.
+
 Uninstall removes everything the package installed: the files, the directories
-it created to hold them (`CriKey\`, `modern-sdk\`, `legacy-shim\` and
-`python-runtime\` when present), the shortcut and its folder, the `App Paths`
-key, and the `PATH` fragment (`Part="last"`, `Permanent="no"`, so the rest of
-`PATH` is left as found). It does not touch `%LOCALAPPDATA%\Programs`, which
-every per-user install on the machine shares. It deliberately keeps
+it created to hold them (`CriKey\`, `modern-sdk\`, `modern-sdk\crikey_sdk\`,
+`legacy-shim\` and `python-runtime\` when present), the shortcut and its
+folder, the `App Paths` key, and the `PATH` fragment (`Part="last"`,
+`Permanent="no"`, so the rest of `PATH` is left as found). Windows Installer
+removes a directory only once it is empty, and the directories `<Files>`
+harvesting invents for a payload tree's subdirectories carry no removal row of
+their own — so each is declared in `crikey.wxs` with a `RemoveFolder` beside
+it, and `build.ps1` fails the build when a staged tree grows one that is not.
+The exception is `-PythonRuntimeArchive`: an interpreter tree's directories
+are not knowable at author time, so that opt-in build leaves them behind
+empty. Uninstall does not touch `%LOCALAPPDATA%\Programs`, which every
+per-user install on the machine shares. It deliberately keeps
 `%APPDATA%\CriKey` (configuration, plugin state, startup journal) and
 `%LOCALAPPDATA%\CriKey` (icon and catalog caches). Reinstalling a launcher must
 not silently discard the user's plugins and hotkeys.
@@ -83,15 +105,16 @@ not silently discard the user's plugins and hotkeys.
 separate `wix msi validate` subcommand, and only an MSBuild `.wixproj`
 validates automatically, so the documented build command produces an `.msi`
 without ever running an ICE. `build.ps1 -Validate` runs the subcommand, with
-`-sice ICE38 -sice ICE64 -sice ICE91` and nowhere else — `wix build` has no
-such switch. Those three describe a package this one cannot be: ICE38 and
-ICE64 are per-user-profile rules, `crikey.wxs` satisfies both for every
-component and directory it authors by hand, and the components WiX generates
-for the harvested Python trees cannot carry a registry key path at all. The
-reasoning is recorded per ICE in the file's header, together with why
-`Scope="perUserOrMachine"` under `ProgramFiles6432Folder` — the ICE-clean
-alternative — is not taken: it would put the default install behind a UAC
-prompt the user gains nothing from.
+`-sice ICE38 -sice ICE61 -sice ICE64 -sice ICE91` and nowhere else — `wix
+build` has no such switch. Those four describe a package this one cannot be:
+ICE38 and ICE64 are per-user-profile rules, `crikey.wxs` satisfies both for
+every component and directory it authors by hand, and the components WiX
+generates for the harvested Python trees cannot carry a registry key path at
+all; ICE61 objects to a package that upgrades its own version, which is what
+`AllowSameVersionUpgrades` deliberately asks for. The reasoning is recorded per
+ICE in the file's header, together with why `Scope="perUserOrMachine"` under
+`ProgramFiles6432Folder` — the ICE-clean alternative — is not taken: it would
+put the default install behind a UAC prompt the user gains nothing from.
 
 **The MSIX** declares exactly one capability, `rescap:runFullTrust`, and
 `EntryPoint="Windows.FullTrustApplication"`. The manifest's comment block
@@ -234,7 +257,7 @@ release compile.
 The tarball is prefix-relative, so a distro-agnostic install is:
 
 ```sh
-sudo tar --strip-components=1 -C /usr/local -xf crikey-0.1.0-x86_64-linux.tar.gz
+sudo tar --strip-components=1 -C /usr/local -xf crikey-<version>-x86_64-linux.tar.gz
 ```
 
 ### Installed layout, and why it is shaped this way
@@ -340,3 +363,21 @@ Windows and macOS artefacts; the Linux ones are listed under `linux/` above.
   logos. `build.sh` omits `CFBundleIconFile` entirely rather than pointing at a
   file that is not there, and `build.ps1` refuses the MSIX route without
   `-MsixAssets`, naming the three files and pixel sizes it needs.
+- **Nested `RemoveFolder` ordering is unverified on Windows.** `crikey.wxs`
+  now declares a removal row for every directory it creates, including the
+  nested `modern-sdk\crikey_sdk`. The `RemoveFile` table documentation
+  specifies no order in which those rows are processed, and Windows Installer
+  removes a directory only when it is already empty, so a parent processed
+  before its child would still be left behind. Confirm on a real host with
+  `msiexec /x CriKey-<version>-x64.msi /l*v uninstall.log`: the `RemoveFiles`
+  section names each directory it removed, and
+  `%LOCALAPPDATA%\Programs\CriKey` must not exist afterwards.
+- **The per-user `PATH` entry is not visible to an already-running shell.**
+  The MSI writes `HKCU\Environment\Path` through the `Environment` table and
+  Windows Installer broadcasts `WM_SETTINGCHANGE`, but a terminal that was
+  open before the install keeps the environment it inherited, so `crikey`
+  appears not to be installed. `reg query HKCU\Environment /v Path` shows
+  whether the entry was written; if it names
+  `%LOCALAPPDATA%\Programs\CriKey`, a new terminal is all that is needed and
+  there is nothing to fix in the package. `Win+R` then `crikey` works
+  immediately either way, through the `App Paths` key.

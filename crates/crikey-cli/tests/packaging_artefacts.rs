@@ -391,6 +391,7 @@ fn the_msi_installs_per_user_and_removes_only_the_directories_it_created() {
             "INSTALLFOLDER",
             "LegacyShimFolder",
             "ModernSdkFolder",
+            "ModernSdkPackageFolder",
             "PythonRuntimeFolder",
             "ShortcutFolder"
         ],
@@ -407,12 +408,12 @@ fn the_msi_installs_per_user_and_removes_only_the_directories_it_created() {
 
     // Validation is what would otherwise catch a broken key path, and it is a
     // separate subcommand: `wix build` neither validates nor accepts -sice, so
-    // the suppressions belong on `wix msi validate` and nowhere else. Three,
+    // the suppressions belong on `wix msi validate` and nowhere else. Four,
     // exactly: anything further would hide a real finding.
     let build = read("packaging/windows/build.ps1");
     assert!(
-        build.contains("msi validate '-sice' 'ICE38' '-sice' 'ICE64' '-sice' 'ICE91'"),
-        "build.ps1 must validate the MSI with exactly the three ICEs crikey.wxs argues are \
+        build.contains("msi validate '-sice' 'ICE38' '-sice' 'ICE61' '-sice' 'ICE64' '-sice' 'ICE91'"),
+        "build.ps1 must validate the MSI with exactly the four ICEs crikey.wxs argues are \
          inapplicable to a per-user package"
     );
     let (_, wix_arguments) = build

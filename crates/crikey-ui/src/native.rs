@@ -16,14 +16,14 @@ use egui_wgpu::{wgpu, Renderer, ScreenDescriptor};
 use thiserror::Error;
 use winit::{
     application::ApplicationHandler,
-    dpi::LogicalSize,
+    dpi::{LogicalSize, PhysicalSize},
     event::{ElementState, Ime, KeyEvent, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
     window::{Window, WindowId, WindowLevel},
 };
 
-use crate::{theme, LauncherWindow, ResultRow, UiCommand, ViewModel};
+use crate::{theme, LauncherWindow, ResultRow, SettingRow, UiCommand, ViewModel};
 
 /// Maximum number of activation-to-present observations retained in memory.
 ///
@@ -278,6 +278,17 @@ struct PendingFrame {
 struct FrameMailbox {
     latest: Option<PendingFrame>,
     wake_session: Option<u64>,
+    /// The host-owned half of the view model, and the session it was published
+    /// for.
+    ///
+    /// It lives under the mailbox lock rather than beside it because a provider
+    /// frame reads it and inserts in one step: with a second lock, a provider
+    /// could read an open panel, lose the race to a host frame that closed it,
+    /// and then overwrite the closed frame with the stale open one. The session
+    /// tag is what stops a panel left over from a dismissed activation
+    /// reappearing over the next one, which has not published a host frame yet.
+    overlay: Overlay,
+    overlay_session: Option<u64>,
 }
 
 const VISIBLE_BIT: u64 = 1;
@@ -300,6 +311,55 @@ struct SharedState {
     lifecycle: AtomicU64,
     frames: Mutex<FrameMailbox>,
     latency: Mutex<ActivationLatencyTracker>,
+}
+
+/// The part of a frame that belongs to the host rather than to a query.
+///
+/// Provider drivers publish straight to the renderer from their own threads,
+/// and the view model they build describes results only: it knows nothing
+/// about a settings panel the user opened a moment ago. Taken at face value,
+/// the first suggestion to arrive would blank that panel under the user's
+/// hands.
+#[derive(Debug, Default, Clone)]
+struct Overlay {
+    settings_open: bool,
+    settings: Arc<[SettingRow]>,
+    settings_focus: Option<String>,
+}
+
+/// Who composed a frame, and therefore who owns its overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameSource {
+    /// The UI thread's retained view model: the whole frame, overlay included.
+    Host,
+    /// A provider driver's results-only frame.
+    Provider,
+}
+
+/// Remembers the host-owned half of a frame the host itself composed.
+fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
+    mailbox.overlay = Overlay {
+        settings_open: model.settings_open,
+        settings: Arc::clone(&model.settings),
+        settings_focus: model.settings_focus.clone(),
+    };
+    mailbox.overlay_session = Some(session);
+}
+
+/// Puts this session's retained host overlay back onto a provider's frame.
+///
+/// An overlay published for an earlier session is not this session's business:
+/// a new activation starts with no panel until the host says otherwise.
+fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> ViewModel {
+    if mailbox.overlay_session != Some(session) {
+        return model.clone();
+    }
+    ViewModel {
+        settings_open: mailbox.overlay.settings_open,
+        settings: Arc::clone(&mailbox.overlay.settings),
+        settings_focus: mailbox.overlay.settings_focus.clone(),
+        ..model.clone()
+    }
 }
 
 impl SharedState {
@@ -516,9 +576,36 @@ impl NativeLauncherHandle {
     /// Replaces the frame waiting for the UI thread with the newest immutable
     /// view model and wakes the loop at most once for that session.
     ///
+    /// This is the host's path: `model` is the whole frame, overlay included,
+    /// so what it says about the settings surface becomes what a later provider
+    /// frame inherits.
+    ///
     /// Replacing a pending frame preserves the view model's coalescing
     /// semantics; rows remain shared through their `Arc` when `model` is cloned.
     pub fn submit_frame(&self, model: &ViewModel) -> Result<(), RendererError> {
+        self.enqueue(model, FrameSource::Host)
+    }
+
+    /// Publishes a results-only frame from a provider thread.
+    ///
+    /// A provider driver builds its view model from a query and its own rows;
+    /// it has no idea whether the user has the settings surface open, and the
+    /// `false` it necessarily carries would close that surface mid-edit. This
+    /// session's retained host overlay is put back on as the frame is queued,
+    /// so a suggestion arriving during a settings edit updates the results
+    /// behind the panel instead of dismissing it.
+    pub fn submit_results(&self, model: &ViewModel) -> Result<(), RendererError> {
+        self.enqueue(model, FrameSource::Provider)
+    }
+
+    /// Stores `model` as this session's pending frame, reconciling the overlay
+    /// under the same lock that inserts it.
+    ///
+    /// Reading the overlay and inserting the frame have to be one step: split
+    /// across two locks, a provider could read an open settings panel, lose the
+    /// race to a host frame that closed it, and then overwrite that frame with
+    /// the panel the user just dismissed.
+    fn enqueue(&self, model: &ViewModel, source: FrameSource) -> Result<(), RendererError> {
         let state = self.shared.snapshot();
         if !lifecycle_visible(state) {
             return Ok(());
@@ -529,10 +616,14 @@ impl NativeLauncherHandle {
             if self.shared.snapshot() != state {
                 return Ok(());
             }
-            mailbox.latest = Some(PendingFrame {
-                session,
-                model: model.clone(),
-            });
+            let model = match source {
+                FrameSource::Host => {
+                    record_overlay(&mut mailbox, session, model);
+                    model.clone()
+                }
+                FrameSource::Provider => with_overlay(&mailbox, session, model),
+            };
+            mailbox.latest = Some(PendingFrame { session, model });
             if mailbox.wake_session == Some(session) {
                 false
             } else {
@@ -1049,6 +1140,9 @@ where
 struct GraphicsState {
     window: Arc<Window>,
     transparent: bool,
+    /// The height the window returns to as soon as it has something to show
+    /// below the query field, in logical pixels.
+    expanded_height: u32,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1056,6 +1150,20 @@ struct GraphicsState {
     renderer: Renderer,
     egui_context: egui::Context,
     egui_state: egui_winit::State,
+}
+
+/// How tall the window has to be to show `model`, in logical pixels.
+///
+/// Only a launcher with nothing under the query field is compact: a result
+/// list, the "no matches" card and the settings surface all want the full
+/// window. Keeping this a function of the model alone is what lets the window
+/// follow the frame instead of standing at list height over an empty query.
+fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
+    if model.query.is_empty() && !model.settings_open {
+        theme::COMPACT_WINDOW_HEIGHT
+    } else {
+        expanded_height
+    }
 }
 
 /// Picks the surface compositing mode that matches how the window was created.
@@ -1120,6 +1228,7 @@ impl GraphicsState {
             window,
             proxy,
             config.transparent,
+            config.height,
             config.present_mode,
         ))
     }
@@ -1128,6 +1237,7 @@ impl GraphicsState {
         window: Arc<Window>,
         proxy: Arc<EventProxy>,
         transparent: bool,
+        expanded_height: u32,
         present_mode: wgpu::PresentMode,
     ) -> Result<Self, RendererError> {
         let instance = wgpu::Instance::default();
@@ -1206,6 +1316,7 @@ impl GraphicsState {
         Ok(Self {
             window,
             transparent,
+            expanded_height,
             surface,
             device,
             queue,
@@ -1240,7 +1351,32 @@ impl GraphicsState {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
+    /// Resizes the window to the height the next frame needs.
+    ///
+    /// Called before the frame is built, so the surface, the egui layout and
+    /// the window all describe the same height. A platform that resizes
+    /// synchronously answers with the new size and the surface is reconfigured
+    /// here; one that resizes asynchronously answers `None` and the
+    /// `Resized` event does it instead.
+    fn fit_window_height(&mut self, model: &ViewModel) {
+        let desired = desired_window_height(model, self.expanded_height);
+        let scale = self.window.scale_factor();
+        let current = self.window.inner_size();
+        let target = ((f64::from(desired) * scale).round() as u32).max(1);
+        if current.height == target {
+            return;
+        }
+
+        if let Some(granted) = self
+            .window
+            .request_inner_size(PhysicalSize::new(current.width, target))
+        {
+            self.resize(granted.width, granted.height);
+        }
+    }
+
     fn draw(&mut self, model: &ViewModel) -> Result<DrawResult, RendererError> {
+        self.fit_window_height(model);
         let input = self.egui_state.take_egui_input(self.window.as_ref());
         let NativeUiFrame { output, commands } =
             build_launcher_frame_with_transparency(&self.egui_context, input, model, self.transparent);
@@ -1360,6 +1496,14 @@ fn translate_keyboard(
     if event.state != ElementState::Pressed {
         return None;
     }
+    // While the settings surface is open its editors own the keyboard: Enter
+    // commits an edit and Tab walks between rows, so neither may still run a
+    // result. Escape is the exception, because closing the surface is what it
+    // means there.
+    if model.is_some_and(|model| model.settings_open) {
+        return matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
+            .then_some(UiCommand::Cancel);
+    }
     match event.logical_key.as_ref() {
         Key::Named(NamedKey::ArrowDown) => Some(UiCommand::SelectNext),
         Key::Named(NamedKey::ArrowUp) => Some(UiCommand::SelectPrevious),
@@ -1398,6 +1542,13 @@ fn draw_launcher(
     transparent: bool,
 ) {
     let colors = theme::palette();
+    // Ctrl+, is what every desktop means by "open preferences". It is consumed
+    // from the egui frame rather than translated out of the raw key event so
+    // that the headless frame builder answers to the shortcut exactly as the
+    // window does, and so the query field never also receives the comma.
+    if context.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+        commands.push(UiCommand::OpenSettings);
+    }
     egui::CentralPanel::default()
         .frame(
             Frame::default()
@@ -1406,14 +1557,25 @@ fn draw_launcher(
         )
         .show(context, |ui| {
             draw_query(ui, model, commands, colors);
-            ui.add_space(theme::SPACE_3);
-            draw_results(ui, model, commands, colors);
-            if model.actions_open {
+            if model.settings_open {
+                // The settings surface takes the result area rather than
+                // floating over it: the launcher is one column, and a list the
+                // user cannot reach behind a panel is only noise.
                 ui.add_space(theme::SPACE_3);
-                draw_actions(ui, model, commands, colors);
+                draw_settings(ui, model, commands, colors);
+            } else if !model.query.is_empty() {
+                // An untyped launcher is the query field and nothing else: no
+                // card, no list, and none of the spacing that would hold room
+                // for one.
+                ui.add_space(theme::SPACE_3);
+                draw_results(ui, model, commands, colors);
+                if model.actions_open {
+                    ui.add_space(theme::SPACE_3);
+                    draw_actions(ui, model, commands, colors);
+                }
             }
             ui.add_space(theme::SPACE_3);
-            draw_status(ui, model, colors);
+            draw_status(ui, model, commands, colors);
         });
 }
 
@@ -1436,7 +1598,13 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
                     .frame(false)
                     .lock_focus(true),
             );
-            response.request_focus();
+            // The query field takes the keyboard back on every frame, which is
+            // right for a launcher whose only job is typing -- except while the
+            // settings surface is open, where it would tear focus out of the
+            // editor the user is typing into.
+            if !model.settings_open {
+                response.request_focus();
+            }
             if response.changed() {
                 flatten_line_breaks(&mut query);
                 commands.push(UiCommand::SetQuery(query));
@@ -1458,6 +1626,27 @@ fn flatten_line_breaks(text: &mut String) {
     }
 }
 
+/// What the renderer last scrolled the result list to, kept per context.
+///
+/// Without it the selected row asks to be scrolled into view on every frame,
+/// which silently undoes the user's own mouse wheel on the very next repaint.
+/// The anchor is renderer state rather than view-model state because it is
+/// about where this list is currently scrolled, which no other renderer and no
+/// host can answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollAnchor {
+    /// Identity of the row set the anchor was taken from. The address of the
+    /// shared allocation, because `publish` replaces the row set wholesale:
+    /// a different address is a different list, and the same address is the
+    /// same list however the user has scrolled it.
+    rows: usize,
+    selected: usize,
+}
+
+fn scroll_anchor_id() -> egui::Id {
+    egui::Id::new("crikey-result-scroll-anchor")
+}
+
 fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
     if model.rows.is_empty() {
         Frame::default()
@@ -1468,8 +1657,6 @@ fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
             .show(ui, |ui| {
                 let (title, detail) = if model.pending_plugins {
                     ("Searching", "Results will appear as providers respond.")
-                } else if model.query.is_empty() {
-                    ("Ready", "Type a name, path, or action to begin.")
                 } else {
                     ("No matches", "Try fewer words or a different spelling.")
                 };
@@ -1479,6 +1666,13 @@ fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
             });
         return;
     }
+
+    let anchor = ScrollAnchor {
+        rows: Arc::as_ptr(&model.rows).cast::<()>() as usize,
+        selected: model.selected,
+    };
+    let previous = ui.data(|data| data.get_temp::<ScrollAnchor>(scroll_anchor_id()));
+    ui.data_mut(|data| data.insert_temp(scroll_anchor_id(), anchor));
 
     let reserved = if model.actions_open {
         theme::SPACE_8 * 4.0
@@ -1491,22 +1685,50 @@ fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
         .max_height(list_height)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            let mut selected_row = None;
             for (index, row) in model.rows.iter().enumerate() {
-                draw_result_row(ui, row, index == model.selected, commands, colors);
+                let response = draw_result_row(ui, row, index == model.selected, commands, colors);
+                if index == model.selected {
+                    selected_row = Some(response);
+                }
                 if index + 1 != model.rows.len() {
                     ui.add_space(theme::SPACE_1);
                 }
             }
+
+            let Some(response) = selected_row else {
+                return;
+            };
+            // Follow the selection, never the scroll position: a wheel gesture
+            // that leaves the selected row behind is exactly what the user
+            // asked for, and scrolling back would undo it on the next repaint.
+            // A list that was replaced under the selection is the one case
+            // where nobody asked for the current scroll offset, so there the
+            // row is fetched back if it landed out of sight.
+            let follow = match previous {
+                None => true,
+                Some(previous) if previous.selected != anchor.selected => true,
+                Some(previous) => {
+                    previous.rows != anchor.rows && !ui.clip_rect().contains_rect(response.rect)
+                }
+            };
+            if follow {
+                response.scroll_to_me(None);
+            }
         });
 }
 
+/// Draws one result row and hands back the response covering it, which is what
+/// [`draw_results`] needs to decide whether the list should follow the
+/// selection. The row itself never scrolls: only the list knows whether the
+/// user has scrolled it since.
 fn draw_result_row(
     ui: &mut egui::Ui,
     row: &ResultRow,
     selected: bool,
     commands: &mut Vec<UiCommand>,
     colors: theme::Palette,
-) {
+) -> egui::Response {
     let fill = if selected {
         colors.accent_soft
     } else {
@@ -1576,12 +1798,7 @@ fn draw_result_row(
                 }
             });
         });
-    if selected {
-        // Keyboard navigation can walk the selection past the bottom of the
-        // visible list; `None` scrolls the least amount that brings the row
-        // back into view and does nothing at all once it is already visible.
-        frame.response.scroll_to_me(None);
-    }
+    frame.response
 }
 
 /// How many icon textures one context retains before the cache is dropped
@@ -1769,7 +1986,136 @@ fn draw_actions(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
         });
 }
 
-fn draw_status(ui: &mut egui::Ui, model: &ViewModel, colors: theme::Palette) {
+/// Draws the settings surface (spec 6.3).
+///
+/// Every row is host-supplied, including the labels, so the renderer decides
+/// nothing about the configuration and a key the host stops publishing simply
+/// stops appearing. The quit control lives here because this is the one
+/// surface a user goes looking for when they want the launcher to stop, and
+/// until now there was nowhere to ask.
+fn draw_settings(
+    ui: &mut egui::Ui,
+    model: &ViewModel,
+    commands: &mut Vec<UiCommand>,
+    colors: theme::Palette,
+) {
+    Frame::default()
+        .fill(colors.surface)
+        .stroke(Stroke::new(1.0_f32, colors.accent))
+        .rounding(Rounding::same(theme::RADIUS_MEDIUM))
+        .inner_margin(Margin::same(theme::SPACE_3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Settings")
+                        .size(theme::TEXT_LABEL)
+                        .strong()
+                        .color(colors.text),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Close  Esc").clicked() {
+                        commands.push(UiCommand::CloseSettings);
+                    }
+                });
+            });
+            ui.add_space(theme::SPACE_2);
+            if model.settings.is_empty() {
+                ui.label(
+                    RichText::new("The launcher host published no settings.")
+                        .size(theme::TEXT_SMALL)
+                        .color(colors.text_muted),
+                );
+            }
+            for row in model.settings.iter() {
+                draw_setting_row(ui, row, model.settings_focus.as_deref(), commands, colors);
+                ui.add_space(theme::SPACE_1);
+            }
+            ui.add_space(theme::SPACE_1);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Enter or Save commits an edit")
+                        .size(theme::TEXT_SMALL)
+                        .color(colors.text_muted),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Quit CriKey").clicked() {
+                        commands.push(UiCommand::Quit);
+                    }
+                });
+            });
+        });
+}
+
+/// One editable setting.
+///
+/// The half-typed value has to be kept somewhere between frames: the model
+/// carries what the host has stored, so an editor bound straight to it would
+/// lose every keystroke on the next repaint. The draft is dropped again the
+/// moment the edit is committed, which is what makes the host's answer --
+/// validated, normalised, or refused -- the value the row shows next.
+fn draw_setting_row(
+    ui: &mut egui::Ui,
+    row: &SettingRow,
+    focus_key: Option<&str>,
+    commands: &mut Vec<UiCommand>,
+    colors: theme::Palette,
+) {
+    let draft_id = egui::Id::new(("crikey-setting-draft", row.key.as_str()));
+    let mut draft = ui
+        .data(|data| data.get_temp::<String>(draft_id))
+        .unwrap_or_else(|| row.value.clone());
+    let mut committed = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(
+                RichText::new(&row.label)
+                    .size(theme::TEXT_BODY)
+                    .color(colors.text),
+            );
+            ui.label(
+                RichText::new(format!("{}  ({})", row.key, row.source))
+                    .size(theme::TEXT_SMALL)
+                    .color(colors.text_muted),
+            );
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Save").clicked() {
+                committed = true;
+            }
+            let response = ui.add(
+                TextEdit::singleline(&mut draft)
+                    .id(draft_id.with("editor"))
+                    .desired_width(theme::SPACE_8 * 6.0),
+            );
+            // Focus is honoured once per request rather than on every frame:
+            // repeating it would pin the keyboard to this row and leave the
+            // user unable to reach any other.
+            if focus_key == Some(row.key.as_str()) {
+                let honoured_id = egui::Id::new("crikey-settings-honoured-focus");
+                let honoured = ui.data(|data| data.get_temp::<String>(honoured_id));
+                if honoured.as_deref() != Some(row.key.as_str()) {
+                    response.request_focus();
+                    ui.data_mut(|data| data.insert_temp(honoured_id, row.key.clone()));
+                }
+            }
+            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                committed = true;
+            } else if response.changed() {
+                ui.data_mut(|data| data.insert_temp(draft_id, draft.clone()));
+            }
+        });
+    });
+    if committed {
+        commands.push(UiCommand::SetSetting {
+            key: row.key.clone(),
+            value: draft,
+        });
+        ui.data_mut(|data| data.remove::<String>(draft_id));
+    }
+}
+
+fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
     ui.separator();
     ui.horizontal(|ui| {
         if model.pending_plugins {
@@ -1779,7 +2125,9 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, colors: theme::Palette) {
                     .small()
                     .color(colors.warning),
             );
-        } else {
+        } else if !model.query.is_empty() {
+            // There is nothing to count before the user has typed, and a
+            // "0 results" under an empty field reads as a failed search.
             let count = model.rows.len();
             let suffix = if count == 1 { "result" } else { "results" };
             ui.label(
@@ -1789,6 +2137,12 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, colors: theme::Palette) {
             );
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // The one control that is on screen no matter what the launcher is
+            // doing: without it a first-time user has no way of discovering
+            // that the launcher can be configured or told to quit at all.
+            if ui.button("Settings  Ctrl+,").clicked() {
+                commands.push(UiCommand::OpenSettings);
+            }
             ui.label(
                 RichText::new("Up/Down navigate   Tab complete   Esc cancel")
                     .small()
@@ -1845,6 +2199,9 @@ mod transparency_tests {
             selected: 0,
             pending_plugins: false,
             actions_open: false,
+            settings_open: false,
+            settings: Arc::default(),
+            settings_focus: None,
         };
         let input = RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1950,6 +2307,9 @@ mod lifecycle_tests {
                     selected: 0,
                     pending_plugins: false,
                     actions_open: false,
+                    settings_open: false,
+                    settings: Arc::default(),
+                    settings_focus: None,
                 },
             });
             mailbox.wake_session = Some(7);
@@ -1979,6 +2339,9 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
                 selected: 0,
                 pending_plugins: false,
                 actions_open: false,
+                settings_open: false,
+                settings: Arc::default(),
+                settings_focus: None,
             },
         });
         mailbox.wake_session = Some(1);
@@ -2115,5 +2478,94 @@ mod surface_tests {
     fn no_advertised_mode_is_an_error_rather_than_a_guess() {
         assert_eq!(preferred_alpha_mode(&[], false), None);
         assert_eq!(preferred_alpha_mode(&[], true), None);
+    }
+}
+
+#[cfg(test)]
+mod window_geometry_tests {
+    use super::*;
+
+    fn view(query: &str, settings_open: bool) -> ViewModel {
+        ViewModel {
+            generation: crikey_core::Generation::ZERO,
+            query: query.to_owned(),
+            rows: Arc::default(),
+            selected: 0,
+            pending_plugins: false,
+            actions_open: false,
+            settings_open,
+            settings: Arc::default(),
+            settings_focus: None,
+        }
+    }
+
+    /// A provider driver publishes from its own thread and can only describe
+    /// results. If its frame were taken at face value the first suggestion to
+    /// arrive would close a settings panel the user is typing into.
+    #[test]
+    fn a_provider_frame_inherits_the_settings_surface_the_host_last_published() {
+        let mut mailbox = FrameMailbox::default();
+        let mut host = view("", true);
+        host.settings = vec![SettingRow {
+            key: "launcher.activation-hotkey".to_owned(),
+            label: "Activation hotkey".to_owned(),
+            value: "Ctrl+Alt+Space".to_owned(),
+            source: "default".to_owned(),
+        }]
+        .into();
+        host.settings_focus = Some("launcher.activation-hotkey".to_owned());
+        record_overlay(&mut mailbox, 7, &host);
+
+        let published = with_overlay(&mailbox, 7, &view("term", false));
+        assert!(
+            published.settings_open,
+            "a provider must not close the surface the user is editing"
+        );
+        assert_eq!(published.settings.len(), 1, "the rows survive the provider frame");
+        assert_eq!(
+            published.settings_focus.as_deref(),
+            Some("launcher.activation-hotkey")
+        );
+        assert_eq!(
+            published.query, "term",
+            "the provider still owns the results half"
+        );
+
+        record_overlay(&mut mailbox, 7, &view("term", false));
+        assert!(
+            !with_overlay(&mailbox, 7, &view("term", false)).settings_open,
+            "closing the surface is the host's to say, and it sticks"
+        );
+    }
+
+    /// An overlay belongs to the activation it was published for. A panel left
+    /// open when the launcher was dismissed must not reappear over the next
+    /// activation, which has published no host frame yet.
+    #[test]
+    fn a_provider_frame_ignores_an_overlay_from_an_earlier_session() {
+        let mut mailbox = FrameMailbox::default();
+        record_overlay(&mut mailbox, 7, &view("", true));
+
+        assert!(
+            !with_overlay(&mailbox, 8, &view("term", false)).settings_open,
+            "a new activation starts with no panel until its host says otherwise"
+        );
+    }
+
+    #[test]
+    fn the_window_is_compact_until_there_is_something_below_the_query_field() {
+        let expanded = theme::DEFAULT_WINDOW_HEIGHT;
+
+        assert_eq!(
+            desired_window_height(&view("", false), expanded),
+            theme::COMPACT_WINDOW_HEIGHT,
+            "an untyped launcher must not stand at list height over the desktop"
+        );
+        assert_eq!(desired_window_height(&view("q", false), expanded), expanded);
+        assert_eq!(
+            desired_window_height(&view("", true), expanded),
+            expanded,
+            "the settings surface needs the room even with nothing typed"
+        );
     }
 }

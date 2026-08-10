@@ -72,8 +72,18 @@ impl TempRoot {
     }
 
     /// The `file://` URL of a document in this directory.
+    ///
+    /// A Windows path is not a URL path: it has backslashes and starts with a
+    /// drive letter rather than a slash, so the empty-authority form has to be
+    /// spelled `file:///C:/dir/file`. Pasting `Path::display()` after `file://`
+    /// would name host `C:`, which the fetcher rightly refuses.
     fn url(&self, name: &str) -> String {
-        format!("file://{}/{name}", self.path.display())
+        let text = self.path.to_string_lossy().replace('\\', "/");
+        if text.starts_with('/') {
+            format!("file://{text}/{name}")
+        } else {
+            format!("file:///{text}/{name}")
+        }
     }
 }
 

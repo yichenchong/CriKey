@@ -50,6 +50,15 @@ pub const KEY_RELOAD_INTERVAL_MS: &str = "launcher.configuration-reload-interval
 /// is", which is exactly what the launcher does with it.
 pub const KEY_MAX_RESULTS: &str = "launcher.max-results";
 
+/// The global accelerator that raises the launcher (spec 21.2).
+///
+/// Defaulted here rather than in the launcher because it is the one launcher
+/// setting a user has no other way to discover: a resident launcher whose
+/// chord is unknown and unwritten is unreachable, so the value the host binds
+/// at startup has to be readable through `crikey config get` on a machine that
+/// has never been configured.
+pub const KEY_ACTIVATION_HOTKEY: &str = "launcher.activation-hotkey";
+
 /// The values the host itself supplies, forming [`ConfigLayer::BuiltInDefaults`].
 ///
 /// Only keys whose default this crate genuinely owns. A key defaulted by another
@@ -58,6 +67,7 @@ pub const BUILT_IN_DEFAULTS: &[(&str, &str)] = &[
     (KEY_COALESCE_MS, "150"),
     (KEY_MAXIMUM_WAIT_MS, "1000"),
     (KEY_RELOAD_INTERVAL_MS, "500"),
+    (KEY_ACTIVATION_HOTKEY, "Ctrl+Alt+Space"),
 ];
 /// Keys under this prefix are operator-pinned: a user may supply a source
 /// declaration, but cannot redirect one an administrator has specified.
@@ -410,6 +420,19 @@ impl ConfigStore {
                 self.layers[ConfigLayer::UserGlobal.index()].remove(&key);
             }
         }
+    }
+
+    /// Records `value` for `key` in the user's global layer, where
+    /// [`Self::save`] will persist it.
+    ///
+    /// The layer, not the winning value: an administrator policy or a session
+    /// override still outranks what this writes, and the caller is expected to
+    /// ask [`Self::layer_of`] afterwards rather than assume the edit is what
+    /// the launcher will now read. Silently promoting the write to whichever
+    /// layer happens to win would let a settings panel overwrite a policy the
+    /// user is not permitted to change.
+    pub fn set_user_global(&mut self, key: &str, value: &str) {
+        self.layers[ConfigLayer::UserGlobal.index()].insert(key.to_owned(), value.to_owned());
     }
 
     /// Sets a value for this process only (spec 21.2, layer 7).

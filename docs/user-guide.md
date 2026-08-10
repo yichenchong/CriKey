@@ -16,11 +16,15 @@ cargo run -p crikey-cli --bin crikey -- run
 cargo run -p crikey-cli --bin crikey-launcher
 ```
 
-`crikey` prints command-line output; `crikey-launcher` starts the graphical
-entry point. `crikey run --help` documents the supported one-shot override:
-`--set key=value`. `crikey run --set key=value` changes that launch only. The
-launcher takes an exclusive per-user lock, so a second instance and an install
-racing a running launcher are refused.
+`crikey` with no arguments and `crikey-launcher` both start the resident
+launcher: the window opens, dismissing it with Escape only hides it, and the
+process stays running so the activation hotkey can bring it back. Quit it for
+good from the settings surface's Quit button. A subcommand — `crikey version`,
+`crikey plugin list` — is command-line output as before, and `crikey --help`
+lists them. `crikey run --help` documents the supported one-shot override:
+`--set key=value`, which changes that launch only. The launcher takes an
+exclusive per-user lock, so a second instance and an install racing a running
+launcher are refused.
 
 Python in a release uses the bundled runtime when the packager staged one --
 which the Flatpak always does and the other formats do only when built with
@@ -46,6 +50,20 @@ crikey config list
 crikey config get <key>
 crikey config layers [<key>]
 ```
+
+The launcher's own settings — the activation hotkey, the result ceiling, the
+selected profile — also have a surface that does not require knowing a key
+name. Press `Ctrl+,` in the launcher, or use the footer's Settings button, to
+edit them in place; the same rows are readable and writable from a terminal:
+
+```sh
+crikey settings
+crikey settings set launcher.activation-hotkey Ctrl+Alt+K
+```
+
+Both write the user-global layer, so the panel and the command line always
+agree. A hotkey the desktop refuses leaves the previous one working and says
+so rather than leaving the launcher unreachable.
 
 Secret fields are redacted. Configuration read errors are reported and a
 launcher run continues with built-in defaults; fix the reported file before
@@ -74,8 +92,14 @@ The launcher is usable without a mouse:
 | Tab | Complete the query |
 | Enter | Execute the selected result's default action |
 | Alt+Enter | Open the selected result's alternate actions |
-| Escape | Cancel or dismiss the launcher |
+| Ctrl+, | Open the settings surface |
+| Escape | Close the settings surface, else cancel or dismiss the launcher |
 | 1–9 (actions open) | Choose that alternate action |
+
+An empty query shows nothing but the query field: the launcher does not list
+the catalog at rest, and the window stays compact until there is something to
+show. Scrolling the result list with the wheel stays where you put it; the
+list only scrolls itself to follow a selection you moved.
 
 Typing updates the visible query immediately. Local catalog search runs in the
 current UI frame; plugin results arrive incrementally and late results from an

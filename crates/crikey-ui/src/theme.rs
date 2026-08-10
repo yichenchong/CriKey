@@ -5,7 +5,15 @@ use egui::{vec2, Color32, FontFamily, FontId, Margin, Rounding, Shadow, Stroke, 
 pub(crate) const DEFAULT_WINDOW_WIDTH: u32 = 720;
 pub(crate) const DEFAULT_WINDOW_HEIGHT: u32 = 520;
 pub(crate) const MIN_WINDOW_WIDTH: u32 = 480;
-pub(crate) const MIN_WINDOW_HEIGHT: u32 = 320;
+/// The window's height when there is nothing below the query field.
+///
+/// An untyped launcher shows the query field and the footer and nothing else,
+/// so the window is exactly that tall: a full-height window standing empty
+/// over the desktop is what the first Windows tester read as the launcher
+/// being broken. It doubles as the minimum a user may drag the window to,
+/// because a minimum above it would keep the compact window from compacting.
+pub(crate) const COMPACT_WINDOW_HEIGHT: u32 = 132;
+pub(crate) const MIN_WINDOW_HEIGHT: u32 = COMPACT_WINDOW_HEIGHT;
 
 pub(crate) const SPACE_1: f32 = 4.0;
 pub(crate) const SPACE_2: f32 = 8.0;

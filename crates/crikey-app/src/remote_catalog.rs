@@ -345,7 +345,7 @@ fn read_file_url(url: &str, rest: &str, max_bytes: u64) -> Result<Vec<u8>, Remot
             reason: "contains a percent escape that is not two hexadecimal digits",
         });
     };
-    let path = PathBuf::from(format!("/{decoded}"));
+    let path = local_path(&decoded);
     let file = File::open(&path).map_err(|error| RemoteCatalogError::Unreachable {
         url: url.to_owned(),
         reason: error.to_string(),
@@ -363,6 +363,29 @@ fn read_file_url(url: &str, rest: &str, max_bytes: u64) -> Result<Vec<u8>, Remot
     }
     let mut reader = file.take(max_bytes.saturating_add(1));
     read_capped(url, &mut reader, max_bytes)
+}
+
+/// The filesystem path a `file:///` URL's decoded body names.
+///
+/// The body arrives with its leading `/` already stripped, because that slash
+/// is the URL's empty-authority separator rather than part of the path. On a
+/// POSIX host putting it back is the whole job. On Windows it must not go
+/// back: RFC 8089 spells a local drive path `file:///C:/dir/file`, so the body
+/// is `C:/dir/file`, and `/C:/dir/file` is not a path Windows can open. A URL
+/// naming a rooted path with no drive (`file:///Windows/win.ini`) still keeps
+/// its slash, since that is what the host means by an absolute path.
+fn local_path(decoded: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let mut characters = decoded.chars();
+        let drive = characters.next().is_some_and(|first| first.is_ascii_alphabetic())
+            && characters.next() == Some(':')
+            && matches!(characters.next(), Some('/') | Some('\\') | None);
+        if drive {
+            return PathBuf::from(decoded);
+        }
+    }
+    PathBuf::from(format!("/{decoded}"))
 }
 
 /// Reads a reader already limited to `max_bytes + 1` and refuses at the ceiling.
@@ -1035,6 +1058,27 @@ mod tests {
     #[test]
     fn an_owner_id_is_namespaced_so_it_cannot_collide_with_a_plugin() {
         assert_eq!(remote_owner("team"), PluginId("remote.team".to_owned()));
+    }
+
+    /// `file:///` names an absolute local path, and what "absolute" spells
+    /// differs by host. Getting this wrong is invisible on the host that
+    /// happens to work and total on the other: every `file://` source refuses.
+    #[test]
+    fn a_file_url_body_becomes_the_absolute_path_this_host_understands() {
+        if cfg!(windows) {
+            // RFC 8089's local-drive form. `/C:/srv/index.txt` is not a path
+            // Windows can open, so the separator must not be put back.
+            assert_eq!(local_path("C:/srv/index.txt"), PathBuf::from("C:/srv/index.txt"));
+            assert_eq!(local_path("c:/srv"), PathBuf::from("c:/srv"));
+            // A rooted path with no drive still means what the host means by
+            // absolute, so it keeps the slash the URL's authority separator ate.
+            assert_eq!(local_path("Windows/win.ini"), PathBuf::from("/Windows/win.ini"));
+        } else {
+            assert_eq!(local_path("srv/index.txt"), PathBuf::from("/srv/index.txt"));
+            // A drive letter is not special here: it is an ordinary file name,
+            // and silently dropping the root would escape the named directory.
+            assert_eq!(local_path("C:/srv"), PathBuf::from("/C:/srv"));
+        }
     }
 
     #[test]

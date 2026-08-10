@@ -24,6 +24,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install the X libraries the launcher loads at run time
+        # Several tests start the real launcher under a private `Xvfb`, and the
+        # launcher's window stack loads `libxkbcommon-x11.so` by name at run
+        # time rather than linking it, so a missing package is not a build
+        # error but a panic inside the spawned process — which reads as the
+        # feature under test being broken. `xdotool` drives the X11 IME and
+        # hotkey tests through XTEST for the same reason: those tests fail
+        # loudly on a missing tool rather than skipping.
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y xvfb xdotool libxkbcommon-x11-0 libxkbcommon0
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets

@@ -113,8 +113,20 @@ impl Drop for Scratch {
     }
 }
 
+/// The `file://` URL naming `path`, in the one spelling the fetcher accepts.
+///
+/// A Windows path is not a URL path: it has backslashes and starts with a drive
+/// letter rather than a slash, so the empty-authority form has to be spelled
+/// `file:///C:/dir/file`. Building the URL by pasting `Path::display()` after
+/// `file://` produces `file://C:\dir\file`, which names host `C:` and is
+/// rightly refused.
 fn file_url(path: &Path) -> String {
-    format!("file://{}", path.display())
+    let text = path.to_string_lossy().replace('\\', "/");
+    if text.starts_with('/') {
+        format!("file://{text}")
+    } else {
+        format!("file:///{text}")
+    }
 }
 
 /// Publishes a slice document and a truthful manifest into `scratch`'s index.

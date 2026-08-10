@@ -59,6 +59,24 @@ pub struct ResultRow {
     pub alternate_actions: Vec<Action>,
 }
 
+/// One configurable value the settings surface shows (spec 6.3).
+///
+/// Entirely host-supplied: the UI knows nothing about the configuration
+/// schema, its layers or its validation, so a row carries its own label and
+/// the name of the layer the value came from and the renderer only draws
+/// what it was handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingRow {
+    /// The configuration key an edit is reported against, such as
+    /// `launcher.activation-hotkey`.
+    pub key: String,
+    pub label: String,
+    pub value: String,
+    /// Which configuration layer supplied `value`, shown so the user can tell
+    /// a default apart from something they set themselves.
+    pub source: String,
+}
+
 /// Everything the renderer needs for one frame.
 ///
 /// The row set is *shared* with the view model, never copied into the frame: a
@@ -80,6 +98,17 @@ pub struct ViewModel {
     /// rung `Cancel` backs out of is decided in one place and every renderer
     /// draws the same launcher.
     pub actions_open: bool,
+    /// True while the settings surface is showing (spec 6.3).
+    pub settings_open: bool,
+    /// What the settings surface lists, as the host last described it.
+    ///
+    /// Shared for the same reason the rows are: a frame that changes nothing
+    /// about the settings costs a refcount bump rather than a copy of every
+    /// key, label and value.
+    pub settings: Arc<[SettingRow]>,
+    /// The setting whose editor should take the keyboard when the surface
+    /// opens, by key. `None` leaves the focus where the user put it.
+    pub settings_focus: Option<String>,
 }
 
 /// Keyboard-only interaction surface (spec 6.3).
@@ -97,6 +126,19 @@ pub enum UiCommand {
     ExecuteAlternate(usize),
     Cancel,
     Dismiss,
+    /// Shows the settings surface (spec 6.3).
+    OpenSettings,
+    /// Hides the settings surface again.
+    CloseSettings,
+    /// Asks the host to persist one setting; the UI neither validates nor
+    /// stores it.
+    SetSetting {
+        key: String,
+        value: String,
+    },
+    /// Asks the launcher to exit for good, rather than to hide until the next
+    /// hotkey press.
+    Quit,
 }
 
 pub trait LauncherWindow {
@@ -129,6 +171,13 @@ pub enum UiEffect {
     Execute { item: ItemId, action: ActionId },
     /// The launcher closed itself and is warm again for the next hotkey.
     Dismissed,
+    /// Persist `value` under `key` (spec 6.3). Opening and closing the
+    /// settings surface is the UI's own business, but the value behind a row
+    /// belongs to the host's configuration store.
+    SetSetting { key: String, value: String },
+    /// The user asked the launcher to exit for good, not to hide until the
+    /// next hotkey press.
+    Quit,
 }
 
 /// The renderer-free launcher state machine (spec 6.1 - 6.5; ADR-0002).
@@ -160,6 +209,17 @@ pub struct LauncherViewModel {
     /// Whether the selected row's action list is open (spec 6.3).
     actions_open: bool,
     pending_plugins: bool,
+    /// Whether the settings surface is showing (spec 6.3).
+    ///
+    /// Not session state: the surface is opened over whatever the launcher is
+    /// already showing and closes without disturbing the query or the rows.
+    settings_open: bool,
+    /// What the settings surface lists, as the host last described it. The
+    /// host owns the configuration; the model only carries its description to
+    /// the renderer, which is why this survives `dismiss`.
+    settings: Arc<[SettingRow]>,
+    /// The setting an opening surface should put the keyboard in, by key.
+    settings_focus: Option<String>,
     /// Highest generation ever begun, across every session of this launcher.
     /// Monotonic and deliberately kept by `dismiss`, so a generation retired
     /// before the launcher closed can never be begun again after it reopens
@@ -195,6 +255,9 @@ impl LauncherViewModel {
             selected: 0,
             actions_open: false,
             pending_plugins: false,
+            settings_open: false,
+            settings: Arc::default(),
+            settings_focus: None,
             floor: None,
             active: None,
             published: None,
@@ -227,6 +290,11 @@ impl LauncherViewModel {
     /// reopened launcher. The generation *floor* survives untouched, so those
     /// same generations also stay rejected by
     /// [`begin_generation`](Self::begin_generation) (spec 6.5).
+    ///
+    /// The settings *rows* survive, because they describe the host's
+    /// configuration rather than this session, but the surface itself closes:
+    /// the next activation is a fresh launcher, not the panel the user left
+    /// open.
     pub fn dismiss(&mut self) {
         if !self.visible {
             return;
@@ -239,6 +307,8 @@ impl LauncherViewModel {
         self.selected = 0;
         self.actions_open = false;
         self.pending_plugins = false;
+        self.settings_open = false;
+        self.settings_focus = None;
         self.active = None;
         self.published = None;
     }
@@ -272,11 +342,17 @@ impl LauncherViewModel {
     /// generation begun in this session and not yet superseded. Older,
     /// never-begun, pre-first-generation and pre-dismiss publishes are
     /// discarded whole and never partially applied (spec 6.2.7).
+    ///
+    /// A publish that lands while the query is empty carries no rows at all,
+    /// whatever the host ranked for it: an untyped launcher is the query field
+    /// and nothing else, and dropping the rows here is what makes that true
+    /// for every renderer instead of only for the one that remembers to check.
     pub fn publish(&mut self, generation: Generation, rows: Vec<ResultRow>, pending_plugins: bool) {
         if !self.visible || self.active != Some(generation) {
             return;
         }
 
+        let rows: Vec<ResultRow> = if self.query.is_empty() { Vec::new() } else { rows };
         self.selected = self.resolve_selection(&rows, generation);
         // One move into a shared allocation per accepted publish; from here on
         // every frame of this result set is a refcount bump.
@@ -310,6 +386,10 @@ impl LauncherViewModel {
             selected: self.selected,
             pending_plugins: self.pending_plugins,
             actions_open: self.actions_open,
+            settings_open: self.settings_open,
+            // Shared for the same reason the rows are.
+            settings: Arc::clone(&self.settings),
+            settings_focus: self.settings_focus.clone(),
         })
     }
 
@@ -361,20 +441,34 @@ impl LauncherViewModel {
                 self.close_actions();
                 Some(effect)
             }
-            // Cancel backs out one rung at a time: it closes an open action
-            // list first, then clears a non-empty query, and closes only an
-            // already-bare launcher. Dismiss skips the ladder entirely.
+            // Opening and closing the settings surface is pure UI state, so
+            // the host has nothing to do about either; only the value behind a
+            // row is the host's to keep.
+            UiCommand::OpenSettings => {
+                self.open_settings(None);
+                None
+            }
+            UiCommand::CloseSettings => {
+                self.close_settings();
+                None
+            }
+            UiCommand::SetSetting { key, value } => Some(UiEffect::SetSetting { key, value }),
+            UiCommand::Quit => Some(UiEffect::Quit),
+            // Cancel backs out one rung at a time: it closes the settings
+            // surface first, then an open action list, then clears a non-empty
+            // query, and closes only an already-bare launcher. Dismiss skips
+            // the ladder entirely.
+            UiCommand::Cancel if self.settings_open => {
+                self.close_settings();
+                None
+            }
             UiCommand::Cancel if self.actions_open => {
                 self.close_actions();
                 None
             }
-            UiCommand::Cancel if !self.query.is_empty() => {
-                self.query.clear();
-                self.dirty = true;
-                // Clearing the query is an edit, not a blanking: the host
-                // replaces the rows, the UI keeps showing the old ones.
-                Some(UiEffect::Query(String::new()))
-            }
+            // Clearing the query is an ordinary edit, so it goes through the
+            // same path a backspace to nothing would take.
+            UiCommand::Cancel if !self.query.is_empty() => self.retype(String::new()),
             UiCommand::Cancel | UiCommand::Dismiss => {
                 self.dismiss();
                 Some(UiEffect::Dismissed)
@@ -384,6 +478,11 @@ impl LauncherViewModel {
 
     /// Applies a query edit. Retyping the identical text is not a new query
     /// state, so it changes nothing and schedules nothing.
+    ///
+    /// An edit back to the empty query drops the rows rather than leaving the
+    /// previous ones standing: an empty query shows nothing but the text
+    /// field, and a row the user cannot see must not still be the one Enter
+    /// runs.
     fn retype(&mut self, text: String) -> Option<UiEffect> {
         if self.query == text {
             return None;
@@ -393,6 +492,11 @@ impl LauncherViewModel {
         // path must not allocate, and `text` is already owned by the effect.
         self.query.clear();
         self.query.push_str(&text);
+        if self.query.is_empty() {
+            self.rows = Arc::default();
+            self.selected = 0;
+            self.actions_open = false;
+        }
         self.dirty = true;
         Some(UiEffect::Query(text))
     }
@@ -439,6 +543,63 @@ impl LauncherViewModel {
         self.rows = rows.into();
         self.dirty = true;
         true
+    }
+
+    /// Replaces what the settings surface lists.
+    ///
+    /// Accepted while hidden, unlike everything else here, because these rows
+    /// describe the host's configuration rather than a launcher session: the
+    /// host publishes them at startup and again after each write, and the
+    /// launcher must already know them the first time it is shown.
+    pub fn set_settings(&mut self, settings: Vec<SettingRow>) {
+        if *self.settings == *settings {
+            return;
+        }
+
+        self.settings = settings.into();
+        // A hidden launcher has no frame to dirty; the next activation carries
+        // the new rows anyway.
+        self.dirty |= self.visible;
+    }
+
+    /// The settings the surface would list right now.
+    pub fn settings(&self) -> &[SettingRow] {
+        &self.settings
+    }
+
+    pub fn is_settings_open(&self) -> bool {
+        self.settings_open
+    }
+
+    /// Shows the settings surface, optionally putting the keyboard in the
+    /// editor for `focus_key` (spec 6.3).
+    ///
+    /// The host opens it directly when something is misconfigured — an
+    /// activation hotkey that would not register, say — so the user lands on
+    /// the row that needs their attention instead of being told to go looking
+    /// for it. Reopening an open surface still re-aims the focus, because the
+    /// second reason to open it need not be the first one.
+    pub fn open_settings(&mut self, focus_key: Option<&str>) {
+        let focus = focus_key.map(str::to_owned);
+        if self.settings_open && self.settings_focus == focus {
+            return;
+        }
+
+        self.settings_open = true;
+        self.settings_focus = focus;
+        self.dirty |= self.visible;
+    }
+
+    /// Hides the settings surface, leaving the query and the rows alone. An
+    /// already closed surface is not a change, so this produces no frame.
+    pub fn close_settings(&mut self) {
+        if !self.settings_open {
+            return;
+        }
+
+        self.settings_open = false;
+        self.settings_focus = None;
+        self.dirty |= self.visible;
     }
 
     /// Opens the action list of the selected row (spec 6.3).

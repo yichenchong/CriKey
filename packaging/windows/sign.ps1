@@ -56,7 +56,7 @@
 
 .EXAMPLE
     $env:CRIKEY_WINDOWS_CERT_THUMBPRINT = 'A1B2...'
-    .\packaging\windows\sign.ps1 -Path .\CriKey-0.1.0-x64.msi
+    .\packaging\windows\sign.ps1 -Path .\CriKey-<version>-x64.msi
 #>
 
 [CmdletBinding()]

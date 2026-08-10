@@ -721,6 +721,11 @@ impl QueryPipeline {
             selected: 0,
             pending_plugins,
             actions_open: false,
+            // A pipeline frame carries results, never the launcher's own
+            // settings: the panel is host state that no query can open or fill.
+            settings_open: false,
+            settings: Arc::default(),
+            settings_focus: None,
         })
     }
 

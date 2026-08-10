@@ -1909,6 +1909,9 @@ impl NativeDriver {
                                 selected: *selected,
                                 pending_plugins: *builtin_pending || frame.pending_plugins,
                                 actions_open: false,
+                                settings_open: false,
+                                settings: Arc::default(),
+                                settings_focus: None,
                             };
                             *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) =
                                 Some(merged.clone());
@@ -1943,6 +1946,9 @@ impl NativeDriver {
                         selected: job.selected,
                         pending_plugins: pending,
                         actions_open: false,
+                        settings_open: false,
+                        settings: Arc::default(),
+                        settings_focus: None,
                     };
 
                     // Hold the mailbox lock across the staleness check and the

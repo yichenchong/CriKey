@@ -1631,6 +1631,9 @@ impl LegacyDriver {
                         selected: job.selected,
                         pending_plugins: pending,
                         actions_open: false,
+                        settings_open: false,
+                        settings: Arc::default(),
+                        settings_focus: None,
                     };
 
                     // Keep the staleness check, queued-job check, and

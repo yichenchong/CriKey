@@ -56,15 +56,30 @@
 //! * `ViewModel::actions_open` carries the action list of the selected row.
 //!   `ShowActions` opens it when that row has alternate actions and does
 //!   nothing when it has none; selection movement, a publish, an execution and
-//!   dismissal close it. `Cancel` is a ladder: it closes an open action list
-//!   first, then clears a non-empty query, and only then dismisses (spec 6.3).
+//!   dismissal close it. `Cancel` is a ladder: it closes the settings surface
+//!   first, then an open action list, then clears a non-empty query, and only
+//!   then dismisses (spec 6.3).
+//! * An empty query carries no rows. A publish that lands while the query is
+//!   empty is accepted with its rows dropped, and an edit back to the empty
+//!   query drops the rows that were standing: an untyped launcher is the query
+//!   field and nothing else.
+//! * `set_settings(Vec<SettingRow>)` describes the settings surface and is the
+//!   one mutator a hidden launcher accepts, because it carries the host's
+//!   configuration rather than a launcher session. `open_settings(Option<&str>)`
+//!   shows the surface, optionally aiming the keyboard at one key, and
+//!   `close_settings()` hides it; `dismiss()` closes the surface but keeps the
+//!   rows. `SetSetting` and `Quit` are the host's work and surface as
+//!   `UiEffect::SetSetting` and `UiEffect::Quit`, while `OpenSettings` and
+//!   `CloseSettings` are pure UI state and produce no effect.
 //! * Existing `ResultRow`, `ViewModel`, `UiCommand` and `LauncherWindow` stay
 //!   source-compatible: a frame is presentable through `LauncherWindow` as is.
 
 use std::sync::Arc;
 
 use crikey_core::{Action, ActionId, Category, ExecutionPolicy, Generation, GenerationTracker, ItemId};
-use crikey_ui::{LauncherViewModel, LauncherWindow, ResultRow, UiCommand, UiEffect, ViewModel, PAGE_SIZE};
+use crikey_ui::{
+    LauncherViewModel, LauncherWindow, ResultRow, SettingRow, UiCommand, UiEffect, ViewModel, PAGE_SIZE,
+};
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -161,12 +176,21 @@ fn fresh_generation() -> Generation {
     GenerationTracker::new().advance()
 }
 
+/// What the fixtures type before they publish rows.
+///
+/// Publishing into an empty query is not a state the launcher can be in: an
+/// untyped launcher is the query field and nothing else, so `publish` drops
+/// the rows. Every fixture that wants a result list types first, exactly as a
+/// user must.
+const FIXTURE_QUERY: &str = "fix";
+
 /// A visible launcher with `ids` published for `generation`. Activation, the
-/// generation change and the publish all coalesce, so the caller drains exactly
-/// one frame.
+/// typed query, the generation change and the publish all coalesce, so the
+/// caller drains exactly one frame.
 fn open_showing(generation: Generation, ids: &[&str]) -> LauncherViewModel {
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(generation);
     view_model.publish(generation, rows(ids), false);
     view_model
@@ -190,6 +214,7 @@ fn rows_with_alternates(ids: &[&str]) -> Vec<ResultRow> {
 fn open_showing_actions(generation: Generation, ids: &[&str]) -> LauncherViewModel {
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(generation);
     view_model.publish(generation, rows_with_alternates(ids), false);
     assert!(
@@ -326,6 +351,7 @@ fn the_same_launcher_survives_repeated_activation_cycles() {
         view_model.activate();
         assert!(view_model.is_visible());
 
+        let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
         view_model.begin_generation(generation);
         view_model.publish(generation, rows(&[id.as_str()]), false);
 
@@ -521,6 +547,7 @@ fn page_navigation_moves_a_whole_page_and_clamps_without_wrapping() {
 
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(generation);
     view_model.publish(generation, numbered_rows(count), false);
     assert_eq!(expect_frame(&mut view_model).selected, 0);
@@ -631,6 +658,7 @@ fn publishing_before_the_first_generation_is_ignored() {
     view_model.publish(generation, rows(&["ghost"]), true);
     expect_idle(&mut view_model);
 
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(generation);
     view_model.publish(generation, rows(&["alpha"]), false);
     assert_eq!(row_ids(&expect_frame(&mut view_model)), vec!["alpha"]);
@@ -717,6 +745,7 @@ fn several_publishes_coalesce_into_one_frame_carrying_the_newest_state() {
     let generation = fresh_generation();
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(generation);
 
     view_model.publish(generation, rows(&["alpha"]), true);
@@ -781,6 +810,7 @@ fn execute_default_is_rejected_when_the_selected_row_has_no_default_action() {
     let generation = fresh_generation();
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(generation);
 
     let mut without_default = row("alpha");
@@ -797,6 +827,7 @@ fn execute_alternate_runs_the_indexed_alternate_action() {
     let generation = fresh_generation();
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(generation);
 
     let mut alpha = row("alpha");
@@ -820,6 +851,7 @@ fn execute_alternate_out_of_range_is_rejected() {
     let generation = fresh_generation();
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(generation);
 
     let mut alpha = row("alpha");
@@ -891,10 +923,9 @@ fn cancel_clears_a_non_empty_query_without_dismissing() {
     assert!(view_model.is_visible());
     let model = expect_frame(&mut view_model);
     assert_eq!(model.query, "");
-    assert_eq!(
-        row_ids(&model),
-        vec!["alpha", "beta"],
-        "clearing the query is an edit: the host replaces the rows, the UI never blanks them"
+    assert!(
+        model.rows.is_empty(),
+        "an empty query shows nothing but the text field, so clearing it drops the rows"
     );
 }
 
@@ -902,6 +933,11 @@ fn cancel_clears_a_non_empty_query_without_dismissing() {
 fn cancel_on_an_empty_query_dismisses_the_launcher() {
     let generation = fresh_generation();
     let mut view_model = open_showing(generation, &["alpha", "beta"]);
+    // The first press only empties the query; the launcher is bare after it.
+    assert_eq!(
+        view_model.apply(UiCommand::Cancel),
+        Some(UiEffect::Query(String::new()))
+    );
     let _ = expect_frame(&mut view_model);
 
     assert_eq!(view_model.apply(UiCommand::Cancel), Some(UiEffect::Dismissed));
@@ -1054,6 +1090,7 @@ fn published_rows_reach_the_frame_with_every_display_field_intact() {
 
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(generation);
     view_model.publish(generation, vec![decorated], false);
 
@@ -1128,6 +1165,7 @@ fn frames_present_through_the_launcher_window_contract_once_per_batch() {
 
     view_model.activate();
     window.show();
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(generation);
     view_model.publish(generation, rows(&["alpha"]), true);
     view_model.publish(generation, rows(&["alpha", "beta"]), true);
@@ -1142,7 +1180,7 @@ fn frames_present_through_the_launcher_window_contract_once_per_batch() {
         window.presented,
         vec![(
             generation.get(),
-            String::new(),
+            FIXTURE_QUERY.to_owned(),
             vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
             0
         )],
@@ -1196,6 +1234,7 @@ fn a_publish_for_the_pre_dismiss_generation_never_reaches_the_reopened_launcher(
 
     // Only a strictly newer generation fills the new session's list, and the
     // retired generation stays rejected right beside it.
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(reopened);
     view_model.publish(closed_over, rows(&["ghost-four"]), true);
     view_model.publish(reopened, rows(&["fresh"]), false);
@@ -1215,6 +1254,7 @@ fn dismissing_while_results_are_outstanding_leaves_the_next_session_idle() {
 
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(outstanding);
     assert!(expect_frame(&mut view_model).pending_plugins);
 
@@ -1447,7 +1487,10 @@ fn cancel_takes_three_presses_to_close_a_launcher_with_an_open_action_list() {
     );
     let model = expect_frame(&mut view_model);
     assert_eq!(model.query, "");
-    assert_eq!(row_ids(&model), vec!["alpha"]);
+    assert!(
+        model.rows.is_empty(),
+        "the cleared query leaves the launcher bare, so nothing is left to list"
+    );
     assert!(view_model.is_visible());
 
     // Rung three: the launcher closes.
@@ -1456,16 +1499,25 @@ fn cancel_takes_three_presses_to_close_a_launcher_with_an_open_action_list() {
 }
 
 #[test]
-fn cancel_closes_an_open_action_list_before_it_dismisses_an_empty_launcher() {
+fn cancel_closes_an_open_action_list_before_it_clears_the_query() {
     let generation = fresh_generation();
     let mut view_model = open_showing_actions(generation, &["alpha"]);
 
     assert_eq!(view_model.apply(UiCommand::Cancel), None);
     assert!(
         view_model.is_visible(),
-        "the first Cancel spends itself on the action list, empty query or not"
+        "the first Cancel spends itself on the action list, whatever else is showing"
     );
-    assert!(!expect_frame(&mut view_model).actions_open);
+    let model = expect_frame(&mut view_model);
+    assert!(!model.actions_open);
+    assert_eq!(model.query, FIXTURE_QUERY);
+
+    assert_eq!(
+        view_model.apply(UiCommand::Cancel),
+        Some(UiEffect::Query(String::new()))
+    );
+    assert!(view_model.is_visible());
+    let _ = expect_frame(&mut view_model);
 
     assert_eq!(view_model.apply(UiCommand::Cancel), Some(UiEffect::Dismissed));
     assert!(!view_model.is_visible());
@@ -1598,6 +1650,7 @@ fn a_query_of_multi_byte_characters_survives_editing_and_completion() {
     let generation = fresh_generation();
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
+    let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
     view_model.begin_generation(generation);
 
     // Two-, three- and four-byte characters, plus one that is several code
@@ -1637,4 +1690,185 @@ fn a_query_of_multi_byte_characters_survives_editing_and_completion() {
     );
     assert_eq!(expect_frame(&mut view_model).query, "");
     assert!(view_model.is_visible());
+}
+
+// ---------------------------------------------------------------------------
+// The untyped launcher (owner report: an empty query listed suggestions).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_publish_for_an_empty_query_carries_no_rows() {
+    let generation = fresh_generation();
+    let mut view_model = LauncherViewModel::new();
+    view_model.activate();
+    view_model.begin_generation(generation);
+
+    // Whatever the host ranked for an untyped launcher, the model refuses to
+    // carry it: the window is the query field and nothing else until the user
+    // types.
+    view_model.publish(generation, rows(&["alpha", "beta"]), false);
+
+    let model = expect_frame(&mut view_model);
+    assert_eq!(model.query, "");
+    assert!(model.rows.is_empty());
+    assert_eq!(model.selected, 0);
+}
+
+#[test]
+fn emptying_the_query_drops_the_rows_it_was_showing() {
+    let generation = fresh_generation();
+    let mut view_model = open_showing(generation, &["alpha", "beta"]);
+    assert_eq!(row_ids(&expect_frame(&mut view_model)), vec!["alpha", "beta"]);
+
+    assert_eq!(
+        view_model.apply(UiCommand::SetQuery(String::new())),
+        Some(UiEffect::Query(String::new()))
+    );
+
+    let model = expect_frame(&mut view_model);
+    assert!(model.rows.is_empty());
+    assert_eq!(
+        view_model.apply(UiCommand::ExecuteDefault),
+        None,
+        "a row the user can no longer see must not still be the one Enter runs"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Settings surface (owner report: nowhere to configure anything, nowhere to
+// quit).
+// ---------------------------------------------------------------------------
+
+fn setting(key: &str, value: &str) -> SettingRow {
+    SettingRow {
+        key: key.to_owned(),
+        label: key.to_owned(),
+        value: value.to_owned(),
+        source: "default".to_owned(),
+    }
+}
+
+#[test]
+fn the_settings_the_host_published_reach_the_frame() {
+    let generation = fresh_generation();
+    let mut view_model = open_showing(generation, &["alpha"]);
+    let model = expect_frame(&mut view_model);
+    assert!(!model.settings_open);
+    assert!(model.settings.is_empty());
+
+    view_model.set_settings(vec![setting("launcher.activation-hotkey", "Ctrl+Alt+Space")]);
+
+    let model = expect_frame(&mut view_model);
+    assert_eq!(model.settings.len(), 1);
+    assert_eq!(model.settings[0].key, "launcher.activation-hotkey");
+    assert_eq!(model.settings[0].value, "Ctrl+Alt+Space");
+    assert!(
+        !model.settings_open,
+        "publishing the settings must not open the surface over the user's search"
+    );
+
+    // Republishing the same rows is not a change and produces no frame.
+    view_model.set_settings(vec![setting("launcher.activation-hotkey", "Ctrl+Alt+Space")]);
+    expect_idle(&mut view_model);
+}
+
+#[test]
+fn settings_published_before_the_first_activation_are_already_there_when_it_opens() {
+    let mut view_model = LauncherViewModel::new();
+    // The host reads its configuration long before the first hotkey press.
+    view_model.set_settings(vec![setting("launcher.activation-hotkey", "Ctrl+Alt+Space")]);
+    expect_idle(&mut view_model);
+
+    view_model.activate();
+
+    let model = expect_frame(&mut view_model);
+    assert_eq!(model.settings.len(), 1);
+}
+
+#[test]
+fn the_host_can_open_the_settings_surface_on_the_row_it_needs_answered() {
+    let mut view_model = LauncherViewModel::new();
+    view_model.set_settings(vec![setting("launcher.activation-hotkey", "Ctrl+Alt+Space")]);
+    view_model.activate();
+    let _ = expect_frame(&mut view_model);
+
+    view_model.open_settings(Some("launcher.activation-hotkey"));
+
+    let model = expect_frame(&mut view_model);
+    assert!(model.settings_open);
+    assert_eq!(
+        model.settings_focus.as_deref(),
+        Some("launcher.activation-hotkey")
+    );
+}
+
+#[test]
+fn escape_closes_the_settings_surface_instead_of_dismissing_the_launcher() {
+    let generation = fresh_generation();
+    let mut view_model = open_showing(generation, &["alpha"]);
+    let _ = expect_frame(&mut view_model);
+
+    assert_eq!(
+        view_model.apply(UiCommand::OpenSettings),
+        None,
+        "opening the settings surface is pure UI state and schedules no host work"
+    );
+    assert!(expect_frame(&mut view_model).settings_open);
+
+    // Escape reaches the model as Cancel, and the surface is the topmost rung
+    // of the ladder.
+    assert_eq!(view_model.apply(UiCommand::Cancel), None);
+
+    let model = expect_frame(&mut view_model);
+    assert!(!model.settings_open);
+    assert!(
+        view_model.is_visible(),
+        "closing the panel must not close the launcher"
+    );
+    assert_eq!(
+        model.query, FIXTURE_QUERY,
+        "the query the surface was opened over survives it"
+    );
+    assert_eq!(row_ids(&model), vec!["alpha"]);
+}
+
+#[test]
+fn an_edited_setting_and_the_quit_control_are_the_hosts_work() {
+    let generation = fresh_generation();
+    let mut view_model = open_showing(generation, &["alpha"]);
+    let _ = expect_frame(&mut view_model);
+
+    assert_eq!(
+        view_model.apply(UiCommand::SetSetting {
+            key: "launcher.activation-hotkey".to_owned(),
+            value: "Ctrl+Shift+Space".to_owned(),
+        }),
+        Some(UiEffect::SetSetting {
+            key: "launcher.activation-hotkey".to_owned(),
+            value: "Ctrl+Shift+Space".to_owned(),
+        }),
+        "the UI neither stores nor validates a setting: the host does both"
+    );
+
+    assert_eq!(view_model.apply(UiCommand::Quit), Some(UiEffect::Quit));
+}
+
+#[test]
+fn dismissal_closes_the_settings_surface_but_keeps_the_settings() {
+    let mut view_model = LauncherViewModel::new();
+    view_model.set_settings(vec![setting("launcher.activation-hotkey", "Ctrl+Alt+Space")]);
+    view_model.activate();
+    view_model.open_settings(None);
+    assert!(expect_frame(&mut view_model).settings_open);
+
+    view_model.dismiss();
+    view_model.activate();
+
+    let model = expect_frame(&mut view_model);
+    assert!(!model.settings_open);
+    assert_eq!(
+        model.settings.len(),
+        1,
+        "the rows describe the host's configuration, not this session"
+    );
 }

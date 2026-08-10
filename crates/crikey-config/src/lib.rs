@@ -69,9 +69,9 @@ pub use remote_catalog::{
 };
 pub use snapshot::ConfigurationSnapshot;
 pub use store::{
-    administrator_policy_path, ConfigStore, BUILT_IN_DEFAULTS, KEY_COALESCE_MS, KEY_MAXIMUM_WAIT_MS,
-    KEY_MAX_RESULTS, KEY_PROFILE, KEY_RELOAD_INTERVAL_MS, PLUGIN_DIRECTORY, POLICY_FILE, PROFILE_DIRECTORY,
-    USER_CONFIG_FILE,
+    administrator_policy_path, ConfigStore, BUILT_IN_DEFAULTS, KEY_ACTIVATION_HOTKEY, KEY_COALESCE_MS,
+    KEY_MAXIMUM_WAIT_MS, KEY_MAX_RESULTS, KEY_PROFILE, KEY_RELOAD_INTERVAL_MS, PLUGIN_DIRECTORY, POLICY_FILE,
+    PROFILE_DIRECTORY, USER_CONFIG_FILE,
 };
 pub use watch::ConfigSourceWatch;
 

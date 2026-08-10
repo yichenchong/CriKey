@@ -15,6 +15,7 @@ mod modern_commands;
 mod native_commands;
 mod package_commands;
 mod plugin_commands;
+mod settings;
 
 use crikey_app::{
     admitted_plugin_roots, ActionSubmission, App, BatchState, DefaultCatalogFetcher, DisabledPlugins,
@@ -50,10 +51,12 @@ const USAGE: &str = "\
 crikey - a fast, keyboard-driven application launcher
 
 USAGE:
+    crikey                          Start the resident launcher
     crikey <COMMAND> [ARGS]
 
 COMMANDS:
     run                             Start the launcher (use `crikey run --help`)
+    settings                        Launcher settings (use `crikey settings --help`)
     plugin                          Plugin management (use `crikey plugin --help`)
     config                          Configuration inspection (use `crikey config --help`)
     catalog                         Remote catalog sources (use `crikey catalog --help`)
@@ -82,8 +85,6 @@ fn pipeline_profile(profile: crikey_plugin_model::SchedulingProfile) -> Scheduli
         crikey_plugin_model::SchedulingProfile::Modern => SchedulingProfile::Modern,
     }
 }
-#[cfg(any(windows, target_os = "linux"))]
-const DEFAULT_ACTIVATION_HOTKEY: &str = "Ctrl+Alt+Space";
 
 const RUN_USAGE: &str = "\
 crikey run - start the launcher
@@ -162,10 +163,15 @@ pub fn start_launcher() -> ExitCode {
 
 fn dispatch(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
-        None => {
-            print!("{USAGE}");
-            ExitCode::SUCCESS
-        }
+        // Bare `crikey` starts the launcher rather than printing usage. The
+        // first Windows hand test double-clicked `crikey.exe` from Explorer,
+        // got the usage text in a console window that closed with the process,
+        // and read a program working exactly as designed as a broken one. The
+        // usage text is still one `--help` away, which is where someone looking
+        // for it types anyway. `Desktop` rather than `Console` for the same
+        // reason: a launch started by a double-click has nowhere to show a
+        // fatal error, so it also needs the startup log and the dialog.
+        None => run_launcher(&[], LaunchSurface::Desktop),
         Some("help") if args.len() == 1 => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -206,6 +212,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         Some("package") => package_commands::run(&args[1..]),
         Some("plugin") => plugin_commands::run(&args[1..]),
         Some("config") => config_commands::run(&args[1..]),
+        Some("settings") => settings::run(&args[1..]),
         Some("catalog") => catalog_commands::run(&args[1..]),
         Some(other) => {
             eprintln!("crikey: unknown command `{other}`\n\n{USAGE}");
@@ -319,35 +326,35 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
 
     // The global activation hotkey, and with it the launcher's reachability
     // after a dismiss. Registration fails when another application already owns
-    // the accelerator, which is a conflict on the operator's desktop and not a
-    // fault in this launch: on both platforms it is reported and the launch
-    // continues with the window that is already on screen, because refusing to
-    // start would let any program that grabbed Ctrl+Alt+Space first take the
-    // launcher away entirely. `has_activation_source` carries the consequence
-    // to the event loop: the dismiss and execute arms exit the process instead
-    // of hiding the window, since a hidden launcher no key combination can
-    // raise is one the operator can neither use nor see to quit.
-    #[cfg(any(windows, target_os = "linux"))]
-    let has_activation_source = {
-        let hotkey_handle = render_handle.clone();
-        match search.register_activation_hotkey(
-            DEFAULT_ACTIVATION_HOTKEY,
-            Box::new(move |_| {
-                let _ = hotkey_handle.request_toggle();
-            }),
-        ) {
-            Ok(()) => true,
-            Err(error) => {
-                eprintln!(
-                    "crikey: global activation hotkey {DEFAULT_ACTIVATION_HOTKEY} unavailable: \
-                     {error}; this launch ends when the window is dismissed"
-                );
-                false
+    // the accelerator, which is a conflict on the user's desktop and not a
+    // fault in this launch: it is reported and the launch continues, because
+    // refusing to start would let any program that grabbed Ctrl+Alt+Space first
+    // take the launcher away entirely.
+    //
+    // The refusal no longer shortens the process's life. It used to: the
+    // dismiss and execute arms exited instead of hiding, on the theory that a
+    // hidden launcher nothing can raise is worse than none. What that produced
+    // in practice was a launcher that vanished on the first Escape with no
+    // explanation. The reason is carried to the view model below instead, which
+    // opens the settings panel on the hotkey row so the user can pick a chord
+    // that is free.
+    let mut activation_hotkey = settings::ActivationHotkey::default();
+    let hotkey_accelerator =
+        settings::configured_hotkey(configuration.as_ref().map(|configuration| &configuration.store));
+    let hotkey_refusal = {
+        let mut registrar = settings::PlatformHotkeys {
+            search: &mut search,
+            handle: render_handle.clone(),
+        };
+        match activation_hotkey.bind(&mut registrar, &hotkey_accelerator) {
+            Ok(None) => None,
+            Ok(Some(warning)) => {
+                eprintln!("crikey: {warning}");
+                None
             }
+            Err(reason) => Some(reason),
         }
     };
-    #[cfg(not(any(windows, target_os = "linux")))]
-    let has_activation_source = false;
 
     search
         .complete_stage(StartupStage::WindowAndHotkey)
@@ -532,7 +539,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     // the same frame into its retained view model on its next turn.
     let legacy_publish_handle = render_handle.clone();
     let legacy_driver = LegacyDriver::spawn(legacy_provider, legacy_pipeline, move |frame| {
-        let _ = legacy_publish_handle.submit_frame(frame);
+        let _ = legacy_publish_handle.submit_results(frame);
     });
 
     // Modern python plugins join the same live query path, driven off the UI
@@ -579,7 +586,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     // or dead child interpreter can never block it.
     let modern_publish_handle = render_handle.clone();
     let modern_driver = ModernDriver::spawn(modern_provider, modern_pipeline, move |frame| {
-        let _ = modern_publish_handle.submit_frame(frame);
+        let _ = modern_publish_handle.submit_results(frame);
     });
 
     // Native plugins use the same asynchronous query boundary as the legacy
@@ -620,7 +627,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         native_provider,
         native_pipeline,
         Box::new(move |frame| {
-            let _ = native_publish_handle.submit_frame(frame);
+            let _ = native_publish_handle.submit_results(frame);
         }),
     );
     // Plugin-owned actions use the same exact-owner endpoints and budget
@@ -672,6 +679,23 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     // there. Readiness is therefore recorded by the callback below, on the
     // first event the loop actually delivers - see `ready_on_first_event`.
     let mut view_model = LauncherViewModel::new();
+    // The settings panel has content before the user opens it, because the one
+    // occasion it opens by itself is a hotkey that could not be bound — and a
+    // panel that came up empty on exactly that occasion would be no better than
+    // the silence it replaces.
+    view_model.set_settings(settings::rows(
+        configuration.as_ref().map(|configuration| &configuration.store),
+    ));
+    if let Some(reason) = hotkey_refusal {
+        let diagnostic = settings::surface_hotkey_failure(&mut view_model, &hotkey_accelerator, &reason);
+        eprintln!("{diagnostic}");
+        // Also durable: `crikey-launcher` is GUI-subsystem on Windows, so that
+        // stderr line went nowhere, and this is precisely the failure nobody
+        // can diagnose from the outside afterwards.
+        if let Err(error) = append_startup_log(&diagnostic) {
+            eprintln!("crikey: the startup log could not be written: {error}");
+        }
+    }
     let mut retained = RetainedRows::default();
     // Per-plugin refusal totals already reported, so a growing counter is
     // announced once per increase rather than on every turn of the loop.
@@ -690,6 +714,33 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             if let Some(configuration) = configuration.as_mut() {
                 if let Some(state) = configuration.poll(Instant::now()) {
                     publish_configuration(&modern_driver, &native_driver, state);
+                }
+                // A hand edit to `config.toml` changes the accelerator exactly
+                // as the settings panel does, so the binding follows the file
+                // too. Gated on an actual reload rather than run every turn:
+                // rebuilding the rows on each event would allocate three
+                // strings per keystroke and mark a visible frame dirty for a
+                // panel nothing changed. `is_current` then keeps a chord the
+                // platform has already refused from being re-attempted on every
+                // subsequent reload.
+                if configuration.take_reloaded() {
+                    let configured = settings::configured_hotkey(Some(&configuration.store));
+                    if !activation_hotkey.is_current(&configured) {
+                        let mut registrar = settings::PlatformHotkeys {
+                            search: &mut search,
+                            handle: render_handle.clone(),
+                        };
+                        match activation_hotkey.bind(&mut registrar, &configured) {
+                            Ok(None) => {}
+                            Ok(Some(warning)) => eprintln!("crikey: {warning}"),
+                            Err(reason) => eprintln!(
+                                "crikey: {configured} could not be registered ({reason}); {} \
+                                 stays in force",
+                                activation_hotkey.bound().unwrap_or("no activation hotkey")
+                            ),
+                        }
+                    }
+                    view_model.set_settings(settings::rows(Some(&configuration.store)));
                 }
             }
             // Remote catalog sources (spec 2.2, ADR-0016). Both calls return
@@ -835,6 +886,10 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 }
             };
 
+            // Read before the match consumes the effect: the window and the
+            // process are one decision made in one place, so no arm can grow
+            // its own private answer to "does this end the launcher".
+            let disposition = effect.as_ref().and_then(settings::residency);
             match effect {
                 Some(UiEffect::Query(raw)) => {
                     // Both ranking inputs are refreshed immediately before the
@@ -917,15 +972,34 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         }
                     }
                 }
-                Some(UiEffect::Dismissed) => {
-                    if let Some(session) = command_session {
-                        let _ = render_handle.request_hide_session(session);
-                    }
-                    // Without a registered reactivation source, retaining a
-                    // hidden process would make the launcher unreachable.
-                    if !has_activation_source {
-                        let _ = render_handle.request_exit();
-                    }
+                // Hiding is the shared disposition below; the arm itself has
+                // nothing left to do.
+                Some(UiEffect::Dismissed) => {}
+                Some(UiEffect::Quit) => {}
+                Some(UiEffect::SetSetting { key, value }) => {
+                    let report = {
+                        let mut registrar = settings::PlatformHotkeys {
+                            search: &mut search,
+                            handle: render_handle.clone(),
+                        };
+                        settings::apply_setting(
+                            configuration
+                                .as_mut()
+                                .map(|configuration| &mut configuration.store),
+                            &mut activation_hotkey,
+                            &mut registrar,
+                            &key,
+                            &value,
+                        )
+                    };
+                    // Republished from the store rather than patched from the
+                    // value that was typed: a refused edit, or one a higher
+                    // layer outranks, must leave the panel showing what the
+                    // launcher will actually do.
+                    view_model.set_settings(settings::rows(
+                        configuration.as_ref().map(|configuration| &configuration.store),
+                    ));
+                    eprintln!("crikey: {report}");
                 }
                 Some(UiEffect::Execute { item, action }) => match search.execute(&item, &action) {
                     Ok(ActionSubmission::Completed) => {
@@ -936,9 +1010,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         view_model.dismiss();
                         if let Some(session) = command_session {
                             let _ = render_handle.request_hide_session(session);
-                        }
-                        if !has_activation_source {
-                            let _ = render_handle.request_exit();
                         }
                     }
                     Ok(ActionSubmission::Pending(request_id)) => {
@@ -952,6 +1023,24 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         report_status(&mut view_model, format!("Launch failed: {error}"));
                     }
                 },
+                None => {}
+            }
+
+            // The launcher is resident: a dismiss hides the window and the
+            // process goes on waiting for its activation hotkey, and only an
+            // explicit quit tears it down. Exiting here is what releases the
+            // launcher lock and joins every provider supervisor, so quitting
+            // through the event loop rather than the process leaves nothing
+            // behind for the next launch to trip over.
+            match disposition {
+                Some(settings::Residency::Hide) => {
+                    if let Some(session) = command_session {
+                        let _ = render_handle.request_hide_session(session);
+                    }
+                }
+                Some(settings::Residency::Exit) => {
+                    let _ = render_handle.request_exit();
+                }
                 None => {}
             }
 
@@ -1111,6 +1200,15 @@ struct LauncherConfiguration {
     session_overrides: Vec<(String, String)>,
     reload_interval: Duration,
     checked: Instant,
+    /// Set when a reload replaced [`Self::store`], and cleared by
+    /// [`Self::take_reloaded`].
+    ///
+    /// The launcher's own settings — the activation hotkey among them — are not
+    /// published to plugins, so they are invisible to the publisher's coalesced
+    /// state and need their own edge. One flag rather than a comparison of the
+    /// two stores: the question is "did the file change", and the file changing
+    /// is exactly what this records.
+    reloaded: bool,
 }
 
 impl LauncherConfiguration {
@@ -1137,11 +1235,17 @@ impl LauncherConfiguration {
             publisher,
             session_overrides: session_overrides.to_vec(),
             checked: Instant::now(),
+            reloaded: false,
         })
     }
 
     fn seed(&mut self, now: Instant) {
         self.publisher.observe(self.store.configuration_snapshot(), now);
+    }
+
+    /// Whether the store has been replaced since this was last asked.
+    fn take_reloaded(&mut self) -> bool {
+        std::mem::take(&mut self.reloaded)
     }
 
     fn poll(&mut self, now: Instant) -> Option<crikey_app::PluginConfiguration> {
@@ -1157,6 +1261,7 @@ impl LauncherConfiguration {
                         self.watch = reloaded.watch;
                         self.reload_interval = reloaded.reload_interval;
                         self.seed(now);
+                        self.reloaded = true;
                     }
                     Err(message) => {
                         eprintln!(
@@ -2480,6 +2585,14 @@ mod tests {
             .expect("the built-in provider registers once");
         let mut view_model = LauncherViewModel::new();
         view_model.activate();
+        // The launcher only reaches `begin_generation` from the query effect,
+        // so by then the view model already holds the text. Publishing under an
+        // empty query presents nothing at all — that is the empty-query rule,
+        // not the intake path this test is about.
+        assert_eq!(
+            view_model.apply(crikey_ui::UiCommand::SetQuery("fire".to_owned())),
+            Some(UiEffect::Query("fire".to_owned()))
+        );
         view_model.begin_generation(search_generation);
 
         let frame = drive_application_provider(&mut pipeline, &owner, "fire", result_items, 17)

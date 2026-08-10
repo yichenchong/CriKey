@@ -2,7 +2,7 @@
 
 mod support;
 
-use crikey_config::ConfigLayer;
+use crikey_config::{ConfigLayer, KEY_ACTIVATION_HOTKEY};
 use crikey_core::PluginId;
 use crikey_plugin_model::SchedulingProfile;
 use support::Fixture;
@@ -171,4 +171,56 @@ fn saving_creates_the_configuration_directory_when_it_does_not_exist_yet() {
     store.set_plugin_enabled(&example(), false);
     store.save().expect("save recreates the directory");
     assert!(fixture.config_dir().join("config.toml").exists());
+}
+
+#[test]
+fn the_activation_hotkey_has_a_default_a_fresh_machine_can_read() {
+    // The launcher binds this chord at startup. On a machine with no
+    // configuration at all the user still has to be able to find out what it
+    // is, so the default is a value the store supplies rather than a constant
+    // buried in the host.
+    let fixture = Fixture::new("hotkey-default");
+    let store = fixture.load().expect("an empty tree loads");
+    assert_eq!(store.get(KEY_ACTIVATION_HOTKEY), Some("Ctrl+Alt+Space"));
+    assert_eq!(
+        store.layer_of(KEY_ACTIVATION_HOTKEY),
+        Some(ConfigLayer::BuiltInDefaults)
+    );
+}
+
+#[test]
+fn a_written_activation_hotkey_survives_a_save_and_reload_in_the_user_global_layer() {
+    let fixture = Fixture::new("hotkey-roundtrip");
+    let mut store = fixture.load().expect("an empty tree loads");
+    store.set_user_global(KEY_ACTIVATION_HOTKEY, "Ctrl+Shift+P");
+    store.save().expect("the user file can be written");
+
+    let reloaded = fixture.load().expect("the saved file is valid");
+    assert_eq!(reloaded.get(KEY_ACTIVATION_HOTKEY), Some("Ctrl+Shift+P"));
+    assert_eq!(
+        reloaded.layer_of(KEY_ACTIVATION_HOTKEY),
+        Some(ConfigLayer::UserGlobal)
+    );
+}
+
+#[test]
+fn a_user_global_write_does_not_override_the_layers_above_it() {
+    // The settings surface writes one layer, not the winning value. The
+    // selected profile outranks the user's global file, so a panel that
+    // reported its own write as effective would tell the user their launcher
+    // now answers to a chord it does not answer to.
+    let fixture = Fixture::new("user-global-outranked");
+    fixture.user_global("[launcher]\nprofile = \"work\"\n");
+    fixture.profile("work", "[launcher]\nactivation-hotkey = \"Ctrl+Alt+K\"\n");
+    let mut store = fixture.load().expect("every fixture file is valid");
+    store.set_user_global(KEY_ACTIVATION_HOTKEY, "Ctrl+Shift+P");
+    store.save().expect("write");
+
+    let reloaded = fixture.load().expect("read back");
+    assert_eq!(reloaded.get(KEY_ACTIVATION_HOTKEY), Some("Ctrl+Alt+K"));
+    assert_eq!(
+        reloaded.layer_of(KEY_ACTIVATION_HOTKEY),
+        Some(ConfigLayer::Profile),
+        "the user's write is persisted but does not win"
+    );
 }

@@ -2017,6 +2017,9 @@ impl ModernDriver {
                         selected: job.selected,
                         pending_plugins: pending,
                         actions_open: false,
+                        settings_open: false,
+                        settings: Arc::default(),
+                        settings_focus: None,
                     };
 
                     // A late answer must never appear under a newer generation.

@@ -4,7 +4,7 @@ use crikey_core::{Generation, ItemId};
 use crikey_platform::IconImage;
 use crikey_ui::{
     build_launcher_frame, create_launcher_context, egui, ActivationLatencyTracker, NativeLauncher,
-    NativeLauncherConfig, NativeLauncherHandle, RendererError, ResultRow, ViewModel,
+    NativeLauncherConfig, NativeLauncherHandle, RendererError, ResultRow, SettingRow, UiCommand, ViewModel,
     ACTIVATION_SAMPLE_CAPACITY,
 };
 
@@ -16,6 +16,9 @@ fn model(query: &str) -> ViewModel {
         selected: 0,
         pending_plugins: false,
         actions_open: false,
+        settings_open: false,
+        settings: Arc::default(),
+        settings_focus: None,
     }
 }
 
@@ -365,4 +368,313 @@ fn a_second_frame_reuses_the_texture_the_first_one_uploaded() {
         0,
         "a steady-state frame must not re-upload an icon it already holds"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The untyped launcher, list scrolling and the settings surface: the three
+// things the first Windows tester found unusable.
+// ---------------------------------------------------------------------------
+
+fn launcher_input(events: Vec<egui::Event>) -> egui::RawInput {
+    let window = NativeLauncherConfig::default();
+    egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(window.width as f32, window.height as f32),
+        )),
+        focused: true,
+        events,
+        ..Default::default()
+    }
+}
+
+fn painted(frame: &crikey_ui::NativeUiFrame, needle: &str) -> bool {
+    frame
+        .output
+        .shapes
+        .iter()
+        .any(|clipped| contains_text(&clipped.shape, needle))
+}
+
+/// A press and release in one frame, which is what egui reads as a click.
+fn click_at(position: egui::Pos2) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(position),
+        egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+/// Where a piece of painted text sits, panicking with the searched text rather
+/// than with `None` so a layout change names itself.
+#[track_caller]
+fn position_of(frame: &crikey_ui::NativeUiFrame, needle: &str) -> egui::Pos2 {
+    frame
+        .output
+        .shapes
+        .iter()
+        .find_map(|clipped| text_origin(&clipped.shape, needle))
+        .unwrap_or_else(|| panic!("{needle:?} is not painted in this frame"))
+}
+
+fn scrollable_model(rows: usize, selected: usize) -> ViewModel {
+    let mut view = model("row");
+    view.rows = (0..rows).map(result_row).collect();
+    view.selected = selected;
+    view
+}
+
+#[test]
+fn an_empty_query_renders_nothing_but_the_query_field() {
+    let context = create_launcher_context();
+    let mut view = model("");
+    // Rows are handed in deliberately: the renderer must draw no result area
+    // for an untyped launcher whatever it is holding.
+    view.rows = (0..3).map(result_row).collect();
+
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+
+    for absent in ["Ready", "Type a name", "No matches", "row-0", "3 results"] {
+        assert!(
+            !painted(&frame, absent),
+            "an untyped launcher shows nothing but the query field, yet it painted {absent:?}"
+        );
+    }
+    assert!(painted(&frame, "Search apps, files, and actions"));
+}
+
+#[test]
+fn a_typed_query_with_no_matches_still_says_so() {
+    let context = create_launcher_context();
+
+    let empty = build_launcher_frame(&context, launcher_input(Vec::new()), &model("qqq"));
+    assert!(painted(&empty, "No matches"));
+
+    let mut pending = model("qqq");
+    pending.pending_plugins = true;
+    let pending = build_launcher_frame(&context, launcher_input(Vec::new()), &pending);
+    assert!(painted(&pending, "Searching"));
+}
+
+/// One egui context plus a monotonic clock.
+///
+/// egui animates a scroll over time rather than jumping to it, so a test that
+/// wants to see where the list came to rest has to hand it a clock that moves
+/// and enough frames for the animation to finish.
+struct Frames {
+    context: egui::Context,
+    clock: f64,
+}
+
+impl Frames {
+    fn new() -> Self {
+        Self {
+            context: create_launcher_context(),
+            clock: 0.0,
+        }
+    }
+
+    fn draw(&mut self, view: &ViewModel, events: Vec<egui::Event>) -> crikey_ui::NativeUiFrame {
+        self.clock += 0.05;
+        let mut input = launcher_input(events);
+        input.time = Some(self.clock);
+        build_launcher_frame(&self.context, input, view)
+    }
+
+    /// Draws until every animation has run out, and answers with the last
+    /// frame.
+    fn settle(&mut self, view: &ViewModel) -> crikey_ui::NativeUiFrame {
+        let mut last = self.draw(view, Vec::new());
+        for _ in 0..40 {
+            last = self.draw(view, Vec::new());
+        }
+        last
+    }
+}
+
+/// The wheel, over the middle of the result list.
+fn wheel_over_list() -> Vec<egui::Event> {
+    let over_list = egui::Pos2::new(200.0, 300.0);
+    vec![
+        egui::Event::PointerMoved(over_list),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -400.0),
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+#[test]
+fn a_mouse_scroll_is_not_undone_while_the_selection_stays_put() {
+    let mut frames = Frames::new();
+    let view = scrollable_model(40, 0);
+
+    let first = frames.draw(&view, Vec::new());
+    assert!(painted(&first, "row-0"), "the list starts at the top");
+
+    let _ = frames.draw(&view, wheel_over_list());
+    let settled = frames.settle(&view);
+
+    assert!(
+        !painted(&settled, "row-0"),
+        "the repaints after a wheel gesture must not walk the list back to the selected row"
+    );
+}
+
+#[test]
+fn moving_the_selection_scrolls_the_row_back_into_view() {
+    let mut frames = Frames::new();
+    let view = scrollable_model(40, 0);
+    let _ = frames.settle(&view);
+
+    let far = scrollable_model(40, 39);
+    let followed = frames.settle(&far);
+
+    assert!(
+        painted(&followed, "row-39"),
+        "keyboard navigation must bring the selected row into view"
+    );
+}
+
+#[test]
+fn a_replaced_list_puts_the_selected_row_back_on_screen() {
+    let mut frames = Frames::new();
+    let view = scrollable_model(40, 0);
+    let _ = frames.draw(&view, Vec::new());
+    let _ = frames.draw(&view, wheel_over_list());
+    let scrolled = frames.settle(&view);
+    assert!(!painted(&scrolled, "row-0"));
+
+    // A republish hands over a different row set with the same selection.
+    // Nobody asked for the offset the old list was left at, so the selected
+    // row is fetched back into view.
+    let replaced = scrollable_model(40, 0);
+    let followed = frames.settle(&replaced);
+
+    assert!(
+        painted(&followed, "row-0"),
+        "a list that was replaced under the selection must show the selected row"
+    );
+}
+
+fn hotkey_settings_model() -> ViewModel {
+    let mut view = model("");
+    view.settings_open = true;
+    view.settings = Arc::from(vec![SettingRow {
+        key: "launcher.activation-hotkey".to_owned(),
+        label: "Activation hotkey".to_owned(),
+        value: "Ctrl+Alt+Space".to_owned(),
+        source: "default".to_owned(),
+    }]);
+    view
+}
+
+#[test]
+fn ctrl_comma_asks_for_the_settings_surface() {
+    let context = create_launcher_context();
+    let shortcut = vec![egui::Event::Key {
+        key: egui::Key::Comma,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    }];
+
+    let frame = build_launcher_frame(&context, launcher_input(shortcut), &model(""));
+
+    assert!(frame.commands.contains(&UiCommand::OpenSettings));
+}
+
+#[test]
+fn the_footer_offers_the_settings_surface_to_a_user_who_knows_no_shortcut() {
+    let context = create_launcher_context();
+    let view = model("");
+
+    let located = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let affordance = position_of(&located, "Settings");
+
+    let clicked = build_launcher_frame(
+        &context,
+        launcher_input(click_at(affordance + egui::vec2(4.0, 4.0))),
+        &view,
+    );
+
+    assert!(clicked.commands.contains(&UiCommand::OpenSettings));
+}
+
+#[test]
+fn the_settings_surface_lists_the_activation_hotkey_and_commits_an_edit() {
+    let context = create_launcher_context();
+    let view = hotkey_settings_model();
+
+    let opened = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(painted(&opened, "launcher.activation-hotkey"));
+    let editor = position_of(&opened, "Ctrl+Alt+Space");
+
+    // Click into the editor, then type the new binding and commit it.
+    let _ = build_launcher_frame(
+        &context,
+        launcher_input(click_at(editor + egui::vec2(4.0, 4.0))),
+        &view,
+    );
+    let typed = vec![
+        egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::Text("!".to_owned()),
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ];
+    let committed = build_launcher_frame(&context, launcher_input(typed), &view);
+
+    let edit = committed
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            UiCommand::SetSetting { key, value } => Some((key.as_str(), value.as_str())),
+            _ => None,
+        })
+        .expect("committing an edit must reach the host as SetSetting");
+    assert_eq!(edit.0, "launcher.activation-hotkey");
+    assert_ne!(
+        edit.1, "Ctrl+Alt+Space",
+        "the committed value must be what the user typed, not what was stored"
+    );
+}
+
+#[test]
+fn the_settings_surface_offers_a_quit_control() {
+    let context = create_launcher_context();
+    let view = hotkey_settings_model();
+
+    let located = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let quit = position_of(&located, "Quit CriKey");
+
+    let clicked = build_launcher_frame(
+        &context,
+        launcher_input(click_at(quit + egui::vec2(4.0, 4.0))),
+        &view,
+    );
+
+    assert!(clicked.commands.contains(&UiCommand::Quit));
 }

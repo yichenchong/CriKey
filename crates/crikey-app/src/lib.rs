@@ -373,6 +373,28 @@ impl App {
         Ok(())
     }
 
+    /// Releases the activation shortcut, so a launcher that re-binds its
+    /// accelerator hands the old chord back to the desktop.
+    ///
+    /// Same targets and same error type as
+    /// [`register_activation_hotkey`](Self::register_activation_hotkey): the
+    /// pair is one API, and a host able to take a grab it can never release
+    /// would leave every chord it has ever bound swallowing that key press for
+    /// the life of the process. The handler is left installed, because the
+    /// caller re-binds rather than goes silent -- a launcher that unregisters
+    /// its last accelerator has nothing left that can fire.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub fn unregister_activation_hotkey(&mut self, accelerator: &str) -> CoreResult<()> {
+        let binding = HotkeyBinding {
+            accelerator: accelerator.to_owned(),
+        };
+        #[cfg(windows)]
+        let hotkeys = self.backend.hotkeys();
+        #[cfg(target_os = "linux")]
+        let hotkeys = self.backend.hotkeys()?;
+        hotkeys.unregister(&binding)
+    }
+
     fn launch_application(&self, item: &Item) -> CoreResult<()> {
         let target = decode_target(&item.target).map_err(|error| {
             crikey_core::CoreError::Invalid(format!("invalid application target: {error}"))
@@ -897,6 +919,12 @@ impl SearchService {
         handler: HotkeyActivationHandler,
     ) -> CoreResult<()> {
         self.app.register_activation_hotkey(accelerator, handler)
+    }
+
+    /// Releases a global shortcut this service registered.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub fn unregister_activation_hotkey(&mut self, accelerator: &str) -> CoreResult<()> {
+        self.app.unregister_activation_hotkey(accelerator)
     }
 
     /// Admits every readable cached slice into the live catalog and reports

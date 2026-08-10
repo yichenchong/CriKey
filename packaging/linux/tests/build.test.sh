@@ -28,6 +28,15 @@ trap 'rm -rf "$workspace" "$in_tree_workspace"' EXIT
 failures=0
 passes=0
 
+# Read from the one place a release bump edits, the same way build.sh reads it.
+# Spelling the version out here made every artefact name in this file a second
+# thing to remember on a version bump, and the first symptom was this suite
+# failing on a release commit that was perfectly correct.
+workspace_version() {
+	sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"$/\1/p' \
+		"$repository_root/Cargo.toml"
+}
+
 check() {
 	local description="$1"
 	shift
@@ -125,7 +134,7 @@ check "the executable the desktop entry names is the one that was installed" \
 check "the desktop entry names an icon that is installed beside it" \
 	contains "Icon=crikey" "$desktop_entry"
 
-tarball="$out/crikey-0.1.0-$(uname -m | sed 's,^arm64$,aarch64,')-linux.tar.gz"
+tarball="$out/crikey-$(workspace_version)-$(uname -m | sed 's,^arm64$,aarch64,')-linux.tar.gz"
 tarball_listing="$(tar tzf "$tarball")"
 check "the tarball ships the attribution notice" \
 	contains "share/doc/crikey/NOTICE.md" "$tarball_listing"
@@ -147,7 +156,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
 	check "a package with no bundled interpreter depends on the system python3" \
 		contains "python3 (>= 3.8)" "$control"
 	check "the package declares the version from the workspace manifest" \
-		contains "Version: 0.1.0" "$control"
+		contains "Version: $(workspace_version)" "$control"
 	check "the package ships the attribution notice" \
 		contains "usr/share/doc/crikey/NOTICE.md" "$contents"
 	check "the package installs the binary onto the default search path" \

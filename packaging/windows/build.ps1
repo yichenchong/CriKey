@@ -98,7 +98,7 @@
     does not validate either -- only an MSBuild .wixproj does -- and because
     validation runs the stock ICE custom actions through Windows Installer,
     which the non-interactive service accounts on hosted CI machines cannot do.
-    On a developer machine it works, and the three ICEs it suppresses are
+    On a developer machine it works, and the four ICEs it suppresses are
     argued per ICE in crikey.wxs. Ignored for the MSIX route.
 
 .EXAMPLE
@@ -307,6 +307,33 @@ if (-not (Test-Path -LiteralPath (Join-Path $stage 'legacy-shim\_crikey_legacy_w
     Stop-WithError "the legacy shim has no _crikey_legacy_worker.py; shim_root() would reject the staged directory"
 }
 
+# Windows Installer removes a directory only once it is already empty, and the
+# directories `<Files>` harvesting invents for the subdirectories of a payload
+# tree carry no removal row of their own. crikey.wxs therefore declares each
+# one explicitly and lists it in InstallFolderRemoval; a subdirectory nobody
+# declared survives an uninstall and keeps every directory above it alive with
+# it, so the whole install tree is left behind. That is invisible until someone
+# uninstalls, which is far too late, so a new subdirectory stops the build here
+# instead. Adding one means declaring it in crikey.wxs and naming it below.
+$declaredPayloadSubdirectories = @('modern-sdk\crikey_sdk')
+$stageRoot = (Resolve-Path -LiteralPath $stage).Path
+$stagedPayloadSubdirectories = @(
+    foreach ($tree in @('modern-sdk', 'legacy-shim')) {
+        Get-ChildItem -LiteralPath (Join-Path $stageRoot $tree) -Directory -Recurse |
+            ForEach-Object { $_.FullName.Substring($stageRoot.Length + 1) }
+    }
+)
+$undeclaredPayloadSubdirectories = @(
+    $stagedPayloadSubdirectories | Where-Object { $declaredPayloadSubdirectories -notcontains $_ }
+)
+if ($undeclaredPayloadSubdirectories.Count -gt 0) {
+    Stop-WithError ("the staged payload trees contain subdirectories crikey.wxs does not declare: " +
+        ($undeclaredPayloadSubdirectories -join ', ') +
+        ". Declare each one as a Directory under its tree, add a RemoveFolder for it to " +
+        "InstallFolderRemoval, harvest it into its own ComponentGroup, and add it to " +
+        "`$declaredPayloadSubdirectories here; otherwise an uninstall leaves the install tree behind.")
+}
+
 $havePythonRuntime = $false
 if ($PythonRuntimeArchive) {
     if (-not (Test-Path -LiteralPath $PythonRuntimeArchive)) {
@@ -402,14 +429,16 @@ if ($Format -eq 'msi' -or $Format -eq 'both') {
     if ($Validate) {
         # `wix build` does not validate; the .NET tool exposes validation as a
         # separate subcommand, and only an MSBuild .wixproj runs it
-        # automatically. Three ICEs describe a package this one cannot be, and
+        # automatically. Four ICEs describe a package this one cannot be, and
         # crikey.wxs records the reasoning per ICE: ICE38 and ICE64 are
         # per-user-profile rules that the harvested Python trees cannot satisfy
         # and that a package installing into exactly one profile does not need,
-        # and ICE91 objects to per-user profile directories as such. Nothing
+        # ICE91 objects to per-user profile directories as such, and ICE61
+        # objects to a package that upgrades its own version, which is what
+        # MajorUpgrade/@AllowSameVersionUpgrades deliberately asks for. Nothing
         # else is suppressed, so any other ICE is a real finding.
         Write-Note "validating $msi"
-        & $wix msi validate '-sice' 'ICE38' '-sice' 'ICE64' '-sice' 'ICE91' $msi
+        & $wix msi validate '-sice' 'ICE38' '-sice' 'ICE61' '-sice' 'ICE64' '-sice' 'ICE91' $msi
         if ($LASTEXITCODE -ne 0) {
             Stop-WithError "wix msi validate failed with exit code $LASTEXITCODE"
         }

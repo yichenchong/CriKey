@@ -101,7 +101,7 @@ fn positional(command: &str, args: &[String], maximum: usize) -> Result<Vec<Stri
 /// user's setting is competing with. Schema problems are reported on stderr and do
 /// not stop the listing — a broken plugin must not make the whole configuration
 /// uninspectable, which is when inspecting it matters most.
-fn load() -> Result<ConfigStore, String> {
+pub(crate) fn load() -> Result<ConfigStore, String> {
     let directories = StandardDirectories::for_process()
         .map_err(|error| format!("cannot resolve the standard directories: {error}"))?;
     let mut store =

@@ -29,7 +29,7 @@
   tool exposes validation as the separate `wix msi validate` subcommand
   (https://docs.firegiant.com/wix/tools/validation/). The build below
   therefore produces an .msi as written. `build.ps1 -Validate` runs that
-  subcommand afterwards, and it names two suppressions, because two ICEs
+  subcommand afterwards, and it names four suppressions, because four ICEs
   describe a package this one cannot be:
 
     * ICE38 wants every component installed under the user profile keyed on an
@@ -42,13 +42,22 @@
       registry one. Suppressing ICE38 covers only those, and a perUser package
       has exactly one profile for a repair to reach into.
 
+    * ICE61 objects to a package that can upgrade its own version, which is
+      exactly what AllowSameVersionUpgrades below asks for and why it is set.
+      The reasoning is with the MajorUpgrade element.
+
     * ICE64 wants every directory created in the user profile listed in the
-      RemoveFile table. The four this file creates are listed, in
-      InstallFolderRemoval below. The subdirectories the harvested trees bring
-      with them are not, because their names are not known here. The concern
-      ICE64 encodes is a per-machine install seeding directories into profiles
-      it will never clean up; this package installs into one profile and
-      removes what it put there.
+      RemoveFile table. Every directory this file creates is listed, in
+      InstallFolderRemoval below, including ModernSdkPackageFolder — the one
+      subdirectory a harvested tree carries, declared here rather than left to
+      harvesting precisely so that it can be removed. The exception is the
+      optional python-runtime tree, whose interpreter directories are not
+      knowable at author time; the concern ICE64 encodes is a per-machine
+      install seeding directories into profiles it will never clean up, and
+      this package installs into one profile.
+
+    * ICE91 objects to per-user profile directories as such, which is the
+      package this one is.
 
   The alternative WiX recommends — Scope="perUserOrMachine" under
   ProgramFiles6432Folder — is ICE-clean, and it is deliberately not taken. It
@@ -73,7 +82,11 @@
   installed and the directories it created to hold it, the Start Menu folder
   and shortcut, the App Paths registration, and the per-user PATH entry
   (Part="last", Permanent="no", so the value is removed from PATH and the rest
-  of PATH is left as found).
+  of PATH is left as found). Windows Installer removes a directory only once
+  it is already empty, so every directory this package creates has to be
+  declared here with a RemoveFolder beside it; the one exception is a build
+  made with -PythonRuntimeArchive, whose interpreter subdirectories cannot be
+  enumerated at author time and are left behind empty.
 
   Deliberately keeps: %APPDATA%\CriKey (configuration, plugin state, the
   startup journal) and %LOCALAPPDATA%\CriKey (icon and catalog caches). No
@@ -102,13 +115,36 @@
       Codepage="65001">
 
     <!--
-      An upgrade replaces the previous version in place. Scheduled after
-      InstallValidate so the old files are removed before the new ones are laid
-      down, which avoids the case where a file that was dropped between
-      versions survives into the new install.
+      An upgrade replaces the previous version in place.
+
+      No ProductCode is authored, so `wix build` generates a new one for every
+      build (https://docs.firegiant.com/wix/schema/wxs/package/). That is what
+      makes a version bump a major upgrade rather than a reinstall: the new
+      package is a different product, FindRelatedProducts matches the installed
+      one on UpgradeCode, and RemoveExistingProducts takes it away. Re-running
+      one already-installed .msi finds its own ProductCode registered and
+      offers maintenance mode instead, which is correct and is not a failure of
+      the upgrade path.
+
+      AllowSameVersionUpgrades because rebuilding a version number that has
+      already been released is the normal case while a release is being
+      repaired. Left at its default, MSI treats same version plus different
+      ProductCode as two products
+      (https://docs.firegiant.com/wix/schema/wxs/majorupgrade/): the user ends
+      up with two Add/Remove Programs entries over one directory, and removing
+      either one leaves the files behind, because the other still references
+      the same components.
+
+      Scheduled after InstallInitialize rather than after InstallValidate. Both
+      remove the installed product entirely before the new one is laid down,
+      which is what stops a file dropped between versions from surviving into
+      the new install. The difference is the failure case: under
+      afterInstallValidate a failed upgrade leaves the machine with neither
+      version installed, and afterInstallInitialize rolls the removal back.
     -->
     <MajorUpgrade
-        Schedule="afterInstallValidate"
+        Schedule="afterInstallInitialize"
+        AllowSameVersionUpgrades="yes"
         DowngradeErrorMessage="A newer version of CriKey is already installed. Uninstall it first if you really want this older one." />
 
     <MediaTemplate EmbedCab="yes" />
@@ -118,7 +154,7 @@
       this repository, and pointing the entry at an icon that is not there
       produces a broken entry rather than the default one.
     -->
-    <Property Id="ARPURLINFOABOUT" Value="https://github.com/crikey-launcher/crikey" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/yichenchong/CriKey" />
     <Property Id="ARPNOREPAIR" Value="1" />
 
     <StandardDirectory Id="LocalAppDataFolder">
@@ -130,7 +166,19 @@
       -->
       <Directory Id="ProgramsFolder" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="CriKey">
-          <Directory Id="ModernSdkFolder" Name="modern-sdk" />
+          <!--
+            `crikey_sdk` is declared rather than left to harvesting because
+            Windows Installer removes a directory only once it is empty, and
+            the directories `Files` invents for the subdirectories of a
+            harvested tree carry no removal row of their own. An undeclared
+            subdirectory therefore survives an uninstall, which keeps
+            modern-sdk non-empty, which keeps INSTALLFOLDER non-empty, and the
+            whole install tree is left behind. build.ps1 fails the build when a
+            staged tree grows a subdirectory this file does not declare.
+          -->
+          <Directory Id="ModernSdkFolder" Name="modern-sdk">
+            <Directory Id="ModernSdkPackageFolder" Name="crikey_sdk" />
+          </Directory>
           <Directory Id="LegacyShimFolder" Name="legacy-shim" />
 <?ifdef PythonRuntime ?>
           <Directory Id="PythonRuntimeFolder" Name="python-runtime" />
@@ -147,6 +195,7 @@
       <ComponentGroupRef Id="Executable" />
       <ComponentGroupRef Id="Legal" />
       <ComponentGroupRef Id="ModernSdk" />
+      <ComponentGroupRef Id="ModernSdkPackage" />
       <ComponentGroupRef Id="LegacyShim" />
 <?ifdef PythonRuntime ?>
       <ComponentGroupRef Id="PythonRuntime" />
@@ -248,7 +297,19 @@
       stale on a user's machine.
     -->
     <ComponentGroup Id="ModernSdk" Directory="ModernSdkFolder">
-      <Files Include="$(var.StageDir)\modern-sdk\**" />
+      <Files Include="$(var.StageDir)\modern-sdk\**">
+        <!--
+          The `crikey_sdk` package is harvested into its own declared directory
+          below, so it has to leave this harvest: `Files` shares one set of
+          already-harvested paths across the package, and a file matched twice
+          is dropped from whichever group reaches it second.
+        -->
+        <Exclude Files="$(var.StageDir)\modern-sdk\crikey_sdk\**" />
+      </Files>
+    </ComponentGroup>
+
+    <ComponentGroup Id="ModernSdkPackage" Directory="ModernSdkPackageFolder">
+      <Files Include="$(var.StageDir)\modern-sdk\crikey_sdk\**" />
     </ComponentGroup>
 
     <ComponentGroup Id="LegacyShim" Directory="LegacyShimFolder">
@@ -346,6 +407,7 @@
       -->
       <Component Id="InstallFolderRemoval" Directory="INSTALLFOLDER" Guid="ABD5C77B-ADDE-4D70-84CB-BF076538415C">
         <RemoveFolder Id="RemoveModernSdkFolder" Directory="ModernSdkFolder" On="uninstall" />
+        <RemoveFolder Id="RemoveModernSdkPackageFolder" Directory="ModernSdkPackageFolder" On="uninstall" />
         <RemoveFolder Id="RemoveLegacyShimFolder" Directory="LegacyShimFolder" On="uninstall" />
 <?ifdef PythonRuntime ?>
         <RemoveFolder Id="RemovePythonRuntimeFolder" Directory="PythonRuntimeFolder" On="uninstall" />
