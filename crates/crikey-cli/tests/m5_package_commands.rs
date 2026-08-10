@@ -492,7 +492,11 @@ fn build_fixture(scratch: &Scratch, label: &str) -> (PathBuf, PathBuf, Run, BTre
 fn package_build_emits_archive_path_entry_count_and_sha256() {
     let scratch = Scratch::new("build");
     let (_plugin, package, run, report) = build_fixture(&scratch, "build");
-    assert_eq!(field(&report, "package", &run), display(&package));
+    // Decoded before comparing, like every other path assertion here: the
+    // output contract percent-encodes, and a Windows path is full of
+    // backslashes, so comparing the raw field passes only where the path
+    // happens to need no escaping.
+    assert_eq!(decode(field(&report, "package", &run)), display(&package));
     assert!(number(&report, "entries", &run) >= 2);
     assert_sha256(field(&report, "hash", &run), &run);
 }

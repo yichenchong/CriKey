@@ -64,6 +64,42 @@ fn a_program_launched_without_arguments_receives_none() {
     assert_eq!(observed, Vec::<String>::new());
 }
 
+/// Writes an executable script, out of reach of the exec-time text-busy race.
+///
+/// Staged under another name and renamed into place: this binary is
+/// multi-threaded, so a sibling test that forks between this file's `open` and
+/// `close` hands the child a writable descriptor, and the kernel then refuses
+/// to exec the path with ETXTBSY. The rename gives the launcher a name no
+/// descriptor in this process has ever pointed at.
+fn write_program(path: &Path, body: &str) {
+    let staged = path.with_extension("staging");
+    fs::write(&staged, body).expect("the program is writable");
+    set_mode(&staged, 0o755);
+    fs::rename(&staged, path).expect("the program is renamed into place");
+}
+
+/// Runs `launch`, tolerating only the kernel's transient refusal to exec a file
+/// some other thread's fork still holds open for writing.
+///
+/// Every other error is reported on the first attempt, so a real launch failure
+/// is never retried into a timeout.
+fn launch_when_not_busy(what: &str, launch: impl Fn() -> crikey_core::Result<()>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match launch() {
+            Ok(()) => return,
+            Err(error) if error.to_string().contains("Text file busy") => {
+                assert!(
+                    Instant::now() < deadline,
+                    "{what} never became executable: {error}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("{what}: {error}"),
+        }
+    }
+}
+
 #[test]
 fn a_launch_uses_an_existing_working_directory() {
     let recorder = Recorder::new();
@@ -72,19 +108,17 @@ fn a_launch_uses_an_existing_working_directory() {
     let fifo = recorder.sibling("working-directory-result");
     make_fifo(&fifo);
     let script = recorder.sibling("record-working-directory");
-    fs::write(&script, format!("#!/bin/sh\npwd > '{}'\n", fifo.display()))
-        .expect("working-directory probe is writable");
-    set_mode(&script, 0o755);
+    write_program(&script, &format!("#!/bin/sh\npwd > '{}'\n", fifo.display()));
 
     let reading =
         thread::spawn(move || fs::read_to_string(fifo).expect("working-directory fifo is readable"));
-    CommandLauncher::new()
-        .launch_in(
-            &PlatformPath::from(script),
+    launch_when_not_busy("launching the working-directory probe succeeds", || {
+        CommandLauncher::new().launch_in(
+            &PlatformPath::from(script.clone()),
             &[],
             Some(&PlatformPath::from(working_directory.clone())),
         )
-        .expect("launching the working-directory probe succeeds");
+    });
     let observed = reading.join().expect("working-directory reader joins");
 
     assert_eq!(observed.trim_end(), working_directory.display().to_string());
@@ -240,28 +274,18 @@ impl Recorder {
         make_fifo(&fifo);
 
         let program = scratch.join("record-argv");
-        // Written under a different name and renamed into place, because this
-        // binary is multi-threaded: a sibling test that forks between this
-        // file's `open` and `close` inherits the writable descriptor, and the
-        // kernel then refuses to exec the path with ETXTBSY. The rename gives
-        // the launcher a name no descriptor in this process has ever pointed
-        // at, so the race has nothing to catch.
-        let staged = scratch.join("record-argv.staging");
         // The scratch path is built from a pid and a counter, so it holds
         // nothing the single quotes here would have to escape.
-        fs::write(
-            &staged,
-            format!(
+        write_program(
+            &program,
+            &format!(
                 "#!/bin/sh\n\
                  exec > '{fifo}'\n\
                  printf '%s\\0' \"$#\"\n\
                  for argument in \"$@\"; do printf '%s\\0' \"$argument\"; done\n",
                 fifo = fifo.display()
             ),
-        )
-        .expect("recording program is writable");
-        set_mode(&staged, 0o755);
-        fs::rename(&staged, &program).expect("the recording program is renamed into place");
+        );
 
         Self {
             scratch,
@@ -289,28 +313,11 @@ impl Recorder {
     /// instead of hang.
     fn record(&self, launch: impl Fn(&PlatformPath) -> crikey_core::Result<()>) -> Vec<String> {
         let reading = self.reading();
-        // ETXTBSY is the one failure this test must not believe. The rename in
-        // `new` closes the common window, but any thread in this binary can
-        // fork between another test's `open` and `close` and hand the child a
-        // writable descriptor to this inode for as long as it takes that child
-        // to exec. That is the kernel protecting a file being written, not the
-        // launcher misbehaving, and it clears on its own. Every other error is
-        // reported on the first attempt, so a real launch failure is never
-        // retried into a timeout.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match launch(&self.target()) {
-                Ok(()) => return argv(&collect(reading)),
-                Err(error) if error.to_string().contains("Text file busy") => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the recording program never became executable: {error}"
-                    );
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(error) => panic!("launching an executable script succeeds: {error}"),
-            }
-        }
+        launch_when_not_busy("launching an executable script succeeds", || {
+            launch(&self.target())
+        });
+
+        argv(&collect(reading))
     }
 
     /// The argv of a program that is already running.
