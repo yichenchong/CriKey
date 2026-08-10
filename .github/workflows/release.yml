@@ -60,10 +60,13 @@ jobs:
         with:
           name: linux
           if-no-files-found: error
+          # `rpmbuild` writes into a per-architecture subdirectory, so a flat
+          # glob matches nothing there and `if-no-files-found` stays quiet
+          # because the other two patterns did match.
           path: |
             target/packaging/linux/*.tar.gz
             target/packaging/linux/*.deb
-            target/packaging/linux/*.rpm
+            target/packaging/linux/**/*.rpm
 
   windows:
     runs-on: windows-latest
@@ -188,4 +191,13 @@ jobs:
             printf 'runtime paths have not been exercised on real hardware. See\n'
             printf '`docs/ROADMAP.md` for the measured status.\n'
           } > release-notes.md
-          gh release create "$TAG" --title "CriKey $TAG" --notes-file release-notes.md upload/*
+          # A re-run must converge on the same published state rather than
+          # failing because the release already exists: a first attempt that
+          # published five of six assets is exactly the case this has to
+          # repair, so existing assets are replaced rather than appended to.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "CriKey $TAG" --notes-file release-notes.md
+            gh release upload "$TAG" upload/* --clobber
+          else
+            gh release create "$TAG" --title "CriKey $TAG" --notes-file release-notes.md upload/*
+          fi
