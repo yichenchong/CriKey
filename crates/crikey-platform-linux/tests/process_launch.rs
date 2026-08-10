@@ -128,13 +128,14 @@ fn a_launch_uses_an_existing_working_directory() {
 fn a_missing_working_directory_is_ignored() {
     let recorder = Recorder::new();
     let missing = recorder.sibling("missing-working-directory");
-    let observed =
-        CommandLauncher::new().launch_in(&recorder.target(), &[], Some(&PlatformPath::from(missing)));
+    launch_when_not_busy("a stale desktop Path= must not block launch", || {
+        CommandLauncher::new().launch_in(
+            &recorder.target(),
+            &[],
+            Some(&PlatformPath::from(missing.clone())),
+        )
+    });
 
-    assert!(
-        observed.is_ok(),
-        "a stale desktop Path= must not block launch: {observed:?}"
-    );
     assert_eq!(recorder.observed(), Vec::<String>::new());
 }
 
@@ -150,14 +151,19 @@ fn launching_returns_before_the_program_it_started_has_finished() {
     // joins, and the bounded wait below turns that into a failure rather than
     // a hung run.
     thread::spawn(move || {
-        // A failed send only means this test already gave up.
-        let _ = sender.send(CommandLauncher::new().launch(&target, &[]));
+        // A failed send only means this test already gave up. ETXTBSY is
+        // tolerated here for the same reason as everywhere else in this file:
+        // it is another thread's fork holding this inode open, not the
+        // launcher waiting for its child, which is what this test measures.
+        launch_when_not_busy("launching an executable script succeeds", || {
+            CommandLauncher::new().launch(&target, &[])
+        });
+        let _ = sender.send(());
     });
 
     receiver
         .recv_timeout(RESPONSE_LIMIT)
-        .expect("launch must return instead of waiting for the program to exit")
-        .expect("launching an executable script succeeds");
+        .expect("launch must return instead of waiting for the program to exit");
 
     // The child really was started, not merely reported: draining the fifo
     // now releases it and yields what it recorded.
