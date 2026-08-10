@@ -901,7 +901,12 @@ fn stale_scratch_files_are_reclaimed_without_touching_fresh_writes() {
 
     let stale = cache.root().join("tmp-old-process-1.part");
     fs::write(&stale, b"abandoned scratch bytes").expect("the stale scratch file must be writable");
-    fs::File::open(&stale)
+    // Opened for writing, not merely reopened: Windows resolves
+    // `SetFileTime` against the handle's access mask, so a read-only handle
+    // fails with "Access is denied" where Unix does not care.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&stale)
         .expect("the stale scratch file must be reopenable")
         .set_modified(SystemTime::now() - Duration::from_secs(2 * 60 * 60))
         .expect("the test must be able to backdate the stale scratch file");

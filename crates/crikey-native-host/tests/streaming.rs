@@ -221,9 +221,19 @@ fn aggregate_stream_limits_truncate_items_batches_and_bytes_without_hanging() {
     assert_eq!(suggestions.state, BatchState::Final);
     assert!(suggestions.truncated);
     assert!(suggestions.items.len() <= 7);
+    // Two is what the contract guarantees and all it guarantees: the batch that
+    // tripped a limit, and the terminal frame the host waits for after asking
+    // the plugin to stop. Which limit trips, and on which frame, depends on how
+    // much the plugin got out before the host cut it off — with a 512-byte cap
+    // the very first frame can already exceed it — so a higher floor asserts
+    // the speed of the machine rather than the behaviour of the host. There is
+    // no upper bound to assert either: frames already in flight when the
+    // truncation was sent are counted as they drain. What bounds this test is
+    // the `recv_timeout` above, and what bounds the stream is the item cap.
     assert!(
-        suggestions.batches >= 3,
-        "the truncation trigger and terminal frame are counted"
+        suggestions.batches >= 2,
+        "the truncation trigger and terminal frame are counted, got {}",
+        suggestions.batches
     );
     assert!(diagnostics.bytes > 0);
     assert_eq!(diagnostics.truncated_calls, 1);
