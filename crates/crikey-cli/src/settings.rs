@@ -588,8 +588,15 @@ mod tests {
         }
 
         fn store(&self) -> ConfigStore {
+            // Every variable any convention consults, pinned to one scratch
+            // directory: the Windows base is resolved from `APPDATA` and
+            // `LOCALAPPDATA` before the `CRIKEY_*_DIR` overrides are applied,
+            // so a fixture that pins only the overrides fails on Windows with
+            // a missing variable rather than testing anything about settings.
             let environment = [
                 "HOME",
+                "APPDATA",
+                "LOCALAPPDATA",
                 "CRIKEY_CONFIG_DIR",
                 "CRIKEY_DATA_DIR",
                 "CRIKEY_CACHE_DIR",
@@ -599,7 +606,11 @@ mod tests {
             .fold(DirectoryEnvironment::new(), |environment, variable| {
                 environment.set(variable, self.root.as_os_str())
             });
-            let directories = StandardDirectories::resolve(DirectoryConvention::Xdg, &environment)
+            // The host's own convention, not a fixed one: `temp_dir()` answers
+            // `C:\...` on Windows, which the XDG rule rightly refuses as not
+            // absolute, and the fixture would fail for a reason that has
+            // nothing to do with settings.
+            let directories = StandardDirectories::resolve(DirectoryConvention::current(), &environment)
                 .expect("every directory is pinned by an override");
             ConfigStore::load_with_policy(&directories, None).expect("an empty tree loads")
         }

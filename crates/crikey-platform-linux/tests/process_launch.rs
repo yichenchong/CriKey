@@ -22,7 +22,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crikey_core::{CoreError, PlatformPath};
 use crikey_platform::{Capability, CapabilityState, ProcessLauncher};
@@ -240,10 +240,17 @@ impl Recorder {
         make_fifo(&fifo);
 
         let program = scratch.join("record-argv");
+        // Written under a different name and renamed into place, because this
+        // binary is multi-threaded: a sibling test that forks between this
+        // file's `open` and `close` inherits the writable descriptor, and the
+        // kernel then refuses to exec the path with ETXTBSY. The rename gives
+        // the launcher a name no descriptor in this process has ever pointed
+        // at, so the race has nothing to catch.
+        let staged = scratch.join("record-argv.staging");
         // The scratch path is built from a pid and a counter, so it holds
         // nothing the single quotes here would have to escape.
         fs::write(
-            &program,
+            &staged,
             format!(
                 "#!/bin/sh\n\
                  exec > '{fifo}'\n\
@@ -253,7 +260,8 @@ impl Recorder {
             ),
         )
         .expect("recording program is writable");
-        set_mode(&program, 0o755);
+        set_mode(&staged, 0o755);
+        fs::rename(&staged, &program).expect("the recording program is renamed into place");
 
         Self {
             scratch,
@@ -279,11 +287,30 @@ impl Recorder {
     /// fifo nobody is reading, and a hung run reports nothing. That the
     /// launcher does not wait is pinned separately, where the wait can fail
     /// instead of hang.
-    fn record(&self, launch: impl FnOnce(&PlatformPath) -> crikey_core::Result<()>) -> Vec<String> {
+    fn record(&self, launch: impl Fn(&PlatformPath) -> crikey_core::Result<()>) -> Vec<String> {
         let reading = self.reading();
-        launch(&self.target()).expect("launching an executable script succeeds");
-
-        argv(&collect(reading))
+        // ETXTBSY is the one failure this test must not believe. The rename in
+        // `new` closes the common window, but any thread in this binary can
+        // fork between another test's `open` and `close` and hand the child a
+        // writable descriptor to this inode for as long as it takes that child
+        // to exec. That is the kernel protecting a file being written, not the
+        // launcher misbehaving, and it clears on its own. Every other error is
+        // reported on the first attempt, so a real launch failure is never
+        // retried into a timeout.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match launch(&self.target()) {
+                Ok(()) => return argv(&collect(reading)),
+                Err(error) if error.to_string().contains("Text file busy") => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the recording program never became executable: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("launching an executable script succeeds: {error}"),
+            }
+        }
     }
 
     /// The argv of a program that is already running.
