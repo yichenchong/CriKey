@@ -736,6 +736,17 @@ fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, HostErro
     probe_with_timeout(path, source, PROBE_TIMEOUT)
 }
 
+/// `ETXTBSY`, the kernel's refusal to execute a file another process still has
+/// open for writing.
+#[cfg(unix)]
+const TEXT_FILE_BUSY: i32 = 26;
+#[cfg(not(unix))]
+const TEXT_FILE_BUSY: i32 = i32::MIN;
+
+/// How long a spawn is retried while the candidate is still held open by a
+/// writer. Short, because this is a race being waited out, not a slow machine.
+const SPAWN_BUSY_GRACE: Duration = Duration::from_secs(2);
+
 fn probe_with_timeout(
     path: &Path,
     source: InterpreterSource,
@@ -753,12 +764,30 @@ fn probe_with_timeout(
         command.process_group(0);
     }
 
-    let mut child = command.spawn().map_err(|error| {
-        HostError::Interpreter(format!(
-            "the {source} interpreter candidate {} could not be executed: {error}",
-            path.display()
-        ))
-    })?;
+    // `ETXTBSY` is the one spawn failure worth waiting out. It does not mean
+    // the candidate is unusable: it means some process still holds it open for
+    // writing, which is the state a runtime unpacked a moment ago is in while
+    // another thread's fork carries its descriptors towards `exec`. Reporting
+    // it as a candidate that "could not be executed" turns a race into a
+    // permanent verdict. Every other error is reported on the first attempt.
+    let started_spawning = Instant::now();
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error)
+                if error.raw_os_error() == Some(TEXT_FILE_BUSY)
+                    && started_spawning.elapsed() < SPAWN_BUSY_GRACE =>
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => {
+                return Err(HostError::Interpreter(format!(
+                    "the {source} interpreter candidate {} could not be executed: {error}",
+                    path.display()
+                )))
+            }
+        }
+    };
     let stdout = child.stdout.take().expect("probe stdout is piped");
     let stderr = child.stderr.take().expect("probe stderr is piped");
     let stdout_capture = Arc::new(Mutex::new(ProbeCapture::default()));

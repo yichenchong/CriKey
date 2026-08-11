@@ -93,6 +93,17 @@ const PROBE_SCAN_LINES: usize = 16;
 /// machine whose interpreter is merely cold is the worse failure of the two.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// `ETXTBSY`, the kernel's refusal to execute a file another process still has
+/// open for writing.
+#[cfg(unix)]
+const TEXT_FILE_BUSY: i32 = 26;
+#[cfg(not(unix))]
+const TEXT_FILE_BUSY: i32 = i32::MIN;
+
+/// How long a spawn is retried while the interpreter is still held open by a
+/// writer. Short, because this is a race being waited out, not a slow machine.
+const SPAWN_BUSY_GRACE: Duration = Duration::from_secs(2);
+
 /// Polling interval for the bounded probe wait.
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -367,10 +378,31 @@ fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, WorkerEr
         .stderr(Stdio::piped());
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = command.spawn().map_err(|error| WorkerError::PythonUnavailable {
-        path: Some(path.to_path_buf()),
-        reason: format!("the interpreter could not be executed: {error}"),
-    })?;
+    let started_spawning = Instant::now();
+    // `ETXTBSY` is the one spawn failure worth waiting out. It does not mean
+    // the interpreter is unusable: it means some process still holds it open
+    // for writing, which is exactly the state a runtime that was unpacked a
+    // moment ago is in while another thread's fork drains its descriptors
+    // towards `exec`. Reporting it as "no usable CPython" turns a race into a
+    // permanent verdict, so it is retried briefly and every other error is
+    // reported on the first attempt.
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error)
+                if error.raw_os_error() == Some(TEXT_FILE_BUSY)
+                    && started_spawning.elapsed() < SPAWN_BUSY_GRACE =>
+            {
+                thread::sleep(PROBE_POLL_INTERVAL);
+            }
+            Err(error) => {
+                return Err(WorkerError::PythonUnavailable {
+                    path: Some(path.to_path_buf()),
+                    reason: format!("the interpreter could not be executed: {error}"),
+                })
+            }
+        }
+    };
     let process_id = child.id();
 
     let stdout = child.stdout.take().expect("probe stdout is piped");
