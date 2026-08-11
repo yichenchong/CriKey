@@ -307,14 +307,19 @@ fn a_missing_plugin_root_is_silent_and_an_unreadable_one_is_still_reported() {
     );
 }
 
-/// Runs one binary to completion on `profile` with no display, which is a fatal
-/// startup failure whichever entry point takes it.
+/// Runs one binary to completion on `profile` with a startup failure it cannot
+/// get past, whichever entry point takes it.
+///
+/// The failure is a catalog cache root that cannot be created, not a missing
+/// display. Removing `DISPLAY` is fatal on Linux and meaningless on Windows
+/// and macOS, where the launcher would open its window, stay resident, and
+/// leave `output()` below waiting for a process that is working correctly.
+/// The cache root is resolved before any window exists and fails on every host
+/// for one reason: the path is an ordinary file, so no directory can be made
+/// there.
 fn fail_to_start(binary: &str, args: &[&str], profile: &Profile) -> (Option<i32>, String) {
     let mut command = Command::new(binary);
     command.args(args);
-    // The failure the launch is being given: no display to open a window on.
-    // Removed rather than emptied so the launcher sees exactly what a session
-    // with no desktop looks like.
     command.env_remove("DISPLAY");
     command.env_remove("WAYLAND_DISPLAY");
     command.env_remove("WAYLAND_SOCKET");
@@ -323,6 +328,9 @@ fn fail_to_start(binary: &str, args: &[&str], profile: &Profile) -> (Option<i32>
     command.env("CRIKEY_CACHE_DIR", profile.path.join("cache"));
     command.env("CRIKEY_STATE_DIR", profile.path.join("state"));
     command.env("CRIKEY_LEGACY_CACHE_ROOT", profile.path.join("legacy-cache"));
+    let blocked = profile.path.join("catalog-root-is-a-file");
+    fs::write(&blocked, b"not a directory").expect("the blocking file is writable");
+    command.env("CRIKEY_CATALOG_CACHE_ROOT", &blocked);
     command.env_remove("CRIKEY_LEGACY_PACKAGE_ROOTS");
     command.env_remove("CRIKEY_MODERN_PLUGIN_ROOTS");
     command.env_remove("CRIKEY_NATIVE_PLUGIN_ROOTS");

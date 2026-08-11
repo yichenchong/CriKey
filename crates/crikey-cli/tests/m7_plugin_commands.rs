@@ -483,10 +483,23 @@ fn crikey_run_reads_the_disabled_set_before_it_touches_a_display() {
         "`plugin disable` must persist the plugin id the launcher keys on"
     );
 
-    // Now make it unreadable, which is the only configuration outcome a headless
-    // launch can observe.
+    // Now make it unreadable, and block the catalog cache root so the launch
+    // ends by itself. Relying on "no display" ends a launch on Linux only:
+    // on Windows and macOS the launcher opens its window and stays resident,
+    // which is correct behaviour and would leave this test waiting on a
+    // process that is working. A cache root that is an ordinary file cannot be
+    // created into on any host, and it is reached after the configuration, so
+    // the ordering this test is about is preserved.
     fs::write(&config, "this is not toml = = =\n").expect("config is writable");
-    let run = host.run_with(&["run"], roots);
+    let blocked = host.path.join("catalog-root-is-a-file");
+    fs::write(&blocked, b"not a directory").expect("the blocking file is writable");
+    let run = host.run_with(
+        &["run"],
+        &[
+            ("CRIKEY_MODERN_PLUGIN_ROOTS", &modern_root),
+            ("CRIKEY_CATALOG_CACHE_ROOT", &blocked),
+        ],
+    );
     assert_ne!(
         run.status,
         Some(PANIC_STATUS),
