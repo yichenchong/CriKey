@@ -83,17 +83,29 @@ fn discover_interpreter() -> PathBuf {
         return path;
     }
 
+    // The names the production discovery in `src/interpreter.rs` looks for, in
+    // the same order and for the same reason: a Windows CPython installs
+    // `python.exe` and usually no `python3.exe` at all, so a helper that knows
+    // only the POSIX spelling reports "no interpreter" on a machine that has
+    // one.
+    const CANDIDATES: &[&str] = if cfg!(windows) {
+        &["python3.exe", "python.exe"]
+    } else {
+        &["python3"]
+    };
     let raw_path = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&raw_path) {
-        let candidate = dir.join("python3");
-        if candidate.is_file() {
-            return candidate;
+        for name in CANDIDATES {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate;
+            }
         }
     }
 
     panic!(
-        "no CPython interpreter found: CRIKEY_PYTHON is unset and `python3` is not on PATH \
-         (searched `{}`). M3 requires a real interpreter subprocess (spec 14.11); a missing \
+        "no CPython interpreter found: CRIKEY_PYTHON is unset and none of {CANDIDATES:?} is on \
+         PATH (searched `{}`). M3 requires a real interpreter subprocess (spec 14.11); a missing \
          interpreter is a test failure, not a skip.",
         raw_path.to_string_lossy()
     );
@@ -3362,11 +3374,25 @@ allowed = tuple({os.path.realpath(sysconfig.get_paths()["stdlib"]),
                  shim_dir,
                  program_dir})
 
-# `purelib` is where pip installs third-party code. If it were somehow inside
-# the allowed set the check below would be vacuous, so assert it is not.
-purelib = os.path.realpath(sysconfig.get_paths()["purelib"])
-t.emit("purelib_excluded",
-       not any(purelib == a or purelib.startswith(a + os.sep) for a in allowed))
+# Where pip installs third-party code. On a Debian-style layout these sit
+# outside the standard library; on a python-build-standalone or hostedtoolcache
+# layout `site-packages` is *inside* it, so allowing the standard library
+# wholesale would quietly allow third-party code too. They are therefore
+# subtracted from the allowed set rather than assumed to be outside it.
+third_party = tuple({os.path.realpath(sysconfig.get_paths()["purelib"]),
+                     os.path.realpath(sysconfig.get_paths()["platlib"])})
+
+def under(path, roots):
+    return any(path == root or path.startswith(root + os.sep) for root in roots)
+
+def is_allowed(path):
+    return under(path, allowed) and not under(path, third_party)
+
+# The check is only worth running if it would actually catch something: a
+# module that lived in the third-party directory must be classified foreign
+# whatever this interpreter's layout happens to be.
+t.emit("purelib_counts_as_foreign",
+       not is_allowed(os.path.realpath(os.path.join(third_party[0], "pretend_third_party.py"))))
 
 foreign = []
 for name in sorted(sys.modules):
@@ -3377,7 +3403,7 @@ for name in sorted(sys.modules):
     if not origin:
         continue
     real = os.path.realpath(origin)
-    if not any(real == a or real.startswith(a + os.sep) for a in allowed):
+    if not is_allowed(real):
         foreign.append(name + " -> " + real)
 
 t.emit("foreign", ";".join(foreign) or "<none>")
@@ -3413,9 +3439,10 @@ t.done()
         "`-S` must actually be in effect; if `site` is loaded the isolation proof is vacuous",
     );
     run.expect(
-        "purelib_excluded",
-        "the third-party install directory must lie outside the allowed set, otherwise the \
-         foreign-module check below proves nothing",
+        "purelib_counts_as_foreign",
+        "a module in the third-party install directory must be classified foreign, otherwise the \
+         foreign-module check below proves nothing. This is asserted rather than assumed because \
+         `site-packages` lives inside the standard library on some layouts and beside it on others",
     );
     assert_eq!(
         run.int("foreign_count"),
