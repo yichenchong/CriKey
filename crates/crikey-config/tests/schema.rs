@@ -203,8 +203,15 @@ fn a_platform_restricted_configured_value_is_not_delivered() {
     let fixture = Fixture::new("schema-platform-configured");
     fixture.plugin_settings("modern.example", "[settings]\nregistry-path = \"shared\"\n");
     let mut store = fixture.load().expect("an empty tree loads");
-    let section = schema("[[configuration.field]]\nname = \"registry-path\"\nplatforms = [\"windows\"]\n");
-    store.register_plugin_schema_for(&example(), &section, "linux");
+    // Restricted to a platform this host is not, chosen from the host rather
+    // than written down: the delivery path filters on the real
+    // `std::env::consts::OS`, so a hard-coded "windows" is a restriction to
+    // *this* platform on a Windows runner and the value is rightly delivered.
+    let elsewhere = if cfg!(windows) { "linux" } else { "windows" };
+    let section = schema(&format!(
+        "[[configuration.field]]\nname = \"registry-path\"\nplatforms = [\"{elsewhere}\"]\n"
+    ));
+    store.register_plugin_schema_for(&example(), &section, std::env::consts::OS);
     assert!(!store.plugin_values(&example()).contains_key("registry-path"),);
     assert!(store
         .configuration_snapshot()

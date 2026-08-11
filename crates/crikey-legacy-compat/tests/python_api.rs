@@ -2254,8 +2254,12 @@ import keypirinha_util as kpu
 import _kptest as t
 
 # The child environment is built from scratch, so this is guaranteed, not
-# incidental: there is no desktop session for these helpers to reach.
+# incidental: there is no display variable for these helpers to reach.
 t.emit("headless", "DISPLAY" not in os.environ and "WAYLAND_DISPLAY" not in os.environ)
+# Windows and macOS always have a desktop; only the POSIX-with-no-display case
+# is what the shim calls unavailable. The helpers below are therefore only run
+# where they must refuse, because running them where they must work would open
+# a browser and touch the clipboard of whoever is running the suite.
 t.emit("desktop_available", kpu.desktop_available())
 
 t.emit("unavailable_is_runtime_error", issubclass(kpu.UnavailableError, RuntimeError))
@@ -2274,7 +2278,7 @@ OPERATIONS = [
 ]
 
 dishonest = []
-for name, call in OPERATIONS:
+for name, call in OPERATIONS if not kpu.desktop_available() else []:
     try:
         call()
     except kpu.UnavailableError as exc:
@@ -2297,7 +2301,7 @@ for name, call in OPERATIONS:
 
 t.emit("dishonest", ";".join(dishonest) or "<none>")
 t.emit("dishonest_count", len(dishonest))
-t.emit("operations_checked", len(OPERATIONS))
+t.emit("operations_checked", len(OPERATIONS) if not kpu.desktop_available() else 0)
 t.done()
 "##,
         &[],
@@ -2308,11 +2312,17 @@ t.done()
         "the child environment must be built from scratch so no desktop session is reachable; \
          otherwise this contract is not deterministic",
     );
+    // What "available" means is platform contract, not environment: the shim
+    // answers True on Windows and macOS whatever the environment says, because
+    // a desktop session is not optional there, and on POSIX it answers for the
+    // display this child was deliberately given none of.
+    let desktop_is_a_given = cfg!(windows) || cfg!(target_os = "macos");
     run.expect_eq(
         "desktop_available",
-        "False",
-        "keypirinha_util.desktop_available() must report False on a headless host so the \
-         diagnostics layer can classify the plugin without provoking an exception",
+        if desktop_is_a_given { "True" } else { "False" },
+        "keypirinha_util.desktop_available() must answer for the platform it is on: a given on \
+         Windows and macOS, and False on a POSIX host with no display so the diagnostics layer \
+         can classify the plugin without provoking an exception",
     );
     run.expect(
         "unavailable_is_runtime_error",
@@ -2330,8 +2340,9 @@ t.done()
     );
     assert_eq!(
         run.int("operations_checked"),
-        5,
-        "every desktop-touching helper must be exercised\n{}",
+        if desktop_is_a_given { 0 } else { 5 },
+        "every desktop-touching helper must be exercised where it must refuse, and none where it \
+         would really open a browser or take the clipboard\n{}",
         run.describe()
     );
     assert_eq!(
