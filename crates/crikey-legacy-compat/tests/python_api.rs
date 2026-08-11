@@ -2129,7 +2129,7 @@ t.done()
 /// with a forward slash asserts the developer's filesystem, not the contract,
 /// which is that the entries are relative and use the host separator.
 fn native(expected: &str) -> String {
-    expected.replace('/', &std::path::MAIN_SEPARATOR.to_string())
+    expected.replace('/', std::path::MAIN_SEPARATOR_STR)
 }
 
 #[test]

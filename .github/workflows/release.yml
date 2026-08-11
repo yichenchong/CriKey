@@ -98,6 +98,44 @@ jobs:
         # the MSI packages rather than a second layout invented here.
         shell: pwsh
         run: Compress-Archive -Path target/packaging/windows/stage/* -DestinationPath target/packaging/windows/crikey-windows-x86_64-portable.zip
+      - name: Install the MSI and prove the installed launcher actually starts
+        # The owner's first report was "it installs and the app opens once,
+        # then vanishes", and nothing in this pipeline could have caught that:
+        # building an MSI proves it packages, not that what it installs runs.
+        # This runs the real per-user install, starts the installed GUI entry
+        # point the Start Menu shortcut starts, and requires it to still be
+        # alive a few seconds later - which is the whole claim the shortcut
+        # makes. A launcher that exits early fails here with its own
+        # startup.log quoted, which is the file it writes for exactly this
+        # case.
+        shell: pwsh
+        run: |
+          $msi = (Get-ChildItem target/packaging/windows/*.msi)[0].FullName
+          $log = Join-Path $env:RUNNER_TEMP 'install.log'
+          $install = Start-Process msiexec -ArgumentList @('/i', "`"$msi`"", '/qn', '/l*v', "`"$log`"") -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            Get-Content $log -Tail 40
+            throw "msiexec refused the package with exit code $($install.ExitCode)"
+          }
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\CriKey\crikey-launcher.exe'
+          if (-not (Test-Path -LiteralPath $installed)) {
+            Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Programs') -Recurse -Depth 2 | Out-String | Write-Host
+            throw "the install did not put crikey-launcher.exe where the shortcut points"
+          }
+          $launcher = Start-Process $installed -PassThru
+          Start-Sleep -Seconds 15
+          $startupLog = Join-Path $env:LOCALAPPDATA 'CriKey\State\startup.log'
+          if ($launcher.HasExited) {
+            if (Test-Path -LiteralPath $startupLog) { Get-Content $startupLog | Write-Host }
+            throw "the installed launcher exited with $($launcher.ExitCode) instead of staying resident"
+          }
+          Stop-Process -Id $launcher.Id -Force
+          # The command-line entry point must answer on PATH too, since that is
+          # what the documentation tells the user to type.
+          & (Join-Path $env:LOCALAPPDATA 'Programs\CriKey\crikey.exe') version
+          if ($LASTEXITCODE -ne 0) { throw "the installed `crikey version` failed with $LASTEXITCODE" }
+          $uninstall = Start-Process msiexec -ArgumentList @('/x', "`"$msi`"", '/qn') -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "uninstall failed with $($uninstall.ExitCode)" }
       - uses: actions/upload-artifact@v4
         with:
           name: windows
