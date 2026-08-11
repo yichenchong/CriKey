@@ -174,6 +174,20 @@ impl PluginIconResolver {
         let key = (plugin.to_owned(), reference.to_owned());
         {
             let mut inflight = lock(&self.inflight);
+            // Re-read the memo under this lock. `resolve` looked before it got
+            // here, and a fetch that finished in between has already stored its
+            // answer and given its slot back — so without this check the same
+            // reference is fetched twice: once by the worker that just
+            // finished, once by a caller holding a stale miss. The worker
+            // writes the memo before it clears the slot, so holding the slot
+            // lock while reading the memo cannot see a gap between them, and
+            // the two locks are never held in the other order.
+            if lock(&self.resolved)
+                .get(plugin)
+                .is_some_and(|references| references.contains_key(reference))
+            {
+                return;
+            }
             if inflight.len() >= MAX_CONCURRENT_FETCHES || inflight.contains(&key) {
                 return;
             }
