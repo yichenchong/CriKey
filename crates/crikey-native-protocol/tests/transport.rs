@@ -203,6 +203,67 @@ fn a_client_that_sends_and_leaves_before_the_accept_is_still_read() {
     remove_endpoint(&endpoint);
 }
 
+/// A client that connects and leaves without saying anything must not consume
+/// the endpoint.
+///
+/// A plugin that dies during startup does exactly this, and the launcher's
+/// answer has to be "that plugin failed, try the next client", not "this
+/// endpoint is finished". On Windows the instance has to be disconnected and
+/// re-armed for that, and the first `ConnectNamedPipe` after the re-arm
+/// reports success for the arming rather than for a client — so a listener
+/// that mistook it for one would hand the caller a pipe with nobody on the
+/// other end, and the real client behind it would never be seen.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_client_that_says_nothing_and_leaves_does_not_consume_the_endpoint() {
+    let endpoint = native_endpoint();
+    let listener = transport::Listener::bind(&endpoint).expect("bind the platform's native endpoint");
+
+    let silent_endpoint = endpoint.clone();
+    std::thread::spawn(move || {
+        let connection = transport::connect(&silent_endpoint, Some(Duration::from_secs(5)))
+            .expect("the silent client reaches the endpoint");
+        drop(connection);
+    })
+    .join()
+    .expect("the silent client finishes");
+
+    let real_endpoint = endpoint.clone();
+    let real_client = std::thread::spawn(move || {
+        let mut connection = transport::connect(&real_endpoint, Some(Duration::from_secs(5)))
+            .expect("the real client reaches the endpoint after a silent one");
+        connection.send(&envelope(9)).expect("client send");
+        // Held open until the server has read, so this half of the test is
+        // about the re-arm and not about salvaging a departed client.
+        std::thread::sleep(Duration::from_millis(200));
+    });
+
+    // The two transports dispose of a silent client differently and both are
+    // correct: a Unix listener hands it over as an accepted connection that
+    // immediately reports end of stream, while a single-instance Windows pipe
+    // re-arms and never mentions it. What must hold on both is that the real
+    // client behind it is still reachable, so accepts are repeated until a
+    // frame arrives rather than assuming which disposal happened.
+    let mut delivered = None;
+    for _ in 0..4 {
+        let mut accepted = listener
+            .accept(Some(Duration::from_secs(5)))
+            .expect("the endpoint must still accept after a client that said nothing");
+        if let Ok(frame) = accepted.recv() {
+            delivered = Some(frame.encode());
+            break;
+        }
+    }
+    assert_eq!(
+        delivered,
+        Some(envelope(9).encode()),
+        "the real client behind a silent one must still be served"
+    );
+    real_client.join().expect("client thread must finish");
+
+    remove_endpoint(&endpoint);
+}
+
 #[cfg(unix)]
 mod unix_tests {
     use std::path::PathBuf;

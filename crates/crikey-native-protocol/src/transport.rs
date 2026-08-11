@@ -852,10 +852,24 @@ mod windows_pipe {
                 )?),
                 None => None,
             };
+            // Whether the next `ConnectNamedPipe` answer is the acknowledgement
+            // that a just-disconnected instance is listening again rather than
+            // news of a client. On a non-blocking pipe the first call after
+            // `DisconnectNamedPipe` succeeds immediately to say exactly that,
+            // and taking it for a connection would hand out a handle nobody is
+            // on the other end of.
+            let mut arming = false;
             loop {
                 // SAFETY: the slot owns this valid server handle and holds it
                 // alive through each non-blocking ConnectNamedPipe call.
                 match unsafe { ConnectNamedPipe(handle, None) } {
+                    Ok(()) if arming => {
+                        arming = false;
+                        if deadline.is_some_and(|at| Instant::now() >= at) {
+                            return Err(crate::ProtocolError::Timeout);
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
                     Ok(()) => break,
                     Err(error) => match WIN32_ERROR::from_error(&error) {
                         Some(ERROR_PIPE_CONNECTED) => break,
@@ -885,6 +899,9 @@ mod windows_pipe {
                                     "a closed client could not be disconnected from the pipe".to_owned(),
                                 ));
                             }
+                            // The next `ConnectNamedPipe` will report success
+                            // for the re-arm itself, not for a client.
+                            arming = true;
                             if deadline.is_some_and(|at| Instant::now() >= at) {
                                 return Err(crate::ProtocolError::Timeout);
                             }
