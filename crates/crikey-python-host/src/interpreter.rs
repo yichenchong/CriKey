@@ -1230,12 +1230,16 @@ mod tests {
         );
     }
 
+    /// The scan matches file names, and a file name has a platform shape: an
+    /// executable is `python3.13` on Unix and `python3.13.exe` on Windows.
     #[test]
     fn only_python3_file_names_are_treated_as_interpreters() {
-        for name in ["python3", "python3.9", "python3.13"] {
-            assert!(is_interpreter_name(name), "{name} is an interpreter name");
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        for stem in ["python3", "python3.9", "python3.13"] {
+            let name = format!("{stem}{suffix}");
+            assert!(is_interpreter_name(&name), "{name} is an interpreter name");
         }
-        for name in [
+        for stem in [
             "python",
             "python3.",
             "python3.x",
@@ -1243,12 +1247,20 @@ mod tests {
             "pythonw3",
             "python2.7",
         ] {
+            let name = format!("{stem}{suffix}");
             assert_eq!(
-                is_interpreter_name(name),
-                cfg!(windows) && name == "python",
+                is_interpreter_name(&name),
+                cfg!(windows) && stem == "python",
                 "{name} must not be picked up off the search path"
             );
         }
+        // Windows executes `.exe`, so a name without it is not a program this
+        // scan may offer, however plausible it reads.
+        assert_eq!(
+            is_interpreter_name("python3"),
+            !cfg!(windows),
+            "an extensionless name is an interpreter on Unix and a stray file on Windows"
+        );
     }
 
     #[cfg(unix)]
