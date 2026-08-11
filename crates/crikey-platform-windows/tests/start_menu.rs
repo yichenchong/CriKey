@@ -182,7 +182,12 @@ fn only_shortcut_files_are_offered_to_the_shell() {
     assert_eq!(found, vec!["Real", "Upper"]);
 }
 
-#[cfg(unix)]
+// Linux only, not merely unix: macOS enforces UTF-8 in file names, so APFS
+// refuses `\xFF` with EILSEQ and the test would fail on the fixture rather
+// than on the scanner. The behaviour under test - that a name the host cannot
+// decode is still offered, lossily - is the same wherever a name like this can
+// exist, so one host that allows it is enough to defend it.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_shortcut_with_non_utf8_name_is_still_found() {
     let scratch = Scratch::new();

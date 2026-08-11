@@ -32,6 +32,17 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Provide the CPython the legacy shim's tests discover
+        # The Legacy Compatibility Layer's tests run a real interpreter and
+        # fail loudly rather than skip when none is found, which is the right
+        # contract and means the runner has to actually have one. Only the
+        # Linux image reliably ships `python3` on PATH: the Windows image has
+        # neither `python3.exe` nor `python.exe` there, so every one of those
+        # tests failed with "no CPython interpreter found". `python-version`
+        # matches the `python-sdk` job so both exercise the same interpreter.
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Install the X and GPU libraries the launcher loads at run time
         # Several tests start the real launcher under a private `Xvfb`, and the
         # launcher's window stack loads `libxkbcommon-x11.so` by name at run
