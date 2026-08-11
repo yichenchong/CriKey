@@ -2121,6 +2121,17 @@ t.done()
     );
 }
 
+/// A `;`-joined expectation spelled with the separator the host actually
+/// returns.
+///
+/// `scan_directory` answers relative paths built by the platform's own path
+/// module, so a Windows run reports `sub\\gamma.txt`. Writing the expectation
+/// with a forward slash asserts the developer's filesystem, not the contract,
+/// which is that the entries are relative and use the host separator.
+fn native(expected: &str) -> String {
+    expected.replace('/', &std::path::MAIN_SEPARATOR.to_string())
+}
+
 #[test]
 fn keypirinha_util_scans_directories_with_documented_flag_and_depth_semantics() {
     let scratch = TempDir::new("scandir");
@@ -2207,7 +2218,7 @@ t.done()
     );
     run.expect_eq(
         "max_level_without_flag",
-        "alpha.txt;sub/gamma.txt",
+        native("alpha.txt;sub/gamma.txt").as_str(),
         "max_level must control recursion without a private RECURSIVE flag",
     );
     run.expect_eq(
@@ -2217,18 +2228,18 @@ t.done()
     );
     run.expect_eq(
         "recursive_txt",
-        "alpha.txt;sub/deep/delta.txt;sub/gamma.txt",
+        native("alpha.txt;sub/deep/delta.txt;sub/gamma.txt").as_str(),
         "ScanFlags.RECURSIVE must descend the whole tree and report package-relative paths, sorted",
     );
     run.expect_eq(
         "recursive_depth_limited",
-        "alpha.txt;sub/gamma.txt",
+        native("alpha.txt;sub/gamma.txt").as_str(),
         "max_level bounds how many directory levels below the base are descended, so max_level=1 \
          reaches `sub` but not `sub/deep`",
     );
     run.expect_eq(
         "recursive_folders",
-        "sub;sub/deep",
+        native("sub;sub/deep").as_str(),
         "a recursive folder scan must report nested directories too",
     );
     run.expect_eq(
@@ -3369,8 +3380,16 @@ t.emit("site_loaded", "site" in sys.modules)
 
 shim_dir = os.path.realpath(os.environ["CRIKEY_SHIM_DIR"])
 program_dir = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+# `DLLs` is where a Windows CPython keeps its own extension modules (_socket,
+# _ssl, _ctypes and friends). It is part of the standard library by any honest
+# reading, but `sysconfig` reports neither stdlib nor platstdlib as its parent,
+# so without it every C extension the shims import reads as a third-party
+# dependency. It does not exist on POSIX, where those modules live under
+# platstdlib already.
+extension_dir = os.path.join(os.path.dirname(os.path.realpath(sys.executable)), "DLLs")
 allowed = tuple({os.path.realpath(sysconfig.get_paths()["stdlib"]),
                  os.path.realpath(sysconfig.get_paths()["platstdlib"]),
+                 os.path.realpath(extension_dir),
                  shim_dir,
                  program_dir})
 
@@ -3871,11 +3890,27 @@ t.done()
         &[],
     );
 
-    assert!(
-        !run.flag("windows"),
-        "this assertion describes the non-Windows behaviour and the CI host must not be Windows.\n{}",
-        run.describe()
-    );
+    // On Windows these helpers are supposed to work, so the refusal contract
+    // is the off-Windows half of the same behaviour. Both halves are asserted
+    // here rather than the test being gated away, because "refuses off
+    // Windows" is only meaningful next to "does not refuse on Windows".
+    if run.flag("windows") {
+        for key in ["read_link", "known_folder"] {
+            let observed = run.field(key);
+            assert!(
+                !observed.starts_with("HostUnavailableError"),
+                "on Windows `{key}` must attempt the Win32 call rather than refuse as unavailable; \
+                 got `{observed}`\n{}",
+                run.describe()
+            );
+        }
+        run.expect(
+            "hasattr_read_link",
+            "the helper must exist on every platform so a plugin can branch on the error rather \
+             than on its absence",
+        );
+        return;
+    }
     run.expect_eq(
         "read_link",
         "HostUnavailableError:read_link",
