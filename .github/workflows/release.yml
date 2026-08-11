@@ -149,9 +149,13 @@ jobs:
           & $console version
           if ($LASTEXITCODE -ne 0) { throw "the installed `crikey version` failed with $LASTEXITCODE" }
           # And an unknown argument must still be a named refusal rather than a
-          # silently started launcher.
-          & $console definitely-not-a-subcommand 2>&1 | Out-Null
-          if ($LASTEXITCODE -eq 0) { throw "an unknown subcommand must not be accepted" }
+          # silently started launcher. Run through Start-Process rather than the
+          # call operator: a deliberate non-zero exit would otherwise be the
+          # last `$LASTEXITCODE` of this script, which the runner reads as the
+          # step failing.
+          $unknown = Start-Process $console -ArgumentList 'definitely-not-a-subcommand' `
+            -Wait -PassThru -NoNewWindow
+          if ($unknown.ExitCode -eq 0) { throw "an unknown subcommand must not be accepted" }
           $uninstall = Start-Process msiexec -ArgumentList @('/x', "`"$msi`"", '/qn') -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "uninstall failed with $($uninstall.ExitCode)" }
       - uses: actions/upload-artifact@v4
