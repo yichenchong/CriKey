@@ -449,14 +449,31 @@ mod windows_pipe {
         FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, SetNamedPipeHandleState, PIPE_NOWAIT,
-        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe, SetNamedPipeHandleState,
+        PIPE_NOWAIT, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// `SECURITY_DESCRIPTOR_REVISION`, which the Win32 headers define as 1 and
     /// the `windows` crate does not re-export.
     const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+    /// How many bytes a pipe instance is still holding for a reader.
+    ///
+    /// Used to tell a client that connected, said its piece and left from one
+    /// that connected and left with nothing to say: the first has a handshake
+    /// worth draining, the second only a stale instance to re-arm. A query
+    /// that fails answers zero, which routes the caller to the re-arm path
+    /// rather than to a handle it could not inspect.
+    fn buffered_bytes(handle: HANDLE) -> u32 {
+        let mut available = 0_u32;
+        // SAFETY: no output buffer is requested; `available` is valid writable
+        // storage for the duration of the call.
+        match unsafe { PeekNamedPipe(handle, None, 0, None, Some(&mut available as *mut u32), None) } {
+            Ok(()) => available,
+            Err(_) => 0,
+        }
+    }
 
     fn io_error(error: windows::core::Error) -> io::Error {
         match WIN32_ERROR::from_error(&error) {
@@ -842,15 +859,37 @@ mod windows_pipe {
                     Ok(()) => break,
                     Err(error) => match WIN32_ERROR::from_error(&error) {
                         Some(ERROR_PIPE_CONNECTED) => break,
-                        // The client connected and closed again before this
-                        // poll came round. Windows keeps what it wrote in the
-                        // instance's buffer until the server disconnects, so
-                        // this is an accepted connection that will read its
-                        // data and then report end of stream — not a failure.
-                        // Treating it as one lost every plugin that answered
-                        // faster than the poll interval, which is every plugin
-                        // whose first act is to send its handshake and exit.
-                        Some(ERROR_NO_DATA) => break,
+                        // A client connected and closed again before this poll
+                        // came round. Win32 is explicit that a good connection
+                        // exists only after `ERROR_PIPE_CONNECTED`, so this
+                        // handle is not treated as one: it is only handed on
+                        // when the departed client actually left bytes in the
+                        // instance buffer, which is the plugin handshake this
+                        // host exists to read. With nothing buffered there is
+                        // nothing to salvage, so the instance is disconnected -
+                        // the documented recovery - and polling continues for
+                        // the next client instead of wedging on a stale one.
+                        Some(ERROR_NO_DATA) => {
+                            if buffered_bytes(handle) > 0 {
+                                break;
+                            }
+                            // SAFETY: the slot still owns this valid server
+                            // handle; disconnecting re-arms the instance and
+                            // leaves it listening for the next client.
+                            if unsafe { DisconnectNamedPipe(handle) }.is_err() {
+                                *guard = None;
+                                // SAFETY: removed from the slot just above, so
+                                // this closes it exactly once.
+                                let _ = unsafe { CloseHandle(handle) };
+                                return Err(crate::ProtocolError::Io(
+                                    "a closed client could not be disconnected from the pipe".to_owned(),
+                                ));
+                            }
+                            if deadline.is_some_and(|at| Instant::now() >= at) {
+                                return Err(crate::ProtocolError::Timeout);
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
                         Some(ERROR_PIPE_LISTENING) => {
                             if deadline.is_some_and(|at| Instant::now() >= at) {
                                 // The slot still holds the handle, so the next
