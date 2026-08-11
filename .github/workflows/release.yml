@@ -130,10 +130,28 @@ jobs:
             throw "the installed launcher exited with $($launcher.ExitCode) instead of staying resident"
           }
           Stop-Process -Id $launcher.Id -Force
-          # The command-line entry point must answer on PATH too, since that is
-          # what the documentation tells the user to type.
-          & (Join-Path $env:LOCALAPPDATA 'Programs\CriKey\crikey.exe') version
+          # The defect the owner actually hit: they double-clicked `crikey.exe`,
+          # which printed usage and exited, and read that as a broken program.
+          # Bare `crikey.exe` now starts the same resident launcher, so it is
+          # smoked the same way - started, left alone, and required to still be
+          # running - rather than being taken on trust because the GUI entry
+          # point passed.
+          $console = Join-Path $env:LOCALAPPDATA 'Programs\CriKey\crikey.exe'
+          $bare = Start-Process $console -PassThru
+          Start-Sleep -Seconds 15
+          if ($bare.HasExited) {
+            if (Test-Path -LiteralPath $startupLog) { Get-Content $startupLog | Write-Host }
+            throw "bare crikey.exe exited with $($bare.ExitCode) instead of starting the launcher"
+          }
+          Stop-Process -Id $bare.Id -Force
+          # A subcommand must still be command-line output, since that is what
+          # the documentation tells the user to type.
+          & $console version
           if ($LASTEXITCODE -ne 0) { throw "the installed `crikey version` failed with $LASTEXITCODE" }
+          # And an unknown argument must still be a named refusal rather than a
+          # silently started launcher.
+          & $console definitely-not-a-subcommand 2>&1 | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw "an unknown subcommand must not be accepted" }
           $uninstall = Start-Process msiexec -ArgumentList @('/x', "`"$msi`"", '/qn') -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "uninstall failed with $($uninstall.ExitCode)" }
       - uses: actions/upload-artifact@v4
