@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "crikey-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "crikey-plugin-model"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "crikey-core",
  "serde",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-wasm-host"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "crikey-core",
  "crikey-plugin-model",
