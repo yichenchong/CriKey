@@ -167,14 +167,19 @@ fn out_of_tree_plugin_streams_cancels_isolated_and_restarts() {
         let cancelled = thread::scope(|scope| {
             let finished_in_thread = Arc::clone(&finished);
             scope.spawn(move || {
-                // Bounded: gives up long before the suite would hang, so a lost
-                // Cancel frame fails the assertion instead of wedging the test.
-                for _ in 0..100_000 {
+                // Bounded, and paced: it gives up long before the suite would
+                // hang, so a lost Cancel frame fails the assertion instead of
+                // wedging the test. The pause matters as much as the bound —
+                // spinning `yield_now` on a two-core runner starves the very
+                // worker thread that has to notice the cancellation, and the
+                // call then hits its own timeout and is reported as a crashed
+                // transport rather than a cancelled batch.
+                for _ in 0..2_000 {
                     if finished_in_thread.load(Ordering::Acquire) {
                         return;
                     }
                     cancel.cancel();
-                    thread::yield_now();
+                    thread::sleep(Duration::from_millis(1));
                 }
             });
             let outcome = worker.suggest(&request(2, "slow cancel-me"));

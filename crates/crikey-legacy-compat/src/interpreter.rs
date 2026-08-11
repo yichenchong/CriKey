@@ -84,7 +84,14 @@ const PROBE_SCAN_LINES: usize = 16;
 
 /// Bound on a version probe. A candidate that never answers must not block
 /// startup or hold a discovery caller forever.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Fifteen seconds rather than five because this bound is only ever paid by a
+/// candidate that is failing: a healthy interpreter answers in milliseconds,
+/// while a first execution of a freshly unpacked CPython on Windows is scanned
+/// by the anti-malware service before its first instruction runs and routinely
+/// takes longer than five seconds. Reporting "unsupported interpreter" on a
+/// machine whose interpreter is merely cold is the worse failure of the two.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Polling interval for the bounded probe wait.
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -352,6 +359,10 @@ fn probe(path: &Path, source: InterpreterSource) -> Result<Interpreter, WorkerEr
     let mut command = Command::new(path);
     command
         .args(VERSION_PROBE_ARGS)
+        // Nothing to read: a probe that inherits a terminal can be a CPython
+        // that decided it was interactive, and an interpreter waiting at a
+        // prompt looks exactly like one that is broken.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
