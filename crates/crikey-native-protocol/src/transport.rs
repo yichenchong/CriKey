@@ -842,6 +842,15 @@ mod windows_pipe {
                     Ok(()) => break,
                     Err(error) => match WIN32_ERROR::from_error(&error) {
                         Some(ERROR_PIPE_CONNECTED) => break,
+                        // The client connected and closed again before this
+                        // poll came round. Windows keeps what it wrote in the
+                        // instance's buffer until the server disconnects, so
+                        // this is an accepted connection that will read its
+                        // data and then report end of stream — not a failure.
+                        // Treating it as one lost every plugin that answered
+                        // faster than the poll interval, which is every plugin
+                        // whose first act is to send its handshake and exit.
+                        Some(ERROR_NO_DATA) => break,
                         Some(ERROR_PIPE_LISTENING) => {
                             if deadline.is_some_and(|at| Instant::now() >= at) {
                                 // The slot still holds the handle, so the next
