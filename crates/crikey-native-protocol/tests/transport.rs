@@ -161,6 +161,48 @@ fn a_timed_out_accept_leaves_the_listener_able_to_accept_a_later_client() {
     remove_endpoint(&endpoint);
 }
 
+/// A client that has already gone is still a client whose bytes must arrive.
+///
+/// This is the shape of every plugin handshake: the child connects, writes,
+/// and can be finished before the host's next poll comes round. On Windows a
+/// non-blocking `ConnectNamedPipe` answers `ERROR_NO_DATA` for that case
+/// rather than `ERROR_PIPE_CONNECTED`, and reading it as a failure loses the
+/// handshake of every plugin quick enough to hit it. The data is buffered in
+/// the pipe instance until the server disconnects, so the contract is that the
+/// accept succeeds and the connection reads what was written before it closed,
+/// then ends.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_client_that_sends_and_leaves_before_the_accept_is_still_read() {
+    let endpoint = native_endpoint();
+    let listener = transport::Listener::bind(&endpoint).expect("bind the platform's native endpoint");
+
+    let client_endpoint = endpoint.clone();
+    let client = std::thread::spawn(move || {
+        let mut connection = transport::connect(&client_endpoint, Some(Duration::from_secs(5)))
+            .expect("the client reaches the endpoint");
+        connection.send(&envelope(7)).expect("client send");
+        // Gone before the server ever calls accept.
+        drop(connection);
+    });
+    client.join().expect("client thread must finish");
+
+    let mut accepted = listener
+        .accept(Some(Duration::from_secs(5)))
+        .expect("a client that already closed is still an accepted connection");
+    assert_eq!(
+        accepted
+            .recv()
+            .expect("the buffered frame survives the client")
+            .encode(),
+        envelope(7).encode(),
+        "what the client wrote before leaving must still be delivered"
+    );
+
+    drop(accepted);
+    remove_endpoint(&endpoint);
+}
+
 #[cfg(unix)]
 mod unix_tests {
     use std::path::PathBuf;

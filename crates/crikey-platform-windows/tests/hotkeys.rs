@@ -389,7 +389,6 @@ fn unimplemented_capabilities_are_never_claimed() {
         Capability::WindowEnumeration,
         Capability::WindowActivation,
         Capability::Notifications,
-        Capability::Icons,
         Capability::FileWatching,
         Capability::SecretStorage,
         Capability::ShellIntegration,
@@ -400,6 +399,24 @@ fn unimplemented_capabilities_are_never_claimed() {
             "{capability:?} is claimed but nothing implements it"
         );
     }
+}
+
+/// Icons are the one capability this backend half-implements, and the claim
+/// has to say so on the platform where the half exists.
+///
+/// A shortcut naming a real image file gets pixels; one naming a PE resource
+/// or a packaged application gets nothing, and `Partial` is the only honest
+/// word for that. Off Windows there is no half at all, so the same backend
+/// claims `Unavailable` — which is what this test asserted for every host
+/// until the suite first ran on a Windows one.
+#[test]
+fn the_half_implemented_icon_capability_is_claimed_as_partial_only_where_it_exists() {
+    let expected = if cfg!(target_os = "windows") {
+        CapabilityState::Partial
+    } else {
+        CapabilityState::Unavailable
+    };
+    assert_eq!(WindowsBackend::new().capability(Capability::Icons), expected);
 }
 
 #[test]
