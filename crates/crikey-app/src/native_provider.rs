@@ -494,6 +494,14 @@ pub struct NativeProvider {
     /// id. Stable item ids are only unique within an owner.
     action_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     collection_window: Duration,
+    /// Answers taken off the completion channel that have not been published
+    /// yet, oldest first.
+    ///
+    /// A call that finishes after the collection window closes still owns an
+    /// active pipeline request. Its answer waits here until a caller with a
+    /// pipeline retires it. Bounded by the channel it comes from and emptied on
+    /// every refresh tick, so it holds at most the calls of one generation.
+    late: Vec<DispatchResult>,
 }
 
 /// How long one query waits for native workers before presenting what arrived.
@@ -542,6 +550,7 @@ impl NativeProvider {
             unavailable: Vec::new(),
             action_items: Arc::new(Mutex::new(BTreeMap::new())),
             collection_window,
+            late: Vec::new(),
         };
 
         for root in roots {
@@ -1205,7 +1214,18 @@ impl NativeProvider {
                     let _ = pipeline.abort_request(&request.plugin, request.generation, at);
                     continue;
                 }
-                let items = suggestions.remove(&request.plugin).unwrap_or_default();
+                let Some(items) = suggestions.remove(&request.plugin) else {
+                    // Still running. Completing it here publishes an empty final
+                    // batch and retires the request, and `deliver` refuses a
+                    // batch whose request is no longer active -- so the answer,
+                    // when it lands a few hundred milliseconds later, is
+                    // rejected as stale and the user never sees those rows.
+                    // Left active, `retire_late_answers` publishes it on the
+                    // driver's next refresh tick. Every call carries its own
+                    // deadline, so a plugin that never answers still produces a
+                    // completion and still retires.
+                    continue;
+                };
                 let _ = pipeline.deliver(
                     ResultBatch {
                         generation: request.generation,
@@ -1219,11 +1239,11 @@ impl NativeProvider {
             }
         }
 
-        // A completion that raced the presentation deadline is no longer
-        // eligible to contribute rows, but its failure must still be
-        // recorded. Completions arriving after this non-blocking drain are
-        // consumed by the next collect, failure snapshot, or shutdown.
-        self.drain_completed_results();
+        // A completion can land between the collection window closing and this
+        // line. Retired rather than drained: draining would take it off the
+        // channel, drop its rows and leave its request active, and the refresh
+        // tick would then have nothing left to publish.
+        self.retire_late_answers(pipeline, at);
 
         let frame = pipeline.present(at);
         frame.filter(|frame| frame.generation == generation)
@@ -1242,6 +1262,7 @@ impl NativeProvider {
         // the channel. Consume them before teardown returns so late successes
         // are retired and late failures cannot disappear with the provider.
         self.drain_completed_results();
+        self.discard_buffered_answers();
     }
 
     /// Dispatches one independent call per plugin. Results are consumed from
@@ -1389,10 +1410,58 @@ impl NativeProvider {
     fn drain_completed_results(&mut self) {
         while let Ok(completion) = self.pool.result_rx.try_recv() {
             self.pool.finish_call(completion.generation, &completion.plugin);
-            let plugin = completion.plugin.clone();
             if completion.soft_timeout {
-                self.pool.record_soft_timeout(plugin);
+                self.pool.record_soft_timeout(completion.plugin.clone());
             }
+            // Buffered, not applied. This runs where there may be no pipeline to
+            // publish to, and applying an answer with nowhere to put it drops
+            // its rows while leaving its request active -- the exact shape of a
+            // spinner that never stops. `retire_late_answers` empties this.
+            self.late.push(completion);
+        }
+    }
+
+    /// Retires answers that arrived after the collection window closed, handing
+    /// their rows to `pipeline` and completing the requests they belong to.
+    ///
+    /// [`drive_query`](Self::drive_query) waits `DEFAULT_COLLECTION_WINDOW` and
+    /// no longer, so a slower plugin's request is still active when the frame
+    /// for that keystroke is published. The driver's refresh tick is the only
+    /// thing still running for that generation; this is where the answer
+    /// becomes rows the user can see.
+    fn retire_late_answers(&mut self, pipeline: &mut QueryPipeline, now: Millis) {
+        self.drain_completed_results();
+        for completion in std::mem::take(&mut self.late) {
+            let plugin = completion.plugin.clone();
+            let generation = Generation::from_raw(completion.generation);
+            let mut collected = BTreeMap::new();
+            let dead = self.apply_dispatch_result(plugin.clone(), completion.result, Some(&mut collected));
+            if dead {
+                // The call failed outright, so the request is abandoned rather
+                // than answered: what a dead plugin gets inside the window too.
+                let _ = pipeline.abort_request(&plugin, generation, now);
+                continue;
+            }
+            let items = collected.remove(&plugin).unwrap_or_default();
+            let _ = pipeline.deliver(
+                ResultBatch {
+                    generation,
+                    plugin: plugin.clone(),
+                    state: BatchState::Final,
+                    items,
+                },
+                now,
+            );
+            let _ = pipeline.complete(&plugin, generation, now);
+        }
+    }
+
+    /// Applies buffered answers with nowhere to publish them, at teardown.
+    ///
+    /// Failure diagnostics are what survive; nobody can be shown rows from
+    /// here, and there is no longer a generation to retire them under.
+    fn discard_buffered_answers(&mut self) {
+        for completion in std::mem::take(&mut self.late) {
             self.apply_dispatch_result(completion.plugin, completion.result, None);
         }
     }
@@ -1897,6 +1966,10 @@ impl NativeDriver {
                             {
                                 continue;
                             }
+                            // This tick is the only thing still running for
+                            // that generation, so an answer that missed the
+                            // collection window is published here or never.
+                            provider.retire_late_answers(&mut pipeline, last_now);
                             let Some(frame) = pipeline.present(last_now) else {
                                 continue;
                             };

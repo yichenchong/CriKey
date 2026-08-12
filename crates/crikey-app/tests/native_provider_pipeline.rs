@@ -1195,3 +1195,88 @@ fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
     );
     drop(driver);
 }
+
+/// A plugin that answers after the collection window still gets its rows shown.
+///
+/// [`NativeProvider::drive_query`] waits `DEFAULT_COLLECTION_WINDOW` (100 ms)
+/// and then completes every request it gathered, so a slower plugin's call is
+/// still running when the keystroke's frame is published. That answer arrives
+/// on the completion channel a few hundred milliseconds later, and the driver's
+/// periodic refresh is the only thing still running for that generation. If the
+/// refresh does not retire it, the rows are dropped and the user never sees the
+/// plugin's results at all — until they type another character, which is the
+/// one thing that would throw the answer away again.
+///
+/// This is a liveness assertion, not a latency one. The bound is generous; what
+/// it forbids is "never".
+#[test]
+fn a_native_answer_after_the_collection_window_still_reaches_the_user() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("late-answer");
+    let plugins_root = scratch.subdir("plugins");
+    // Comfortably past the 100 ms collection window and comfortably inside the
+    // plugin's own call deadline, so the child really does answer.
+    write_native_plugin(&plugins_root, "slow", &conformance, "slow:400");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = NativeProvider::load(&mut pipeline, &[plugins_root], &DisabledPlugins::default());
+    assert_eq!(
+        provider.unavailable(),
+        &[],
+        "the slow plugin must load: {:?}",
+        provider.unavailable(),
+    );
+
+    let published: Arc<Mutex<Vec<(Generation, bool, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&published);
+    let driver = NativeDriver::spawn(
+        provider,
+        pipeline,
+        Box::new(move |frame: &ViewModel| {
+            sink.lock().expect("the publish sink is not poisoned").push((
+                frame.generation,
+                frame.pending_plugins,
+                frame.rows.len(),
+            ));
+        }),
+    );
+
+    let generation = Generation::from_raw(1);
+    driver.submit(generation, "late", 17, Vec::new(), false, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut delivered = false;
+    while Instant::now() < deadline {
+        delivered = published
+            .lock()
+            .expect("the publish sink is not poisoned")
+            .iter()
+            .any(|(published_generation, _, rows)| *published_generation == generation && *rows >= 1);
+        if delivered {
+            break;
+        }
+        sleep(Duration::from_millis(10));
+    }
+    assert!(
+        delivered,
+        "the slow plugin's answer must reach a published frame without another keystroke; \
+         frames seen (generation, pending, rows): {:?}",
+        published.lock().expect("the publish sink is not poisoned"),
+    );
+
+    // And the frame carrying it must not still claim work is outstanding.
+    let settled = published
+        .lock()
+        .expect("the publish sink is not poisoned")
+        .iter()
+        .rev()
+        .find(|(published_generation, _, rows)| *published_generation == generation && *rows >= 1)
+        .copied();
+    let (_, pending, _) = settled.expect("the delivering frame was just observed");
+    assert!(
+        !pending,
+        "the frame that finally carries the plugin's rows must not still say it is waiting for it"
+    );
+
+    drop(driver);
+}
