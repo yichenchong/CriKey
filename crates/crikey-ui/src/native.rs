@@ -16,7 +16,7 @@ use egui_wgpu::{wgpu, Renderer, ScreenDescriptor};
 use thiserror::Error;
 use winit::{
     application::ApplicationHandler,
-    dpi::{LogicalSize, PhysicalSize},
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event::{ElementState, Ime, KeyEvent, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
@@ -1154,16 +1154,33 @@ struct GraphicsState {
 
 /// How tall the window has to be to show `model`, in logical pixels.
 ///
-/// Only a launcher with nothing under the query field is compact: a result
-/// list, the "no matches" card and the settings surface all want the full
-/// window. Keeping this a function of the model alone is what lets the window
-/// follow the frame instead of standing at list height over an empty query.
+/// The launcher is a query field that grows a list under itself and shrinks
+/// back when the list empties. Nothing under the field -- no rows, no settings
+/// surface -- is [`theme::COMPACT_WINDOW_HEIGHT`], and that includes a query
+/// the providers have not answered yet: a window that grew on the first
+/// keystroke would stand there as an empty panel until results arrived.
+///
+/// With rows, the height is arithmetic over the row metrics rather than a
+/// measurement of the frame. egui lays the frame out inside whatever window
+/// already exists, so asking it how tall the content is answers with the
+/// current window height and the size never changes again. The metrics are
+/// pinned instead, by `every_result_row_matches_the_pinned_row_metrics`, which
+/// lays real rows out and fails if the drawing and this sum disagree.
 fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
-    if model.query.is_empty() && !model.settings_open {
-        theme::COMPACT_WINDOW_HEIGHT
-    } else {
-        expanded_height
+    if model.settings_open {
+        return expanded_height;
     }
+    let rows = model.rows.len();
+    if rows == 0 {
+        return theme::COMPACT_WINDOW_HEIGHT;
+    }
+    // The list, plus the gap above it, added to the field and footer that are
+    // always drawn. Saturating throughout: a result set large enough to
+    // overflow this is clamped to the expanded height anyway.
+    let gaps = (rows.saturating_sub(1) as f32) * theme::ROW_GAP;
+    let list = (rows as f32) * theme::ROW_HEIGHT + gaps + theme::SPACE_3;
+    let total = f32::from(u16::try_from(theme::COMPACT_WINDOW_HEIGHT).unwrap_or(u16::MAX)) + list;
+    (total.ceil().max(0.0) as u32).clamp(theme::COMPACT_WINDOW_HEIGHT, expanded_height)
 }
 
 /// Picks the surface compositing mode that matches how the window was created.
@@ -1210,9 +1227,15 @@ impl GraphicsState {
     ) -> Result<Self, RendererError> {
         let attributes = Window::default_attributes()
             .with_title(config.title.clone())
+            // The launcher opens on an empty query, which is the compact
+            // window. Creating it at the configured height instead would show a
+            // tall empty box for the frame it takes to fit itself, and would
+            // place the first centring for a height nothing ever displays.
+            // `config.height` is what the window expands to, not what it opens
+            // at, and it is carried as `expanded_height`.
             .with_inner_size(LogicalSize::new(
                 f64::from(config.width),
-                f64::from(config.height),
+                f64::from(theme::COMPACT_WINDOW_HEIGHT),
             ))
             .with_min_inner_size(LogicalSize::new(
                 f64::from(theme::MIN_WINDOW_WIDTH),
@@ -1327,7 +1350,68 @@ impl GraphicsState {
         })
     }
 
+    /// Puts the query field in the middle of the monitor the user is working
+    /// on and shows the window.
+    ///
+    /// Centring happens on every show rather than once at creation: the window
+    /// is summoned by a global hotkey, and between two summons the user may
+    /// have moved to another monitor, changed the resolution, or docked the
+    /// machine. A launcher that reappears on the display they left is a
+    /// launcher they have to go looking for.
+    ///
+    /// What is centred is the compact window -- the query field and the footer
+    /// -- and not whatever height the window happens to be. Two reasons. The
+    /// window is resized to fit its results, so centring the current height
+    /// would put the field somewhere different for every result count; and the
+    /// height at the moment of showing is last session's, not the one the first
+    /// frame is about to ask for. Fixing the top edge instead means the field
+    /// sits in the middle of the screen and stays exactly where the user is
+    /// looking while the list grows downwards under it.
+    fn center_on_active_monitor(&self) {
+        // The monitor the window is on, falling back to the primary.
+        // `current_monitor` answers for a hidden window too, which is the state
+        // this is called in.
+        let Some(monitor) = self
+            .window
+            .current_monitor()
+            .or_else(|| self.window.primary_monitor())
+        else {
+            // A backend that will not name a monitor cannot be asked where the
+            // middle is; leaving the window where it is beats guessing at 0,0.
+            return;
+        };
+        let screen = monitor.size();
+        if screen.width == 0 || screen.height == 0 {
+            return;
+        }
+        let scale = self.window.scale_factor();
+        let physical = |logical: u32| (f64::from(logical) * scale).round() as u32;
+        let width = self.window.outer_size().width;
+        // Saturating, because a window wider than the monitor must land at the
+        // left edge rather than wrap around to an enormous coordinate.
+        let x = screen.width.saturating_sub(width) / 2;
+        let mut y = screen
+            .height
+            .saturating_sub(physical(theme::COMPACT_WINDOW_HEIGHT))
+            / 2;
+        // On a short screen the list would run off the bottom, so the whole
+        // window is lifted just far enough to fit. The field stops being
+        // centred before it stops being reachable.
+        let expanded = physical(self.expanded_height);
+        if y + expanded > screen.height {
+            y = screen.height.saturating_sub(expanded);
+        }
+        let origin = monitor.position();
+        self.window.set_outer_position(PhysicalPosition::new(
+            origin.x + i32::try_from(x).unwrap_or(0),
+            origin.y + i32::try_from(y).unwrap_or(0),
+        ));
+    }
+
     fn show(&self) {
+        // Before the window is mapped: a position set afterwards is a visible
+        // jump from wherever the compositor first put it.
+        self.center_on_active_monitor();
         self.window.set_visible(true);
         self.window.set_ime_allowed(true);
         self.window.focus_window();
@@ -1648,22 +1732,13 @@ fn scroll_anchor_id() -> egui::Id {
 }
 
 fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
+    // Nothing below the field until there is something to put there. The card
+    // that used to stand here said "Searching" or "No matches" inside a
+    // full-width box, so the moment a key was pressed the launcher grew into a
+    // large empty panel and stayed that way until results arrived. The status
+    // line already carries both states -- a spinner while providers respond, a
+    // result count once they have -- without taking the room.
     if model.rows.is_empty() {
-        Frame::default()
-            .fill(colors.surface)
-            .stroke(Stroke::new(1.0_f32, colors.border))
-            .rounding(Rounding::same(theme::RADIUS_MEDIUM))
-            .inner_margin(Margin::same(theme::SPACE_6))
-            .show(ui, |ui| {
-                let (title, detail) = if model.pending_plugins {
-                    ("Searching", "Results will appear as providers respond.")
-                } else {
-                    ("No matches", "Try fewer words or a different spelling.")
-                };
-                ui.label(RichText::new(title).size(theme::TEXT_LABEL).strong());
-                ui.add_space(theme::SPACE_1);
-                ui.label(RichText::new(detail).small().color(colors.text_muted));
-            });
         return;
     }
 
@@ -1681,10 +1756,18 @@ fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
     };
     let list_height = (ui.available_height() - reserved).max(theme::SPACE_8 * 3.0);
     egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
+        // Vertically the list is exactly as tall as its rows, up to the cap:
+        // filling the cap regardless would put empty space between the last
+        // result and the status line, which is what makes a three-result search
+        // look like a mostly empty window.
+        .auto_shrink([false, true])
         .max_height(list_height)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+            // The gap between rows is exactly ROW_GAP, which the window height
+            // is computed from. egui's own item spacing would be added on top
+            // of it and put the arithmetic out by a few pixels per row.
+            ui.spacing_mut().item_spacing.y = 0.0;
             let mut selected_row = None;
             for (index, row) in model.rows.iter().enumerate() {
                 let response = draw_result_row(ui, row, index == model.selected, commands, colors);
@@ -1692,7 +1775,7 @@ fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
                     selected_row = Some(response);
                 }
                 if index + 1 != model.rows.len() {
-                    ui.add_space(theme::SPACE_1);
+                    ui.add_space(theme::ROW_GAP);
                 }
             }
 
@@ -1745,6 +1828,17 @@ fn draw_result_row(
         .rounding(Rounding::same(theme::RADIUS_SMALL))
         .inner_margin(Margin::symmetric(theme::SPACE_3, theme::SPACE_2))
         .show(ui, |ui| {
+            // Every row is as wide as the list, not as wide as its own text.
+            // An egui frame shrinks to its content, so without this the rows
+            // end wherever their label happens to end and the list reads as a
+            // ragged column of differently sized cards -- and the selected row,
+            // which alone is stretched by the scroll area's minimum width,
+            // looks like a different kind of thing from the rest.
+            ui.set_min_width(ui.available_width());
+            // And exactly as tall as every other row, description or not, so
+            // the list is a regular column and the window can be sized from the
+            // row count. The margins are outside this, hence the subtraction.
+            ui.set_min_height(theme::ROW_HEIGHT - 2.0 * theme::SPACE_2);
             ui.horizontal(|ui| {
                 draw_row_icon(ui, row);
                 ui.vertical(|ui| {
@@ -2499,6 +2593,32 @@ mod window_geometry_tests {
         }
     }
 
+    /// A model showing `count` results, each with every optional field a row
+    /// can draw: the tallest a row gets is what the row metrics must cover.
+    fn view_with_rows(count: usize) -> ViewModel {
+        let rows: Vec<ResultRow> = (0..count)
+            .map(|index| ResultRow {
+                item: crikey_core::ItemId(format!("item-{index}")),
+                label: format!("Result {index}"),
+                description: "A description that occupies the second line".to_owned(),
+                icon_reference: None,
+                icon: None,
+                category: "Application".to_owned(),
+                plugin_name: "builtin".to_owned(),
+                highlights: Vec::new(),
+                argument_hint: None,
+                status: None,
+                default_action: None,
+                alternate_actions: Vec::new(),
+            })
+            .collect();
+        ViewModel {
+            query: "q".to_owned(),
+            rows: rows.into(),
+            ..view("q", false)
+        }
+    }
+
     /// A provider driver publishes from its own thread and can only describe
     /// results. If its frame were taken at face value the first suggestion to
     /// arrive would close a settings panel the user is typing into.
@@ -2553,7 +2673,7 @@ mod window_geometry_tests {
     }
 
     #[test]
-    fn the_window_is_compact_until_there_is_something_below_the_query_field() {
+    fn the_window_is_compact_until_there_are_rows_to_show() {
         let expanded = theme::DEFAULT_WINDOW_HEIGHT;
 
         assert_eq!(
@@ -2561,11 +2681,131 @@ mod window_geometry_tests {
             theme::COMPACT_WINDOW_HEIGHT,
             "an untyped launcher must not stand at list height over the desktop"
         );
-        assert_eq!(desired_window_height(&view("q", false), expanded), expanded);
+        assert_eq!(
+            desired_window_height(&view("q", false), expanded),
+            theme::COMPACT_WINDOW_HEIGHT,
+            "typing is not a result: the field must not grow an empty panel under \
+             itself while the providers are still answering"
+        );
         assert_eq!(
             desired_window_height(&view("", true), expanded),
             expanded,
             "the settings surface needs the room even with nothing typed"
         );
+    }
+
+    #[test]
+    fn a_listed_window_is_as_tall_as_its_rows_and_no_taller() {
+        let expanded = theme::DEFAULT_WINDOW_HEIGHT;
+
+        let one = desired_window_height(&view_with_rows(1), expanded);
+        let two = desired_window_height(&view_with_rows(2), expanded);
+        assert_eq!(
+            two - one,
+            (theme::ROW_HEIGHT + theme::ROW_GAP) as u32,
+            "each further result adds exactly one row and one gap"
+        );
+        assert!(
+            one > theme::COMPACT_WINDOW_HEIGHT && one < expanded,
+            "a single result neither leaves the window compact nor fills it: {one}"
+        );
+        assert_eq!(
+            desired_window_height(&view_with_rows(500), expanded),
+            expanded,
+            "a long list scrolls inside the window rather than covering the screen"
+        );
+    }
+
+    /// The window height is arithmetic over [`theme::ROW_HEIGHT`] and
+    /// [`theme::ROW_GAP`], and nothing in egui enforces that the rows it draws
+    /// are that size. This lays real rows out and fails if they are not: the
+    /// arithmetic and the drawing must not be able to drift apart.
+    #[test]
+    fn every_result_row_matches_the_pinned_row_metrics() {
+        // A row is a small-radius rectangle painted in one of the two row
+        // fills. The rounding alone would also collect the footer's Settings
+        // button, which is a small-radius rectangle in a widget fill.
+        fn row_rects(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            let colors = theme::palette();
+            match shape {
+                egui::Shape::Rect(rect)
+                    if rect.rounding.nw == theme::RADIUS_SMALL
+                        && (rect.fill == colors.surface || rect.fill == colors.accent_soft) =>
+                {
+                    out.push(rect.rect);
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| row_rects(shape, out)),
+                _ => {}
+            }
+        }
+
+        // Deliberately taller than the window ever is, so the list is not
+        // capped and every row is laid out.
+        let input = RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(720.0, 2000.0),
+            )),
+            ..Default::default()
+        };
+        let frame = build_launcher_frame(&create_launcher_context(), input.clone(), &view_with_rows(3));
+        let mut rects = Vec::new();
+        for clipped in &frame.output.shapes {
+            row_rects(&clipped.shape, &mut rects);
+        }
+        rects.sort_by(|left, right| left.min.y.total_cmp(&right.min.y));
+
+        assert_eq!(rects.len(), 3, "three results are three rows");
+        for rect in &rects {
+            assert_eq!(
+                rect.height(),
+                theme::ROW_HEIGHT,
+                "a row that is not ROW_HEIGHT tall puts the window height out"
+            );
+        }
+        // Full width: every row spans the list, so the column is not ragged.
+        let width = rects[0].width();
+        for rect in &rects {
+            assert_eq!(rect.width(), width, "rows must all be the same width");
+        }
+        assert!(
+            width > 600.0,
+            "rows must span the 720-wide window, not shrink to their text: {width}"
+        );
+        for pair in rects.windows(2) {
+            assert_eq!(
+                pair[1].min.y - pair[0].min.y,
+                theme::ROW_HEIGHT + theme::ROW_GAP,
+                "the gap between rows must be exactly ROW_GAP"
+            );
+        }
+
+        // A row carrying less text is still a row. The window height is
+        // row-count arithmetic, so a short row would silently leave the last
+        // result half outside the window.
+        let mut sparse = view_with_rows(2);
+        let bare: Vec<ResultRow> = sparse
+            .rows
+            .iter()
+            .map(|row| ResultRow {
+                description: String::new(),
+                category: String::new(),
+                ..row.clone()
+            })
+            .collect();
+        sparse.rows = bare.into();
+        let frame = build_launcher_frame(&create_launcher_context(), input, &sparse);
+        let mut rects = Vec::new();
+        for clipped in &frame.output.shapes {
+            row_rects(&clipped.shape, &mut rects);
+        }
+        assert_eq!(rects.len(), 2);
+        for rect in &rects {
+            assert_eq!(
+                rect.height(),
+                theme::ROW_HEIGHT,
+                "a row with no description must still be ROW_HEIGHT tall"
+            );
+        }
     }
 }

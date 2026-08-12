@@ -88,10 +88,51 @@ jobs:
         # one version that both understands this authoring and needs no licence
         # acceptance, so an unpinned `dotnet tool install wix` fails on the
         # toolset rather than on anything in the tree.
-        run: dotnet tool install --global wix --version "5.*"
+        # The UI extension is pinned exactly. It supplies the dialog set, and a
+        # package built without it installs with no window but a progress bar --
+        # which reads to everyone who double-clicks it as an installer that
+        # opened and then closed.
+        run: |
+          dotnet tool install --global wix --version "5.*"
+          wix extension add --global WixToolset.UI.wixext/5.0.2
       - name: Build the MSI
         shell: pwsh
         run: ./packaging/windows/build.ps1 -Unsigned -Format msi -OutputDirectory target/packaging/windows
+      - name: Prove the MSI has an installer UI
+        # The gate below installs with `/qn`, which never opens a window, so
+        # every quiet check in this pipeline passed while a double-click showed
+        # nothing but a progress bar. Read the dialog set straight out of the
+        # built package instead: a UI-less MSI has no Dialog table at all.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem target/packaging/windows/*.msi | Select-Object -First 1).FullName
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.GetType().InvokeMember(
+            'OpenDatabase', 'InvokeMethod', $null, $installer, @($msi, 0))
+          $view = $database.GetType().InvokeMember(
+            'OpenView', 'InvokeMethod', $null, $database, @('SELECT `Dialog` FROM `Dialog`'))
+          $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+          $dialogs = @()
+          while ($true) {
+            $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+            if ($null -eq $record) { break }
+            $dialogs += $record.GetType().InvokeMember(
+              'StringData', 'GetProperty', $null, $record, @(1))
+          }
+          Write-Host "dialogs: $($dialogs.Count)"
+          # The two that carry the whole complaint: one window before anything
+          # is installed, and one saying it finished.
+          foreach ($required in @('WelcomeEulaDlg', 'ExitDialog')) {
+            if ($dialogs -notcontains $required) {
+              throw "the MSI has no $required, so double-clicking it shows no installer"
+            }
+          }
+          # And the licence shown must be CriKey's, not the toolset's sample.
+          $license = Get-Content target/packaging/windows/LICENSE.rtf -Raw
+          if ($license -notmatch 'Apache License') {
+            throw 'the licence dialog would not show the Apache-2.0 text'
+          }
       - name: Archive the staged tree as a portable zip
         # The MSI is a per-user install; the zip is what someone who wants to
         # run CriKey without installing it needs, and it is the same staged tree

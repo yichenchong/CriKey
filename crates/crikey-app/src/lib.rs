@@ -1405,6 +1405,15 @@ fn select_best<'items>(
     for plugin in owners {
         let prior = previous.and_then(|by_owner| by_owner.get(plugin));
         let mut selection = PluginSelection::new(plan, prior.map_or(0, |positions| positions.len()));
+        // The leading token, when the prefix index can answer it.
+        //
+        // Two characters, not one, and that is a measured floor rather than an
+        // arbitrary one. A single-character prefix match cannot outscore the
+        // best possible non-prefix match, so `skip_remaining` below can never
+        // fire for it, and admitting one-character tokens here buys a full
+        // `starts_with` scan of the catalog that changes no answer and skips no
+        // work: measured at 200k items it moved the median one-character
+        // keystroke from 44.5 ms to 53.8 ms.
         let prefix_token = query.tokens.first().filter(|token| {
             token.chars().take(2).count() == 2
                 && token

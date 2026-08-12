@@ -19,8 +19,19 @@ pub(crate) const SPACE_1: f32 = 4.0;
 pub(crate) const SPACE_2: f32 = 8.0;
 pub(crate) const SPACE_3: f32 = 12.0;
 pub(crate) const SPACE_4: f32 = 16.0;
-pub(crate) const SPACE_6: f32 = 24.0;
 pub(crate) const SPACE_8: f32 = 32.0;
+
+/// The height of one result row, in logical pixels.
+///
+/// Every row is this tall whether or not it carries a description, so the list
+/// is a regular column and the window height is arithmetic rather than a
+/// measurement of a frame that has already been laid out inside the window it
+/// is supposed to be sizing. Tall enough for the three lines a full row draws
+/// -- label, description, category -- inside the row's vertical margins.
+pub(crate) const ROW_HEIGHT: f32 = 80.0;
+
+/// The vertical gap between two result rows, in logical pixels.
+pub(crate) const ROW_GAP: f32 = SPACE_1;
 
 pub(crate) const RADIUS_SMALL: f32 = 4.0;
 pub(crate) const RADIUS_MEDIUM: f32 = 8.0;

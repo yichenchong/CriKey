@@ -104,7 +104,8 @@
   crikey-cabi-host.exe, LICENSE.txt, NOTICE.md, modern-sdk\ and legacy-shim\,
   and python-runtime\ when -d PythonRuntime=1 is also passed.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package
       Name="CriKey"
       Manufacturer="The CriKey Authors"
@@ -421,5 +422,28 @@
                        KeyPath="yes" />
       </Component>
     </ComponentGroup>
+
+    <!--
+      A double-clicked MSI with no authored UI is not a silent install: it is
+      an install whose only window is the progress bar. It appears, the bar
+      runs, the window vanishes, and the package is installed with no welcome
+      dialog, no licence, and nothing saying it worked. Everyone who tries it
+      reports the same thing, that the installer "opens and then closes", and
+      they are right to: nothing distinguishes that from a crash.
+
+      WixUI_Minimal, not one of the larger sets, because there is exactly one
+      decision to offer and it is not the install directory: this package is
+      per-user and installs into %LOCALAPPDATA%\Programs\CriKey by definition.
+      Minimal is welcome-and-licence, progress, finish.
+    -->
+    <ui:WixUI Id="WixUI_Minimal" />
+
+    <!--
+      The real licence, not the toolset's placeholder. Left unset, WixUI shows
+      the sample EULA shipped inside the UI extension, which would present the
+      user with a licence CriKey is not distributed under. build.ps1 renders
+      LICENSE into RTF because that is the only format this control reads.
+    -->
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
   </Package>
 </Wix>

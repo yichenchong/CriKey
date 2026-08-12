@@ -399,6 +399,37 @@ if ($Format -eq 'msi' -or $Format -eq 'both') {
     # nobody pinned.
     $wix = Resolve-RequiredTool -Name 'wix' -ProvidedBy 'the WiX v5 toolset: dotnet tool install --global wix --version "5.*"'
 
+    # WixUI lives in an extension, and an extension that is merely missing does
+    # not fail the build: `wix` would report an unknown `ui:WixUI` element, and
+    # the fix for that reads like an authoring mistake rather than an absent
+    # tool. Checked up front so the error names the install command.
+    $extensions = & $wix extension list --global 2>&1 | Out-String
+    if ($extensions -notmatch 'WixToolset\.UI\.wixext') {
+        Stop-WithError "the WiX UI extension is not installed (the MSI would have no dialogs and would appear to open and close). Install it with: wix extension add --global WixToolset.UI.wixext/5.0.2"
+    }
+
+    # The licence dialog reads RTF and nothing else, so the repository's plain
+    # text LICENSE is rendered rather than a second copy of the licence being
+    # kept in a format nobody edits. Written beside the artefact, not into the
+    # staging tree: the staging tree is the install payload, and the installer
+    # does not install its own dialog text.
+    $licenseSource = Join-Path $rootDir 'LICENSE'
+    $licenseRtf = Join-Path $OutputDirectory 'LICENSE.rtf'
+    $body = [System.IO.File]::ReadAllText($licenseSource)
+    # RTF's own three metacharacters, then every non-ASCII character as a signed
+    # 16-bit escape. Apache-2.0 is plain ASCII today; a licence that stops being
+    # so must not silently render as mojibake in the one dialog a user reads.
+    $body = $body -replace '\\', '\\\\' -replace '\{', '\{' -replace '\}', '\}'
+    $body = [regex]::Replace($body, '[^\x00-\x7F]', {
+        param($match)
+        $code = [int][char]$match.Value
+        if ($code -gt 32767) { $code -= 65536 }
+        "\u$code?"
+    })
+    $body = $body -replace "`r`n", "`n" -replace "`n", "\par`r`n"
+    $rtf = "{\rtf1\ansi\deff0{\fonttbl{\f0\fnil\fcharset0 Segoe UI;}}\fs18`r`n" + $body + "`r`n}"
+    [System.IO.File]::WriteAllText($licenseRtf, $rtf, [System.Text.Encoding]::ASCII)
+
     $msi = Join-Path $OutputDirectory "CriKey-$Version-x64.msi"
     Write-Note "building $msi"
 
@@ -413,8 +444,10 @@ if ($Format -eq 'msi' -or $Format -eq 'both') {
         'build',
         (Join-Path $scriptDir 'crikey.wxs'),
         '-arch', 'x64',
+        '-ext', 'WixToolset.UI.wixext',
         '-d', "Version=$Version",
         '-d', "StageDir=$stage",
+        '-d', "LicenseRtf=$licenseRtf",
         '-o', $msi
     )
     if ($havePythonRuntime) {

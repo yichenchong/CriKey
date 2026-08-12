@@ -453,17 +453,34 @@ fn an_empty_query_renders_nothing_but_the_query_field() {
     assert!(painted(&frame, "Search apps, files, and actions"));
 }
 
+/// A search that matched nothing must say so -- but in the status line, not in
+/// a card under the field. The card made the window grow into a large empty
+/// panel on the first keystroke and stay one until results arrived, which is
+/// the "blocky" the first Windows tester reported.
 #[test]
-fn a_typed_query_with_no_matches_still_says_so() {
+fn a_typed_query_with_no_matches_says_so_without_growing_a_panel() {
     let context = create_launcher_context();
 
     let empty = build_launcher_frame(&context, launcher_input(Vec::new()), &model("qqq"));
-    assert!(painted(&empty, "No matches"));
+    assert!(
+        painted(&empty, "0 results"),
+        "a search that matched nothing must still tell the user that"
+    );
 
     let mut pending = model("qqq");
     pending.pending_plugins = true;
     let pending = build_launcher_frame(&context, launcher_input(Vec::new()), &pending);
-    assert!(painted(&pending, "Searching"));
+    assert!(
+        painted(&pending, "Providers are still responding"),
+        "a search still running must say so rather than look like it found nothing"
+    );
+
+    for absent in ["No matches", "Try fewer words", "Results will appear"] {
+        assert!(
+            !painted(&empty, absent) && !painted(&pending, absent),
+            "nothing is drawn under the field until there are rows, yet it painted {absent:?}"
+        );
+    }
 }
 
 /// One egui context plus a monotonic clock.
