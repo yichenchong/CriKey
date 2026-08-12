@@ -1223,8 +1223,23 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     // clamped to the expanded height anyway.
     let gaps = (rows.saturating_sub(1) as f32) * theme::ROW_GAP;
     let list = (rows as f32) * theme::ROW_HEIGHT + gaps + theme::SPACE_3 + theme::SPACE_2;
-    let total =
-        f32::from(u16::try_from(theme::COMPACT_WINDOW_HEIGHT).unwrap_or(u16::MAX)) + list + theme::SPACE_4;
+    // The action list opens between the results and the status line, so it
+    // needs room of its own. Without this a single result with alternates
+    // opened its actions into a window sized for the list alone and pushed the
+    // status line off the bottom -- the same clipping, from the other
+    // direction, and one that a long result set hides because it is clamped.
+    let actions = if model.actions_open {
+        let buttons = model.rows.get(model.selected).map_or(0, |row| {
+            usize::from(row.default_action.is_some()) + row.alternate_actions.len()
+        });
+        BLOCK_GAP + actions_overlay_height(buttons)
+    } else {
+        0.0
+    };
+    let total = f32::from(u16::try_from(theme::COMPACT_WINDOW_HEIGHT).unwrap_or(u16::MAX))
+        + list
+        + actions
+        + theme::SPACE_4;
     (total.ceil().max(0.0) as u32).clamp(theme::COMPACT_WINDOW_HEIGHT, expanded_height)
 }
 
@@ -3199,6 +3214,90 @@ mod window_geometry_tests {
                 "{rows} results leave {} of empty window under the status line, which is \
                  more than a whole row",
                 f32::from(height as u16) - needed
+            );
+        }
+    }
+
+    /// The same clipping check with the action list open.
+    ///
+    /// A long result set hides this: it clamps to the expanded height, which is
+    /// tall enough for anything. It is the short list -- one result, its
+    /// actions opened -- where the overlay has to be paid for out of the
+    /// window's height, and where forgetting it pushes the status line off the
+    /// bottom.
+    #[test]
+    fn opening_the_action_list_makes_room_for_it() {
+        use crikey_core::{Action, ActionId};
+
+        fn drawn_bottom(shape: &egui::Shape, canvas: egui::Color32) -> f32 {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes
+                    .iter()
+                    .map(|shape| drawn_bottom(shape, canvas))
+                    .fold(f32::NEG_INFINITY, f32::max),
+                egui::Shape::Rect(rect) if rect.fill == canvas => f32::NEG_INFINITY,
+                other => {
+                    let bounds = other.visual_bounding_rect();
+                    if bounds.is_finite() {
+                        bounds.max.y
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                }
+            }
+        }
+
+        for rows in 1_usize..=2 {
+            let mut model = view_with_rows(rows);
+            // A row with something to act on, which is what opens the overlay.
+            let mut first = model.rows[0].clone();
+            first.default_action = Some(Action {
+                action_id: ActionId("run".to_owned()),
+                label: "Run".to_owned(),
+                description: String::new(),
+                applicable_categories: Vec::new(),
+                icon_reference: None,
+                execution_policy: crikey_core::ExecutionPolicy::HostMediated,
+            });
+            first.alternate_actions = vec![Action {
+                action_id: ActionId("reveal".to_owned()),
+                label: "Reveal".to_owned(),
+                description: String::new(),
+                applicable_categories: Vec::new(),
+                icon_reference: None,
+                execution_policy: crikey_core::ExecutionPolicy::HostMediated,
+            }];
+            let mut all = model.rows.to_vec();
+            all[0] = first;
+            model.rows = all.into();
+            model.actions_open = true;
+
+            let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
+            let input = RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(
+                        f32::from(theme::DEFAULT_WINDOW_WIDTH as u16),
+                        f32::from(height as u16),
+                    ),
+                )),
+                ..Default::default()
+            };
+            let frame = build_launcher_frame(&create_launcher_context(), input, &model);
+            let colors = theme::palette();
+            let bottom = frame
+                .output
+                .shapes
+                .iter()
+                .map(|clipped| drawn_bottom(&clipped.shape, colors.canvas))
+                .fold(f32::NEG_INFINITY, f32::max);
+
+            let needed = bottom + theme::SPACE_4;
+            assert!(
+                needed <= f32::from(height as u16),
+                "{rows} results with the action list open draw down to {bottom}, so the \
+                 window needs {needed} and was only given {height}: the overlay or the \
+                 status line is cut off"
             );
         }
     }

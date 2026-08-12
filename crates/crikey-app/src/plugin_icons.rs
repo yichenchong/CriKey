@@ -450,6 +450,15 @@ mod tests {
             references.len(),
             "every silent reference settles, so no fetch slot was kept"
         );
+        // The worker writes the memo and only then gives the slot back, so a
+        // loop that stops the instant the memo is complete can look between
+        // those two steps. On a loaded runner that gap is wide enough to see:
+        // this waits for the release rather than asserting it has already
+        // happened, which is the same contract without the race.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && !lock(&resolver.inflight).is_empty() {
+            thread::sleep(Duration::from_millis(5));
+        }
         assert!(
             lock(&resolver.inflight).is_empty(),
             "no outstanding request survives its own fetch"
