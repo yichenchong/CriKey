@@ -263,6 +263,26 @@ regardless, enable lingering once (this is the only step needing root):
 sudo loginctl enable-linger "$USER"
 ```
 
+## Commit identity
+
+Commits are authored by the repository owner, `Yi Chen Chong
+<yichenchong@yahoo.com>`. That is set in this clone's `.git/config`, so an
+ordinary `git commit` is already correct and nothing needs passing on the
+command line.
+
+Do not override it — not with `git -c user.name=...`, not with `GIT_AUTHOR_*`
+or `GIT_COMMITTER_*` in the environment, and not by editing `.git/config`. An
+earlier agent set this clone to a placeholder `CriKey <dev@crikey.invalid>`;
+because that address belongs to no GitHub account, sixty-nine commits and six
+release tags were attributed to nobody, and putting it right meant rewriting
+every commit and force-pushing every tag. Check with:
+
+```console
+$ git config user.name && git config user.email
+Yi Chen Chong
+yichenchong@yahoo.com
+```
+
 ## Working in parallel
 
 Several people or agents editing this workspace at once share one build
