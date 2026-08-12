@@ -171,6 +171,10 @@ pub struct QueryPipeline {
     drain_budget: DrainBudget,
     last_intake_drain_at: Option<Millis>,
     result_trace_capacity: usize,
+    /// The largest batch the aggregator will accept, kept so a caller can size
+    /// its deliveries. A producer that submits more than this has its whole
+    /// batch refused rather than truncated, so it has to know the ceiling.
+    max_items_per_batch: usize,
     unranked_batches: usize,
     registered: Vec<PluginId>,
     health_sync: HashMap<PluginId, HealthSync>,
@@ -226,6 +230,7 @@ impl QueryPipeline {
             drain_budget: config.drain_budget,
             last_intake_drain_at: None,
             result_trace_capacity,
+            max_items_per_batch: config.limits.max_items_per_batch,
             unranked_batches: 0,
             registered: Vec::new(),
             health_sync: HashMap::new(),
@@ -247,6 +252,14 @@ impl QueryPipeline {
             presentation_dirty: false,
             icons: None,
         }
+    }
+
+    /// The largest batch [`Self::deliver`] will accept for one plugin.
+    ///
+    /// A batch above it is refused whole, so a producer holding more items than
+    /// this must split them rather than hope for truncation.
+    pub fn max_items_per_batch(&self) -> usize {
+        self.max_items_per_batch
     }
 
     /// Records the profile override configured for a plugin. Providers must
@@ -674,6 +687,41 @@ impl QueryPipeline {
     /// Fair-drains intake, preserves plugin publication order and publishes at
     /// most one coalesced frame. The empty opening frame of every generation is
     /// visible, so rows can never outlive the query generation that produced them.
+    /// Presents after draining everything a synchronous producer has queued.
+    ///
+    /// [`Self::present`] drains one batch per plugin per timestamp: that budget
+    /// paces a stream of plugin results against the frame rate, and the
+    /// once-per-timestamp gate stops a repainting UI from re-draining. Neither
+    /// applies to a producer that has already handed over its whole answer
+    /// before returning, and pacing it against frames is actively wrong -- the
+    /// built-in application catalog queued three chunks of a common-letter
+    /// match, one drained, the rest sat in the queue, and the request stayed
+    /// unsettled, so the launcher said "Providers are still responding" until
+    /// the next keystroke.
+    ///
+    /// Bounded by the queue depth observed on entry plus a margin, so a batch
+    /// that cannot drain ends the loop instead of spinning in it.
+    pub fn present_drained(&mut self, now: Millis) -> Option<ViewModel> {
+        let mut frame = self.present(now);
+        let mut rounds = self.intake.depth().batches.saturating_add(2);
+        while rounds > 0 && self.intake.depth().batches > 0 {
+            rounds -= 1;
+            let before = self.intake.depth().batches;
+            // Re-arm the gate deliberately: this is the same instant, and the
+            // whole point is to take the rest of what is already queued.
+            self.last_intake_drain_at = None;
+            if let Some(next) = self.present(now) {
+                frame = Some(next);
+            }
+            if self.intake.depth().batches >= before {
+                // No progress; something is refusing to drain and another pass
+                // would only repeat it.
+                break;
+            }
+        }
+        frame
+    }
+
     pub fn present(&mut self, now: Millis) -> Option<ViewModel> {
         let (_, errors) = self.drain_intake(now);
         for error in errors {

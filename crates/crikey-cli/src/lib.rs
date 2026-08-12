@@ -2045,21 +2045,59 @@ fn drive_application_provider(
             let _ = pipeline.complete(&request.plugin, request.generation, now);
             continue;
         };
-        delivered_current = pipeline
-            .deliver(
-                ResultBatch {
-                    generation: request.generation,
-                    plugin: request.plugin.clone(),
-                    state: BatchState::Final,
-                    items: batch_items,
-                },
-                now,
-            )
-            .is_ok();
+        // Split to the aggregator's ceiling. A batch above it is refused
+        // whole -- not truncated -- and a refused batch leaves the request
+        // unsettled, so the frame never presents and the launcher keeps
+        // saying "Providers are still responding" until the next keystroke.
+        // Selection admits up to `max_items_per_plugin_per_query` (250) while
+        // one batch may carry `max_items_per_batch` (50), so any common letter
+        // typed against a real Start Menu exceeded it.
+        let ceiling = pipeline.max_items_per_batch().max(1);
+        let batch_count = batch_items.len().div_ceil(ceiling).max(1);
+        delivered_current = true;
+        for (index, chunk) in batch_items.chunks(ceiling).enumerate() {
+            // Only the last chunk ends the stream: a `Final` in the middle
+            // would terminate it and every later chunk would be refused as
+            // arriving after the end.
+            let state = if index + 1 == batch_count {
+                BatchState::Final
+            } else {
+                BatchState::Partial
+            };
+            let accepted = pipeline
+                .deliver(
+                    ResultBatch {
+                        generation: request.generation,
+                        plugin: request.plugin.clone(),
+                        state,
+                        items: chunk.to_vec(),
+                    },
+                    now,
+                )
+                .is_ok();
+            delivered_current &= accepted;
+        }
+        // An empty result set still owes the pipeline a terminal batch, or the
+        // request stays outstanding exactly as an over-large one did.
+        if batch_items.is_empty() {
+            delivered_current = pipeline
+                .deliver(
+                    ResultBatch {
+                        generation: request.generation,
+                        plugin: request.plugin.clone(),
+                        state: BatchState::Final,
+                        items: Vec::new(),
+                    },
+                    now,
+                )
+                .is_ok();
+        }
         let _ = pipeline.complete(&request.plugin, request.generation, now);
     }
 
-    let frame = pipeline.present(now);
+    // Drained, not merely presented: every chunk delivered above is already in
+    // hand, and leaving any of it queued leaves the request unsettled.
+    let frame = pipeline.present_drained(now);
     let presentation_succeeded = pipeline.take_errors().is_empty();
     if !tick_succeeded || !delivered_current || !presentation_succeeded {
         return None;
@@ -2691,6 +2729,93 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, QueryTraceEvent::StaleResultRejected { .. })),
             "the UI boundary must never receive a stale built-in batch"
+        );
+    }
+
+    /// A common letter matches more applications than one batch may carry, and
+    /// the launcher must still say it has finished.
+    ///
+    /// The built-in provider hands `SearchService`'s hits to the pipeline as a
+    /// single `ResultBatch`. Selection admits up to
+    /// `max_items_per_plugin_per_query` (250 by default) but the aggregator
+    /// refuses any batch over `max_items_per_batch` (50), so on a machine with a
+    /// real Start Menu, typing one common letter produced a batch that was
+    /// rejected outright: no rows, and — because the refused batch leaves the
+    /// request unsettled — `pending_plugins` stayed true, so the launcher sat
+    /// there saying "Providers are still responding" with no plugins installed
+    /// at all. Rarer letters matched fewer than fifty and worked, which is what
+    /// made it look like a slow search rather than a broken one.
+    #[test]
+    fn a_query_matching_more_applications_than_one_batch_holds_still_settles() {
+        use std::collections::BTreeMap;
+
+        use crikey_core::{ArgumentPolicy, Category, HitPolicy, ItemId};
+
+        let owner = PluginId(APPLICATION_CATALOG_PLUGIN.to_owned());
+        let application = |id: &str, label: &str| Item {
+            stable_id: ItemId(id.to_owned()),
+            plugin_id: owner.clone(),
+            category: Category::Application,
+            label: label.to_owned(),
+            description: format!("launch {label}"),
+            target: format!("app://{id}"),
+            search_terms: Vec::new(),
+            icon_reference: None,
+            argument_policy: ArgumentPolicy::Forbidden,
+            hit_policy: HitPolicy::Recorded,
+            score_hint: 0,
+            metadata: BTreeMap::new(),
+            actions: Vec::new(),
+        };
+
+        // Comfortably over the fifty-item batch ceiling, which a Start Menu
+        // clears on any common letter.
+        let catalog: Vec<Item> = (0..120)
+            .map(|index| application(&format!("app-{index}"), &format!("Alpha Application {index}")))
+            .collect();
+
+        let mut search = SearchService::new(App::new());
+        search
+            .complete_stage(StartupStage::WindowAndHotkey)
+            .expect("window startup completes");
+        search
+            .replace_catalog(&owner, 1, catalog)
+            .expect("the application catalog is valid");
+        search
+            .complete_stage(StartupStage::PersistedCatalog)
+            .expect("catalog startup completes");
+        search
+            .complete_stage(StartupStage::AcceptQueries)
+            .expect("query startup completes");
+
+        search.submit_query("a").expect("the local query is immediate");
+        let matched = search.results().len();
+        assert!(
+            matched > 50,
+            "the fixture must exceed one batch to exercise the ceiling, matched {matched}"
+        );
+        let result_items = search
+            .results()
+            .iter()
+            .map(|hit| hit.item.clone())
+            .collect::<Vec<_>>();
+
+        let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+        pipeline
+            .register_plugin(owner.clone(), application_provider_policy())
+            .expect("the built-in provider registers once");
+
+        let frame = drive_application_provider(&mut pipeline, &owner, "a", result_items, 17)
+            .expect("the built-in provider presents a frame");
+        assert!(
+            !frame.pending_plugins,
+            "the built-in catalog is synchronous and has answered, so nothing is \
+             outstanding: a frame that still claims to be waiting leaves the \
+             launcher spinning until the next keystroke"
+        );
+        assert!(
+            !frame.rows.is_empty(),
+            "a query matching {matched} applications must show some of them"
         );
     }
 

@@ -186,6 +186,72 @@ fn a_reference_is_resolved_once_however_many_rows_and_publications_present_it() 
     assert!(Arc::ptr_eq(&shared(&first, 0), &shared(&second, 0)));
 }
 
+/// "Once per session" has to mean the loader is not consulted again, not merely
+/// that the pixels are shared.
+///
+/// `result_rows` runs on the UI thread for every row of every keystroke. A
+/// reference that is re-resolved each time costs a theme-chain search and an
+/// image decode per row per keystroke -- about 3 ms each against a real theme,
+/// and a miss costs the most because it searches everything before giving up.
+/// That is what put the launcher's spinner up for seconds on a machine with a
+/// full Start Menu.
+///
+/// Deleting the file is how a test sees the difference: pixels already resolved
+/// stay resolved, while a loader consulted again would find nothing there.
+#[test]
+fn a_resolved_reference_is_not_looked_up_again_on_the_next_keystroke() {
+    let scratch = Scratch::new();
+    let icon = scratch.write("app.svg", &svg());
+    let reference = icon.to_string_lossy().into_owned();
+    let mut service = service(vec![item("one", "firefox", Some(reference))]);
+    service.submit_query("firefox").expect("queries are accepted");
+
+    let first = service.result_rows();
+    assert!(
+        first[0].icon.is_some(),
+        "the fixture resolves on the first publication"
+    );
+
+    fs::remove_file(&icon).expect("the fixture is removable");
+
+    let second = service.result_rows();
+    assert!(
+        second[0].icon.is_some(),
+        "a reference resolved once this session must not be resolved again: the \
+         platform loader was consulted a second time and paid for a search that \
+         the session had already answered"
+    );
+}
+
+/// The exception, and the reason re-resolving was there in the first place: a
+/// replaced catalog slice is an install, an upgrade or a removal, and any of
+/// those can change what a reference resolves to.
+#[test]
+fn replacing_a_catalog_slice_lets_every_reference_resolve_again() {
+    let scratch = Scratch::new();
+    let icon = scratch.write("app.svg", &svg());
+    let reference = icon.to_string_lossy().into_owned();
+    let mut service = service(vec![item("one", "firefox", Some(reference.clone()))]);
+    service.submit_query("firefox").expect("queries are accepted");
+    assert!(service.result_rows()[0].icon.is_some());
+
+    fs::remove_file(&icon).expect("the fixture is removable");
+    service
+        .replace_catalog(
+            &PluginId(PLUGIN.to_owned()),
+            2,
+            vec![item("one", "firefox", Some(reference))],
+        )
+        .expect("the catalog slice is accepted");
+    service.submit_query("firefox").expect("queries are accepted");
+
+    assert!(
+        service.result_rows()[0].icon.is_none(),
+        "a replaced slice drops the memo, so the reference resolves against what \
+         is on disk now rather than what was there before the install"
+    );
+}
+
 #[test]
 fn a_reference_naming_an_oversize_file_is_reported_as_no_icon_rather_than_read() {
     let scratch = Scratch::new();

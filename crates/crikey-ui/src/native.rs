@@ -768,6 +768,14 @@ struct NativeApplication<F> {
     /// True while an input method is building a character out of several key
     /// presses. Those presses belong to the composition, not to the launcher.
     composing: bool,
+    /// True once the compositor has told us this window holds the keyboard.
+    ///
+    /// Dismissal on focus loss is gated on this having been observed first: a
+    /// headless or unfocusable backend that never sends `Focused(true)` (Xvfb
+    /// with no window manager, which the launcher tests run under) would
+    /// otherwise close the launcher the instant a stray `Focused(false)`
+    /// arrived at startup.
+    focused: bool,
     next_repaint: Option<Instant>,
     consecutive_surface_retries: u32,
     on_event: F,
@@ -791,6 +799,7 @@ where
             pending_activation: None,
             modifiers: ModifiersState::default(),
             composing: false,
+            focused: false,
             next_repaint: None,
             consecutive_surface_retries: 0,
             on_event,
@@ -849,6 +858,11 @@ where
         // Hiding disables the input method, so a half-built character does not
         // survive into the next activation.
         self.composing = false;
+        // Unmapping the window makes the compositor hand the keyboard back to
+        // whatever had it before, so a `Focused(false)` follows every hide.
+        // Forgetting the focus here is what stops that event from being read as
+        // a fresh click-away and dismissing the *next* activation.
+        self.focused = false;
         self.next_repaint = None;
         self.consecutive_surface_retries = 0;
     }
@@ -1113,6 +1127,19 @@ where
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             WindowEvent::CloseRequested => self.dispatch_command(event_loop, UiCommand::Dismiss),
+            // A launcher is dismissed by being clicked away from, the way
+            // Spotlight and Alfred are. The dismissal is the same one Escape
+            // ends at, so it goes through `dispatch_command` and lets the host
+            // clear the view model and hide the window; hiding here as well
+            // would be a second, divergent path.
+            WindowEvent::Focused(focused) => {
+                let dismiss =
+                    should_dismiss_on_focus_change(focused, self.active_session.is_some(), self.focused);
+                self.focused = focused;
+                if dismiss {
+                    self.dispatch_command(event_loop, UiCommand::Dismiss);
+                }
+            }
             WindowEvent::Destroyed if !self.exiting => {
                 self.fail(event_loop, RendererError::WindowDestroyed);
             }
@@ -1165,7 +1192,9 @@ struct GraphicsState {
 /// already exists, so asking it how tall the content is answers with the
 /// current window height and the size never changes again. The metrics are
 /// pinned instead, by `every_result_row_matches_the_pinned_row_metrics`, which
-/// lays real rows out and fails if the drawing and this sum disagree.
+/// lays real rows out and fails if the drawing and this sum disagree, and by
+/// `a_listed_window_leaves_the_status_line_room_to_be_read`, which fails if
+/// the sum below stops covering everything the frame actually draws.
 fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     if model.settings_open {
         return expanded_height;
@@ -1174,13 +1203,77 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     if rows == 0 {
         return theme::COMPACT_WINDOW_HEIGHT;
     }
-    // The list, plus the gap above it, added to the field and footer that are
-    // always drawn. Saturating throughout: a result set large enough to
-    // overflow this is clamped to the expanded height anyway.
+    // The list, plus everything the panel puts around it, added to the field
+    // and footer that are always drawn.
+    //
+    // [`theme::COMPACT_WINDOW_HEIGHT`] is a deliberately tight height: it ends
+    // just under the footer and spends the panel's bottom inner margin to stay
+    // small. A listed window cannot do that, because the last thing the frame
+    // draws is the status line -- the "3 results" the owner could only see the
+    // top of -- so the margin is added back here as [`theme::SPACE_4`], which
+    // is what [`draw_launcher`] gives the central panel.
+    //
+    // [`theme::SPACE_2`] is the panel's own `item_spacing.y`, which egui
+    // inserts between the query field and the scroll area holding the list.
+    // It is not spacing anybody asked for, but it is drawn, and leaving it out
+    // of the sum is the other half of the clipping: the frame ended lower than
+    // the window it was sized for.
+    //
+    // Saturating throughout: a result set large enough to overflow this is
+    // clamped to the expanded height anyway.
     let gaps = (rows.saturating_sub(1) as f32) * theme::ROW_GAP;
-    let list = (rows as f32) * theme::ROW_HEIGHT + gaps + theme::SPACE_3;
-    let total = f32::from(u16::try_from(theme::COMPACT_WINDOW_HEIGHT).unwrap_or(u16::MAX)) + list;
+    let list = (rows as f32) * theme::ROW_HEIGHT + gaps + theme::SPACE_3 + theme::SPACE_2;
+    let total =
+        f32::from(u16::try_from(theme::COMPACT_WINDOW_HEIGHT).unwrap_or(u16::MAX)) + list + theme::SPACE_4;
     (total.ceil().max(0.0) as u32).clamp(theme::COMPACT_WINDOW_HEIGHT, expanded_height)
+}
+
+/// The physical size the next frame must be built at, given the size the
+/// window has now, the height that was just requested of it, and whatever
+/// `Window::request_inner_size` answered.
+///
+/// A backend that resizes synchronously answers `Some` with the size it
+/// actually gave, which is not always the size that was asked for -- a
+/// minimum size or a tiling constraint can cut it down -- so the granted size
+/// wins. A backend that resizes asynchronously (X11, Wayland, and Windows in
+/// several situations) answers `None`: the window is about to become the
+/// requested height, and the frame has to be built for the window it is
+/// becoming rather than the one it is leaving. Building at the old size and
+/// presenting into the new window leaves the compositor scaling one frame up
+/// -- the single-frame stretch of the query field seen when results arrive --
+/// until the `Resized` event lands and a correct frame replaces it.
+///
+/// Shrinking is susceptible in exactly the same way, with the stretch running
+/// the other way: a tall frame squeezed into a short window for one frame when
+/// the results are cleared. It is less noticeable but not less wrong, and the
+/// requested height is the right answer in both directions.
+///
+/// When the requested height is the height the window already has, the `None`
+/// branch returns that same size, so the caller's `resize` hits its
+/// unchanged-size early return and the common frame costs nothing.
+fn next_frame_size(
+    current: PhysicalSize<u32>,
+    target_height: u32,
+    granted: Option<PhysicalSize<u32>>,
+) -> PhysicalSize<u32> {
+    granted.unwrap_or(PhysicalSize::new(current.width, target_height))
+}
+
+/// Works out where the window's top-left corner goes on a monitor of
+/// `screen`, given the window's current `window_width` and the height it will
+/// reach once it is fully expanded, both in physical pixels.
+///
+/// Split out from [`GraphicsState::center_on_active_monitor`] because that
+/// function needs a real monitor from winit and so cannot be exercised in a
+/// unit test, while the arithmetic -- and in particular its saturating
+/// behaviour on a window larger than the screen -- is exactly the part that
+/// can be got wrong silently.
+fn centred_origin(screen: PhysicalSize<u32>, window_width: u32, expanded_height_physical: u32) -> (u32, u32) {
+    // Saturating on both axes, because a window larger than the monitor must
+    // land at the edge rather than wrap around to an enormous coordinate.
+    let x = screen.width.saturating_sub(window_width) / 2;
+    let y = screen.height.saturating_sub(expanded_height_physical) / 2;
+    (x, y)
 }
 
 /// Picks the surface compositing mode that matches how the window was created.
@@ -1350,8 +1443,8 @@ impl GraphicsState {
         })
     }
 
-    /// Puts the query field in the middle of the monitor the user is working
-    /// on and shows the window.
+    /// Positions the window so that the *expanded* launcher is centred on the
+    /// monitor the user is working on.
     ///
     /// Centring happens on every show rather than once at creation: the window
     /// is summoned by a global hotkey, and between two summons the user may
@@ -1359,14 +1452,19 @@ impl GraphicsState {
     /// machine. A launcher that reappears on the display they left is a
     /// launcher they have to go looking for.
     ///
-    /// What is centred is the compact window -- the query field and the footer
-    /// -- and not whatever height the window happens to be. Two reasons. The
-    /// window is resized to fit its results, so centring the current height
-    /// would put the field somewhere different for every result count; and the
-    /// height at the moment of showing is last session's, not the one the first
-    /// frame is about to ask for. Fixing the top edge instead means the field
-    /// sits in the middle of the screen and stays exactly where the user is
-    /// looking while the list grows downwards under it.
+    /// The vertical origin is derived from `expanded_height` rather than from
+    /// the compact height or from whatever height the window happens to be
+    /// right now. The window only ever grows downwards as results arrive, so
+    /// anchoring the top edge where the expanded window's top edge belongs
+    /// leaves the whole surface balanced on screen for the state it spends its
+    /// working life in -- showing results. The price is that the empty box sits
+    /// above the middle of the screen while there is nothing to show, which the
+    /// owner prefers to a full list hanging off the bottom half.
+    ///
+    /// Using the current height instead would be worse on both counts: it would
+    /// move the query field for every result count, and the height at the
+    /// moment of showing is last session's, not the one the first frame is
+    /// about to ask for.
     fn center_on_active_monitor(&self) {
         // The monitor the window is on, falling back to the primary.
         // `current_monitor` answers for a hidden window too, which is the state
@@ -1385,22 +1483,14 @@ impl GraphicsState {
             return;
         }
         let scale = self.window.scale_factor();
-        let physical = |logical: u32| (f64::from(logical) * scale).round() as u32;
+        let expanded = (f64::from(self.expanded_height) * scale).round() as u32;
         let width = self.window.outer_size().width;
-        // Saturating, because a window wider than the monitor must land at the
-        // left edge rather than wrap around to an enormous coordinate.
-        let x = screen.width.saturating_sub(width) / 2;
-        let mut y = screen
-            .height
-            .saturating_sub(physical(theme::COMPACT_WINDOW_HEIGHT))
-            / 2;
-        // On a short screen the list would run off the bottom, so the whole
-        // window is lifted just far enough to fit. The field stops being
-        // centred before it stops being reachable.
-        let expanded = physical(self.expanded_height);
-        if y + expanded > screen.height {
-            y = screen.height.saturating_sub(expanded);
-        }
+        // No short-screen clamp is needed any more. The origin is already
+        // derived from the expanded height, so `y + expanded` is at most
+        // `screen.height` whenever the expanded window fits, and the saturating
+        // subtraction pins `y` to 0 when it does not -- which is the lowest the
+        // old clamp could ever have pushed it anyway.
+        let (x, y) = centred_origin(screen, width, expanded);
         let origin = monitor.position();
         self.window.set_outer_position(PhysicalPosition::new(
             origin.x + i32::try_from(x).unwrap_or(0),
@@ -1435,33 +1525,57 @@ impl GraphicsState {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    /// Resizes the window to the height the next frame needs.
+    /// Resizes the window to the height the next frame needs, and answers with
+    /// the physical size that frame must be built at.
     ///
     /// Called before the frame is built, so the surface, the egui layout and
-    /// the window all describe the same height. A platform that resizes
-    /// synchronously answers with the new size and the surface is reconfigured
-    /// here; one that resizes asynchronously answers `None` and the
-    /// `Resized` event does it instead.
-    fn fit_window_height(&mut self, model: &ViewModel) {
+    /// the window all describe the same height. The surface is reconfigured to
+    /// that size here on both paths, synchronous and asynchronous, rather than
+    /// only when the backend grants the resize outright: see [`next_frame_size`]
+    /// for why a frame built at the outgoing size is the one-frame stretch the
+    /// launcher used to show whenever results arrived.
+    ///
+    /// The `Resized` event still reconfigures when the real resize lands. On
+    /// the asynchronous path it now arrives with the size the surface was
+    /// already given, so `resize` early-returns and the event costs nothing;
+    /// when the compositor lands on a different size after all, the event is
+    /// still what corrects it.
+    fn fit_window_height(&mut self, model: &ViewModel) -> PhysicalSize<u32> {
         let desired = desired_window_height(model, self.expanded_height);
         let scale = self.window.scale_factor();
         let current = self.window.inner_size();
         let target = ((f64::from(desired) * scale).round() as u32).max(1);
         if current.height == target {
-            return;
+            return current;
         }
 
-        if let Some(granted) = self
+        let granted = self
             .window
-            .request_inner_size(PhysicalSize::new(current.width, target))
-        {
-            self.resize(granted.width, granted.height);
-        }
+            .request_inner_size(PhysicalSize::new(current.width, target));
+        let next = next_frame_size(current, target, granted);
+        self.resize(next.width, next.height);
+        next
     }
 
     fn draw(&mut self, model: &ViewModel) -> Result<DrawResult, RendererError> {
-        self.fit_window_height(model);
-        let input = self.egui_state.take_egui_input(self.window.as_ref());
+        let frame_size = self.fit_window_height(model);
+        let mut input = self.egui_state.take_egui_input(self.window.as_ref());
+        // `take_egui_input` reads the window's *current* inner size, which on a
+        // backend that resizes asynchronously is still the outgoing one. Laying
+        // the frame out at that size and presenting it into the taller window
+        // is what stretched the query field for a frame, so egui is told the
+        // size the surface was just configured to instead. egui works in
+        // logical points, hence the division by the scale factor; the
+        // `ScreenDescriptor` built below reads the same surface configuration,
+        // so layout, surface and render all describe one frame.
+        let points = (self.window.scale_factor() as f32).max(f32::MIN_POSITIVE);
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(
+                frame_size.width as f32 / points,
+                frame_size.height as f32 / points,
+            ),
+        ));
         let NativeUiFrame { output, commands } =
             build_launcher_frame_with_transparency(&self.egui_context, input, model, self.transparent);
         let egui::FullOutput {
@@ -1572,6 +1686,25 @@ struct DrawResult {
     retry: bool,
 }
 
+/// Decides whether a `WindowEvent::Focused` means the user clicked away.
+///
+/// Three conditions have to hold together, and each one rules out a way the
+/// launcher could dismiss itself:
+///
+/// * `focused` must be false. Gaining focus is never a dismissal.
+/// * `active` must be true. A `Focused(false)` for a window that is already
+///   hidden -- the one the compositor sends as the unmap takes effect -- is not
+///   a click-away, and dismissing again would push a second `Dismiss` at the
+///   host for a session it has already closed.
+/// * `had_focus` must be true. `GraphicsState::show` focuses the window
+///   programmatically, so a genuine click-away is always preceded by a
+///   `Focused(true)`. Requiring it is what keeps a backend that never grants
+///   focus at all, such as Xvfb without a window manager, from closing the
+///   launcher the moment it opens.
+fn should_dismiss_on_focus_change(focused: bool, active: bool, had_focus: bool) -> bool {
+    !focused && active && had_focus
+}
+
 fn translate_keyboard(
     event: &KeyEvent,
     modifiers: ModifiersState,
@@ -1618,6 +1751,17 @@ fn canvas_fill(colors: theme::Palette, transparent: bool) -> egui::Color32 {
         colors.canvas
     }
 }
+
+/// The vertical distance [`draw_launcher`] puts between two of the blocks it
+/// stacks in the central panel, in logical pixels.
+///
+/// Two things make it up and both are drawn: the explicit
+/// [`theme::SPACE_3`] the panel body asks for, and the
+/// [`theme::SPACE_2`] of `item_spacing.y` egui inserts ahead of that space
+/// because it is a fresh allocation in a vertical layout. Reserving only the
+/// explicit gap is how [`draw_results`] used to end up 8 px lower than it
+/// thought it would.
+const BLOCK_GAP: f32 = theme::SPACE_2 + theme::SPACE_3;
 
 fn draw_launcher(
     context: &egui::Context,
@@ -1749,11 +1893,32 @@ fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
     let previous = ui.data(|data| data.get_temp::<ScrollAnchor>(scroll_anchor_id()));
     ui.data_mut(|data| data.insert_temp(scroll_anchor_id(), anchor));
 
-    let reserved = if model.actions_open {
-        theme::SPACE_8 * 4.0
+    // What the list may occupy is what is left after everything drawn under
+    // it, measured rather than guessed. This used to subtract a flat
+    // [`theme::SPACE_8`], which is 34 logical px short of the footer alone: a
+    // list long enough to clamp the window to its expanded height pushed the
+    // separator and the "120 results" row past the bottom edge, and the owner
+    // of a 1600x1000 screen saw only their top few pixels.
+    //
+    // The central panel's bottom inner margin is already outside
+    // `available_height`, so it must not be counted again here.
+    //
+    // The actions overlay stands between the list and the footer, so with it
+    // open the list gives up the overlay and a second gap as well. Its height
+    // follows the number of buttons the selected row publishes, because a row
+    // with three alternates draws an overlay half again as tall as one with
+    // none. [`draw_launcher`] spends the gap above the overlay whether or not
+    // [`draw_actions`] finds a row to describe.
+    let overlay = if model.actions_open {
+        BLOCK_GAP
+            + model.rows.get(model.selected).map_or(0.0, |row| {
+                let buttons = usize::from(row.default_action.is_some()) + row.alternate_actions.len();
+                actions_overlay_height(buttons)
+            })
     } else {
-        theme::SPACE_8
+        0.0
     };
+    let reserved = overlay + BLOCK_GAP + STATUS_BLOCK_HEIGHT;
     let list_height = (ui.available_height() - reserved).max(theme::SPACE_8 * 3.0);
     egui::ScrollArea::vertical()
         // Vertically the list is exactly as tall as its rows, up to the cap:
@@ -2036,6 +2201,33 @@ fn highlighted_label(row: &ResultRow, colors: theme::Palette) -> LayoutJob {
     job
 }
 
+/// The height of the header row [`draw_actions`] opens with, in logical
+/// pixels: one line of [`theme::TEXT_LABEL`] text, which egui lays out 24 px
+/// tall. There is no way to ask a style for that figure without laying the
+/// text out, so it is measured instead -- see [`actions_overlay_height`].
+const ACTIONS_HEADER_HEIGHT: f32 = 24.0;
+
+/// How tall the overlay [`draw_actions`] draws is, in logical pixels, for a
+/// row publishing `buttons` actions.
+///
+/// [`draw_results`] has to know this before the overlay is drawn, because the
+/// overlay comes out of the room the result list would otherwise take. The sum
+/// follows the drawing directly: the frame's [`theme::SPACE_3`] inner margin
+/// at the top and bottom, the header row, three [`theme::SPACE_2`] under the
+/// header -- the explicit gap plus the item spacing egui puts either side of
+/// it -- and then one button per action at the [`theme::SPACE_8`] of
+/// `interact_size`, separated by item spacing.
+///
+/// Measured, not guessed:
+/// `a_clamped_window_still_leaves_the_status_line_room_to_be_read` lays the
+/// overlay out and fails if the frame it draws is not this tall, so a
+/// restyled overlay cannot quietly grow over the status line again.
+fn actions_overlay_height(buttons: usize) -> f32 {
+    let chrome = theme::SPACE_3 * 2.0 + ACTIONS_HEADER_HEIGHT + theme::SPACE_2 * 3.0;
+    let stack = (buttons as f32) * theme::SPACE_8 + (buttons.saturating_sub(1) as f32) * theme::SPACE_2;
+    chrome + stack
+}
+
 fn draw_actions(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
     let Some(row) = model.rows.get(model.selected) else {
         return;
@@ -2208,6 +2400,27 @@ fn draw_setting_row(
         ui.data_mut(|data| data.remove::<String>(draft_id));
     }
 }
+
+/// The vertical room egui's `Separator` takes across a vertical layout, in
+/// logical pixels. It allocates `Separator::spacing` and draws its one-pixel
+/// line down the middle of that strip; the default is 6 and there is no
+/// accessor to ask for it, so it is measured -- see [`STATUS_BLOCK_HEIGHT`].
+const SEPARATOR_STRIP: f32 = 6.0;
+
+/// The vertical room [`draw_status`] needs, in logical pixels: the separator's
+/// strip, the [`theme::SPACE_2`] of item spacing egui puts under it, and the
+/// status row itself, which is [`theme::SPACE_8`] tall because the
+/// `Settings  Ctrl+,` button's `interact_size` decides the row's height rather
+/// than the small text beside it.
+///
+/// [`draw_results`] subtracts this from the room the result list may take, so
+/// it must be the room the footer actually occupies rather than an estimate of
+/// it. Measured, not guessed:
+/// `a_clamped_window_still_leaves_the_status_line_room_to_be_read` lays a
+/// clamped frame out and fails if the span from the top of the separator strip
+/// to the bottom of the status row stops matching this, which is what let a
+/// 120-result list push the "120 results" line off the bottom of the window.
+const STATUS_BLOCK_HEIGHT: f32 = SEPARATOR_STRIP + theme::SPACE_2 + theme::SPACE_8;
 
 fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
     ui.separator();
@@ -2417,6 +2630,37 @@ mod lifecycle_tests {
         assert_eq!(mailbox.wake_session, None);
         assert!(mailbox.latest.is_some());
     }
+
+    /// The defect: clicking away left the launcher on screen. Losing focus
+    /// while a session is on screen and holding the keyboard is the click-away,
+    /// and it has to dismiss.
+    #[test]
+    fn losing_focus_while_shown_dismisses_the_launcher() {
+        assert!(should_dismiss_on_focus_change(false, true, true));
+    }
+
+    /// Hiding the window makes the compositor send `Focused(false)` after the
+    /// session has already been closed. Acting on it would dismiss a second
+    /// time, and after a quick re-activation it would close the new session.
+    #[test]
+    fn the_focus_loss_that_hiding_causes_is_not_a_second_dismissal() {
+        assert!(!should_dismiss_on_focus_change(false, false, true));
+        assert!(!should_dismiss_on_focus_change(false, true, false));
+    }
+
+    /// Xvfb without a window manager never focuses the window, so the launcher
+    /// must not read the resulting focus report as the user clicking away.
+    #[test]
+    fn a_window_that_never_gained_focus_does_not_dismiss_itself() {
+        assert!(!should_dismiss_on_focus_change(false, true, false));
+    }
+
+    /// Gaining focus is how a session starts, never a reason to end one.
+    #[test]
+    fn gaining_focus_is_never_a_dismissal() {
+        assert!(!should_dismiss_on_focus_change(true, true, false));
+        assert!(!should_dismiss_on_focus_change(true, true, true));
+    }
 }
 
 #[test]
@@ -2578,6 +2822,88 @@ mod surface_tests {
 #[cfg(test)]
 mod window_geometry_tests {
     use super::*;
+
+    /// A backend that resizes asynchronously -- X11, Wayland, and Windows in
+    /// several situations -- answers `request_inner_size` with `None`. The
+    /// frame built in that gap must already be the height the window is
+    /// becoming: an old-size image presented into a new-size window is scaled
+    /// up by the compositor, which is the single-frame stretch of the query
+    /// field the owner reported when results arrive.
+    #[test]
+    fn an_asynchronous_resize_builds_the_frame_at_the_requested_height() {
+        let current = PhysicalSize::new(720, 96);
+
+        assert_eq!(next_frame_size(current, 420, None), PhysicalSize::new(720, 420));
+    }
+
+    /// Shrinking is the same artefact with the stretch running the other way:
+    /// a tall image squeezed into a short window. Clearing the results back to
+    /// the compact box goes through the identical path, so it gets the
+    /// identical answer.
+    #[test]
+    fn an_asynchronous_shrink_builds_the_frame_at_the_requested_height() {
+        let current = PhysicalSize::new(720, 420);
+
+        assert_eq!(next_frame_size(current, 96, None), PhysicalSize::new(720, 96));
+    }
+
+    /// A backend that resizes synchronously answers with the size it actually
+    /// gave, which is not always the size that was asked for -- a minimum size
+    /// or a tiling constraint can cut it down. The granted size is what the
+    /// window really is, so it wins over the request.
+    #[test]
+    fn a_granted_resize_wins_over_the_requested_height() {
+        let current = PhysicalSize::new(720, 96);
+
+        assert_eq!(
+            next_frame_size(current, 420, Some(PhysicalSize::new(720, 300))),
+            PhysicalSize::new(720, 300)
+        );
+    }
+
+    /// The height the window already has asks for no resize at all, so the
+    /// frame is built at the size it is: this is the case that must stay a
+    /// cheap no-op through `resize`'s unchanged-size early return, every frame
+    /// the launcher draws without the result count changing.
+    #[test]
+    fn a_height_that_is_already_current_leaves_the_frame_size_alone() {
+        let current = PhysicalSize::new(720, 96);
+
+        assert_eq!(next_frame_size(current, 96, None), current);
+    }
+
+    /// The window is centred horizontally, but vertically the origin comes from
+    /// the expanded height, so that the window is centred once it is showing
+    /// results rather than while it is still an empty box. Centring the compact
+    /// height here instead would put the origin at 1934, which is the bug this
+    /// pins.
+    #[test]
+    fn the_vertical_origin_leaves_room_for_the_expanded_window_below_it() {
+        let screen = PhysicalSize::new(2560, 4000);
+        let expanded = 1000;
+
+        let (x, y) = centred_origin(screen, 720, expanded);
+
+        assert_eq!(x, (2560 - 720) / 2);
+        assert_eq!(y, (4000 - 1000) / 2);
+        // The expanded window ends as far above the bottom edge as it starts
+        // below the top one, which is what "centred upon expansion" means.
+        assert_eq!(y, screen.height - (y + expanded));
+    }
+
+    /// A window wider or taller than the monitor must land at the edge. These
+    /// are unsigned pixel counts, so an unguarded subtraction would wrap to
+    /// roughly four billion and throw the window off the desktop entirely.
+    #[test]
+    fn a_window_larger_than_the_monitor_lands_at_the_origin_rather_than_wrapping() {
+        let screen = PhysicalSize::new(800, 600);
+
+        assert_eq!(centred_origin(screen, 1920, 1080), (0, 0));
+        // Each axis saturates on its own: a narrow window on a short screen
+        // still gets its horizontal centring.
+        assert_eq!(centred_origin(screen, 400, 1080), (200, 0));
+        assert_eq!(centred_origin(screen, 1920, 400), (0, 100));
+    }
 
     fn view(query: &str, settings_open: bool) -> ViewModel {
         ViewModel {
@@ -2806,6 +3132,228 @@ mod window_geometry_tests {
                 theme::ROW_HEIGHT,
                 "a row with no description must still be ROW_HEIGHT tall"
             );
+        }
+    }
+
+    /// The owner of the v0.1.6 window reported seeing "the top 5% of the 'x
+    /// results'": the status line is the last thing [`draw_launcher`] draws,
+    /// and the window was being sized to a sum that stopped above it.
+    ///
+    /// Row arithmetic on its own cannot catch that -- the rows were the right
+    /// size all along -- so this measures the frame instead. It lays the frame
+    /// out at exactly the height [`desired_window_height`] asks for and
+    /// compares the lowest pixel the frame draws against that height.
+    #[test]
+    fn a_listed_window_leaves_the_status_line_room_to_be_read() {
+        // Everything except the central panel's own background, which fills
+        // the window by definition and would report the window height back
+        // rather than the height of what was drawn in it.
+        fn drawn_bottom(shape: &egui::Shape, canvas: egui::Color32) -> f32 {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes
+                    .iter()
+                    .map(|shape| drawn_bottom(shape, canvas))
+                    .fold(f32::NEG_INFINITY, f32::max),
+                egui::Shape::Rect(rect) if rect.fill == canvas => f32::NEG_INFINITY,
+                other => {
+                    let bounds = other.visual_bounding_rect();
+                    if bounds.is_finite() {
+                        bounds.max.y
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                }
+            }
+        }
+
+        for rows in 1_usize..=3 {
+            let model = view_with_rows(rows);
+            let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
+            let input = RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(
+                        f32::from(theme::DEFAULT_WINDOW_WIDTH as u16),
+                        f32::from(height as u16),
+                    ),
+                )),
+                ..Default::default()
+            };
+            let frame = build_launcher_frame(&create_launcher_context(), input, &model);
+            let colors = theme::palette();
+            let bottom = frame
+                .output
+                .shapes
+                .iter()
+                .map(|clipped| drawn_bottom(&clipped.shape, colors.canvas))
+                .fold(f32::NEG_INFINITY, f32::max);
+
+            let needed = bottom + theme::SPACE_4;
+            assert!(
+                needed <= f32::from(height as u16),
+                "{rows} results draw down to {bottom}, so the window needs {needed} and \
+                 was only given {height}: the status line is cut off"
+            );
+            assert!(
+                f32::from(height as u16) - needed < theme::ROW_HEIGHT,
+                "{rows} results leave {} of empty window under the status line, which is \
+                 more than a whole row",
+                f32::from(height as u16) - needed
+            );
+        }
+    }
+
+    /// The v0.1.6 footer was cut off again, this time only once the list was
+    /// long enough to matter: at 1600x1000 with 120 matches the window filled
+    /// to [`theme::DEFAULT_WINDOW_HEIGHT`] and the "120 results" line showed
+    /// nothing but its top few pixels.
+    ///
+    /// [`a_listed_window_leaves_the_status_line_room_to_be_read`] cannot see
+    /// it: a short list is sized to fit, so the frame ends where it should and
+    /// only the clamped case squeezes the footer out. This lays a clamped
+    /// frame out at exactly the height [`desired_window_height`] asks for and
+    /// asserts on the status line itself rather than on total content, because
+    /// what went wrong is that the result list took the status line's room.
+    #[test]
+    fn a_clamped_window_still_leaves_the_status_line_room_to_be_read() {
+        fn leaves<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| leaves(shape, out)),
+                other => out.push(other),
+            }
+        }
+
+        fn action(label: &str) -> crikey_core::Action {
+            crikey_core::Action {
+                action_id: crikey_core::ActionId(label.to_owned()),
+                label: label.to_owned(),
+                description: "does a thing".to_owned(),
+                applicable_categories: Vec::new(),
+                icon_reference: None,
+                execution_policy: crikey_core::ExecutionPolicy::HostMediated,
+            }
+        }
+
+        // Three actions per row, so the overlay is tall enough that reserving
+        // its chrome alone would not be enough either.
+        const BUTTONS: usize = 3;
+
+        for actions_open in [false, true] {
+            // Far more results than the window can hold: this is the case the
+            // owner reported, and the one where the list is capped rather than
+            // sized to fit.
+            let mut model = view_with_rows(120);
+            let rows: Vec<ResultRow> = model
+                .rows
+                .iter()
+                .map(|row| ResultRow {
+                    default_action: Some(action("Launch")),
+                    alternate_actions: vec![action("Open folder"), action("Copy path")],
+                    ..row.clone()
+                })
+                .collect();
+            model.rows = rows.into();
+            model.actions_open = actions_open;
+
+            let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
+            assert_eq!(
+                height,
+                theme::DEFAULT_WINDOW_HEIGHT,
+                "120 results must clamp the window, or this tests the wrong case"
+            );
+            let input = RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(
+                        f32::from(theme::DEFAULT_WINDOW_WIDTH as u16),
+                        f32::from(height as u16),
+                    ),
+                )),
+                ..Default::default()
+            };
+            let frame = build_launcher_frame(&create_launcher_context(), input, &model);
+            let mut shapes = Vec::new();
+            for clipped in &frame.output.shapes {
+                leaves(&clipped.shape, &mut shapes);
+            }
+
+            // The footer starts at the one separator the frame draws, so the
+            // status line can be found without guessing at a coordinate.
+            let lines: Vec<f32> = shapes
+                .iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::LineSegment { points, .. } => Some(points[0].y),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                lines.len(),
+                1,
+                "draw_status opens with the only separator in a listed frame"
+            );
+            let separator = lines[0];
+
+            // Below the separator there is exactly one rectangle: the
+            // `Settings  Ctrl+,` button, whose interact_size is what makes the
+            // status row as tall as it is. The unexpanded `rect` is the layout
+            // rect; `visual_bounding_rect` would add half the stroke.
+            let below: Vec<egui::Rect> = shapes
+                .iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Rect(rect) if rect.rect.min.y > separator => Some(rect.rect),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                below.len(),
+                1,
+                "the status row's one rectangle is the Settings button, not {below:?}"
+            );
+            let status_bottom = below[0].max.y;
+
+            let window = f32::from(height as u16);
+            let needed = status_bottom + theme::SPACE_4;
+            assert!(
+                needed <= window,
+                "with actions_open={actions_open} the status row ends at {status_bottom}, so \
+                 the window needs {needed} once the panel's bottom margin is added and it is \
+                 only {window} tall: the status line is cut off"
+            );
+            assert!(
+                window - needed < theme::ROW_HEIGHT,
+                "with actions_open={actions_open} the list gave up {} px it could have shown \
+                 results in, which is more than a whole row",
+                window - needed
+            );
+
+            // The reserved room is only honest while these two measurements
+            // hold. egui draws the separator line down the middle of the strip
+            // it allocates, hence the half-strip; the line is snapped to a
+            // pixel centre, hence the tolerance.
+            let block = status_bottom - (separator - SEPARATOR_STRIP / 2.0);
+            assert!(
+                (block - STATUS_BLOCK_HEIGHT).abs() <= 1.0,
+                "the footer occupies {block}, not the STATUS_BLOCK_HEIGHT of {} that \
+                 draw_results reserves for it",
+                STATUS_BLOCK_HEIGHT
+            );
+            if actions_open {
+                let overlay = shapes
+                    .iter()
+                    .filter_map(|shape| match shape {
+                        egui::Shape::Rect(rect) if rect.stroke.color == theme::palette().accent => {
+                            Some(rect.rect.height())
+                        }
+                        _ => None,
+                    })
+                    .fold(f32::NEG_INFINITY, f32::max);
+                assert_eq!(
+                    overlay,
+                    actions_overlay_height(BUTTONS),
+                    "the actions overlay for {BUTTONS} actions is not the height \
+                     draw_results reserves for it"
+                );
+            }
         }
     }
 }
