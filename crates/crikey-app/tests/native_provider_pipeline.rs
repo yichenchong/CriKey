@@ -1280,3 +1280,88 @@ fn a_native_answer_after_the_collection_window_still_reaches_the_user() {
 
     drop(driver);
 }
+
+/// A plugin that answers "I failed" has still answered.
+///
+/// Its request must be retired, not left outstanding. A protocol failure is
+/// reported inside the collection window and carries no rows, so it looks from
+/// the outside exactly like a plugin that has not replied yet — and a request
+/// left active for a call that already finished can never be retired by
+/// anything, because the completion it was waiting for has been consumed. The
+/// launcher would say "Providers are still responding" until the user typed
+/// again.
+#[test]
+fn a_native_plugin_that_reports_failure_does_not_leave_the_query_outstanding() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("failed-batch");
+    let plugins_root = scratch.subdir("plugins");
+    write_native_plugin(&plugins_root, "failing", &conformance, "fail-suggest");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[plugins_root],
+        ROW_DELIVERY_WINDOW,
+        &DisabledPlugins::default(),
+    );
+    assert_eq!(
+        provider.unavailable(),
+        &[],
+        "the failing plugin must load: {:?}",
+        provider.unavailable(),
+    );
+
+    let frame = provider
+        .drive_query(&mut pipeline, "anything", 17)
+        .expect("the provider publishes a frame for the current generation");
+    assert!(
+        !frame.pending_plugins,
+        "a plugin that reported a failure is not still being waited for"
+    );
+    assert!(
+        !provider.dispatch_failures().is_empty(),
+        "the failure must still be recorded as a diagnostic"
+    );
+
+    provider.shutdown(180);
+}
+
+/// A plugin busy with the previous keystroke's call gets no new call for this
+/// one — and the request it never received must not be left outstanding.
+///
+/// `collect_suggestions` skips a plugin that already has a call in flight. That
+/// older call cannot answer the newer generation: when it finishes it is
+/// retired under the generation it belongs to. So nothing will ever arrive for
+/// the newer request, and leaving it active strands the newest frame as
+/// "Providers are still responding" forever. Typing fast into a launcher is the
+/// normal case, and this plugin ignores cancellation, which is the whole point:
+/// a plugin that misbehaves must not be able to wedge the UI.
+#[test]
+fn a_plugin_busy_with_an_older_call_does_not_strand_the_newest_query() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("busy-older");
+    let plugins_root = scratch.subdir("plugins");
+    write_native_plugin(&plugins_root, "stubborn", &conformance, "ignore-cancel:500");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    // The production window: the point is that the first call is still running
+    // when the second query arrives.
+    let mut provider = NativeProvider::load(&mut pipeline, &[plugins_root], &DisabledPlugins::default());
+    assert_eq!(
+        provider.unavailable(),
+        &[],
+        "the stubborn plugin must load: {:?}",
+        provider.unavailable(),
+    );
+
+    let _first = provider.drive_query(&mut pipeline, "first", 17);
+    let second = provider
+        .drive_query(&mut pipeline, "second", 18)
+        .expect("the newer generation is presented");
+    assert!(
+        !second.pending_plugins,
+        "the newest frame must not wait on a call that was never made for it"
+    );
+
+    provider.shutdown(180);
+}

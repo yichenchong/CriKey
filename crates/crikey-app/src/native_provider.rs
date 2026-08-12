@@ -1207,14 +1207,18 @@ impl NativeProvider {
                 .iter()
                 .map(|request| request.plugin.clone())
                 .collect::<BTreeSet<_>>();
-            let (mut suggestions, dead_plugins) =
-                self.collect_suggestions(query, generation, at, &requested_plugins);
+            let CollectedSuggestions {
+                mut by_plugin,
+                dead_plugins,
+                outstanding,
+            } = self.collect_suggestions(query, generation, at, &requested_plugins);
             for request in requests {
                 if dead_plugins.contains(&request.plugin) {
                     let _ = pipeline.abort_request(&request.plugin, request.generation, at);
                     continue;
                 }
-                let Some(items) = suggestions.remove(&request.plugin) else {
+                let answer = by_plugin.remove(&request.plugin);
+                if answer.is_none() && outstanding.contains(&request.plugin) {
                     // Still running. Completing it here publishes an empty final
                     // batch and retires the request, and `deliver` refuses a
                     // batch whose request is no longer active -- so the answer,
@@ -1225,7 +1229,13 @@ impl NativeProvider {
                     // deadline, so a plugin that never answers still produces a
                     // completion and still retires.
                     continue;
-                };
+                }
+                // Either the plugin answered, or no call for this generation is
+                // running for it -- a plugin still busy with an older
+                // keystroke's call gets no new call and so will never answer
+                // this one. Both retire the request; only a live call may keep
+                // it open.
+                let items = answer.unwrap_or_default();
                 let _ = pipeline.deliver(
                     ResultBatch {
                         generation: request.generation,
@@ -1276,7 +1286,7 @@ impl NativeProvider {
         generation: Generation,
         now: Millis,
         requested_plugins: &BTreeSet<PluginId>,
-    ) -> (BTreeMap<PluginId, Vec<Item>>, BTreeSet<PluginId>) {
+    ) -> CollectedSuggestions {
         let generation_value = generation.get();
         self.pool.cancel_before(generation_value);
         self.drain_completed_results();
@@ -1299,10 +1309,16 @@ impl NativeProvider {
         let mut pending = 0usize;
 
         let mut dead_plugins = BTreeSet::new();
+        // Plugins this generation actually dispatched a call to. A plugin still
+        // busy with an older keystroke's call is skipped below and never enters
+        // this set: nothing is coming for *this* generation, so its request must
+        // be retired now rather than waited on.
+        let mut dispatched = BTreeSet::new();
         for (plugin, key, soft_timeout) in targets {
             if self.pool.has_in_flight(&plugin) {
                 continue;
             }
+            dispatched.insert(plugin.clone());
             let supervisor = match self.pool.supervisors.get(&key) {
                 Some(supervisor) => Arc::clone(supervisor),
                 None => {
@@ -1373,6 +1389,7 @@ impl NativeProvider {
         }
 
         let mut by_plugin = BTreeMap::new();
+        let mut answered = BTreeSet::new();
         let deadline = Instant::now() + self.collection_window;
         while pending != 0 {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1393,6 +1410,7 @@ impl NativeProvider {
             }
             let failed = if is_current {
                 pending = pending.saturating_sub(1);
+                answered.insert(plugin.clone());
                 self.apply_dispatch_result(completion.plugin, completion.result, Some(&mut by_plugin))
             } else {
                 self.apply_dispatch_result(completion.plugin, completion.result, None)
@@ -1402,7 +1420,17 @@ impl NativeProvider {
             }
         }
 
-        (by_plugin, dead_plugins)
+        // Dispatched, not answered by the time the window closed, and not
+        // already declared dead: those are the calls still genuinely running.
+        let outstanding = dispatched
+            .into_iter()
+            .filter(|plugin| !answered.contains(plugin) && !dead_plugins.contains(plugin))
+            .collect();
+        CollectedSuggestions {
+            by_plugin,
+            dead_plugins,
+            outstanding,
+        }
     }
     /// Retires every completion that has reached the channel. Results that
     /// arrive outside the presentation window are intentionally not rendered,
@@ -1479,7 +1507,16 @@ impl NativeProvider {
                     .map(|error| error.message)
                     .filter(|message| !message.is_empty())
                     .unwrap_or_else(|| "the native plugin reported a failure".to_owned());
-                self.pool.record_dispatch_failure(plugin, reason);
+                self.pool.record_dispatch_failure(plugin.clone(), reason);
+                // A failure is an answer: the call is over and the plugin will
+                // send nothing more for this generation. Recorded as a reply
+                // carrying no rows so the caller retires the request. Left out,
+                // the request stays outstanding for a call that has already
+                // finished, nothing can ever retire it, and the launcher says
+                // "Providers are still responding" until the next keystroke.
+                if let Some(output) = output {
+                    output.insert(plugin, Vec::new());
+                }
                 false
             }
             Ok(suggestions) => {
@@ -1515,6 +1552,18 @@ impl Drop for NativeProvider {
     fn drop(&mut self) {
         self.shutdown(0);
     }
+}
+
+/// What one collection window observed.
+struct CollectedSuggestions {
+    /// Rows per plugin that answered in time.
+    by_plugin: BTreeMap<PluginId, Vec<Item>>,
+    /// Plugins whose call could not be made or failed outright.
+    dead_plugins: BTreeSet<PluginId>,
+    /// Plugins with a call for this generation still running when the window
+    /// closed. Only these may keep a pipeline request open: every other
+    /// request is retired now, because nothing is coming for it.
+    outstanding: BTreeSet<PluginId>,
 }
 
 /// One asynchronous native query, tagged with the UI generation it belongs to.
