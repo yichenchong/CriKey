@@ -570,6 +570,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             }
         }
     }
+    // Before any build is requested: a plugin that refuses catalog persistence
+    // must have last run's slice withdrawn even if its build never completes.
+    for (plugin, persist) in modern_provider.catalog_declarations() {
+        search.set_catalog_persistence(&plugin, persist);
+    }
     let modern_plugins = modern_provider.plugins().to_vec();
     for plugin in modern_plugins {
         if let Err(error) = modern_provider.request_catalog_build(&plugin, 1, crikey_core::Generation::ZERO) {
@@ -610,6 +615,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 let _ = native_pipeline.set_scheduling_profile(plugin, pipeline_profile(profile));
             }
         }
+    }
+    // Before any build is requested: a plugin that refuses catalog persistence
+    // must have last run's slice withdrawn even if its build never completes.
+    for (plugin, persist) in native_provider.catalog_declarations() {
+        search.set_catalog_persistence(&plugin, persist);
     }
     let native_plugins = native_provider.plugins().to_vec();
     for plugin in native_plugins {

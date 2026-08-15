@@ -963,6 +963,20 @@ impl ModernProvider {
         &self.plugins
     }
 
+    /// Each loaded plugin's catalog-persistence declaration (spec 22.1).
+    ///
+    /// Read at discovery, before any catalog build is requested, because a
+    /// refusal has to take effect even for a plugin that never publishes. A
+    /// build can fail, be refused a budget, or simply not finish, and in every
+    /// one of those cases a slice written by an earlier run is already loaded
+    /// and already answering queries.
+    pub fn catalog_declarations(&self) -> Vec<(PluginId, bool)> {
+        self.loaded
+            .iter()
+            .map(|loaded| (loaded.plugin.clone(), loaded.catalog_persist))
+            .collect()
+    }
+
     /// Packages that could not be served, each with an attributable reason.
     pub fn unavailable(&self) -> &[ModernUnavailable] {
         &self.unavailable

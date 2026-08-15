@@ -307,3 +307,63 @@ fn permitting_persistence_again_resumes_writing() {
 
     assert_eq!(cache.stored_owners(), vec![plugin()]);
 }
+
+/// The declaration must not depend on the plugin succeeding.
+///
+/// A build can fail, be refused a budget, or never finish. In each case the
+/// plugin publishes nothing, so a refusal applied only at the publication edge
+/// would never run - and the slice an earlier run left behind would answer
+/// queries for the whole session. Providers therefore report declarations at
+/// discovery, which is what this reproduces.
+#[test]
+fn a_refusal_applies_even_when_the_plugin_never_publishes() {
+    let stale = CachedSlice {
+        plugin: plugin(),
+        instance: 1,
+        generation: Generation::ZERO,
+        items: vec![item(&plugin(), "Yesterday's Session")],
+    };
+    let cache = Arc::new(RecordingCache::with_persisted(stale));
+    let mut service = accepting(&cache);
+    service
+        .load_persisted_catalog(cache.as_ref())
+        .expect("cache enumerates");
+
+    // Discovery reports the manifest; the plugin's catalog build then fails,
+    // so nothing is ever published for it.
+    service.set_catalog_persistence(&plugin(), false);
+
+    service.submit_query("yesterday").expect("query accepted");
+    assert!(
+        labels(&service).is_empty(),
+        "the stale slice must not answer, got {:?}",
+        labels(&service)
+    );
+    assert!(
+        !cache.holds(&plugin()),
+        "and it must not survive to the next launch either"
+    );
+}
+
+/// A plugin that permits persistence and never publishes keeps its cached
+/// slice: that slice answering early is the entire point of the cache.
+#[test]
+fn a_permitted_slice_still_answers_when_the_plugin_never_publishes() {
+    let stale = CachedSlice {
+        plugin: plugin(),
+        instance: 1,
+        generation: Generation::ZERO,
+        items: vec![item(&plugin(), "Yesterday's Session")],
+    };
+    let cache = Arc::new(RecordingCache::with_persisted(stale));
+    let mut service = accepting(&cache);
+    service
+        .load_persisted_catalog(cache.as_ref())
+        .expect("cache enumerates");
+
+    service.set_catalog_persistence(&plugin(), true);
+
+    service.submit_query("yesterday").expect("query accepted");
+    assert_eq!(labels(&service), vec!["Yesterday's Session".to_string()]);
+    assert!(cache.holds(&plugin()));
+}
