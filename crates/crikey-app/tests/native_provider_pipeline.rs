@@ -33,6 +33,23 @@ use crikey_ui::ViewModel;
 /// itself must use `NativeProvider::load`.
 const ROW_DELIVERY_WINDOW: Duration = Duration::from_secs(5);
 
+/// Liveness ceiling for a publication that waits on the **resource** child
+/// rather than the query child.
+///
+/// Separate from [`ROW_DELIVERY_WINDOW`] because it bounds a strictly larger
+/// cost. `[performance] startup = "eager"` starts a package's query
+/// supervisor at load; the icon resolver installs a *second* supervisor whose
+/// child is spawned on first use, so the first icon of a run also pays a cold
+/// process spawn and handshake. Five seconds covered that on Linux and
+/// Windows and did not on macOS, which is the whole reason this is its own
+/// number.
+///
+/// Its value asserts nothing. The latency contract is
+/// [`ICON_ISOLATION_WINDOW`] and [`BATCH_PUBLICATION_SLACK`], measured
+/// separately and deliberately tight; this only decides how long a genuinely
+/// stuck run takes to say so, and a passing run never waits it out.
+const RESOURCE_DELIVERY_WINDOW: Duration = Duration::from_secs(60);
+
 /// A private directory removed when the test that made it ends. Every package
 /// manifest and mode witness is written at test time, never committed.
 #[derive(Debug)]
@@ -887,17 +904,21 @@ fn native_plugin_icons_round_trip_through_resource_request() {
     );
     driver.submit(Generation::from_raw(1), "icon", 17, Vec::new(), false, 0);
 
-    for _ in 0..1_000 {
-        let ready = published
-            .lock()
-            .expect("the publish sink is not poisoned")
-            .iter()
-            .any(|(_, has_icon_row, pixels)| *has_icon_row && pixels.is_some());
-        if ready {
-            break;
-        }
-        sleep(Duration::from_millis(5));
-    }
+    // This wait includes the resource child's first spawn, exactly as the
+    // slow-icon test's decorated wait does, so it takes the same ceiling. The
+    // hand-rolled bound this replaces expired into the `expect` below, which
+    // then blamed a missing publication for a wait that had simply run out.
+    await_condition(
+        RESOURCE_DELIVERY_WINDOW,
+        "a publication carrying decoded resource pixels",
+        || {
+            published
+                .lock()
+                .expect("the publish sink is not poisoned")
+                .iter()
+                .any(|(_, has_icon_row, pixels)| *has_icon_row && pixels.is_some())
+        },
+    );
 
     let entries = published
         .lock()
@@ -958,8 +979,12 @@ fn native_healthy_worker_survives_repeated_queries() {
 /// Deliberately shorter than the fixture's 150 ms icon answer. The subject is
 /// that an outstanding icon fetch costs the NEXT query nothing, and that is
 /// only observable while the window is narrow enough that a fetch which had
-/// consumed it would show up as a query with no rows at all. Both packages
-/// start eagerly, so no measured query pays child startup.
+/// consumed it would show up as a query with no rows at all.
+///
+/// Both packages start eagerly, so no measured QUERY pays child startup. That
+/// says nothing about the icon: eager startup covers a package's query
+/// supervisor, while the resource child behind an icon is spawned on first
+/// use. Waits that include that spawn use [`RESOURCE_DELIVERY_WINDOW`].
 const ICON_ISOLATION_WINDOW: Duration = Duration::from_millis(60);
 
 /// How far past the collection window a batch may still be called on time.
@@ -1025,12 +1050,20 @@ fn spawn_icon_timing_driver(
 ///
 /// A missing publication is the failure this reports, never a silent skip: the
 /// defect these tests cover looks exactly like a row that never arrives.
+///
+/// `ceiling` is passed per call rather than taken from one constant because
+/// the waits here do not bound the same work: a row comes from a query child
+/// that is already running, an icon may also be waiting on a resource child
+/// that has yet to spawn. One shared number is either too tight for the second
+/// or uselessly loose for the first.
 fn await_publication(
     published: &Mutex<Vec<IconTiming>>,
+    ceiling: Duration,
     expectation: &str,
     predicate: impl Fn(&IconTiming) -> bool,
 ) -> IconTiming {
-    let deadline = Instant::now() + ROW_DELIVERY_WINDOW;
+    let started = Instant::now();
+    let deadline = started + ceiling;
     loop {
         let seen = published
             .lock()
@@ -1041,7 +1074,28 @@ fn await_publication(
         }
         assert!(
             Instant::now() < deadline,
-            "no publication was {expectation}: {seen:?}"
+            "no publication was {expectation} within {ceiling:?} (waited {:?}): {seen:?}",
+            started.elapsed()
+        );
+        sleep(Duration::from_millis(2));
+    }
+}
+
+/// Polls `ready` until it holds, or fails by name.
+///
+/// The counterpart to [`await_publication`] for sinks that are not
+/// [`IconTiming`]. Hand-rolling `for _ in 0..N { sleep(..) }` instead loses two
+/// things that matter when this fires on a machine nobody is sitting at: the
+/// bound is spelled as an iteration count that has to be multiplied out to be
+/// understood, and falling out of the loop leaves the *next* assertion to
+/// report the failure, which then describes a missing value rather than a wait
+/// that expired.
+fn await_condition(ceiling: Duration, expectation: &str, mut ready: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !ready() {
+        assert!(
+            started.elapsed() < ceiling,
+            "{expectation} did not happen within {ceiling:?}"
         );
         sleep(Duration::from_millis(2));
     }
@@ -1076,9 +1130,12 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
     // what starts the fetch. Everything measured below happens while that
     // fetch is still outstanding.
     driver.submit(Generation::from_raw(1), "icon one", 17, Vec::new(), false, 0);
-    let opening = await_publication(&published, "a first-generation row", |(_, generation, row, _)| {
-        *generation == Generation::from_raw(1) && *row
-    });
+    let opening = await_publication(
+        &published,
+        ROW_DELIVERY_WINDOW,
+        "a first-generation row",
+        |(_, generation, row, _)| *generation == Generation::from_raw(1) && *row,
+    );
     assert!(
         !opening.3,
         "the batch that first names the icon cannot already carry it"
@@ -1088,6 +1145,7 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
     driver.submit(Generation::from_raw(2), "icon two", 200, Vec::new(), false, 0);
     let batch = await_publication(
         &published,
+        ROW_DELIVERY_WINDOW,
         "a second-generation row",
         |(_, generation, row, _)| *generation == Generation::from_raw(2) && *row,
     );
@@ -1103,6 +1161,9 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
 
     let decorated = await_publication(
         &published,
+        // The only wait here that can include the resource child's first
+        // spawn, because this is the first icon of the run.
+        RESOURCE_DELIVERY_WINDOW,
         "a second-generation row carrying its icon",
         |(_, generation, _, icon)| *generation == Generation::from_raw(2) && *icon,
     );
@@ -1154,14 +1215,18 @@ fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
     let (driver, published) = spawn_icon_timing_driver(provider, pipeline, owner);
 
     driver.submit(Generation::from_raw(1), "icon one", 17, Vec::new(), false, 0);
-    await_publication(&published, "a first-generation row", |(_, generation, row, _)| {
-        *generation == Generation::from_raw(1) && *row
-    });
+    await_publication(
+        &published,
+        ROW_DELIVERY_WINDOW,
+        "a first-generation row",
+        |(_, generation, row, _)| *generation == Generation::from_raw(1) && *row,
+    );
 
     let submitted = Instant::now();
     driver.submit(Generation::from_raw(2), "icon two", 200, Vec::new(), false, 0);
     let during = await_publication(
         &published,
+        ROW_DELIVERY_WINDOW,
         "a second-generation row",
         |(_, generation, row, _)| *generation == Generation::from_raw(2) && *row,
     );
@@ -1176,9 +1241,12 @@ fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
     sleep(PLUGIN_ICON_DEADLINE + BATCH_PUBLICATION_SLACK);
     let resubmitted = Instant::now();
     driver.submit(Generation::from_raw(3), "icon three", 900, Vec::new(), false, 0);
-    let after = await_publication(&published, "a third-generation row", |(_, generation, row, _)| {
-        *generation == Generation::from_raw(3) && *row
-    });
+    let after = await_publication(
+        &published,
+        ROW_DELIVERY_WINDOW,
+        "a third-generation row",
+        |(_, generation, row, _)| *generation == Generation::from_raw(3) && *row,
+    );
     let after_delay = after.0.duration_since(resubmitted);
     assert!(
         after_delay <= ICON_ISOLATION_WINDOW + BATCH_PUBLICATION_SLACK,
