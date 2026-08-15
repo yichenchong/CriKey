@@ -732,6 +732,153 @@ fn modern_plugin_is_scheduled_under_its_manifest_query_policy() {
     provider.shutdown(180);
 }
 
+/// The defect this closes: `drive_query` used to run `collect_suggestions`
+/// over *every* loaded plugin before the pipeline had ticked, so the first
+/// keystroke started the child interpreter of every `startup = "lazy"` modern
+/// plugin — including ones whose own activation gate excluded that query. The
+/// gate then discarded the answer it had just paid an interpreter startup for.
+///
+/// Proof is the marker file: the plugin module writes it at import time, so it
+/// exists if and only if a child interpreter actually imported the plugin.
+/// Asserting on rows alone would not distinguish "never started" from
+/// "started, answered, and had its answer dropped by the gate".
+///
+/// The ungated sibling is load bearing twice over. It makes each keystroke
+/// dispatch *something*, so the provider genuinely reaches its collection step
+/// with a live request list rather than short-circuiting on an empty tick; and
+/// it is what forces the collection to be filtered by the scheduler's
+/// requested set, since collecting over the loaded set instead would start the
+/// gated plugin alongside the sibling the query really named.
+/// The gate under test is a §8.11 activation pattern, which also covers the
+/// declaration end to end: manifest, validation, resolved policy, scheduler.
+#[test]
+fn a_gated_lazy_plugin_is_never_started_for_a_query_it_cannot_serve() {
+    require_modern_interpreter();
+
+    let scratch = Scratch::new("lazy-gate");
+    let plugins_root = scratch.subdir("plugins");
+    let dir = plugins_root.join("patterned");
+    fs::create_dir_all(&dir).expect("plugin directory is creatable");
+    let marker = dir.join("imported.marker");
+
+    // `startup` is omitted deliberately: `lazy` is the manifest default
+    // (`PerformanceSection::default`), and the test must exercise the default
+    // rather than an opt-in.
+    let manifest = "manifest-version = 1\n\
+                    \n\
+                    [plugin]\n\
+                    id = \"patterned\"\n\
+                    name = \"patterned\"\n\
+                    version = \"1.0.0\"\n\
+                    runtime = \"python\"\n\
+                    entrypoint = \"patterned_plugin:Patterned\"\n\
+                    \n\
+                    [python]\n\
+                    requires-python = \">=3.12\"\n\
+                    \n\
+                    [activation]\n\
+                    patterns = [\"^issue [0-9]+$\"]\n";
+    fs::write(dir.join("crikey.toml"), manifest).expect("manifest is writable");
+    let source = format!(
+        "import pathlib\n\
+         from crikey_sdk.plugin import Item, Plugin\n\
+         \n\
+         pathlib.Path(r\"{marker}\").write_text(\"imported\")\n\
+         \n\
+         \n\
+         class Patterned(Plugin):\n\
+         \x20   def suggest(self, query, context):\n\
+         \x20       context.emit(Item(stable_id=\"p-1\", label=\"patterned hit\", target=\"p\"))\n",
+        marker = marker.display()
+    );
+    fs::write(dir.join("patterned_plugin.py"), source).expect("plugin module is writable");
+    // The ungated sibling: no `[activation]` at all, so every keystroke below
+    // dispatches it and the provider always has real work to collect.
+    write_modern_plugin(
+        &plugins_root,
+        "healthy",
+        "healthy_plugin",
+        "Healthy",
+        HEALTHY_SOURCE,
+    );
+
+    let patterned = modern_plugin("patterned");
+    let healthy = modern_plugin("healthy");
+    let index_root = scratch.subdir("index");
+    let cache_root = scratch.join("cache");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(index_root),
+        cache_root,
+        &DisabledPlugins::default(),
+    );
+    for plugin in [&patterned, &healthy] {
+        assert!(
+            provider.plugins().contains(plugin),
+            "`{}` must load; unavailable: {:?}",
+            plugin.0,
+            provider.unavailable(),
+        );
+    }
+    assert!(
+        !marker.exists(),
+        "a lazy plugin must own no child interpreter before any query"
+    );
+
+    // Three non-matching queries, not one: a provider that started the worker
+    // on the first keystroke and reused it afterwards would still fail the
+    // first assertion, but a provider that started it on any later keystroke
+    // must fail too.
+    for (at, query) in [(17, "issue"), (1_000, "issue abc"), (2_000, "reopen issue 42")] {
+        let frame = provider
+            .drive_query(&mut pipeline, query, at)
+            .unwrap_or_else(|| panic!("`{query}` reaches the ungated sibling and produces a frame"));
+        assert!(
+            frame.rows.iter().any(|row| row.plugin_name == healthy.0),
+            "`{query}` must still dispatch the ungated sibling, or the gated plugin's silence \
+             proves nothing; rows: {:?}",
+            frame
+                .rows
+                .iter()
+                .map(|row| row.plugin_name.clone())
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            !frame.rows.iter().any(|row| row.plugin_name == patterned.0),
+            "`{query}` does not match the declared pattern and must produce no rows for it"
+        );
+        assert!(
+            !marker.exists(),
+            "`{query}` is excluded by the plugin's own activation pattern, so no child \
+             interpreter may be started to ask it — not even alongside the sibling that was asked"
+        );
+    }
+
+    // A matching query proves the silence above was the gate and not a broken
+    // plugin: the interpreter starts here, on demand, and serves.
+    let served = provider
+        .drive_query(&mut pipeline, "issue 42", 5_000)
+        .expect("a query matching the declared pattern produces a frame");
+    assert!(
+        served.rows.iter().any(|row| row.plugin_name == patterned.0),
+        "a query matching the declared pattern must dispatch the plugin; rows: {:?}",
+        served
+            .rows
+            .iter()
+            .map(|row| (row.plugin_name.clone(), row.label.clone()))
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        marker.exists(),
+        "the matching query must start the child interpreter it was deferred for"
+    );
+
+    provider.shutdown(6_000);
+}
+
 #[test]
 fn modern_driver_refuses_a_superseded_generation() {
     require_modern_interpreter();
