@@ -122,7 +122,7 @@ impl SelectionHistoryStore {
         ));
         let staging = PathBuf::from(staging);
 
-        fs::write(&staging, serialize(snapshot))?;
+        fs::write(&staging, serialize(&within_budget(snapshot, Self::MAX_BYTES)))?;
         match fs::rename(&staging, &self.path) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -142,6 +142,80 @@ impl SelectionHistoryStore {
 // and corruption loads as an empty history rather than as a guess at what the
 // user once selected.
 
+/// The most-used records of `snapshot` that fit in `budget` bytes.
+///
+/// The ranking store caps how many records it keeps and how large one affinity
+/// key may be, so this should never have anything to do. It runs anyway,
+/// because the two limits are set in a different crate from the one that owns
+/// the file size, and the failure they guard against is not a truncated file
+/// but a *silently empty* one: anything over
+/// [`SelectionHistoryStore::MAX_BYTES`] loads as no history at all, discarding
+/// everything the user ever taught the launcher.
+///
+/// Sizes are accumulated record by record rather than by serializing the whole
+/// snapshot and measuring it. Measuring first would allocate the very thing
+/// the budget exists to refuse; this way the peak is one record above budget.
+fn within_budget(snapshot: &SelectionHistorySnapshot, budget: u64) -> SelectionHistorySnapshot {
+    let mut used = envelope_bytes() as u64;
+    let mut scratch = String::new();
+
+    // Most-used first, then by key so that two hosts trimming the same history
+    // keep the same records.
+    let mut selections: Vec<&SelectionRecord> = snapshot.selections.iter().collect();
+    selections.sort_by(|left, right| {
+        right
+            .frequency
+            .cmp(&left.frequency)
+            .then_with(|| (&left.plugin, &left.item).cmp(&(&right.plugin, &right.item)))
+    });
+    let mut affinities: Vec<&QueryAffinityRecord> = snapshot.query_affinities.iter().collect();
+    affinities.sort_by(|left, right| {
+        right.count.cmp(&left.count).then_with(|| {
+            (&left.query, &left.plugin, &left.item).cmp(&(&right.query, &right.plugin, &right.item))
+        })
+    });
+
+    let mut kept_selections = Vec::new();
+    for record in selections {
+        scratch.clear();
+        push_selection(&mut scratch, record);
+        let cost = scratch.len() as u64 + u64::from(!kept_selections.is_empty());
+        if used.saturating_add(cost) > budget {
+            break;
+        }
+        used += cost;
+        kept_selections.push(record.clone());
+    }
+
+    let mut kept_affinities = Vec::new();
+    for record in affinities {
+        scratch.clear();
+        push_affinity(&mut scratch, record);
+        let cost = scratch.len() as u64 + u64::from(!kept_affinities.is_empty());
+        if used.saturating_add(cost) > budget {
+            break;
+        }
+        used += cost;
+        kept_affinities.push(record.clone());
+    }
+
+    // Back into the store's own key order, so a file still round-trips into an
+    // identically ordered snapshot.
+    kept_selections.sort_by(|left, right| (&left.plugin, &left.item).cmp(&(&right.plugin, &right.item)));
+    kept_affinities.sort_by(|left, right| {
+        (&left.query, &left.plugin, &left.item).cmp(&(&right.query, &right.plugin, &right.item))
+    });
+    SelectionHistorySnapshot {
+        selections: kept_selections,
+        query_affinities: kept_affinities,
+    }
+}
+
+/// Bytes the enclosing object costs with both arrays empty.
+fn envelope_bytes() -> usize {
+    serialize(&SelectionHistorySnapshot::default()).len()
+}
+
 fn serialize(snapshot: &SelectionHistorySnapshot) -> String {
     let mut out = String::new();
     out.push('{');
@@ -151,36 +225,47 @@ fn serialize(snapshot: &SelectionHistorySnapshot) -> String {
         if index > 0 {
             out.push(',');
         }
-        out.push_str("{\"plugin\":");
-        write_json_string(&mut out, &record.plugin.0);
-        out.push_str(",\"item\":");
-        write_json_string(&mut out, &record.item.0);
-        let _ = write!(out, ",\"frequency\":{}", record.frequency);
-        out.push_str(",\"last_selected_secs\":");
-        match record.last_selected_secs {
-            Some(secs) => {
-                let _ = write!(out, "{secs}");
-            }
-            None => out.push_str("null"),
-        }
-        out.push('}');
+        push_selection(&mut out, record);
     }
     out.push_str("],\"query_affinities\":[");
     for (index, record) in snapshot.query_affinities.iter().enumerate() {
         if index > 0 {
             out.push(',');
         }
-        out.push_str("{\"plugin\":");
-        write_json_string(&mut out, &record.plugin.0);
-        out.push_str(",\"item\":");
-        write_json_string(&mut out, &record.item.0);
-        out.push_str(",\"query\":");
-        write_json_string(&mut out, &record.query);
-        let _ = write!(out, ",\"count\":{}", record.count);
-        out.push('}');
+        push_affinity(&mut out, record);
     }
     out.push_str("]}");
     out
+}
+
+/// One selection record. Shared with the budget, so the size it measures is
+/// the size the file will hold rather than an estimate that could drift.
+fn push_selection(out: &mut String, record: &SelectionRecord) {
+    out.push_str("{\"plugin\":");
+    write_json_string(out, &record.plugin.0);
+    out.push_str(",\"item\":");
+    write_json_string(out, &record.item.0);
+    let _ = write!(out, ",\"frequency\":{}", record.frequency);
+    out.push_str(",\"last_selected_secs\":");
+    match record.last_selected_secs {
+        Some(secs) => {
+            let _ = write!(out, "{secs}");
+        }
+        None => out.push_str("null"),
+    }
+    out.push('}');
+}
+
+/// One affinity record, on the same terms as [`push_selection`].
+fn push_affinity(out: &mut String, record: &QueryAffinityRecord) {
+    out.push_str("{\"plugin\":");
+    write_json_string(out, &record.plugin.0);
+    out.push_str(",\"item\":");
+    write_json_string(out, &record.item.0);
+    out.push_str(",\"query\":");
+    write_json_string(out, &record.query);
+    let _ = write!(out, ",\"count\":{}", record.count);
+    out.push('}');
 }
 
 /// Parses a saved record, or `None` if the bytes are not one this build wrote.

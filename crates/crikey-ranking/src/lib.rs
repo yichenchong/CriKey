@@ -143,6 +143,28 @@ pub struct SelectionHistory {
 const MAX_ITEM_RECORDS: usize = 4_096;
 const MAX_QUERY_AFFINITIES: usize = 8_192;
 
+/// Largest affinity key, in bytes, that is worth keeping.
+///
+/// A record cap alone does not bound the store's *size*: a query is whatever
+/// the user typed - including something pasted - and an item id is whatever a
+/// plugin chose. Without this, a few thousand records could hold hundreds of
+/// megabytes, which the persisted file cannot represent and no amount of
+/// trimming at save time can undo, because the memory was already taken.
+///
+/// Nothing useful is lost. An affinity key only ever pays out when the user
+/// types a prefix of it again; a key this long is not something anyone retypes.
+/// The item-level frequency and recency of such a selection are still recorded.
+const MAX_AFFINITY_KEY_BYTES: usize = 512;
+
+/// Largest item key, in bytes, that a history will hold.
+///
+/// Separate from [`MAX_AFFINITY_KEY_BYTES`] because it bounds the other map,
+/// and because the two fail differently: a long *query* costs one affinity, a
+/// long *item id* would be cloned into every record that item ever earns. A
+/// catalog limits an item's whole payload, but this crate does not sit behind
+/// that check and must not assume it.
+const MAX_ITEM_KEY_BYTES: usize = 256;
+
 #[derive(Debug, Clone, Copy, Default)]
 struct HistoryEntry {
     frequency: u32,
@@ -217,7 +239,24 @@ impl QueryAffinity<'_> {
 
 impl SelectionHistory {
     /// Records one successful item selection.
+    ///
+    /// Both halves are guarded by size, and neither key is safe to assume
+    /// small. A plugin chooses its own ids, and this crate is not the one that
+    /// admits them to a catalog, so it cannot borrow that layer's limits:
+    ///
+    /// * an item whose own key exceeds [`MAX_ITEM_KEY_BYTES`] is not recorded
+    ///   at all, because there is no half of the record that would not hold it;
+    /// * the affinity is additionally skipped when the query pushes the key
+    ///   past [`MAX_AFFINITY_KEY_BYTES`].
+    ///
+    /// A refusal costs one selection's learning about a pathological item, and
+    /// buys the bound that keeps the persisted history loadable at all.
     pub fn record(&mut self, item: &Item, query: &NormalizedQuery, now_secs: u64) {
+        let item_key_bytes = item.plugin_id.0.len().saturating_add(item.stable_id.0.len());
+        if item_key_bytes > MAX_ITEM_KEY_BYTES {
+            return;
+        }
+
         let entry = self
             .entries
             .entry((item.plugin_id.clone(), item.stable_id.clone()))
@@ -225,13 +264,15 @@ impl SelectionHistory {
         entry.frequency = entry.frequency.saturating_add(1);
         entry.last_selected_secs = Some(now_secs);
 
-        let query_key = (
-            query.normalized.clone(),
-            item.plugin_id.clone(),
-            item.stable_id.clone(),
-        );
-        let count = self.query_counts.entry(query_key).or_default();
-        *count = count.saturating_add(1);
+        if item_key_bytes.saturating_add(query.normalized.len()) <= MAX_AFFINITY_KEY_BYTES {
+            let query_key = (
+                query.normalized.clone(),
+                item.plugin_id.clone(),
+                item.stable_id.clone(),
+            );
+            let count = self.query_counts.entry(query_key).or_default();
+            *count = count.saturating_add(1);
+        }
 
         self.evict_to_capacity();
     }

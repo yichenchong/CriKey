@@ -514,3 +514,109 @@ fn a_foreground_program_that_merely_resembles_a_catalog_entry_yields_no_category
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Size budget
+// ---------------------------------------------------------------------------
+//
+// A record count is not a byte count. A query is whatever the user typed, and
+// an item id is whatever a plugin chose, so a few thousand records of pasted
+// text can still clear `MAX_BYTES`. The file that results does not load as a
+// truncated history - it loads as *no* history, discarding everything the user
+// ever taught the launcher. These pin both defences: the affinity key is
+// bounded when it is recorded, and whatever reaches the file is trimmed to fit.
+
+/// A hostile query must not be able to make the file unreadable.
+#[test]
+fn an_enormous_query_does_not_cost_the_user_their_history() {
+    let scratch = Scratch::new("huge-query");
+    let store = SelectionHistoryStore::new(scratch.join("selection-history.json"));
+
+    let mut history = crikey_ranking::SelectionHistory::default();
+    let ordinary = item("firefox", "Firefox", Category::Application, &[]);
+    let normalizer = crikey_query::DefaultNormalizer::default();
+    use crikey_query::Normalizer as _;
+
+    // Something worth keeping, then a pasted novel.
+    history.record(&ordinary, &normalizer.normalize("fire"), 10);
+    let huge = "x".repeat(4 * 1024 * 1024);
+    history.record(&ordinary, &normalizer.normalize(&huge), 20);
+
+    store.save(&history.snapshot()).expect("history is writable");
+    let reloaded = store.load();
+
+    assert!(
+        reloaded
+            .query_affinities
+            .iter()
+            .any(|record| record.query == "fire"),
+        "the ordinary affinity must survive, got {:?}",
+        reloaded
+            .query_affinities
+            .iter()
+            .map(|record| record.query.len())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !reloaded
+            .query_affinities
+            .iter()
+            .any(|record| record.query.len() > 4096),
+        "the pasted query must never have been recorded as a key"
+    );
+    assert_eq!(
+        reloaded.selections.len(),
+        1,
+        "and the item-level record is kept either way"
+    );
+}
+
+/// Even if a snapshot arrives oversized, the file written from it must load.
+#[test]
+fn an_oversized_snapshot_is_trimmed_rather_than_written_unreadable() {
+    let scratch = Scratch::new("oversized");
+    let store = SelectionHistoryStore::new(scratch.join("selection-history.json"));
+
+    // Built directly, bypassing the recording caps, the way a future caller or
+    // a differently-bounded build could.
+    let filler = "q".repeat(4_096);
+    let mut snapshot = crikey_app::SelectionHistorySnapshot::default();
+    snapshot.selections.push(crikey_app::SelectionRecord {
+        plugin: PluginId(PLUGIN.to_owned()),
+        item: ItemId("firefox".to_owned()),
+        frequency: 500,
+        last_selected_secs: Some(10),
+    });
+    for index in 0..4_096 {
+        snapshot.query_affinities.push(crikey_app::QueryAffinityRecord {
+            plugin: PluginId(PLUGIN.to_owned()),
+            item: ItemId(format!("item-{index}")),
+            query: format!("{filler}{index}"),
+            count: 1,
+        });
+    }
+    // The unbounded form of this snapshot is far past the limit.
+    assert!(
+        snapshot.query_affinities.len() as u64 * 4_096 > SelectionHistoryStore::MAX_BYTES,
+        "the fixture must actually exceed the budget"
+    );
+
+    store.save(&snapshot).expect("history is writable");
+
+    let written = fs::metadata(store.path()).expect("the file exists").len();
+    assert!(
+        written <= SelectionHistoryStore::MAX_BYTES,
+        "wrote {written} bytes against a {} byte budget",
+        SelectionHistoryStore::MAX_BYTES
+    );
+    let reloaded = store.load();
+    assert_eq!(
+        reloaded.selections.len(),
+        1,
+        "the most-used record survives, so the history is not lost"
+    );
+    assert!(
+        !reloaded.query_affinities.is_empty(),
+        "and the file still carries affinities rather than loading empty"
+    );
+}
