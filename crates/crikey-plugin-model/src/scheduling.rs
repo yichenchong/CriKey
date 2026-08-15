@@ -1,5 +1,6 @@
 //! Manifest scheduling declarations and their resolved runtime policy.
 
+use crikey_core::{ActivationPattern, ActivationPatternError};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{Manifest, Runtime};
@@ -12,6 +13,12 @@ pub const MAX_DEBOUNCE_MS: u64 = 1_000;
 pub const MAX_CONCURRENT_REQUESTS: u32 = 32;
 /// Largest accepted activation minimum, measured in Unicode scalar values.
 pub const MAX_MINIMUM_QUERY_LENGTH: usize = 1_024;
+/// Largest accepted number of activation patterns in one manifest.
+///
+/// Every pattern is evaluated on every keystroke the plugin is a candidate
+/// for, so this is a per-plugin per-keystroke cost. An author who needs more
+/// than this many alternatives has an alternation, not a list.
+pub const MAX_ACTIVATION_PATTERNS: usize = 16;
 
 const NATIVE_DEBOUNCE_MS: u64 = 40;
 const PYTHON_DEBOUNCE_MS: u64 = 60;
@@ -33,6 +40,10 @@ pub enum PolicyProblem {
     Contradictory,
     OutOfRange,
     NotPermitted,
+    /// The declaration is syntactically well-formed TOML but not a usable
+    /// value of its own kind — an activation pattern that is not a regular
+    /// expression this host can compile.
+    Malformed,
 }
 
 /// One manifest declaration the host accepts but cannot act on, and why.
@@ -59,11 +70,20 @@ pub struct QueryPolicy {
     pub empty_query: bool,
     pub prefixes: Vec<String>,
     pub keywords: Vec<String>,
+    /// Compiled activation patterns (spec 8.11). Empty unless the manifest
+    /// declared `[activation] patterns` under a modern profile.
+    pub patterns: Vec<ActivationPattern>,
     pub categories: Vec<String>,
 }
 
 impl QueryPolicy {
     /// Whether a normalized query passes the manifest's activation gates.
+    ///
+    /// Prefixes and keywords are literals and are compared without regard to
+    /// case. Patterns are not literals, so they are matched against the query
+    /// lowercased — the same subject `crikey-input-scheduler` builds — rather
+    /// than case-folded by the host, which would silently rewrite an author's
+    /// character classes.
     pub fn admits(&self, query: &str) -> bool {
         if query.is_empty() {
             return self.empty_query;
@@ -71,7 +91,7 @@ impl QueryPolicy {
         if query.chars().count() < self.minimum_query_length {
             return false;
         }
-        if self.prefixes.is_empty() && self.keywords.is_empty() {
+        if self.prefixes.is_empty() && self.keywords.is_empty() && self.patterns.is_empty() {
             return true;
         }
 
@@ -83,6 +103,10 @@ impl QueryPolicy {
                     .iter()
                     .any(|keyword| first.eq_ignore_ascii_case(keyword))
             })
+            || {
+                let normalized = query.to_lowercase();
+                self.patterns.iter().any(|pattern| pattern.is_match(&normalized))
+            }
     }
 }
 
@@ -114,6 +138,7 @@ impl Manifest {
                 empty_query: true,
                 prefixes: Vec::new(),
                 keywords: Vec::new(),
+                patterns: Vec::new(),
                 categories: self.activation.categories.clone(),
             };
         }
@@ -143,8 +168,27 @@ impl Manifest {
             empty_query: self.activation.empty_query.unwrap_or(false),
             prefixes: self.activation.prefixes.clone(),
             keywords: self.activation.keywords.clone(),
+            patterns: self.compiled_activation_patterns(),
             categories: self.activation.categories.clone(),
         }
+    }
+
+    /// Compiles the declared activation patterns.
+    ///
+    /// A declaration that does not compile is retained as a pattern that
+    /// admits nothing rather than dropped, so a `Manifest` that never went
+    /// through [`Self::validate_query_policy`] gates more tightly than its
+    /// author asked rather than not at all. A parsed manifest cannot reach
+    /// this state: validation refuses it first.
+    fn compiled_activation_patterns(&self) -> Vec<ActivationPattern> {
+        self.activation
+            .patterns
+            .iter()
+            .map(|declared| {
+                ActivationPattern::new(declared)
+                    .unwrap_or_else(|_| ActivationPattern::never_matching(declared))
+            })
+            .collect()
     }
 
     /// Names declarations that `legacy-strict` deliberately neutralizes.
@@ -153,7 +197,7 @@ impl Manifest {
             return Vec::new();
         }
 
-        let mut ignored = Vec::with_capacity(10);
+        let mut ignored = Vec::with_capacity(11);
         if self.activation.minimum_query_length.is_some() {
             ignored.push("activation.minimum-query-length");
         }
@@ -162,6 +206,9 @@ impl Manifest {
         }
         if !self.activation.keywords.is_empty() {
             ignored.push("activation.keywords");
+        }
+        if !self.activation.patterns.is_empty() {
+            ignored.push("activation.patterns");
         }
         if self.activation.empty_query.is_some() {
             ignored.push("activation.empty-query");
@@ -374,6 +421,28 @@ impl Manifest {
                 PolicyProblem::OutOfRange,
             ));
         }
+        if self.activation.patterns.len() > MAX_ACTIVATION_PATTERNS {
+            return Err(invalid("activation.patterns", PolicyProblem::OutOfRange));
+        }
+        // Compiled here rather than trusted at first use. An author whose
+        // pattern does not compile learns it from `crikey plugin doctor` with
+        // the engine's own reason quoted, instead of shipping a plugin that
+        // silently never becomes relevant.
+        for declared in &self.activation.patterns {
+            if let Err(error) = ActivationPattern::new(declared) {
+                let problem = match error {
+                    ActivationPatternError::TooLong { .. } => PolicyProblem::OutOfRange,
+                    ActivationPatternError::Empty | ActivationPatternError::Malformed { .. } => {
+                        PolicyProblem::Malformed
+                    }
+                };
+                return Err(invalid_with_detail(
+                    "activation.patterns",
+                    problem,
+                    error.to_string(),
+                ));
+            }
+        }
 
         // A maximum wait only has meaning when the effective debounce period
         // can postpone dispatch. For runtimes such as `builtin`, the omitted
@@ -442,18 +511,23 @@ fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
         .get(..prefix.len())
         .is_some_and(|leading| leading.eq_ignore_ascii_case(prefix.as_bytes()))
 }
+
 fn invalid(field: &'static str, problem: PolicyProblem) -> ManifestError {
-    invalid_with_detail(field, problem, None)
+    ManifestError::InvalidQueryPolicy {
+        field,
+        problem,
+        detail: None,
+    }
 }
 
 fn invalid_with_detail(
     field: &'static str,
     problem: PolicyProblem,
-    detail: impl Into<Option<&'static str>>,
+    detail: impl Into<std::borrow::Cow<'static, str>>,
 ) -> ManifestError {
     ManifestError::InvalidQueryPolicy {
         field,
         problem,
-        detail: detail.into(),
+        detail: Some(detail.into()),
     }
 }

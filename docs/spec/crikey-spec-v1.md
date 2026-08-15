@@ -1601,6 +1601,7 @@ A modern plugin manifest may define:
 - Maximum results.
 - Query prefixes.
 - Keywords.
+- Query patterns.
 - Empty-query support.
 - Network-backed status.
 - Preferred cancellation behavior.

@@ -320,6 +320,15 @@ pub struct ActivationSection {
     pub prefixes: Vec<String>,
     #[serde(default)]
     pub keywords: Vec<String>,
+    /// Regular expressions that admit a query (spec 8.11 "query patterns").
+    ///
+    /// Held as written rather than compiled: this struct is the manifest as
+    /// the author typed it, and a `Deserialize` impl is the wrong place to
+    /// refuse one. [`Manifest::validate_query_policy`] compiles every entry
+    /// and rejects the manifest, and [`Manifest::query_policy`] compiles them
+    /// once more into the resolved policy the host actually matches against.
+    #[serde(default)]
+    pub patterns: Vec<String>,
     #[serde(default)]
     pub categories: Vec<String>,
     #[serde(default)]

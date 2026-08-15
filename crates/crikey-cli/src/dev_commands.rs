@@ -1565,6 +1565,7 @@ fn gate_reason(reason: GateReason) -> &'static str {
         GateReason::EmptyQueryUnsupported => "empty-query-unsupported",
         GateReason::PrefixMismatch => "prefix-mismatch",
         GateReason::KeywordMismatch => "keyword-mismatch",
+        GateReason::PatternMismatch => "pattern-mismatch",
         GateReason::Disabled => "disabled",
     }
 }

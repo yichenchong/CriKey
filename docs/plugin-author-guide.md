@@ -33,6 +33,7 @@ arch = ["x86_64", "aarch64"]
 [activation]
 minimum-query-length = 2
 prefixes = ["repo"]
+patterns = ["^#[0-9]+$"]
 
 [query]
 debounce-ms = 50
@@ -67,6 +68,33 @@ instantiates the module itself. It needs a valid `entrypoint.<os>-<arch>`
 naming a `.wasm` file inside the package, and the host executable staged beside
 the launcher, which every packager installs. A package missing a matching entrypoint is unavailable,
 not silently loaded.
+
+`[activation]` decides which keystrokes reach your plugin at all, and it is the
+one field that decides whether your process runs. A plugin with
+`startup = "lazy"` — the default — owns no process until a query its activation
+metadata admits arrives, so a plugin that declares a gate costs the user
+nothing until they ask for it.
+
+The three gates are alternatives, not a conjunction: a query passes when a
+declared prefix leads it, *or* its first whole token is a declared keyword,
+*or* a declared pattern matches. Declaring none means every query long enough
+to satisfy `minimum-query-length` reaches you.
+
+`patterns` are regular expressions, for the queries no literal can describe —
+an issue number, a date, a hex colour. Four things to know:
+
+- They are matched against the **normalized** query: trimmed and lowercased.
+  An uppercase literal in a pattern can never match, and `(?i)` is redundant.
+- Matching is **unanchored**, so `#[0-9]+` admits `see #42`. Write `^…$` when
+  you mean the whole query, as the example above does.
+- The syntax is Rust's [`regex`](https://docs.rs/regex) crate, which has no
+  backtracking: your pattern cannot be slow, but it also has no backreferences
+  or lookaround.
+- A pattern that does not compile, is longer than 512 bytes, or compiles to an
+  unreasonably large program makes the whole manifest invalid. At most 16 may
+  be declared, because every one of them runs on every keystroke; use
+  alternation rather than a long list. `crikey plugin doctor` quotes the
+  compiler's own reason for a rejection.
 
 `[catalog] persist` decides whether the host may keep your published catalog on
 disk between runs. It defaults to `true`, and the launcher serves those slices

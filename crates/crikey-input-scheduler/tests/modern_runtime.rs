@@ -76,6 +76,13 @@ fn modern(
     }
 }
 
+/// Compiles one activation pattern, panicking on a declaration this suite
+/// wrote wrong rather than letting a never-matching gate look like a passing
+/// assertion.
+fn pattern(source: &str) -> crikey_core::ActivationPattern {
+    crikey_core::ActivationPattern::new(source).expect("the test's own pattern must compile")
+}
+
 fn serial(mut policy: PluginPolicy, limit: usize) -> PluginPolicy {
     policy.max_concurrent_requests = limit;
     policy
@@ -887,6 +894,120 @@ fn combined_activation_uses_prefix_or_first_token_keyword_gating() {
     assert_eq!(
         gates(&scheduler, &combined),
         vec![(20, later_keyword.get(), GateReason::PrefixMismatch)]
+    );
+}
+
+#[test]
+fn pattern_activation_decides_relevance_on_the_normalized_query() {
+    // Spec 8.11 "query patterns": the gate a literal prefix cannot express.
+    // The subject is the normalized query — trimmed and lowercased — which is
+    // the same text prefixes and keywords are compared against.
+    let issues = plugin("dev.crikey.issues");
+    let mut scheduler = scheduler();
+    scheduler.register_plugin(
+        issues.clone(),
+        PluginPolicy {
+            activation: ActivationPolicy {
+                patterns: vec![pattern(r"^#\d+$")],
+                ..ActivationPolicy::default()
+            },
+            ..modern(0, None, true, true)
+        },
+    );
+
+    let unrelated = scheduler.submit_query("notes", 0);
+    assert!(
+        scheduler.tick(0).is_empty(),
+        "a query the pattern rejects must reach no plugin"
+    );
+
+    let matching = scheduler.submit_query("#1234", 10);
+    assert_eq!(
+        shape(&scheduler.tick(10)),
+        vec![("dev.crikey.issues", matching.get(), "#1234", 10)],
+        "a matching pattern admits, and the plugin receives the raw text"
+    );
+    assert_eq!(
+        scheduler.complete(&issues, matching, 11),
+        CompletionOutcome::Accepted
+    );
+
+    // Trailing whitespace is normalized away before matching, so an anchored
+    // pattern still admits. This is what makes the gate usable at all: a user
+    // types spaces.
+    let padded = scheduler.submit_query("  #1234  ", 20);
+    assert_eq!(
+        shape(&scheduler.tick(20)),
+        vec![("dev.crikey.issues", padded.get(), "  #1234  ", 20)],
+        "the pattern is matched against the trimmed query"
+    );
+    assert_eq!(
+        scheduler.complete(&issues, padded, 21),
+        CompletionOutcome::Accepted
+    );
+
+    let embedded = scheduler.submit_query("see #1234 please", 30);
+    assert!(
+        scheduler.tick(30).is_empty(),
+        "an anchored pattern is not a substring search"
+    );
+
+    assert_eq!(
+        gates(&scheduler, &issues),
+        vec![
+            (0, unrelated.get(), GateReason::PatternMismatch),
+            (30, embedded.get(), GateReason::PatternMismatch),
+        ],
+        "a plugin gated only by patterns is refused under the pattern reason"
+    );
+}
+
+#[test]
+fn a_pattern_is_an_alternative_to_a_prefix_and_reports_the_declared_reason() {
+    // Two kinds of gate on one plugin. Either admits; when neither does, the
+    // reported reason stays the prefix — the vocabulary `crikey dev` already
+    // prints — rather than changing meaning because a pattern was added.
+    let mixed = plugin("dev.crikey.mixed");
+    let mut scheduler = scheduler();
+    scheduler.register_plugin(
+        mixed.clone(),
+        PluginPolicy {
+            activation: ActivationPolicy {
+                prefixes: vec!["repo".to_string()],
+                patterns: vec![pattern(r"^\d{4}-\d{2}$")],
+                ..ActivationPolicy::default()
+            },
+            ..modern(0, None, true, true)
+        },
+    );
+
+    let by_prefix = scheduler.submit_query("repo crikey", 0);
+    assert_eq!(
+        shape(&scheduler.tick(0)),
+        vec![("dev.crikey.mixed", by_prefix.get(), "repo crikey", 0)],
+        "the prefix admits on its own"
+    );
+    assert_eq!(
+        scheduler.complete(&mixed, by_prefix, 1),
+        CompletionOutcome::Accepted
+    );
+
+    let by_pattern = scheduler.submit_query("2026-08", 10);
+    assert_eq!(
+        shape(&scheduler.tick(10)),
+        vec![("dev.crikey.mixed", by_pattern.get(), "2026-08", 10)],
+        "the pattern admits on its own"
+    );
+    assert_eq!(
+        scheduler.complete(&mixed, by_pattern, 11),
+        CompletionOutcome::Accepted
+    );
+
+    let neither = scheduler.submit_query("unrelated", 20);
+    assert!(scheduler.tick(20).is_empty());
+    assert_eq!(
+        gates(&scheduler, &mixed),
+        vec![(20, neither.get(), GateReason::PrefixMismatch)]
     );
 }
 

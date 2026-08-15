@@ -18,9 +18,10 @@
 //!   8.11, 25.4). A legacy manifest may still *contain* modern fields, but the
 //!   host must drop them and say so rather than silently applying them.
 
+use crikey_core::MAX_PATTERN_BYTES;
 use crikey_plugin_model::{
     Manifest, ManifestError, PolicyProblem, QueryPolicy, Runtime, SchedulingProfile, UnhonouredDeclaration,
-    MAX_CONCURRENT_REQUESTS, MAX_DEBOUNCE_MS, MAX_MINIMUM_QUERY_LENGTH,
+    MAX_ACTIVATION_PATTERNS, MAX_CONCURRENT_REQUESTS, MAX_DEBOUNCE_MS, MAX_MINIMUM_QUERY_LENGTH,
 };
 
 /// The manifest example printed in spec 19.1, byte for byte.
@@ -803,6 +804,110 @@ fn prefixes_and_keywords_are_alternatives() {
     assert!(policy.admits("repository search"), "prefix match");
     assert!(policy.admits("gh issues"), "keyword match");
     assert!(!policy.admits("unrelated"));
+}
+
+/// Spec 8.11 "query patterns": a regular expression admits a query no literal
+/// prefix or keyword can describe.
+#[test]
+fn patterns_gate_on_a_regular_expression() {
+    let policy = resolved_policy("native", "[activation]\npatterns = [\"^[0-9]{4}-[0-9]{2}$\"]\n");
+
+    assert_eq!(
+        policy.patterns.iter().map(|p| p.source()).collect::<Vec<_>>(),
+        ["^[0-9]{4}-[0-9]{2}$"],
+        "the declaration is retained so a diagnostic can quote it"
+    );
+    assert!(policy.admits("2026-08"));
+    assert!(!policy.admits("2026-8"), "the pattern anchors both ends");
+    assert!(
+        !policy.admits("on 2026-08"),
+        "an anchored pattern is not a substring search"
+    );
+}
+
+/// A pattern is matched against the lowercased query, the same subject the
+/// scheduler builds. An author who needs to distinguish case cannot, and this
+/// pins that so the two gates can never drift apart.
+#[test]
+fn patterns_match_the_lowercased_query() {
+    let policy = resolved_policy("native", "[activation]\npatterns = [\"^gh [a-z]+$\"]\n");
+
+    assert!(policy.admits("gh issues"));
+    assert!(
+        policy.admits("GH ISSUES"),
+        "the subject is lowercased before matching"
+    );
+
+    let uppercase = resolved_policy("native", "[activation]\npatterns = [\"^GH\"]\n");
+    assert!(
+        !uppercase.admits("GH issues"),
+        "an uppercase literal in a pattern can never match a lowercased subject"
+    );
+}
+
+/// Patterns join prefixes and keywords as alternatives rather than narrowing
+/// them: any one declared gate admits.
+#[test]
+fn patterns_are_an_alternative_to_prefixes_and_keywords() {
+    let policy = resolved_policy(
+        "native",
+        "[activation]\nprefixes = [\"repo\"]\npatterns = [\"^[0-9]+$\"]\n",
+    );
+
+    assert!(policy.admits("repo crikey"), "prefix match");
+    assert!(policy.admits("42"), "pattern match");
+    assert!(!policy.admits("unrelated"));
+}
+
+/// An uncompilable pattern is refused at parse time with the engine's own
+/// reason, not accepted and quietly ignored at the first keystroke.
+#[test]
+fn a_malformed_pattern_is_refused_with_a_quotable_reason() {
+    let error = reject("native", "[activation]\npatterns = [\"^(unclosed\"]\n");
+    assert_invalid(&error, "activation.patterns", PolicyProblem::Malformed);
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("^(unclosed"),
+        "the refusal must quote the declaration, got: {rendered}"
+    );
+}
+
+/// Both pattern bounds are enforced: the count, because every pattern runs on
+/// every keystroke, and the length of one declaration.
+#[test]
+fn pattern_declarations_beyond_their_bounds_are_refused() {
+    let too_many = (0..=MAX_ACTIVATION_PATTERNS)
+        .map(|index| format!("\"^a{index}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let error = reject("native", &format!("[activation]\npatterns = [{too_many}]\n"));
+    assert_invalid(&error, "activation.patterns", PolicyProblem::OutOfRange);
+
+    let oversized = "a".repeat(MAX_PATTERN_BYTES + 1);
+    let error = reject("native", &format!("[activation]\npatterns = [\"{oversized}\"]\n"));
+    assert_invalid(&error, "activation.patterns", PolicyProblem::OutOfRange);
+}
+
+/// `legacy-strict` neutralizes every modern gate, patterns included, and says
+/// so rather than silently dropping the declaration.
+#[test]
+fn legacy_strict_neutralizes_and_reports_declared_patterns() {
+    let manifest = parse("legacy-python", "[activation]\npatterns = [\"^gh \"]\n");
+    let policy = manifest.query_policy();
+
+    assert!(
+        policy.patterns.is_empty(),
+        "a legacy-strict plugin carries no gate"
+    );
+    assert!(
+        policy.admits("anything at all"),
+        "spec 7.1: legacy requests are broadcast regardless of the declaration"
+    );
+    assert!(
+        manifest.ignored_modern_fields().contains(&"activation.patterns"),
+        "the neutralized declaration must be reported, got: {:?}",
+        manifest.ignored_modern_fields()
+    );
 }
 
 /// Spec 8.11 gating is opt-in. A plugin that declares no gate is asked about

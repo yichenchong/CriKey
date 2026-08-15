@@ -1226,6 +1226,7 @@ pub(crate) fn plugin_policy_from_manifest(manifest: &Manifest) -> PluginPolicy {
             supports_empty_query: resolved.empty_query,
             prefixes: resolved.prefixes,
             keywords: resolved.keywords,
+            patterns: resolved.patterns,
         },
         max_concurrent_requests: resolved.max_concurrent_requests as usize,
         queue_policy: defaults.queue_policy,

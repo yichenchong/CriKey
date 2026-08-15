@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crikey_core::{Generation, GenerationTracker, PluginId};
+use crikey_core::{ActivationPattern, Generation, GenerationTracker, PluginId};
 
 use crate::{DebouncePolicy, LegacyDispatch, Millis, SchedulingProfile};
 
@@ -12,6 +12,15 @@ pub struct ActivationPolicy {
     pub supports_empty_query: bool,
     pub prefixes: Vec<String>,
     pub keywords: Vec<String>,
+    /// Compiled activation patterns (spec 8.11).
+    ///
+    /// Evaluated against the *normalized* query — trimmed and lowercased, the
+    /// same text prefixes and keywords are compared against — so a pattern
+    /// spelling an uppercase literal can never match. The alternative, running
+    /// patterns against the raw query, would mean two plugins declaring the
+    /// same gate see different subjects depending on which kind of gate they
+    /// declared.
+    pub patterns: Vec<ActivationPattern>,
 }
 
 /// Overflow behavior for one plugin's undispatched request queue.
@@ -121,6 +130,7 @@ pub enum GateReason {
     EmptyQueryUnsupported,
     PrefixMismatch,
     KeywordMismatch,
+    PatternMismatch,
 }
 
 /// One observable modern debounce decision.
@@ -1439,7 +1449,7 @@ fn gate_reason(state: &PluginState, normalized: &str) -> Option<GateReason> {
     }
 
     let activation = &state.policy.activation;
-    if activation.prefixes.is_empty() && activation.keywords.is_empty() {
+    if activation.prefixes.is_empty() && activation.keywords.is_empty() && activation.patterns.is_empty() {
         return None;
     }
     let prefix_matches = activation
@@ -1450,11 +1460,22 @@ fn gate_reason(state: &PluginState, normalized: &str) -> Option<GateReason> {
         .split_whitespace()
         .next()
         .is_some_and(|first| activation.keywords.iter().any(|keyword| first == keyword));
-    if prefix_matches || keyword_matches {
-        None
-    } else if activation.prefixes.is_empty() {
+    let pattern_matches = activation
+        .patterns
+        .iter()
+        .any(|pattern| pattern.is_match(normalized));
+    if prefix_matches || keyword_matches || pattern_matches {
+        return None;
+    }
+    // One reason, reported in declaration precedence, so the existing
+    // prefix/keyword vocabulary keeps meaning what it meant: a plugin that
+    // declares several kinds of gate is refused under the first kind it
+    // declared rather than under whichever was evaluated last.
+    if !activation.prefixes.is_empty() {
+        Some(GateReason::PrefixMismatch)
+    } else if !activation.keywords.is_empty() {
         Some(GateReason::KeywordMismatch)
     } else {
-        Some(GateReason::PrefixMismatch)
+        Some(GateReason::PatternMismatch)
     }
 }
