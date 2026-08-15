@@ -759,6 +759,7 @@ name = "crikey-platform"
 version = "0.1.7"
 dependencies = [
  "crikey-core",
+ "crikey-query",
  "libc",
  "png",
  "resvg",

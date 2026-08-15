@@ -31,3 +31,6 @@ libc = "0.2"
 # The fixtures are real encoded images: an oversize-refusal test that hand-rolls
 # its own PNG proves nothing about the decoder the launcher runs.
 png.workspace = true
+# Application search terms exist to be matched; asserting they are present says
+# nothing about whether the matcher can actually reach them.
+crikey-query.workspace = true
