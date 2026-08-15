@@ -74,7 +74,7 @@ pub type PluginConfiguration =
 
 use std::{
     cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -650,6 +650,11 @@ pub struct CatalogBuild {
     pub instance: u64,
     pub generation: Generation,
     pub items: Vec<Item>,
+    /// Whether this slice may be written to the persistent catalog cache
+    /// (spec 22.1). Carried with the build rather than looked up at the
+    /// publication edge because the manifest that declares it is held by the
+    /// provider, and the edge is reached from three of them.
+    pub persist: bool,
 }
 
 /// A catalog request that completed without publishing because it was
@@ -708,7 +713,12 @@ impl std::error::Error for CatalogDispatchError {}
 
 impl CatalogBuild {
     /// Publishes through the existing owner/instance-safe catalog edge.
+    ///
+    /// The declaration is applied first, so that a plugin refusing persistence
+    /// has any slice an earlier run left on disk withdrawn even on the pass
+    /// where it publishes a replacement.
     pub fn publish(self, search: &mut SearchService) -> Result<usize, CatalogError> {
+        search.set_catalog_persistence(&self.plugin, self.persist);
         search.replace_catalog(&self.plugin, self.instance, self.items)
     }
 }
@@ -734,6 +744,11 @@ pub struct SearchService {
     /// User-defined query rewrites, applied to every normalized query.
     aliases: AliasTable,
     matcher: DefaultMatcher,
+    /// Plugins whose manifest refuses catalog persistence (spec 22.1, 22.4).
+    volatile: HashSet<PluginId>,
+    /// Plugins whose live slice came from the persisted cache rather than from
+    /// the plugin itself during this run.
+    cache_sourced: HashSet<PluginId>,
     ranker: DefaultRanker,
     results: Vec<SearchHit>,
     catalog_cache: Option<CatalogCacheHandle>,
@@ -772,6 +787,8 @@ impl SearchService {
             normalizer: DefaultNormalizer::default(),
             aliases: AliasTable::default(),
             matcher: DefaultMatcher::default(),
+            volatile: HashSet::new(),
+            cache_sourced: HashSet::new(),
             ranker: DefaultRanker::new(crikey_ranking::HistoryPolicy { enabled: true }),
             results: Vec::new(),
             catalog_cache: None,
@@ -830,6 +847,51 @@ impl SearchService {
     #[must_use]
     pub const fn aliases(&self) -> &AliasTable {
         &self.aliases
+    }
+
+    /// Records whether a plugin permits its catalog to be persisted (spec 22.1).
+    ///
+    /// Called when a manifest is registered, which is *after* the persisted
+    /// catalog has already been loaded and made searchable - that ordering is
+    /// the whole reason this does more than set a flag. A plugin whose
+    /// declaration changed since the last run, or that never got to correct a
+    /// slice written by an older version of itself, would otherwise have that
+    /// slice answering queries for the rest of the session.
+    ///
+    /// So refusing persistence withdraws the cached slice immediately, both
+    /// from disk and from the live catalog - but only when the live slice is
+    /// the one that came from the cache. A plugin that has already published
+    /// for itself this run keeps what it published; those items are current by
+    /// definition, and dropping them would delete a working catalog.
+    pub fn set_catalog_persistence(&mut self, plugin: &PluginId, persist: bool) {
+        if persist {
+            self.volatile.remove(plugin);
+            return;
+        }
+        if !self.volatile.insert(plugin.clone()) {
+            return;
+        }
+        if let Some(cache) = &self.catalog_cache {
+            if let Err(error) = cache.0.invalidate(plugin) {
+                self.cache_error = Some(error);
+            }
+        }
+        if self.cache_sourced.remove(plugin) {
+            self.withdraw_slice(plugin);
+        }
+    }
+
+    /// Removes a plugin's live catalog slice and everything derived from it.
+    fn withdraw_slice(&mut self, plugin: &PluginId) {
+        self.catalog.invalidate(plugin);
+        self.non_prefix_upper.remove(plugin);
+        if let Ok(at) = self.owners.binary_search(plugin) {
+            self.owners.remove(at);
+        }
+        // The visible answer may name an item that no longer exists, and a
+        // narrowed candidate set indexes positions that have just moved.
+        self.results.clear();
+        self.candidate_cache = None;
     }
 
     /// Sets the clock used for deterministic recency scoring.
@@ -1037,7 +1099,13 @@ impl SearchService {
                 Ok(None) | Err(_) => None,
             };
             match admitted {
-                Some(items) => load.items = load.items.saturating_add(items),
+                Some(items) => {
+                    load.items = load.items.saturating_add(items);
+                    // Provenance, so that a plugin which later declares itself
+                    // non-persistable can have exactly this slice withdrawn
+                    // without disturbing one it has published live.
+                    self.cache_sourced.insert(plugin.clone());
+                }
                 None => load.skipped = load.skipped.saturating_add(1),
             }
         }
@@ -1095,8 +1163,15 @@ impl SearchService {
             (0, Err(_)) | (_, Ok(_)) => {}
             (_, Err(at)) => self.owners.insert(at, plugin.clone()),
         }
+        // The plugin has published for itself, so whatever the cache holds for
+        // it is superseded and its slice is no longer cache-sourced.
+        self.cache_sourced.remove(plugin);
         if let Some(cache) = &self.catalog_cache {
-            if retained > 0 {
+            // A plugin that refuses persistence is not merely skipped: any
+            // slice an earlier declaration left on disk is withdrawn here, so
+            // the refusal takes effect for the *next* launch and not only for
+            // this one.
+            if retained > 0 && !self.volatile.contains(plugin) {
                 let slice = CachedSlice {
                     plugin: plugin.clone(),
                     instance,

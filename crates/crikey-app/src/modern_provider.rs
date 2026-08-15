@@ -129,6 +129,8 @@ struct LoadedPlugin {
     budget: PluginBudgetHandle,
     soft_timeout: Duration,
     permissions: Permissions,
+    /// Whether this plugin's catalog may be written to the persistent cache.
+    catalog_persist: bool,
 }
 
 /// Maximum number of catalog tasks retained before the host drains results.
@@ -857,6 +859,7 @@ impl ModernProvider {
             worker_options,
             budget,
             soft_timeout,
+            catalog_persist: manifest.catalog.persist,
             permissions: manifest.permissions,
         });
     }
@@ -1046,6 +1049,7 @@ impl ModernProvider {
                 plugin: plugin.clone(),
             })?;
         let budget = Arc::clone(&loaded.budget);
+        let catalog_persist = loaded.catalog_persist;
         let interpreter = loaded.interpreter.clone();
         // Catalog callbacks are not suggestion callbacks; keep their
         // independent long transport budget rather than applying the manifest
@@ -1085,6 +1089,7 @@ impl ModernProvider {
                             plugin: plugin_for_thread,
                             instance,
                             generation,
+                            persist: catalog_persist,
                             items,
                         })
                     }

@@ -90,6 +90,8 @@ struct LoadedPlugin {
     budget: PluginBudgetHandle,
     soft_timeout: Duration,
     permissions: Permissions,
+    /// Whether this plugin's catalog may be written to the persistent cache.
+    catalog_persist: bool,
 }
 
 /// Maximum number of catalog tasks retained before the host drains results.
@@ -830,6 +832,7 @@ impl NativeProvider {
             worker_options: options,
             budget,
             soft_timeout,
+            catalog_persist: manifest.catalog.persist,
             permissions: manifest.permissions,
         });
     }
@@ -971,6 +974,7 @@ impl NativeProvider {
         })?;
         let request_id = self.catalog.next_id();
         let sender = self.catalog.result_tx.clone();
+        let catalog_persist = loaded.catalog_persist;
         let plugin_for_thread = plugin.clone();
         let thread_plugin = plugin.clone();
         let join = thread::Builder::new()
@@ -1000,6 +1004,7 @@ impl NativeProvider {
                             instance,
                             generation,
                             items,
+                            persist: catalog_persist,
                         })
                     }
                     Ok(Err(reason)) => CatalogBuildResult::Failed {

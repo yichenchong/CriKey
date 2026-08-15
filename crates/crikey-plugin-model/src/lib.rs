@@ -11,8 +11,8 @@ pub use configuration::{
     RULE_REQUIRED, RULE_TYPE, RULE_UNKNOWN_FIELD,
 };
 pub use manifest::{
-    ActivationSection, ConcurrencySection, Manifest, PerformanceSection, PluginSection, PythonSection,
-    QuerySection, Runtime, Startup,
+    ActivationSection, CatalogSection, ConcurrencySection, Manifest, PerformanceSection, PluginSection,
+    PythonSection, QuerySection, Runtime, Startup,
 };
 pub use permissions::{
     ClipboardPermission, FilesystemAccess, FilesystemPermission, FilesystemScope, Permissions,
