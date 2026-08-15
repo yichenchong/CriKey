@@ -36,7 +36,7 @@
 //! (spec 11.1). [`searchable_text`] folds the fields the mask is taken over
 //! once, at index time.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use crikey_core::Item;
 use unicode_casefold::UnicodeCaseFold;
@@ -169,6 +169,109 @@ impl Normalizer for DefaultNormalizer {
         NormalizedQuery {
             raw: raw.to_owned(),
             normalized,
+            tokens,
+        }
+    }
+}
+
+/// User-defined query aliases, applied to a normalized query before matching.
+///
+/// An alias is a *rewrite*, not an extra reading: the token `vsc` becomes the
+/// tokens of `Visual Studio Code`, and the search that follows is an ordinary
+/// search for those tokens. That is the whole reason this lives here rather
+/// than in the catalog. Every prefilter downstream - the presence mask, the
+/// ordered-pair postings, the prefix postings, `may_match` - derives from the
+/// query, so a rewritten query is automatically sound for all of them. Tagging
+/// items with alias terms instead would put host configuration inside plugin
+/// data: it would be persisted into the catalog cache, counted against the
+/// publishing plugin's payload limits, and would have to be unpicked from
+/// `search_terms` by position on every reload.
+///
+/// The cost of rewriting is that the literal reading of an aliased token is
+/// not also tried. A user who defines `ss` has said what `ss` means to them;
+/// an item whose own text reads `ss` is no longer found by it. Aliases are
+/// opt-in per entry, so nothing is lost that was not asked for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AliasTable {
+    /// Folded single-token alias to the folded tokens it stands for.
+    entries: BTreeMap<String, Vec<String>>,
+}
+
+impl AliasTable {
+    /// Builds a table from `alias -> target` text pairs, folding both sides
+    /// with the same rules the matcher uses so that what a user typed and what
+    /// they configured compare as equals.
+    ///
+    /// Entries that could never fire are dropped rather than stored:
+    ///
+    /// * an alias that folds to nothing, or to more than one token, can never
+    ///   equal a single query token;
+    /// * a target that folds to nothing would delete the token instead of
+    ///   replacing it, widening the query to match more than the user typed.
+    pub fn new<I, K, V>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let entries = pairs
+            .into_iter()
+            .filter_map(|(alias, target)| {
+                let alias = normalize_text(alias.as_ref());
+                let mut names = alias.split_whitespace();
+                let name = names.next()?.to_owned();
+                if names.next().is_some() {
+                    return None;
+                }
+                let target = normalize_text(target.as_ref());
+                let tokens: Vec<String> = target.split_whitespace().map(str::to_owned).collect();
+                (!tokens.is_empty()).then_some((name, tokens))
+            })
+            .collect();
+        Self { entries }
+    }
+
+    /// Whether any alias is defined. An empty table rewrites nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// How many aliases are defined.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Rewrites every token that names an alias, leaving the rest alone.
+    ///
+    /// Expansion is single pass: the tokens an alias produces are never
+    /// themselves expanded. That makes `a = "b"`, `b = "a"` terminate with no
+    /// cycle check, and means an alias always stands for what it literally
+    /// says rather than for whatever another entry later redefines.
+    ///
+    /// `raw` is untouched, so the UI still echoes what the user typed.
+    #[must_use]
+    pub fn expand(&self, query: NormalizedQuery) -> NormalizedQuery {
+        if self.entries.is_empty() || query.tokens.is_empty() {
+            return query;
+        }
+        if !query.tokens.iter().any(|token| self.entries.contains_key(token)) {
+            return query;
+        }
+
+        let mut tokens = Vec::with_capacity(query.tokens.len());
+        for token in &query.tokens {
+            match self.entries.get(token) {
+                Some(expansion) => tokens.extend(expansion.iter().cloned()),
+                None => tokens.push(token.clone()),
+            }
+        }
+        // Rebuilt rather than edited: `normalized.split_whitespace()` must keep
+        // reproducing `tokens`, which is what every later reader relies on.
+        NormalizedQuery {
+            raw: query.raw,
+            normalized: tokens.join(" "),
             tokens,
         }
     }

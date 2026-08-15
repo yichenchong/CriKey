@@ -25,6 +25,7 @@ mod wasm_provider;
 /// without depending on the supervisor crate directly; the driver accessors
 /// that return these live here.
 pub use crikey_plugin_supervisor::{BudgetKind, ConcurrencyRefusals, PluginHealth};
+pub use crikey_query::AliasTable;
 /// Re-exported so a host can persist ranking history without naming the
 /// ranking crate: [`SelectionHistoryStore`] speaks in exactly these types.
 pub use crikey_ranking::{QueryAffinityRecord, SelectionHistorySnapshot, SelectionRecord};
@@ -730,6 +731,8 @@ pub struct SearchService {
     owners: Vec<PluginId>,
     aggregator: MemoryResultAggregator,
     normalizer: DefaultNormalizer,
+    /// User-defined query rewrites, applied to every normalized query.
+    aliases: AliasTable,
     matcher: DefaultMatcher,
     ranker: DefaultRanker,
     results: Vec<SearchHit>,
@@ -767,6 +770,7 @@ impl SearchService {
             owners: Vec::new(),
             aggregator,
             normalizer: DefaultNormalizer::default(),
+            aliases: AliasTable::default(),
             matcher: DefaultMatcher::default(),
             ranker: DefaultRanker::new(crikey_ranking::HistoryPolicy { enabled: true }),
             results: Vec::new(),
@@ -803,6 +807,29 @@ impl SearchService {
             MatchPolicy::Subsequence => DefaultMatcher::with_subsequence(),
         };
         self.candidate_cache = None;
+    }
+
+    /// Installs the user's query aliases (spec 21.2).
+    ///
+    /// The candidate cache is dropped, but unlike [`Self::set_match_policy`]
+    /// this is housekeeping rather than a correctness requirement. Reuse is
+    /// gated on the *rewritten* text prefix-extending the rewritten text the
+    /// cache was built from, and matching is prefix-closed, so a cached set
+    /// stays a valid superset no matter which table produced either string.
+    /// Dropping it keeps the cache attributable to the configuration in force,
+    /// and costs one cold pass on an event that happens when a file is edited.
+    pub fn set_aliases(&mut self, aliases: AliasTable) {
+        if self.aliases == aliases {
+            return;
+        }
+        self.aliases = aliases;
+        self.candidate_cache = None;
+    }
+
+    /// The aliases currently in force.
+    #[must_use]
+    pub const fn aliases(&self) -> &AliasTable {
+        &self.aliases
     }
 
     /// Sets the clock used for deterministic recency scoring.
@@ -1135,7 +1162,7 @@ impl SearchService {
         let generation = self.app.generations().advance();
         self.aggregator.begin_generation(generation);
 
-        let query = self.normalizer.normalize(raw);
+        let query = self.aliases.expand(self.normalizer.normalize(raw));
         self.last_query = Some(query.clone());
         let per_plugin_limit = self
             .app

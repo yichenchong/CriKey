@@ -18,10 +18,10 @@ mod plugin_commands;
 mod settings;
 
 use crikey_app::{
-    admitted_plugin_roots, ActionSubmission, App, BatchState, DefaultCatalogFetcher, DisabledPlugins,
-    LegacyDriver, LegacyProvider, ModernDriver, ModernProvider, NativeDriver, NativeProvider, PipelineConfig,
-    PluginActionRouter, QueryPipeline, RemoteCatalogService, RemoteSource, ResultBatch, SearchService,
-    SelectionHistoryStore, StartupJournal, StartupMode, StartupStage,
+    admitted_plugin_roots, ActionSubmission, AliasTable, App, BatchState, DefaultCatalogFetcher,
+    DisabledPlugins, LegacyDriver, LegacyProvider, ModernDriver, ModernProvider, NativeDriver,
+    NativeProvider, PipelineConfig, PluginActionRouter, QueryPipeline, RemoteCatalogService, RemoteSource,
+    ResultBatch, SearchService, SelectionHistoryStore, StartupJournal, StartupMode, StartupStage,
 };
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
@@ -307,6 +307,9 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     let launcher = NativeLauncher::new(NativeLauncherConfig::default()).map_err(|error| error.to_string())?;
     let render_handle = launcher.handle();
     let mut search = SearchService::new(App::new());
+    if let Some(configuration) = configuration.as_ref() {
+        search.set_aliases(configured_aliases(&configuration.store));
+    }
     let catalog_cache_root = catalog_cache_root()?;
     let catalog_cache: Arc<dyn CatalogCache + Send + Sync> =
         Arc::new(FileCatalogCache::new(catalog_cache_root));
@@ -741,6 +744,9 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         }
                     }
                     view_model.set_settings(settings::rows(Some(&configuration.store)));
+                    // Aliases are host configuration, so a hand edit takes
+                    // effect on the next query rather than the next restart.
+                    search.set_aliases(configured_aliases(&configuration.store));
                 }
             }
             // Remote catalog sources (spec 2.2, ADR-0016). Both calls return
@@ -1302,6 +1308,19 @@ fn millis(store: &ConfigStore, key: &str) -> Duration {
             }
         },
     }
+}
+
+/// The user's query aliases, as configured (spec 21.2).
+///
+/// Written as an `[aliases]` table, one entry per abbreviation:
+///
+/// ```toml
+/// [aliases]
+/// ss = "Settings"
+/// vsc = "Visual Studio Code"
+/// ```
+fn configured_aliases(store: &ConfigStore) -> AliasTable {
+    AliasTable::new(store.aliases())
 }
 
 /// The pipeline bounds this launch runs under, with `launcher.max-results`

@@ -78,6 +78,12 @@ const SETTINGS_MARKER: &str = ".settings.";
 const ENABLED_SUFFIX: &str = ".enabled";
 const SCHEDULING_PROFILE_SUFFIX: &str = ".scheduling-profile";
 
+/// Keys under this prefix name a user-defined alias: `aliases.ss = "Settings"`.
+///
+/// The key space is open rather than schema-declared, because the whole point
+/// is that a user names abbreviations the host could not have anticipated.
+const ALIASES_PREFIX: &str = "aliases.";
+
 /// Layered configuration, resolved once and then queried per key.
 ///
 /// # Shape
@@ -354,6 +360,36 @@ impl ConfigStore {
             .filter_map(|field| {
                 let value = self.get(&format!("{prefix}{field}"))?;
                 Some((field, value.to_owned()))
+            })
+            .collect()
+    }
+
+    /// Every user-defined alias, as `alias -> target`, resolved by layer.
+    ///
+    /// An alias names a thing the user types; the target names the item they
+    /// mean. Both come back exactly as written: the target is compared against
+    /// item text by the catalog, which owns the folding rules, and doing it
+    /// here would fold twice under two different conventions.
+    ///
+    /// An empty target removes an alias a lower layer defined, which is the
+    /// only way a profile can retract a global alias: the layers merge by key,
+    /// so there is otherwise no spelling for "not this one".
+    pub fn aliases(&self) -> BTreeMap<String, String> {
+        let mut names = BTreeSet::new();
+        for layer in &self.layers {
+            for key in layer.keys() {
+                if let Some(alias) = key.strip_prefix(ALIASES_PREFIX) {
+                    if !alias.is_empty() {
+                        names.insert(alias.to_owned());
+                    }
+                }
+            }
+        }
+        names
+            .into_iter()
+            .filter_map(|alias| {
+                let target = self.get(&format!("{ALIASES_PREFIX}{alias}"))?;
+                (!target.trim().is_empty()).then(|| (alias, target.to_owned()))
             })
             .collect()
     }
