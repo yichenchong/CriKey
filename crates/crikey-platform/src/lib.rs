@@ -119,8 +119,8 @@ pub fn application_items(plugin: &PluginId, discovered: &[DiscoveredApplication]
                 category: Category::Application,
                 label: application.name.clone(),
                 description: String::new(),
+                search_terms: application_search_terms(application),
                 target,
-                search_terms: vec![application.name.clone()],
                 icon_reference: application.icon_reference.clone(),
                 argument_policy: ArgumentPolicy::Forbidden,
                 metadata: argument_metadata(&application.arguments, application.working_directory.as_ref()),
@@ -137,6 +137,53 @@ pub fn application_items(plugin: &PluginId, discovered: &[DiscoveredApplication]
             }
         })
         .collect()
+}
+
+/// Names an application answers to besides its display label.
+///
+/// The matcher deliberately never searches `target`: it is an execution
+/// payload, and folding a whole path in would make every `/usr/bin/...` item
+/// answer to `usr`. The executable's *stem* is a different thing — it is the
+/// name users actually type, and it is frequently unrecoverable from the label.
+/// `Command Prompt` launches `cmd.exe`, `Visual Studio Code` launches `code`,
+/// and no decomposition of either label yields those, because the letters do
+/// not begin its words.
+///
+/// The platform identifier is included for the same reason: a desktop-entry id
+/// such as `org.gnome.Nautilus` carries `nautilus`, which `Files` does not.
+///
+/// Duplicates and empties are dropped, so an application whose stem already
+/// equals its label contributes one term rather than two.
+fn application_search_terms(application: &DiscoveredApplication) -> Vec<String> {
+    let mut terms = Vec::with_capacity(3);
+    let mut push = |term: &str| {
+        let term = term.trim();
+        if term.is_empty() || terms.iter().any(|existing| existing == term) {
+            return;
+        }
+        terms.push(term.to_owned());
+    };
+
+    push(&application.name);
+    if let Some(stem) = executable_stem(&application.target) {
+        push(stem);
+    }
+    if let Some(platform_id) = application.platform_id.as_deref() {
+        // Desktop-entry and AppUserModelID forms are dotted; the last segment is
+        // the part a user would type.
+        push(platform_id.rsplit('.').next().unwrap_or(platform_id));
+    }
+    terms
+}
+
+/// The executable file name without its extension, when the target has one.
+fn executable_stem(target: &PlatformPath) -> Option<&str> {
+    target.as_os_str().to_str().and_then(|text| {
+        let name = text.rsplit(['/', '\\']).next()?;
+        // `.` alone is not an extension separator worth splitting on: a name
+        // like `foo.bar.exe` should yield `foo.bar`, not `foo`.
+        Some(name.rsplit_once('.').map_or(name, |(stem, _)| stem))
+    })
 }
 
 /// Records launch arguments and an optional encoded working directory.

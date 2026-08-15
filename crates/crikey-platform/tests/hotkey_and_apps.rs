@@ -784,3 +784,103 @@ fn a_native_non_utf8_target_names_the_platform_that_wrote_it() {
         "a Unix-origin and a Windows-origin target are distinguishable, got {encoded:?}"
     );
 }
+
+/// An application is searchable by the name of the thing it launches.
+///
+/// The matcher never searches `target`: it is an execution payload, and folding
+/// a whole path in would make every `/usr/bin/...` item answer to `usr`. But the
+/// executable's stem is the name users type, and it is routinely unrecoverable
+/// from the label — no reading of `Command Prompt` yields `cmd`, because those
+/// letters do not begin its words. Carrying the stem as a search term is what
+/// keeps such an application reachable.
+#[test]
+fn application_items_are_searchable_by_their_executable_stem() {
+    let cases = [
+        ("Command Prompt", "C:\\Windows\\System32\\cmd.exe", "cmd"),
+        ("Visual Studio Code", "/usr/bin/code", "code"),
+        ("GNU Image Manipulation Program", "/usr/bin/gimp", "gimp"),
+    ];
+    for (name, target, stem) in cases {
+        let items = application_items(&plugin(), &[discovered(name, target)]);
+        let item = items.first().expect("one discovery makes one item");
+        assert!(
+            item.search_terms.iter().any(|term| term == stem),
+            "{name:?} should answer to {stem:?}, found {:?}",
+            item.search_terms
+        );
+        assert!(
+            item.search_terms.iter().any(|term| term == name),
+            "the display name stays searchable, found {:?}",
+            item.search_terms
+        );
+    }
+}
+
+/// A platform identifier contributes its last segment.
+///
+/// A desktop-entry id such as `org.gnome.Nautilus` carries `nautilus`, which the
+/// label `Files` does not.
+#[test]
+fn application_items_are_searchable_by_their_platform_identifier() {
+    let mut discovery = discovered("Files", "/usr/bin/nautilus");
+    discovery.platform_id = Some("org.gnome.Nautilus".to_owned());
+    let items = application_items(&plugin(), &[discovery]);
+    let item = items.first().expect("one discovery makes one item");
+    assert!(
+        item.search_terms.iter().any(|term| term == "Nautilus"),
+        "the identifier's last segment is searchable, found {:?}",
+        item.search_terms
+    );
+}
+
+/// Search terms carry no duplicates and no empties.
+///
+/// An application whose stem already equals its label contributes one term, not
+/// two identical ones, so the keyword tier does not score the same text twice.
+#[test]
+fn application_search_terms_are_deduplicated() {
+    let items = application_items(&plugin(), &[discovered("gimp", "/usr/bin/gimp")]);
+    let terms = &items.first().expect("one item").search_terms;
+    assert_eq!(
+        terms,
+        &vec!["gimp".to_owned()],
+        "expected one term, got {terms:?}"
+    );
+
+    // A target with no usable stem contributes nothing rather than an empty term.
+    let items = application_items(&plugin(), &[discovered("Shell", "/usr/bin/")]);
+    let terms = &items.first().expect("one item").search_terms;
+    assert!(
+        terms.iter().all(|term| !term.is_empty()),
+        "no empty search terms, got {terms:?}"
+    );
+}
+
+/// The stem is reachable through the real matcher, not merely present.
+///
+/// `cmd` is not an abbreviation of `Command Prompt` under any word split — the
+/// `d` begins no word — so before the stem became a search term the application
+/// was unreachable by the name everybody types for it.
+#[test]
+fn executable_stem_makes_the_application_matchable() {
+    use crikey_query::{DefaultMatcher, DefaultNormalizer, MatchMethod, Matcher, Normalizer};
+
+    let items = application_items(
+        &plugin(),
+        &[discovered("Command Prompt", "C:\\Windows\\System32\\cmd.exe")],
+    );
+    let item = items.first().expect("one discovery makes one item");
+    let query = DefaultNormalizer::default().normalize("cmd");
+    let outcome = DefaultMatcher::default()
+        .match_item(&query, item)
+        .expect("the executable stem should make this reachable");
+    assert_eq!(
+        outcome.method,
+        MatchMethod::Keyword,
+        "an alias is a keyword hit, not a reading of the label"
+    );
+    assert!(
+        outcome.highlights.is_empty(),
+        "a keyword hit is not in the label, so it highlights nothing"
+    );
+}

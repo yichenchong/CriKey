@@ -596,6 +596,31 @@ impl<'items, 'query> PluginSelection<'items, 'query> {
             self.limit,
         );
     }
+
+    /// Records a candidate that was skipped for scoring but must still narrow
+    /// the next keystroke.
+    ///
+    /// The cache is a superset of the match set, so membership is decided by
+    /// `may_match` under the policy this selection *scores* with. Deciding that
+    /// at the call site invited the two to drift: a strict test beside a
+    /// subsequence-scoring matcher discards precisely the candidates that
+    /// matcher exists to find, and because the cached set only ever shrinks,
+    /// they never come back. Keeping it here leaves one policy source instead
+    /// of two that have to agree.
+    ///
+    /// `already_filtered` says the source applied the same test — the catalog
+    /// does when revisiting cached positions — so it is not repeated.
+    fn record_pruned(
+        &mut self,
+        position: usize,
+        prepared_label: &'items PreparedLabel,
+        already_filtered: bool,
+    ) {
+        self.stats.candidates_examined = self.stats.candidates_examined.saturating_add(1);
+        if already_filtered || prepared_label.may_match_with(self.query, self.matcher.policy()) {
+            self.matched_positions.push(position);
+        }
+    }
 }
 
 /// What one pass over the persistent cache made of it (spec 22.1, 25.6).
@@ -1492,17 +1517,7 @@ fn select_best<'items>(
                         .peek()
                         .is_some_and(|Reverse(weakest)| upper < weakest.score)
                     {
-                        selection.stats.candidates_examined =
-                            selection.stats.candidates_examined.saturating_add(1);
-                        // This candidate is skipped for scoring but still has to
-                        // enter the cache, and it must do so under the policy the
-                        // matcher scores with. A strict test here would drop
-                        // subsequence-only candidates on a cold pass, before the
-                        // warm path ever saw them. A warm source already applied
-                        // the same test in the catalog.
-                        if source_is_filtered || prepared_label.may_match_with(query, matcher.policy()) {
-                            selection.matched_positions.push(position);
-                        }
+                        selection.record_pruned(position, prepared_label, source_is_filtered);
                         return;
                     }
                 }
