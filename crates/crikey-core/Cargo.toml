@@ -13,3 +13,4 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+regex.workspace = true

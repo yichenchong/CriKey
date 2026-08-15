@@ -87,6 +87,20 @@ serde_json = "1"
 toml = "0.8"
 thiserror = "2"
 
+# Activation patterns declared in third-party plugin manifests (spec 8.11,
+# 19.4), compiled by `crikey-core` and evaluated by the query scheduler on
+# every keystroke. The engine choice is the security decision: `regex` compiles
+# to finite automata and matches in time linear in the subject, so a hostile or
+# merely careless manifest cannot wedge the scheduler thread the way a
+# backtracking engine can be wedged by `(a+)+$`. A hand-rolled matcher would be
+# a second, unreviewed implementation of exactly that guarantee, and the
+# alternative of restricting authors to literal prefixes is what this feature
+# exists to lift. `default-features = false` drops the Unicode tables the
+# launcher does not need for query text; `unicode-perl` keeps `\d`, `\w` and
+# `\s` Unicode-aware, which query text demands, and `std` keeps the engine's
+# error types wired into `thiserror`.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
+
 # SHA-256 for the modern Python package manager (spec 23.2, 23.3). A lockfile
 # pins each resolved package's digest and materialisation recomputes and
 # compares it, so a tampered or wrong artefact is refused. This is a security

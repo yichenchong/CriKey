@@ -18,8 +18,8 @@ pub use permissions::{
     ClipboardPermission, FilesystemAccess, FilesystemPermission, FilesystemScope, Permissions,
 };
 pub use scheduling::{
-    PolicyProblem, QueryPolicy, SchedulingProfile, UnhonouredDeclaration, MAX_CONCURRENT_REQUESTS,
-    MAX_DEBOUNCE_MS, MAX_MINIMUM_QUERY_LENGTH,
+    PolicyProblem, QueryPolicy, SchedulingProfile, UnhonouredDeclaration, MAX_ACTIVATION_PATTERNS,
+    MAX_CONCURRENT_REQUESTS, MAX_DEBOUNCE_MS, MAX_MINIMUM_QUERY_LENGTH,
 };
 
 #[derive(Debug)]
@@ -29,7 +29,10 @@ pub enum ManifestError {
     InvalidQueryPolicy {
         field: &'static str,
         problem: PolicyProblem,
-        detail: Option<&'static str>,
+        /// Prose naming what the author must change. `Cow` because most
+        /// refusals are fixed sentences, while a malformed activation pattern
+        /// has to quote the regex compiler's own reason.
+        detail: Option<std::borrow::Cow<'static, str>>,
     },
     NoEntrypoint {
         os: String,

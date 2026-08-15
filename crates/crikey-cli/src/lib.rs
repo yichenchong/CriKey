@@ -2038,6 +2038,7 @@ fn application_provider_policy() -> PluginPolicy {
             supports_empty_query: true,
             prefixes: Vec::new(),
             keywords: Vec::new(),
+            patterns: Vec::new(),
         },
         max_concurrent_requests: 1,
         queue_policy: QueuePolicy::ReplaceOldest,
