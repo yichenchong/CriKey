@@ -11,10 +11,18 @@
 //! match (logical AND); each token is credited with the strongest
 //! interpretation it supports, in the fixed precedence
 //! [`ExactPrefix`](MatchMethod::ExactPrefix) > [`Prefix`](MatchMethod::Prefix) >
-//! [`Substring`](MatchMethod::Substring) > [`Acronym`](MatchMethod::Acronym) >
-//! [`Keyword`](MatchMethod::Keyword) > [`Fuzzy`](MatchMethod::Fuzzy); and the
-//! outcome as a whole is characterised by its *weakest* token so that one
-//! strong token cannot inflate an otherwise poor candidate.
+//! [`WordPrefix`](MatchMethod::WordPrefix) >
+//! [`Substring`](MatchMethod::Substring) > [`Keyword`](MatchMethod::Keyword);
+//! and the outcome as a whole is characterised by its *weakest* token so that
+//! one strong token cannot inflate an otherwise poor candidate.
+//!
+//! [`WordPrefix`](MatchMethod::WordPrefix) is what makes abbreviations work:
+//! the token is split into chunks that are each a prefix of a distinct label
+//! word, taken left to right, so `vscode` reads as `v|s|code` over
+//! `Visual Studio Code`. Requiring every chunk to start a word is what keeps
+//! `manic` away from `Memory Diagnostic Tool` — there is no such split — while
+//! still admitting initialisms, which are the special case where every chunk is
+//! one character long.
 //!
 //! Highlights are byte ranges into the **raw** label. Normalization can change
 //! byte lengths (`ﬁ` folds to `fi`, `Ⅷ` folds to `viii`), so the matcher keeps a
@@ -53,8 +61,18 @@ pub enum MatchMethod {
     ExactPrefix,
     Prefix,
     Substring,
+    /// The token's characters occur in the label in order but not adjacently,
+    /// and not aligned to word boundaries (spec 11.1 fuzzy matching).
+    ///
+    /// Only reachable under [`MatchPolicy::Subsequence`]. It is the weakest and
+    /// least selective reading available: `manic` matches `Memory Diagnostic
+    /// Tool` this way, which is why no default configuration admits it.
     Fuzzy,
-    Acronym,
+    /// The token splits into two or more chunks that are each a prefix of a
+    /// distinct label word, consumed left to right. Subsumes initialisms (`tm`
+    /// for `Task Manager`) and mixed abbreviations (`vscode` for
+    /// `Visual Studio Code`).
+    WordPrefix,
     Keyword,
 }
 
@@ -69,12 +87,36 @@ impl MatchMethod {
         match self {
             Self::ExactPrefix => 0,
             Self::Prefix => 1,
-            Self::Substring => 2,
-            Self::Acronym => 3,
+            Self::WordPrefix => 2,
+            Self::Substring => 3,
             Self::Keyword => 4,
             Self::Fuzzy => 5,
         }
     }
+}
+
+/// Which readings of a token a matcher is allowed to credit.
+///
+/// Ordered-subsequence matching is opt-in because it cannot be made selective:
+/// the query `manic` and the query `vscode` produce indistinguishable evidence
+/// against `Memory Diagnostic Tool` and `Visual Studio Code` respectively, so no
+/// threshold separates the coincidence from the abbreviation. Word-prefix
+/// matching handles the abbreviation, and this policy exists for callers that
+/// deliberately want the looser behaviour as well.
+///
+/// The policy is also a candidate-pruning contract. A caller narrowing a
+/// previously accepted candidate set must have built that set under the *same*
+/// policy, or a strict pass will have discarded the very candidates a
+/// subsequence pass needs. [`PreparedLabel::may_match_with`] takes the policy
+/// for exactly that reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MatchPolicy {
+    /// Every reading except ordered subsequence. The default everywhere.
+    #[default]
+    Strict,
+    /// Additionally credits ordered-subsequence matches as
+    /// [`MatchMethod::Fuzzy`].
+    Subsequence,
 }
 
 /// Score plus the highlight ranges that produced it.
@@ -210,11 +252,17 @@ fn char_bit(ch: char) -> u64 {
 /// A 64-bit set over the distinct **normalized** characters of `text`.
 ///
 /// This is the catalog's candidate prefilter (spec 11.1). Every method
-/// [`DefaultMatcher`] supports — exact prefix, prefix, substring, acronym,
-/// keyword and fuzzy — can only fire when every character of the token already
-/// occurs somewhere in the item's searchable text. So for a token mask `q` and
-/// an item mask `m`, `q & !m == 0` is a *necessary* condition for a match, and
-/// an item it rejects cannot have matched.
+/// [`DefaultMatcher`] supports — exact prefix, prefix, word prefix, substring
+/// and keyword — can only fire when every character of the token already occurs
+/// somewhere in the item's searchable text, in order. So for a token mask `q`
+/// and an item mask `m`, `q & !m == 0` is a *necessary* condition for a match,
+/// and an item it rejects cannot have matched.
+///
+/// This invariant is why the matcher admits no edit-distance tier: a typo
+/// substitutes or transposes characters, so a token that is *close to* an item
+/// need not be a subsequence of it, and the prefilter would prune the candidate
+/// before scoring. Adding typo tolerance means adding an index that tolerates
+/// typos, not just a scoring method.
 ///
 /// # Invariant
 ///
@@ -361,6 +409,15 @@ pub struct PreparedLabel {
     map: Option<Box<OffsetMap>>,
     /// Character count of the label portion of `text`.
     char_len: usize,
+    /// Byte ranges of the label's words inside the **normalized** text,
+    /// ascending and disjoint.
+    ///
+    /// Computed from the raw label because case folding destroys the camel-case
+    /// boundaries word-prefix matching depends on: `PowerShell` folds to
+    /// `powershell`, and nothing in the folded form recovers the split. Stored
+    /// with one spare slot beyond [`MAX_WORD_PREFIX_WORDS`] so an over-cap label
+    /// is detectable without retaining an unbounded list.
+    words: Box<[(u32, u32)]>,
 }
 
 impl PreparedLabel {
@@ -393,11 +450,13 @@ impl PreparedLabel {
         } else {
             Some(Box::new(OffsetMap::Unavailable))
         };
+        let words = word_ranges(raw, label, map.as_deref());
         Self {
             text: text.into_boxed_str(),
             label_bytes,
             map,
             char_len,
+            words,
         }
     }
 
@@ -450,13 +509,27 @@ impl PreparedLabel {
         remaining.is_empty()
     }
 
-    /// Cheaply rejects items that no matcher interpretation can accept.
+    /// Cheaply rejects items that no matcher interpretation can accept, under
+    /// the default [`MatchPolicy::Strict`].
     ///
     /// This repeats only the boolean shape of matching over ingestion-time
     /// folded text: no highlight vectors, keyword normalization, outcomes or
     /// scores are built. Returning `true` is permission to run the full
     /// matcher; returning `false` is definitive.
+    ///
+    /// A candidate set narrowed with this method must not be handed to a
+    /// [`MatchPolicy::Subsequence`] pass: strict pruning discards exactly the
+    /// loose candidates such a pass exists to find. Use
+    /// [`Self::may_match_with`] with the policy the matcher will run under.
     pub fn may_match(&self, query: &NormalizedQuery) -> bool {
+        self.may_match_with(query, MatchPolicy::Strict)
+    }
+
+    /// [`Self::may_match`] under an explicit policy.
+    ///
+    /// The policy must be the one the matcher will run under, so that the
+    /// admitted set stays a superset of the matched set across every keystroke.
+    pub fn may_match_with(&self, query: &NormalizedQuery, policy: MatchPolicy) -> bool {
         if query.tokens.is_empty()
             || !query
                 .normalized
@@ -471,7 +544,47 @@ impl PreparedLabel {
         query
             .tokens
             .iter()
-            .all(|token| token_may_match(label, keywords, token))
+            .all(|token| self.token_may_match(label, keywords, token, policy))
+    }
+
+    /// The label's word ranges inside the normalized text.
+    fn word_ranges(&self) -> &[(u32, u32)] {
+        &self.words
+    }
+
+    /// Boolean counterpart of `match_token`: the disjunction over every tier the
+    /// matcher can report under `policy`, evaluated over ingestion-time folded
+    /// text.
+    ///
+    /// Each disjunct is prefix-closed — extending the token can only turn a
+    /// `true` into a `false`, never the reverse — which is what lets a caller
+    /// narrow a previously accepted candidate set as the user keeps typing.
+    fn token_may_match(&self, label: &str, keywords: &str, token: &str, policy: MatchPolicy) -> bool {
+        if token.is_empty() {
+            return false;
+        }
+        // Prefix, substring and keyword.
+        if label.contains(token) || keywords.contains(token) {
+            return true;
+        }
+        // Both remaining readings consume the token's characters in order, so
+        // one scan settles the shared precondition.
+        if !is_ordered_subsequence(label, token) {
+            return false;
+        }
+        // Word prefix, admitted through a necessary condition rather than the
+        // decomposition itself. This runs for every candidate the catalog
+        // revisits on every keystroke, so it must not allocate or run the grid.
+        //
+        // The subsequence precondition above is load bearing: `may_decompose`
+        // inspects only the first two characters, so on its own it would admit
+        // `manic` for `Task Manager` — a label containing neither `i` nor `c` —
+        // and the candidate set would stop shrinking as the user types.
+        if may_decompose(self.word_ranges(), label, token) {
+            return true;
+        }
+        // Ordered subsequence, only where the matcher would credit one.
+        policy == MatchPolicy::Subsequence && token.chars().count() >= 2
     }
 
     /// Translates a byte range of the normalized label into the raw label byte
@@ -504,31 +617,326 @@ impl PreparedLabel {
     }
 }
 
-/// Boolean counterpart of `match_token`, over already-normalized fields.
-fn token_may_match(label: &str, keywords: &str, token: &str) -> bool {
-    if token.is_empty() {
+// ---------------------------------------------------------------------------
+// Word segmentation and word-prefix decomposition
+// ---------------------------------------------------------------------------
+
+/// Most label words the word-prefix DP will consider.
+///
+/// A label with more words declines the tier outright rather than scoring a
+/// truncated prefix of itself. Real application labels are two to four words.
+pub const MAX_WORD_PREFIX_WORDS: usize = 8;
+
+/// Longest token the word-prefix DP will consider, in characters.
+///
+/// Over-cap tokens decline the tier. Truncating the *token* instead would be
+/// unsound: a partition of the first `n` characters is not a partition of the
+/// token, so `vscodezz` would match `Visual Studio Code` as though the trailing
+/// characters had never been typed.
+pub const MAX_WORD_PREFIX_TOKEN: usize = 12;
+
+/// Value deducted for each label word the decomposition steps over.
+const WORD_SKIP_PENALTY: f32 = 0.6;
+
+/// Whether a character belongs to a word.
+///
+/// Combining marks count: they attach to the preceding letter, so treating them
+/// as separators would split `e` + `U+0301` into two words and let a query match
+/// across the seam.
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || is_mark(ch)
+}
+
+/// Whether `previous` -> `current` opens a new word.
+///
+/// `next` is the character after `current`, used only to split an acronym run
+/// from a following capitalized word (`VSCode` -> `vs` + `code`).
+fn opens_word(previous: Option<char>, current: char, next: Option<char>) -> bool {
+    // A mark continues whatever it attaches to and can never start a word.
+    if !current.is_alphanumeric() {
         return false;
     }
-    if label.contains(token) || keywords.contains(token) {
+    let Some(previous) = previous else {
+        return true;
+    };
+    if !is_word_char(previous) {
+        return true;
+    }
+    if previous.is_lowercase() && current.is_uppercase() {
+        return true;
+    }
+    if previous.is_alphabetic() && current.is_numeric() {
+        return true;
+    }
+    if previous.is_numeric() && current.is_alphabetic() {
+        return true;
+    }
+    previous.is_uppercase() && current.is_uppercase() && next.is_some_and(|next| next.is_lowercase())
+}
+
+/// Byte ranges of `raw`'s words, expressed as offsets into `label`.
+///
+/// Segmentation runs on `raw` because folding erases the case transitions that
+/// separate `PowerShell` into `power` and `shell`. Offsets are then translated
+/// into normalized space, which is what the matcher searches.
+fn word_ranges(raw: &str, label: &str, map: Option<&OffsetMap>) -> Box<[(u32, u32)]> {
+    // One spare slot so an over-cap label is detectable from the stored list.
+    let capacity = MAX_WORD_PREFIX_WORDS + 1;
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+
+    match map {
+        // ASCII folds byte for byte, so raw offsets are already label offsets.
+        None => {
+            let bytes = raw.as_bytes();
+            let mut index = 0usize;
+            while index < bytes.len() && ranges.len() < capacity {
+                let current = bytes[index] as char;
+                let previous = (index > 0).then(|| bytes[index - 1] as char);
+                let next = bytes.get(index + 1).map(|byte| *byte as char);
+                if opens_word(previous, current, next) {
+                    let start = index;
+                    let mut end = index + 1;
+                    while end < bytes.len() {
+                        let candidate = bytes[end] as char;
+                        let following = bytes.get(end + 1).map(|byte| *byte as char);
+                        if !candidate.is_alphanumeric()
+                            || opens_word(Some(bytes[end - 1] as char), candidate, following)
+                        {
+                            break;
+                        }
+                        end += 1;
+                    }
+                    if end <= label.len() {
+                        ranges.push((start as u32, end as u32));
+                    }
+                    index = end;
+                    continue;
+                }
+                index += 1;
+            }
+        }
+        // Folding changed byte lengths: walk the marks, which carry each
+        // normalized character's raw source range.
+        Some(OffsetMap::Marks { marks, mapped_end }) => {
+            let mut open: Option<u32> = None;
+            let mut previous: Option<char> = None;
+            for (position, mark) in marks.iter().enumerate() {
+                if mark.norm >= *mapped_end {
+                    break;
+                }
+                let current = raw[mark.src_start as usize..mark.src_end as usize].chars().next();
+                let Some(current) = current else { continue };
+                let next = marks
+                    .get(position + 1)
+                    .and_then(|mark| raw[mark.src_start as usize..mark.src_end as usize].chars().next());
+                let norm_end = marks
+                    .get(position + 1)
+                    .map_or(*mapped_end, |following| following.norm);
+                if opens_word(previous, current, next) {
+                    if let Some(start) = open.take() {
+                        ranges.push((start, mark.norm));
+                    }
+                    if ranges.len() >= capacity {
+                        open = None;
+                        break;
+                    }
+                    open = Some(mark.norm);
+                } else if !is_word_char(current) {
+                    if let Some(start) = open.take() {
+                        ranges.push((start, mark.norm));
+                    }
+                }
+                previous = Some(current);
+                if open.is_some() && position + 1 == marks.len() {
+                    let start = open.take().unwrap_or(mark.norm);
+                    ranges.push((start, norm_end));
+                }
+            }
+            if let Some(start) = open {
+                if ranges.len() < capacity {
+                    ranges.push((start, *mapped_end));
+                }
+            }
+        }
+        // No usable mapping: fall back to segmenting the folded text. Case
+        // transitions are gone, so camel-case labels contribute one word.
+        Some(OffsetMap::Unavailable) => {
+            let mut open: Option<usize> = None;
+            for (offset, current) in label.char_indices() {
+                if is_word_char(current) {
+                    if open.is_none() {
+                        open = Some(offset);
+                    }
+                } else if let Some(start) = open.take() {
+                    ranges.push((start as u32, offset as u32));
+                    if ranges.len() >= capacity {
+                        return ranges.into_boxed_slice();
+                    }
+                }
+            }
+            if let Some(start) = open {
+                ranges.push((start as u32, label.len() as u32));
+            }
+        }
+    }
+
+    ranges.truncate(capacity);
+    ranges.into_boxed_slice()
+}
+
+/// Longest token the decomposition grid is sized for, in bytes.
+const MAX_WORD_PREFIX_TOKEN_BYTES: usize = MAX_WORD_PREFIX_TOKEN * 4;
+
+/// Cells in the decomposition grid: one row per word plus a base row, one
+/// column per token byte offset plus the empty suffix.
+const WORD_PREFIX_GRID: usize = (MAX_WORD_PREFIX_WORDS + 1) * (MAX_WORD_PREFIX_TOKEN_BYTES + 1);
+
+/// Whether `token`'s characters occur in `label` in order, not necessarily
+/// adjacently.
+///
+/// Necessary for every label-side reading the matcher supports: prefixes and
+/// substrings are contiguous runs, and a word-prefix decomposition consumes its
+/// chunks left to right across words in increasing order.
+fn is_ordered_subsequence(label: &str, token: &str) -> bool {
+    let mut haystack = label.chars();
+    token
+        .chars()
+        .all(|needle| haystack.by_ref().any(|character| character == needle))
+}
+
+/// Necessary condition for a word-prefix decomposition, without running one.
+///
+/// For a token of two or more characters, any partition either opens with a
+/// chunk of two or more characters — so some word carries the first two
+/// characters as a prefix — or opens with a single character, in which case the
+/// second character begins a *later* word. Both halves are required: the first
+/// covers `so` over `Sound Recorder`, the second covers `vscode` over
+/// `Visual Studio Code`, and each alone rejects real matches the other admits.
+///
+/// Cheap and allocation-free by design. Candidate filtering runs this for every
+/// retained position on every keystroke, where the grid would not fit the
+/// budget; the grid then confirms or rejects the survivors during scoring.
+fn may_decompose(words: &[(u32, u32)], label: &str, token: &str) -> bool {
+    let mut characters = token.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    let Some(second) = characters.next() else {
+        // A single character can only form a one-chunk decomposition, which the
+        // matcher reports as a prefix or substring rather than a word prefix.
+        return false;
+    };
+
+    let text = |&(start, end): &(u32, u32)| label.get(start as usize..end as usize).unwrap_or_default();
+
+    // A: some word carries both characters as its prefix.
+    if words.iter().any(|range| {
+        let mut characters = text(range).chars();
+        characters.next() == Some(first) && characters.next() == Some(second)
+    }) {
         return true;
     }
 
-    if token.chars().count() >= 2 {
-        let mut initials = word_initials(label).map(|(_, character)| character);
-        if token
-            .chars()
-            .all(|needle| initials.next().is_some_and(|initial| initial == needle))
-        {
-            return true;
-        }
+    // B: a `first`-initial word strictly precedes a `second`-initial word.
+    let opens_with = |range: &(u32, u32), wanted: char| text(range).starts_with(wanted);
+    match words.iter().position(|range| opens_with(range, first)) {
+        Some(index) => words[index + 1..].iter().any(|range| opens_with(range, second)),
+        None => false,
+    }
+}
 
-        let mut haystack = label.chars();
-        return token
-            .chars()
-            .all(|needle| haystack.by_ref().any(|character| character == needle));
+/// Best decomposition value of `token` over `words`, or `None` when no
+/// partition exists.
+///
+/// A partition splits `token` into consecutive non-empty chunks, each a prefix
+/// of a distinct word, words consumed left to right. Value rewards long chunks
+/// and whole-word chunks and charges [`WORD_SKIP_PENALTY`] per skipped word, so
+/// `vscode` prefers `v|s|code` over any sparser reading.
+///
+/// The grid is a fixed stack buffer rather than a heap allocation: at
+/// `MAX_WORD_PREFIX_WORDS` words and `MAX_WORD_PREFIX_TOKEN` characters it is
+/// under two kilobytes, and allocating one per candidate measured eight times
+/// the cost of the arithmetic it serves. Only the base row is initialized —
+/// every other cell is written before it is read, because the fill runs
+/// backwards.
+fn word_prefix_into(
+    words: &[(u32, u32)],
+    label: &str,
+    token: &str,
+    grid: &mut [f32; WORD_PREFIX_GRID],
+) -> Option<(f32, usize)> {
+    let word_count = words.len();
+    let token_len = token.len();
+    if token_len == 0 || word_count == 0 || word_count > MAX_WORD_PREFIX_WORDS {
+        return None;
+    }
+    if token.chars().count() > MAX_WORD_PREFIX_TOKEN {
+        return None;
+    }
+    debug_assert!(token_len <= MAX_WORD_PREFIX_TOKEN_BYTES);
+
+    // `grid[w * stride + q]` is the best value covering `token[q..]` using words
+    // `w..`. Filled backwards so each cell reads only already-written cells.
+    let stride = token_len + 1;
+    let base = word_count * stride;
+    grid[base..base + stride].fill(f32::NEG_INFINITY);
+    grid[base + token_len] = 0.0;
+
+    for word in (0..word_count).rev() {
+        let (start, end) = words[word];
+        let text = label.get(start as usize..end as usize).unwrap_or_default();
+        let row = word * stride;
+        let next = row + stride;
+        grid[row + token_len] = 0.0;
+        for offset in (0..token_len).rev() {
+            // Offsets inside a multi-byte character are not reachable chunk
+            // boundaries. They must still be written, because the skip
+            // transition below reads the same column of the next row.
+            if !token.is_char_boundary(offset) {
+                grid[row + offset] = f32::NEG_INFINITY;
+                continue;
+            }
+            let skipped = grid[next + offset];
+            let mut best = if skipped == f32::NEG_INFINITY {
+                f32::NEG_INFINITY
+            } else {
+                skipped - WORD_SKIP_PENALTY
+            };
+            // Viable chunk lengths are exactly the prefixes of the longest
+            // common prefix, so it is computed once per cell. It is truncated to
+            // a character boundary of the token, so `offset + length` is one too.
+            let reach = common_prefix_len(&token[offset..], text);
+            for length in 1..=reach {
+                let rest = grid[next + offset + length];
+                if rest == f32::NEG_INFINITY {
+                    continue;
+                }
+                let whole_word = if length == text.len() { 1.0 } else { 0.0 };
+                let value = length as f32 + whole_word + rest;
+                if value > best {
+                    best = value;
+                }
+            }
+            grid[row + offset] = best;
+        }
     }
 
-    false
+    let value = grid[0];
+    (value != f32::NEG_INFINITY).then_some((value, word_count))
+}
+
+/// Byte length of the longest common prefix, truncated to a character boundary.
+fn common_prefix_len(left: &str, right: &str) -> usize {
+    let limit = left.len().min(right.len());
+    let (left_bytes, right_bytes) = (left.as_bytes(), right.as_bytes());
+    let mut length = 0usize;
+    while length < limit && left_bytes[length] == right_bytes[length] {
+        length += 1;
+    }
+    while length > 0 && !left.is_char_boundary(length) {
+        length -= 1;
+    }
+    length
 }
 
 /// Aligns the precisely attributable prefix of `text` (the normalization of
@@ -585,12 +993,31 @@ const fn band(method: MatchMethod) -> (f32, f32) {
     match method {
         MatchMethod::ExactPrefix => (0.90, 1.00),
         MatchMethod::Prefix => (0.75, 0.88),
-        MatchMethod::Substring => (0.58, 0.72),
-        MatchMethod::Acronym => (0.42, 0.55),
-        MatchMethod::Keyword => (0.26, 0.39),
-        MatchMethod::Fuzzy => (0.10, 0.23),
+        MatchMethod::WordPrefix => (0.60, 0.73),
+        MatchMethod::Substring => (0.45, 0.58),
+        MatchMethod::Keyword => (0.30, 0.43),
+        MatchMethod::Fuzzy => (0.05, 0.17),
     }
 }
+
+// Adjacent bands are separated by at least 0.02, which is the invariant
+// `crikey-ranking`'s `W_MATCH_POSITION` is calibrated against: the position
+// bonus may refine an ordering within a band and tie at a band edge, but it must
+// never carry a weaker method past a stronger one. Narrowing any gap below that
+// weight silently makes match position able to invert the tier order.
+//
+// The bound is checked at 0.019 because the band edges are `f32` literals and
+// their difference is not exact: `0.90 - 0.88` evaluates just under `0.02`.
+const _: () = {
+    const fn gap(stronger: MatchMethod, weaker: MatchMethod) -> f32 {
+        band(stronger).0 - band(weaker).1
+    }
+    assert!(gap(MatchMethod::ExactPrefix, MatchMethod::Prefix) >= 0.019);
+    assert!(gap(MatchMethod::Prefix, MatchMethod::WordPrefix) >= 0.019);
+    assert!(gap(MatchMethod::WordPrefix, MatchMethod::Substring) >= 0.019);
+    assert!(gap(MatchMethod::Substring, MatchMethod::Keyword) >= 0.019);
+    assert!(gap(MatchMethod::Keyword, MatchMethod::Fuzzy) >= 0.019);
+};
 
 /// Clamps a quality term into `[0.0, 1.0]`, mapping non-finite input to zero.
 fn unit(value: f32) -> f32 {
@@ -620,18 +1047,48 @@ fn score_for(method: MatchMethod, quality: f32) -> f32 {
 
 /// The default [`Matcher`] (spec 11.1).
 ///
-/// Prefix, substring, acronym and fuzzy matching run against the label, which
-/// is the only field highlights can point at. Keyword matching additionally
-/// covers the fields a plugin submits for search — `search_terms` and
-/// `description` — by containment only. The `target` is deliberately excluded:
-/// it is an execution payload (a path, URL or command line), and matching it
-/// would make every `/usr/bin/...` item answer to `usr`.
+/// Prefix, word-prefix and substring matching run against the label, which is
+/// the only field highlights can point at. Keyword matching additionally covers
+/// the fields a plugin submits for search — `search_terms` and `description` —
+/// by containment only. The `target` is deliberately excluded: it is an
+/// execution payload (a path, URL or command line), and matching it would make
+/// every `/usr/bin/...` item answer to `usr`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DefaultMatcher {
-    _private: (),
+    policy: MatchPolicy,
 }
 
 impl DefaultMatcher {
+    /// A matcher that credits every reading except ordered subsequence.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            policy: MatchPolicy::Strict,
+        }
+    }
+
+    /// A matcher that additionally credits ordered-subsequence matches as
+    /// [`MatchMethod::Fuzzy`] (spec 11.1).
+    ///
+    /// Opt-in because subsequence matching cannot be made selective: it admits
+    /// `manic` for `Memory Diagnostic Tool` on the same evidence that admits
+    /// `vscode` for `Visual Studio Code`, and the two are one part in five
+    /// hundred apart. Callers that enable it must also narrow candidate sets
+    /// with [`PreparedLabel::may_match_with`] under the same policy, or a later
+    /// keystroke will silently drop the subsequence-only candidates.
+    #[must_use]
+    pub const fn with_subsequence() -> Self {
+        Self {
+            policy: MatchPolicy::Subsequence,
+        }
+    }
+
+    /// The readings this matcher credits.
+    #[must_use]
+    pub const fn policy(&self) -> MatchPolicy {
+        self.policy
+    }
+
     /// Scores a prepared label while reusing caller-owned highlight storage.
     ///
     /// `label` must have been prepared from the same `item`; callers that
@@ -690,7 +1147,7 @@ impl DefaultMatcher {
         let mut quality_total = 0.0f32;
 
         for token in &query.tokens {
-            let (method, quality) = match_token(&mut view, token, spans)?;
+            let (method, quality) = match_token(&mut view, token, spans, self.policy)?;
             if method.precedence() > weakest.precedence() {
                 weakest = method;
             }
@@ -806,6 +1263,7 @@ fn match_token(
     view: &mut ItemView<'_>,
     token: &str,
     spans: &mut Vec<(usize, usize)>,
+    policy: MatchPolicy,
 ) -> Option<(MatchMethod, f32)> {
     // The normalizer never emits one, but `NormalizedQuery` is constructible by
     // hand: an empty token carries no evidence, so it cannot license a match.
@@ -819,17 +1277,26 @@ fn match_token(
         return Some(found);
     }
 
+    // Keyword containment over plugin-supplied fields. It earns no label
+    // highlights: the hit is in a description or search term, not in the label
+    // the UI underlines.
     if view.label.keywords().contains(token) {
-        let keyword = keyword_quality(view.keywords(), token, token_chars);
-        if let Some(quality) = keyword {
+        if let Some(quality) = keyword_quality(view.keywords(), token, token_chars) {
             return Some((MatchMethod::Keyword, quality));
         }
     }
 
-    fuzzy_quality(view.label, token, token_chars, spans).map(|quality| (MatchMethod::Fuzzy, quality))
+    // Ordered subsequence: the weakest reading, and opt-in because it cannot be
+    // made selective.
+    if policy == MatchPolicy::Subsequence {
+        return subsequence_quality(view.label, token, token_chars, spans)
+            .map(|quality| (MatchMethod::Fuzzy, quality));
+    }
+
+    None
 }
 
-/// Prefix, substring and acronym matching, in precedence order.
+/// Prefix, word-prefix and substring matching, in precedence order.
 fn match_label(
     label: &PreparedLabel,
     token: &str,
@@ -841,6 +1308,15 @@ fn match_label(
         return Some((MatchMethod::Prefix, ratio(token_chars, label.char_len)));
     }
 
+    // The grid is only worth building for a candidate that could decompose.
+    // Scoring runs over the whole indexed admission set, not just the warm
+    // cache, so this gate belongs here as well as in `may_match_with`.
+    if may_decompose(label.word_ranges(), label.normalized(), token) {
+        if let Some(quality) = word_prefix_quality(label, token, spans) {
+            return Some((MatchMethod::WordPrefix, quality));
+        }
+    }
+
     if let Some(at) = label.normalized().find(token) {
         push_span(spans, label.to_raw(at, at.saturating_add(token.len())));
         let coverage = ratio(token_chars, label.char_len);
@@ -849,50 +1325,82 @@ fn match_label(
         return Some((MatchMethod::Substring, 0.5 * coverage + 0.5 * position));
     }
 
-    acronym_quality(label, token, token_chars, spans).map(|quality| (MatchMethod::Acronym, quality))
+    None
 }
 
-/// The token spells the leading word initials of the label.
-fn acronym_quality(
-    label: &PreparedLabel,
-    token: &str,
-    token_chars: usize,
-    spans: &mut Vec<(usize, usize)>,
-) -> Option<f32> {
-    // A single letter is a prefix, not an acronym.
-    if token_chars < 2 {
+/// The token splits into two or more chunks that are each a prefix of a
+/// distinct label word.
+///
+/// Highlights cover the matched chunks, recovered by replaying the choices the
+/// value grid made. Quality normalizes the decomposition value by the best a
+/// token of this length over a label of this many words could earn, so a tight
+/// reading of a short label outscores a sparse reading of a long one.
+///
+/// A single-chunk decomposition is deliberately rejected: it is a substring
+/// anchored at a word start, not an abbreviation spanning words, and the
+/// substring tier already scores it by position.
+fn word_prefix_quality(label: &PreparedLabel, token: &str, spans: &mut Vec<(usize, usize)>) -> Option<f32> {
+    let words = label.word_ranges();
+    let text = label.normalized();
+    // Stack-resident: see `word_prefix_into`. Only the base row is initialized
+    // there, so the zeroes here are never read as values.
+    let mut grid = [0.0f32; WORD_PREFIX_GRID];
+    let (value, word_count) = word_prefix_into(words, text, token, &mut grid)?;
+
+    let stride = token.len() + 1;
+    let mark = spans.len();
+    let mut offset = 0usize;
+    let mut chunks = 0usize;
+
+    for word in 0..word_count {
+        if offset == token.len() {
+            break;
+        }
+        let (start, end) = words[word];
+        let word_text = text.get(start as usize..end as usize).unwrap_or_default();
+        let expected = grid[word * stride + offset];
+        let reach = common_prefix_len(&token[offset..], word_text);
+        // Recover which chunk length the grid credited at this cell, if any.
+        let taken = (1..=reach).find(|&length| {
+            let rest = grid[(word + 1) * stride + offset + length];
+            if rest == f32::NEG_INFINITY {
+                return false;
+            }
+            let whole_word = if length == word_text.len() { 1.0 } else { 0.0 };
+            (length as f32 + whole_word + rest - expected).abs() < 1e-4
+        });
+        let Some(taken) = taken else { continue };
+        push_span(spans, label.to_raw(start as usize, start as usize + taken));
+        chunks += 1;
+        offset += taken;
+    }
+
+    if offset != token.len() || chunks < 2 {
+        spans.truncate(mark);
         return None;
     }
 
-    let mark = spans.len();
-    let mut initials = word_initials(label.normalized());
-    let mut matched = 0usize;
-
-    for needle in token.chars() {
-        match initials.next() {
-            Some((index, initial)) if initial == needle => {
-                push_span(spans, label.to_raw(index, index + initial.len_utf8()));
-                matched += 1;
-            }
-            _ => {
-                spans.truncate(mark);
-                return None;
-            }
-        }
-    }
-
-    // Covering every word is a better acronym than covering only the first few.
-    Some(ratio(matched, matched + initials.count()))
+    let ideal = token.chars().count() as f32 + word_count as f32;
+    Some(unit(value.max(0.0) / ideal))
 }
 
-/// The token's characters occur in the label in order, not necessarily adjacent.
-fn fuzzy_quality(
+/// The token's characters occur in the label in order, not necessarily adjacent
+/// and not necessarily at word boundaries (spec 11.1 fuzzy matching).
+///
+/// Only reached under [`MatchPolicy::Subsequence`]. The quality term below is
+/// the best available separation of an intentional abbreviation from a
+/// coincidence, and it is not good enough to rank on alone: measured over a
+/// realistic catalog, `vscode` against `Visual Studio Code` scores 0.667 and
+/// `manic` against `Manage Windows Credentials` scores 0.656. That is why the
+/// word-prefix tier exists above it and why this one is opt-in — no threshold
+/// placed here separates the two classes.
+fn subsequence_quality(
     label: &PreparedLabel,
     token: &str,
     token_chars: usize,
     spans: &mut Vec<(usize, usize)>,
 ) -> Option<f32> {
-    // A single character is a substring, not a fuzzy match.
+    // A single character is a substring, not a subsequence.
     if token_chars < 2 {
         return None;
     }
@@ -952,29 +1460,6 @@ fn keyword_quality(fields: &[Cow<'_, str>], token: &str, token_chars: usize) -> 
     }
 
     found.then_some(best)
-}
-
-/// Byte offset and character of the first character of each word.
-///
-/// Words are runs of alphanumeric characters plus Unicode marks, so combining
-/// marks cannot invent boundaries inside a word. Other punctuation separates
-/// words as before.
-fn word_initials(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
-    let mut inside_word = false;
-    text.char_indices().filter_map(move |(index, ch)| {
-        if is_mark(ch) {
-            return None;
-        }
-        if !ch.is_alphanumeric() {
-            inside_word = false;
-            return None;
-        }
-        if inside_word {
-            return None;
-        }
-        inside_word = true;
-        Some((index, ch))
-    })
 }
 
 fn is_mark(ch: char) -> bool {

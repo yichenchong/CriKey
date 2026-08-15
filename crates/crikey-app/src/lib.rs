@@ -91,7 +91,8 @@ use crikey_platform::{
 #[cfg(any(windows, target_os = "linux"))]
 use crikey_platform::{HotkeyActivationHandler, HotkeyBinding};
 use crikey_query::{
-    DefaultMatcher, DefaultNormalizer, MatchMethod, MatchOutcome, NormalizedQuery, Normalizer, PreparedLabel,
+    DefaultMatcher, DefaultNormalizer, MatchMethod, MatchOutcome, MatchPolicy, NormalizedQuery, Normalizer,
+    PreparedLabel,
 };
 use crikey_ranking::{DefaultRanker, RankingSignals, Score, SelectionHistory};
 use crikey_result_aggregator::{MemoryResultAggregator, ResultAggregator};
@@ -758,6 +759,27 @@ impl SearchService {
         }
     }
 
+    /// Chooses which readings the matcher credits (spec 11.1).
+    ///
+    /// Defaults to [`MatchPolicy::Strict`]. [`MatchPolicy::Subsequence`]
+    /// additionally admits ordered-subsequence matches, which cannot be made
+    /// selective — `manic` reaches `Memory Diagnostic Tool` that way — so it is
+    /// off unless a caller asks for it.
+    ///
+    /// Changing the policy invalidates the candidate cache: it was narrowed
+    /// under the previous policy, and a stricter narrowing has already discarded
+    /// the looser candidates the new policy would want.
+    pub fn set_match_policy(&mut self, policy: MatchPolicy) {
+        if self.matcher.policy() == policy {
+            return;
+        }
+        self.matcher = match policy {
+            MatchPolicy::Strict => DefaultMatcher::new(),
+            MatchPolicy::Subsequence => DefaultMatcher::with_subsequence(),
+        };
+        self.candidate_cache = None;
+    }
+
     /// Sets the clock used for deterministic recency scoring.
     pub fn set_history_time(&mut self, now_secs: u64) {
         self.now_secs = now_secs;
@@ -1401,6 +1423,7 @@ fn select_best<'items>(
     plan: SearchPlan<'_>,
 ) -> (Vec<RankedCandidate<'items>>, SearchStats, PositionCache, bool) {
     let SearchPlan {
+        matcher,
         ranker,
         non_prefix_upper,
         query,
@@ -1471,7 +1494,13 @@ fn select_best<'items>(
                     {
                         selection.stats.candidates_examined =
                             selection.stats.candidates_examined.saturating_add(1);
-                        if source_is_filtered || prepared_label.may_match(query) {
+                        // This candidate is skipped for scoring but still has to
+                        // enter the cache, and it must do so under the policy the
+                        // matcher scores with. A strict test here would drop
+                        // subsequence-only candidates on a cold pass, before the
+                        // warm path ever saw them. A warm source already applied
+                        // the same test in the catalog.
+                        if source_is_filtered || prepared_label.may_match_with(query, matcher.policy()) {
                             selection.matched_positions.push(position);
                         }
                         return;
@@ -1481,7 +1510,18 @@ fn select_best<'items>(
                 selection.consider(position, item, prepared_label);
             };
             if let Some(positions) = prior {
-                catalog.visit_prepared_positions(plugin, positions, query, &mut visit_remaining);
+                // The warm filter must use the policy the matcher scores with.
+                // Narrowing more strictly than the matcher matches would drop
+                // candidates it would have accepted, so a subsequence-enabled
+                // search would lose its subsequence-only hits on the second
+                // keystroke.
+                catalog.visit_prepared_positions_with(
+                    plugin,
+                    positions,
+                    query,
+                    matcher.policy(),
+                    &mut visit_remaining,
+                );
             } else {
                 catalog.visit_prepared_candidates(plugin, query, &mut visit_remaining);
             }

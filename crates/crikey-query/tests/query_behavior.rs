@@ -2,8 +2,9 @@
 //!
 //! These tests exercise only the public surface of `crikey-query`:
 //! `DefaultNormalizer` (Unicode normalization, case normalization,
-//! tokenization) and `DefaultMatcher` (prefix, substring, acronym, fuzzy and
-//! keyword matching with byte-safe label highlights).
+//! tokenization) and `DefaultMatcher` (exact-prefix, prefix, word-prefix,
+//! substring, keyword and opt-in subsequence matching with byte-safe label
+//! highlights).
 //!
 //! Deliberate non-goals: exact score values are never asserted. Scores are
 //! only checked for finiteness, bounds and relative ordering so that the
@@ -81,10 +82,24 @@ fn try_match(raw: &str, item: &Item) -> Option<MatchOutcome> {
     DefaultMatcher::default().match_item(&normalize(raw), item)
 }
 
+/// Subsequence ("fuzzy") matching is opt-in: a default matcher never reports
+/// `MatchMethod::Fuzzy`, so every loose expectation must name this matcher.
+fn try_match_loose(raw: &str, item: &Item) -> Option<MatchOutcome> {
+    DefaultMatcher::with_subsequence().match_item(&normalize(raw), item)
+}
+
 /// Matches and enforces the invariants that must hold for *every* outcome.
 fn matched(raw: &str, item: &Item) -> MatchOutcome {
-    let outcome =
-        try_match(raw, item).unwrap_or_else(|| panic!("query {raw:?} should match label {:?}", item.label));
+    assert_outcome(raw, item, try_match(raw, item))
+}
+
+/// [`matched`] under the opt-in subsequence policy.
+fn matched_loose(raw: &str, item: &Item) -> MatchOutcome {
+    assert_outcome(raw, item, try_match_loose(raw, item))
+}
+
+fn assert_outcome(raw: &str, item: &Item, outcome: Option<MatchOutcome>) -> MatchOutcome {
+    let outcome = outcome.unwrap_or_else(|| panic!("query {raw:?} should match label {:?}", item.label));
     assert_valid_highlights(&item.label, &outcome.highlights);
     assert!(
         outcome.score.is_finite(),
@@ -224,7 +239,7 @@ fn blank_query_yields_no_tokens_and_matches_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// Matching (spec 11.1: prefix, substring, fuzzy, acronym, keyword)
+// Matching (spec 11.1: prefix, word-prefix, substring, keyword, opt-in fuzzy)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -280,14 +295,15 @@ fn substring_match_reports_interior_range() {
 }
 
 #[test]
-fn acronym_match_highlights_word_initials() {
+fn word_prefix_match_highlights_word_initials() {
     let item = vscode();
     let outcome = matched("vsc", &item);
 
     assert_eq!(
         outcome.method,
-        MatchMethod::Acronym,
-        "word initials must beat the fuzzy interpretation of the same query"
+        MatchMethod::WordPrefix,
+        "each character is a prefix of a distinct label word, which is the \
+         word-prefix reading and not a mere substring"
     );
     assert_eq!(
         outcome.highlights,
@@ -298,10 +314,17 @@ fn acronym_match_highlights_word_initials() {
 }
 
 #[test]
-fn fuzzy_match_requires_ordered_characters() {
+fn fuzzy_match_requires_ordered_characters_and_an_opt_in_matcher() {
     let item = terminal();
-    let outcome = matched("tmnl", &item);
 
+    assert!(
+        try_match("tmnl", &item).is_none(),
+        "a scattered subsequence carries no evidence of intent, so the default \
+         matcher must not credit it on {:?}",
+        item.label
+    );
+
+    let outcome = matched_loose("tmnl", &item);
     assert_eq!(outcome.method, MatchMethod::Fuzzy);
     assert_eq!(
         outcome.highlights.len(),
@@ -312,8 +335,9 @@ fn fuzzy_match_requires_ordered_characters() {
     assert_eq!(highlighted(&item.label, &outcome.highlights), "tmnl");
 
     assert!(
-        try_match("lnmt", &item).is_none(),
-        "the same characters out of order must not match {:?}",
+        try_match_loose("lnmt", &item).is_none(),
+        "the same characters out of order must not match {:?} even when the \
+         caller opts in",
         item.label
     );
 }
@@ -379,14 +403,24 @@ fn every_query_token_must_match() {
 }
 
 #[test]
-fn precedence_prefers_prefix_over_substring_over_fuzzy() {
+fn precedence_orders_prefix_word_prefix_substring_then_fuzzy() {
     let prefix_item = app("Terminal", "Command line shell", "/usr/bin/terminal", &[]);
+    let word_prefix_item = app(
+        "Time Entry Report Manager",
+        "Log billable hours",
+        "/usr/bin/tereman",
+        &[],
+    );
     let substring_item = app("Xterm", "Classic X11 console", "/usr/bin/xterm", &[]);
     let fuzzy_item = app("Text Formatter", "Reformat documents", "/usr/bin/textfmt", &[]);
 
     let prefix = matched("term", &prefix_item);
+    let word_prefix = matched("term", &word_prefix_item);
     let substring = matched("term", &substring_item);
-    let fuzzy = matched("term", &fuzzy_item);
+    // The weakest tier is unreachable without opting in, which is precisely
+    // what keeps it from competing with the readings above.
+    assert!(try_match("term", &fuzzy_item).is_none());
+    let fuzzy = matched_loose("term", &fuzzy_item);
 
     assert!(
         matches!(prefix.method, MatchMethod::ExactPrefix | MatchMethod::Prefix),
@@ -394,14 +428,21 @@ fn precedence_prefers_prefix_over_substring_over_fuzzy() {
         prefix_item.label,
         prefix.method
     );
+    assert_eq!(word_prefix.method, MatchMethod::WordPrefix);
     assert_eq!(substring.method, MatchMethod::Substring);
     assert_eq!(fuzzy.method, MatchMethod::Fuzzy);
     assert_eq!(substring.highlights, [(1, 5)]);
 
     assert!(
-        prefix.score > substring.score,
-        "prefix {} must outrank substring {}",
+        prefix.score > word_prefix.score,
+        "prefix {} must outrank word-prefix {}",
         prefix.score,
+        word_prefix.score
+    );
+    assert!(
+        word_prefix.score > substring.score,
+        "word-prefix {} must outrank substring {}",
+        word_prefix.score,
         substring.score
     );
     assert!(
@@ -426,17 +467,32 @@ fn unrelated_query_does_not_match() {
 #[test]
 fn scores_are_finite_and_bounded_for_every_method() {
     let code = app("Code", "Code editing. Redefined.", "/usr/bin/code", &[]);
-    let probes: [(&str, Item); 6] = [
-        ("code", code),         // exact prefix
-        ("fire", firefox()),    // prefix
-        ("refo", firefox()),    // substring
-        ("vsc", vscode()),      // acronym
-        ("tmnl", terminal()),   // fuzzy
-        ("browser", firefox()), // keyword
+    let probes: [(&str, Item, MatchMethod); 6] = [
+        ("code", code, MatchMethod::ExactPrefix),
+        ("fire", firefox(), MatchMethod::Prefix),
+        ("vsc", vscode(), MatchMethod::WordPrefix),
+        ("refo", firefox(), MatchMethod::Substring),
+        ("browser", firefox(), MatchMethod::Keyword),
+        ("tmnl", terminal(), MatchMethod::Fuzzy),
     ];
 
-    for (raw, item) in probes {
-        let outcome = matched(raw, &item);
+    for (raw, item, method) in probes {
+        let outcome = if method == MatchMethod::Fuzzy {
+            // Fuzzy is the one tier the default matcher never reports.
+            assert!(
+                try_match(raw, &item).is_none(),
+                "{raw:?} on {:?} must stay unmatched without opting in",
+                item.label
+            );
+            matched_loose(raw, &item)
+        } else {
+            matched(raw, &item)
+        };
+        assert_eq!(
+            outcome.method, method,
+            "fixture {raw:?} on {:?} must exercise {method:?}",
+            item.label
+        );
         assert!(
             outcome.score > 0.0 && outcome.score <= 1.0,
             "match quality for {raw:?} on {:?} must lie in (0.0, 1.0], got {} via {:?}",

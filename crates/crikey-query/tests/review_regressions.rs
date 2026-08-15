@@ -34,9 +34,27 @@ fn try_match(raw: &str, candidate: &Item) -> Option<MatchOutcome> {
     DefaultMatcher::default().match_item(&normalize(raw), candidate)
 }
 
+/// Subsequence ("fuzzy") matching is opt-in: only a matcher built with
+/// [`DefaultMatcher::with_subsequence`] ever reports `MatchMethod::Fuzzy`.
+fn try_match_loose(raw: &str, candidate: &Item) -> Option<MatchOutcome> {
+    DefaultMatcher::with_subsequence().match_item(&normalize(raw), candidate)
+}
+
 fn matched(raw: &str, candidate: &Item) -> MatchOutcome {
     let outcome = try_match(raw, candidate)
         .unwrap_or_else(|| panic!("query {raw:?} should match label {:?}", candidate.label));
+    assert_valid_highlights(&candidate.label, &outcome.highlights);
+    outcome
+}
+
+/// [`matched`] under the opt-in subsequence policy.
+fn matched_loose(raw: &str, candidate: &Item) -> MatchOutcome {
+    let outcome = try_match_loose(raw, candidate).unwrap_or_else(|| {
+        panic!(
+            "query {raw:?} should match label {:?} under the opt-in policy",
+            candidate.label
+        )
+    });
     assert_valid_highlights(&candidate.label, &outcome.highlights);
     outcome
 }
@@ -182,14 +200,21 @@ fn empty_and_short_candidates_never_match_nonempty_queries() {
 }
 
 #[test]
-fn combining_marks_do_not_create_acronym_boundaries() {
+fn combining_marks_do_not_create_word_prefix_boundaries() {
     for (label, query) in [("q\u{0307}x ray", "qx"), ("नमस्ते", "नत")] {
         let candidate = item(label, "", "/test/marks", &[]);
-        let outcome = matched(query, &candidate);
+        // A mark belongs to the word it attaches to. Were it treated as a
+        // boundary, `qx` would decompose into prefixes of two "words" and be
+        // credited as a word-prefix match — a spurious initialism.
+        assert!(
+            try_match(query, &candidate).is_none(),
+            "combining marks inside {label:?} must not create initials"
+        );
+        let outcome = matched_loose(query, &candidate);
         assert_eq!(
             outcome.method,
             MatchMethod::Fuzzy,
-            "combining marks inside {label:?} must not create initials"
+            "{query:?} on {label:?} is reachable only as the weakest reading"
         );
     }
 }
@@ -199,8 +224,13 @@ fn fuzzy_compactness_counts_characters_instead_of_utf8_bytes() {
     let ascii_gap = item("axb", "", "/test/ascii-gap", &[]);
     let multibyte_gap = item("aβb", "", "/test/multibyte-gap", &[]);
 
-    let ascii = matched("ab", &ascii_gap);
-    let multibyte = matched("ab", &multibyte_gap);
+    // Both are subsequence-only readings, so neither exists for the default
+    // matcher: compactness is a property of the opt-in tier alone.
+    assert!(try_match("ab", &ascii_gap).is_none());
+    assert!(try_match("ab", &multibyte_gap).is_none());
+
+    let ascii = matched_loose("ab", &ascii_gap);
+    let multibyte = matched_loose("ab", &multibyte_gap);
     assert_eq!(ascii.method, MatchMethod::Fuzzy);
     assert_eq!(multibyte.method, MatchMethod::Fuzzy);
     assert_eq!(
@@ -249,19 +279,20 @@ fn description_is_searchable_but_execution_target_is_not() {
 
 #[test]
 fn score_bands_enforce_the_full_declared_precedence() {
-    let probes = [
+    // Strongest first: the reported method alone fixes the coarse rank, so
+    // every band must sit strictly below the one before it.
+    let strict_probes = [
         (MatchMethod::ExactPrefix, item("ac", "", "/test/exact", &[])),
         (MatchMethod::Prefix, item("acorn", "", "/test/prefix", &[])),
-        (MatchMethod::Substring, item("xacorn", "", "/test/substring", &[])),
         (
-            MatchMethod::Acronym,
-            item("Alpha Centauri", "", "/test/acronym", &[]),
+            MatchMethod::WordPrefix,
+            item("Alpha Centauri", "", "/test/word-prefix", &[]),
         ),
+        (MatchMethod::Substring, item("xacorn", "", "/test/substring", &[])),
         (MatchMethod::Keyword, item("Nimbus", "", "/test/keyword", &["ac"])),
-        (MatchMethod::Fuzzy, item("aβc", "", "/test/fuzzy", &[])),
     ];
 
-    let outcomes: Vec<MatchOutcome> = probes
+    let mut outcomes: Vec<MatchOutcome> = strict_probes
         .iter()
         .map(|(expected, candidate)| {
             let outcome = matched("ac", candidate);
@@ -269,6 +300,17 @@ fn score_bands_enforce_the_full_declared_precedence() {
             outcome
         })
         .collect();
+
+    // Fuzzy closes the chain, but only for a caller that opts in: the default
+    // matcher cannot see a subsequence-only candidate at all.
+    let loose_candidate = item("aβc", "", "/test/fuzzy", &[]);
+    assert!(
+        try_match("ac", &loose_candidate).is_none(),
+        "the weakest band is unreachable under the default policy"
+    );
+    let loose = matched_loose("ac", &loose_candidate);
+    assert_eq!(loose.method, MatchMethod::Fuzzy);
+    outcomes.push(loose);
 
     for pair in outcomes.windows(2) {
         assert!(

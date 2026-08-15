@@ -16,7 +16,7 @@ use crikey_core::{
     PluginId,
 };
 use crikey_query::{
-    presence_mask, searchable_text_with_label, NormalizedQuery, PreparedLabel, DEDICATED_BITS,
+    presence_mask, searchable_text_with_label, MatchPolicy, NormalizedQuery, PreparedLabel, DEDICATED_BITS,
 };
 
 /// Why a catalog lifecycle operation or update was rejected.
@@ -233,8 +233,9 @@ fn dedicated_index(character: char) -> Option<usize> {
 fn ordered_pair_signature(label: &PreparedLabel) -> [u64; ORDERED_PAIR_WORDS] {
     let mut signature = [0u64; ORDERED_PAIR_WORDS];
 
-    // Label matching admits substrings, acronyms and fuzzy subsequences, so
-    // every earlier dedicated character may constrain every later one.
+    // Label matching admits substrings and word-prefix decompositions, and both
+    // consume the token's characters in order, so every earlier dedicated
+    // character may constrain every later one.
     let mut seen = 0u64;
     for character in label.normalized().chars() {
         let Some(after) = dedicated_index(character) else {
@@ -712,7 +713,8 @@ impl MemoryCatalog {
         }
     }
 
-    /// Revisits positions accepted by an earlier query from the same catalog.
+    /// Revisits positions accepted by an earlier query from the same catalog,
+    /// under the default [`MatchPolicy::Strict`].
     ///
     /// A caller may use this only when the new normalized query extends the
     /// previous one, making its match set a subset of the previous match set.
@@ -721,6 +723,26 @@ impl MemoryCatalog {
         plugin: &PluginId,
         positions: &[usize],
         query: &NormalizedQuery,
+        visit: impl FnMut(usize, &'a Item, &'a PreparedLabel),
+    ) {
+        self.visit_prepared_positions_with(plugin, positions, query, MatchPolicy::Strict, visit);
+    }
+
+    /// [`Self::visit_prepared_positions`] under an explicit policy.
+    ///
+    /// The policy must be the one the matcher runs under, and the same one the
+    /// retained `positions` were admitted under. Narrowing a set with a stricter
+    /// policy than the matcher uses drops candidates the matcher would have
+    /// accepted: a [`MatchPolicy::Subsequence`] pass whose warm keystrokes filter
+    /// strictly would match a subsequence-only item on the first character and
+    /// then lose it on the second, which reads as results flickering out as the
+    /// user types.
+    pub fn visit_prepared_positions_with<'a>(
+        &'a self,
+        plugin: &PluginId,
+        positions: &[usize],
+        query: &NormalizedQuery,
+        policy: MatchPolicy,
         mut visit: impl FnMut(usize, &'a Item, &'a PreparedLabel),
     ) {
         let Some(catalog) = self.plugins.get(plugin) else {
@@ -730,7 +752,7 @@ impl MemoryCatalog {
             let Some((item, entry)) = catalog.items.get(position).zip(catalog.index.get(position)) else {
                 continue;
             };
-            if entry.prepared_label().may_match(query) {
+            if entry.prepared_label().may_match_with(query, policy) {
                 visit(position, item, entry.prepared_label());
             }
         }

@@ -111,8 +111,9 @@ const FIXTURE_LEN: usize = 6;
 ///
 /// `a-prefix` and `b-prefix` are byte-identical apart from their stable ids, so
 /// they score identically and the order between them is decided purely by the
-/// tie-break (spec 11.6).
-const FIRE_ORDER: [&str; 5] = ["a-prefix", "b-prefix", "substring", "keyword", "fuzzy"];
+/// tie-break (spec 11.6). The three behind them are ordered by method strength
+/// alone: word prefix outranks substring, which outranks keyword.
+const FIRE_ORDER: [&str; 5] = ["a-prefix", "b-prefix", "word-prefix", "substring", "keyword"];
 
 /// The milestones that must be acknowledged before a query is legal, each
 /// paired with the milestone acknowledging it makes pending (spec 25.6).
@@ -149,17 +150,28 @@ fn owned(plugin: &str, id: &str, label: &str, description: &str, search_terms: &
     }
 }
 
-/// Items that between them exercise prefix, substring, keyword and fuzzy
+/// Items that between them exercise prefix, word-prefix, substring and keyword
 /// matching against the query `fire`, an exact score tie across two of them,
 /// and one item that answers only the disjoint query `water` so exclusion is
 /// observable rather than vacuous.
+///
+/// Every tier here is one the service can actually reach: [`SearchService`]
+/// composes the strict [`DefaultMatcher`], which never credits a
+/// subsequence-only candidate, so a fuzzy-only item would be indistinguishable
+/// from `nonmatch`.
 fn fixture_items() -> Vec<Item> {
     vec![
         candidate("a-prefix", "Fire Atlas", "Launch the map", &[]),
         candidate("b-prefix", "Fire Atlas", "Launch the map", &[]),
+        // Word prefix on `fire`: the leading initials of all four words.
+        candidate(
+            "word-prefix",
+            "Fast Image Rendering Engine",
+            "Graphics toolkit",
+            &[],
+        ),
         candidate("substring", "Campfire Notes", "Outdoor notebook", &[]),
         candidate("keyword", "Blaze Guide", "Wildland fire safety", &[]),
-        candidate("fuzzy", "File Reader", "Open documents", &[]),
         candidate("nonmatch", "Water Clock", "Track the tides", &["rain"]),
     ]
 }
@@ -430,9 +442,9 @@ fn results_are_ranked_descending_and_tie_broken_by_item_id() {
     );
     assert_eq!(hits[0].method, MatchMethod::Prefix);
     assert_eq!(hits[1].method, MatchMethod::Prefix);
-    assert_eq!(hits[2].method, MatchMethod::Substring);
-    assert_eq!(hits[3].method, MatchMethod::Keyword);
-    assert_eq!(hits[4].method, MatchMethod::Fuzzy);
+    assert_eq!(hits[2].method, MatchMethod::WordPrefix);
+    assert_eq!(hits[3].method, MatchMethod::Substring);
+    assert_eq!(hits[4].method, MatchMethod::Keyword);
 
     assert_eq!(
         hits[0].highlights.first().map(|&(start, _)| start),
@@ -446,7 +458,7 @@ fn a_bounded_answer_retains_the_best_hits_not_the_first_arrivals() {
     let owner = "dev.crikey.top-k";
     let items = vec![
         owned(owner, "z-weak", "Campfire Notes", "", &[]),
-        owned(owner, "y-fuzzy", "File Reader", "", &[]),
+        owned(owner, "y-weak", "Fast Image Rendering Engine", "", &[]),
         owned(owner, "d-tie", "Fire Atlas", "", &[]),
         owned(owner, "c-tie", "Fire Atlas", "", &[]),
         owned(owner, "b-tie", "Fire Atlas", "", &[]),
@@ -817,16 +829,18 @@ const SEARCH_TERM_ONLY_QUERY: &str = "kumquat";
 /// characters are absent from that item's label entirely.
 const LABEL_DISJOINT_DESCRIPTION_QUERY: &str = "jigsaw";
 
-/// The mixed catalog's answer to `fire`, sorted by id: a prefix hit, an
-/// acronym hit, a substring hit, a keyword hit and a fuzzy hit, spread over
-/// every owner.
-const FIRE_MATCHES: [&str; 6] = [
+/// The mixed catalog's answer to `fire`, sorted by id: two prefix hits, a
+/// word-prefix hit, a substring hit and a keyword hit, spread over every owner.
+///
+/// The catalog also holds a subsequence-only candidate for `fire`
+/// (`main-finder`), which the strict matcher the service composes never
+/// credits, so it is absent here by contract rather than by pruning.
+const FIRE_MATCHES: [&str; 5] = [
     "early-atlas",
     "early-engine",
     "late-vault",
     "main-blaze",
     "main-campfire",
-    "main-finder",
 ];
 
 /// Queries the pruned path must answer exactly as an unpruned sweep would.
@@ -836,7 +850,7 @@ const EQUIVALENCE_QUERIES: [&str; 11] = [
     // possible match, and that is the failure this catches.
     "f",
     "fi",
-    // Prefix, substring, acronym, keyword and fuzzy hits at once, across all
+    // Prefix, word-prefix, substring and keyword hits at once, across all
     // three owners.
     "fire",
     // Two tokens, one of which reproduces a whole label.
@@ -867,7 +881,8 @@ fn early_items() -> Vec<Item> {
             "Launch the wall map",
             &[],
         ),
-        // Acronym on `fire`: the leading initials of all four words.
+        // Word prefix on `fire`: the leading initials of all four words, so the
+        // token decomposes into four chunks over four distinct words.
         owned(
             EARLY_PLUGIN,
             "early-engine",
@@ -908,8 +923,11 @@ fn main_items() -> Vec<Item> {
             "Signal relay for wildland crews",
             &[],
         ),
-        // Fuzzy on `fire`: f-i-r-e in order, none of them adjacent, and no
-        // searchable field containing the token.
+        // Subsequence-only on `fire`: f-i-r-e in order, none of them adjacent,
+        // no searchable field containing the token and no decomposition into
+        // word prefixes. The strict matcher the service composes must therefore
+        // reject it, which is what keeps the pruned/unpruned comparison honest
+        // about absences as well as presences.
         owned(
             PLUGIN,
             "main-finder",
@@ -1100,16 +1118,23 @@ fn the_pruned_answer_is_the_unpruned_answer_query_for_query() {
     for method in [
         MatchMethod::ExactPrefix,
         MatchMethod::Prefix,
+        MatchMethod::WordPrefix,
         MatchMethod::Substring,
-        MatchMethod::Acronym,
         MatchMethod::Keyword,
-        MatchMethod::Fuzzy,
     ] {
         assert!(
             exercised.contains(&method),
             "the queries above must between them produce a {method:?} hit: {exercised:?}"
         );
     }
+
+    // Subsequence matching is opt-in, and the service does not opt in: no
+    // query above may be answered by a fuzzy hit, however many characters of
+    // it a label happens to spell out in order.
+    assert!(
+        !exercised.contains(&MatchMethod::Fuzzy),
+        "the strict matcher the service composes must never credit a subsequence: {exercised:?}"
+    );
 }
 
 #[test]

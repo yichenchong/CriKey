@@ -681,12 +681,24 @@ fn query_method_bands_outrank_the_largest_position_advantage() {
     let r = ranker(true);
     let q = query("fire");
     let it = item("File Reader");
+    // One pair per adjacent band edge, strongest first: the stronger method sits
+    // at its band FLOOR, the weaker one at its band CEILING. WordPrefix now sits
+    // above Substring, so the ladder is
+    // ExactPrefix (0.90,1.00) > Prefix (0.75,0.88) > WordPrefix (0.60,0.73)
+    // > Substring (0.45,0.58) > Keyword (0.30,0.43) > Fuzzy (0.05,0.17).
+    // Adjacent bands are spaced 0.02, which is exactly `W_MATCH_POSITION`. So the
+    // largest possible position advantage (offset zero) can close a band edge to a
+    // tie -- to within f32 rounding, since 0.45 - 0.43 is not exactly 0.02 in
+    // binary -- but it must never carry the weaker method meaningfully past the
+    // stronger one, and anything short of the very best position must still lose
+    // outright.
+    const EDGE_TOLERANCE: f32 = 1e-6;
     let adjacent_band_edges = [
         (MatchMethod::ExactPrefix, 0.90, MatchMethod::Prefix, 0.88),
-        (MatchMethod::Prefix, 0.75, MatchMethod::Substring, 0.72),
-        (MatchMethod::Substring, 0.58, MatchMethod::Acronym, 0.55),
-        (MatchMethod::Acronym, 0.42, MatchMethod::Keyword, 0.39),
-        (MatchMethod::Keyword, 0.26, MatchMethod::Fuzzy, 0.23),
+        (MatchMethod::Prefix, 0.75, MatchMethod::WordPrefix, 0.73),
+        (MatchMethod::WordPrefix, 0.60, MatchMethod::Substring, 0.58),
+        (MatchMethod::Substring, 0.45, MatchMethod::Keyword, 0.43),
+        (MatchMethod::Keyword, 0.30, MatchMethod::Fuzzy, 0.17),
     ];
 
     for (stronger_method, stronger_floor, weaker_method, weaker_ceiling) in adjacent_band_edges {
@@ -701,10 +713,20 @@ fn query_method_bands_outrank_the_largest_position_advantage() {
         );
         let weaker_at_start = r.score(&q, &it, &outcome(weaker_ceiling, weaker_method, 0));
         assert!(
-            stronger > weaker_at_start,
+            stronger.get() >= weaker_at_start.get() - EDGE_TOLERANCE,
+            "{stronger_method:?} at its band floor must never be outranked by \
+             {weaker_method:?} at its ceiling, even when only the weaker match \
+             starts at offset zero: {stronger:?} vs {weaker_at_start:?}"
+        );
+
+        // One character further in already spends part of the position budget, so
+        // the band separation must reassert itself strictly.
+        let weaker_off_start = r.score(&q, &it, &outcome(weaker_ceiling, weaker_method, 1));
+        assert!(
+            stronger > weaker_off_start,
             "{stronger_method:?} at its band floor must outrank {weaker_method:?} \
-             at its ceiling even when only the weaker match starts at offset zero: \
-             {stronger:?} vs {weaker_at_start:?}"
+             at its ceiling once the weaker match no longer starts at offset zero: \
+             {stronger:?} vs {weaker_off_start:?}"
         );
     }
 }
@@ -718,7 +740,7 @@ fn ranker_awards_the_whole_label_bonus_only_to_exact_prefix() {
         MatchMethod::ExactPrefix,
         MatchMethod::Prefix,
         MatchMethod::Substring,
-        MatchMethod::Acronym,
+        MatchMethod::WordPrefix,
         MatchMethod::Keyword,
         MatchMethod::Fuzzy,
     ];
@@ -807,6 +829,8 @@ fn malformed_highlights_do_not_grant_position_evidence() {
 
 #[test]
 fn equal_character_positions_rank_equally_across_utf8_widths() {
+    // The default matcher is strict (no subsequence tier), which is all this test
+    // needs: "x" lands inside both labels as a plain substring.
     let matcher = DefaultMatcher::default();
     let r = ranker(true);
     let q = query("x");
@@ -866,7 +890,7 @@ fn ranker_is_deterministic_and_finite() {
     let mut it = item("Firefox");
     it.score_hint = 25;
     it.category = Category::PluginDefined("browser".into());
-    let out = outcome(0.77, MatchMethod::Acronym, 3);
+    let out = outcome(0.68, MatchMethod::WordPrefix, 3);
 
     let first = r.score(&q, &it, &out);
     let second = r.score(&q, &it, &out);
@@ -896,8 +920,10 @@ fn non_prefix_bound_covers_all_optional_signals() {
     let r = ranker(true);
     let candidate = item("candidate");
     let bound = r.non_prefix_upper_bound(&candidate);
+    // 0.73 is the WordPrefix ceiling, i.e. the strongest quality any non-prefix
+    // method can reach, so this is the worst case the advertised bound must cover.
     let actual = r.score_signals(RankingSignals {
-        match_quality: 0.72,
+        match_quality: 0.73,
         exact_prefix: false,
         match_position: Some(0),
         category_weight: 1.0,
