@@ -1543,3 +1543,88 @@ fn a_superseded_lazy_startup_abandons_its_obsolete_target_list() {
 
     drop(driver);
 }
+
+/// A catalog-persistence refusal must reach the host even when the plugin it
+/// belongs to never loads.
+///
+/// Spec 22.1 requires a refusal to withdraw a slice an earlier run persisted
+/// whether or not the plugin publishes. Reading declarations off the loaded set
+/// would miss exactly the cases that matter most: the plugin whose worker will
+/// not start is the one whose last-known catalog is stalest, and the one the
+/// user is most likely to be served from cache.
+#[test]
+fn a_persistence_refusal_survives_a_plugin_that_fails_to_load() {
+    let scratch = Scratch::new("persistence-declaration");
+    let plugins_root = scratch.subdir("plugins");
+    let dir = plugins_root.join("volatile");
+    fs::create_dir_all(&dir).expect("plugin directory is creatable");
+    // A parseable manifest that refuses persistence, whose only entrypoint is
+    // for a platform this host is not, so discovery records it unavailable and
+    // it never reaches the loaded set.
+    fs::write(
+        dir.join("crikey.toml"),
+        "manifest-version = 1\n\
+         \n\
+         [plugin]\n\
+         id = \"volatile\"\n\
+         name = \"volatile\"\n\
+         version = \"1.0.0\"\n\
+         runtime = \"python\"\n\
+         entrypoint.plan9-mips = \"no_such_module:Missing\"\n\
+         \n\
+         [catalog]\n\
+         persist = false\n",
+    )
+    .expect("manifest is writable");
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(scratch.subdir("index")),
+        scratch.join("cache"),
+        &DisabledPlugins::default(),
+    );
+
+    assert!(
+        provider.plugins().is_empty(),
+        "the fixture must actually fail to load, or this proves nothing"
+    );
+    let declared = provider.catalog_declarations();
+    assert_eq!(
+        declared
+            .iter()
+            .find(|(plugin, _)| plugin.0 == "modern.volatile")
+            .map(|(_, persist)| *persist),
+        Some(false),
+        "the refusal must be reported even though the plugin is unavailable, got {declared:?}"
+    );
+}
+
+/// The ordinary case still reports, so the test above is not passing because
+/// declarations are reported for everything regardless of content.
+#[test]
+fn a_loaded_plugin_reports_the_default_persistence() {
+    let scratch = Scratch::new("persistence-default");
+    let plugins_root = scratch.subdir("plugins");
+    write_modern_plugin(&plugins_root, "healthy", "healthy", "Healthy", HEALTHY_SOURCE);
+
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = ModernProvider::load(
+        &mut pipeline,
+        &[plugins_root],
+        Some(scratch.subdir("index")),
+        scratch.join("cache"),
+        &DisabledPlugins::default(),
+    );
+
+    assert_eq!(
+        provider
+            .catalog_declarations()
+            .iter()
+            .find(|(plugin, _)| plugin.0 == "modern.healthy")
+            .map(|(_, persist)| *persist),
+        Some(true),
+        "a manifest that says nothing permits persistence"
+    );
+}

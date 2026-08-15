@@ -71,6 +71,37 @@ relying on the setting. For isolated development, the standard-directory
 locations can be overridden with `CRIKEY_CONFIG_DIR`, `CRIKEY_DATA_DIR`,
 `CRIKEY_CACHE_DIR`, and `CRIKEY_STATE_DIR`.
 
+### Aliases
+
+Some names are not abbreviations of anything. `ss` for Settings and `vsc` for
+Visual Studio Code are letters from inside a word, and no matching rule can
+separate them from coincidences without dragging every coincidence back in.
+They are names *you* have for a thing, so you say what they are:
+
+```toml
+[aliases]
+ss = "Settings"
+vsc = "Visual Studio Code"
+snd = "Sound"
+```
+
+An alias replaces the word you typed with the words it stands for, so `snd rec`
+searches for `Sound Rec` and finds Sound Recorder. It applies to whole words
+only: an alias for `ss` never rewrites the middle of `press`.
+
+The alias table obeys the same layer precedence as everything else, and an
+empty value retracts an alias a lower layer defined, which is how a profile
+drops one it inherits from your global file:
+
+```toml
+[aliases]
+ss = ""
+```
+
+Because an alias replaces the word, the literal reading is not also tried: once
+`ss` means Settings, something whose own name reads `ss` is no longer found by
+it. Edits take effect on your next query, not your next restart.
+
 Plugin discovery roots are optional environment path lists:
 
 * `CRIKEY_MODERN_PLUGIN_ROOTS` — directories containing modern Python plugin

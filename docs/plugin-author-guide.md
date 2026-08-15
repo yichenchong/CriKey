@@ -52,6 +52,9 @@ suggest-soft-timeout-ms = 50
 suggest-hard-timeout-ms = 500
 maximum-results-per-query = 250
 maximum-results-per-batch = 50
+
+[catalog]
+persist = true
 ```
 
 Native manifests use `runtime = "native"` and platform-specific
@@ -64,6 +67,24 @@ instantiates the module itself. It needs a valid `entrypoint.<os>-<arch>`
 naming a `.wasm` file inside the package, and the host executable staged beside
 the launcher, which every packager installs. A package missing a matching entrypoint is unavailable,
 not silently loaded.
+
+`[catalog] persist` decides whether the host may keep your published catalog on
+disk between runs. It defaults to `true`, and the launcher serves those slices
+at the next startup *before* any plugin has run — which is what lets a query
+answer immediately, and is right for a catalog that is a list of installed
+things.
+
+Set it to `false` when your items are only true while you are running: a
+session list, a device list, anything holding a handle, anything that would
+execute against state that has since gone. For those a persisted slice is not a
+stale convenience but a set of items that look live and are not, offered before
+you can correct them. Refusing also withdraws any slice an earlier version of
+your plugin left behind, from disk and from the running catalog, so the change
+takes effect on the launch you ship it in. Items you publish while running are
+unaffected — they are current by definition, and are still served normally.
+
+This governs the on-disk catalog only. It is not a privacy control, and it is
+not query-result caching.
 
 Declare dependencies in `[python]` or `pyproject.toml`. CriKey resolves a
 locked, platform- and architecture-specific environment; system-wide

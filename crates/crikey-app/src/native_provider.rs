@@ -492,6 +492,9 @@ pub struct NativeProvider {
     catalog: NativeCatalogDispatcher,
     plugins: Vec<PluginId>,
     unavailable: Vec<NativeUnavailable>,
+    /// Catalog-persistence declarations, keyed by plugin, recorded as soon as
+    /// a manifest is parsed and independent of whether the plugin then loaded.
+    catalog_declarations: BTreeMap<PluginId, bool>,
     /// Current async suggestion snapshots keyed by the owning plugin and item
     /// id. Stable item ids are only unique within an owner.
     action_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
@@ -545,6 +548,7 @@ impl NativeProvider {
         disabled: &DisabledPlugins,
     ) -> Self {
         let mut provider = Self {
+            catalog_declarations: BTreeMap::new(),
             pool: NativeWorkerPool::default(),
             loaded: Vec::new(),
             catalog: NativeCatalogDispatcher::default(),
@@ -676,6 +680,11 @@ impl NativeProvider {
         // under the same `native` plugin root and is addressed by the same id
         // the CLI prints.
         let plugin = PluginId(format!("native.{}", manifest.plugin.id));
+        // Recorded the moment the manifest is understood, and deliberately not
+        // from `loaded`: a refusal has to withdraw an earlier run's slice even
+        // when this run never gets the plugin started (spec 22.1).
+        self.catalog_declarations
+            .insert(plugin.clone(), manifest.catalog.persist);
         // Held back before the worker process is spawned: an operator who
         // disabled a plugin must not pay for its process, and the only proof
         // that it did not run is that nothing started it (spec 21.2).
@@ -921,9 +930,9 @@ impl NativeProvider {
     /// one of those cases a slice written by an earlier run is already loaded
     /// and already answering queries.
     pub fn catalog_declarations(&self) -> Vec<(PluginId, bool)> {
-        self.loaded
+        self.catalog_declarations
             .iter()
-            .map(|loaded| (loaded.plugin.clone(), loaded.catalog_persist))
+            .map(|(plugin, persist)| (plugin.clone(), *persist))
             .collect()
     }
 

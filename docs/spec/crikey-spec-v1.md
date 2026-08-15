@@ -1700,6 +1700,21 @@ The host shall coalesce rapid changes and send the latest complete configuration
 
 Legacy configuration notifications shall follow the compatibility contract.
 
+### 21.5 Query aliases
+
+A user may define aliases, each mapping a single query token to the text it
+stands for.
+
+Aliases shall be an open key space rather than a declared schema: the point is
+to name abbreviations the host could not have anticipated.
+
+An alias shall rewrite a query token that matches it exactly. It shall not
+match part of a token, and the rewritten token's literal reading is not
+additionally credited.
+
+Aliases shall obey the layer precedence of 21.2, and an empty target shall
+retract an alias defined by a lower layer.
+
 ---
 
 ## 22. Caching and Invalidation
@@ -1719,6 +1734,17 @@ CriKey shall support caching of:
 - Native package validation results.
 - Modern plugin query results where safe.
 - Ranking history.
+
+A plugin may refuse persistence of its own catalog items, for a catalog whose
+entries are only valid while the plugin is running.
+
+A refusal shall take effect on the launch that declares it: the host shall
+withdraw any slice persisted by an earlier declaration, both from storage and
+from the running catalog, and shall do so whether or not the plugin goes on to
+publish. Items published during the current run shall be unaffected.
+
+This declaration governs persistence only, and is distinct from the query
+result caching of 22.2.
 
 ### 22.2 Modern query-result caching
 
