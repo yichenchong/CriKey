@@ -122,6 +122,24 @@ pub struct PluginResource {
     pub media_type: String,
 }
 
+/// What a plugin did when asked for one resource.
+///
+/// Three outcomes rather than two because a caller that memoizes has to tell
+/// "the plugin answered no" from "the plugin has not answered": the first is
+/// final, the second is worth retrying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceOutcome {
+    /// The plugin served these bytes.
+    Served(PluginResource),
+    /// The plugin was reached and declined: it has no such reference, it
+    /// answered with an error, it served nothing, or it served more than the
+    /// caller's `max_bytes`. Asking again gets the same answer.
+    Declined,
+    /// The plugin said nothing before the caller's timeout. The request may
+    /// still be in flight inside the plugin; a later attempt may be answered.
+    Silent,
+}
+
 /// What a host resource request is asking a plugin for (spec 16.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceKind {
@@ -1188,21 +1206,26 @@ impl NativeWorker {
 
     /// Asks the live plugin to serve one resource (spec 16.4).
     ///
-    /// `Ok(None)` covers every way a plugin can decline: it does not have the
-    /// reference, it answered with an error, it served more than `max_bytes`,
-    /// or it said nothing before `timeout`. None of those kills the worker,
-    /// and that asymmetry with the query path is deliberate. A resource is
-    /// decoration -- an item's icon, in practice -- so taking the process down
-    /// over one would cost the user working suggestions to punish a missing
-    /// picture. Transport death is still an error: that is not the plugin
-    /// declining, it is the channel being gone.
+    /// Neither a decline nor a silence kills the worker, and that asymmetry
+    /// with the query path is deliberate. A resource is decoration — an item's
+    /// icon, in practice — so taking the process down over one would cost the
+    /// user working suggestions to punish a missing picture. Transport death
+    /// is still an error: that is not the plugin declining, it is the channel
+    /// being gone.
+    ///
+    /// The two non-error outcomes are reported apart because they mean
+    /// opposite things to a caller that memoizes. A decline is the plugin's
+    /// answer and will not change; a silence is the absence of an answer,
+    /// which the very next attempt may supply. Collapsing them — as this
+    /// returned `Option` once did — is what let one slow resource child cost a
+    /// plugin its icons for the rest of a session.
     pub fn request_resource(
         &mut self,
         kind: ResourceKind,
         reference: &str,
         timeout: Duration,
         max_bytes: usize,
-    ) -> Result<Option<PluginResource>, HostError> {
+    ) -> Result<ResourceOutcome, HostError> {
         self.ensure_alive()?;
         let request_id = self.begin_request(0);
         self.send_control(&Envelope {
@@ -1222,12 +1245,12 @@ impl NativeWorker {
         loop {
             let remaining = end.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Ok(None);
+                return Ok(ResourceOutcome::Silent);
             }
             let envelope = match self.link.recv(remaining) {
                 Ok(ReaderEvent::Envelope(envelope)) => envelope,
                 Ok(ReaderEvent::Failure(failure)) => return Err(self.transport_error(failure)),
-                Err(RecvTimeoutError::Timeout) => return Ok(None),
+                Err(RecvTimeoutError::Timeout) => return Ok(ResourceOutcome::Silent),
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(self.transport_error(ReaderFailure {
                         error: ProtocolError::Closed,
@@ -1260,9 +1283,9 @@ impl NativeWorker {
                         || response.content.len() > max_bytes
                         || response.content.is_empty()
                     {
-                        return Ok(None);
+                        return Ok(ResourceOutcome::Declined);
                     }
-                    return Ok(Some(PluginResource {
+                    return Ok(ResourceOutcome::Served(PluginResource {
                         reference: response.reference,
                         content: response.content,
                         media_type: response.media_type,
@@ -1272,7 +1295,7 @@ impl NativeWorker {
                 // An `Error` here is the SDK's answer for a plugin that does
                 // not implement resources at all, which is a decline, not a
                 // violation.
-                Some(Payload::Error(_)) | Some(_) | None => return Ok(None),
+                Some(Payload::Error(_)) | Some(_) | None => return Ok(ResourceOutcome::Declined),
             }
         }
     }

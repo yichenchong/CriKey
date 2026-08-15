@@ -49,10 +49,25 @@ const MAX_RESOLVED_ICONS: usize = 512;
 
 /// Native icon fetches allowed to be outstanding at once.
 ///
-/// A fetch occupies one thread and one plugin's worker for up to
-/// [`PLUGIN_ICON_DEADLINE`], so an unbounded fan-out would let a screenful of
-/// rows from a slow plugin spawn a screenful of blocked threads.
+/// A fetch occupies one thread and one plugin's worker for as long as that
+/// plugin's resource child takes to come up plus [`PLUGIN_ICON_DEADLINE`] to
+/// answer, so an unbounded fan-out would let a screenful of rows from a slow
+/// plugin spawn a screenful of blocked threads.
+///
+/// Only the first fetch of a run pays the startup half, and it is bounded by
+/// the worker handshake budget rather than by the icon deadline — see the note
+/// above `NativeResourceSource` in `native_provider` for why that budget is
+/// not tightened here, and what taking the spawn off the fetch path would
+/// require.
 const MAX_CONCURRENT_FETCHES: usize = 4;
+
+/// Transient failures tolerated for one reference before the host stops asking.
+///
+/// A reference that cannot be fetched *yet* must stay retryable, or one slow
+/// cold start costs a plugin its icons for the rest of the session. A
+/// reference that fails forever must stop costing a fetch slot, or a dead
+/// plugin starves the healthy ones. This is the line between the two.
+const MAX_ICON_FETCH_ATTEMPTS: u32 = 3;
 
 /// Serves the bytes behind one reference for one plugin.
 ///
@@ -60,10 +75,27 @@ const MAX_CONCURRENT_FETCHES: usize = 4;
 /// protocol. Modern plugins need no implementation: their packages are on disk
 /// and the host reads them directly.
 pub trait PluginResourceSource: fmt::Debug + Send + Sync {
-    /// `None` for every way a plugin can decline -- it has no such resource, it
-    /// refused, it served more than the host accepts, or it stayed silent past
-    /// the deadline.
-    fn fetch(&self, reference: &str) -> Option<Vec<u8>>;
+    /// Answers with bytes, a definitive absence, or a transient failure.
+    ///
+    /// The distinction is load bearing: the resolver memoizes an [`IconFetch::Absent`]
+    /// so a missing icon costs one round trip per session, and deliberately
+    /// does not memoize an [`IconFetch::Unavailable`] so a plugin whose child
+    /// was merely slow to start is asked again on a later frame.
+    fn fetch(&self, reference: &str) -> IconFetch;
+}
+
+/// The outcome of asking a plugin for one resource.
+#[derive(Debug)]
+pub enum IconFetch {
+    /// The plugin answered with these bytes.
+    Found(Vec<u8>),
+    /// The plugin was reached and has no such resource, refused it, or served
+    /// more than the host accepts. Asking again would get the same answer.
+    Absent,
+    /// The plugin could not be asked: its child did not start in time, the
+    /// transport failed, or it stayed silent past the deadline. Asking again
+    /// later may well succeed.
+    Unavailable,
 }
 
 /// Where the bytes behind one plugin's icon references come from.
@@ -97,6 +129,10 @@ pub struct PluginIconResolver {
     /// where both halves of the key are already borrowed from a row.
     resolved: Mutex<ResolvedIcons>,
     inflight: Mutex<HashSet<(String, String)>>,
+    /// Transient failures seen per reference, so a retryable failure stays
+    /// retryable a bounded number of times. Entries are only created by a
+    /// failure, so a healthy launcher never allocates here.
+    attempts: Mutex<HashMap<(String, String), u32>>,
 }
 
 impl PluginIconResolver {
@@ -197,8 +233,35 @@ impl PluginIconResolver {
         let spawned = thread::Builder::new()
             .name("crikey-plugin-icon".to_owned())
             .spawn(move || {
-                let image = source.fetch(&key.1).and_then(|bytes| decode(&key.1, &bytes));
-                resolver.store(&key.0, &key.1, image);
+                match source.fetch(&key.1) {
+                    // Bytes that will not decode are the plugin's answer, not a
+                    // failure to reach it: asking again produces the same bytes.
+                    IconFetch::Found(bytes) => {
+                        resolver.store(&key.0, &key.1, decode(&key.1, &bytes));
+                        lock(&resolver.attempts).remove(&key);
+                    }
+                    IconFetch::Absent => {
+                        resolver.store(&key.0, &key.1, None);
+                        lock(&resolver.attempts).remove(&key);
+                    }
+                    // Deliberately not memoized until the allowance is spent.
+                    // A memo here is what turned one slow resource-child start
+                    // into a plugin with no icons for the rest of the session.
+                    IconFetch::Unavailable => {
+                        let spent = {
+                            let mut attempts = lock(&resolver.attempts);
+                            let seen = attempts.entry(key.clone()).or_insert(0);
+                            *seen = seen.saturating_add(1);
+                            *seen >= MAX_ICON_FETCH_ATTEMPTS
+                        };
+                        if spent {
+                            // Stop paying a fetch slot for a reference that has
+                            // never once been answerable.
+                            resolver.store(&key.0, &key.1, None);
+                            lock(&resolver.attempts).remove(&key);
+                        }
+                    }
+                }
                 lock(&resolver.inflight).remove(&key);
             });
         if let Err(error) = spawned {
@@ -392,22 +455,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
-    /// A served origin that answers nothing, the way a plugin whose resource
-    /// deadline the host abandoned looks from this side of the seam.
+    /// A served origin that answers nothing, the way a plugin the host reached
+    /// and which had no such reference looks from this side of the seam.
+    ///
+    /// Reports [`IconFetch::Absent`] deliberately: this fixture stands for a
+    /// definitive decline, which is the outcome that may be memoized. The
+    /// retryable outcome has its own fixture below.
     #[derive(Debug, Default)]
     struct SilentSource {
         fetches: AtomicU64,
     }
 
     impl PluginResourceSource for SilentSource {
-        fn fetch(&self, _reference: &str) -> Option<Vec<u8>> {
+        fn fetch(&self, _reference: &str) -> IconFetch {
             self.fetches.fetch_add(1, Ordering::Relaxed);
             // Long enough that the concurrency bound is genuinely reached
             // while several references are outstanding at once, which is the
             // only state in which a leaked slot is distinguishable from a
             // released one.
             std::thread::sleep(Duration::from_millis(20));
-            None
+            IconFetch::Absent
         }
     }
 
@@ -467,6 +534,107 @@ mod tests {
             source.fetches.load(Ordering::Relaxed) as usize,
             references.len(),
             "a settled reference is asked for exactly once"
+        );
+    }
+
+    /// A source that is unavailable for its first `failures` attempts and
+    /// serves afterwards, which is exactly the shape of a resource child that
+    /// was slow to start.
+    #[derive(Debug)]
+    struct RecoveringSource {
+        failures: u32,
+        attempts: AtomicU64,
+    }
+
+    impl PluginResourceSource for RecoveringSource {
+        fn fetch(&self, _reference: &str) -> IconFetch {
+            let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
+            if attempt < u64::from(self.failures) {
+                return IconFetch::Unavailable;
+            }
+            // Not decodable, and deliberately so: this test is about whether
+            // the reference is asked again, which the attempt counter reports.
+            // Decoding real pixels here would test the decoder instead.
+            IconFetch::Found(b"not-an-image".to_vec())
+        }
+    }
+
+    /// Settles `reference` or panics, so a hang is a named failure.
+    fn settle(resolver: &Arc<PluginIconResolver>, plugin: &PluginId, reference: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let _ = resolver.resolve(&plugin.0, reference);
+            if lock(&resolver.resolved)
+                .get(&plugin.0)
+                .is_some_and(|references| references.contains_key(reference))
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("`{reference}` never settled");
+    }
+
+    /// A reference that could not be fetched *yet* must be asked again.
+    ///
+    /// The defect this closes cost a plugin every icon for the rest of a
+    /// session: a resource child that was merely slow to start made one fetch
+    /// fail, the failure was memoized exactly like a missing file, and nothing
+    /// ever asked again. Recovery on the second attempt is what proves the
+    /// memo did not swallow the first.
+    #[test]
+    fn a_transient_failure_is_retried_rather_than_memoized() {
+        let plugin = PluginId("native.slowstart".to_owned());
+        let source = Arc::new(RecoveringSource {
+            failures: 1,
+            attempts: AtomicU64::new(0),
+        });
+        let resolver = Arc::new({
+            let mut resolver = PluginIconResolver::default();
+            resolver.insert_served(&plugin, Arc::clone(&source) as Arc<dyn PluginResourceSource>);
+            resolver
+        });
+
+        settle(&resolver, &plugin, "late.svg");
+        assert!(
+            source.attempts.load(Ordering::Relaxed) >= 2,
+            "the unavailable first attempt must not be the last word"
+        );
+    }
+
+    /// Retrying must be bounded, or a plugin that can never answer keeps
+    /// spending one of [`MAX_CONCURRENT_FETCHES`] slots forever and starves
+    /// the plugins that can.
+    #[test]
+    fn a_reference_that_is_never_available_stops_being_asked() {
+        let plugin = PluginId("native.dead".to_owned());
+        let source = Arc::new(RecoveringSource {
+            failures: u32::MAX,
+            attempts: AtomicU64::new(0),
+        });
+        let resolver = Arc::new({
+            let mut resolver = PluginIconResolver::default();
+            resolver.insert_served(&plugin, Arc::clone(&source) as Arc<dyn PluginResourceSource>);
+            resolver
+        });
+
+        settle(&resolver, &plugin, "never.svg");
+        let spent = source.attempts.load(Ordering::Relaxed);
+        assert_eq!(
+            spent,
+            u64::from(MAX_ICON_FETCH_ATTEMPTS),
+            "the allowance is spent exactly once, not per frame"
+        );
+
+        // Asking after the allowance is spent must cost nothing: the memo now
+        // answers, so no further fetch is started.
+        for _ in 0..10 {
+            assert!(resolver.resolve(&plugin.0, "never.svg").is_none());
+        }
+        assert_eq!(
+            source.attempts.load(Ordering::Relaxed),
+            spent,
+            "a reference that gave up is not asked again"
         );
     }
 }

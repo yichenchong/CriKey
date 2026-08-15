@@ -46,14 +46,14 @@ use crikey_core::{ActionId, ArgumentPolicy, ExecutionPolicy, Generation, Item, I
 use crikey_input_scheduler::Millis;
 use crikey_native_host::{
     CancelHandle, ExecuteOutcome, HostError, LaunchSpec, NativeSuggestRequest, NativeSupervisor,
-    ResourceKind, Suggestions, SupervisorConfig, WorkerOptions,
+    ResourceKind, ResourceOutcome, Suggestions, SupervisorConfig, WorkerOptions,
 };
 use crikey_plugin_model::{Manifest, Permissions, Runtime, Startup};
 use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
 use crikey_ui::{ResultRow, ViewModel};
 
 use crate::plugin_icons::{
-    PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
+    IconFetch, PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
 };
 use crate::{
     ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError, DisabledPlugins,
@@ -445,6 +445,26 @@ impl NativeWorkerPool {
     }
 }
 
+// Why the resource child keeps the general startup budget.
+//
+// An earlier revision of this change capped it, on the reasoning that a fetch
+// slot should not be held for the ten-second handshake allowance when
+// `PLUGIN_ICON_DEADLINE` advertises 250 ms. The reasoning was wrong in a way
+// worth recording so it is not repeated: startup time is per attempt, not
+// additive across them. Each retry starts a fresh child and restarts the
+// handshake, so retrying a four-second cap three times does not serve a child
+// that needs seven seconds to come up — it fails three times and then
+// memoizes the absence, losing icons on exactly the slow machines the old
+// single ten-second attempt served.
+//
+// So the honest statement of the bound, which `MAX_CONCURRENT_FETCHES` is
+// documented against, is: a fetch holds its slot for the worker startup
+// budget plus `PLUGIN_ICON_DEADLINE`, and only the first fetch of a run pays
+// the startup half. Making that genuinely 250 ms means taking the spawn off
+// the fetch path — starting the resource child without occupying a slot and
+// letting the retry find it warm — which is a change to the resolver seam
+// rather than a constant, and is not attempted here.
+
 /// Serves one native plugin's resources by asking a child of its own.
 ///
 /// The supervisor here is deliberately NOT the one query dispatch uses. A
@@ -463,19 +483,33 @@ struct NativeResourceSource {
 }
 
 impl PluginResourceSource for NativeResourceSource {
-    fn fetch(&self, reference: &str) -> Option<Vec<u8>> {
+    fn fetch(&self, reference: &str) -> IconFetch {
         let mut supervisor = self.supervisor.lock().unwrap_or_else(|error| error.into_inner());
-        let worker = supervisor.worker(&self.plugin, 0).ok()?;
-        worker
-            .request_resource(
-                ResourceKind::Icon,
-                reference,
-                PLUGIN_ICON_DEADLINE,
-                MAX_PLUGIN_ICON_BYTES,
-            )
-            .ok()
-            .flatten()
-            .map(|resource| resource.content)
+        // Starting the child is part of the fetch, and it is the part
+        // `PLUGIN_ICON_DEADLINE` does not bound — see the note above this
+        // impl. A child that fails to come up is reported as unavailable
+        // rather than absent, so the reference stays retryable instead of
+        // being memoized away on one slow start.
+        let Ok(worker) = supervisor.worker(&self.plugin, 0) else {
+            return IconFetch::Unavailable;
+        };
+        match worker.request_resource(
+            ResourceKind::Icon,
+            reference,
+            PLUGIN_ICON_DEADLINE,
+            MAX_PLUGIN_ICON_BYTES,
+        ) {
+            Ok(ResourceOutcome::Served(resource)) => IconFetch::Found(resource.content),
+            // The plugin was reached and answered no. Asking again is waste.
+            Ok(ResourceOutcome::Declined) => IconFetch::Absent,
+            // No answer inside the deadline. Distinct from a decline on
+            // purpose: a plugin busy with its first request, or a child that
+            // has only just finished starting, answers the next attempt.
+            Ok(ResourceOutcome::Silent) => IconFetch::Unavailable,
+            // Transport fault. The supervisor will restart the child, and the
+            // reference is worth asking again once it has.
+            Err(_) => IconFetch::Unavailable,
+        }
     }
 }
 
@@ -598,10 +632,12 @@ impl NativeProvider {
     /// to load has no worker to ask for an icon.
     ///
     /// Each served origin is backed by a second supervisor built from the same
-    /// immutable launch recipe the catalog path uses. `register` starts no
-    /// process, so this costs a plugin nothing until one of its icons is
-    /// actually asked for; a registration that is refused leaves the plugin
-    /// with no origin, which resolves to no icon rather than to a shared lock.
+    /// immutable launch recipe, and the same worker options, that the catalog
+    /// path uses. `register`
+    /// starts no process, so this costs a plugin nothing until one of its
+    /// icons is actually asked for; a registration that is refused leaves the
+    /// plugin with no origin, which resolves to no icon rather than to a
+    /// shared lock.
     fn install_icon_resolver(&mut self, pipeline: &mut QueryPipeline) {
         // Disjoint field borrows: the recipes are read while the pool that
         // retains the new supervisors is written.

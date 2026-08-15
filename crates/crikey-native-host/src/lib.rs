@@ -20,5 +20,5 @@ pub use stream::{
 pub use supervisor::{NativeSupervisor, SupervisorConfig};
 pub use worker::{
     CancelHandle, ExitKind, ExitRecord, HostError, NativeWorker, PluginHandshake, PluginResource,
-    ResourceKind,
+    ResourceKind, ResourceOutcome,
 };
