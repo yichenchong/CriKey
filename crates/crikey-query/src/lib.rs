@@ -369,7 +369,7 @@ fn push_searchable_field(out: &mut String, raw: &str) {
 // ---------------------------------------------------------------------------
 
 /// One normalized character and the raw byte range it was folded from.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Mark {
     /// Byte offset of the character inside the normalized text.
     norm: u32,
@@ -387,7 +387,7 @@ struct Mark {
 const MAX_RUN_BYTES: usize = 128;
 
 /// How normalized byte offsets map back onto raw label bytes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum OffsetMap {
     /// Precisely mapped normalized prefix. Bytes at or beyond `mapped_end`
     /// belong to a degraded tail and must not produce highlights.
@@ -400,7 +400,13 @@ enum OffsetMap {
 ///
 /// Catalogs retain this beside the item so repeated queries do not normalize
 /// the same label on every keystroke.
-#[derive(Debug, Clone)]
+///
+/// Two prepared labels are equal when every derived buffer agrees, which is
+/// what lets [`DefaultMatcher::match_prepared`] prove a caller-supplied buffer
+/// belongs to the item it is about to score. Folded equality alone would not:
+/// `words` and `map` come from the raw label, and `PowerShell` and
+/// `Powershell` fold to the same text while carrying different boundaries.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PreparedLabel {
     /// Folded label followed by optional folded keyword text.
     text: Box<str>,
@@ -475,38 +481,6 @@ impl PreparedLabel {
     /// Every folded searchable field in catalog order.
     pub fn searchable_text(&self) -> &str {
         &self.text
-    }
-
-    /// Checks whether this prepared buffer belongs to `item`.
-    ///
-    /// The constructor is public for catalog integrations, so a caller can
-    /// accidentally reuse a prepared label from another item. Matching with
-    /// such a buffer can otherwise produce a false positive or point at a
-    /// different, but still valid, byte range in the candidate label.
-    fn matches_item(&self, item: &Item) -> bool {
-        if self.normalized() != normalize_field(&item.label).as_ref() {
-            return false;
-        }
-        let mut remaining = self.keywords();
-        let mut wrote_any = !self.normalized().is_empty();
-        for raw in std::iter::once(&item.description).chain(item.search_terms.iter()) {
-            if raw.is_empty() {
-                continue;
-            }
-            let field = normalize_field(raw);
-            if wrote_any {
-                let Some(stripped) = remaining.strip_prefix(' ') else {
-                    return false;
-                };
-                remaining = stripped;
-            }
-            if !remaining.starts_with(field.as_ref()) {
-                return false;
-            }
-            remaining = &remaining[field.len()..];
-            wrote_any |= !field.is_empty();
-        }
-        remaining.is_empty()
     }
 
     /// Cheaply rejects items that no matcher interpretation can accept, under
@@ -1172,19 +1146,29 @@ impl DefaultMatcher {
     /// If a caller accidentally supplies a prepared buffer for another item,
     /// the matcher rebuilds the candidate's buffer before scoring. This keeps
     /// public misuse from turning into a false match or a wrong highlight.
+    ///
+    /// Validation is exact rather than probabilistic: the canonical buffer for
+    /// `item` is built and compared field for field. Comparing only the folded
+    /// text would not do — `words` and `map` are derived from the *raw* label,
+    /// and distinct raw labels can fold alike. A buffer prepared from
+    /// `PowerShell` would otherwise be accepted for an item labelled
+    /// `Powershell`, reporting `psh` as a word-prefix match against a label with
+    /// no interior boundary and highlighting bytes that spell nothing.
+    ///
+    /// The rebuild is the same work the mismatch path already did, so a
+    /// mismatched call costs what it always cost; a matching call now pays one
+    /// preparation to prove itself. Callers on the hot path should use
+    /// [`Self::score_prepared`], which trusts the buffer.
     pub fn match_prepared(
         &self,
         query: &NormalizedQuery,
         item: &Item,
         label: &PreparedLabel,
     ) -> Option<MatchOutcome> {
-        if label.matches_item(item) {
-            return self.match_prepared_unchecked(query, item, label);
-        }
-
         let (text, label_bytes) = searchable_text_with_label(item);
-        let owned = PreparedLabel::from_searchable_text(&item.label, text, label_bytes);
-        self.match_prepared_unchecked(query, item, &owned)
+        let canonical = PreparedLabel::from_searchable_text(&item.label, text, label_bytes);
+        let label = if *label == canonical { label } else { &canonical };
+        self.match_prepared_unchecked(query, item, label)
     }
 
     fn match_prepared_unchecked(

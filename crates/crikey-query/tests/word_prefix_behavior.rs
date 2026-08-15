@@ -391,3 +391,79 @@ fn strict_pruning_would_drop_subsequence_candidates() {
     assert!(!prepared.may_match_with(&normalized, MatchPolicy::Strict));
     assert!(prepared.may_match_with(&normalized, MatchPolicy::Subsequence));
 }
+
+// ---------------------------------------------------------------------------
+// Prepared-buffer identity
+// ---------------------------------------------------------------------------
+
+/// A prepared buffer from a differently-cased label must not be trusted.
+///
+/// `PowerShell` and `Powershell` fold to the same text, so folded equality
+/// would accept one buffer for the other item. Their word boundaries differ —
+/// only the first splits into `power` and `shell` — so the stale buffer would
+/// report `psh` as a word-prefix match against a label that has no interior
+/// boundary, and highlight bytes that spell nothing the user typed.
+#[test]
+fn prepared_buffer_from_a_differently_cased_label_is_rebuilt() {
+    let matcher = DefaultMatcher::default();
+    let stale = PreparedLabel::new("PowerShell");
+    let candidate = item("Powershell", &[]);
+
+    // Sanity: the two labels really do fold alike, so only raw-derived data
+    // distinguishes them.
+    assert_eq!(
+        PreparedLabel::new("PowerShell").normalized(),
+        PreparedLabel::new("Powershell").normalized()
+    );
+
+    // `Powershell` is one word, so `psh` cannot decompose over it.
+    assert_eq!(method("Powershell", "psh"), None);
+    assert!(
+        matcher
+            .match_prepared(&query("psh"), &candidate, &stale)
+            .is_none(),
+        "a stale buffer must not license a match the item cannot support"
+    );
+
+    // The correctly prepared item still matches, so the guard is not blanket.
+    let genuine = item("PowerShell", &[]);
+    let prepared = PreparedLabel::new("PowerShell");
+    let outcome = matcher
+        .match_prepared(&query("psh"), &genuine, &prepared)
+        .expect("the matching buffer should score");
+    assert_eq!(outcome.method, MatchMethod::WordPrefix);
+}
+
+/// The same guard holds when folding changes byte lengths.
+#[test]
+fn prepared_buffer_from_a_differently_spelled_label_is_rebuilt() {
+    let matcher = DefaultMatcher::default();
+    // `ﬁ` folds to `fi`, so these two labels fold to the same text while their
+    // raw byte offsets differ.
+    let stale = PreparedLabel::new("ﬁle Explorer");
+    let candidate = item("file Explorer", &[]);
+    assert_eq!(
+        PreparedLabel::new("ﬁle Explorer").normalized(),
+        PreparedLabel::new("file Explorer").normalized()
+    );
+
+    // Whatever the outcome, every highlight must slice the candidate's own
+    // label; a stale offset map would point into the other spelling.
+    if let Some(outcome) = matcher.match_prepared(&query("fex"), &candidate, &stale) {
+        for &(start, end) in &outcome.highlights {
+            assert!(
+                candidate.label.get(start..end).is_some(),
+                "highlight {start}..{end} does not slice {:?}",
+                candidate.label
+            );
+        }
+        assert_eq!(
+            outcome.highlights,
+            matcher
+                .match_prepared(&query("fex"), &candidate, &PreparedLabel::new("file Explorer"))
+                .expect("canonical buffer should match")
+                .highlights,
+            "a stale buffer must produce the canonical buffer's highlights"
+        );
+    }
+}
