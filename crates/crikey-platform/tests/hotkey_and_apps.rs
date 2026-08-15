@@ -816,21 +816,57 @@ fn application_items_are_searchable_by_their_executable_stem() {
     }
 }
 
-/// A platform identifier contributes its last segment.
+/// A platform identifier contributes the part a user would type.
 ///
-/// A desktop-entry id such as `org.gnome.Nautilus` carries `nautilus`, which the
-/// label `Files` does not.
+/// Each platform hands over a different shape, and the Linux one is a trap: the
+/// identifier is the desktop-entry *file name*, so taking the last dotted
+/// segment without stripping the extension files every application on the
+/// system under the alias `desktop`.
 #[test]
 fn application_items_are_searchable_by_their_platform_identifier() {
-    let mut discovery = discovered("Files", "/usr/bin/nautilus");
-    discovery.platform_id = Some("org.gnome.Nautilus".to_owned());
-    let items = application_items(&plugin(), &[discovery]);
-    let item = items.first().expect("one discovery makes one item");
-    assert!(
-        item.search_terms.iter().any(|term| term == "Nautilus"),
-        "the identifier's last segment is searchable, found {:?}",
-        item.search_terms
-    );
+    let cases = [
+        // Linux: plain desktop-entry file name.
+        ("Firefox", "firefox.desktop", "firefox"),
+        // Linux: reverse-DNS desktop-entry file name.
+        ("Files", "org.gnome.Nautilus.desktop", "Nautilus"),
+        // macOS: bundle identifier, no extension to strip.
+        ("Safari", "com.apple.Safari", "Safari"),
+    ];
+    for (name, platform_id, expected) in cases {
+        let mut discovery = discovered(name, "/usr/bin/placeholder");
+        discovery.platform_id = Some(platform_id.to_owned());
+        let items = application_items(&plugin(), &[discovery]);
+        let terms = &items.first().expect("one item").search_terms;
+        assert!(
+            terms.iter().any(|term| term == expected),
+            "{platform_id:?} should contribute {expected:?}, found {terms:?}"
+        );
+        assert!(
+            !terms.iter().any(|term| term == "desktop"),
+            "{platform_id:?} must not file the application under \"desktop\", found {terms:?}"
+        );
+    }
+}
+
+/// No application answers to `desktop` merely because it has a desktop entry.
+///
+/// A shared alias across the whole catalog is worse than no alias: one query
+/// would return every installed application.
+#[test]
+fn desktop_entries_do_not_share_a_catalog_wide_alias() {
+    let discoveries = ["firefox", "gimp", "nautilus"].map(|stem| {
+        let mut discovery = discovered(stem, format!("/usr/bin/{stem}"));
+        discovery.platform_id = Some(format!("{stem}.desktop"));
+        discovery
+    });
+    for item in application_items(&plugin(), &discoveries) {
+        assert!(
+            !item.search_terms.iter().any(|term| term == "desktop"),
+            "{:?} must not answer to \"desktop\", found {:?}",
+            item.label,
+            item.search_terms
+        );
+    }
 }
 
 /// Search terms carry no duplicates and no empties.
