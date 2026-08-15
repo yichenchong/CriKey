@@ -169,11 +169,23 @@ fn application_search_terms(application: &DiscoveredApplication) -> Vec<String> 
         push(stem);
     }
     if let Some(platform_id) = application.platform_id.as_deref() {
-        // Desktop-entry and AppUserModelID forms are dotted; the last segment is
-        // the part a user would type.
-        push(platform_id.rsplit('.').next().unwrap_or(platform_id));
+        push(platform_identifier_alias(platform_id));
     }
     terms
+}
+
+/// The typeable part of a platform identifier.
+///
+/// The three platforms hand over three shapes. Linux gives the desktop-entry
+/// *file name* — `firefox.desktop`, or `org.gnome.Nautilus.desktop` for a
+/// reverse-DNS entry — so the trailing extension has to come off first; taking
+/// the last dotted segment straight away would file every Linux application
+/// under `desktop`. macOS gives a bundle identifier such as `com.apple.Safari`,
+/// where the last segment is exactly right. Windows gives an already-readable
+/// moniker, which has no dots to split and passes through.
+fn platform_identifier_alias(platform_id: &str) -> &str {
+    let identifier = platform_id.strip_suffix(".desktop").unwrap_or(platform_id);
+    identifier.rsplit('.').next().unwrap_or(identifier)
 }
 
 /// The executable file name without its extension, when the target has one.
