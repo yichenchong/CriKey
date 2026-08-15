@@ -9,15 +9,15 @@
 //! the true [`DefaultMatcher`] match set computed by brute force over the very
 //! same slice, so a false negative fails loudly and deterministically.
 //!
-//! The prefilter is a presence mask. Every method the matcher supports —
-//! exact prefix, prefix, substring, acronym, keyword and fuzzy — can only fire
-//! when *every character* of a query token already occurs somewhere in the
-//! item's searchable text, so `query_mask & !item_mask == 0` is a necessary
-//! condition with no false negatives by construction. Three consequences are
-//! defended below. The mask must be taken over **normalized** text, or `Ⅷ`
-//! never answers to `viii`. It must be the union over **every** field the
-//! matcher reads — label *and* description *and* `search_terms` — because
-//! keyword matching reads the latter two, so a label-only mask silently
+//! The prefilter is a presence mask. Every method the matcher supports — exact
+//! prefix, prefix, word prefix, substring, keyword and the opt-in subsequence
+//! tier — can only fire when *every character* of a query token already occurs
+//! somewhere in the item's searchable text, so `query_mask & !item_mask == 0`
+//! is a necessary condition with no false negatives by construction. Three
+//! consequences are defended below. The mask must be taken over **normalized**
+//! text, or `Ⅷ` never answers to `viii`. It must be the union over **every**
+//! field the matcher reads — label *and* description *and* `search_terms` —
+//! because keyword matching reads the latter two, so a label-only mask silently
 //! deletes real keyword hits. And it must stop there: `target` is an
 //! execution payload the matcher deliberately ignores, so folding it in would
 //! undo that exclusion.
@@ -366,12 +366,14 @@ fn strings_up_to(alphabet: &[char], max_len: usize) -> Vec<String> {
 }
 
 /// Queries drawn from a realistic slice: whole words, every prefix, every
-/// short substring, label acronyms, adjacent word pairs and cross-item pairs.
+/// short substring, label initials, adjacent word pairs and cross-item pairs.
 ///
-/// Prefixes reach prefix matching, interior substrings reach substring and
-/// fuzzy matching, initials reach acronym matching, and the non-label words
-/// reach keyword matching — so the recall claim covers every method the
-/// matcher can answer with.
+/// Prefixes reach exact-prefix and prefix matching, interior substrings reach
+/// substring matching, initials reach word-prefix matching, and the non-label
+/// words reach keyword matching — so the recall claim covers every method the
+/// strict matcher can answer with. The opt-in subsequence tier needs no
+/// queries of its own: a subsequence hit spans the same characters an interior
+/// substring hit does, so the mask condition it must satisfy is the same one.
 fn derived_queries(items: &[Item]) -> Vec<String> {
     let mut queries: BTreeSet<String> = BTreeSet::new();
 
@@ -1048,7 +1050,7 @@ fn candidates_are_exactly_the_mask_admitted_items() {
 /// query over `a`-`f` up to three characters, and every pair of such queries
 /// up to two characters, can be *enumerated* rather than sampled. For each one
 /// the offered candidates must cover the true [`DefaultMatcher`] match set —
-/// prefix, substring, acronym, keyword and fuzzy hits alike — and must equal
+/// prefix, word-prefix, substring and keyword hits alike — and must equal
 /// the mask-admitted set the contract specifies. A pruning bug therefore shows
 /// up here as a named missing id, never as a speed difference.
 #[test]

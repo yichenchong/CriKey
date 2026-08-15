@@ -453,9 +453,14 @@ impl DefaultRanker {
     /// The bound maximizes every optional signal as well as the strongest
     /// non-prefix match. That keeps it valid for callers that use an enabled
     /// history policy or supply context and preference signals.
+    ///
+    /// `match_quality` is the ceiling of the strongest non-prefix band, which is
+    /// [`MatchMethod::WordPrefix`]. Reordering the bands in `crikey-query`
+    /// without revisiting this constant would prune candidates that can in fact
+    /// outrank what has already been retained.
     pub fn non_prefix_upper_bound(&self, item: &Item) -> Score {
         self.score_signals(RankingSignals {
-            match_quality: 0.72,
+            match_quality: 0.73,
             exact_prefix: false,
             match_position: Some(0),
             category_weight: category_weight(&item.category),
