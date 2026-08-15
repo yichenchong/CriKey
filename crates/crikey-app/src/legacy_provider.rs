@@ -890,6 +890,11 @@ impl LegacyProvider {
                 instance: task.instance,
                 generation: task.generation,
                 items,
+                // A legacy package has no `crikey.toml` to declare anything, and
+                // its catalog is the static list it builds on load. Spec 22.3
+                // withholds caching from legacy *dynamic suggestions*, which do
+                // not travel this path.
+                persist: true,
             }));
         }
         results

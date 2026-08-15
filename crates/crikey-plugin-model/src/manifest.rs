@@ -35,6 +35,9 @@ pub struct Manifest {
     /// empty one only in that the manifest stays shorter.
     #[serde(default)]
     pub configuration: ConfigurationSection,
+    /// How the plugin's published catalog may be retained (spec 22.1, 22.4).
+    #[serde(default)]
+    pub catalog: CatalogSection,
 }
 
 impl Manifest {
@@ -258,6 +261,53 @@ pub struct PythonSection {
     pub requires_python: Option<String>,
     #[serde(default)]
     pub dependencies: Vec<String>,
+}
+
+/// Whether a plugin's published catalog may outlive the process (spec 22.1).
+///
+/// The host persists each plugin's slice so that the launcher can answer a
+/// query at the next startup before the plugin has run. That is the right
+/// default: an application list is worth having a moment early and costs
+/// nothing if it is a moment old.
+///
+/// It is the wrong default for a plugin whose items are only true while it is
+/// running - a session list, a device list, anything holding a handle, or
+/// anything whose items would execute against state that no longer exists. For
+/// those, a persisted slice is not a stale convenience but a set of items that
+/// look live and are not, offered before the plugin can correct them. Such a
+/// plugin declares `persist = false` and is never written to the cache.
+///
+/// This is not a privacy control. Items still live in memory, and the plugin
+/// still publishes them; the declaration governs the on-disk catalog only.
+///
+/// # This is not spec 22.2
+///
+/// Spec 22.2 governs *modern query-result* caching, and offers five modes -
+/// uncacheable, exact query, normalized query, TTL, and until an event or
+/// configuration change. No modern result cache exists yet, so there is
+/// nothing for those modes to configure. This declaration governs the
+/// persistent *catalog* cache of spec 22.1, which does exist, is written on
+/// every publication, and is served at the next startup before any plugin has
+/// run. When a result cache is built, it needs its own declaration with the
+/// modes 22.2 names; a boolean here must not be widened to stand in for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct CatalogSection {
+    /// Whether the host may write this plugin's slice to the catalog cache.
+    #[serde(default = "persist_default")]
+    pub persist: bool,
+}
+
+const fn persist_default() -> bool {
+    true
+}
+
+impl Default for CatalogSection {
+    fn default() -> Self {
+        Self {
+            persist: persist_default(),
+        }
+    }
 }
 
 /// Relevance gating metadata (spec 8.11). Never applied to `legacy-strict`.
