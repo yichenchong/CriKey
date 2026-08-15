@@ -281,3 +281,82 @@ fn an_ordinary_item_id_is_recorded() {
 
     assert_eq!(history.snapshot().selections.len(), 1);
 }
+
+/// The size bounds must hold for the store, not for one way into it.
+///
+/// A history file well under the reader's byte limit can still carry a handful
+/// of enormous ids or queries - it only takes one. Restoring those would clone
+/// them into every lookup, write them straight back out, and let them survive
+/// eviction on the strength of whatever count the file claims.
+#[test]
+fn restoring_a_snapshot_rejects_oversized_keys() {
+    let ordinary = item("Firefox");
+    let huge_id = ItemId("x".repeat(64 * 1024));
+    let huge_query = "q".repeat(64 * 1024);
+
+    let snapshot = crikey_ranking::SelectionHistorySnapshot {
+        selections: vec![
+            crikey_ranking::SelectionRecord {
+                plugin: ordinary.plugin_id.clone(),
+                item: ordinary.stable_id.clone(),
+                frequency: 3,
+                last_selected_secs: Some(10),
+            },
+            crikey_ranking::SelectionRecord {
+                plugin: ordinary.plugin_id.clone(),
+                item: huge_id.clone(),
+                frequency: 9_999,
+                last_selected_secs: Some(10),
+            },
+        ],
+        query_affinities: vec![
+            crikey_ranking::QueryAffinityRecord {
+                plugin: ordinary.plugin_id.clone(),
+                item: ordinary.stable_id.clone(),
+                query: "fire".to_owned(),
+                count: 3,
+            },
+            // Oversized by its query, with an otherwise ordinary item.
+            crikey_ranking::QueryAffinityRecord {
+                plugin: ordinary.plugin_id.clone(),
+                item: ordinary.stable_id.clone(),
+                query: huge_query,
+                count: 9_999,
+            },
+            // Oversized by its item id.
+            crikey_ranking::QueryAffinityRecord {
+                plugin: ordinary.plugin_id.clone(),
+                item: huge_id,
+                query: "fire".to_owned(),
+                count: 9_999,
+            },
+        ],
+    };
+
+    let restored = SelectionHistory::from_snapshot(snapshot).snapshot();
+
+    assert_eq!(
+        restored.selections.len(),
+        1,
+        "only the ordinary item survives, got {:?}",
+        restored
+            .selections
+            .iter()
+            .map(|r| r.item.0.len())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        restored.query_affinities.len(),
+        1,
+        "only the ordinary affinity survives, got {:?}",
+        restored
+            .query_affinities
+            .iter()
+            .map(|r| (r.item.0.len(), r.query.len()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(restored.query_affinities[0].query, "fire");
+    // A high count must not buy an oversized record a place; the bound is not
+    // a ranking decision.
+    assert_eq!(restored.selections[0].frequency, 3);
+}
