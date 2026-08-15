@@ -252,8 +252,7 @@ impl SelectionHistory {
     /// A refusal costs one selection's learning about a pathological item, and
     /// buys the bound that keeps the persisted history loadable at all.
     pub fn record(&mut self, item: &Item, query: &NormalizedQuery, now_secs: u64) {
-        let item_key_bytes = item.plugin_id.0.len().saturating_add(item.stable_id.0.len());
-        if item_key_bytes > MAX_ITEM_KEY_BYTES {
+        if !item_key_fits(&item.plugin_id, &item.stable_id) {
             return;
         }
 
@@ -264,7 +263,7 @@ impl SelectionHistory {
         entry.frequency = entry.frequency.saturating_add(1);
         entry.last_selected_secs = Some(now_secs);
 
-        if item_key_bytes.saturating_add(query.normalized.len()) <= MAX_AFFINITY_KEY_BYTES {
+        if affinity_key_fits(&item.plugin_id, &item.stable_id, &query.normalized) {
             let query_key = (
                 query.normalized.clone(),
                 item.plugin_id.clone(),
@@ -424,9 +423,19 @@ impl SelectionHistory {
     /// snapshot may have come off disk, where nothing prevents a damaged or
     /// hand-edited file from repeating a key, and a ranking store has no
     /// business refusing to start over an ambiguity it can resolve.
+    ///
+    /// Oversized keys *are* rejected, by the same rules [`Self::record`]
+    /// applies. The size bounds have to hold for the type, not for one way
+    /// into it: a file well under the reader's byte limit can still carry a
+    /// handful of enormous ids, and a key admitted here would be cloned into
+    /// every lookup, saved back out, and survive eviction on the strength of
+    /// whatever count it claims.
     pub fn from_snapshot(snapshot: SelectionHistorySnapshot) -> Self {
         let mut history = Self::default();
         for record in snapshot.selections {
+            if !item_key_fits(&record.plugin, &record.item) {
+                continue;
+            }
             history.entries.insert(
                 (record.plugin, record.item),
                 HistoryEntry {
@@ -436,6 +445,9 @@ impl SelectionHistory {
             );
         }
         for record in snapshot.query_affinities {
+            if !affinity_key_fits(&record.plugin, &record.item, &record.query) {
+                continue;
+            }
             history
                 .query_counts
                 .insert((record.query, record.plugin, record.item), record.count);
@@ -444,6 +456,26 @@ impl SelectionHistory {
         history.evict_to_capacity();
         history
     }
+}
+
+/// Whether an item's own key is small enough to hold.
+///
+/// Shared by every way into a [`SelectionHistory`], so the bound is a property
+/// of the store rather than of the path that happened to write it.
+fn item_key_fits(plugin: &PluginId, item: &ItemId) -> bool {
+    plugin.0.len().saturating_add(item.0.len()) <= MAX_ITEM_KEY_BYTES
+}
+
+/// Whether an affinity key is small enough to hold. Implies [`item_key_fits`]
+/// only when the affinity bound is the larger of the two, which it is.
+fn affinity_key_fits(plugin: &PluginId, item: &ItemId, query: &str) -> bool {
+    item_key_fits(plugin, item)
+        && plugin
+            .0
+            .len()
+            .saturating_add(item.0.len())
+            .saturating_add(query.len())
+            <= MAX_AFFINITY_KEY_BYTES
 }
 
 /// Final ordering key. Candidate identity supplies any deterministic tie-break.
