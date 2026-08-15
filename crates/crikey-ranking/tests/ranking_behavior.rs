@@ -949,7 +949,13 @@ fn selection_history_augments_frequency_recency_query_and_context() {
     history.record(&selected, &q, 100);
 
     let mut signals = RankingSignals::default();
-    history.augment(&selected, &q, 160, Some(&Category::Application), &mut signals);
+    history.augment(
+        &selected,
+        &history.affinities_for(&q),
+        160,
+        Some(&Category::Application),
+        &mut signals,
+    );
     assert_eq!(signals.selection_frequency, 1);
     assert_eq!(signals.selection_recency_secs, Some(60));
     assert!(signals.query_history > 0.0);
@@ -957,7 +963,13 @@ fn selection_history_augments_frequency_recency_query_and_context() {
 
     let other = item("Terminal");
     let mut neutral = RankingSignals::default();
-    history.augment(&other, &q, 160, Some(&Category::File), &mut neutral);
+    history.augment(
+        &other,
+        &history.affinities_for(&q),
+        160,
+        Some(&Category::File),
+        &mut neutral,
+    );
     assert_eq!(neutral.selection_frequency, 0);
     assert_eq!(neutral.selection_recency_secs, None);
     assert_eq!(neutral.query_history, 0.0);
@@ -989,9 +1001,21 @@ fn a_selection_history_survives_a_snapshot_round_trip_with_every_field_intact() 
     ] {
         let asked = query(raw);
         let mut before = RankingSignals::default();
-        original.augment(selected, &asked, 2_000, Some(&Category::Application), &mut before);
+        original.augment(
+            selected,
+            &original.affinities_for(&asked),
+            2_000,
+            Some(&Category::Application),
+            &mut before,
+        );
         let mut after = RankingSignals::default();
-        restored.augment(selected, &asked, 2_000, Some(&Category::Application), &mut after);
+        restored.augment(
+            selected,
+            &restored.affinities_for(&asked),
+            2_000,
+            Some(&Category::Application),
+            &mut after,
+        );
 
         assert_eq!(
             after.selection_frequency, before.selection_frequency,
@@ -1063,7 +1087,13 @@ fn clearing_a_history_leaves_nothing_for_a_snapshot_to_carry() {
 
     let restored = SelectionHistory::from_snapshot(snapshot);
     let mut signals = RankingSignals::default();
-    restored.augment(&item("Firefox"), &query("fi"), 20, None, &mut signals);
+    restored.augment(
+        &item("Firefox"),
+        &restored.affinities_for(&query("fi")),
+        20,
+        None,
+        &mut signals,
+    );
     assert_eq!(signals.selection_frequency, 0);
     assert_eq!(signals.selection_recency_secs, None);
     assert_eq!(signals.query_history, 0.0);

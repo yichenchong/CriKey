@@ -14,7 +14,7 @@
 //! active signals: switching a signal off removes exactly its own
 //! contribution and rescales nothing else.
 
-use std::{cmp::Ordering, collections::BTreeMap};
+use std::{cmp::Ordering, collections::BTreeMap, ops::Bound};
 
 use crikey_core::{Category, Item, ItemId, PluginId};
 use crikey_query::{MatchMethod, MatchOutcome, MatchSummary, NormalizedQuery};
@@ -112,11 +112,36 @@ pub struct RankingSignals {
 /// The store is deliberately owned by the application rather than persisted
 /// by the ranker. Callers decide when a selection is durable and provide the
 /// current query and clock value, which keeps tests and replay deterministic.
+///
+/// # Why the affinity map is keyed by query first
+///
+/// A selection is recorded against the query that was typed when it happened,
+/// and the user types that query one character at a time. Keyed by item, only
+/// the finished query could ever be found again, so selecting Chrome for
+/// `chrome` taught the ranker nothing about `chr` - the keystroke where the
+/// help is actually wanted. Keying by query first makes every query the user
+/// is part-way through a prefix range, so the evidence applies while it is
+/// still being typed (see [`Self::affinities_for`]).
 #[derive(Debug, Clone, Default)]
 pub struct SelectionHistory {
     entries: BTreeMap<(PluginId, ItemId), HistoryEntry>,
-    query_counts: BTreeMap<(PluginId, ItemId, String), u32>,
+    query_counts: BTreeMap<(String, PluginId, ItemId), u32>,
 }
+
+/// Most items a history retains, and most affinities it retains.
+///
+/// The store used to be unbounded, which its own documentation denied. That is
+/// worse than it sounds: the persisted file is refused above
+/// `selection_history_store::MAX_BYTES`, and a refused file loads as *empty*,
+/// so unbounded growth ended in the silent loss of the user's entire ranking
+/// history rather than in a bounded degradation. Both caps sit far enough
+/// below that limit that the file cannot reach it.
+///
+/// Eviction keeps the most-used records, which is also the useful policy: what
+/// a launcher must never forget is the handful of things a user picks
+/// constantly.
+const MAX_ITEM_RECORDS: usize = 4_096;
+const MAX_QUERY_AFFINITIES: usize = 8_192;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct HistoryEntry {
@@ -165,6 +190,31 @@ pub struct SelectionHistorySnapshot {
     pub query_affinities: Vec<QueryAffinityRecord>,
 }
 
+/// Per-item affinity for one query, resolved once and read per candidate.
+///
+/// Borrowed from the history it was built from, so building it copies nothing
+/// but the counts themselves.
+#[derive(Debug, Clone, Default)]
+pub struct QueryAffinity<'history> {
+    totals: BTreeMap<(&'history PluginId, &'history ItemId), u32>,
+}
+
+impl QueryAffinity<'_> {
+    /// How many times this item was selected under the query this was built
+    /// for, or any continuation of it.
+    #[must_use]
+    pub fn count_for(&self, item: &Item) -> Option<u32> {
+        self.totals.get(&(&item.plugin_id, &item.stable_id)).copied()
+    }
+
+    /// Whether any item has affinity here. An empty affinity leaves the signal
+    /// neutral for every candidate.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.totals.is_empty()
+    }
+}
+
 impl SelectionHistory {
     /// Records one successful item selection.
     pub fn record(&mut self, item: &Item, query: &NormalizedQuery, now_secs: u64) {
@@ -176,22 +226,61 @@ impl SelectionHistory {
         entry.last_selected_secs = Some(now_secs);
 
         let query_key = (
+            query.normalized.clone(),
             item.plugin_id.clone(),
             item.stable_id.clone(),
-            query.normalized.clone(),
         );
         let count = self.query_counts.entry(query_key).or_default();
         *count = count.saturating_add(1);
+
+        self.evict_to_capacity();
+    }
+
+    /// Per-item affinity for everything the user has ever selected while the
+    /// query read `query` or any continuation of it.
+    ///
+    /// Built once per query rather than looked up per candidate: the range is
+    /// bounded by the number of *recorded queries*, which is capped, while
+    /// candidates are bounded by the size of the catalog.
+    ///
+    /// Counts sum. Every selection in the range happened with `query` on
+    /// screen on the way to it, so each one is evidence that this item is what
+    /// the user means by what they have typed so far.
+    #[must_use]
+    pub fn affinities_for(&self, query: &NormalizedQuery) -> QueryAffinity<'_> {
+        let mut totals: BTreeMap<(&PluginId, &ItemId), u32> = BTreeMap::new();
+        if !query.normalized.is_empty() {
+            // The empty plugin and item ids sort below every real one, so this
+            // is the first key whose query could start with `normalized`.
+            let start = (
+                query.normalized.clone(),
+                PluginId(String::new()),
+                ItemId(String::new()),
+            );
+            for ((_, plugin, item), count) in self
+                .query_counts
+                .range((Bound::Included(start), Bound::Unbounded))
+                .take_while(|((recorded, _, _), _)| recorded.starts_with(&query.normalized))
+            {
+                let total = totals.entry((plugin, item)).or_default();
+                *total = total.saturating_add(*count);
+            }
+        }
+        QueryAffinity { totals }
     }
 
     /// Applies the recorded history and foreground category to dynamic signals.
     ///
     /// Future timestamps are treated as zero age rather than underflowing. A
     /// missing history entry leaves all history fields neutral.
+    ///
+    /// `affinity` must have been built from the same query by
+    /// [`Self::affinities_for`]; passing one built for a different query would
+    /// credit an item for evidence that does not apply to what is on screen.
     pub fn augment(
         &self,
         item: &Item,
-        query: &NormalizedQuery,
+        affinity: &QueryAffinity,
         now_secs: u64,
         foreground_category: Option<&Category>,
         signals: &mut RankingSignals,
@@ -205,16 +294,51 @@ impl SelectionHistory {
                 .last_selected_secs
                 .map(|selected| now_secs.saturating_sub(selected));
         }
-        signals.query_history = self
-            .query_counts
-            .get(&(
-                item.plugin_id.clone(),
-                item.stable_id.clone(),
-                query.normalized.clone(),
-            ))
-            .copied()
+        signals.query_history = affinity
+            .count_for(item)
             .map_or(0.0, |count| saturating_rise(count as f32, FREQUENCY_HALF_LIFE));
         signals.context_match = foreground_category.is_some_and(|category| category == &item.category);
+    }
+
+    /// Drops the least-used records once either map is over capacity.
+    ///
+    /// Least-used first, so what survives is what the user relies on. Ties
+    /// break on the key, which is a `BTreeMap` ordering and therefore the same
+    /// on every host: two runs that recorded the same selections evict the
+    /// same records, or a persisted history would drift between machines.
+    ///
+    /// Eviction reclaims an eighth of the cap rather than the single record
+    /// that breached it. Trimming to exactly the cap would re-rank the whole
+    /// map on *every* subsequent selection once full, which is a sort and a
+    /// key clone per record for the rest of the process; reclaiming a batch
+    /// amortizes it to once per `cap / 8` selections.
+    fn evict_to_capacity(&mut self) {
+        if self.entries.len() > MAX_ITEM_RECORDS {
+            let target = MAX_ITEM_RECORDS - MAX_ITEM_RECORDS / 8;
+            let mut ranked: Vec<_> = self
+                .entries
+                .iter()
+                .map(|(key, entry)| (entry.frequency, entry.last_selected_secs, key.clone()))
+                .collect();
+            ranked.sort_unstable();
+            let excess = self.entries.len() - target;
+            for (_, _, key) in ranked.into_iter().take(excess) {
+                self.entries.remove(&key);
+            }
+        }
+        if self.query_counts.len() > MAX_QUERY_AFFINITIES {
+            let target = MAX_QUERY_AFFINITIES - MAX_QUERY_AFFINITIES / 8;
+            let mut ranked: Vec<_> = self
+                .query_counts
+                .iter()
+                .map(|(key, count)| (*count, key.clone()))
+                .collect();
+            ranked.sort_unstable();
+            let excess = self.query_counts.len() - target;
+            for (_, key) in ranked.into_iter().take(excess) {
+                self.query_counts.remove(&key);
+            }
+        }
     }
 
     /// Removes all records. Useful when the user clears ranking history.
@@ -243,7 +367,7 @@ impl SelectionHistory {
             query_affinities: self
                 .query_counts
                 .iter()
-                .map(|((plugin, item, query), count)| QueryAffinityRecord {
+                .map(|((query, plugin, item), count)| QueryAffinityRecord {
                     plugin: plugin.clone(),
                     item: item.clone(),
                     query: query.clone(),
@@ -273,8 +397,10 @@ impl SelectionHistory {
         for record in snapshot.query_affinities {
             history
                 .query_counts
-                .insert((record.plugin, record.item, record.query), record.count);
+                .insert((record.query, record.plugin, record.item), record.count);
         }
+        // A file may be older than the caps, or hand edited past them.
+        history.evict_to_capacity();
         history
     }
 }
