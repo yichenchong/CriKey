@@ -95,7 +95,7 @@ use crikey_query::{
     DefaultMatcher, DefaultNormalizer, MatchMethod, MatchOutcome, MatchPolicy, NormalizedQuery, Normalizer,
     PreparedLabel,
 };
-use crikey_ranking::{DefaultRanker, RankingSignals, Score, SelectionHistory};
+use crikey_ranking::{DefaultRanker, QueryAffinity, RankingSignals, Score, SelectionHistory};
 use crikey_result_aggregator::{MemoryResultAggregator, ResultAggregator};
 use crikey_ui::ResultRow;
 
@@ -541,6 +541,8 @@ struct PluginSelection<'items, 'query> {
     ranker: &'query DefaultRanker,
     query: &'query NormalizedQuery,
     history: &'query SelectionHistory,
+    /// Per-item affinity for this query, resolved once for the whole sweep.
+    affinity: QueryAffinity<'query>,
     foreground_category: Option<&'query Category>,
     now_secs: u64,
     match_spans: Vec<(usize, usize)>,
@@ -559,6 +561,7 @@ impl<'items, 'query> PluginSelection<'items, 'query> {
             ranker: plan.ranker,
             query: plan.query,
             history: plan.history,
+            affinity: plan.history.affinities_for(plan.query),
             foreground_category: plan.foreground_category,
             now_secs: plan.now_secs,
             match_spans: Vec::new(),
@@ -582,7 +585,7 @@ impl<'items, 'query> PluginSelection<'items, 'query> {
         let mut signals = RankingSignals::default();
         self.history.augment(
             item,
-            self.query,
+            &self.affinity,
             self.now_secs,
             self.foreground_category,
             &mut signals,
@@ -1300,6 +1303,8 @@ impl SearchService {
 
         let retained = self.aggregator.items();
         let mut hits = Vec::with_capacity(retained.len());
+        // One resolution for the whole publication, as in the candidate sweep.
+        let affinity = self.history.affinities_for(&query);
         for item in retained {
             let Some(outcome) = outcomes
                 .get_mut(&item.plugin_id)
@@ -1310,7 +1315,7 @@ impl SearchService {
             let mut signals = RankingSignals::default();
             self.history.augment(
                 item,
-                &query,
+                &affinity,
                 self.now_secs,
                 self.foreground_category.as_ref(),
                 &mut signals,
