@@ -1307,26 +1307,59 @@ impl ModernProvider {
         now: Millis,
     ) -> Option<ViewModel> {
         let generation = pipeline.keystroke(query, now);
-        let (mut suggestions, dead_plugins) = self.collect_suggestions(query, generation);
+        // One reset per query, not one per tick: a generation can be dispatched
+        // across several wake-ups, and clearing inside the collection below
+        // would drop the action items an earlier tick's plugins just produced.
+        self.cancellation.cancel_before(generation.get());
+        self.action_items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
 
         let mut at = now;
+        let mut dead_plugins = BTreeSet::new();
         // Advance the pipeline until its registered plugins have been dispatched
         // for this generation. Modern plugins debounce, so a query that is not a
         // leading edge dispatches on a later timer wake-up; the loop follows the
         // scheduler's own wake-ups and is bounded by construction.
         for _ in 0..64 {
+            // Ask the scheduler first. Collecting before this tick would start
+            // a lazy plugin's child interpreter for a query its own
+            // minimum-length, prefix, keyword or pattern gate excludes it from
+            // — the whole point of `startup = "lazy"`.
             let tick = pipeline.tick(at);
             for cancellation in tick.cancellations {
                 let _ = pipeline.complete(&cancellation.plugin, cancellation.generation, at);
             }
-            let mut dispatched_current = false;
+
+            let mut requests = Vec::new();
             for request in tick.dispatches {
                 if request.generation != generation {
                     let _ = pipeline.complete(&request.plugin, request.generation, at);
                     continue;
                 }
-                dispatched_current = true;
                 if dead_plugins.contains(&request.plugin) {
+                    let _ = pipeline.abort_request(&request.plugin, request.generation, at);
+                    continue;
+                }
+                requests.push(request);
+            }
+
+            if requests.is_empty() {
+                match pipeline.next_wakeup() {
+                    Some(next) if next > at => {
+                        at = next;
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+
+            let requested: BTreeSet<PluginId> =
+                requests.iter().map(|request| request.plugin.clone()).collect();
+            let (mut suggestions, newly_dead) = self.collect_suggestions(query, generation, &requested);
+            for request in requests {
+                if newly_dead.contains(&request.plugin) {
                     let _ = pipeline.abort_request(&request.plugin, request.generation, at);
                     continue;
                 }
@@ -1342,10 +1375,8 @@ impl ModernProvider {
                 );
                 let _ = pipeline.complete(&request.plugin, request.generation, at);
             }
+            dead_plugins.extend(newly_dead);
 
-            if suggestions.is_empty() && dispatched_current {
-                break;
-            }
             match pipeline.next_wakeup() {
                 Some(next) if next > at => at = next,
                 _ => break,
@@ -1385,30 +1416,33 @@ impl ModernProvider {
         }
     }
 
-    /// Runs every loaded plugin's `suggest` in its child process and groups the
-    /// resulting items by owning plugin. Every failure — a dead worker, a crash
-    /// mid-callback, or a plugin-raised error — is contained as a recorded
-    /// dispatch failure and contributes no items.
+    /// Runs `suggest` in the child process of every plugin the scheduler
+    /// dispatched this tick, and groups the resulting items by owning plugin.
+    /// Every failure — a dead worker, a crash mid-callback, or a plugin-raised
+    /// error — is contained as a recorded dispatch failure and contributes no
+    /// items.
+    ///
+    /// `requested` is the gate. A plugin absent from it was found irrelevant by
+    /// [`crikey_input_scheduler`], and starting its interpreter to ask anyway
+    /// would spend a child process — and, for a `startup = "lazy"` plugin, the
+    /// whole interpreter startup — on a query the pipeline will not publish.
     fn collect_suggestions(
         &mut self,
         query: &str,
         generation: Generation,
+        requested: &BTreeSet<PluginId>,
     ) -> (BTreeMap<PluginId, Vec<Item>>, BTreeSet<PluginId>) {
-        self.cancellation.cancel_before(generation.get());
         let request = SuggestRequest {
             generation: generation.get(),
             text: query.to_owned(),
             normalized: query.to_owned(),
             selected_item_id: None,
         };
-        self.action_items
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
         // Snapshot the loaded set so the pool can be mutated while iterating.
         let targets: Vec<(PluginId, WorkerKey, Duration)> = self
             .loaded
             .iter()
+            .filter(|loaded| requested.contains(&loaded.plugin))
             .map(|loaded| (loaded.plugin.clone(), loaded.key.clone(), loaded.soft_timeout))
             .collect();
 
