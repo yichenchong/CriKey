@@ -215,3 +215,69 @@ fn a_snapshot_round_trip_preserves_prefix_affinity() {
         );
     }
 }
+
+/// A record cap bounds how many keys are held, not how large they are. A query
+/// is whatever the user typed - including something pasted - so without a size
+/// bound the store could hold hundreds of megabytes, which no amount of
+/// trimming at save time can undo because the memory is already taken.
+#[test]
+fn an_enormous_query_is_not_kept_as_an_affinity_key() {
+    let firefox = item("Firefox");
+    let mut history = SelectionHistory::default();
+    let huge = "x".repeat(64 * 1024);
+
+    history.record(&firefox, &query(&huge), 0);
+
+    let snapshot = history.snapshot();
+    assert!(
+        snapshot.query_affinities.is_empty(),
+        "a key that long is never retyped and must not be stored"
+    );
+    assert_eq!(
+        snapshot.selections.len(),
+        1,
+        "but the selection itself is still worth remembering"
+    );
+}
+
+/// The bound must not reject the ordinary case; a real query is tiny.
+#[test]
+fn an_ordinary_query_is_kept() {
+    let firefox = item("Firefox");
+    let mut history = SelectionHistory::default();
+
+    history.record(&firefox, &query("firefox"), 0);
+
+    assert_eq!(history.snapshot().query_affinities.len(), 1);
+}
+
+/// The item key is not safe to assume small either. A plugin chooses its own
+/// ids, and this crate does not sit behind the catalog check that bounds an
+/// item's payload - so an enormous id would otherwise be cloned into the
+/// entries map and into every affinity that item ever earned.
+#[test]
+fn an_enormous_item_id_is_not_recorded_at_all() {
+    let mut enormous = item("Firefox");
+    enormous.stable_id = ItemId("x".repeat(64 * 1024));
+    let mut history = SelectionHistory::default();
+
+    history.record(&enormous, &query("fire"), 0);
+
+    let snapshot = history.snapshot();
+    assert!(
+        snapshot.selections.is_empty(),
+        "there is no half of the record that would not hold the id"
+    );
+    assert!(snapshot.query_affinities.is_empty());
+}
+
+/// An ordinary id is unaffected; real ids are short.
+#[test]
+fn an_ordinary_item_id_is_recorded() {
+    let firefox = item("Firefox");
+    let mut history = SelectionHistory::default();
+
+    history.record(&firefox, &query("fire"), 0);
+
+    assert_eq!(history.snapshot().selections.len(), 1);
+}
