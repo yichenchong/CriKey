@@ -825,8 +825,12 @@ fn the_linux_backend_reports_application_discovery_as_available() {
 /// statement about the runner instead of about the backend.
 #[test]
 fn capabilities_without_a_linux_implementation_report_unavailable() {
+    // File search is deliberately absent: it now has an implementation
+    // (`file_search.rs`), and what it reports depends on the running user's
+    // `$HOME` and on whether `plocate` is installed. Asserting it here would be
+    // a statement about the build host; `capabilities.rs` pins it instead, with
+    // the service injected.
     let unimplemented = [
-        Capability::FileSearch,
         Capability::Clipboard,
         Capability::UriOpen,
         Capability::Notifications,

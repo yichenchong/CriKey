@@ -17,6 +17,13 @@
 //! handler this backend does not have, so it -- and everything else without
 //! an implementation -- keeps reporting itself unavailable (spec 18.2).
 //!
+//! File search is implemented too, in [`file_search`]: a deadline-bounded
+//! breadth-first walk of the user's roots, with `plocate` in front of it when
+//! the session has that binary installed. Linux guarantees no index, so the
+//! walk is the floor and the index is an optimisation -- and because an index
+//! is only as fresh as the last `updatedb`, having one makes the reported
+//! capability `Partial` rather than `Available` (spec 18.1, 18.2).
+//!
 //! Global shortcuts and window control are reported against the detected
 //! session rather than in the abstract, because on Linux they are optional
 //! (spec 18.6) and the reason they are missing differs: a Wayland compositor
@@ -50,12 +57,15 @@ use std::thread;
 
 use crikey_core::{CoreError, PlatformPath, Result};
 use crikey_platform::{
-    ApplicationDiscovery, Capability, CapabilityState, DiscoveredApplication, HotkeyService, IconLoader,
-    IconProvider, ProcessLauncher, StandardDirectories, WindowService,
+    ApplicationDiscovery, Capability, CapabilityState, DiscoveredApplication, FileSearchService,
+    HotkeyService, IconLoader, IconProvider, ProcessLauncher, StandardDirectories, WindowService,
 };
 
 pub mod icons;
 pub use icons::XdgIconSource;
+
+pub mod file_search;
+pub use file_search::FilesystemSearch;
 
 pub mod hotkeys;
 pub mod wayland;
@@ -384,6 +394,13 @@ pub struct LinuxBackend {
     /// startup work nothing should pay for before an icon is asked for, and the
     /// answer does not change for the lifetime of the process.
     icons: OnceLock<IconLoader<icons::XdgIconSource>>,
+    /// Built on first use and cached, for the same reason as the icon loader:
+    /// deciding whether `plocate` is installed and whether `$HOME` is a
+    /// readable directory is filesystem work, and a constructor is a pure
+    /// function of its arguments. Cached because the answer decides what
+    /// [`Capability::FileSearch`] reports, and reporting must not change
+    /// between two calls in one session.
+    files: OnceLock<FilesystemSearch>,
 }
 
 impl LinuxBackend {
@@ -432,6 +449,19 @@ impl LinuxBackend {
         backend
     }
 
+    /// Searches files through `files` instead of through the roots and the
+    /// index of the running session.
+    ///
+    /// The same kind of seam as the portal injection above, and needed for the
+    /// same reason: what [`Capability::FileSearch`] may claim depends on
+    /// whether `$HOME` is readable and whether `plocate` is installed, so a
+    /// reporting test that used the session service would pass or fail on the
+    /// build host's package list.
+    pub fn with_file_search(self, files: FilesystemSearch) -> Self {
+        let _ = self.files.set(files);
+        self
+    }
+
     fn build(applications: DesktopEntryScanner, desktop: DesktopEnvironment) -> Self {
         Self {
             applications,
@@ -443,6 +473,7 @@ impl LinuxBackend {
             portal: OnceLock::new(),
             user_time: Arc::new(AtomicU32::new(0)),
             icons: OnceLock::new(),
+            files: OnceLock::new(),
         }
     }
 
@@ -507,8 +538,21 @@ impl LinuxBackend {
             // usable for. `Partial` is what that is; `Available` would be a
             // claim the `.xpm`-only icons in `/usr/share/pixmaps` disprove.
             Capability::Icons => CapabilityState::Partial,
-            Capability::FileSearch
-            | Capability::Clipboard
+            // File search is the one capability whose answer comes from the
+            // filesystem rather than from the session: a walk needs no display
+            // and no daemon, only a readable root. With one it is `Available`,
+            // and with none there is nothing to search and nothing to claim.
+            // An installed `plocate` *lowers* the claim to `Partial` on
+            // purpose: that answer comes from an index rebuilt on a timer, so a
+            // file saved since the last `updatedb` is missing from it, and
+            // `Partial` is what "real results that do not cover everything"
+            // is called (spec 18.2).
+            Capability::FileSearch => match self.file_search() {
+                None => CapabilityState::Unavailable,
+                Some(_) if self.files().uses_index() => CapabilityState::Partial,
+                Some(_) => CapabilityState::Available,
+            },
+            Capability::Clipboard
             | Capability::UriOpen
             | Capability::Notifications
             | Capability::FileWatching
@@ -545,6 +589,33 @@ impl LinuxBackend {
                 Err(_) => IconLoader::new(source),
             }
         })
+    }
+
+    /// The service behind [`Capability::FileSearch`], or `None` when this
+    /// session has nothing for it to search.
+    ///
+    /// `None` is not a hypothetical: a systemd unit or a container with no
+    /// `$HOME` gives the walk no root, and a service with no root can only
+    /// return empty answers forever. Handing one out anyway would teach the
+    /// user that file search is broken; declining to, and reporting
+    /// [`CapabilityState::Unavailable`] for the same reason, tells them why.
+    pub fn file_search(&self) -> Option<&dyn FileSearchService> {
+        let files = self.files();
+        if files.roots().is_empty() {
+            return None;
+        }
+
+        Some(files)
+    }
+
+    /// The file search service as its concrete type, built on first use.
+    ///
+    /// Separate from [`Self::file_search`] because capability reporting needs
+    /// [`FilesystemSearch::uses_index`], which is not part of the trait: the
+    /// trait is what a caller searches through, and how fresh the answer can be
+    /// is a fact about this backend's session.
+    fn files(&self) -> &FilesystemSearch {
+        self.files.get_or_init(FilesystemSearch::for_session)
     }
 
     /// The service behind [`Capability::WindowEnumeration`] and

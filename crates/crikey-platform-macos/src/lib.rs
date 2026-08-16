@@ -25,12 +25,15 @@
 
 #![cfg(target_os = "macos")]
 
+pub mod file_search;
+
 use crikey_core::{CoreError, PlatformPath, Result};
 use crikey_platform::{
     bundle_display_name, bundle_icon_path, parse_info_plist, ApplicationDiscovery, Capability,
-    CapabilityState, DiscoveredApplication, IconLoader, IconProvider, PathIconSource, ProcessLauncher,
-    StandardDirectories,
+    CapabilityState, DiscoveredApplication, FileSearchService, IconLoader, IconProvider, PathIconSource,
+    ProcessLauncher, StandardDirectories,
 };
+use file_search::MacFileSearch;
 use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -465,6 +468,9 @@ pub struct MacOsBackend {
     /// Built on first use and cached: resolving the cache directory reads the
     /// environment, which a constructor that touches nothing should not do.
     icons: OnceLock<IconLoader<PathIconSource>>,
+    /// Spotlight, with a bounded walk of the home directory behind it. Its
+    /// own roots resolve on first use for the same reason the icons do.
+    files: MacFileSearch,
 }
 
 impl MacOsBackend {
@@ -490,6 +496,7 @@ impl MacOsBackend {
             applications: BundleScanner::with_bundles(roots, bundles),
             processes: OpenLauncher::new(),
             icons: OnceLock::new(),
+            files: MacFileSearch::new(),
         }
     }
 
@@ -509,8 +516,11 @@ impl MacOsBackend {
             // all `NSImage` compositions rather than files, and none of them is
             // implemented. `Partial` is that split.
             Capability::Icons => CapabilityState::Partial,
-            Capability::FileSearch
-            | Capability::Clipboard
+            // Spotlight answers first and cannot report what it was not
+            // allowed to see, so the honest ceiling is `Partial`; the service
+            // itself owns that reasoning.
+            Capability::FileSearch => self.files.capability_state(),
+            Capability::Clipboard
             | Capability::GlobalHotkeys
             | Capability::WindowEnumeration
             | Capability::WindowActivation
@@ -546,6 +556,15 @@ impl MacOsBackend {
                 Err(_) => IconLoader::new(PathIconSource),
             }
         })
+    }
+
+    /// The service behind [`Capability::FileSearch`].
+    ///
+    /// Always present on macOS: even a machine with Spotlight switched off can
+    /// have its home directory walked, and a walk that finds nothing is a
+    /// truthful answer where withholding the service would not be.
+    pub fn file_search(&self) -> Option<&dyn FileSearchService> {
+        Some(&self.files)
     }
 }
 

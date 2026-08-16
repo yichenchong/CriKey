@@ -31,6 +31,7 @@
 //! empty crate.
 
 mod applications;
+mod file_search;
 mod hotkeys;
 mod icons;
 mod process;
@@ -46,8 +47,11 @@ pub use applications::{
 #[cfg(not(target_os = "windows"))]
 use crikey_core::CoreError;
 use crikey_platform::{
-    ApplicationDiscovery, Capability, CapabilityState, HotkeyService, IconLoader, IconProvider,
-    ProcessLauncher, StandardDirectories,
+    ApplicationDiscovery, Capability, CapabilityState, FileSearchService, HotkeyService, IconLoader,
+    IconProvider, ProcessLauncher, StandardDirectories,
+};
+pub use file_search::{
+    system_index_sql, unix_seconds_from_file_time, WindowsFileSearch, SELECT_COLUMNS, WALK_SUBDIRECTORIES,
 };
 pub use hotkeys::{HotkeyCode, HotkeyRegistration, HotkeyRegistrations, WindowsHotkeys};
 pub use icons::ShortcutIconSource;
@@ -62,6 +66,10 @@ pub struct WindowsBackend {
     /// Built on first use and cached: resolving the cache directory reads the
     /// environment, which a constructor that touches nothing should not do.
     icons: OnceLock<IconLoader<ShortcutIconSource>>,
+    /// Built on first use and cached: the searcher resolves this user's profile
+    /// folders from the environment, which a constructor that touches nothing
+    /// should not do.
+    files: OnceLock<WindowsFileSearch>,
 }
 
 impl WindowsBackend {
@@ -81,6 +89,7 @@ impl WindowsBackend {
             hotkeys: WindowsHotkeys::new(),
             launcher: ShellLauncher::new(),
             icons: OnceLock::new(),
+            files: OnceLock::new(),
         }
     }
 
@@ -93,6 +102,7 @@ impl WindowsBackend {
             hotkeys: WindowsHotkeys::new(),
             launcher: ShellLauncher::new(),
             icons: OnceLock::new(),
+            files: OnceLock::new(),
         }
     }
 
@@ -130,8 +140,23 @@ impl WindowsBackend {
                     CapabilityState::Unavailable
                 }
             }
-            Capability::FileSearch
-            | Capability::Clipboard
+            // Windows Search answers from the `SystemIndex` catalog, and the
+            // catalog holds the locations indexing is configured for -- in the
+            // Classic mode a clean install uses, that is Documents, Pictures,
+            // Music and the Desktop, not the drive; Enhanced mode indexes the
+            // whole PC and is off by default. The directory walk that covers
+            // what the catalog misses is narrower still. Real results from a
+            // subset is exactly `Partial`, and it stays `Partial` on target: the
+            // missing part is the user's indexing configuration, not missing
+            // code.
+            Capability::FileSearch => {
+                if cfg!(target_os = "windows") {
+                    CapabilityState::Partial
+                } else {
+                    CapabilityState::Unavailable
+                }
+            }
+            Capability::Clipboard
             | Capability::WindowEnumeration
             | Capability::WindowActivation
             | Capability::Notifications
@@ -168,6 +193,21 @@ impl WindowsBackend {
                 Err(_) => IconLoader::new(source),
             }
         })
+    }
+
+    /// The service behind [`Capability::FileSearch`], built on first use.
+    ///
+    /// `None` off Windows, and not because the walk could not run there: the
+    /// backend hands out a service only for the session it is actually running
+    /// in, and a build with no Windows Search catalog and no Windows profile to
+    /// walk has no file search to offer. On target the service answers from the
+    /// `SystemIndex` catalog and from this user's profile folders, which is what
+    /// [`CapabilityState::Partial`] reports.
+    pub fn file_search(&self) -> Option<&dyn FileSearchService> {
+        if !cfg!(target_os = "windows") {
+            return None;
+        }
+        Some(self.files.get_or_init(WindowsFileSearch::new))
     }
 
     /// The hotkey service behind [`Capability::GlobalHotkeys`].

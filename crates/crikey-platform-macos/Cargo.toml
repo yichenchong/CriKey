@@ -15,3 +15,36 @@ workspace = true
 crikey-core.workspace = true
 crikey-platform.workspace = true
 libc = "0.2"
+
+# Apple-only, and declared under a target table rather than plainly because
+# Cargo builds a workspace member's dependency graph on every host: an
+# unconditional entry here makes `cargo clippy --workspace` on Linux try to
+# compile `objc2-core-services`, whose `#[link(kind = "framework")]` is an
+# error off Apple targets. The crate's own source is `cfg`-gated, which is not
+# enough — the manifest has to be too. Same shape as the x11rb entry in
+# `crikey-platform-linux`.
+[target.'cfg(target_os = "macos")'.dependencies]
+# Spotlight is the file index macOS already maintains, and querying it is the
+# only way this backend can answer a file search in the milliseconds a
+# keystroke allows; the alternative, a walk, is the fallback rather than the
+# answer. `objc2-core-services` is the maintained generated binding to the
+# `MDQuery`/`MDItem` C API -- docs.rs marks the older hand-written entry points
+# deprecated in its favour -- and only the two metadata modules are enabled, so
+# none of Launch Services, SearchKit or Apple Events is compiled. Not in the
+# workspace dependency table because no other crate can link CoreServices.
+objc2-core-services = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "Metadata",
+    "MDQuery",
+    "MDItem",
+] }
+# The CoreFoundation value types those calls take and return: a query is a
+# `CFString`, a scope is a `CFArray`, a modification time is a `CFDate`. Comes
+# in transitively behind `objc2-core-services` regardless; named here because
+# this crate uses it directly, and with only the three modules it needs.
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CFArray",
+    "CFDate",
+    "CFString",
+] }
