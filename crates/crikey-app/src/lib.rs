@@ -86,8 +86,9 @@ use crikey_core::{
     PluginId, Result as CoreResult,
 };
 use crikey_platform::{
-    application_arguments, application_items, application_working_directory, decode_target, IconImage,
-    IconProvider, WindowInfo, APPLICATION_LAUNCH_ACTION_ID, DEFAULT_ICON_SIZE,
+    application_arguments, application_items, application_working_directory, decode_target, file_items,
+    FileSearchQuery, FileSearchResults, IconImage, IconProvider, WindowInfo, APPLICATION_LAUNCH_ACTION_ID,
+    DEFAULT_ICON_SIZE,
 };
 #[cfg(any(windows, target_os = "linux"))]
 use crikey_platform::{HotkeyActivationHandler, HotkeyBinding};
@@ -219,6 +220,23 @@ impl App {
         }
     }
 
+    /// Builds an application over a caller-supplied platform backend.
+    ///
+    /// [`Backend`] is a per-target alias, so this is not a way to run one
+    /// platform's backend on another; it is how a caller substitutes a backend
+    /// it has configured. The reason it exists is testing capabilities whose
+    /// answer depends on the machine: file search reads the user's real home
+    /// directory, and a test that asserted against that would assert against
+    /// whatever happens to be on the developer's disk. The platform crates
+    /// already expose the matching seams — `LinuxBackend::with_file_search`,
+    /// `MacFileSearch::walking` — and this is the host-side end of them.
+    pub fn with_backend(backend: Backend) -> Self {
+        Self {
+            backend,
+            ..Self::new()
+        }
+    }
+
     pub fn generations(&self) -> &GenerationTracker {
         &self.generations
     }
@@ -339,6 +357,31 @@ impl App {
     pub fn discover_application_items(&self, plugin: &PluginId) -> CoreResult<Vec<Item>> {
         let discovered = self.backend.application_discovery().discover()?;
         Ok(application_items(plugin, &discovered))
+    }
+
+    /// Searches the platform's files and folders, mapping hits into items
+    /// owned by `plugin`.
+    ///
+    /// `None` when this build's backend has no file search for the session it
+    /// is running in — a Linux unit with no readable home, a Windows build off
+    /// Windows. That is distinct from `Some` with no hits, which means the
+    /// search ran and found nothing, and the caller must keep them apart: the
+    /// first is a missing capability to report, the second is an ordinary
+    /// empty answer to show.
+    ///
+    /// Unlike [`Self::discover_application_items`] this runs per query rather
+    /// than once at startup, so the deadline in `query` is load bearing. The
+    /// backends treat it as a promise; see `crikey_platform::file_search`.
+    pub fn search_file_items(
+        &self,
+        plugin: &PluginId,
+        query: &FileSearchQuery,
+    ) -> Option<CoreResult<(Vec<Item>, FileSearchResults)>> {
+        let service = self.backend.file_search()?;
+        Some(service.search(query).map(|results| {
+            let items = file_items(plugin, &results.hits);
+            (items, results)
+        }))
     }
 
     /// Registers the activation shortcut and connects it to the native UI
@@ -1048,6 +1091,16 @@ impl SearchService {
     /// Discovers application items through the selected platform backend.
     pub fn discover_application_items(&self, plugin: &PluginId) -> CoreResult<Vec<Item>> {
         self.app.discover_application_items(plugin)
+    }
+
+    /// Searches files through the selected platform backend; see
+    /// [`App::search_file_items`].
+    pub fn search_file_items(
+        &self,
+        plugin: &PluginId,
+        query: &FileSearchQuery,
+    ) -> Option<CoreResult<(Vec<Item>, FileSearchResults)>> {
+        self.app.search_file_items(plugin, query)
     }
 
     /// Connects the platform global shortcut to a native UI event-loop wake-up.

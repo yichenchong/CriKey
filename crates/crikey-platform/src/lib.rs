@@ -144,6 +144,79 @@ pub fn application_items(plugin: &PluginId, discovered: &[DiscoveredApplication]
         .collect()
 }
 
+/// Host-mediated action attached to every file and folder item.
+///
+/// Distinct from [`APPLICATION_LAUNCH_ACTION_ID`] because the host does a
+/// different thing with it: launching an application runs a program the host
+/// chose, while opening a file hands a path to whatever the desktop has
+/// associated with it. Sharing one id would make the launch gate unable to
+/// tell "start this program" from "open this document with whatever is
+/// registered", which are different authority questions.
+pub const FILE_OPEN_ACTION_ID: &str = "crikey.file.open";
+
+/// Maps one search's hits into catalog items owned by `plugin`.
+///
+/// The label is the basename and the description is the containing directory,
+/// which is the split the matcher needs: `search_terms` and `label` are
+/// searched, `target` never is (see [`application_search_terms`]), so scoring
+/// against the whole path would let a deeply buried file outrank an exact
+/// basename match because the query happened to appear in a parent directory
+/// name. The directory still has to be *shown*, because two files with the
+/// same name are otherwise indistinguishable in the list, so it goes in the
+/// description where a human reads it and the matcher does not.
+pub fn file_items(plugin: &PluginId, hits: &[FileHit]) -> Vec<Item> {
+    hits.iter()
+        .map(|hit| {
+            let category = match hit.kind {
+                FileKind::File => Category::File,
+                FileKind::Directory => Category::Directory,
+            };
+            let target = encode_target(&hit.path);
+            Item {
+                stable_id: ItemId::derived(plugin, &category, &target),
+                plugin_id: plugin.clone(),
+                category,
+                label: hit.name.clone(),
+                description: parent_directory_display(&hit.path),
+                // Nothing beyond the label: the basename is what the user
+                // typed at, and adding path fragments here would reintroduce
+                // the parent-directory matching the split above exists to
+                // prevent.
+                search_terms: Vec::new(),
+                target,
+                icon_reference: None,
+                argument_policy: ArgumentPolicy::Forbidden,
+                metadata: BTreeMap::new(),
+                hit_policy: HitPolicy::Recorded,
+                score_hint: 0,
+                actions: vec![Action {
+                    action_id: ActionId(FILE_OPEN_ACTION_ID.to_owned()),
+                    label: match hit.kind {
+                        FileKind::File => "Open".to_owned(),
+                        FileKind::Directory => "Open folder".to_owned(),
+                    },
+                    description: "Open this with the desktop's default handler".to_owned(),
+                    applicable_categories: vec![Category::File, Category::Directory],
+                    icon_reference: None,
+                    execution_policy: ExecutionPolicy::HostMediated,
+                }],
+            }
+        })
+        .collect()
+}
+
+/// The containing directory, shown to a human and never matched against.
+///
+/// Lossy on purpose: this string is display text, and a path that is not valid
+/// Unicode still has to appear as *something* in the list. The lossless copy
+/// lives in `target`, which is what actually gets opened.
+fn parent_directory_display(path: &PlatformPath) -> String {
+    std::path::Path::new(path.as_os_str())
+        .parent()
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Names an application answers to besides its display label.
 ///
 /// The matcher deliberately never searches `target`: it is an execution
