@@ -17,16 +17,16 @@
 //! when the test ends, so runs are order independent and leave nothing behind.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(not(target_os = "windows"))]
 use crikey_core::CoreError;
-use crikey_core::PlatformPath;
+use crikey_core::{ExecutionPolicy, PlatformPath, PluginId};
 #[cfg(not(target_os = "windows"))]
 use crikey_platform::ApplicationDiscovery;
-use crikey_platform::DiscoveredApplication;
-use crikey_platform_windows::{split_arguments, ApplicationSet, StartMenuDiscovery};
+use crikey_platform::{application_items, DiscoveredApplication};
+use crikey_platform_windows::{split_arguments, ApplicationSet, StartMenuDiscovery, WELL_KNOWN_APPLICATIONS};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 
@@ -428,6 +428,181 @@ fn an_unterminated_quote_yields_the_rest_of_the_string() {
     assert_eq!(
         split_arguments(r#"--open "C:\Program Files\App"#),
         vec!["--open", r"C:\Program Files\App"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Well-known applications
+// ---------------------------------------------------------------------------
+
+/// The file every case below stands in for `%SystemRoot%\explorer.exe`.
+fn write_executable(root: &Path, relative: &str) -> PathBuf {
+    let path = root.join(relative);
+    // Contents are never read: discovery only asks whether the file is there,
+    // and the shell launches it by path.
+    fs::write(&path, b"MZ").expect("executable is writable");
+    path
+}
+
+fn well_known(system_root: Option<PathBuf>) -> Vec<DiscoveredApplication> {
+    StartMenuDiscovery::with_roots(Vec::new(), false)
+        .with_system_root(system_root)
+        .well_known_applications()
+}
+
+/// File Explorer is discovered, and it is discovered as `explorer.exe`.
+///
+/// It is the one application Windows ships that neither source finds: the Start
+/// Menu need not hold a `.lnk` for it, and its AppUserModelID
+/// (`Microsoft.Windows.Explorer`) carries no `!`, so the packaged enumeration
+/// drops it. If this stops passing, a launcher on Windows can no longer open a
+/// file manager.
+#[test]
+fn file_explorer_is_discovered_below_the_system_root() {
+    let scratch = Scratch::new();
+    let system_root = scratch.root("Windows");
+    let explorer = write_executable(&system_root, "explorer.exe");
+
+    let discovered = well_known(Some(system_root));
+
+    let explorer_entry = discovered
+        .iter()
+        .find(|found| found.name == "File Explorer")
+        .unwrap_or_else(|| panic!("File Explorer must be discovered, found {discovered:?}"));
+    assert_eq!(
+        explorer_entry.target,
+        PlatformPath::new(explorer.as_os_str().to_owned()),
+        "the entry launches the executable, so the executable is the target"
+    );
+    assert!(
+        explorer_entry.icon_reference.is_none(),
+        "an executable's resource icon is not implemented, so none is claimed"
+    );
+    assert!(
+        explorer_entry.platform_id.is_none(),
+        "this entry is identified by where it points, not by an AppUserModelID"
+    );
+    assert!(
+        explorer_entry.arguments.is_empty(),
+        "no arguments opens the shell's start location"
+    );
+}
+
+/// A user typing `explorer`, `file explorer` or `file` reaches it, and it
+/// launches the way every other application does.
+#[test]
+fn file_explorer_carries_the_aliases_users_type() {
+    let scratch = Scratch::new();
+    let system_root = scratch.root("Windows");
+    write_executable(&system_root, "explorer.exe");
+
+    let plugin = PluginId("builtin.crikey.applications".to_owned());
+    let items = application_items(&plugin, &well_known(Some(system_root)));
+    let item = items
+        .iter()
+        .find(|item| item.label == "File Explorer")
+        .expect("File Explorer becomes an item");
+
+    for alias in ["File Explorer", "explorer"] {
+        assert!(
+            item.search_terms.iter().any(|term| term == alias),
+            "File Explorer must answer to {alias:?}, found {:?}",
+            item.search_terms
+        );
+    }
+    let action = item.actions.first().expect("an application launches");
+    assert_eq!(action.action_id.0, "crikey.application.launch");
+    assert_eq!(action.execution_policy, ExecutionPolicy::HostMediated);
+}
+
+/// A named executable that is not there is absent, not fabricated.
+///
+/// The table is a belief about where Windows keeps its own components, and a
+/// future Windows is allowed to prove it wrong without costing the user every
+/// other application.
+#[test]
+fn a_well_known_application_that_is_not_installed_is_not_reported() {
+    let scratch = Scratch::new();
+    assert!(well_known(Some(scratch.root("Windows"))).is_empty());
+    assert!(well_known(Some(scratch.missing("Windows"))).is_empty());
+}
+
+/// A directory in place of the executable is not an application either.
+#[test]
+fn a_directory_named_like_the_executable_is_not_an_application() {
+    let scratch = Scratch::new();
+    let system_root = scratch.root("Windows");
+    fs::create_dir(system_root.join("explorer.exe")).expect("directory is creatable");
+
+    assert!(well_known(Some(system_root)).is_empty());
+}
+
+/// Without a system root nothing is named: a scanner told exactly where to look
+/// reports exactly what is there.
+#[test]
+fn a_scanner_with_no_system_root_names_no_well_known_application() {
+    let plain = StartMenuDiscovery::with_roots(Vec::new(), false);
+
+    assert!(plain.system_root().is_none());
+    assert!(plain.well_known_applications().is_empty());
+    assert!(well_known(None).is_empty());
+}
+
+/// The admission rule is a closed list of single files, not a search.
+///
+/// This is what keeps the table from becoming a way for anything else to enter
+/// the result set: every entry names one plain file directly below the system
+/// root, so no entry can reach a directory a user can write to.
+#[test]
+fn the_well_known_table_admits_only_named_system_files() {
+    assert!(
+        WELL_KNOWN_APPLICATIONS
+            .iter()
+            .any(|known| known.name == "File Explorer" && known.executable == "explorer.exe"),
+        "File Explorer is the entry this table exists for, found {WELL_KNOWN_APPLICATIONS:?}"
+    );
+    for known in WELL_KNOWN_APPLICATIONS {
+        assert!(!known.name.is_empty(), "an entry with no name names nothing");
+        let components: Vec<_> = Path::new(known.executable).components().collect();
+        assert!(
+            matches!(components.as_slice(), [Component::Normal(_)]),
+            "{:?} must be one plain file name, not a path",
+            known.executable
+        );
+    }
+}
+
+/// The Start Menu's own entry wins when the machine has one.
+///
+/// Both discoveries name `%SystemRoot%\explorer.exe` -- the shortcut stores it
+/// as `%windir%\explorer.exe` and the resolver expands it -- so the duplicate
+/// collapses on the target rather than showing "File Explorer" twice, and the
+/// shortcut, which carries the shell's localised name and icon, is the one kept.
+#[test]
+fn a_start_menu_shortcut_for_file_explorer_absorbs_the_well_known_entry() {
+    let scratch = Scratch::new();
+    let system_root = scratch.root("Windows");
+    let explorer = write_executable(&system_root, "explorer.exe");
+
+    let mut applications = ApplicationSet::new();
+    // What resolving a real `File Explorer.lnk` produces: the same file, spelled
+    // the way the shortcut happened to store it.
+    applications.insert(application(
+        "Explorateur de fichiers",
+        &explorer.to_string_lossy().to_uppercase(),
+    ));
+    for known in well_known(Some(system_root)) {
+        applications.insert(known);
+    }
+
+    let discovered = applications.into_applications();
+    assert_eq!(
+        discovered
+            .iter()
+            .map(|found| found.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Explorateur de fichiers"],
+        "one executable is one application, and the shell's own name for it wins"
     );
 }
 

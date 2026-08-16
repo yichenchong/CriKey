@@ -65,12 +65,17 @@ const OPEN: &str = "/usr/bin/open";
 
 /// Application discovery over `.app` bundles (spec 18.5).
 ///
-/// Roots are scanned in the order they were given and the earliest root wins a
-/// duplicate bundle directory name, which is what lets `~/Applications`
-/// override a system-wide copy of the same application.
+/// Two kinds of source feed one scan. *Roots* are directories whose immediate
+/// `.app` children are applications; *named bundles* are individual bundle
+/// paths that no install location contains. Roots are scanned in the order they
+/// were given and the earliest root wins a duplicate bundle directory name,
+/// which is what lets `~/Applications` override a system-wide copy of the same
+/// application; named bundles are read last, so a scanned copy of the same
+/// bundle name always wins over a hard-coded path.
 #[derive(Debug)]
 pub struct BundleScanner {
     roots: Vec<PathBuf>,
+    bundles: Vec<PathBuf>,
 }
 
 impl BundleScanner {
@@ -83,22 +88,42 @@ impl BundleScanner {
     /// parsed.
     pub const MAX_INFO_PLIST_BYTES: u64 = 1024 * 1024;
 
-    /// Records the roots to scan, highest precedence first.
+    /// Records the roots to scan, highest precedence first, and no named
+    /// bundles.
     ///
     /// Construction touches no filesystem: every read happens inside
     /// [`ApplicationDiscovery::discover`], so a scanner can be built before the
     /// directories it names exist.
     pub fn new(roots: Vec<PathBuf>) -> Self {
-        Self { roots }
+        Self {
+            roots,
+            bundles: Vec::new(),
+        }
+    }
+
+    /// Records the roots to scan and individual bundle paths to read besides
+    /// them.
+    ///
+    /// Each named bundle is a candidate, not a claim: one that is not there is
+    /// silently absent from the result (see `well_known_bundles`).
+    pub fn with_bundles(roots: Vec<PathBuf>, bundles: Vec<PathBuf>) -> Self {
+        Self { roots, bundles }
+    }
+
+    /// The individual bundle paths this scanner reads besides its roots.
+    pub fn bundles(&self) -> &[PathBuf] {
+        &self.bundles
     }
 }
 
 impl ApplicationDiscovery for BundleScanner {
-    /// Scans every root once and returns the bundles it found.
+    /// Scans every root and every named bundle once, and returns what it found.
     ///
-    /// This never fails. `~/Applications` does not exist on most machines and
-    /// a bundle installed by a third party may be unreadable or malformed;
-    /// neither is a reason to hide every other application on the machine.
+    /// This never fails. `~/Applications` does not exist on most machines, a
+    /// named bundle is a path this build believes in rather than one it can
+    /// insist on, and a bundle installed by a third party may be unreadable or
+    /// malformed; none of those is a reason to hide every other application on
+    /// the machine.
     fn discover(&self) -> Result<Vec<DiscoveredApplication>> {
         let mut discovered = Vec::new();
         let mut claimed: HashSet<OsString> = HashSet::new();
@@ -128,6 +153,21 @@ impl ApplicationDiscovery for BundleScanner {
                     // application of the same name in a later root.
                     claimed.insert(name);
                 }
+            }
+        }
+
+        // Named bundles last: a copy under a scanned root carries the user's own
+        // version of the application and has already claimed the name.
+        for bundle in &self.bundles {
+            let Some(name) = bundle.file_name() else {
+                continue;
+            };
+            if claimed.contains(name) {
+                continue;
+            }
+            if let Some(application) = read_bundle(bundle, name) {
+                discovered.push(application);
+                claimed.insert(name.to_owned());
             }
         }
 
@@ -432,16 +472,22 @@ impl MacOsBackend {
     pub const NAME: &'static str = "macos";
 
     /// Discovers applications from the standard bundle locations of the
-    /// running user.
+    /// running user, plus the bundles macOS keeps outside them.
     pub fn new() -> Self {
-        Self::with_application_roots(bundle_roots())
+        Self::with_application_sources(bundle_roots(), well_known_bundles())
     }
 
     /// Discovers applications from exactly these roots, highest precedence
-    /// first, instead of the standard locations.
+    /// first, instead of the standard locations, and names no bundle of its own.
     pub fn with_application_roots(roots: Vec<PathBuf>) -> Self {
+        Self::with_application_sources(roots, Vec::new())
+    }
+
+    /// Discovers applications from exactly these roots and these individual
+    /// bundle paths, instead of the standard locations.
+    pub fn with_application_sources(roots: Vec<PathBuf>, bundles: Vec<PathBuf>) -> Self {
         Self {
-            applications: BundleScanner::new(roots),
+            applications: BundleScanner::with_bundles(roots, bundles),
             processes: OpenLauncher::new(),
             icons: OnceLock::new(),
         }
@@ -526,4 +572,250 @@ fn bundle_roots() -> Vec<PathBuf> {
     roots.push(PathBuf::from("/System/Applications"));
     roots.push(PathBuf::from("/System/Applications/Utilities"));
     roots
+}
+
+/// The individual application bundles macOS ships outside every install
+/// location, highest precedence first.
+///
+/// Finder is the file manager of the platform and the one application a user is
+/// certain to look for by name, but it is not installed: it lives in
+/// `/System/Library/CoreServices`, which [`bundle_roots`] deliberately does not
+/// list, so before this it was the one obvious application the launcher could
+/// not find.
+///
+/// Two ways to reach it were weighed.
+///
+/// Adding `/System/Library/CoreServices` as a scan root was rejected as noise.
+/// That directory is not an application folder; it is where macOS keeps the
+/// agents that *are* the desktop. A stock system holds `Dock.app`,
+/// `SystemUIServer.app`, `loginwindow.app`, `Spotlight.app`,
+/// `NotificationCenter.app`, `ControlCenter.app`, `WiFiAgent.app`, `mrt.app`
+/// (the malware removal tool) and a long tail of similar bundles there. Almost
+/// none of them has a user interface, several restart or reconfigure the running
+/// session when opened, and a launcher that offered dozens of them alongside
+/// Finder would have made the result list worse in order to fix one entry. The
+/// bundles in that tree a user might genuinely want -- Archive Utility,
+/// Directory Utility, Screen Sharing, Wireless Diagnostics -- are one level
+/// further down in `CoreServices/Applications`, which the non-recursive scan
+/// would not have reached anyway.
+///
+/// Naming the bundle was chosen instead: one entry, one result, nothing else
+/// indexed. It costs one `stat` per scan.
+///
+/// The path is a candidate, never an assumption. It is read by the same
+/// [`read_bundle`] as any scanned directory, so a system that does not keep
+/// Finder there -- a future macOS, a trimmed image -- contributes no item and
+/// reports no error, and the name and bundle identifier always come from the
+/// bundle's own `Info.plist` rather than from this list.
+fn well_known_bundles() -> Vec<PathBuf> {
+    vec![PathBuf::from("/System/Library/CoreServices/Finder.app")]
+}
+
+#[cfg(test)]
+mod tests {
+    //! Contract for the bundles that are discovered without being installed
+    //! (spec 10.2, 18.5).
+    //!
+    //! Finder is the case that motivated named bundles: it is the platform's
+    //! file manager, and it is not in any directory [`bundle_roots`] scans.
+    //!
+    //! Every case builds its own bundle in a unique temp directory, so what is
+    //! pinned here is the scanner's rule rather than the contents of the host's
+    //! `/System/Library/CoreServices`.
+
+    use super::*;
+    use crikey_core::{ExecutionPolicy, PluginId};
+    use crikey_platform::{application_items, APPLICATION_LAUNCH_ACTION_ID};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A unique scratch directory that deletes itself when the test ends.
+    ///
+    /// Uniqueness comes from the process id plus a monotonic counter, never from
+    /// a clock, so parallel test threads and repeated runs cannot collide.
+    struct Scratch {
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new() -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = env::temp_dir().join(format!("crikey-macos-bundles-{}-{unique}", std::process::id()));
+            fs::create_dir_all(&path).expect("the scratch directory must be creatable");
+            Self { path }
+        }
+
+        fn join(&self, relative: &str) -> PathBuf {
+            self.path.join(relative)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Writes a bundle that reads back as the application it says it is.
+    fn write_bundle(path: &Path, name: &str, identifier: &str) {
+        fs::create_dir_all(path.join(EXECUTABLE_DIRECTORY)).expect("bundle layout must be creatable");
+        fs::write(
+            path.join(INFO_PLIST),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <plist version=\"1.0\"><dict>\
+                 <key>CFBundleName</key><string>{name}</string>\
+                 <key>CFBundleIdentifier</key><string>{identifier}</string>\
+                 </dict></plist>"
+            ),
+        )
+        .expect("the property list must be writable");
+    }
+
+    fn discover(scanner: &BundleScanner) -> Vec<DiscoveredApplication> {
+        scanner.discover().expect("discovery never fails")
+    }
+
+    /// The launcher ships the path Finder actually has, and it is not a root.
+    ///
+    /// This is the regression this list exists for: before it, no source in the
+    /// backend named `/System/Library/CoreServices`, so Finder was unreachable.
+    #[test]
+    fn the_standard_sources_name_finder_outside_every_root() {
+        let finder = PathBuf::from("/System/Library/CoreServices/Finder.app");
+        assert!(
+            well_known_bundles().contains(&finder),
+            "Finder must be named explicitly, found {:?}",
+            well_known_bundles()
+        );
+        assert!(
+            !bundle_roots().iter().any(|root| finder.starts_with(root)),
+            "no scanned root contains Finder, so naming it is the only way in"
+        );
+    }
+
+    /// A named bundle is discovered exactly like a scanned one.
+    #[test]
+    fn a_named_bundle_is_discovered_without_being_under_a_root() {
+        let scratch = Scratch::new();
+        let finder = scratch.join("CoreServices/Finder.app");
+        write_bundle(&finder, "Finder", "com.apple.finder");
+
+        let discovered = discover(&BundleScanner::with_bundles(Vec::new(), vec![finder.clone()]));
+
+        assert_eq!(discovered.len(), 1, "one named bundle is one application");
+        assert_eq!(discovered[0].name, "Finder");
+        assert_eq!(discovered[0].platform_id.as_deref(), Some("com.apple.finder"));
+        assert_eq!(
+            discovered[0].target,
+            PlatformPath::new(finder.as_os_str().to_owned()),
+            "Launch Services opens the bundle, so the bundle is the target"
+        );
+    }
+
+    /// A user typing `finder` reaches it, and the entry launches like any other
+    /// application.
+    #[test]
+    fn a_named_bundle_becomes_a_launchable_item_with_its_own_aliases() {
+        let scratch = Scratch::new();
+        let finder = scratch.join("Finder.app");
+        write_bundle(&finder, "Finder", "com.apple.finder");
+
+        let discovered = discover(&BundleScanner::with_bundles(Vec::new(), vec![finder]));
+        let plugin = PluginId("builtin.crikey.applications".to_owned());
+        let items = application_items(&plugin, &discovered);
+        let item = items.first().expect("one discovery makes one item");
+
+        assert_eq!(item.label, "Finder");
+        for alias in ["Finder", "finder"] {
+            assert!(
+                item.search_terms.iter().any(|term| term == alias),
+                "Finder must answer to {alias:?}, found {:?}",
+                item.search_terms
+            );
+        }
+        let action = item.actions.first().expect("an application launches");
+        assert_eq!(action.action_id.0, APPLICATION_LAUNCH_ACTION_ID);
+        assert_eq!(action.execution_policy, ExecutionPolicy::HostMediated);
+    }
+
+    /// A named bundle that is not there is absent, not an error.
+    ///
+    /// The whole point of naming a path is that the path may one day be wrong;
+    /// a future macOS that moves Finder must cost the user one entry, not every
+    /// application on the machine.
+    #[test]
+    fn a_named_bundle_that_is_not_there_yields_no_item_and_no_error() {
+        let scratch = Scratch::new();
+        let scanner = BundleScanner::with_bundles(
+            Vec::new(),
+            vec![
+                scratch.join("gone/Finder.app"),
+                PathBuf::from("/"),
+                PathBuf::new(),
+            ],
+        );
+
+        assert!(discover(&scanner).is_empty());
+    }
+
+    /// A copy under a scanned root wins: that is the user's own installation.
+    #[test]
+    fn a_scanned_copy_shadows_the_named_bundle_of_the_same_name() {
+        let scratch = Scratch::new();
+        let installed = scratch.join("Applications/Finder.app");
+        write_bundle(&installed, "Installed Finder", "com.example.finder");
+        let system = scratch.join("CoreServices/Finder.app");
+        write_bundle(&system, "Finder", "com.apple.finder");
+
+        let discovered = discover(&BundleScanner::with_bundles(
+            vec![scratch.join("Applications")],
+            vec![system],
+        ));
+
+        assert_eq!(discovered.len(), 1, "one bundle name is one application");
+        assert_eq!(discovered[0].name, "Installed Finder");
+    }
+
+    /// Naming a bundle indexes that bundle and nothing beside it.
+    ///
+    /// This is the difference from the rejected alternative of scanning
+    /// `/System/Library/CoreServices`: the agents that share Finder's directory
+    /// stay out of the catalog.
+    #[test]
+    fn naming_a_bundle_does_not_index_its_neighbours() {
+        let scratch = Scratch::new();
+        let core_services = scratch.join("CoreServices");
+        write_bundle(&core_services.join("Finder.app"), "Finder", "com.apple.finder");
+        write_bundle(&core_services.join("Dock.app"), "Dock", "com.apple.dock");
+
+        let discovered = discover(&BundleScanner::with_bundles(
+            Vec::new(),
+            vec![core_services.join("Finder.app")],
+        ));
+
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|found| found.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Finder"]
+        );
+    }
+
+    /// The scanner reports the bundles it was given.
+    #[test]
+    fn a_scanner_reports_the_bundles_it_was_given() {
+        let bundles = vec![PathBuf::from("/System/Library/CoreServices/Finder.app")];
+        assert_eq!(
+            BundleScanner::with_bundles(Vec::new(), bundles.clone()).bundles(),
+            bundles.as_slice()
+        );
+        assert!(
+            BundleScanner::new(vec![PathBuf::from("/Applications")])
+                .bundles()
+                .is_empty(),
+            "a roots-only scanner names no bundle of its own"
+        );
+    }
 }

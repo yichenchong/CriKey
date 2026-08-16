@@ -75,7 +75,8 @@ fn known_folder(folder: &GUID) -> Option<PathBuf> {
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
-/// Resolves the Start Menu and, when asked, the packaged applications.
+/// Resolves the Start Menu, the applications this backend names itself and,
+/// when asked, the packaged applications.
 pub(super) fn discover(scanner: &StartMenuDiscovery) -> Result<Vec<DiscoveredApplication>> {
     let _apartment = Apartment::enter("application discovery")?;
 
@@ -85,6 +86,13 @@ pub(super) fn discover(scanner: &StartMenuDiscovery) -> Result<Vec<DiscoveredApp
         if let Some(application) = resolve(&shortcut, &mut text) {
             applications.insert(application);
         }
+    }
+
+    // After the shortcuts, so a machine that does have `File Explorer.lnk`
+    // keeps the shell's own localised name and icon for it: both discoveries
+    // name `%SystemRoot%\explorer.exe`, and the deduplicator keeps the first.
+    for application in scanner.well_known_applications() {
+        applications.insert(application);
     }
 
     if scanner.packaged {
