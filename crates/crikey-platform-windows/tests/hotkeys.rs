@@ -384,7 +384,6 @@ fn on_target_the_implemented_capabilities_are_claimed() {
 fn unimplemented_capabilities_are_never_claimed() {
     let backend = WindowsBackend::new();
     for capability in [
-        Capability::FileSearch,
         Capability::Clipboard,
         Capability::WindowEnumeration,
         Capability::WindowActivation,
@@ -417,6 +416,37 @@ fn the_half_implemented_icon_capability_is_claimed_as_partial_only_where_it_exis
         CapabilityState::Unavailable
     };
     assert_eq!(WindowsBackend::new().capability(Capability::Icons), expected);
+}
+
+/// File search is the second half-implemented capability, and half for a reason
+/// that is not this crate's to fix.
+///
+/// The `SystemIndex` catalog holds the locations Windows Search is configured to
+/// index, which on a clean install is Documents, Pictures, Music and the Desktop
+/// rather than the drive, and the directory walk that covers the rest -- notably
+/// Downloads -- reaches a handful of profile folders. Real results from a subset
+/// is `Partial`, and it stays `Partial` on Windows: the missing part is the
+/// user's indexing configuration, not missing code. Off Windows there is neither
+/// catalog nor profile, so there is nothing to claim.
+#[test]
+fn file_search_is_claimed_as_partial_only_where_windows_search_exists() {
+    let expected = if cfg!(target_os = "windows") {
+        CapabilityState::Partial
+    } else {
+        CapabilityState::Unavailable
+    };
+    assert_eq!(WindowsBackend::new().capability(Capability::FileSearch), expected);
+}
+
+/// A backend hands out a service only for the session it is running in.
+#[test]
+fn the_file_search_service_exists_only_on_windows() {
+    let backend = WindowsBackend::new();
+    assert_eq!(
+        backend.file_search().is_some(),
+        cfg!(target_os = "windows"),
+        "the service must be offered exactly where Windows Search and a Windows profile are"
+    );
 }
 
 #[test]

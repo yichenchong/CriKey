@@ -31,9 +31,34 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crikey_platform::{Capability, CapabilityState};
-use crikey_platform_linux::{detect_desktop_environment, DesktopEnvironment, LinuxBackend};
+use crikey_platform_linux::{detect_desktop_environment, DesktopEnvironment, FilesystemSearch, LinuxBackend};
+
+/// A backend that reports for `environment`, with the portal probe answered and
+/// file search pinned to an explicit service.
+///
+/// Both injections exist for the same reason: what the backend may claim for
+/// global shortcuts depends on an installed portal, and what it may claim for
+/// file search depends on a readable root and an installed `plocate`. A test
+/// that let either come from the running session would pass or fail on the
+/// build host's packages instead of on the reporting rules.
+fn reporting_backend(environment: DesktopEnvironment, portal: bool, indexed: bool) -> LinuxBackend {
+    // A root that exists on every host, because `Available` is a claim about
+    // having something to walk. The path is never walked here: reporting must
+    // not touch the filesystem beyond deciding that the root is there.
+    let roots = vec![std::env::temp_dir()];
+    let files = if indexed {
+        // Deliberately a path that cannot be spawned: reporting must answer
+        // from the *configuration*, not by running the index.
+        FilesystemSearch::with_locate(roots, PathBuf::from("/nonexistent/plocate"))
+    } else {
+        FilesystemSearch::walking(roots)
+    };
+
+    LinuxBackend::with_desktop_environment_and_portal(environment, portal).with_file_search(files)
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -101,7 +126,12 @@ fn index_of(capability: Capability) -> usize {
 /// The state the Linux backend is required to report, capability by capability
 /// and session by session. This is the contract table, written out rather than
 /// derived, so that an implementation cannot satisfy it by construction.
-fn required_state(environment: DesktopEnvironment, portal: bool, capability: Capability) -> CapabilityState {
+fn required_state(
+    environment: DesktopEnvironment,
+    portal: bool,
+    indexed: bool,
+    capability: Capability,
+) -> CapabilityState {
     match capability {
         // No display server needed: honest everywhere.
         Capability::ApplicationDiscovery | Capability::ProcessLaunch => CapabilityState::Available,
@@ -135,10 +165,19 @@ fn required_state(environment: DesktopEnvironment, portal: bool, capability: Cap
         // nothing usable for: `.svgz`, `.xpm`, and the scaled (HiDPI) theme
         // directories it skips.
         Capability::Icons => CapabilityState::Partial,
+        // File search: the one capability here that is a function of the
+        // filesystem rather than of the session, because a walk needs neither a
+        // display nor a daemon. With a readable root it is `Available` in every
+        // session including a headless one. An installed `plocate` lowers the
+        // claim to `Partial` rather than raising it: that answer comes from an
+        // index rebuilt on a timer, so a file saved since the last `updatedb`
+        // is missing from it, and a faster mechanism does not license a
+        // stronger claim (spec 18.1, 18.2).
+        Capability::FileSearch if indexed => CapabilityState::Partial,
+        Capability::FileSearch => CapabilityState::Available,
         // Nothing else has a Linux implementation behind it yet, so nothing
         // else may be claimed in any session.
-        Capability::FileSearch
-        | Capability::Clipboard
+        Capability::Clipboard
         | Capability::UriOpen
         | Capability::Notifications
         | Capability::FileWatching
@@ -149,15 +188,14 @@ fn required_state(environment: DesktopEnvironment, portal: bool, capability: Cap
 
 /// The capabilities that must never be claimed, whatever the session is.
 ///
-/// Icons are deliberately absent: they have an implementation behind them, and
-/// it is the one capability here that does not depend on a display server at
-/// all.
-const UNBACKED: [Capability; 7] = [
+/// Icons and file search are deliberately absent: both have an implementation
+/// behind them, and both are the capabilities here that do not depend on a
+/// display server at all.
+const UNBACKED: [Capability; 6] = [
     Capability::Clipboard,
     Capability::SecretStorage,
     Capability::Notifications,
     Capability::FileWatching,
-    Capability::FileSearch,
     Capability::UriOpen,
     Capability::ShellIntegration,
 ];
@@ -427,9 +465,9 @@ fn discovery_and_launching_stay_available_in_every_session() {
 /// Nothing is claimed without an implementation behind it.
 ///
 /// Kills the bug where making the backend session-aware turns into optimism:
-/// a session upgrade must not promote clipboard, secrets, notifications, icons,
-/// file watching, file search, URI opening or shell integration, none of which
-/// have a Linux implementation.
+/// a session upgrade must not promote clipboard, secrets, notifications,
+/// file watching, URI opening or shell integration, none of which have a Linux
+/// implementation.
 #[test]
 fn no_capability_is_claimed_available_without_a_backend_behind_it() {
     for environment in ALL_ENVIRONMENTS {
@@ -465,16 +503,86 @@ fn every_capability_has_a_deliberate_answer_in_every_session() {
 
     for environment in ALL_ENVIRONMENTS {
         for portal in [true, false] {
-            let label = format!("{environment:?}");
-            let backend = LinuxBackend::with_desktop_environment_and_portal(environment, portal);
-            for capability in ALL_CAPABILITIES {
-                assert_eq!(
-                    backend.capability(capability),
-                    required_state(environment, portal, capability),
-                    "{capability:?} under {label} with portal={portal} does not match the \
-                     reporting table (spec 18.2)"
-                );
+            for indexed in [true, false] {
+                let label = format!("{environment:?}");
+                let backend = reporting_backend(environment, portal, indexed);
+                for capability in ALL_CAPABILITIES {
+                    assert_eq!(
+                        backend.capability(capability),
+                        required_state(environment, portal, indexed, capability),
+                        "{capability:?} under {label} with portal={portal} indexed={indexed} does \
+                         not match the reporting table (spec 18.2)"
+                    );
+                }
             }
         }
     }
+}
+
+/// File search is claimed in every session, and an index lowers the claim.
+///
+/// Kills two bugs. Reporting file search from the session label -- the shape
+/// every other optional capability here has -- would make a headless unit claim
+/// nothing, when a walk of `$HOME` needs no display at all. And reporting
+/// `Available` while delegating to `plocate` promises live results from an index
+/// that `updatedb` refreshes on a timer; the file the user saved a minute ago is
+/// exactly the one missing from it (spec 18.1, 18.2).
+#[test]
+fn file_search_is_claimed_in_every_session_and_an_index_only_lowers_the_claim() {
+    for environment in ALL_ENVIRONMENTS {
+        let label = format!("{environment:?}");
+
+        let walking = reporting_backend(environment, false, false);
+        assert_eq!(
+            walking.capability(Capability::FileSearch),
+            CapabilityState::Available,
+            "a readable root is all a walk needs, so file search is claimed under {label}"
+        );
+
+        let indexed = reporting_backend(environment, false, true);
+        assert_eq!(
+            indexed.capability(Capability::FileSearch),
+            CapabilityState::Partial,
+            "an answer from a periodically rebuilt index does not cover everything under {label}"
+        );
+    }
+}
+
+/// A session with nothing to search claims nothing and hands out no service.
+///
+/// Kills the bug where the walk's "it always works" reasoning is taken too far:
+/// a systemd unit or container with no `$HOME` gives the walk no root, and a
+/// service that can only ever return empty answers teaches the user the feature
+/// is broken rather than that it has nowhere to look (spec 18.2).
+#[test]
+fn a_session_with_no_readable_root_claims_no_file_search_at_all() {
+    let backend = LinuxBackend::with_desktop_environment(DesktopEnvironment::X11)
+        .with_file_search(FilesystemSearch::walking(Vec::new()));
+
+    assert_eq!(
+        backend.capability(Capability::FileSearch),
+        CapabilityState::Unavailable,
+        "with no root there is nothing behind the claim"
+    );
+    assert!(
+        backend.file_search().is_none(),
+        "a service with no root must not be handed out: it can only answer empty forever"
+    );
+}
+
+/// The service really is handed out when there is a root, and names its
+/// mechanism.
+#[test]
+fn a_session_with_a_root_hands_out_a_file_search_service_that_names_its_mechanism() {
+    let backend = LinuxBackend::with_desktop_environment(DesktopEnvironment::Headless)
+        .with_file_search(FilesystemSearch::walking(vec![std::env::temp_dir()]));
+
+    let service = backend
+        .file_search()
+        .expect("a backend with a readable root offers file search");
+    assert_eq!(
+        service.source_name(),
+        "filesystem-walk",
+        "the diagnostic names the mechanism that answered, not the platform"
+    );
 }
