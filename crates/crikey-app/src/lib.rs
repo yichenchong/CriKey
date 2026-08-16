@@ -44,7 +44,7 @@ pub use plugin_action::{
     PluginActionRouter,
 };
 pub use plugin_icons::{
-    PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
+    IconFetch, PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
 };
 pub use query_pipeline::{PipelineConfig, PipelineError, PipelineTick, QueryPipeline};
 pub use remote_catalog::{
