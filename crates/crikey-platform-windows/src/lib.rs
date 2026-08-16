@@ -17,9 +17,9 @@
 //! command line hands a program back the argument vector it was launched with.
 //! None of that needs a Windows kernel to be exercised, so none of it is
 //! allowed to hide behind one. [`HotkeyCode`], [`HotkeyRegistrations`],
-//! [`StartMenuDiscovery::shortcuts`], [`ApplicationSet`] and
-//! [`quote_arguments`] are ordinary Rust on every host, and the test suite runs
-//! them on every host.
+//! [`StartMenuDiscovery::shortcuts`], [`StartMenuDiscovery::well_known_applications`],
+//! [`ApplicationSet`] and [`quote_arguments`] are ordinary Rust on every host,
+//! and the test suite runs them on every host.
 //!
 //! The second is honesty. A backend that cannot reach Win32 must say so rather
 //! than answer plausibly: [`WindowsBackend::capability`] reports everything
@@ -39,7 +39,10 @@ mod win32;
 
 use std::{path::PathBuf, sync::OnceLock};
 
-pub use applications::{split_arguments, ApplicationSet, Shortcut, StartMenuDiscovery};
+pub use applications::{
+    split_arguments, ApplicationSet, Shortcut, StartMenuDiscovery, WellKnownApplication,
+    WELL_KNOWN_APPLICATIONS,
+};
 #[cfg(not(target_os = "windows"))]
 use crikey_core::CoreError;
 use crikey_platform::{

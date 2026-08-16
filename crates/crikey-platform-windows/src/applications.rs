@@ -1,18 +1,21 @@
 //! Application discovery over the Start Menu and the shell's app list
 //! (spec 10.2, 18.4).
 //!
-//! Two sources feed one result. The Start Menu known folders are walked for
+//! Three sources feed one result. The Start Menu known folders are walked for
 //! `.lnk` files, each resolved through the shell link object into the target
 //! and arguments a launcher would run; the shell's Applications folder is
 //! enumerated for packaged applications, which have no path at all and are
-//! named by their AppUserModelID instead. Both land in one [`ApplicationSet`],
-//! which is what makes the result deduplicated and stable.
+//! named by their AppUserModelID instead; and a short hard-coded table names
+//! the components of Windows itself that neither source reports, of which File
+//! Explorer is one (see [`WELL_KNOWN_APPLICATIONS`]). All land in one
+//! [`ApplicationSet`], which is what makes the result deduplicated and stable.
 //!
 //! The Win32 half lives in the target-gated submodule. Everything above it --
 //! the tree walk, the argument splitter, the deduplication rule -- is ordinary
 //! Rust, because those are the parts with rules worth testing.
 
 use std::collections::HashSet;
+use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,6 +25,101 @@ use crikey_platform::{ApplicationDiscovery, DiscoveredApplication};
 
 #[cfg(target_os = "windows")]
 mod win32;
+
+/// One application Windows ships that neither discovery source reports.
+///
+/// Both sources look for something an installer left behind: a `.lnk` under a
+/// Start Menu known folder, or a package registered with the shell. A component
+/// of Windows itself may have neither, and File Explorer is exactly that case
+/// (see [`WELL_KNOWN_APPLICATIONS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WellKnownApplication {
+    /// The label the entry carries. Hard coded, and therefore English: the
+    /// localised name lives in the shell's own item for the application, which
+    /// is the thing this entry exists because the machine may not have.
+    pub name: &'static str,
+    /// The executable, named relative to the Windows system root so the entry
+    /// follows a system installed on a volume other than `C:`.
+    pub executable: &'static str,
+}
+
+/// The applications this backend names itself, because Windows names them
+/// nowhere the two discovery sources look (spec 18.4).
+///
+/// # Why File Explorer needs an entry at all
+///
+/// The Start Menu walk only reports `.lnk` files (`is_shortcut`), and a stock
+/// Windows 11 need not have one for File Explorer: Microsoft's own default
+/// layout pins it through
+/// `%APPDATA%\Microsoft\Windows\Start Menu\Programs\File Explorer.lnk`, a
+/// per-user file that is absent on machines whose profile was never given it,
+/// and pinning by identifier instead uses the desktop application id
+/// `Microsoft.Windows.Explorer`
+/// (<https://learn.microsoft.com/en-us/windows/configuration/start/layout>).
+/// The packaged-application enumeration cannot cover the gap either: File
+/// Explorer is not packaged, so its identifier carries no `!`, and
+/// `win32::packaged_application` drops every identifier without one.
+///
+/// # Why not relax that filter instead
+///
+/// The `!` test is not a formality. The Applications folder lists *every*
+/// desktop program as well as the packaged ones, so dropping the filter would
+/// duplicate most of the Start Menu, and admitting `Microsoft.Windows.Explorer`
+/// by name would still duplicate File Explorer itself on every machine that does
+/// have the shortcut: the two discoveries carry different targets
+/// (`shell:AppsFolder\Microsoft.Windows.Explorer` against `explorer.exe`), and
+/// [`ApplicationSet`] deduplicates on the target because that is what an item's
+/// stable id is derived from. Naming the executable produces the *same* target
+/// the shortcut resolves to -- the shortcut stores `%windir%\explorer.exe`,
+/// which `win32::resolve` expands -- so the duplicate collapses on its own and
+/// the shortcut, which carries the localised name and its own icon, wins.
+///
+/// # The admission rule
+///
+/// This list, and nothing else. Each entry names one executable relative to
+/// `%SystemRoot%`, and it becomes an application only if that exact file is
+/// there: nothing is enumerated, no filter is loosened, and no registry or
+/// shell namespace is searched, so no third party can add to the result set
+/// through it. An entry whose file is missing -- a future Windows that moves
+/// `explorer.exe`, or an off-target build with no system root at all -- yields
+/// no item and no error.
+pub const WELL_KNOWN_APPLICATIONS: &[WellKnownApplication] = &[WellKnownApplication {
+    // `explorer.exe` sits directly in the Windows directory, not in
+    // `System32`, and launching it with no arguments opens File Explorer at the
+    // shell's configured start location -- the same thing the Start Menu
+    // shortcut and the taskbar button do.
+    name: "File Explorer",
+    executable: "explorer.exe",
+}];
+
+impl WellKnownApplication {
+    /// The application this entry names, if the system really has it.
+    ///
+    /// No icon is recorded. An executable's default icon lives in its resources,
+    /// and extracting one is not implemented (see [`crate::icons`]); reporting
+    /// the `.exe` as an icon reference would hand the decoder a PE image, so the
+    /// entry says nothing rather than something wrong -- the same rule
+    /// `win32::resolve` applies to a shortcut that declares no icon.
+    ///
+    /// No AppUserModelID is recorded either: like a Start Menu shortcut, this
+    /// entry is identified by the executable it points at, and it is launched by
+    /// running that executable rather than by activating an identifier.
+    fn resolve(&self, system_root: &Path) -> Option<DiscoveredApplication> {
+        let executable = system_root.join(self.executable);
+        if !executable.is_file() {
+            return None;
+        }
+
+        Some(DiscoveredApplication {
+            name: self.name.to_owned(),
+            target: PlatformPath::new(executable.into_os_string()),
+            arguments: Vec::new(),
+            icon_reference: None,
+            platform_id: None,
+            working_directory: None,
+        })
+    }
+}
 
 /// One `.lnk` the Start Menu walk found.
 ///
@@ -40,14 +138,17 @@ pub struct Shortcut {
     pub name: String,
 }
 
-/// Start Menu and packaged application discovery (spec 18.4).
+/// Start Menu, packaged and well-known application discovery (spec 18.4).
 ///
 /// Roots are scanned in the order they were given, so a per-user shortcut
-/// shadows the machine-wide copy of the same program.
+/// shadows the machine-wide copy of the same program. The system root is where
+/// [`WELL_KNOWN_APPLICATIONS`] are looked for; a scanner without one reports
+/// none of them.
 #[derive(Debug)]
 pub struct StartMenuDiscovery {
     roots: Vec<PathBuf>,
     packaged: bool,
+    system_root: Option<PathBuf>,
 }
 
 impl StartMenuDiscovery {
@@ -75,17 +176,52 @@ impl StartMenuDiscovery {
         Self {
             roots: start_menu_roots(),
             packaged: true,
+            system_root: system_root(),
         }
     }
 
     /// Discovers exactly these roots, highest precedence first, and packaged
-    /// applications only if asked.
+    /// applications only if asked. No well-known application is named: a
+    /// scanner told exactly where to look reports exactly what is there, and
+    /// [`Self::with_system_root`] adds them back.
     ///
     /// Construction touches no filesystem and no COM: every read happens inside
-    /// [`ApplicationDiscovery::discover`] or [`Self::shortcuts`], so a scanner
-    /// can be built before the directories it names exist.
+    /// [`ApplicationDiscovery::discover`], [`Self::shortcuts`] or
+    /// [`Self::well_known_applications`], so a scanner can be built before the
+    /// directories it names exist.
     pub fn with_roots(roots: Vec<PathBuf>, packaged: bool) -> Self {
-        Self { roots, packaged }
+        Self {
+            roots,
+            packaged,
+            system_root: None,
+        }
+    }
+
+    /// Looks for [`WELL_KNOWN_APPLICATIONS`] below this directory instead of
+    /// below the running system's root.
+    pub fn with_system_root(mut self, system_root: Option<PathBuf>) -> Self {
+        self.system_root = system_root;
+        self
+    }
+
+    /// Where [`WELL_KNOWN_APPLICATIONS`] are looked for, when anywhere.
+    pub fn system_root(&self) -> Option<&Path> {
+        self.system_root.as_deref()
+    }
+
+    /// The well-known applications this system really has.
+    ///
+    /// Empty when no system root is known, which is every build that is not
+    /// running on Windows: an entry is only ever reported once its executable
+    /// has been seen.
+    pub fn well_known_applications(&self) -> Vec<DiscoveredApplication> {
+        let Some(system_root) = self.system_root.as_deref() else {
+            return Vec::new();
+        };
+        WELL_KNOWN_APPLICATIONS
+            .iter()
+            .filter_map(|known| known.resolve(system_root))
+            .collect()
     }
 
     /// The roots this scanner walks, highest precedence first.
@@ -160,8 +296,8 @@ impl Default for StartMenuDiscovery {
 }
 
 impl ApplicationDiscovery for StartMenuDiscovery {
-    /// Resolves every shortcut and packaged application into one deduplicated
-    /// list.
+    /// Resolves every shortcut, well-known and packaged application into one
+    /// deduplicated list.
     ///
     /// Failure is reserved for the cases that make discovery meaningless:
     /// COM refusing to start, or the shell refusing to open its own
@@ -189,6 +325,18 @@ fn start_menu_roots() -> Vec<PathBuf> {
 #[cfg(not(target_os = "windows"))]
 fn start_menu_roots() -> Vec<PathBuf> {
     Vec::new()
+}
+
+/// The Windows directory of the running system, when there is one.
+///
+/// `SystemRoot` is set by Windows itself for every process, so this is the
+/// volume-independent way to reach `explorer.exe` without hard-coding `C:`. Off
+/// target the variable is unset and [`WELL_KNOWN_APPLICATIONS`] contribute
+/// nothing, which matches [`start_menu_roots`] reporting no known folders.
+fn system_root() -> Option<PathBuf> {
+    env::var_os("SystemRoot")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
 }
 
 /// `name.lnk` and nothing else: not `.lnk`, `name.lnk.bak`, or a bare `lnk`.
