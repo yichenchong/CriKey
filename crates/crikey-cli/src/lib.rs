@@ -10,6 +10,7 @@ mod activation_commands;
 mod catalog_commands;
 mod config_commands;
 mod dev_commands;
+mod file_provider;
 mod legacy_commands;
 mod modern_commands;
 mod native_commands;
@@ -41,6 +42,7 @@ use crikey_platform::{DirectoryConvention, PluginKind, StandardDirectories};
 use crikey_ui::{
     LauncherViewModel, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, UiEffect, ViewModel,
 };
+use file_provider::{file_provider_policy, FileSearchDriver, FILE_SEARCH_PLUGIN};
 use std::cell::RefCell;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -643,6 +645,26 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             let _ = native_publish_handle.submit_results(frame);
         }),
     );
+    // The host's own file search joins the live query path here. It gets its own
+    // pipeline because its policy is its own: it debounces where the
+    // application provider fires on the leading edge, and one pipeline cannot
+    // hold two answers to when a query should be dispatched.
+    let file_owner = PluginId(FILE_SEARCH_PLUGIN.to_owned());
+    let mut file_pipeline = QueryPipeline::new(pipeline_bounds);
+    file_pipeline
+        .register_plugin(file_owner.clone(), file_provider_policy())
+        .map_err(|error| format!("cannot register the file provider with the query pipeline: {error}"))?;
+    let file_publish_handle = render_handle.clone();
+    let file_driver = FileSearchDriver::spawn(
+        file_owner.clone(),
+        file_pipeline,
+        // Built on the driver's own worker thread rather than here: a platform
+        // backend need not be `Send`, and this one never has to be.
+        Box::new(|| Box::new(App::new())),
+        move |frame| {
+            let _ = file_publish_handle.submit_results(frame);
+        },
+    );
     // Plugin-owned actions use the same exact-owner endpoints and budget
     // handles retained by the provider drivers. Registering this router before
     // the event loop makes `crikey run` execute selected legacy/modern/native
@@ -665,6 +687,12 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     action_router
         .register_host_catalog(PluginId(APPLICATION_CATALOG_PLUGIN.to_owned()))
         .map_err(|error| format!("cannot register the application catalog grants: {error}"))?;
+    // The file provider is the host's own too, and needs the same entry for the
+    // same reason: without it every file row would render and then refuse to
+    // open, because the host-mediated gate refuses an owner it does not know.
+    action_router
+        .register_host_catalog(file_owner.clone())
+        .map_err(|error| format!("cannot register the file provider grants: {error}"))?;
     // One `Arc`, shared. The legacy driver needs the same router the search
     // service uses: a host-mediated action a legacy plugin asks for is gated by
     // exactly the grants registered above, and a second router would be a
@@ -834,6 +862,18 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 );
                 view_model.publish(outcome.generation, retained.merged(), retained.pending());
             }
+            // File rows fold in the same way: the search ran on the driver's
+            // worker thread, so its answer arrives on some later turn of this
+            // loop and under the generation that asked for it or not at all.
+            if let Some(outcome) = file_driver.take_outcome() {
+                retained.absorb(
+                    outcome.generation,
+                    RowSource::Files,
+                    &outcome.rows,
+                    outcome.pending_plugins,
+                );
+                view_model.publish(outcome.generation, retained.merged(), retained.pending());
+            }
             // Catalog outcomes use the same SearchService instance/owner
             // publication edge as persisted slices. Obsolete and failed
             // results are observable but can never replace live state.
@@ -895,6 +935,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     // one so its query and rows cannot cross the boundary.
                     view_model.dismiss();
                     view_model.activate();
+                    // A new session searches from cold. Within one burst of
+                    // typing the filesystem is effectively still, but between
+                    // two sessions the user has had time to create the file
+                    // they are about to look for.
+                    file_driver.invalidate_cache();
                     (None, None)
                 }
                 NativeLauncherEvent::Command { session, command } => {
@@ -979,10 +1024,30 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                         0,
                                     );
                                 }
+                                // The file search runs on its own worker thread
+                                // under a deadline no synchronous provider could
+                                // afford, so it is handed the query here and
+                                // folds its rows in whenever it answers. An
+                                // empty query is not submitted at all: there is
+                                // nothing to search for, and walking the user's
+                                // home directory to prove it would be the most
+                                // expensive answer the launcher ever produced.
+                                let files_outstanding = file_driver.is_serving() && !raw.trim().is_empty();
+                                if files_outstanding {
+                                    file_driver.submit(
+                                        generation,
+                                        &raw,
+                                        now,
+                                        rows.clone(),
+                                        frame.pending_plugins,
+                                        0,
+                                    );
+                                }
                                 retained.set_builtin(generation, rows, frame.pending_plugins);
                                 retained.mark_pending(generation, RowSource::Legacy, legacy_outstanding);
                                 retained.mark_pending(generation, RowSource::Native, native_outstanding);
                                 retained.mark_pending(generation, RowSource::Modern, modern_outstanding);
+                                retained.mark_pending(generation, RowSource::Files, files_outstanding);
                                 view_model.publish(generation, retained.merged(), retained.pending());
                             }
                         }
@@ -1017,28 +1082,43 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     ));
                     eprintln!("crikey: {report}");
                 }
-                Some(UiEffect::Execute { item, action }) => match search.execute(&item, &action) {
-                    Ok(ActionSubmission::Completed) => {
-                        search.set_history_time(history_clock.advance());
-                        if search.record_selection(&item) {
-                            commit_selection_history(selection_history.as_ref(), &search);
+                Some(UiEffect::Execute { item, action }) => {
+                    // A file item never entered the catalog, so the search
+                    // service cannot find it: it lives in the driver that
+                    // published the row, under the generation the rows on
+                    // screen belong to. Resolving there first is what makes a
+                    // file row selectable at all; anything the driver does not
+                    // own is an ordinary catalog or plugin selection.
+                    let file_item = retained
+                        .generation()
+                        .and_then(|generation| file_driver.resolve(generation, &item));
+                    let submission = match file_item.as_ref() {
+                        Some(file_item) => search.execute_host_action(file_item, &action),
+                        None => search.execute(&item, &action),
+                    };
+                    match submission {
+                        Ok(ActionSubmission::Completed) => {
+                            search.set_history_time(history_clock.advance());
+                            if search.record_selection(&item) {
+                                commit_selection_history(selection_history.as_ref(), &search);
+                            }
+                            view_model.dismiss();
+                            if let Some(session) = command_session {
+                                let _ = render_handle.request_hide_session(session);
+                            }
                         }
-                        view_model.dismiss();
-                        if let Some(session) = command_session {
-                            let _ = render_handle.request_hide_session(session);
+                        Ok(ActionSubmission::Pending(request_id)) => {
+                            let message = format!(
+                                "Action pending ({} / request {})",
+                                request_id.plugin.0, request_id.sequence
+                            );
+                            report_status(&mut view_model, message);
+                        }
+                        Err(error) => {
+                            report_status(&mut view_model, format!("Launch failed: {error}"));
                         }
                     }
-                    Ok(ActionSubmission::Pending(request_id)) => {
-                        let message = format!(
-                            "Action pending ({} / request {})",
-                            request_id.plugin.0, request_id.sequence
-                        );
-                        report_status(&mut view_model, message);
-                    }
-                    Err(error) => {
-                        report_status(&mut view_model, format!("Launch failed: {error}"));
-                    }
-                },
+                }
                 None => {}
             }
 
@@ -1866,11 +1946,12 @@ fn create_private_dir(dir: &std::path::Path) -> Result<(), String> {
 }
 
 /// The provider group a published row belongs to, used to merge the built-in,
-/// legacy, modern and native row sets into one presented frame without one
+/// file, legacy, modern and native row sets into one presented frame without one
 /// clobbering another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowSource {
     Builtin,
+    Files,
     Legacy,
     Modern,
     Native,
@@ -1878,10 +1959,13 @@ enum RowSource {
 
 /// Classifies a published row by the source group its owning plugin belongs to
 /// (spec 10.2 namespacing): `legacy.*`, `modern.*` and `native.*` are the three
-/// asynchronous providers; everything else — the built-in application catalog
-/// included — is built-in.
+/// asynchronous providers, the host's file search is its own group because it
+/// answers asynchronously too, and everything else — the built-in application
+/// catalog included — is built-in.
 fn row_source(plugin_name: &str) -> RowSource {
-    if plugin_name.starts_with("legacy.") {
+    if plugin_name == FILE_SEARCH_PLUGIN {
+        RowSource::Files
+    } else if plugin_name.starts_with("legacy.") {
         RowSource::Legacy
     } else if plugin_name.starts_with("modern.") {
         RowSource::Modern
@@ -1898,18 +1982,20 @@ fn row_source(plugin_name: &str) -> RowSource {
 /// Each asynchronous provider publishes the built-in rows ahead of its own,
 /// and each calls back independently through `take_outcome`; without per-source
 /// retention the second fold of a turn would overwrite the first provider's
-/// rows. Keeping the four groups and re-merging on every fold makes legacy,
-/// modern and native rows coexist under one generation (contract §8). A new
+/// rows. Keeping the five groups and re-merging on every fold makes file,
+/// legacy, modern and native rows coexist under one generation (contract §8). A new
 /// generation drops every retained group first, so stale rows never cross a
 /// query boundary.
 #[derive(Debug, Default)]
 struct RetainedRows {
     generation: Option<Generation>,
     builtin: Vec<crikey_ui::ResultRow>,
+    files: Vec<crikey_ui::ResultRow>,
     legacy: Vec<crikey_ui::ResultRow>,
     modern: Vec<crikey_ui::ResultRow>,
     native: Vec<crikey_ui::ResultRow>,
     builtin_pending: bool,
+    files_pending: bool,
     legacy_pending: bool,
     modern_pending: bool,
     native_pending: bool,
@@ -1936,6 +2022,12 @@ impl RetainedRows {
         }
     }
 
+    /// The generation the presented rows belong to, which is the generation any
+    /// selection made against them has to resolve under.
+    fn generation(&self) -> Option<Generation> {
+        self.generation
+    }
+
     /// Refreshes the built-in group from the synchronous publish.
     fn set_builtin(&mut self, generation: Generation, rows: Vec<crikey_ui::ResultRow>, pending: bool) {
         if !self.begin(generation) {
@@ -1953,6 +2045,7 @@ impl RetainedRows {
         }
         match source {
             RowSource::Builtin => self.builtin_pending = pending,
+            RowSource::Files => self.files_pending = pending,
             RowSource::Legacy => self.legacy_pending = pending,
             RowSource::Modern => self.modern_pending = pending,
             RowSource::Native => self.native_pending = pending,
@@ -1980,6 +2073,14 @@ impl RetainedRows {
             .collect();
         match source {
             RowSource::Builtin => self.builtin_pending = pending,
+            RowSource::Files => {
+                self.files = rows
+                    .iter()
+                    .filter(|row| row_source(&row.plugin_name) == RowSource::Files)
+                    .cloned()
+                    .collect();
+                self.files_pending = pending;
+            }
             RowSource::Legacy => {
                 self.legacy = rows
                     .iter()
@@ -2006,12 +2107,14 @@ impl RetainedRows {
             }
         }
     }
-    /// The merged presentation order: built-in rows, then legacy, modern and native.
+    /// The merged presentation order: built-in rows, then file, legacy, modern
+    /// and native.
     fn merged(&self) -> Vec<crikey_ui::ResultRow> {
         let mut rows = Vec::with_capacity(
-            self.builtin.len() + self.legacy.len() + self.modern.len() + self.native.len(),
+            self.builtin.len() + self.files.len() + self.legacy.len() + self.modern.len() + self.native.len(),
         );
         rows.extend(self.builtin.iter().cloned());
+        rows.extend(self.files.iter().cloned());
         rows.extend(self.legacy.iter().cloned());
         rows.extend(self.modern.iter().cloned());
         rows.extend(self.native.iter().cloned());
@@ -2020,7 +2123,11 @@ impl RetainedRows {
 
     /// Whether any source still has work outstanding for the retained generation.
     fn pending(&self) -> bool {
-        self.builtin_pending || self.legacy_pending || self.modern_pending || self.native_pending
+        self.builtin_pending
+            || self.files_pending
+            || self.legacy_pending
+            || self.modern_pending
+            || self.native_pending
     }
 }
 
@@ -2867,12 +2974,13 @@ mod tests {
     }
 
     #[test]
-    fn retained_rows_merge_legacy_and_modern_by_source() {
+    fn retained_rows_merge_files_legacy_and_modern_by_source() {
         let generation = Generation::from_raw(7);
         let mut retained = RetainedRows::default();
 
-        // The synchronous built-in publish, with both async providers still out.
+        // The synchronous built-in publish, with every async source still out.
         retained.set_builtin(generation, vec![row("builtin.app", "app")], false);
+        retained.mark_pending(generation, RowSource::Files, true);
         retained.mark_pending(generation, RowSource::Legacy, true);
         retained.mark_pending(generation, RowSource::Modern, true);
         assert!(retained.pending(), "outstanding providers keep the frame pending");
@@ -2882,6 +2990,15 @@ mod tests {
             generation,
             RowSource::Legacy,
             &[row("builtin.app", "app"), row("legacy.files", "file")],
+            false,
+        );
+        // Then the file provider, whose rows are neither built-in nor any
+        // plugin's: classified by owner, so the built-in refresh below cannot
+        // absorb them and the modern fold cannot drop them.
+        retained.absorb(
+            generation,
+            RowSource::Files,
+            &[row("builtin.app", "app"), row(FILE_SEARCH_PLUGIN, "report.txt")],
             false,
         );
         // Then the modern supervisor answers with built-in + modern rows. A
@@ -2898,8 +3015,8 @@ mod tests {
         // whole-frame replacement would leave only built-in + `modern.web`.
         assert_eq!(
             sources,
-            vec!["builtin.app", "legacy.files", "modern.web"],
-            "built-in, legacy and modern rows coexist in that presentation order",
+            vec!["builtin.app", FILE_SEARCH_PLUGIN, "legacy.files", "modern.web"],
+            "built-in, file, legacy and modern rows coexist in that presentation order",
         );
         assert!(
             !retained.pending(),

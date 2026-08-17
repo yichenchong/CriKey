@@ -105,6 +105,23 @@ pub trait PluginActionExecutor: Send + Sync {
 pub enum HostCapability {
     /// Starting an application through the platform launcher.
     ProcessLaunch,
+    /// Handing a path the *user* picked to whatever their desktop registered
+    /// for it, through the platform opener.
+    ///
+    /// Its own variant rather than a second use of [`Self::ProcessLaunch`]
+    /// because the two are different questions and a gate that cannot tell
+    /// them apart cannot ever be tightened: "start this program with this
+    /// argument vector" is a decision this workspace made, while "open this
+    /// document with whatever is registered" is a decision the user's desktop
+    /// made. A refusal has to be able to name which one was refused.
+    ///
+    /// It is nonetheless backed by the same `process` permission, and that is
+    /// deliberate rather than a shortcut: `xdg-open`, `/usr/bin/open` and
+    /// `ShellExecuteExW` all run a `.desktop`, a `.app` or an `.exe` when
+    /// handed one, so the authority is genuinely the same authority. Giving it
+    /// a weaker field of its own would be a gate that reads as a restriction
+    /// while restricting nothing.
+    DocumentOpen,
     /// Reading a resource file shipped inside the plugin's own package.
     PackageFileRead,
 }
@@ -113,7 +130,7 @@ impl HostCapability {
     /// The manifest field an author has to change to grant this.
     fn permission(self) -> &'static str {
         match self {
-            Self::ProcessLaunch => "process",
+            Self::ProcessLaunch | Self::DocumentOpen => "process",
             Self::PackageFileRead => "filesystem",
         }
     }
@@ -122,13 +139,14 @@ impl HostCapability {
     fn operation(self) -> &'static str {
         match self {
             Self::ProcessLaunch => "process launch",
+            Self::DocumentOpen => "document open",
             Self::PackageFileRead => "package resource read",
         }
     }
 
     fn granted_by(self, permissions: &Permissions) -> bool {
         match self {
-            Self::ProcessLaunch => permissions.process,
+            Self::ProcessLaunch | Self::DocumentOpen => permissions.process,
             Self::PackageFileRead => permissions.allows_filesystem_read(FilesystemScope::Package),
         }
     }

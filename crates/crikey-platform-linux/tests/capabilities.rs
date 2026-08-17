@@ -34,17 +34,25 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crikey_platform::{Capability, CapabilityState};
-use crikey_platform_linux::{detect_desktop_environment, DesktopEnvironment, FilesystemSearch, LinuxBackend};
+use crikey_platform_linux::{
+    detect_desktop_environment, DesktopEnvironment, FilesystemSearch, LinuxBackend, XdgOpener,
+};
 
 /// A backend that reports for `environment`, with the portal probe answered and
-/// file search pinned to an explicit service.
+/// file search and file opening pinned to explicit services.
 ///
-/// Both injections exist for the same reason: what the backend may claim for
-/// global shortcuts depends on an installed portal, and what it may claim for
-/// file search depends on a readable root and an installed `plocate`. A test
-/// that let either come from the running session would pass or fail on the
+/// All three injections exist for the same reason: what the backend may claim
+/// for global shortcuts depends on an installed portal, what it may claim for
+/// file search depends on a readable root and an installed `plocate`, and what
+/// it may claim for file opening depends on an installed `xdg-open`. A test
+/// that let any of them come from the running session would pass or fail on the
 /// build host's packages instead of on the reporting rules.
-fn reporting_backend(environment: DesktopEnvironment, portal: bool, indexed: bool) -> LinuxBackend {
+fn reporting_backend(
+    environment: DesktopEnvironment,
+    portal: bool,
+    indexed: bool,
+    opener: bool,
+) -> LinuxBackend {
     // A root that exists on every host, because `Available` is a claim about
     // having something to walk. The path is never walked here: reporting must
     // not touch the filesystem beyond deciding that the root is there.
@@ -56,8 +64,13 @@ fn reporting_backend(environment: DesktopEnvironment, portal: bool, indexed: boo
     } else {
         FilesystemSearch::walking(roots)
     };
+    // Deliberately unspawnable too, and for the same reason: the claim follows
+    // from the session having a helper, not from running it.
+    let opener = opener.then(|| XdgOpener::with_helper("/nonexistent/xdg-open"));
 
-    LinuxBackend::with_desktop_environment_and_portal(environment, portal).with_file_search(files)
+    LinuxBackend::with_desktop_environment_and_portal(environment, portal)
+        .with_file_search(files)
+        .with_file_opener(opener)
 }
 
 // ---------------------------------------------------------------------------
@@ -76,13 +89,14 @@ fn fixture(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
 }
 
 /// Every [`Capability`] variant, listed once, in declaration order.
-const ALL_CAPABILITIES: [Capability; 13] = [
+const ALL_CAPABILITIES: [Capability; 14] = [
     Capability::ApplicationDiscovery,
     Capability::FileSearch,
     Capability::Clipboard,
     Capability::GlobalHotkeys,
     Capability::ProcessLaunch,
     Capability::UriOpen,
+    Capability::FileOpen,
     Capability::WindowEnumeration,
     Capability::WindowActivation,
     Capability::Notifications,
@@ -113,13 +127,14 @@ fn index_of(capability: Capability) -> usize {
         Capability::GlobalHotkeys => 3,
         Capability::ProcessLaunch => 4,
         Capability::UriOpen => 5,
-        Capability::WindowEnumeration => 6,
-        Capability::WindowActivation => 7,
-        Capability::Notifications => 8,
-        Capability::Icons => 9,
-        Capability::FileWatching => 10,
-        Capability::SecretStorage => 11,
-        Capability::ShellIntegration => 12,
+        Capability::FileOpen => 6,
+        Capability::WindowEnumeration => 7,
+        Capability::WindowActivation => 8,
+        Capability::Notifications => 9,
+        Capability::Icons => 10,
+        Capability::FileWatching => 11,
+        Capability::SecretStorage => 12,
+        Capability::ShellIntegration => 13,
     }
 }
 
@@ -130,6 +145,7 @@ fn required_state(
     environment: DesktopEnvironment,
     portal: bool,
     indexed: bool,
+    opener: bool,
     capability: Capability,
 ) -> CapabilityState {
     match capability {
@@ -175,6 +191,13 @@ fn required_state(
         // stronger claim (spec 18.1, 18.2).
         Capability::FileSearch if indexed => CapabilityState::Partial,
         Capability::FileSearch => CapabilityState::Available,
+        // Opening a path: a function of whether xdg-utils is installed, which
+        // `reporting_backend` injects for the same reason it injects the file
+        // search. `Available` with a helper and `Unavailable` without one, and
+        // nothing in between: `xdg-open` performs the whole handler lookup
+        // itself, so there is no subset of paths a present helper covers.
+        Capability::FileOpen if opener => CapabilityState::Available,
+        Capability::FileOpen => CapabilityState::Unavailable,
         // Nothing else has a Linux implementation behind it yet, so nothing
         // else may be claimed in any session.
         Capability::Clipboard
@@ -504,15 +527,17 @@ fn every_capability_has_a_deliberate_answer_in_every_session() {
     for environment in ALL_ENVIRONMENTS {
         for portal in [true, false] {
             for indexed in [true, false] {
-                let label = format!("{environment:?}");
-                let backend = reporting_backend(environment, portal, indexed);
-                for capability in ALL_CAPABILITIES {
-                    assert_eq!(
-                        backend.capability(capability),
-                        required_state(environment, portal, indexed, capability),
-                        "{capability:?} under {label} with portal={portal} indexed={indexed} does \
-                         not match the reporting table (spec 18.2)"
-                    );
+                for opener in [true, false] {
+                    let label = format!("{environment:?}");
+                    let backend = reporting_backend(environment, portal, indexed, opener);
+                    for capability in ALL_CAPABILITIES {
+                        assert_eq!(
+                            backend.capability(capability),
+                            required_state(environment, portal, indexed, opener, capability),
+                            "{capability:?} under {label} with portal={portal} indexed={indexed} \
+                             opener={opener} does not match the reporting table (spec 18.2)"
+                        );
+                    }
                 }
             }
         }
@@ -532,14 +557,14 @@ fn file_search_is_claimed_in_every_session_and_an_index_only_lowers_the_claim() 
     for environment in ALL_ENVIRONMENTS {
         let label = format!("{environment:?}");
 
-        let walking = reporting_backend(environment, false, false);
+        let walking = reporting_backend(environment, false, false, true);
         assert_eq!(
             walking.capability(Capability::FileSearch),
             CapabilityState::Available,
             "a readable root is all a walk needs, so file search is claimed under {label}"
         );
 
-        let indexed = reporting_backend(environment, false, true);
+        let indexed = reporting_backend(environment, false, true, true);
         assert_eq!(
             indexed.capability(Capability::FileSearch),
             CapabilityState::Partial,

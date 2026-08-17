@@ -48,7 +48,18 @@ pub enum Capability {
     Clipboard,
     GlobalHotkeys,
     ProcessLaunch,
+    /// Handing a URI to whatever the session registered for its scheme.
     UriOpen,
+    /// Handing a filesystem path to the desktop's default handler for it, and
+    /// showing that path in the desktop's file manager.
+    ///
+    /// Deliberately not folded into [`Self::UriOpen`]. The two questions have
+    /// different answers on Linux: opening a `https:` URI means resolving a
+    /// scheme handler, which this workspace has no portal client and no rule
+    /// for, while opening a path means `xdg-open`, which every freedesktop
+    /// desktop ships. One arm would have to answer both, and whichever answer
+    /// it gave would be a lie about the other.
+    FileOpen,
     WindowEnumeration,
     WindowActivation,
     Notifications,
@@ -154,6 +165,15 @@ pub fn application_items(plugin: &PluginId, discovered: &[DiscoveredApplication]
 /// registered", which are different authority questions.
 pub const FILE_OPEN_ACTION_ID: &str = "crikey.file.open";
 
+/// Host-mediated action that shows a file or folder in the file manager.
+///
+/// A second id rather than an argument to the first, because the two do
+/// different things to different objects: opening a spreadsheet starts the
+/// spreadsheet editor, while revealing it starts the file manager on the
+/// directory that contains it. A user who picks the wrong one of those notices
+/// immediately, so they must be separately pickable.
+pub const FILE_REVEAL_ACTION_ID: &str = "crikey.file.reveal";
+
 /// Maps one search's hits into catalog items owned by `plugin`.
 ///
 /// The label is the basename and the description is the containing directory,
@@ -189,17 +209,29 @@ pub fn file_items(plugin: &PluginId, hits: &[FileHit]) -> Vec<Item> {
                 metadata: BTreeMap::new(),
                 hit_policy: HitPolicy::Recorded,
                 score_hint: 0,
-                actions: vec![Action {
-                    action_id: ActionId(FILE_OPEN_ACTION_ID.to_owned()),
-                    label: match hit.kind {
-                        FileKind::File => "Open".to_owned(),
-                        FileKind::Directory => "Open folder".to_owned(),
+                // Open first: it is the default action, which is what pressing
+                // Enter on the row runs.
+                actions: vec![
+                    Action {
+                        action_id: ActionId(FILE_OPEN_ACTION_ID.to_owned()),
+                        label: match hit.kind {
+                            FileKind::File => "Open".to_owned(),
+                            FileKind::Directory => "Open folder".to_owned(),
+                        },
+                        description: "Open this with the desktop's default handler".to_owned(),
+                        applicable_categories: vec![Category::File, Category::Directory],
+                        icon_reference: None,
+                        execution_policy: ExecutionPolicy::HostMediated,
                     },
-                    description: "Open this with the desktop's default handler".to_owned(),
-                    applicable_categories: vec![Category::File, Category::Directory],
-                    icon_reference: None,
-                    execution_policy: ExecutionPolicy::HostMediated,
-                }],
+                    Action {
+                        action_id: ActionId(FILE_REVEAL_ACTION_ID.to_owned()),
+                        label: "Reveal in file manager".to_owned(),
+                        description: "Show this in the desktop's file manager".to_owned(),
+                        applicable_categories: vec![Category::File, Category::Directory],
+                        icon_reference: None,
+                        execution_policy: ExecutionPolicy::HostMediated,
+                    },
+                ],
             }
         })
         .collect()
@@ -1016,6 +1048,33 @@ pub trait ProcessLauncher {
         self.launch(target, args)
     }
     fn open_uri(&self, uri: &str) -> Result<()>;
+}
+
+/// Handing a filesystem path to the desktop (spec 18.2, [`Capability::FileOpen`]).
+///
+/// Separate from [`ProcessLauncher`] because the authority is different, not
+/// because the mechanism is: a launcher runs a program *this workspace chose*
+/// with an argument vector it assembled, while an opener hands a path the user
+/// picked to whatever that user's desktop has registered for it. Keeping the
+/// two traits apart keeps that distinction visible at every call site, and
+/// lets a backend offer one without claiming the other.
+///
+/// Every implementation takes a [`PlatformPath`], never a `String`, and every
+/// implementation passes it as one argv entry or one Win32 argument. A path is
+/// not text on either platform family (ADR-0007), and a filename containing
+/// `;`, `$(reboot)` or a newline is an ordinary filename that must open --
+/// never a command. No implementation here may reach a shell.
+pub trait FileOpener {
+    /// Opens `path` with the desktop's default handler for it.
+    fn open_path(&self, path: &PlatformPath) -> Result<()>;
+
+    /// Shows `path` in the desktop's file manager.
+    ///
+    /// Distinct from [`Self::open_path`]: opening a document starts the
+    /// application registered for it, while revealing it starts the file
+    /// manager on the directory holding it. How closely a backend can select
+    /// the item itself is the backend's business and is documented there.
+    fn reveal_path(&self, path: &PlatformPath) -> Result<()>;
 }
 
 pub trait Notifications {
