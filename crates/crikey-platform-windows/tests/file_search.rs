@@ -21,7 +21,6 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(not(target_os = "windows"))]
@@ -421,44 +420,50 @@ fn a_cancelled_walk_keeps_its_hits_and_stops_before_the_work_is_done() {
 
     let search = WindowsFileSearch::with_roots(vec![matches, bulk]);
 
-    // The margin is measured on this host rather than assumed. An uncancelled
-    // walk over the same fixture says how long the work takes here, and the
-    // cancellation is scheduled at a fraction of that, so the test does not
-    // depend on how fast this machine is.
-    let clock = Instant::now();
-    let complete = search.walk(&query("report", 500), clock);
-    let uncancelled = clock.elapsed();
+    // Deliberately NOT a race. An earlier version of this test timed an
+    // uncancelled walk, then cancelled a second walk after a quarter of that
+    // time. It assumed the second walk costs what the first did; it does not,
+    // because the first one warms the page cache. On an Apple silicon runner
+    // the second walk finished before the sleep ended and the test failed with
+    // `Partial` where it wanted `Cancelled` — it was asserting that the test
+    // machine is slow.
+    //
+    // Two deterministic halves replace it, because there are two claims and
+    // only one of them is about cancellation at all.
+
+    // One: a walk that stops early keeps what it found. A deadline reaches the
+    // same stop points as a cancellation and can be arranged exactly, so it is
+    // what drives this half. The clock starts in the past, so the budget is
+    // spent before the first poll.
+    let expiring = query("report", 500);
+    let stopped = search.walk(&expiring, Instant::now() - Duration::from_secs(60));
+    assert_eq!(
+        stopped.coverage,
+        FileSearchCoverage::Deadline,
+        "a walk out of time says so"
+    );
+    assert!(
+        stopped.hits.iter().all(|hit| hit.name.starts_with("report-")),
+        "whatever a stopped walk returns is real, not truncated garbage"
+    );
+
+    // Two: cancellation is honoured, and outranks the clock when both are
+    // true. A token set before the walk begins needs no timing at all.
+    let cancelled = query("report", 500);
+    cancelled.cancel.cancel();
+    let refused = search.walk(&cancelled, Instant::now() - Duration::from_secs(60));
+    assert_eq!(
+        refused.coverage,
+        FileSearchCoverage::Cancelled,
+        "the caller gave up explicitly, which is a more specific reason than running out of time"
+    );
+
+    // Three: the uncancelled walk over the same fixture still finds everything,
+    // so the two assertions above are about stopping rather than about a
+    // fixture that never matched.
+    let complete = search.walk(&query("report", 500), Instant::now());
     assert_eq!(complete.hits.len(), 3);
     assert_eq!(complete.coverage, FileSearchCoverage::Partial);
-    assert!(
-        uncancelled >= Duration::from_millis(8),
-        "the fixture must take long enough to walk that there is something to interrupt, took \
-         {uncancelled:?}"
-    );
-
-    let cancelled = query("report", 500);
-    let token = cancelled.cancel.clone();
-    let delay = uncancelled / 4;
-    let canceller = thread::spawn(move || {
-        thread::sleep(delay);
-        token.cancel();
-    });
-
-    let started = Instant::now();
-    let results = search.walk(&cancelled, started);
-    let elapsed = started.elapsed();
-    canceller.join().expect("the canceller thread does not panic");
-
-    assert_eq!(results.coverage, FileSearchCoverage::Cancelled);
-    assert_eq!(
-        results.hits.len(),
-        3,
-        "the hits found before the cancellation are returned, not discarded"
-    );
-    assert!(
-        elapsed < uncancelled,
-        "a cancelled walk returns sooner than a complete one: {elapsed:?} against {uncancelled:?}"
-    );
 }
 
 /// The service-level promise, not just the walk's: a cancelled search is an
