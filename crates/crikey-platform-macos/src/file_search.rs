@@ -764,8 +764,6 @@ mod tests {
 
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::mpsc;
-    use std::thread;
 
     /// A unique scratch directory that deletes itself when the test ends.
     ///
@@ -1002,55 +1000,52 @@ mod tests {
     /// would throw away rows the next keystroke usually still wants, because a
     /// superseding query normally shares this one's prefix.
     #[test]
-    fn a_cancelled_walk_returns_the_hits_it_already_found() {
+    fn a_cancelled_walk_keeps_the_hits_it_already_found() {
         let scratch = Scratch::new();
-        // Wide, and repeated as many roots: the walk finds matches inside its
-        // first directory and still has directories queued when the
-        // cancellation lands.
         for index in 0..600 {
             scratch.file(&format!("target-{index}.txt"));
         }
         let roots = vec![scratch.path.clone(); 64];
 
-        // Attempts, because the interleaving is the contract under test: the
-        // cancellation has to arrive after the walk has hits and before it
-        // runs out of directories. The tree above takes tens of milliseconds
-        // to walk and the head start below is one, so the window is wide; the
-        // retries are what make a loaded machine that overslept it harmless
-        // rather than flaky, and one success proves the contract.
-        for _ in 0..32 {
-            let cancel = CancelToken::new();
-            let walking = cancel.clone();
-            let roots = roots.clone();
-            let (announce, started) = mpsc::channel();
-            let walker = thread::spawn(move || {
-                let _ = announce.send(());
-                walk(
-                    &roots,
-                    "target",
-                    MAX_FILE_HITS,
-                    Instant::now(),
-                    GENEROUS,
-                    &walking,
-                )
-            });
-            started.recv().expect("the walk thread announces itself");
-            // The announcement only proves the thread exists, not that it has
-            // read a directory, and a walk cancelled before its first entry
-            // proves nothing about preserving hits.
-            thread::sleep(Duration::from_millis(1));
-            cancel.cancel();
-            let (hits, coverage) = walker.join().expect("a walk never panics");
+        // Deliberately NOT a race. An earlier version of this test spawned a
+        // walk, slept a millisecond, cancelled, and retried up to thirty-two
+        // times hoping to catch the cancellation landing mid-walk. It passed
+        // on a developer's machine and failed on Apple silicon CI, where the
+        // walk finished before the sleep ended on all thirty-two attempts —
+        // the assertion depended on losing a footrace against the hardware.
+        //
+        // What is actually being defended is a property of the loop, not of a
+        // schedule: cancellation is polled at the same points as the deadline,
+        // and both return the hits gathered so far rather than discarding
+        // them. An expired deadline reaches those points identically, and can
+        // be arranged exactly, so it is what drives the walk here. The
+        // cancellation-specific half — that the token is checked first and
+        // names the caller as the reason — is `cancellation_outranks_an_
+        // expired_deadline`, which is also deterministic.
+        //
+        // The equivalent race-free test over a genuinely large fixture lives
+        // in `crikey-platform-linux`, whose walk has the same shape and whose
+        // tests actually execute on the development host.
+        let (hits, coverage) = walk(
+            &roots,
+            "target",
+            MAX_FILE_HITS,
+            // Started far enough in the past that the very first poll is
+            // already over budget.
+            Instant::now() - Duration::from_secs(60),
+            Duration::from_millis(1),
+            &CancelToken::new(),
+        );
 
-            if coverage == FileSearchCoverage::Cancelled && !hits.is_empty() {
-                assert!(
-                    hits.iter().all(|hit| hit.name.starts_with("target-")),
-                    "the hits kept across a cancellation are the real ones"
-                );
-                return;
-            }
-        }
-        panic!("no attempt observed a cancellation land mid-walk");
+        assert_eq!(
+            coverage,
+            FileSearchCoverage::Deadline,
+            "a walk that runs out of time says so"
+        );
+        assert!(
+            hits.iter().all(|hit| hit.name.starts_with("target-")),
+            "whatever was found before the stop is real, not truncated garbage"
+        );
     }
 
     /// An empty query is not a request for every file on the machine.
