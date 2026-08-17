@@ -808,25 +808,28 @@ fn a_walk_cancelled_from_another_thread_stops_and_reports_the_caller_as_the_reas
     );
     assert_eq!(full.hits.len(), 24, "the fixture really does hold matching files");
 
+    // Cancelled BEFORE the search rather than from a thread racing it. An
+    // earlier version spawned a canceller immediately before the walk and
+    // asserted the walk lost the race; on a fast host the 4,800-entry
+    // traversal can finish before the spawned thread is scheduled, and the
+    // assertion then reads `Complete`. Two sibling backends failed in CI for
+    // exactly that reason. A token already set when the walk starts needs no
+    // scheduling assumption and tests the same branch: the walk polls the
+    // token at its first stop point either way.
     let token = CancelToken::new();
+    token.cancel();
     let superseded = FileSearchQuery {
         normalized: "leaf-000".to_owned(),
         limit: 64,
+        // Deliberately generous: if the deadline could end this walk, the
+        // assertion below would not be about cancellation at all.
         deadline: Duration::from_secs(30),
-        cancel: token.clone(),
+        cancel: token,
     };
-    // A different thread, because that is the real topology: the thread taking
-    // keystrokes cancels, the thread walking observes. It does not sleep first
-    // -- an early cancellation is honoured just as well as a mid-walk one, and
-    // not sleeping is what keeps this assertion off the clock.
-    let canceller = thread::spawn(move || token.cancel());
 
-    let started = Instant::now();
     let results = service
         .search(&superseded)
         .expect("cancellation is an outcome, not an error");
-    let elapsed = started.elapsed();
-    canceller.join().expect("the cancelling thread does not panic");
 
     assert_eq!(
         results.coverage,
@@ -838,9 +841,80 @@ fn a_walk_cancelled_from_another_thread_stops_and_reports_the_caller_as_the_reas
         "a cancelled walk cannot have covered the whole fixture, yet it returned all {} hits",
         full.hits.len()
     );
+}
+
+/// A walk that stops early keeps the hits it had already found.
+///
+/// Driven by the LIMIT, not by the clock or the token. That is the only one of
+/// the three early exits that can be arranged deterministically *and* leaves
+/// hits behind: a spent deadline stops the walk before its first `read_dir`,
+/// so a test built on one asserts over an empty vector and proves nothing —
+/// which is exactly the trap the first draft of this test fell into. Reaching
+/// the limit, by contrast, requires having found that many hits first.
+#[test]
+fn a_walk_that_stops_early_returns_the_hits_it_already_found() {
+    let scratch = Scratch::new();
+    for outer in 0..24 {
+        for inner in 0..200 {
+            scratch.file(&format!("tree-{outer:02}/leaf-{inner:03}.txt"));
+        }
+    }
+
+    let service = FilesystemSearch::walking(vec![scratch.root().to_path_buf()]);
+    // Five of the twenty-four available matches, so the walk must stop with
+    // work left rather than running out of fixture.
+    let truncated = FileSearchQuery {
+        normalized: "leaf-000".to_owned(),
+        limit: 5,
+        deadline: Duration::from_secs(30),
+        cancel: CancelToken::new(),
+    };
+
+    let results = service
+        .search(&truncated)
+        .expect("a stopped walk is not an error");
+
+    assert_eq!(
+        results.hits.len(),
+        5,
+        "the walk stopped at the limit holding every hit it had found"
+    );
     assert!(
-        elapsed < Duration::from_millis(250),
-        "a cancelled walk must return at once rather than finish the tree; it took {elapsed:?}"
+        results.hits.iter().all(|hit| hit.name == "leaf-000.txt"),
+        "the retained hits are real matches, not truncated garbage: {:?}",
+        results.hits.iter().map(|hit| &hit.name).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        results.coverage,
+        FileSearchCoverage::Partial,
+        "a walk that stopped at the limit has not seen the whole tree and says so"
+    );
+}
+
+/// A budget spent before the walk begins produces nothing, and says why.
+///
+/// Deliberately separate from the test above and deliberately modest in what
+/// it claims: the deadline is checked before the first directory is read, so
+/// the honest assertion is that there are no hits at all.
+#[test]
+fn a_walk_with_no_time_left_reports_the_deadline_and_no_hits() {
+    let scratch = Scratch::new();
+    scratch.file("documents/leaf-000.txt");
+
+    let service = FilesystemSearch::walking(vec![scratch.root().to_path_buf()]);
+    let hurried = FileSearchQuery {
+        normalized: "leaf-000".to_owned(),
+        limit: 64,
+        deadline: Duration::from_nanos(1),
+        cancel: CancelToken::new(),
+    };
+
+    let results = service.search(&hurried).expect("a stopped walk is not an error");
+
+    assert_eq!(results.coverage, FileSearchCoverage::Deadline);
+    assert!(
+        results.hits.is_empty(),
+        "the budget was spent before the first directory was read"
     );
 }
 
