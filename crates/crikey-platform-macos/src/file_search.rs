@@ -569,9 +569,7 @@ mod spotlight {
         // so every later keystroke would find Spotlight permanently "busy" and
         // silently walk instead. A stuck flag is a quieter failure than a
         // leaked thread and a longer-lived one.
-        let Some(permit) = QueryPermit::acquire() else {
-            return None;
-        };
+        let permit = QueryPermit::acquire()?;
         let (sender, receiver) = mpsc::channel();
         let spawned = thread::Builder::new()
             .name("crikey-spotlight".to_owned())
