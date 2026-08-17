@@ -143,6 +143,27 @@ const TYPE_UNITS: usize = 64;
 /// number of *live* queries, not the number of waits.
 static QUERY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// Ownership of the single query slot, released on drop.
+///
+/// See the acquisition site for why this is a guard and not a pair of stores.
+struct QueryPermit;
+
+impl QueryPermit {
+    /// Takes the slot, or `None` when a query is already outstanding.
+    fn acquire() -> Option<Self> {
+        QUERY_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for QueryPermit {
+    fn drop(&mut self) {
+        QUERY_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
 /// What the query thread has to say to the caller.
 enum Message {
     /// Hits from one `GetNextRows` batch.
@@ -194,14 +215,18 @@ pub(super) fn search(
     // A caller that finds the permit taken walks instead of queueing: a walk
     // that answers now beats a catalog answer that arrives after the user has
     // typed three more characters.
-    if QUERY_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+    //
+    // A guard rather than a matching pair of `store` calls, because the release
+    // has to survive an unwind. A panic anywhere in the COM call chain or the
+    // row decoding would skip a manual release and leave the flag set for the
+    // life of the process, quietly forcing every later search onto the walk
+    // forever. That is a subtler failure than the leaked threads this permit
+    // exists to prevent, and a longer-lived one.
+    let Some(permit) = QueryPermit::acquire() else {
         return Err(CoreError::Invalid(
             "a Windows Search query is already outstanding for this process".to_owned(),
         ));
-    }
+    };
 
     let (sender, receiver) = mpsc::channel();
     let owned_sql = sql.to_owned();
@@ -211,6 +236,9 @@ pub(super) fn search(
     let spawned = thread::Builder::new()
         .name("crikey-file-search".to_owned())
         .spawn(move || {
+            // Moved in because the permit tracks the QUERY, which outlives an
+            // abandoned wait. Dropped when this closure ends, panic included.
+            let _permit = permit;
             let message = match query(&owned_sql, limit, &worker_cancel, &sender) {
                 Ok(()) => Message::Finished,
                 Err(refusal) => Message::Refused(refusal),
@@ -218,13 +246,10 @@ pub(super) fn search(
             // A closed channel means the caller stopped listening at its
             // deadline. There is nobody to tell, and that is not an error.
             let _ = sender.send(message);
-            // Released by the worker rather than the caller: the permit tracks
-            // the QUERY, which outlives an abandoned wait.
-            QUERY_IN_FLIGHT.store(false, Ordering::Release);
         });
     if let Err(error) = spawned {
-        // A permit that was never used must not be kept.
-        QUERY_IN_FLIGHT.store(false, Ordering::Release);
+        // The permit moved into a closure that never ran, so it was dropped
+        // with it; there is nothing to release here.
         return Err(CoreError::Invalid(format!(
             "the Windows Search index cannot be queried without a thread to wait on it: {error}"
         )));

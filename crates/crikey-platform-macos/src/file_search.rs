@@ -462,6 +462,30 @@ mod spotlight {
     /// instead sets the rate at which it leaks threads.
     static QUERY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+    /// Ownership of the single query slot, released on drop.
+    ///
+    /// A guard rather than a matching pair of `store` calls because the release
+    /// has to survive an unwind: a panic inside the FFI gather would skip a
+    /// manual release and leave the flag set forever, permanently convincing
+    /// every later search that Spotlight is busy.
+    struct QueryPermit;
+
+    impl QueryPermit {
+        /// Takes the slot, or `None` when a query is already outstanding.
+        fn acquire() -> Option<Self> {
+            QUERY_IN_FLIGHT
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .ok()
+                .map(|_| Self)
+        }
+    }
+
+    impl Drop for QueryPermit {
+        fn drop(&mut self) {
+            QUERY_IN_FLIGHT.store(false, Ordering::Release);
+        }
+    }
+
     /// Consecutive overruns before Spotlight is left alone.
     ///
     /// Two rather than one: a single slow query is ordinary on a machine that
@@ -536,18 +560,26 @@ mod spotlight {
             return None;
         }
         let predicate = predicate(needle)?;
-        // Acquire the single permit. Failure means another keystroke's query
-        // is still inside `mds`; the walk is the better answer.
-        if QUERY_IN_FLIGHT
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        // Failure to acquire means another keystroke's query is still inside
+        // `mds`; the walk is the better answer.
+        // Acquired here and released by the guard below, wherever the worker
+        // leaves. A manual `store(false)` at the end of the closure looked
+        // equivalent and was not: an unwinding panic anywhere inside `gather`
+        // would skip it and leave the permit set for the life of the process,
+        // so every later keystroke would find Spotlight permanently "busy" and
+        // silently walk instead. A stuck flag is a quieter failure than a
+        // leaked thread and a longer-lived one.
+        let Some(permit) = QueryPermit::acquire() else {
             return None;
-        }
+        };
         let (sender, receiver) = mpsc::channel();
         let spawned = thread::Builder::new()
             .name("crikey-spotlight".to_owned())
             .spawn(move || {
+                // Moved into the worker because the permit tracks the QUERY,
+                // which outlives an abandoned wait. Dropped when this closure
+                // ends, including by panic.
+                let _permit = permit;
                 // SAFETY: `gather` owns every CoreFoundation object it makes
                 // and hands back only owned Rust values, so nothing borrowed
                 // from this thread outlives it.
@@ -555,14 +587,10 @@ mod spotlight {
                 // The receiver is gone when the deadline expired first. That
                 // is the designed outcome, not an error.
                 let _ = sender.send(found);
-                // Released here rather than by the caller: the permit tracks
-                // the QUERY, which outlives an abandoned wait.
-                QUERY_IN_FLIGHT.store(false, Ordering::Release);
             });
         if spawned.is_err() {
-            // A process that cannot spawn a thread cannot run a query either,
-            // but it must not keep the permit it never used.
-            QUERY_IN_FLIGHT.store(false, Ordering::Release);
+            // The permit went into the closure that never ran, so it was
+            // dropped with it; nothing to release here.
             return None;
         }
         // Waited for in poll-length slices rather than in one blocking call.
