@@ -32,6 +32,34 @@
 //! query finishes into a closed channel and the thread exits; the next keystroke
 //! does not wait for it.
 //!
+//! # What a cancellation can actually stop here
+//!
+//! Three different things, and it is worth being exact about which:
+//!
+//! * **Before any COM work**, a cancelled token means the search never starts:
+//!   no activation, no apartment, no thread.
+//! * **The caller's drain loop** stops within [`CANCEL_POLL`] and returns the
+//!   batches it already has as [`FileSearchCoverage::Cancelled`].
+//! * **The worker** stops at a *batch boundary*: it checks the token before each
+//!   `GetNextRows` and after each send, so it stops fetching instead of draining
+//!   the rest of the rowset.
+//!
+//! What cannot be stopped is a call already inside the provider. `GetNextRows`
+//! is synchronous and has no documented mid-call abort; `ICommand::Cancel`
+//! applies only between `Execute` being entered and returning, and
+//! `IDBAsynchStatus::Abort` covers asynchronous rowset population, which this
+//! module does not request. So a cancellation arriving during a fetch is
+//! honoured when that fetch returns, not before.
+//!
+//! Abandoning the rowset part-way is nonetheless safe: a final release of the
+//! rowset's interface pointers cleans up the row handles subordinate to it, and
+//! this module releases each batch's handles with `ReleaseRows` and frees the
+//! provider-allocated handle array with the COM task allocator as it goes, so
+//! the cancellation path leaves nothing outstanding. The accessor is the one
+//! object that needs its own `ReleaseAccessor`, which is what [`Accessor`]'s
+//! `Drop` is for, and every release happens on the thread and in the apartment
+//! that created the objects, as COM requires.
+//!
 //! # Why there is no MFT enumeration here
 //!
 //! See the module documentation of [`super`]: `FSCTL_ENUM_USN_DATA` and
@@ -62,7 +90,7 @@ use windows::Win32::System::Search::{
 };
 
 use crikey_core::{CoreError, PlatformPath, Result};
-use crikey_platform::{FileHit, FileKind, FileSearchCoverage, FileSearchResults};
+use crikey_platform::{CancelToken, FileHit, FileKind, FileSearchCoverage, FileSearchResults};
 
 use crate::win32::Apartment;
 
@@ -80,6 +108,17 @@ const DBGUID_DEFAULT: GUID = GUID::from_u128(0xc8b521fb_5cf3_11ce_ade5_00aa00447
 /// that the caller sees the first batch long before the last one and can stop at
 /// its deadline with real hits in hand.
 const BATCH: usize = 32;
+
+/// Longest the caller waits on the channel before looking at the cancellation
+/// token again.
+///
+/// The deadline is generous by design -- a second is reasonable, because the
+/// provider runs off the UI thread -- so a plain `recv_timeout(remaining)` would
+/// leave a cancelled search holding its batches until the provider next spoke.
+/// Slicing the wait bounds that to this interval, which is well under the delay
+/// a user could perceive between keystrokes, at a cost of at most a couple of
+/// hundred timer wakeups across a whole one-second deadline.
+const CANCEL_POLL: Duration = Duration::from_millis(5);
 
 /// UTF-16 code units reserved for a bound `System.ItemPathDisplay`.
 ///
@@ -123,16 +162,28 @@ pub(super) fn search(
     sql: &str,
     started: Instant,
     deadline: Duration,
+    cancel: &CancelToken,
     limit: usize,
 ) -> Result<FileSearchResults> {
+    // Cheapest possible honesty: a search superseded before it began does not
+    // activate the Search service, does not enter an apartment and does not
+    // spawn a thread whose COM teardown someone would have to wait for.
+    if cancel.is_cancelled() {
+        return Ok(FileSearchResults {
+            hits: Vec::new(),
+            coverage: FileSearchCoverage::Cancelled,
+        });
+    }
+
     let (sender, receiver) = mpsc::channel();
     let owned_sql = sql.to_owned();
+    let worker_cancel = cancel.clone();
     // A named thread so a stuck provider is identifiable in a debugger or a
     // crash dump rather than being one more anonymous worker.
     thread::Builder::new()
         .name("crikey-file-search".to_owned())
         .spawn(move || {
-            let message = match query(&owned_sql, limit, &sender) {
+            let message = match query(&owned_sql, limit, &worker_cancel, &sender) {
                 Ok(()) => Message::Finished,
                 Err(refusal) => Message::Refused(refusal),
             };
@@ -149,8 +200,20 @@ pub(super) fn search(
     let mut hits: Vec<FileHit> = Vec::new();
     let mut coverage = FileSearchCoverage::Partial;
     loop {
+        // Cancellation is decided here rather than inside the `recv_timeout`
+        // arm so that it is checked once per slice however the wait ended, and
+        // ahead of the deadline because a caller who gave up is told that
+        // rather than that the clock ran out.
+        if cancel.is_cancelled() {
+            coverage = FileSearchCoverage::Cancelled;
+            break;
+        }
         let remaining = deadline.saturating_sub(started.elapsed());
-        match receiver.recv_timeout(remaining) {
+        if remaining.is_zero() {
+            coverage = FileSearchCoverage::Deadline;
+            break;
+        }
+        match receiver.recv_timeout(remaining.min(CANCEL_POLL)) {
             Ok(Message::Rows(mut batch)) => hits.append(&mut batch),
             Ok(Message::Finished) => break,
             // Before any row, a refusal means the catalog cannot answer and the
@@ -172,10 +235,9 @@ pub(super) fn search(
                 }
                 break;
             }
-            Err(RecvTimeoutError::Timeout) => {
-                coverage = FileSearchCoverage::Deadline;
-                break;
-            }
+            // One poll slice with nothing to show for it. Whether that is the
+            // end of the wait is the top of the loop's decision.
+            Err(RecvTimeoutError::Timeout) => continue,
         }
         if hits.len() >= limit {
             break;
@@ -195,10 +257,16 @@ fn refused(error: Error) -> CoreError {
 
 /// Runs `sql` against `SystemIndex`, sending each fetched batch to `sender`.
 ///
-/// Returns once the rowset is drained, `sender` is closed, or `limit` hits have
-/// been sent. Every COM object is created and released inside this function, on
-/// this thread, because none of them may cross an apartment boundary.
-fn query(sql: &str, limit: usize, sender: &Sender<Message>) -> Result<()> {
+/// Returns once the rowset is drained, `sender` is closed, `cancel` is set, or
+/// `limit` hits have been sent. Every COM object is created and released inside
+/// this function, on this thread, because none of them may cross an apartment
+/// boundary.
+///
+/// `cancel` is polled at the batch boundary and nowhere finer, which is the
+/// honest limit of this path: `ICommand::Execute` and `IRowset::GetNextRows` are
+/// synchronous calls into the provider, and a call already inside the Search
+/// service cannot be taken back.
+fn query(sql: &str, limit: usize, cancel: &CancelToken, sender: &Sender<Message>) -> Result<()> {
     let _apartment = Apartment::enter("a Windows Search query")?;
 
     // SAFETY: an in-process activation of a documented shell class; the class id
@@ -298,6 +366,9 @@ fn query(sql: &str, limit: usize, sender: &Sender<Message>) -> Result<()> {
     let mut rows = vec![Row::EMPTY; BATCH];
     let mut sent = 0usize;
     while sent < limit {
+        if cancel.is_cancelled() {
+            break;
+        }
         // The provider allocates the handle array and writes its address into
         // the first element; the slice length is how many rows are wanted.
         let mut handles = [ptr::null_mut::<usize>(); BATCH];
@@ -342,6 +413,13 @@ fn query(sql: &str, limit: usize, sender: &Sender<Message>) -> Result<()> {
         sent += batch.len();
         if sender.send(Message::Rows(batch)).is_err() {
             // The caller reached its deadline and stopped listening.
+            break;
+        }
+        if cancel.is_cancelled() {
+            // Checked again after the send because the batch just handed over is
+            // work the caller may still want, while the next `GetNextRows` is
+            // work nobody does. Stopping here leaves the rowset undrained on
+            // purpose.
             break;
         }
         // A short batch means the rowset had no more to give.

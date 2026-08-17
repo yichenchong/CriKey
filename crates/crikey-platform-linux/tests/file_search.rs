@@ -28,10 +28,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crikey_platform::{
-    FileKind, FileSearchCoverage, FileSearchQuery, FileSearchResults, FileSearchService, MAX_FILE_HITS,
+    CancelToken, FileKind, FileSearchCoverage, FileSearchQuery, FileSearchResults, FileSearchService,
+    MAX_FILE_HITS,
 };
 use crikey_platform_linux::FilesystemSearch;
 
@@ -126,6 +128,7 @@ fn query(text: &str, limit: usize) -> FileSearchQuery {
         normalized: text.to_owned(),
         limit,
         deadline: Duration::from_secs(30),
+        ..Default::default()
     }
 }
 
@@ -434,6 +437,7 @@ fn an_expired_deadline_returns_at_once_and_reports_the_clock_as_the_reason() {
         normalized: "deadline-".to_owned(),
         limit: 64,
         deadline: Duration::ZERO,
+        ..Default::default()
     };
 
     let started = Instant::now();
@@ -487,6 +491,7 @@ fn a_tiny_budget_over_a_large_fixture_returns_promptly_without_hanging() {
         normalized: "tiny-".to_owned(),
         limit: MAX_FILE_HITS,
         deadline: Duration::from_millis(1),
+        ..Default::default()
     };
 
     let started = Instant::now();
@@ -749,6 +754,7 @@ fn an_index_that_hangs_is_abandoned_within_the_deadline() {
         normalized: "patient-note".to_owned(),
         limit: 8,
         deadline: Duration::from_millis(300),
+        ..Default::default()
     };
 
     let started = Instant::now();
@@ -765,5 +771,123 @@ fn an_index_that_hangs_is_abandoned_within_the_deadline() {
             FileSearchCoverage::Deadline | FileSearchCoverage::Partial | FileSearchCoverage::Complete
         ),
         "whatever coverage it reports, the search must return an answer rather than an error"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation (spec 18.1)
+// ---------------------------------------------------------------------------
+
+/// A walk cancelled by another thread stops and says the caller gave up.
+///
+/// Kills the bug that makes a generous deadline unaffordable: with no
+/// cancellation check the walk below runs the whole fixture out, so every
+/// superseded keystroke costs a full traversal. The deadline here is 30
+/// seconds, so nothing but the token can end this search early -- a pass
+/// cannot come from the clock. `Cancelled` rather than `Deadline` because the
+/// two say different things to the caller: one invites a retry, the other
+/// records that the caller already moved on.
+#[test]
+fn a_walk_cancelled_from_another_thread_stops_and_reports_the_caller_as_the_reason() {
+    let scratch = Scratch::new();
+    // Large enough that the traversal is measurable work rather than a handful
+    // of syscalls: the needle matches one file per directory, so the walk has
+    // to read every entry instead of stopping at the limit.
+    for outer in 0..24 {
+        for inner in 0..200 {
+            scratch.file(&format!("tree-{outer:02}/leaf-{inner:03}.txt"));
+        }
+    }
+
+    let service = FilesystemSearch::walking(vec![scratch.root().to_path_buf()]);
+    let full = service.search(&query("leaf-000", 64)).expect("the walk answers");
+    assert_eq!(
+        full.coverage,
+        FileSearchCoverage::Complete,
+        "the fixture is searchable, so the cancelled answer below is a decision rather than a failure"
+    );
+    assert_eq!(full.hits.len(), 24, "the fixture really does hold matching files");
+
+    let token = CancelToken::new();
+    let superseded = FileSearchQuery {
+        normalized: "leaf-000".to_owned(),
+        limit: 64,
+        deadline: Duration::from_secs(30),
+        cancel: token.clone(),
+    };
+    // A different thread, because that is the real topology: the thread taking
+    // keystrokes cancels, the thread walking observes. It does not sleep first
+    // -- an early cancellation is honoured just as well as a mid-walk one, and
+    // not sleeping is what keeps this assertion off the clock.
+    let canceller = thread::spawn(move || token.cancel());
+
+    let started = Instant::now();
+    let results = service
+        .search(&superseded)
+        .expect("cancellation is an outcome, not an error");
+    let elapsed = started.elapsed();
+    canceller.join().expect("the cancelling thread does not panic");
+
+    assert_eq!(
+        results.coverage,
+        FileSearchCoverage::Cancelled,
+        "the caller gave up, and that outranks both the clock and the fixture"
+    );
+    assert!(
+        results.hits.len() < full.hits.len(),
+        "a cancelled walk cannot have covered the whole fixture, yet it returned all {} hits",
+        full.hits.len()
+    );
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "a cancelled walk must return at once rather than finish the tree; it took {elapsed:?}"
+    );
+}
+
+/// A cancelled delegation kills the index child instead of waiting it out.
+///
+/// The index child is the one thing this backend can truly stop -- it is a
+/// separate process, so the signal ends its work rather than merely abandoning
+/// it. The stub sleeps far longer than the budget and the budget is far longer
+/// than the cancellation, so the only way to return inside the bound is to kill
+/// the child when the token flips.
+#[test]
+fn a_cancelled_delegation_kills_the_index_child_rather_than_waiting_out_its_budget() {
+    let scratch = Scratch::new();
+    scratch.file("documents/patient-note.txt");
+    let stub = scratch.stub_locate("stub-locate", "#!/bin/sh\nsleep 30\n");
+
+    let service = FilesystemSearch::with_locate(vec![scratch.root().to_path_buf()], stub);
+    let token = CancelToken::new();
+    let superseded = FileSearchQuery {
+        normalized: "patient-note".to_owned(),
+        limit: 8,
+        // Generous on purpose: half of this is the delegation's budget, so a
+        // pass here cannot come from the timeout.
+        deadline: Duration::from_secs(20),
+        cancel: token.clone(),
+    };
+    let canceller = thread::spawn(move || {
+        // Long enough that the child is certainly running, short enough that
+        // the assertion below has no room to pass by accident.
+        thread::sleep(Duration::from_millis(50));
+        token.cancel();
+    });
+
+    let started = Instant::now();
+    let results = service
+        .search(&superseded)
+        .expect("cancelling a delegation is not an error");
+    let elapsed = started.elapsed();
+    canceller.join().expect("the cancelling thread does not panic");
+
+    assert_eq!(
+        results.coverage,
+        FileSearchCoverage::Cancelled,
+        "the delegation was cancelled, and falling back to a walk would spend a budget the caller disowned"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the child must be killed when the token flips, not waited out; it took {elapsed:?}"
     );
 }

@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use crikey_app::App;
 use crikey_core::{Category, ExecutionPolicy, PluginId};
-use crikey_platform::{FileSearchQuery, FILE_OPEN_ACTION_ID, MAX_FILE_HITS};
+use crikey_platform::{CancelToken, FileSearchQuery, FILE_OPEN_ACTION_ID, MAX_FILE_HITS};
 use crikey_platform_linux::{FilesystemSearch, LinuxBackend};
 
 /// A scratch tree removed when the test that made it ends.
@@ -60,6 +60,7 @@ fn query(text: &str) -> FileSearchQuery {
         normalized: text.to_owned(),
         limit: MAX_FILE_HITS,
         deadline: Duration::from_secs(5),
+        cancel: CancelToken::new(),
     }
 }
 

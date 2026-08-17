@@ -35,6 +35,19 @@
 //! codebase makes, so the MFT route is deliberately not implemented, here or
 //! behind a feature flag.
 //!
+//! # What cancellation stops
+//!
+//! The two sources honour a cancelled [`FileSearchQuery::cancel`] to different
+//! degrees, and the difference is real rather than an implementation detail.
+//! [`WindowsFileSearch::walk`] owns its loop and stops within one directory read
+//! or 128 entries. The catalog is reached through synchronous OLE DB calls, so
+//! [`win32`] can decline to start, stop collecting batches, and stop asking for
+//! more of them, but it cannot take back a `GetNextRows` already inside the
+//! Search service; its granularity is one batch. Either way the hits already
+//! found come back as [`FileSearchCoverage::Cancelled`] rather than being
+//! discarded, because the keystroke that superseded this search usually shares a
+//! prefix with it.
+//!
 //! # What runs off Windows
 //!
 //! Everything except [`win32`]: the SQL builder, the escaping rules, the
@@ -129,11 +142,14 @@ impl WindowsFileSearch {
     /// are never descended into, so the cap is a second line of defence.
     pub const MAX_DEPTH: usize = 12;
 
-    /// How many directory entries the walk inspects between two clock reads.
+    /// How many directory entries the walk inspects between two checks of the
+    /// clock and of the caller's cancellation token.
     ///
     /// `Instant::now` is cheap but not free, and a walk that checks it per entry
     /// spends measurable time asking what time it is. Every 128 entries bounds
-    /// the overrun to one directory read's worth of work.
+    /// the overrun to one directory read's worth of work. The cancellation
+    /// token is polled at the same points, as the shared contract requires, and
+    /// costs one atomic load per stride.
     pub const DEADLINE_CHECK_STRIDE: usize = 128;
 
     /// Searches the `SystemIndex` catalog and this user's profile folders.
@@ -199,7 +215,7 @@ impl WindowsFileSearch {
         }
         let sql = system_index_sql(query)
             .ok_or_else(|| CoreError::Invalid("an empty query has nothing to ask the index".to_owned()))?;
-        win32::search(&sql, started, query.deadline, limit)
+        win32::search(&sql, started, query.deadline, &query.cancel, limit)
     }
 
     /// There is no catalog on a build that is not Windows, whatever the searcher
@@ -226,6 +242,11 @@ impl WindowsFileSearch {
     /// reported when they match but never descended into, so a junction cycle
     /// cannot make the walk run forever. Coverage is never `Complete`: these
     /// roots are a handful of directories, not the filesystem.
+    ///
+    /// This is the one part of the backend that stops the instant it is asked
+    /// to: the loop is ours, so a cancellation is noticed within one directory
+    /// read or 128 entries and the hits found so far come back as
+    /// [`FileSearchCoverage::Cancelled`].
     pub fn walk(&self, query: &FileSearchQuery, started: Instant) -> FileSearchResults {
         let limit = query.limit.min(MAX_FILE_HITS);
         let mut hits = Vec::new();
@@ -242,6 +263,13 @@ impl WindowsFileSearch {
         let mut inspected = 0usize;
 
         'walk: while let Some((directory, depth)) = pending.pop_front() {
+            // Cancellation before the deadline because it is the stronger fact:
+            // a caller who has given up gets told that, not that the clock ran
+            // out. This loop is ours, so the stop is one directory read away.
+            if query.cancel.is_cancelled() {
+                coverage = FileSearchCoverage::Cancelled;
+                break;
+            }
             if started.elapsed() >= query.deadline {
                 coverage = FileSearchCoverage::Deadline;
                 break;
@@ -255,9 +283,15 @@ impl WindowsFileSearch {
 
             for entry in entries.flatten() {
                 inspected += 1;
-                if inspected % Self::DEADLINE_CHECK_STRIDE == 0 && started.elapsed() >= query.deadline {
-                    coverage = FileSearchCoverage::Deadline;
-                    break 'walk;
+                if inspected % Self::DEADLINE_CHECK_STRIDE == 0 {
+                    if query.cancel.is_cancelled() {
+                        coverage = FileSearchCoverage::Cancelled;
+                        break 'walk;
+                    }
+                    if started.elapsed() >= query.deadline {
+                        coverage = FileSearchCoverage::Deadline;
+                        break 'walk;
+                    }
                 }
 
                 // `file_type` reads what the directory entry already carries and
@@ -338,12 +372,14 @@ impl FileSearchService for WindowsFileSearch {
         }
 
         // The catalog answered as much as the caller asked for, ran the clock out
-        // doing it, or left nowhere to walk. Any of the three makes its answer
-        // the whole answer.
+        // doing it, was cancelled, or left nowhere to walk. Any of the four makes
+        // its answer the whole answer -- and starting a walk after a cancellation
+        // would spend the work the cancellation exists to save.
         match self.indexed(query, started, limit) {
             Ok(results) => {
                 if results.hits.len() >= limit
                     || results.coverage == FileSearchCoverage::Deadline
+                    || results.coverage == FileSearchCoverage::Cancelled
                     || self.roots.is_empty()
                 {
                     self.answered.store(ANSWERED_INDEX, Ordering::Relaxed);
@@ -371,10 +407,16 @@ impl FileSearchService for WindowsFileSearch {
 /// The catalog comes first because it is the broader source and the walk is
 /// there to cover what the catalog's configured scope leaves out; a file inside
 /// both is one hit, and the deduplication is on the whole path because that is
-/// what the launcher opens and derives an item id from. Coverage is the weaker
-/// of the two: a deadline reached by either source bounded the answer.
+/// what the launcher opens and derives an item id from. Coverage is the weakest
+/// of the two: a deadline or a cancellation on either side bounded the answer,
+/// and a cancellation is reported ahead of a deadline because it is the more
+/// specific reason the answer is short.
 fn merge(indexed: FileSearchResults, walked: FileSearchResults, limit: usize) -> FileSearchResults {
-    let coverage = if indexed.coverage == FileSearchCoverage::Deadline
+    let coverage = if indexed.coverage == FileSearchCoverage::Cancelled
+        || walked.coverage == FileSearchCoverage::Cancelled
+    {
+        FileSearchCoverage::Cancelled
+    } else if indexed.coverage == FileSearchCoverage::Deadline
         || walked.coverage == FileSearchCoverage::Deadline
     {
         FileSearchCoverage::Deadline
