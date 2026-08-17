@@ -30,8 +30,8 @@ pub mod file_search;
 use crikey_core::{CoreError, PlatformPath, Result};
 use crikey_platform::{
     bundle_display_name, bundle_icon_path, parse_info_plist, ApplicationDiscovery, Capability,
-    CapabilityState, DiscoveredApplication, FileSearchService, IconLoader, IconProvider, PathIconSource,
-    ProcessLauncher, StandardDirectories,
+    CapabilityState, DiscoveredApplication, FileOpener, FileSearchService, IconLoader, IconProvider,
+    PathIconSource, ProcessLauncher, StandardDirectories,
 };
 use file_search::MacFileSearch;
 use std::collections::HashSet;
@@ -397,6 +397,47 @@ impl OpenLauncher {
     }
 }
 
+/// Opening a file or folder through Launch Services (spec 18.2).
+///
+/// The same `/usr/bin/open` the launcher uses, because on macOS these really
+/// are one mechanism: a positional operand is opened with the application
+/// Launch Services has associated with it, whether that operand is a document,
+/// a folder or a bundle.
+///
+/// The path travels as one argv entry. No shell is involved, which is not a
+/// stylistic preference: a file legitimately named `report;rm -rf ~.txt` or
+/// `$(reboot).pdf` is a file the user is entitled to open, and any construction
+/// that built a command *string* would run it instead. `Command` execs `open`
+/// directly, so those bytes can only ever arrive as an argument.
+impl FileOpener for OpenLauncher {
+    fn open_path(&self, path: &PlatformPath) -> Result<()> {
+        if path.as_os_str().is_empty() {
+            return Err(CoreError::Invalid(
+                "the macOS backend cannot open an empty path".to_owned(),
+            ));
+        }
+        let mut command = Command::new(OPEN);
+        command.arg(operand(path));
+        self.spawn(&mut command, &path.display().to_string())
+    }
+
+    /// Selects the item in the Finder, through `open -R`.
+    ///
+    /// A true reveal, unlike the other two backends: `-R` is Launch Services'
+    /// documented "reveal in Finder" and it selects the item rather than merely
+    /// opening the directory around it.
+    fn reveal_path(&self, path: &PlatformPath) -> Result<()> {
+        if path.as_os_str().is_empty() {
+            return Err(CoreError::Invalid(
+                "the macOS backend cannot reveal an empty path".to_owned(),
+            ));
+        }
+        let mut command = Command::new(OPEN);
+        command.arg("-R").arg(operand(path));
+        self.spawn(&mut command, &path.display().to_string())
+    }
+}
+
 /// Collects `child`'s exit status on a thread of its own.
 ///
 /// `open` hands the request to Launch Services and exits within milliseconds,
@@ -506,9 +547,14 @@ impl MacOsBackend {
     /// forces a deliberate answer here instead of inheriting a wildcard.
     pub fn capability(&self, capability: Capability) -> CapabilityState {
         match capability {
-            Capability::ApplicationDiscovery | Capability::ProcessLaunch | Capability::UriOpen => {
-                CapabilityState::Available
-            }
+            // `/usr/bin/open` is always present on macOS and resolves handlers,
+            // schemes and reveals alike, so all four are one claim here. That
+            // `FileOpen` and `UriOpen` are separate variants is a fact about
+            // Linux, not about this backend.
+            Capability::ApplicationDiscovery
+            | Capability::ProcessLaunch
+            | Capability::UriOpen
+            | Capability::FileOpen => CapabilityState::Available,
             // A bundle's own `.icns` resolves and decodes. Everything else macOS
             // calls an icon does not: a document icon composed by Launch
             // Services, a folder or volume icon, the generic icon for a bundle
@@ -540,6 +586,20 @@ impl MacOsBackend {
     /// [`Capability::UriOpen`].
     pub fn process_launcher(&self) -> &dyn ProcessLauncher {
         &self.processes
+    }
+
+    /// The opener behind [`Capability::FileOpen`].
+    ///
+    /// The same object as [`Self::process_launcher`], because on macOS it is
+    /// the same `/usr/bin/open`. Two accessors rather than one so that a caller
+    /// asks for the authority it needs: handing a user's document to Launch
+    /// Services is not the same decision as running a program.
+    ///
+    /// Always `Some`, for the same reason [`Self::file_search`] is: `Option` is
+    /// what the three backends' accessors have in common, and on Linux the
+    /// helper really can be missing.
+    pub fn file_opener(&self) -> Option<&dyn FileOpener> {
+        Some(&self.processes)
     }
 
     /// The provider behind [`Capability::Icons`], built on first use.

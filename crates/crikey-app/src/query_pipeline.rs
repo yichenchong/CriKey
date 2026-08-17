@@ -175,6 +175,20 @@ pub struct QueryPipeline {
     /// its deliveries. A producer that submits more than this has its whole
     /// batch refused rather than truncated, so it has to know the ceiling.
     max_items_per_batch: usize,
+    /// Items one plugin may contribute to one query in total.
+    ///
+    /// Retained for the same reason as the batch ceiling, and it is a different
+    /// ceiling: a producer that splits correctly into legal batches still has
+    /// its *next* batch refused whole once the running total would cross this,
+    /// and a refused batch becomes a pipeline error rather than a truncation.
+    /// A per-query producer therefore has to stop at this number, not merely
+    /// batch beneath the other one.
+    max_items_per_plugin_per_query: usize,
+    /// Items every plugin together may contribute to one query.
+    ///
+    /// Lowered on its own by the launcher's `max-results` setting, so it can be
+    /// smaller than the per-plugin quota above.
+    max_items_per_query: usize,
     unranked_batches: usize,
     registered: Vec<PluginId>,
     health_sync: HashMap<PluginId, HealthSync>,
@@ -231,6 +245,8 @@ impl QueryPipeline {
             last_intake_drain_at: None,
             result_trace_capacity,
             max_items_per_batch: config.limits.max_items_per_batch,
+            max_items_per_plugin_per_query: config.limits.max_items_per_plugin_per_query,
+            max_items_per_query: config.limits.max_items_per_query,
             unranked_batches: 0,
             registered: Vec::new(),
             health_sync: HashMap::new(),
@@ -260,6 +276,29 @@ impl QueryPipeline {
     /// this must split them rather than hope for truncation.
     pub fn max_items_per_batch(&self) -> usize {
         self.max_items_per_batch
+    }
+
+    /// The total items [`Self::deliver`] will accept from one plugin for one
+    /// query.
+    ///
+    /// A producer that can find more than this must stop here. Handing over the
+    /// extra does not truncate the answer, it gets the crossing batch refused
+    /// whole and turns a broad-but-legal query into a pipeline error and no
+    /// published frame at all.
+    pub fn max_items_per_plugin_per_query(&self) -> usize {
+        self.max_items_per_plugin_per_query
+    }
+
+    /// The total items [`Self::deliver`] will accept for one query across every
+    /// plugin.
+    ///
+    /// Separate from the per-owner quota and frequently *smaller* than it: the
+    /// launcher's `max-results` setting lowers this one alone, so a provider
+    /// that respects only the per-owner number can still be refused here. Both
+    /// bounds have to be obeyed, and a producer should cap at whichever is
+    /// lower.
+    pub fn max_items_per_query(&self) -> usize {
+        self.max_items_per_query
     }
 
     /// Records the profile override configured for a plugin. Providers must

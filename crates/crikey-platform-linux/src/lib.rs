@@ -46,7 +46,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read;
 use std::mem;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -57,7 +57,7 @@ use std::thread;
 
 use crikey_core::{CoreError, PlatformPath, Result};
 use crikey_platform::{
-    ApplicationDiscovery, Capability, CapabilityState, DiscoveredApplication, FileSearchService,
+    ApplicationDiscovery, Capability, CapabilityState, DiscoveredApplication, FileOpener, FileSearchService,
     HotkeyService, IconLoader, IconProvider, ProcessLauncher, StandardDirectories, WindowService,
 };
 
@@ -314,6 +314,157 @@ impl ProcessLauncher for CommandLauncher {
     }
 }
 
+/// The helper every freedesktop desktop ships to resolve a default handler.
+const XDG_OPEN: &str = "xdg-open";
+
+/// Opening a file or folder with the session's default handler (spec 18.2).
+///
+/// `xdg-open` and nothing else. Unlike URI opening -- which
+/// [`CommandLauncher::open_uri`] still refuses, because choosing among the
+/// scheme handlers a session may or may not have installed would be a guess --
+/// handing a *path* to `xdg-open` is the documented, desktop-independent way
+/// to do exactly this, and xdg-utils is a dependency of every desktop this
+/// backend targets. It is still probed for rather than assumed: see
+/// [`Self::for_session`].
+///
+/// The path travels as one `OsStr` argv entry. No shell is involved anywhere,
+/// which is not a stylistic preference: a file legitimately named
+/// `report;rm -rf ~.txt` or `$(reboot).pdf` is a file the user is entitled to
+/// open, and any construction that built a command *string* would run it
+/// instead. `Command` execs the helper directly, so those bytes can only ever
+/// arrive as `argv[1]`.
+#[derive(Debug, Clone)]
+pub struct XdgOpener {
+    helper: OsString,
+}
+
+impl XdgOpener {
+    /// The opener this session can actually use, or `None` when the helper is
+    /// not installed.
+    ///
+    /// Probed rather than assumed, for the same reason the portal is: a
+    /// container or a minimal unit may have no xdg-utils, and a backend that
+    /// claimed [`Capability::FileOpen`] there would hand the user a row whose
+    /// only action fails with `ENOENT` every time.
+    pub fn for_session() -> Option<Self> {
+        Self::on_path(XDG_OPEN).then(|| Self::with_helper(XDG_OPEN))
+    }
+
+    /// An opener that runs `helper` instead of `xdg-open`.
+    ///
+    /// The seam the argv tests need. Spawning the real handler would open
+    /// whatever the build host has registered -- a browser, an editor -- so the
+    /// only way to assert that a path arrives whole is to put a recorder where
+    /// the helper goes.
+    pub fn with_helper(helper: impl Into<OsString>) -> Self {
+        Self {
+            helper: helper.into(),
+        }
+    }
+
+    /// Whether `command` resolves to an executable file on `PATH`.
+    fn on_path(command: &str) -> bool {
+        env::var_os("PATH").is_some_and(|path| {
+            env::split_paths(&path).any(|directory| is_executable_file(&directory.join(command)))
+        })
+    }
+
+    /// Runs the helper on one path, detached, and returns once it exists.
+    ///
+    /// The same detachment [`ProcessLauncher::launch`] uses and for the same
+    /// reasons: the handler outlives the launcher, standard streams are closed
+    /// so nothing can block on a pipe nobody drains, a new process group keeps
+    /// a terminal interrupt from killing it, and a private waiter reaps it.
+    fn run(&self, operand: &Path, subject: &Path) -> Result<()> {
+        let mut child = Command::new(&self.helper)
+            // One argument, never a command line: see the type's documentation.
+            .arg(operand)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|error| {
+                // Both halves matter to whoever reads this: what was tried, and
+                // what the kernel said about it.
+                CoreError::Invalid(format!(
+                    "cannot open {} with {}: {error}",
+                    subject.display(),
+                    self.helper.to_string_lossy()
+                ))
+            })?;
+
+        let _ = thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    }
+}
+
+impl FileOpener for XdgOpener {
+    fn open_path(&self, path: &PlatformPath) -> Result<()> {
+        let path = non_empty(path)?;
+        self.run(&operand(path), path)
+    }
+
+    /// Opens the *containing directory* with the default file manager.
+    ///
+    /// Not a true reveal: no desktop-independent Linux mechanism selects an
+    /// item, and the one that comes closest --
+    /// `org.freedesktop.FileManager1.ShowItems` -- needs a DBus client this
+    /// crate does not have. Running `xdg-open` on the file instead would launch
+    /// its editor, which is [`Self::open_path`] under another name and the one
+    /// outcome a user asking to reveal it does not want. The compatibility
+    /// layer's `explore_file` already made this exact trade, so the launcher
+    /// behaves the same way wherever the request comes from.
+    fn reveal_path(&self, path: &PlatformPath) -> Result<()> {
+        let path = non_empty(path)?;
+        self.run(&operand(containing_directory(path)), path)
+    }
+}
+
+/// Rejects the empty path rather than handing the helper a bare `""`, which
+/// names no file and which `xdg-open` reports as a usage error on stderr this
+/// backend has closed.
+fn non_empty(path: &PlatformPath) -> Result<&Path> {
+    if path.as_os_str().is_empty() {
+        return Err(CoreError::Invalid(
+            "the linux backend cannot open an empty path".to_owned(),
+        ));
+    }
+    Ok(path.as_path())
+}
+
+/// The directory a path lives in.
+fn containing_directory(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        // A relative bare name lives in the process's own directory; `""` is
+        // not a directory and would be refused.
+        Some(_) => Path::new("."),
+        // A root has no parent and contains itself.
+        None => path,
+    }
+}
+
+/// A path spelled so the helper reads it as an operand and not as an option.
+///
+/// Only a relative path can begin with `-`, so prefixing `./` names the same
+/// file and can never collide with an absolute one. Without this a file called
+/// `-h` in the working directory would print the helper's usage instead of
+/// opening.
+fn operand(path: &Path) -> PathBuf {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.first() != Some(&b'-') {
+        return path.to_path_buf();
+    }
+
+    let mut prefixed = Vec::with_capacity(bytes.len() + 2);
+    prefixed.extend_from_slice(b"./");
+    prefixed.extend_from_slice(bytes);
+    PathBuf::from(OsString::from_vec(prefixed))
+}
+
 /// How the running session presents itself, which decides what window control
 /// and global shortcuts can honestly be claimed (spec 18.2, 18.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,6 +552,11 @@ pub struct LinuxBackend {
     /// [`Capability::FileSearch`] reports, and reporting must not change
     /// between two calls in one session.
     files: OnceLock<FilesystemSearch>,
+    /// Probed on first use and cached, for the same reason as the file search:
+    /// whether xdg-utils is installed is filesystem work, and the answer
+    /// decides what [`Capability::FileOpen`] reports, which must not change
+    /// between two calls in one session.
+    opener: OnceLock<Option<XdgOpener>>,
 }
 
 impl LinuxBackend {
@@ -462,6 +618,20 @@ impl LinuxBackend {
         self
     }
 
+    /// Opens files through `opener` instead of through the session's
+    /// `xdg-open`, or through nothing at all when it is `None`.
+    ///
+    /// The same kind of seam as [`Self::with_file_search`], and needed three
+    /// times over: what [`Capability::FileOpen`] may claim depends on the build
+    /// host's package list, asserting that a path reaches the helper whole
+    /// requires a helper that records instead of one that opens a browser, and
+    /// the helper-less session has to be reachable without mutating the
+    /// process-wide `PATH` that every other test is reading.
+    pub fn with_file_opener(self, opener: Option<XdgOpener>) -> Self {
+        let _ = self.opener.set(opener);
+        self
+    }
+
     fn build(applications: DesktopEntryScanner, desktop: DesktopEnvironment) -> Self {
         Self {
             applications,
@@ -474,6 +644,7 @@ impl LinuxBackend {
             user_time: Arc::new(AtomicU32::new(0)),
             icons: OnceLock::new(),
             files: OnceLock::new(),
+            opener: OnceLock::new(),
         }
     }
 
@@ -552,6 +723,15 @@ impl LinuxBackend {
                 Some(_) if self.files().uses_index() => CapabilityState::Partial,
                 Some(_) => CapabilityState::Available,
             },
+            // `xdg-open` either resolves on `PATH` or it does not, and there is
+            // no partial answer between those: the helper performs the whole
+            // handler lookup itself, so a session that has it can open anything
+            // that session has an association for. `UriOpen` stays
+            // `Unavailable` beside this on purpose -- see `Capability::FileOpen`.
+            Capability::FileOpen => match self.file_opener() {
+                Some(_) => CapabilityState::Available,
+                None => CapabilityState::Unavailable,
+            },
             Capability::Clipboard
             | Capability::UriOpen
             | Capability::Notifications
@@ -616,6 +796,20 @@ impl LinuxBackend {
     /// is a fact about this backend's session.
     fn files(&self) -> &FilesystemSearch {
         self.files.get_or_init(FilesystemSearch::for_session)
+    }
+
+    /// The service behind [`Capability::FileOpen`], or `None` when this
+    /// session has no `xdg-open` to hand a path to.
+    ///
+    /// `None` for the same reason [`Self::file_search`] returns one: a service
+    /// that can only fail is worse than an absent one, because the launcher can
+    /// say why an action is missing but cannot explain an action that never
+    /// works.
+    pub fn file_opener(&self) -> Option<&dyn FileOpener> {
+        self.opener
+            .get_or_init(XdgOpener::for_session)
+            .as_ref()
+            .map(|opener| opener as &dyn FileOpener)
     }
 
     /// The service behind [`Capability::WindowEnumeration`] and

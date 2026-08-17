@@ -47,8 +47,8 @@ pub use applications::{
 #[cfg(not(target_os = "windows"))]
 use crikey_core::CoreError;
 use crikey_platform::{
-    ApplicationDiscovery, Capability, CapabilityState, FileSearchService, HotkeyService, IconLoader,
-    IconProvider, ProcessLauncher, StandardDirectories,
+    ApplicationDiscovery, Capability, CapabilityState, FileOpener, FileSearchService, HotkeyService,
+    IconLoader, IconProvider, ProcessLauncher, StandardDirectories,
 };
 pub use file_search::{
     system_index_sql, unix_seconds_from_file_time, WindowsFileSearch, SELECT_COLUMNS, WALK_SUBDIRECTORIES,
@@ -113,10 +113,16 @@ impl WindowsBackend {
     /// inheriting a wildcard.
     pub fn capability(&self, capability: Capability) -> CapabilityState {
         match capability {
+            // One `ShellExecuteExW` dispatch answers all of these: the shell
+            // resolves an executable, a packaged moniker, a scheme handler and
+            // a document association through the same call. That `FileOpen`
+            // and `UriOpen` are separate variants is a fact about Linux, not
+            // about this backend.
             Capability::ApplicationDiscovery
             | Capability::GlobalHotkeys
             | Capability::ProcessLaunch
-            | Capability::UriOpen => {
+            | Capability::UriOpen
+            | Capability::FileOpen => {
                 if cfg!(target_os = "windows") {
                     CapabilityState::Available
                 } else {
@@ -175,6 +181,21 @@ impl WindowsBackend {
     /// [`Capability::UriOpen`].
     pub fn process_launcher(&self) -> &dyn ProcessLauncher {
         &self.launcher
+    }
+
+    /// The opener behind [`Capability::FileOpen`].
+    ///
+    /// The same object as [`Self::process_launcher`], because on Windows it is
+    /// the same `ShellExecuteExW`. Two accessors rather than one so that a
+    /// caller asks for the authority it needs: handing a user's document to the
+    /// shell is not the same decision as running a program.
+    ///
+    /// `None` off Windows, matching [`Self::capability`] and
+    /// [`Self::file_search`]: the backend hands out a service only for the
+    /// session it is actually running in, and there is no shell to dispatch to
+    /// on a build with no Windows underneath it.
+    pub fn file_opener(&self) -> Option<&dyn FileOpener> {
+        cfg!(target_os = "windows").then_some(&self.launcher as &dyn FileOpener)
     }
 
     /// The provider behind [`Capability::Icons`], built on first use.

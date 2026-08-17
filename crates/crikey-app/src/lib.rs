@@ -82,13 +82,13 @@ use crikey_catalog::{
     CacheError, CachedSlice, CatalogCache, CatalogError, CatalogStore, CatalogUpdate, MemoryCatalog,
 };
 use crikey_core::{
-    ActionId, ArgumentPolicy, Category, ExecutionPolicy, Generation, GenerationTracker, Item, ItemId,
+    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, Generation, GenerationTracker, Item, ItemId,
     PluginId, Result as CoreResult,
 };
 use crikey_platform::{
     application_arguments, application_items, application_working_directory, decode_target, file_items,
     FileSearchQuery, FileSearchResults, IconImage, IconProvider, WindowInfo, APPLICATION_LAUNCH_ACTION_ID,
-    DEFAULT_ICON_SIZE,
+    DEFAULT_ICON_SIZE, FILE_OPEN_ACTION_ID, FILE_REVEAL_ACTION_ID,
 };
 #[cfg(any(windows, target_os = "linux"))]
 use crikey_platform::{HotkeyActivationHandler, HotkeyBinding};
@@ -451,10 +451,50 @@ impl App {
             .launch_in(&target, &arguments, working_directory.as_ref())
     }
 
+    /// Opens a file item's target with the desktop's default handler.
+    ///
+    /// The path is reconstructed from the item's own encoded target rather
+    /// than from anything the renderer carried alongside the row: a target is
+    /// the one lossless copy of the path (ADR-0007), and a row's description
+    /// is display text that has already been through a lossy conversion.
+    fn open_file_item(&self, item: &Item) -> CoreResult<()> {
+        self.file_opener()?.open_path(&file_target(item)?)
+    }
+
+    /// Shows a file item's target in the desktop's file manager.
+    fn reveal_file_item(&self, item: &Item) -> CoreResult<()> {
+        self.file_opener()?.reveal_path(&file_target(item)?)
+    }
+
+    /// The platform opener, or the refusal that says this session has none.
+    ///
+    /// A session without one is reachable -- a Linux container with no
+    /// xdg-utils -- and it must fail here rather than earlier: the file rows
+    /// themselves are still useful, and the user who picks one is owed the
+    /// reason instead of a row that silently does nothing.
+    fn file_opener(&self) -> CoreResult<&dyn crikey_platform::FileOpener> {
+        self.backend.file_opener().ok_or_else(|| {
+            crikey_core::CoreError::Invalid(format!(
+                "the {} backend has no way to open files in this session",
+                Backend::NAME
+            ))
+        })
+    }
+
     /// Name of the platform backend compiled into this build.
     pub fn platform_backend_name() -> &'static str {
         Backend::NAME
     }
+}
+
+/// The path a file item names, or the refusal that says why it names none.
+///
+/// Separate from the launch decode so the two diagnostics stay distinct: a
+/// broken application target and a broken file target come from different
+/// producers and are fixed in different places.
+fn file_target(item: &Item) -> CoreResult<crikey_core::PlatformPath> {
+    decode_target(&item.target)
+        .map_err(|error| crikey_core::CoreError::Invalid(format!("invalid file target: {error}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,31 +1584,7 @@ impl SearchService {
             _ => {}
         }
         match action.execution_policy {
-            ExecutionPolicy::HostMediated => {
-                if argument.is_some() {
-                    return Err(crikey_core::CoreError::Invalid(
-                        "host-mediated actions do not accept an argument".to_owned(),
-                    ));
-                }
-                if action.action_id.0 != APPLICATION_LAUNCH_ACTION_ID {
-                    return Err(crikey_core::CoreError::Invalid(format!(
-                        "unsupported host-mediated action {:?}",
-                        action.action_id.0
-                    )));
-                }
-                // Per owner, through the one grant map. A build with no action
-                // registry has no plugin runtimes either, so every item it can
-                // hold was produced by the host; once a registry exists, an
-                // owner it does not know is refused rather than assumed
-                // host-owned, which is why the composition root registers its
-                // own builtin catalogs there too.
-                if let Some(router) = self.plugin_actions.as_ref() {
-                    router.authorize(&hit.item.plugin_id, HostCapability::ProcessLaunch)?;
-                }
-                self.app
-                    .launch_application(&hit.item)
-                    .map(|()| ActionSubmission::Completed)
-            }
+            ExecutionPolicy::HostMediated => self.dispatch_host_mediated(&hit.item, action, argument),
             ExecutionPolicy::Plugin => self
                 .plugin_actions
                 .as_ref()
@@ -1578,6 +1594,86 @@ impl SearchService {
                 .submit(&hit.item.plugin_id, &hit.item, action_id, argument)
                 .map(ActionSubmission::Pending),
         }
+    }
+
+    /// Runs a host-mediated action on an item the caller resolved itself.
+    ///
+    /// [`Self::execute_with_argument`] finds its item in the ranked answer to
+    /// the last query, which is the catalog's answer. A per-query provider --
+    /// file search is the one -- deliberately does not publish through the
+    /// catalog, so its rows are unknown there and their owner keeps its own
+    /// table of what it just delivered. This is the entry point for that
+    /// caller, and it exists so there is still exactly *one* host-mediated
+    /// gate: same action lookup, same category check, same authorisation, same
+    /// dispatch. A second copy of those four would be the copy that drifts.
+    ///
+    /// Plugin-owned actions are refused here rather than routed. This path
+    /// bypasses the ranked answer, so accepting one would let a caller submit
+    /// an action for an item the pipeline never selected.
+    pub fn execute_host_action(&self, item: &Item, action_id: &ActionId) -> CoreResult<ActionSubmission> {
+        let action = item
+            .actions
+            .iter()
+            .find(|action| &action.action_id == action_id)
+            .ok_or_else(|| {
+                crikey_core::CoreError::Invalid("selected action is no longer available".to_owned())
+            })?;
+        if action.execution_policy != ExecutionPolicy::HostMediated {
+            return Err(crikey_core::CoreError::Invalid(format!(
+                "action `{}` is plugin-owned and cannot be run as a host action",
+                action.action_id.0
+            )));
+        }
+        if !action.applicable_categories.is_empty() && !action.applicable_categories.contains(&item.category)
+        {
+            return Err(crikey_core::CoreError::Invalid(format!(
+                "action `{}` is not applicable to item category `{}`",
+                action.action_id.0,
+                item.category.as_str()
+            )));
+        }
+        self.dispatch_host_mediated(item, action, None)
+    }
+
+    /// The one place the host performs an action on its own behalf.
+    ///
+    /// Three questions in a fixed order, and the order is the point. *Is this
+    /// an action the host implements at all?* -- an unknown id is refused
+    /// rather than dispatched somewhere plausible. *May this owner have it
+    /// done?* -- per owner, through the one grant map; a build with no action
+    /// registry has no plugin runtimes either, so every item it can hold was
+    /// produced by the host, while a build that has one refuses an owner it
+    /// does not know rather than assuming it is host-owned. That is why the
+    /// composition root registers its own builtin catalogs there too. Only
+    /// then is anything run.
+    fn dispatch_host_mediated(
+        &self,
+        item: &Item,
+        action: &Action,
+        argument: Option<&str>,
+    ) -> CoreResult<ActionSubmission> {
+        if argument.is_some() {
+            return Err(crikey_core::CoreError::Invalid(
+                "host-mediated actions do not accept an argument".to_owned(),
+            ));
+        }
+        // The capability, not just the operation: launching an application and
+        // opening a document are different authority questions even though
+        // today's grant map answers both from the same declaration.
+        let (capability, run): (_, fn(&App, &Item) -> CoreResult<()>) = match action.action_id.0.as_str() {
+            APPLICATION_LAUNCH_ACTION_ID => (HostCapability::ProcessLaunch, App::launch_application),
+            FILE_OPEN_ACTION_ID => (HostCapability::DocumentOpen, App::open_file_item),
+            FILE_REVEAL_ACTION_ID => (HostCapability::DocumentOpen, App::reveal_file_item),
+            unsupported => {
+                return Err(crikey_core::CoreError::Invalid(format!(
+                    "unsupported host-mediated action {unsupported:?}"
+                )))
+            }
+        };
+        if let Some(router) = self.plugin_actions.as_ref() {
+            router.authorize(&item.plugin_id, capability)?;
+        }
+        run(&self.app, item).map(|()| ActionSubmission::Completed)
     }
 
     pub fn poll_action_completions(&self) -> Vec<PluginActionCompletion> {
@@ -1784,6 +1880,42 @@ fn merge(
         state,
         items,
     })
+}
+
+/// One file search a caller can own, so the search runs somewhere other than
+/// the thread that asked for it.
+///
+/// [`App::search_file_items`] is the whole implementation; this trait exists
+/// because the launcher's file provider runs its searches on a worker thread
+/// and a backend is not required to be `Send`. The provider therefore builds
+/// its own implementation *on* that thread and keeps it there — only the query
+/// and the resulting items cross the boundary, and both already are `Send`.
+/// A test substitutes a recording or scripted implementation through the same
+/// seam without going near a filesystem.
+pub trait FileItemSearch {
+    /// Files and folders matching `query`, as items owned by `plugin`.
+    ///
+    /// `None` carries exactly [`App::search_file_items`]'s meaning: this
+    /// session has no file search at all, which is not the same answer as a
+    /// search that ran and matched nothing.
+    fn search_file_items(
+        &self,
+        plugin: &PluginId,
+        query: &FileSearchQuery,
+    ) -> Option<CoreResult<(Vec<Item>, FileSearchResults)>>;
+}
+
+impl FileItemSearch for App {
+    fn search_file_items(
+        &self,
+        plugin: &PluginId,
+        query: &FileSearchQuery,
+    ) -> Option<CoreResult<(Vec<Item>, FileSearchResults)>> {
+        // Named rather than called through `self`: the inherent method of the
+        // same name is what this forwards to, and spelling it out is what
+        // keeps the forward from silently becoming a recursion.
+        App::search_file_items(self, plugin, query)
+    }
 }
 
 /// The platform backend selected for this target.

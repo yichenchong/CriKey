@@ -20,9 +20,10 @@
 //! [`split_arguments`]: crate::split_arguments
 
 use std::ffi::OsStr;
+use std::path::Path;
 
 use crikey_core::{CoreError, PlatformPath, Result};
-use crikey_platform::ProcessLauncher;
+use crikey_platform::{FileOpener, ProcessLauncher};
 
 #[cfg(target_os = "windows")]
 mod win32;
@@ -139,6 +140,70 @@ impl ShellLauncher {
             (!parameters.is_empty()).then(|| OsStr::new(parameters.as_str())),
             directory,
         )
+    }
+}
+
+/// Opening a file or folder with its registered handler (spec 18.2).
+///
+/// The same `ShellExecuteExW` dispatch as a launch, with the shell's default
+/// verb, because to the shell this *is* the same operation: it resolves a
+/// document's association through the registry exactly as it resolves an
+/// executable through the filesystem.
+///
+/// The path travels as `lpFile`, a single wide-string argument, and never
+/// through a command line. That matters here more than it does for a launch:
+/// the path came from a file search rather than from a desktop entry this
+/// workspace parsed, so it is whatever the user happens to have on disk. A
+/// file named `a&b.txt` or `x^y.txt` is an ordinary file, and building a
+/// command string out of it would let `cmd.exe`'s metacharacters mean
+/// something. Nothing here builds one.
+impl FileOpener for ShellLauncher {
+    fn open_path(&self, path: &PlatformPath) -> Result<()> {
+        let file = openable("path", path)?;
+
+        dispatch("open", file, None, None)
+    }
+
+    /// Opens the *containing folder* in Explorer.
+    ///
+    /// Not a true reveal: selecting the item needs `SHOpenFolderAndSelectItems`
+    /// and the shell item list it takes, which is a COM surface this backend
+    /// does not carry. The alternative within `ShellExecuteExW` -- passing the
+    /// file itself -- would launch its registered application, which is
+    /// [`Self::open_path`] under another name and the one outcome a user asking
+    /// to reveal it does not want. `explorer.exe /select,<path>` is not the
+    /// answer either: it takes a *command line*, so a path containing a comma
+    /// arrives as a different path, and this seam refuses to corrupt one.
+    fn reveal_path(&self, path: &PlatformPath) -> Result<()> {
+        let file = openable("path", path)?;
+        let directory = containing_directory(Path::new(file));
+
+        dispatch("reveal", directory.as_os_str(), None, None)
+    }
+}
+
+/// The path as a string the shell can carry whole, or the refusal saying why
+/// it cannot.
+fn openable<'a>(role: &str, path: &'a PlatformPath) -> Result<&'a OsStr> {
+    let path = path.as_os_str();
+    if path.is_empty() {
+        return Err(CoreError::Invalid(format!(
+            "the Windows backend cannot open an empty {role}"
+        )));
+    }
+    carriable(role, path)?;
+    Ok(path)
+}
+
+/// The directory a path lives in.
+fn containing_directory(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        // A relative bare name lives in the process's own directory; `""` is
+        // not a directory and the shell would refuse it.
+        Some(_) => Path::new("."),
+        // A root has no parent and contains itself.
+        None => path,
     }
 }
 
