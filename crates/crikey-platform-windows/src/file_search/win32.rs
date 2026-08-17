@@ -72,6 +72,7 @@ use std::ffi::{OsStr, OsString};
 use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::OsStringExt;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -135,6 +136,13 @@ const NAME_UNITS: usize = 512;
 /// generous.
 const TYPE_UNITS: usize = 64;
 
+/// Whether a catalog query is running right now.
+///
+/// See the acquisition site in [`search`] for why one at a time is the bound:
+/// a cancelled worker is not a stopped worker, so what has to be capped is the
+/// number of *live* queries, not the number of waits.
+static QUERY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
 /// What the query thread has to say to the caller.
 enum Message {
     /// Hits from one `GetNextRows` batch.
@@ -175,12 +183,32 @@ pub(super) fn search(
         });
     }
 
+    // One catalog query at a time, process-wide. Cancellation stops the worker
+    // only at a batch boundary, and a `GetNextRows` already inside the Search
+    // service runs to completion however long it takes — so an abandoned
+    // worker is still a live worker holding an apartment and a rowset. Without
+    // this permit, a user typing while the provider is wedged would spawn one
+    // more of those per keystroke. The same reasoning, and the same fix, as
+    // the Spotlight permit in the macOS backend.
+    //
+    // A caller that finds the permit taken walks instead of queueing: a walk
+    // that answers now beats a catalog answer that arrives after the user has
+    // typed three more characters.
+    if QUERY_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(CoreError::Invalid(
+            "a Windows Search query is already outstanding for this process".to_owned(),
+        ));
+    }
+
     let (sender, receiver) = mpsc::channel();
     let owned_sql = sql.to_owned();
     let worker_cancel = cancel.clone();
     // A named thread so a stuck provider is identifiable in a debugger or a
     // crash dump rather than being one more anonymous worker.
-    thread::Builder::new()
+    let spawned = thread::Builder::new()
         .name("crikey-file-search".to_owned())
         .spawn(move || {
             let message = match query(&owned_sql, limit, &worker_cancel, &sender) {
@@ -190,12 +218,17 @@ pub(super) fn search(
             // A closed channel means the caller stopped listening at its
             // deadline. There is nobody to tell, and that is not an error.
             let _ = sender.send(message);
-        })
-        .map_err(|error| {
-            CoreError::Invalid(format!(
-                "the Windows Search index cannot be queried without a thread to wait on it: {error}"
-            ))
-        })?;
+            // Released by the worker rather than the caller: the permit tracks
+            // the QUERY, which outlives an abandoned wait.
+            QUERY_IN_FLIGHT.store(false, Ordering::Release);
+        });
+    if let Err(error) = spawned {
+        // A permit that was never used must not be kept.
+        QUERY_IN_FLIGHT.store(false, Ordering::Release);
+        return Err(CoreError::Invalid(format!(
+            "the Windows Search index cannot be queried without a thread to wait on it: {error}"
+        )));
+    }
 
     let mut hits: Vec<FileHit> = Vec::new();
     let mut coverage = FileSearchCoverage::Partial;
