@@ -442,9 +442,15 @@ fn a_cancelled_walk_keeps_its_hits_and_stops_before_the_work_is_done() {
         FileSearchCoverage::Deadline,
         "a walk out of time says so"
     );
+    // Emptiness rather than "the hits are real": the deadline is polled before
+    // the first directory read, so there are none, and an `.all()` over an
+    // empty vector passes whatever the walk did. The non-empty half of this
+    // property is provable through limit truncation instead, which the Linux
+    // suite covers deterministically.
     assert!(
-        stopped.hits.iter().all(|hit| hit.name.starts_with("report-")),
-        "whatever a stopped walk returns is real, not truncated garbage"
+        stopped.hits.is_empty(),
+        "the budget was spent before the first directory was read, got {:?}",
+        stopped.hits
     );
 
     // Two: cancellation is honoured, and outranks the clock when both are

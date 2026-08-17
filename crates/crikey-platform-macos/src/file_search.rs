@@ -1042,9 +1042,15 @@ mod tests {
             FileSearchCoverage::Deadline,
             "a walk that runs out of time says so"
         );
+        // Asserting emptiness rather than "the hits are real": the deadline is
+        // polled before the first `read_dir`, so there are none, and a
+        // `.all()` over an empty vector would pass whatever the walk did. The
+        // non-empty half of this property is provable only through limit
+        // truncation, which the Linux backend's suite covers deterministically
+        // and on a host where the tests actually run.
         assert!(
-            hits.iter().all(|hit| hit.name.starts_with("target-")),
-            "whatever was found before the stop is real, not truncated garbage"
+            hits.is_empty(),
+            "the budget was spent before the first directory was read, got {hits:?}"
         );
     }
 
