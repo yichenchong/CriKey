@@ -21,11 +21,14 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(not(target_os = "windows"))]
 use crikey_core::CoreError;
-use crikey_platform::{FileKind, FileSearchCoverage, FileSearchQuery, FileSearchService, MAX_FILE_HITS};
+use crikey_platform::{
+    CancelToken, FileKind, FileSearchCoverage, FileSearchQuery, FileSearchService, MAX_FILE_HITS,
+};
 use crikey_platform_windows::{
     system_index_sql, unix_seconds_from_file_time, WindowsFileSearch, SELECT_COLUMNS, WALK_SUBDIRECTORIES,
 };
@@ -90,6 +93,7 @@ fn query(text: &str, limit: usize) -> FileSearchQuery {
         normalized: text.to_owned(),
         limit,
         deadline: Duration::from_secs(30),
+        cancel: CancelToken::new(),
     }
 }
 
@@ -348,12 +352,132 @@ fn an_expired_deadline_is_reported_rather_than_overrun() {
             normalized: "report".to_owned(),
             limit: 50,
             deadline: Duration::ZERO,
+            cancel: CancelToken::new(),
         },
         Instant::now(),
     );
 
     assert_eq!(results.coverage, FileSearchCoverage::Deadline);
     assert!(results.hits.is_empty(), "no budget means no directory was read");
+}
+
+/// Cancellation is the stronger fact: a caller who has given up is told that,
+/// not that a clock it no longer cares about ran out.
+#[test]
+fn a_cancelled_walk_reports_cancellation_rather_than_the_deadline() {
+    let scratch = Scratch::new();
+    let root = scratch.directory("root");
+    scratch.file("root/report.txt");
+
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let search = WindowsFileSearch::with_roots(vec![root]);
+    let results = search.walk(
+        &FileSearchQuery {
+            normalized: "report".to_owned(),
+            limit: 50,
+            // Expired as well, so this pins which of the two reasons is
+            // reported when both apply.
+            deadline: Duration::ZERO,
+            cancel,
+        },
+        Instant::now(),
+    );
+
+    assert_eq!(results.coverage, FileSearchCoverage::Cancelled);
+    assert!(
+        results.hits.is_empty(),
+        "a search cancelled before it began read no directory"
+    );
+}
+
+/// The walk is the one part of this backend that stops when it is asked to, and
+/// the hits it already had are the point: a superseding keystroke usually shares
+/// a prefix, so throwing them away costs the user work that was already done.
+///
+/// The fixture is two roots, and their order is what makes this deterministic
+/// rather than a race. The walk is breadth first over `roots` in order, so every
+/// hit lives in the first root and is found before the second is opened, while
+/// the second root is a long stretch of work with no hit in it -- the stretch a
+/// cancellation has to cut short. The bulk root's cost is name folding, not
+/// filesystem traffic, so a warm page cache does not shrink the window the
+/// canceller aims at.
+#[test]
+fn a_cancelled_walk_keeps_its_hits_and_stops_before_the_work_is_done() {
+    /// Long enough that folding one name to lowercase and scanning it costs
+    /// real time, which is what makes the bulk root's duration cpu bound.
+    const PADDING: usize = 180;
+
+    let scratch = Scratch::new();
+    let matches = scratch.directory("matches");
+    for index in 0..3 {
+        scratch.file(&format!("matches/report-{index}.txt"));
+    }
+    let bulk = scratch.directory("bulk");
+    let padding = "N".repeat(PADDING);
+    for index in 0..20_000 {
+        scratch.file(&format!("bulk/{padding}-{index:05}.bin"));
+    }
+
+    let search = WindowsFileSearch::with_roots(vec![matches, bulk]);
+
+    // The margin is measured on this host rather than assumed. An uncancelled
+    // walk over the same fixture says how long the work takes here, and the
+    // cancellation is scheduled at a fraction of that, so the test does not
+    // depend on how fast this machine is.
+    let clock = Instant::now();
+    let complete = search.walk(&query("report", 500), clock);
+    let uncancelled = clock.elapsed();
+    assert_eq!(complete.hits.len(), 3);
+    assert_eq!(complete.coverage, FileSearchCoverage::Partial);
+    assert!(
+        uncancelled >= Duration::from_millis(8),
+        "the fixture must take long enough to walk that there is something to interrupt, took \
+         {uncancelled:?}"
+    );
+
+    let cancelled = query("report", 500);
+    let token = cancelled.cancel.clone();
+    let delay = uncancelled / 4;
+    let canceller = thread::spawn(move || {
+        thread::sleep(delay);
+        token.cancel();
+    });
+
+    let started = Instant::now();
+    let results = search.walk(&cancelled, started);
+    let elapsed = started.elapsed();
+    canceller.join().expect("the canceller thread does not panic");
+
+    assert_eq!(results.coverage, FileSearchCoverage::Cancelled);
+    assert_eq!(
+        results.hits.len(),
+        3,
+        "the hits found before the cancellation are returned, not discarded"
+    );
+    assert!(
+        elapsed < uncancelled,
+        "a cancelled walk returns sooner than a complete one: {elapsed:?} against {uncancelled:?}"
+    );
+}
+
+/// The service-level promise, not just the walk's: a cancelled search is an
+/// answer with `Cancelled` coverage, never an error and never a full walk.
+#[test]
+fn a_cancelled_search_answers_with_cancelled_coverage_on_any_host() {
+    let scratch = Scratch::new();
+    let root = scratch.directory("root");
+    scratch.file("root/report.txt");
+
+    let request = query("report", 50);
+    request.cancel.cancel();
+    let search = WindowsFileSearch::with_roots(vec![root]);
+    let results = search
+        .search(&request)
+        .expect("a cancelled search is not a failure");
+
+    assert_eq!(results.coverage, FileSearchCoverage::Cancelled);
+    assert!(results.hits.is_empty());
 }
 
 /// A profile without a Videos folder is ordinary, and one unreadable directory

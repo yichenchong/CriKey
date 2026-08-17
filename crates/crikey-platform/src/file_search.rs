@@ -34,11 +34,55 @@
 //!   implementation backed by a service that also indexes content must still
 //!   only answer name queries through it, so results mean the same thing on
 //!   every platform.
-
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crikey_core::{PlatformPath, Result};
 
+/// A caller's request that an in-flight search stop.
+///
+/// Cloned into the search and set by the caller when a newer keystroke makes
+/// the answer worthless. It is *cooperative*: an implementation that owns its
+/// loop must poll it at least as often as it checks the deadline, and one that
+/// is blocked inside a foreign call cannot honour it at all.
+///
+/// That asymmetry is deliberate and must not be papered over. A directory walk
+/// checks this between entries and stops within microseconds. `MDQueryExecute`
+/// has no cancellation in the API at all, so a Spotlight search can only be
+/// *abandoned* — the call keeps running inside `mds` until it returns, and the
+/// only real protection is bounding how many can be outstanding. An OLE DB
+/// rowset can stop between batches but not mid-batch. Callers must therefore
+/// treat cancellation as "stop as soon as you can", never as "this work has
+/// ceased", and must not assume a cancelled search has released its resources.
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    /// A token nobody has cancelled yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Asks every search holding this token to stop.
+    ///
+    /// Idempotent, and safe to call from the thread that started the search:
+    /// the point is that the caller does not wait.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Whether the caller has given up on this search.
+    ///
+    /// `Relaxed` would be enough for the flag itself, but `Acquire` pairs with
+    /// the `Release` above so anything the canceller wrote first is visible to
+    /// an implementation that reacts to the cancellation.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
 /// Largest number of hits a caller may ask one search for.
 ///
 /// The launcher shows a screenful and ranks what it is given, so a larger
@@ -77,7 +121,7 @@ pub struct FileHit {
 }
 
 /// One search request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct FileSearchQuery {
     /// The user's text, already trimmed and lowercased by the caller so every
     /// backend matches against the same subject.
@@ -85,7 +129,18 @@ pub struct FileSearchQuery {
     /// Upper bound on returned hits; a backend clamps this to [`MAX_FILE_HITS`].
     pub limit: usize,
     /// How long the caller will wait. See the module note: this is a promise.
+    ///
+    /// It can be generous — a second is reasonable — precisely because it is
+    /// not a UI-thread budget: the provider runs the search off-thread and the
+    /// deadline bounds the *search*, not the frame. What keeps a generous
+    /// deadline from wasting work is [`Self::cancel`], not a short clock.
     pub deadline: Duration,
+    /// Set by the caller when a newer keystroke supersedes this search.
+    ///
+    /// An implementation that owns its loop must poll this wherever it polls
+    /// the deadline. One blocked inside a foreign call cannot, and says so:
+    /// see [`CancelToken`] for which of the three backends can actually stop.
+    pub cancel: CancelToken,
 }
 
 /// How completely a backend's answer covers the user's files.
@@ -101,6 +156,10 @@ pub enum FileSearchCoverage {
     /// Real results, but from a subset: an index still building, a scope the
     /// user has narrowed, or folders the process may not read.
     Partial,
+    /// The caller cancelled before the search finished. Whatever had been
+    /// found is returned rather than discarded — a superseding keystroke
+    /// usually shares a prefix, so those hits are often still wanted.
+    Cancelled,
     /// The deadline expired before the search finished. Results are whatever
     /// had been found; a later identical query may return more.
     Deadline,

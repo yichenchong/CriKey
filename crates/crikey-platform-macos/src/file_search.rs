@@ -54,7 +54,7 @@
 
 use crikey_core::{PlatformPath, Result};
 use crikey_platform::{
-    CapabilityState, FileHit, FileKind, FileSearchCoverage, FileSearchQuery, FileSearchResults,
+    CancelToken, CapabilityState, FileHit, FileKind, FileSearchCoverage, FileSearchQuery, FileSearchResults,
     FileSearchService, MAX_FILE_HITS,
 };
 use std::collections::VecDeque;
@@ -91,6 +91,8 @@ const MAX_NEEDLE_CHARS: usize = 128;
 /// the walk performs one comparison per entry either way. Sampling the clock
 /// every few hundred entries bounds the overshoot past the deadline to the
 /// time it takes to `stat`-and-compare that many names, which is microseconds.
+/// The cancellation flag is sampled at the same points, so a superseded search
+/// stops inside the same few microseconds rather than at the next directory.
 const DEADLINE_CHECK_INTERVAL: usize = 512;
 
 /// Directory entries one walk may inspect regardless of the deadline.
@@ -233,13 +235,23 @@ impl FileSearchService for MacFileSearch {
             });
         }
 
+        // Cheapest possible win, and the common case while a user types: the
+        // caller gave up before this search touched a disk or an index.
+        if query.cancel.is_cancelled() {
+            return Ok(FileSearchResults {
+                hits: Vec::new(),
+                coverage: FileSearchCoverage::Cancelled,
+            });
+        }
+
         if self.spotlight {
             let budget = query.deadline * SPOTLIGHT_DEADLINE_NUMERATOR / SPOTLIGHT_DEADLINE_DENOMINATOR;
             // `None` is "Spotlight did not answer"; an empty answer is one of
             // the three silent declines. Neither can be distinguished from an
             // honest miss, so both fall through to the walk rather than being
-            // reported as "no such file".
-            if let Some(hits) = spotlight::search(needle, limit, budget) {
+            // reported as "no such file". A cancelled wait also lands here,
+            // and the walk reports the cancellation on its first check.
+            if let Some(hits) = spotlight::search(needle, limit, budget, &query.cancel) {
                 if !hits.is_empty() {
                     return Ok(FileSearchResults {
                         hits,
@@ -249,7 +261,14 @@ impl FileSearchService for MacFileSearch {
             }
         }
 
-        let (hits, coverage) = walk(self.roots(), needle, limit, started, query.deadline);
+        let (hits, coverage) = walk(
+            self.roots(),
+            needle,
+            limit,
+            started,
+            query.deadline,
+            &query.cancel,
+        );
         Ok(FileSearchResults { hits, coverage })
     }
 }
@@ -268,12 +287,20 @@ fn walk(
     limit: usize,
     started: Instant,
     deadline: Duration,
+    cancel: &CancelToken,
 ) -> (Vec<FileHit>, FileSearchCoverage) {
     let mut hits = Vec::new();
     let mut queue: VecDeque<PathBuf> = roots.iter().cloned().collect();
     let mut inspected = 0usize;
 
     while let Some(directory) = queue.pop_front() {
+        // This loop is ours, so cancellation here is real rather than
+        // aspirational: the walk stops within one directory of the caller
+        // asking, and the hits gathered so far go back rather than being
+        // thrown away -- the next keystroke usually shares this prefix.
+        if cancel.is_cancelled() {
+            return (hits, FileSearchCoverage::Cancelled);
+        }
         if started.elapsed() >= deadline {
             return (hits, FileSearchCoverage::Deadline);
         }
@@ -290,8 +317,15 @@ fn walk(
             if inspected >= MAX_WALKED_ENTRIES {
                 return (hits, FileSearchCoverage::Partial);
             }
-            if inspected % DEADLINE_CHECK_INTERVAL == 0 && started.elapsed() >= deadline {
-                return (hits, FileSearchCoverage::Deadline);
+            if inspected % DEADLINE_CHECK_INTERVAL == 0 {
+                // Cancellation first: a superseded answer is worthless even
+                // when time is left, so there is no point spending the rest.
+                if cancel.is_cancelled() {
+                    return (hits, FileSearchCoverage::Cancelled);
+                }
+                if started.elapsed() >= deadline {
+                    return (hits, FileSearchCoverage::Deadline);
+                }
             }
 
             let name = entry.file_name();
@@ -396,7 +430,7 @@ mod spotlight {
     // Matches the precedent in `crikey-sandbox/src/landlock.rs`.
     #![allow(unsafe_code)]
 
-    use super::{FileHit, FileKind, PlatformPath, MAX_NEEDLE_CHARS};
+    use super::{CancelToken, FileHit, FileKind, PlatformPath, MAX_NEEDLE_CHARS};
     use objc2_core_foundation::{
         kCFAbsoluteTimeIntervalSince1970, CFArray, CFDate, CFIndex, CFOptionFlags, CFRetained, CFString,
     };
@@ -407,7 +441,15 @@ mod spotlight {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// How long one wait for a Spotlight answer blocks before the caller's
+    /// cancellation is re-read.
+    ///
+    /// Short enough that a superseded search returns before the next keystroke
+    /// is drawn, long enough that the waiting thread is asleep essentially all
+    /// of the time.
+    const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
     /// Whether a Spotlight query is running right now.
     ///
@@ -444,7 +486,7 @@ mod spotlight {
     /// caller cannot tell the three apart and must not present any of them as
     /// an empty result set.
     ///
-    /// # Why a thread, and why only ever one
+    /// # Why a thread, why only ever one, and what cancellation means here
     ///
     /// `MDQueryExecute` with `kMDQuerySynchronous` blocks until the gather
     /// phase finishes, and nothing in the API caps how long that is: a machine
@@ -454,18 +496,42 @@ mod spotlight {
     /// the result arrives over a channel. A query that overruns is abandoned,
     /// not waited for: the thread finishes into a dropped receiver and exits.
     ///
-    /// Abandoning is only safe because it is bounded. The query has no
-    /// cancellation, so an abandoned thread stays alive until `mds` answers
-    /// it; `QUERY_IN_FLIGHT` therefore admits one at a time, and a caller that
-    /// arrives while one is outstanding gets `None` and walks instead of
-    /// queueing behind a call that may never return. After
-    /// `TIMEOUTS_BEFORE_GIVING_UP` consecutive overruns Spotlight is dropped
-    /// for the rest of the session: an index that cannot answer twice running
-    /// will not answer the third time either, and every attempt costs the user
-    /// two thirds of a keystroke's budget before the walk even starts.
+    /// Cancellation buys exactly the same thing as the deadline and nothing
+    /// more, and this must not be dressed up. There is no cancellation in the
+    /// `MDQuery` API at all, so **cancelling here means this function stops
+    /// waiting** — the query keeps running inside `mds` until `mds` is done
+    /// with it. Two things, not the token, bound the wasted work: the single
+    /// `QUERY_IN_FLIGHT` permit caps the still-running queries at one, and
+    /// `CONSECUTIVE_TIMEOUTS` is what stops the launcher from starting the
+    /// same doomed query on every keystroke. What the token does buy is worth
+    /// having anyway: a query is never *started* for a search the caller has
+    /// already given up on, and a search that is superseded mid-wait returns
+    /// in a poll interval instead of at the end of the budget.
+    ///
+    /// Abandoning is only safe because it is bounded. An abandoned thread
+    /// stays alive until `mds` answers it; `QUERY_IN_FLIGHT` therefore admits
+    /// one at a time, and a caller that arrives while one is outstanding gets
+    /// `None` and walks instead of queueing behind a call that may never
+    /// return. After `TIMEOUTS_BEFORE_GIVING_UP` consecutive overruns
+    /// Spotlight is dropped for the rest of the session: an index that cannot
+    /// answer twice running will not answer the third time either, and every
+    /// attempt costs the user two thirds of a keystroke's budget before the
+    /// walk even starts.
     ///
     /// [`FileSearchQuery`]: crikey_platform::FileSearchQuery
-    pub(super) fn search(needle: &str, limit: usize, budget: Duration) -> Option<Vec<FileHit>> {
+    pub(super) fn search(
+        needle: &str,
+        limit: usize,
+        budget: Duration,
+        cancel: &CancelToken,
+    ) -> Option<Vec<FileHit>> {
+        // Before anything else, because it is one atomic load and because a
+        // fast typist supersedes most searches before they begin: a query that
+        // is started can no longer be stopped, so not starting it is the only
+        // real saving available on this path.
+        if cancel.is_cancelled() {
+            return None;
+        }
         if CONSECUTIVE_TIMEOUTS.load(Ordering::Relaxed) >= TIMEOUTS_BEFORE_GIVING_UP {
             return None;
         }
@@ -499,14 +565,41 @@ mod spotlight {
             QUERY_IN_FLIGHT.store(false, Ordering::Release);
             return None;
         }
-        match receiver.recv_timeout(budget) {
-            Ok(found) => {
-                CONSECUTIVE_TIMEOUTS.store(0, Ordering::Relaxed);
-                found
-            }
-            Err(_) => {
+        // Waited for in poll-length slices rather than in one blocking call.
+        // The query itself cannot be stopped, but the *wait* can: a superseded
+        // search hands its answer back within a poll interval instead of
+        // holding the caller for the rest of the budget. Ten milliseconds is
+        // below the threshold a person notices and costs two clock reads and a
+        // futex wake per interval, which is nothing beside a metadata query.
+        let waiting_since = Instant::now();
+        loop {
+            let remaining = budget.saturating_sub(waiting_since.elapsed());
+            if remaining.is_zero() {
                 CONSECUTIVE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                None
+                return None;
+            }
+            match receiver.recv_timeout(remaining.min(CANCEL_POLL_INTERVAL)) {
+                Ok(found) => {
+                    CONSECUTIVE_TIMEOUTS.store(0, Ordering::Relaxed);
+                    return found;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Stop waiting, but do not count it against Spotlight:
+                    // `mds` may be answering perfectly promptly, and the query
+                    // it is still running is what `QUERY_IN_FLIGHT` bounds.
+                    // Tripping the breaker on a fast typist would disable the
+                    // index for the rest of the session.
+                    if cancel.is_cancelled() {
+                        return None;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // No answer at all: `gather` unwound. Indistinguishable
+                    // from an overrun to the caller, and counted the same so
+                    // an index that keeps failing stops being asked.
+                    CONSECUTIVE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
             }
         }
     }
@@ -671,6 +764,8 @@ mod tests {
 
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
 
     /// A unique scratch directory that deletes itself when the test ends.
     ///
@@ -722,6 +817,7 @@ mod tests {
                 normalized: text.to_owned(),
                 limit,
                 deadline: GENEROUS,
+                cancel: CancelToken::new(),
             })
             .expect("a walk of a readable directory never fails")
     }
@@ -848,11 +944,113 @@ mod tests {
                 normalized: "target".to_owned(),
                 limit: 16,
                 deadline: Duration::ZERO,
+                cancel: CancelToken::new(),
             })
             .expect("running out of time is not a failure");
 
         assert_eq!(results.coverage, FileSearchCoverage::Deadline);
         assert!(results.hits.is_empty(), "no time was available to find anything");
+    }
+
+    /// Cancellation outranks the deadline. The caller reacts differently to
+    /// the two: a deadline invites the same query again, whereas a
+    /// cancellation *was* the newer query arriving.
+    #[test]
+    fn cancellation_outranks_an_expired_deadline() {
+        let scratch = Scratch::new();
+        scratch.file("target.txt");
+
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let (hits, coverage) = walk(
+            &[scratch.path.clone()],
+            "target",
+            16,
+            Instant::now(),
+            Duration::ZERO,
+            &cancel,
+        );
+
+        assert_eq!(coverage, FileSearchCoverage::Cancelled);
+        assert!(hits.is_empty(), "nothing was walked before the cancellation");
+    }
+
+    /// A search the caller has already given up on reports the cancellation
+    /// rather than an empty answer that reads like "no such file".
+    #[test]
+    fn a_search_cancelled_before_it_begins_reports_cancelled() {
+        let scratch = Scratch::new();
+        scratch.file("target.txt");
+
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let service = MacFileSearch::walking(vec![scratch.path.clone()]);
+        let results = service
+            .search(&FileSearchQuery {
+                normalized: "target".to_owned(),
+                limit: 16,
+                deadline: GENEROUS,
+                cancel,
+            })
+            .expect("a cancellation is not a failure");
+
+        assert_eq!(results.coverage, FileSearchCoverage::Cancelled);
+        assert!(results.hits.is_empty(), "no directory was read");
+    }
+
+    /// A cancelled walk hands back the hits it already had. Discarding them
+    /// would throw away rows the next keystroke usually still wants, because a
+    /// superseding query normally shares this one's prefix.
+    #[test]
+    fn a_cancelled_walk_returns_the_hits_it_already_found() {
+        let scratch = Scratch::new();
+        // Wide, and repeated as many roots: the walk finds matches inside its
+        // first directory and still has directories queued when the
+        // cancellation lands.
+        for index in 0..600 {
+            scratch.file(&format!("target-{index}.txt"));
+        }
+        let roots = vec![scratch.path.clone(); 64];
+
+        // Attempts, because the interleaving is the contract under test: the
+        // cancellation has to arrive after the walk has hits and before it
+        // runs out of directories. The tree above takes tens of milliseconds
+        // to walk and the head start below is one, so the window is wide; the
+        // retries are what make a loaded machine that overslept it harmless
+        // rather than flaky, and one success proves the contract.
+        for _ in 0..32 {
+            let cancel = CancelToken::new();
+            let walking = cancel.clone();
+            let roots = roots.clone();
+            let (announce, started) = mpsc::channel();
+            let walker = thread::spawn(move || {
+                let _ = announce.send(());
+                walk(
+                    &roots,
+                    "target",
+                    MAX_FILE_HITS,
+                    Instant::now(),
+                    GENEROUS,
+                    &walking,
+                )
+            });
+            started.recv().expect("the walk thread announces itself");
+            // The announcement only proves the thread exists, not that it has
+            // read a directory, and a walk cancelled before its first entry
+            // proves nothing about preserving hits.
+            thread::sleep(Duration::from_millis(1));
+            cancel.cancel();
+            let (hits, coverage) = walker.join().expect("a walk never panics");
+
+            if coverage == FileSearchCoverage::Cancelled && !hits.is_empty() {
+                assert!(
+                    hits.iter().all(|hit| hit.name.starts_with("target-")),
+                    "the hits kept across a cancellation are the real ones"
+                );
+                return;
+            }
+        }
+        panic!("no attempt observed a cancellation land mid-walk");
     }
 
     /// An empty query is not a request for every file on the machine.

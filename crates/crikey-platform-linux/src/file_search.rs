@@ -27,7 +27,7 @@
 //! it is also the only path that respects the pruning `updatedb.conf` was
 //! configured with.
 //!
-//! # The deadline
+//! # The deadline and cancellation
 //!
 //! Search runs on a keystroke, so [`FileSearchQuery::deadline`] is a promise
 //! (see the trait's module documentation). The walk therefore checks the clock
@@ -37,6 +37,17 @@
 //! runs out of time returns the hits it has with
 //! [`FileSearchCoverage::Deadline`]; it is not an error, and it is the ordinary
 //! case on the first keystroke over a large home directory.
+//!
+//! [`FileSearchQuery::cancel`] is polled at exactly those points, and takes
+//! precedence over the clock when both say stop: a caller that has explicitly
+//! given up is making a stronger statement than one that merely ran out of
+//! time. Cancellation is what makes a *generous* deadline affordable, because
+//! the next keystroke stops this search rather than waiting out its budget.
+//!
+//! Both mechanisms here can genuinely stop, which is not true of every backend
+//! (see [`CancelToken`]): the walk is a loop this code owns and leaves it
+//! within microseconds, and the delegation is a *separate process*, so killing
+//! it really does end the work instead of merely abandoning it.
 //!
 //! # What is deliberately not done here
 //!
@@ -61,8 +72,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crikey_core::{PlatformPath, Result};
 use crikey_platform::{
-    FileHit, FileKind, FileSearchCoverage, FileSearchQuery, FileSearchResults, FileSearchService,
-    MAX_FILE_HITS,
+    CancelToken, FileHit, FileKind, FileSearchCoverage, FileSearchQuery, FileSearchResults,
+    FileSearchService, MAX_FILE_HITS,
 };
 
 /// Directory names the walk never descends into, hidden names aside.
@@ -108,6 +119,30 @@ const LOCATE_OVERSAMPLE: usize = 4;
 
 /// Upper bound on candidates requested from the index, whatever the limit is.
 const LOCATE_MAX_CANDIDATES: usize = 4096;
+
+/// How long the delegation blocks on the index's output before it looks at the
+/// cancellation flag again.
+///
+/// Waiting for the whole budget in one `recv_timeout` would honour the deadline
+/// but ignore a cancellation for up to half a second, which is exactly the case
+/// cancellation exists for. Slicing the wait costs one extra channel wakeup per
+/// interval and bounds how long a superseded search keeps a `plocate` alive.
+const LOCATE_CANCEL_POLL: Duration = Duration::from_millis(2);
+
+/// What a delegation to the index produced.
+///
+/// Three outcomes, not two: "no usable answer" must fall through to the walk,
+/// while "cancelled" must not -- walking after the caller gave up is the work
+/// cancellation was meant to avoid.
+enum Delegation {
+    /// Hits the service is allowed to report.
+    Hits(Vec<FileHit>),
+    /// The caller cancelled while the child was running; it has been killed and
+    /// reaped.
+    Cancelled,
+    /// The index could not answer, including answering nothing.
+    Unusable,
+}
 
 /// File search over the user's roots, with `plocate` in front of it when the
 /// session has it (spec 18.1).
@@ -187,8 +222,8 @@ impl FilesystemSearch {
         self.locate.is_some()
     }
 
-    /// Hands the query to the index binary, or `None` when it could not answer
-    /// and the walk must.
+    /// Hands the query to the index binary, reporting whether it answered, was
+    /// cancelled, or left the walk to answer.
     ///
     /// "Could not answer" deliberately includes *found nothing*. `plocate`
     /// exits non-zero both for an empty result and for a missing database, so
@@ -202,16 +237,26 @@ impl FilesystemSearch {
         limit: usize,
         started: Instant,
         deadline: Duration,
-    ) -> Option<Vec<FileHit>> {
+        cancel: &CancelToken,
+    ) -> Delegation {
+        // Nothing has been spawned yet, so a caller who has already given up
+        // costs a `fork` rather than a wait.
+        if cancel.is_cancelled() {
+            return Delegation::Cancelled;
+        }
+
         // Half the remaining budget, so that a delegation that stalls still
         // leaves the fallback walk something to answer within.
-        let budget = deadline.checked_sub(started.elapsed())? / 2;
+        let Some(remaining) = deadline.checked_sub(started.elapsed()) else {
+            return Delegation::Unusable;
+        };
+        let budget = remaining / 2;
         if budget.is_zero() {
-            return None;
+            return Delegation::Unusable;
         }
 
         let candidates = limit.saturating_mul(LOCATE_OVERSAMPLE).min(LOCATE_MAX_CANDIDATES);
-        let mut child = Command::new(binary)
+        let Ok(mut child) = Command::new(binary)
             .arg("--ignore-case")
             .arg("--basename")
             .arg("--null")
@@ -229,12 +274,18 @@ impl FilesystemSearch {
             // diagnostics onto the launcher's stderr.
             .stderr(Stdio::null())
             .spawn()
-            .ok()?;
+        else {
+            return Delegation::Unusable;
+        };
 
         // Read on a thread, keep the `Child` here. Reading in this thread would
         // block past the deadline on a stalled index, and moving the child into
         // the thread would leave nothing here to kill it with.
-        let mut stdout = child.stdout.take()?;
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Delegation::Unusable;
+        };
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -242,15 +293,39 @@ impl FilesystemSearch {
             let _ = sender.send(read.map(|_| bytes));
         });
 
-        let output = match receiver.recv_timeout(budget) {
-            Ok(Ok(bytes)) => bytes,
-            // A read error, or a delegation that outlived its budget. Killing
-            // it releases the reader thread by closing the pipe, and reaping it
-            // here keeps the launcher from collecting zombies over a session.
-            Ok(Err(_)) | Err(_) => {
+        let expires_at = Instant::now() + budget;
+        let output = loop {
+            // Checked before the clock: the caller gave up, which outranks
+            // merely running out of time. This is the one place in this crate
+            // where cancellation stops work *outside* the process -- `plocate`
+            // is a child, and the signal ends its indexing scan for real,
+            // unlike a foreign in-process index call, which can only be
+            // abandoned while it keeps burning cycles behind our back.
+            if cancel.is_cancelled() {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Delegation::Cancelled;
+            }
+
+            let left = expires_at.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(left.min(LOCATE_CANCEL_POLL)) {
+                Ok(Ok(bytes)) => break bytes,
+                // A read error, a reader thread that vanished, or a delegation
+                // that outlived its budget. Killing it releases the reader
+                // thread by closing the pipe, and reaping it here keeps the
+                // launcher from collecting zombies over a session.
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Delegation::Unusable;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if left.is_zero() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Delegation::Unusable;
+                    }
+                }
             }
         };
 
@@ -258,15 +333,15 @@ impl FilesystemSearch {
         // meaningfully. A non-zero status means no usable answer -- see above.
         match child.wait() {
             Ok(status) if status.success() => {}
-            _ => return None,
+            _ => return Delegation::Unusable,
         }
 
         let hits = self.index_hits(&output, needle, limit);
         if hits.is_empty() {
-            return None;
+            return Delegation::Unusable;
         }
 
-        Some(hits)
+        Delegation::Hits(hits)
     }
 
     /// Turns NUL-separated index output into hits this service is allowed to
@@ -361,14 +436,23 @@ impl FilesystemSearch {
         true
     }
 
-    /// The deadline-bounded breadth-first walk (strategy (a)).
+    /// The deadline- and cancellation-bounded breadth-first walk (strategy (a)).
     ///
     /// Coverage is earned, not assumed: [`FileSearchCoverage::Complete`] means
     /// the queue drained with every directory read and every hit kept.
     /// A directory the process may not read, or a limit that cut the walk short,
     /// makes the answer [`FileSearchCoverage::Partial`] -- the results are real
-    /// but there is provably more.
-    fn walk(&self, needle: &str, limit: usize, started: Instant, deadline: Duration) -> FileSearchResults {
+    /// but there is provably more. A caller that cancels or a clock that
+    /// expires gets the hits found so far, never nothing: a superseding
+    /// keystroke usually shares a prefix with this one.
+    fn walk(
+        &self,
+        needle: &str,
+        limit: usize,
+        started: Instant,
+        deadline: Duration,
+        cancel: &CancelToken,
+    ) -> FileSearchResults {
         let mut hits = Vec::new();
         let mut queue: VecDeque<PathBuf> = self
             .roots
@@ -381,6 +465,15 @@ impl FilesystemSearch {
         let mut until_check = DEADLINE_CHECK_STRIDE;
 
         'walk: while let Some(directory) = queue.pop_front() {
+            // Cancellation first: both can be true at once, and "the caller
+            // gave up" is a stronger statement about this answer than "time
+            // ran out", which invites a retry.
+            if cancel.is_cancelled() {
+                return FileSearchResults {
+                    hits,
+                    coverage: FileSearchCoverage::Cancelled,
+                };
+            }
             if started.elapsed() >= deadline {
                 return FileSearchResults {
                     hits,
@@ -400,6 +493,14 @@ impl FilesystemSearch {
                 until_check -= 1;
                 if until_check == 0 {
                     until_check = DEADLINE_CHECK_STRIDE;
+                    // A loop this code owns, so cancellation lands within the
+                    // cost of at most 128 `readdir` steps -- microseconds.
+                    if cancel.is_cancelled() {
+                        return FileSearchResults {
+                            hits,
+                            coverage: FileSearchCoverage::Cancelled,
+                        };
+                    }
                     if started.elapsed() >= deadline {
                         return FileSearchResults {
                             hits,
@@ -494,18 +595,29 @@ impl FileSearchService for FilesystemSearch {
         }
 
         if let Some(binary) = &self.locate {
-            if let Some(hits) = self.delegate_to_locate(binary, &needle, limit, started, query.deadline) {
+            match self.delegate_to_locate(binary, &needle, limit, started, query.deadline, &query.cancel) {
                 // Never `Complete`: the index is as old as the last `updatedb`,
                 // so a file saved since then is missing from this answer and
                 // the caller is entitled to know that.
-                return Ok(FileSearchResults {
-                    hits,
-                    coverage: FileSearchCoverage::Partial,
-                });
+                Delegation::Hits(hits) => {
+                    return Ok(FileSearchResults {
+                        hits,
+                        coverage: FileSearchCoverage::Partial,
+                    })
+                }
+                // Falling through to the walk here would spend the deadline the
+                // caller has already disowned.
+                Delegation::Cancelled => {
+                    return Ok(FileSearchResults {
+                        hits: Vec::new(),
+                        coverage: FileSearchCoverage::Cancelled,
+                    })
+                }
+                Delegation::Unusable => {}
             }
         }
 
-        Ok(self.walk(&needle, limit, started, query.deadline))
+        Ok(self.walk(&needle, limit, started, query.deadline, &query.cancel))
     }
 }
 

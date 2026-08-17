@@ -30,8 +30,8 @@ pub mod window;
 pub use bundle::{bundle_display_name, bundle_icon_path, parse_info_plist, AppBundle};
 pub use directories::{DirectoryConvention, DirectoryEnvironment, PluginKind, StandardDirectories};
 pub use file_search::{
-    FileHit, FileKind, FileSearchCoverage, FileSearchQuery, FileSearchResults, FileSearchService,
-    MAX_FILE_HITS,
+    CancelToken, FileHit, FileKind, FileSearchCoverage, FileSearchQuery, FileSearchResults,
+    FileSearchService, MAX_FILE_HITS,
 };
 pub use icon::{
     decode_icon, IconCache, IconCacheKey, IconError, IconFormat, IconImage, IconLoader, IconProvider,
