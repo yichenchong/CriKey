@@ -347,8 +347,9 @@ fn off_target_registration_fails_instead_of_pretending() {
 
 /// Everything this backend stands behind, and therefore claims on Windows and
 /// nowhere else.
-const IMPLEMENTED: [Capability; 4] = [
+const IMPLEMENTED: [Capability; 5] = [
     Capability::ApplicationDiscovery,
+    Capability::Clipboard,
     Capability::GlobalHotkeys,
     Capability::ProcessLaunch,
     Capability::UriOpen,
@@ -384,7 +385,6 @@ fn on_target_the_implemented_capabilities_are_claimed() {
 fn unimplemented_capabilities_are_never_claimed() {
     let backend = WindowsBackend::new();
     for capability in [
-        Capability::Clipboard,
         Capability::WindowEnumeration,
         Capability::WindowActivation,
         Capability::Notifications,
