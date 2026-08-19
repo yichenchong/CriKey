@@ -2,8 +2,9 @@
 //!
 //! Start Menu shortcuts, packaged apps, `.lnk` parsing, AppUserModelIDs,
 //! global hotkeys (spec 18.4) and shell execution of what discovery found
-//! (spec 18.2). Named pipes, window integration, clipboard and notifications
-//! stay for later milestones and keep reporting themselves unavailable.
+//! (spec 18.2). Named pipes, window integration and notifications stay for
+//! later milestones and keep reporting themselves unavailable; the clipboard is
+//! implemented, in `clipboard.rs`.
 //!
 //! # Why this crate compiles everywhere
 //!
@@ -31,6 +32,11 @@
 //! empty crate.
 
 mod applications;
+/// The clipboard, and gated like `win32` below: it is a Win32 binding whole, so
+/// off target there is no honest stub to compile -- [`WindowsBackend::clipboard`]
+/// hands out nothing there instead.
+#[cfg(target_os = "windows")]
+mod clipboard;
 mod file_search;
 mod hotkeys;
 mod icons;
@@ -44,11 +50,13 @@ pub use applications::{
     split_arguments, ApplicationSet, Shortcut, StartMenuDiscovery, WellKnownApplication,
     WELL_KNOWN_APPLICATIONS,
 };
+#[cfg(target_os = "windows")]
+pub use clipboard::WindowsClipboard;
 #[cfg(not(target_os = "windows"))]
 use crikey_core::CoreError;
 use crikey_platform::{
-    ApplicationDiscovery, Capability, CapabilityState, FileOpener, FileSearchService, HotkeyService,
-    IconLoader, IconProvider, ProcessLauncher, StandardDirectories,
+    ApplicationDiscovery, Capability, CapabilityState, Clipboard, FileOpener, FileSearchService,
+    HotkeyService, IconLoader, IconProvider, ProcessLauncher, StandardDirectories,
 };
 pub use file_search::{
     system_index_sql, unix_seconds_from_file_time, WindowsFileSearch, SELECT_COLUMNS, WALK_SUBDIRECTORIES,
@@ -162,8 +170,18 @@ impl WindowsBackend {
                     CapabilityState::Unavailable
                 }
             }
-            Capability::Clipboard
-            | Capability::WindowEnumeration
+            // Windows keeps clipboard contents itself, so there is no session
+            // gate of the kind Linux has and no partial answer to give: an
+            // interactive session has a clipboard and a build with no Win32
+            // underneath it has nothing at all (see [`clipboard`]).
+            Capability::Clipboard => {
+                if cfg!(target_os = "windows") {
+                    CapabilityState::Available
+                } else {
+                    CapabilityState::Unavailable
+                }
+            }
+            Capability::WindowEnumeration
             | Capability::WindowActivation
             | Capability::Notifications
             | Capability::FileWatching
@@ -181,6 +199,28 @@ impl WindowsBackend {
     /// [`Capability::UriOpen`].
     pub fn process_launcher(&self) -> &dyn ProcessLauncher {
         &self.launcher
+    }
+
+    /// The service behind [`Capability::Clipboard`], or `None` on a build with
+    /// no Win32 underneath it.
+    ///
+    /// Owned rather than borrowed, matching the other two backends, whose Linux
+    /// half genuinely needs it: an X11 selection lives only as long as the
+    /// client that owns it, so the caller has to hold the clipboard. Windows
+    /// keeps the value itself, so a caller may drop this as soon as the copy
+    /// returns -- the uniform signature costs nothing and keeps the platform
+    /// difference out of the composition root.
+    pub fn clipboard(&self) -> Option<Box<dyn Clipboard>> {
+        #[cfg(target_os = "windows")]
+        {
+            WindowsClipboard::for_session().map(|clipboard| Box::new(clipboard) as Box<dyn Clipboard>)
+        }
+        // Not a stub standing in for a clipboard: there is no Win32 here, so
+        // there is nothing to hand out and nothing that could succeed.
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
     }
 
     /// The opener behind [`Capability::FileOpen`].

@@ -87,8 +87,8 @@ use crikey_core::{
 };
 use crikey_platform::{
     application_arguments, application_items, application_working_directory, decode_target, file_items,
-    FileSearchQuery, FileSearchResults, IconImage, IconProvider, WindowInfo, APPLICATION_LAUNCH_ACTION_ID,
-    DEFAULT_ICON_SIZE, FILE_OPEN_ACTION_ID, FILE_REVEAL_ACTION_ID,
+    Clipboard, FileSearchQuery, FileSearchResults, IconImage, IconProvider, WindowInfo,
+    APPLICATION_LAUNCH_ACTION_ID, DEFAULT_ICON_SIZE, FILE_OPEN_ACTION_ID, FILE_REVEAL_ACTION_ID,
 };
 #[cfg(any(windows, target_os = "linux"))]
 use crikey_platform::{HotkeyActivationHandler, HotkeyBinding};
@@ -350,6 +350,25 @@ impl App {
         {
             None
         }
+    }
+
+    /// The session's clipboard, when this build's backend has one for the
+    /// session it is running in.
+    ///
+    /// `None` is a session fact, not a defect: a Linux unit with no display
+    /// server has no clipboard to reach, a Wayland session without XWayland
+    /// cannot reach the one it has, and a macOS process without access to the
+    /// pasteboard server is handed none. A caller that gets `None` should say so
+    /// rather than pretend a copy happened.
+    ///
+    /// Owned, unlike [`Self::icon_provider`] and [`Self::search_file_items`],
+    /// and that is the load-bearing part of this signature: an X11 selection is
+    /// served by the client that owns it, so the value only stays pasteable
+    /// while somebody holds this box. The launcher holds it for the lifetime of
+    /// the process. Borrowing from the backend instead would tie the user's
+    /// clipboard to the lifetime of an `App` that lives on a worker thread.
+    pub fn clipboard(&self) -> Option<Box<dyn Clipboard>> {
+        self.backend.clipboard()
     }
 
     /// Discovers the current platform's applications and maps them into one
@@ -1131,6 +1150,12 @@ impl SearchService {
     /// Discovers application items through the selected platform backend.
     pub fn discover_application_items(&self, plugin: &PluginId) -> CoreResult<Vec<Item>> {
         self.app.discover_application_items(plugin)
+    }
+
+    /// The session's clipboard through the selected platform backend; see
+    /// [`App::clipboard`].
+    pub fn clipboard(&self) -> Option<Box<dyn Clipboard>> {
+        self.app.clipboard()
     }
 
     /// Searches files through the selected platform backend; see

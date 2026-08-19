@@ -24,6 +24,11 @@ libc = "0.2"
 # enough — the manifest has to be too. Same shape as the x11rb entry in
 # `crikey-platform-linux`.
 [target.'cfg(target_os = "macos")'.dependencies]
+# The general pasteboard, behind `NSPasteboard`. Target-gated with everything
+# else here and for exactly the same reason: `arboard` links AppKit on this
+# target, so an unconditional entry would break the Linux and Windows
+# cross-target checks the moment they resolved it.
+arboard.workspace = true
 # Spotlight is the file index macOS already maintains, and querying it is the
 # only way this backend can answer a file search in the milliseconds a
 # keystroke allows; the alternative, a walk, is the fallback rather than the

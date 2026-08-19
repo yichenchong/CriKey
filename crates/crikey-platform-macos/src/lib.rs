@@ -6,8 +6,9 @@
 //! Compiled only for its target so platform-independent crates can never
 //! accidentally depend on it (spec 5.3).
 //!
-//! Implemented so far: application discovery over `.app` bundles, and process
-//! launching through `/usr/bin/open`. Both stop at what the core actually
+//! Implemented so far: application discovery over `.app` bundles, process
+//! launching through `/usr/bin/open`, and the general pasteboard
+//! ([`clipboard`]). The first two stop at what the core actually
 //! consumes. Discovery reads the four `Info.plist` keys a launcher needs and
 //! nothing else, so icons, document types and Spotlight metadata stay for a
 //! later milestone; launching hands the target to Launch Services rather than
@@ -25,13 +26,16 @@
 
 #![cfg(target_os = "macos")]
 
+pub mod clipboard;
 pub mod file_search;
+
+pub use clipboard::MacPasteboard;
 
 use crikey_core::{CoreError, PlatformPath, Result};
 use crikey_platform::{
     bundle_display_name, bundle_icon_path, parse_info_plist, ApplicationDiscovery, Capability,
-    CapabilityState, DiscoveredApplication, FileOpener, FileSearchService, IconLoader, IconProvider,
-    PathIconSource, ProcessLauncher, StandardDirectories,
+    CapabilityState, Clipboard, DiscoveredApplication, FileOpener, FileSearchService, IconLoader,
+    IconProvider, PathIconSource, ProcessLauncher, StandardDirectories,
 };
 use file_search::MacFileSearch;
 use std::collections::HashSet;
@@ -512,6 +516,15 @@ pub struct MacOsBackend {
     /// Spotlight, with a bounded walk of the home directory behind it. Its
     /// own roots resolve on first use for the same reason the icons do.
     files: MacFileSearch,
+    /// Whether the pasteboard server hands this process a general pasteboard,
+    /// probed on first ask and then cached.
+    ///
+    /// A probe rather than an assumption because `generalPasteboard` returns
+    /// null for a process without access to it, and cached because the answer
+    /// decides what [`Capability::Clipboard`] reports, which must not change
+    /// between two calls in one session. Acquiring the handle neither reads the
+    /// user's pasteboard nor writes to it, so this costs the session nothing.
+    pasteboard: OnceLock<bool>,
 }
 
 impl MacOsBackend {
@@ -538,6 +551,7 @@ impl MacOsBackend {
             processes: OpenLauncher::new(),
             icons: OnceLock::new(),
             files: MacFileSearch::new(),
+            pasteboard: OnceLock::new(),
         }
     }
 
@@ -566,8 +580,21 @@ impl MacOsBackend {
             // allowed to see, so the honest ceiling is `Partial`; the service
             // itself owns that reasoning.
             Capability::FileSearch => self.files.capability_state(),
-            Capability::Clipboard
-            | Capability::GlobalHotkeys
+            // The pasteboard is a store the window server keeps, so there is
+            // nothing session-dependent to hedge about and nothing to stay
+            // resident for -- but the process really can have no pasteboard at
+            // all, so the claim follows the probe rather than the platform.
+            Capability::Clipboard => {
+                if *self
+                    .pasteboard
+                    .get_or_init(|| MacPasteboard::for_session().is_some())
+                {
+                    CapabilityState::Available
+                } else {
+                    CapabilityState::Unavailable
+                }
+            }
+            Capability::GlobalHotkeys
             | Capability::WindowEnumeration
             | Capability::WindowActivation
             | Capability::Notifications
@@ -586,6 +613,19 @@ impl MacOsBackend {
     /// [`Capability::UriOpen`].
     pub fn process_launcher(&self) -> &dyn ProcessLauncher {
         &self.processes
+    }
+
+    /// The service behind [`Capability::Clipboard`], or `None` when this
+    /// process has no general pasteboard.
+    ///
+    /// Owned rather than borrowed, matching the other two backends, whose Linux
+    /// half genuinely needs it: an X11 selection lives only as long as the
+    /// client that owns it, so the caller has to hold the clipboard. On macOS
+    /// the pasteboard server holds the value instead, so a caller may drop this
+    /// as soon as the copy returns -- the uniform signature costs nothing and
+    /// keeps the platform difference out of the composition root.
+    pub fn clipboard(&self) -> Option<Box<dyn Clipboard>> {
+        MacPasteboard::for_session().map(|pasteboard| Box::new(pasteboard) as Box<dyn Clipboard>)
     }
 
     /// The opener behind [`Capability::FileOpen`].

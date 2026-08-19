@@ -18,6 +18,14 @@ crikey-platform.workspace = true
 # Only the Windows target links Win32, so a Linux or macOS build of the
 # workspace still compiles this crate -- as an honestly unsupported backend --
 # without downloading a single import library.
+#
+# The clipboard rides in the same table for the same reason: `arboard` is a
+# `clipboard-win` and `windows-sys` binding on this target and nothing at all
+# off it, so an unconditional entry would put those import libraries into every
+# Linux and macOS build of the workspace.
+[target.'cfg(target_os = "windows")'.dependencies]
+arboard.workspace = true
+
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 workspace = true
 features = [

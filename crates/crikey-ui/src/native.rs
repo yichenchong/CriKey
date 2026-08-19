@@ -1203,26 +1203,22 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     if rows == 0 {
         return theme::COMPACT_WINDOW_HEIGHT;
     }
-    // The list, plus everything the panel puts around it, added to the field
-    // and footer that are always drawn.
+    // The list, plus the gap above it, added to the compact frame -- the field
+    // and the footer inside both panel margins -- which
+    // [`theme::COMPACT_WINDOW_HEIGHT`] already is. Nothing here re-derives the
+    // field or the footer: the last thing a listed frame draws is the status
+    // line, and the panel's bottom margin under it is part of the compact
+    // height, so a listed window is the compact one with a list inserted.
     //
-    // [`theme::COMPACT_WINDOW_HEIGHT`] is a deliberately tight height: it ends
-    // just under the footer and spends the panel's bottom inner margin to stay
-    // small. A listed window cannot do that, because the last thing the frame
-    // draws is the status line -- the "3 results" the owner could only see the
-    // top of -- so the margin is added back here as [`theme::SPACE_4`], which
-    // is what [`draw_launcher`] gives the central panel.
-    //
-    // [`theme::SPACE_2`] is the panel's own `item_spacing.y`, which egui
-    // inserts between the query field and the scroll area holding the list.
-    // It is not spacing anybody asked for, but it is drawn, and leaving it out
-    // of the sum is the other half of the clipping: the frame ended lower than
-    // the window it was sized for.
+    // [`BLOCK_GAP`] is that insertion's own gap: the explicit space
+    // [`draw_launcher`] puts above the list plus the item spacing egui adds
+    // ahead of it. Leaving the implicit half out of the sum is how the frame
+    // used to end lower than the window it was sized for.
     //
     // Saturating throughout: a result set large enough to overflow this is
     // clamped to the expanded height anyway.
     let gaps = (rows.saturating_sub(1) as f32) * theme::ROW_GAP;
-    let list = (rows as f32) * theme::ROW_HEIGHT + gaps + theme::SPACE_3 + theme::SPACE_2;
+    let list = (rows as f32) * theme::ROW_HEIGHT + gaps + BLOCK_GAP;
     // The action list opens between the results and the status line, so it
     // needs room of its own. Without this a single result with alternates
     // opened its actions into a window sized for the list alone and pushed the
@@ -1236,10 +1232,7 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     } else {
         0.0
     };
-    let total = f32::from(u16::try_from(theme::COMPACT_WINDOW_HEIGHT).unwrap_or(u16::MAX))
-        + list
-        + actions
-        + theme::SPACE_4;
+    let total = f32::from(u16::try_from(theme::COMPACT_WINDOW_HEIGHT).unwrap_or(u16::MAX)) + list + actions;
     (total.ceil().max(0.0) as u32).clamp(theme::COMPACT_WINDOW_HEIGHT, expanded_height)
 }
 
@@ -1772,11 +1765,11 @@ fn canvas_fill(colors: theme::Palette, transparent: bool) -> egui::Color32 {
 ///
 /// Two things make it up and both are drawn: the explicit
 /// [`theme::SPACE_3`] the panel body asks for, and the
-/// [`theme::SPACE_2`] of `item_spacing.y` egui inserts ahead of that space
-/// because it is a fresh allocation in a vertical layout. Reserving only the
-/// explicit gap is how [`draw_results`] used to end up 8 px lower than it
-/// thought it would.
-const BLOCK_GAP: f32 = theme::SPACE_2 + theme::SPACE_3;
+/// [`theme::ITEM_SPACING_Y`] egui puts ahead of the block that follows it,
+/// because every allocation in a vertical layout is preceded by item spacing.
+/// Reserving only the explicit gap is how [`draw_results`] used to end up
+/// short of where it thought it would.
+const BLOCK_GAP: f32 = theme::ITEM_SPACING_Y + theme::SPACE_3;
 
 fn draw_launcher(
     context: &egui::Context,
@@ -1796,7 +1789,7 @@ fn draw_launcher(
         .frame(
             Frame::default()
                 .fill(canvas_fill(colors, transparent))
-                .inner_margin(Margin::same(theme::SPACE_4)),
+                .inner_margin(Margin::same(theme::PANEL_MARGIN)),
         )
         .show(context, |ui| {
             draw_query(ui, model, commands, colors);
@@ -1823,21 +1816,26 @@ fn draw_launcher(
 }
 
 fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
+    // One filled pill, no border: the field is the only thing on the canvas
+    // above the list, and at [`theme::TEXT_QUERY`] the text says "type here"
+    // more plainly than an outline would. The fill is a whole surface tier
+    // above the canvas so that the pill is still unmistakably a field.
     Frame::default()
-        .fill(colors.input)
-        .stroke(Stroke::new(1.0_f32, colors.border))
+        .fill(colors.surface)
         .rounding(Rounding::same(theme::RADIUS_MEDIUM))
-        .inner_margin(Margin::symmetric(theme::SPACE_2, theme::SPACE_1))
         .show(ui, |ui| {
             let mut query = model.query.clone();
+            // The pill has no margin of its own: the editor's own padding is
+            // the field's padding, which keeps [`theme::FIELD_HEIGHT`] the
+            // height of what is actually drawn.
             let response = ui.add_sized(
-                [ui.available_width(), theme::SPACE_8 + theme::SPACE_2],
+                [ui.available_width(), theme::FIELD_HEIGHT],
                 TextEdit::singleline(&mut query)
                     .font(TextStyle::Heading)
                     .hint_text("Search apps, files, and actions")
                     .hint_text_font(TextStyle::Heading)
                     .desired_width(f32::INFINITY)
-                    .margin(Margin::symmetric(theme::SPACE_2, theme::SPACE_1))
+                    .margin(Margin::symmetric(theme::SPACE_3, theme::SPACE_1))
                     .frame(false)
                     .lock_focus(true),
             );
@@ -1910,10 +1908,10 @@ fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
 
     // What the list may occupy is what is left after everything drawn under
     // it, measured rather than guessed. This used to subtract a flat
-    // [`theme::SPACE_8`], which is 34 logical px short of the footer alone: a
-    // list long enough to clamp the window to its expanded height pushed the
-    // separator and the "120 results" row past the bottom edge, and the owner
-    // of a 1600x1000 screen saw only their top few pixels.
+    // [`theme::SPACE_8`], which was short of the footer: a list long enough to
+    // clamp the window to its expanded height pushed the "120 results" row
+    // past the bottom edge, and the owner of a 1600x1000 screen saw only its
+    // top few pixels.
     //
     // The central panel's bottom inner margin is already outside
     // `available_height`, so it must not be counted again here.
@@ -1992,21 +1990,21 @@ fn draw_result_row(
     commands: &mut Vec<UiCommand>,
     colors: theme::Palette,
 ) -> egui::Response {
-    let fill = if selected {
-        colors.accent_soft
+    // Only the selected row is a shape at all. A fill and a border on every
+    // row is what made the list read as a stack of cards, and it left the
+    // selection competing with a dozen other outlines instead of being the
+    // only one on screen: the rest of the rows are text on the canvas, and
+    // what separates them is their own leading.
+    let (fill, stroke) = if selected {
+        (colors.accent_soft, Stroke::new(1.0_f32, colors.accent))
     } else {
-        colors.surface
-    };
-    let stroke = if selected {
-        Stroke::new(1.0_f32, colors.accent)
-    } else {
-        Stroke::new(1.0_f32, colors.border)
+        (egui::Color32::TRANSPARENT, Stroke::NONE)
     };
     let frame = Frame::default()
         .fill(fill)
         .stroke(stroke)
         .rounding(Rounding::same(theme::RADIUS_SMALL))
-        .inner_margin(Margin::symmetric(theme::SPACE_3, theme::SPACE_2))
+        .inner_margin(Margin::symmetric(theme::ROW_PAD_X, theme::ROW_PAD_Y))
         .show(ui, |ui| {
             // Every row is as wide as the list, not as wide as its own text.
             // An egui frame shrinks to its content, so without this the rows
@@ -2017,37 +2015,29 @@ fn draw_result_row(
             ui.set_min_width(ui.available_width());
             // And exactly as tall as every other row, description or not, so
             // the list is a regular column and the window can be sized from the
-            // row count. The margins are outside this, hence the subtraction.
-            ui.set_min_height(theme::ROW_HEIGHT - 2.0 * theme::SPACE_2);
+            // row count. The padding is outside this, hence the subtraction.
+            ui.set_min_height(theme::ROW_HEIGHT - 2.0 * theme::ROW_PAD_Y);
+            // Horizontally the icon stands away from the text; vertically the
+            // label and the line under it are one thing, so they are set
+            // tighter than anything else in the window.
+            ui.spacing_mut().item_spacing = vec2(theme::SPACE_2, theme::ROW_LINE_GAP);
             ui.horizontal(|ui| {
                 draw_row_icon(ui, row);
                 ui.vertical(|ui| {
-                    ui.add(egui::Label::new(highlighted_label(row, colors)));
-                    if !row.description.is_empty() {
-                        ui.label(
-                            RichText::new(&row.description)
-                                .size(theme::TEXT_SMALL)
-                                .color(colors.text_muted),
-                        );
-                    }
+                    // Truncated rather than wrapped: a row that grew a second
+                    // line for a long path would break the row arithmetic the
+                    // window height is computed from.
+                    ui.add(egui::Label::new(highlighted_label(row, colors)).truncate());
                     ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(&row.category)
-                                .size(theme::TEXT_SMALL)
-                                .color(colors.text_muted),
+                        ui.spacing_mut().item_spacing.x = theme::SPACE_1;
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(row_metadata(row))
+                                    .size(theme::TEXT_SMALL)
+                                    .color(colors.text_muted),
+                            )
+                            .truncate(),
                         );
-                        if !row.plugin_name.is_empty() {
-                            ui.label(
-                                RichText::new("/")
-                                    .size(theme::TEXT_SMALL)
-                                    .color(colors.text_muted),
-                            );
-                            ui.label(
-                                RichText::new(&row.plugin_name)
-                                    .size(theme::TEXT_SMALL)
-                                    .color(colors.text_muted),
-                            );
-                        }
                         if let Some(hint) = &row.argument_hint {
                             ui.label(RichText::new(hint).size(theme::TEXT_SMALL).color(colors.accent));
                         }
@@ -2073,6 +2063,33 @@ fn draw_result_row(
             });
         });
     frame.response
+}
+
+/// The one muted line under a row's label: what the result is, and where it
+/// came from.
+///
+/// One line and one galley rather than a stacked description, category and
+/// plugin name. Three lines of text needed a row half again as tall as this
+/// one, and rows tall enough to hold three lines are what made a five-result
+/// search fill the screen.
+fn row_metadata(row: &ResultRow) -> String {
+    // Interpuncts, because the parts are peers: the description is the most
+    // useful of them, so it leads.
+    let mut line = String::with_capacity(row.description.len() + row.category.len() + row.plugin_name.len());
+    for part in [
+        row.description.as_str(),
+        row.category.as_str(),
+        row.plugin_name.as_str(),
+    ] {
+        if part.is_empty() {
+            continue;
+        }
+        if !line.is_empty() {
+            line.push_str("  ·  ");
+        }
+        line.push_str(part);
+    }
+    line
 }
 
 /// How many icon textures one context retains before the cache is dropped
@@ -2228,18 +2245,21 @@ const ACTIONS_HEADER_HEIGHT: f32 = 24.0;
 /// [`draw_results`] has to know this before the overlay is drawn, because the
 /// overlay comes out of the room the result list would otherwise take. The sum
 /// follows the drawing directly: the frame's [`theme::SPACE_3`] inner margin
-/// at the top and bottom, the header row, three [`theme::SPACE_2`] under the
-/// header -- the explicit gap plus the item spacing egui puts either side of
-/// it -- and then one button per action at the [`theme::SPACE_8`] of
-/// `interact_size`, separated by item spacing.
+/// at the top and bottom, the header row, the explicit [`theme::SPACE_2`]
+/// under the header plus the one [`theme::ITEM_SPACING_Y`] egui adds ahead of
+/// the first button -- `add_space` advances the cursor and nothing else, so
+/// the implicit spacing lands after the explicit gap and not before it -- and
+/// then one button per action at [`theme::CONTROL_HEIGHT`], separated by item
+/// spacing.
 ///
 /// Measured, not guessed:
 /// `a_clamped_window_still_leaves_the_status_line_room_to_be_read` lays the
 /// overlay out and fails if the frame it draws is not this tall, so a
 /// restyled overlay cannot quietly grow over the status line again.
 fn actions_overlay_height(buttons: usize) -> f32 {
-    let chrome = theme::SPACE_3 * 2.0 + ACTIONS_HEADER_HEIGHT + theme::SPACE_2 * 3.0;
-    let stack = (buttons as f32) * theme::SPACE_8 + (buttons.saturating_sub(1) as f32) * theme::SPACE_2;
+    let chrome = theme::SPACE_3 * 2.0 + ACTIONS_HEADER_HEIGHT + theme::SPACE_2 + theme::ITEM_SPACING_Y;
+    let stack =
+        (buttons as f32) * theme::CONTROL_HEIGHT + (buttons.saturating_sub(1) as f32) * theme::ITEM_SPACING_Y;
     chrome + stack
 }
 
@@ -2247,9 +2267,11 @@ fn draw_actions(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
     let Some(row) = model.rows.get(model.selected) else {
         return;
     };
+    // A sheet, not a bordered box: it is the only thing under the field while
+    // it is open, so the surface tier is enough to say it stands over the
+    // list. The accent outline it used to carry only shouted.
     Frame::default()
         .fill(colors.surface)
-        .stroke(Stroke::new(1.0_f32, colors.accent))
         .rounding(Rounding::same(theme::RADIUS_MEDIUM))
         .inner_margin(Margin::same(theme::SPACE_3))
         .show(ui, |ui| {
@@ -2302,7 +2324,6 @@ fn draw_settings(
 ) {
     Frame::default()
         .fill(colors.surface)
-        .stroke(Stroke::new(1.0_f32, colors.accent))
         .rounding(Rounding::same(theme::RADIUS_MEDIUM))
         .inner_margin(Margin::same(theme::SPACE_3))
         .show(ui, |ui| {
@@ -2331,8 +2352,9 @@ fn draw_settings(
                 draw_setting_row(ui, row, model.settings_focus.as_deref(), commands, colors);
                 ui.add_space(theme::SPACE_1);
             }
-            ui.add_space(theme::SPACE_1);
-            ui.separator();
+            // The footer of the sheet is set apart by space rather than by a
+            // rule: it is the last thing on a surface that has already ended.
+            ui.add_space(theme::SPACE_2);
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Enter or Save commits an edit")
@@ -2416,29 +2438,26 @@ fn draw_setting_row(
     }
 }
 
-/// The vertical room egui's `Separator` takes across a vertical layout, in
-/// logical pixels. It allocates `Separator::spacing` and draws its one-pixel
-/// line down the middle of that strip; the default is 6 and there is no
-/// accessor to ask for it, so it is measured -- see [`STATUS_BLOCK_HEIGHT`].
-const SEPARATOR_STRIP: f32 = 6.0;
-
-/// The vertical room [`draw_status`] needs, in logical pixels: the separator's
-/// strip, the [`theme::SPACE_2`] of item spacing egui puts under it, and the
-/// status row itself, which is [`theme::SPACE_8`] tall because the
-/// `Settings  Ctrl+,` button's `interact_size` decides the row's height rather
-/// than the small text beside it.
+/// The vertical room [`draw_status`] needs, in logical pixels: one status row,
+/// which is [`theme::CONTROL_HEIGHT`] tall because the `Settings  Ctrl+,`
+/// button's `interact_size` decides the row's height rather than the small
+/// text beside it.
+///
+/// There is no rule above it any more. The footer used to open with a
+/// `Separator` drawn edge to edge, which is a border across the one part of
+/// the window that should recede; the [`BLOCK_GAP`] over it already says the
+/// same thing.
 ///
 /// [`draw_results`] subtracts this from the room the result list may take, so
 /// it must be the room the footer actually occupies rather than an estimate of
 /// it. Measured, not guessed:
 /// `a_clamped_window_still_leaves_the_status_line_room_to_be_read` lays a
-/// clamped frame out and fails if the span from the top of the separator strip
-/// to the bottom of the status row stops matching this, which is what let a
-/// 120-result list push the "120 results" line off the bottom of the window.
-const STATUS_BLOCK_HEIGHT: f32 = SEPARATOR_STRIP + theme::SPACE_2 + theme::SPACE_8;
+/// clamped frame out and fails if the status row stops matching this, which is
+/// what let a 120-result list push the "120 results" line off the bottom of
+/// the window.
+const STATUS_BLOCK_HEIGHT: f32 = theme::CONTROL_HEIGHT;
 
 fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
-    ui.separator();
     ui.horizontal(|ui| {
         if model.pending_plugins {
             ui.spinner();
@@ -3057,21 +3076,75 @@ mod window_geometry_tests {
         );
     }
 
+    /// The lowest pixel a frame draws, ignoring the central panel's own
+    /// background: that fills the window by definition and would report the
+    /// window height back rather than the height of what was drawn in it.
+    fn drawn_bottom(shape: &egui::Shape, canvas: egui::Color32) -> f32 {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .map(|shape| drawn_bottom(shape, canvas))
+                .fold(f32::NEG_INFINITY, f32::max),
+            egui::Shape::Rect(rect) if rect.fill == canvas => f32::NEG_INFINITY,
+            other => {
+                let bounds = other.visual_bounding_rect();
+                if bounds.is_finite() {
+                    bounds.max.y
+                } else {
+                    f32::NEG_INFINITY
+                }
+            }
+        }
+    }
+
+    /// The frame `model` draws in a window of the launcher's width and
+    /// `height`, which is how every clipping check here lays a frame out at
+    /// exactly the height the launcher would have asked the window for.
+    fn frame_at(model: &ViewModel, height: u32) -> NativeUiFrame {
+        let input = RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(
+                    f32::from(theme::DEFAULT_WINDOW_WIDTH as u16),
+                    f32::from(height as u16),
+                ),
+            )),
+            ..Default::default()
+        };
+        build_launcher_frame(&create_launcher_context(), input, model)
+    }
+
+    /// The lowest pixel `frame` draws.
+    fn frame_bottom(frame: &NativeUiFrame) -> f32 {
+        let canvas = theme::palette().canvas;
+        frame
+            .output
+            .shapes
+            .iter()
+            .map(|clipped| drawn_bottom(&clipped.shape, canvas))
+            .fold(f32::NEG_INFINITY, f32::max)
+    }
+
+    /// The narrowest a result row may be in a 720-wide test window, in logical
+    /// pixels: wider than any control the launcher draws inside a row, so a
+    /// row's own rectangle can be told apart from theirs by width alone.
+    const LIST_WIDTH_FLOOR: f32 = 600.0;
+
     /// The window height is arithmetic over [`theme::ROW_HEIGHT`] and
     /// [`theme::ROW_GAP`], and nothing in egui enforces that the rows it draws
     /// are that size. This lays real rows out and fails if they are not: the
     /// arithmetic and the drawing must not be able to drift apart.
     #[test]
     fn every_result_row_matches_the_pinned_row_metrics() {
-        // A row is a small-radius rectangle painted in one of the two row
-        // fills. The rounding alone would also collect the footer's Settings
-        // button, which is a small-radius rectangle in a widget fill.
+        // A row is the full-width small-radius rectangle its frame paints: the
+        // selected row paints it in the selection fill, the rest paint it
+        // transparent, so the fill cannot be what identifies one. The width is
+        // what separates a row from the buttons inside it and from the
+        // footer's Settings button, which share the radius.
         fn row_rects(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
-            let colors = theme::palette();
             match shape {
                 egui::Shape::Rect(rect)
-                    if rect.rounding.nw == theme::RADIUS_SMALL
-                        && (rect.fill == colors.surface || rect.fill == colors.accent_soft) =>
+                    if rect.rounding.nw == theme::RADIUS_SMALL && rect.rect.width() > LIST_WIDTH_FLOOR =>
                 {
                     out.push(rect.rect);
                 }
@@ -3110,7 +3183,7 @@ mod window_geometry_tests {
             assert_eq!(rect.width(), width, "rows must all be the same width");
         }
         assert!(
-            width > 600.0,
+            width > LIST_WIDTH_FLOOR,
             "rows must span the 720-wide window, not shrink to their text: {width}"
         );
         for pair in rects.windows(2) {
@@ -3150,6 +3223,64 @@ mod window_geometry_tests {
         }
     }
 
+    /// The selection is the only shape in the list.
+    ///
+    /// The rows are drawn as a list rather than as a stack of cards, which
+    /// means the selection cannot rely on being a slightly different card any
+    /// more: it is the one row that is filled and outlined at all. Giving every
+    /// row a fill back would take the selection's only affordance away, and
+    /// dropping the selected row's fill would leave the user with nothing at
+    /// all to look at.
+    #[test]
+    fn the_selected_row_is_the_only_row_the_list_paints() {
+        fn row_shapes<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::epaint::RectShape>) {
+            match shape {
+                egui::Shape::Rect(rect)
+                    if rect.rounding.nw == theme::RADIUS_SMALL && rect.rect.width() > LIST_WIDTH_FLOOR =>
+                {
+                    out.push(rect);
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| row_shapes(shape, out)),
+                _ => {}
+            }
+        }
+
+        let mut model = view_with_rows(3);
+        model.selected = 1;
+        let frame = frame_at(&model, theme::DEFAULT_WINDOW_HEIGHT);
+        let mut rows = Vec::new();
+        for clipped in &frame.output.shapes {
+            row_shapes(&clipped.shape, &mut rows);
+        }
+        rows.sort_by(|left, right| left.rect.min.y.total_cmp(&right.rect.min.y));
+        assert_eq!(rows.len(), 3, "three results are three rows");
+
+        let colors = theme::palette();
+        for (index, row) in rows.iter().enumerate() {
+            if index == model.selected {
+                assert_eq!(
+                    row.fill, colors.accent_soft,
+                    "the selected row must be filled, or nothing on screen says which row \
+                     Enter would run"
+                );
+                assert_eq!(row.stroke.color, colors.accent, "and outlined in the accent");
+                assert!(row.stroke.width >= 1.0, "with a stroke that is actually drawn");
+            } else {
+                assert_eq!(
+                    row.fill,
+                    egui::Color32::TRANSPARENT,
+                    "an unselected row paints nothing: a fill on every row is what made the \
+                     list a stack of cards and left the selection competing with it"
+                );
+                assert_eq!(
+                    row.stroke,
+                    Stroke::NONE,
+                    "and it is not outlined either, for the same reason"
+                );
+            }
+        }
+    }
+
     /// The owner of the v0.1.6 window reported seeing "the top 5% of the 'x
     /// results'": the status line is the last thing [`draw_launcher`] draws,
     /// and the window was being sized to a sum that stopped above it.
@@ -3160,50 +3291,12 @@ mod window_geometry_tests {
     /// compares the lowest pixel the frame draws against that height.
     #[test]
     fn a_listed_window_leaves_the_status_line_room_to_be_read() {
-        // Everything except the central panel's own background, which fills
-        // the window by definition and would report the window height back
-        // rather than the height of what was drawn in it.
-        fn drawn_bottom(shape: &egui::Shape, canvas: egui::Color32) -> f32 {
-            match shape {
-                egui::Shape::Vec(shapes) => shapes
-                    .iter()
-                    .map(|shape| drawn_bottom(shape, canvas))
-                    .fold(f32::NEG_INFINITY, f32::max),
-                egui::Shape::Rect(rect) if rect.fill == canvas => f32::NEG_INFINITY,
-                other => {
-                    let bounds = other.visual_bounding_rect();
-                    if bounds.is_finite() {
-                        bounds.max.y
-                    } else {
-                        f32::NEG_INFINITY
-                    }
-                }
-            }
-        }
-
         for rows in 1_usize..=3 {
             let model = view_with_rows(rows);
             let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
-            let input = RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(
-                        f32::from(theme::DEFAULT_WINDOW_WIDTH as u16),
-                        f32::from(height as u16),
-                    ),
-                )),
-                ..Default::default()
-            };
-            let frame = build_launcher_frame(&create_launcher_context(), input, &model);
-            let colors = theme::palette();
-            let bottom = frame
-                .output
-                .shapes
-                .iter()
-                .map(|clipped| drawn_bottom(&clipped.shape, colors.canvas))
-                .fold(f32::NEG_INFINITY, f32::max);
+            let bottom = frame_bottom(&frame_at(&model, height));
 
-            let needed = bottom + theme::SPACE_4;
+            let needed = bottom + theme::PANEL_MARGIN;
             assert!(
                 needed <= f32::from(height as u16),
                 "{rows} results draw down to {bottom}, so the window needs {needed} and \
@@ -3218,6 +3311,40 @@ mod window_geometry_tests {
         }
     }
 
+    /// The same clipping check for the window the launcher opens with.
+    ///
+    /// [`theme::COMPACT_WINDOW_HEIGHT`] is the one height nothing computes: it
+    /// is a pinned number that has to cover the query field, the footer and
+    /// both panel margins, and every other height in the launcher is that
+    /// number plus a list. Shrinking the field or the footer without shrinking
+    /// it leaves an empty strip under the footer; shrinking it too far cuts the
+    /// footer off in the window the user sees most.
+    #[test]
+    fn a_compact_window_leaves_room_for_the_field_and_the_footer() {
+        let model = view("", false);
+        assert_eq!(
+            desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT),
+            theme::COMPACT_WINDOW_HEIGHT,
+            "an untyped launcher is the compact window, or this tests the wrong height"
+        );
+
+        let window = f32::from(theme::COMPACT_WINDOW_HEIGHT as u16);
+        let bottom = frame_bottom(&frame_at(&model, theme::COMPACT_WINDOW_HEIGHT));
+        let needed = bottom + theme::PANEL_MARGIN;
+        assert!(
+            needed <= window,
+            "the compact frame draws down to {bottom}, so it needs {needed} once the \
+             panel's bottom margin is added and the window is only {window} tall: the \
+             footer is cut off"
+        );
+        assert!(
+            window - needed < theme::ROW_GAP,
+            "the compact window is {} taller than what it draws, which is a strip of \
+             empty canvas under the footer",
+            window - needed
+        );
+    }
+
     /// The same clipping check with the action list open.
     ///
     /// A long result set hides this: it clamps to the expanded height, which is
@@ -3229,23 +3356,8 @@ mod window_geometry_tests {
     fn opening_the_action_list_makes_room_for_it() {
         use crikey_core::{Action, ActionId};
 
-        fn drawn_bottom(shape: &egui::Shape, canvas: egui::Color32) -> f32 {
-            match shape {
-                egui::Shape::Vec(shapes) => shapes
-                    .iter()
-                    .map(|shape| drawn_bottom(shape, canvas))
-                    .fold(f32::NEG_INFINITY, f32::max),
-                egui::Shape::Rect(rect) if rect.fill == canvas => f32::NEG_INFINITY,
-                other => {
-                    let bounds = other.visual_bounding_rect();
-                    if bounds.is_finite() {
-                        bounds.max.y
-                    } else {
-                        f32::NEG_INFINITY
-                    }
-                }
-            }
-        }
+        // The overlay's own height is checked by the clamped case; here it is
+        // only in the way of the status line.
 
         for rows in 1_usize..=2 {
             let mut model = view_with_rows(rows);
@@ -3273,26 +3385,9 @@ mod window_geometry_tests {
             model.actions_open = true;
 
             let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
-            let input = RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(
-                        f32::from(theme::DEFAULT_WINDOW_WIDTH as u16),
-                        f32::from(height as u16),
-                    ),
-                )),
-                ..Default::default()
-            };
-            let frame = build_launcher_frame(&create_launcher_context(), input, &model);
-            let colors = theme::palette();
-            let bottom = frame
-                .output
-                .shapes
-                .iter()
-                .map(|clipped| drawn_bottom(&clipped.shape, colors.canvas))
-                .fold(f32::NEG_INFINITY, f32::max);
+            let bottom = frame_bottom(&frame_at(&model, height));
 
-            let needed = bottom + theme::SPACE_4;
+            let needed = bottom + theme::PANEL_MARGIN;
             assert!(
                 needed <= f32::from(height as u16),
                 "{rows} results with the action list open draw down to {bottom}, so the \
@@ -3360,58 +3455,47 @@ mod window_geometry_tests {
                 theme::DEFAULT_WINDOW_HEIGHT,
                 "120 results must clamp the window, or this tests the wrong case"
             );
-            let input = RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(
-                        f32::from(theme::DEFAULT_WINDOW_WIDTH as u16),
-                        f32::from(height as u16),
-                    ),
-                )),
-                ..Default::default()
-            };
-            let frame = build_launcher_frame(&create_launcher_context(), input, &model);
+            let frame = frame_at(&model, height);
             let mut shapes = Vec::new();
             for clipped in &frame.output.shapes {
                 leaves(&clipped.shape, &mut shapes);
             }
-
-            // The footer starts at the one separator the frame draws, so the
-            // status line can be found without guessing at a coordinate.
-            let lines: Vec<f32> = shapes
+            let canvas = theme::palette().canvas;
+            // Every rectangle the frame paints except the panel's own
+            // background, which is the window and would answer every question
+            // here with the window's own edges.
+            let mut rects: Vec<egui::Rect> = shapes
                 .iter()
                 .filter_map(|shape| match shape {
-                    egui::Shape::LineSegment { points, .. } => Some(points[0].y),
+                    egui::Shape::Rect(rect) if rect.fill != canvas => Some(rect.rect),
                     _ => None,
                 })
                 .collect();
-            assert_eq!(
-                lines.len(),
-                1,
-                "draw_status opens with the only separator in a listed frame"
-            );
-            let separator = lines[0];
+            rects.sort_by(|left, right| left.min.y.total_cmp(&right.min.y));
 
-            // Below the separator there is exactly one rectangle: the
-            // `Settings  Ctrl+,` button, whose interact_size is what makes the
-            // status row as tall as it is. The unexpanded `rect` is the layout
-            // rect; `visual_bounding_rect` would add half the stroke.
-            let below: Vec<egui::Rect> = shapes
-                .iter()
-                .filter_map(|shape| match shape {
-                    egui::Shape::Rect(rect) if rect.rect.min.y > separator => Some(rect.rect),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                below.len(),
-                1,
-                "the status row's one rectangle is the Settings button, not {below:?}"
+            // The footer is the last thing the frame draws and its one
+            // rectangle is the `Settings  Ctrl+,` button, whose interact_size
+            // is what makes the status row as tall as it is. There is no
+            // separator to find it by any more, so it is found by being last.
+            // The unexpanded `rect` is the layout rect; `visual_bounding_rect`
+            // would add half the stroke.
+            let footer = *rects.last().expect("a listed frame paints the footer button");
+            // Where a rectangle *starts*, not where it ends: the last row of a
+            // clamped list is cut off by the scroll area's clip rect, so its
+            // rectangle reaches under the footer while none of it is drawn
+            // there.
+            assert!(
+                rects.iter().filter(|rect| rect.min.y >= footer.min.y).count() == 1,
+                "the footer is one control, not {:?}",
+                rects
+                    .iter()
+                    .filter(|rect| rect.min.y >= footer.min.y)
+                    .collect::<Vec<_>>()
             );
-            let status_bottom = below[0].max.y;
+            let status_bottom = footer.max.y;
 
             let window = f32::from(height as u16);
-            let needed = status_bottom + theme::SPACE_4;
+            let needed = status_bottom + theme::PANEL_MARGIN;
             assert!(
                 needed <= window,
                 "with actions_open={actions_open} the status row ends at {status_bottom}, so \
@@ -3425,29 +3509,42 @@ mod window_geometry_tests {
                 window - needed
             );
 
-            // The reserved room is only honest while these two measurements
-            // hold. egui draws the separator line down the middle of the strip
-            // it allocates, hence the half-strip; the line is snapped to a
-            // pixel centre, hence the tolerance.
-            let block = status_bottom - (separator - SEPARATOR_STRIP / 2.0);
+            // The room [`draw_results`] gives up for the footer is only honest
+            // while the footer is that tall. The button is snapped to a pixel
+            // grid, hence the tolerance.
             assert!(
-                (block - STATUS_BLOCK_HEIGHT).abs() <= 1.0,
-                "the footer occupies {block}, not the STATUS_BLOCK_HEIGHT of {} that \
+                (footer.height() - STATUS_BLOCK_HEIGHT).abs() <= 1.0,
+                "the footer occupies {}, not the STATUS_BLOCK_HEIGHT of {} that \
                  draw_results reserves for it",
+                footer.height(),
                 STATUS_BLOCK_HEIGHT
             );
             if actions_open {
-                let overlay = shapes
+                // Two sheets stand on the canvas: the query field and, under
+                // the list, the action overlay. Neither is outlined any more,
+                // so they are found by fill and radius, and the overlay is the
+                // lower of the two.
+                let surface = theme::palette().surface;
+                let mut sheets: Vec<egui::Rect> = shapes
                     .iter()
                     .filter_map(|shape| match shape {
-                        egui::Shape::Rect(rect) if rect.stroke.color == theme::palette().accent => {
-                            Some(rect.rect.height())
+                        egui::Shape::Rect(rect)
+                            if rect.fill == surface && rect.rounding.nw == theme::RADIUS_MEDIUM =>
+                        {
+                            Some(rect.rect)
                         }
                         _ => None,
                     })
-                    .fold(f32::NEG_INFINITY, f32::max);
+                    .collect();
+                sheets.sort_by(|left, right| left.min.y.total_cmp(&right.min.y));
                 assert_eq!(
-                    overlay,
+                    sheets.len(),
+                    2,
+                    "a frame with the action list open draws the query field and the \
+                     overlay, not {sheets:?}"
+                );
+                assert_eq!(
+                    sheets[1].height(),
                     actions_overlay_height(BUTTONS),
                     "the actions overlay for {BUTTONS} actions is not the height \
                      draw_results reserves for it"

@@ -198,10 +198,22 @@ fn required_state(
         // itself, so there is no subset of paths a present helper covers.
         Capability::FileOpen if opener => CapabilityState::Available,
         Capability::FileOpen => CapabilityState::Unavailable,
+        // The clipboard follows the session and, like window control, without
+        // opening a display. X11 selections are core protocol, so an X11 session
+        // needs nothing installed for them. Wayland is `Partial` because this
+        // backend reaches a Wayland clipboard through XWayland, which every
+        // compositor it targets runs and none of them owes it -- the same
+        // "supported by this session, subject to a runtime gate" that window
+        // control gets under X11. A session with no display server has no
+        // clipboard to claim at all.
+        Capability::Clipboard => match environment {
+            DesktopEnvironment::X11 => CapabilityState::Available,
+            DesktopEnvironment::Wayland => CapabilityState::Partial,
+            DesktopEnvironment::Headless => CapabilityState::Unavailable,
+        },
         // Nothing else has a Linux implementation behind it yet, so nothing
         // else may be claimed in any session.
-        Capability::Clipboard
-        | Capability::UriOpen
+        Capability::UriOpen
         | Capability::Notifications
         | Capability::FileWatching
         | Capability::SecretStorage
@@ -213,9 +225,10 @@ fn required_state(
 ///
 /// Icons and file search are deliberately absent: both have an implementation
 /// behind them, and both are the capabilities here that do not depend on a
-/// display server at all.
-const UNBACKED: [Capability; 6] = [
-    Capability::Clipboard,
+/// display server at all. The clipboard is absent too, and for the opposite
+/// reason: it has an implementation *and* it depends on the session, so what it
+/// may claim is pinned per session in [`required_state`] instead.
+const UNBACKED: [Capability; 5] = [
     Capability::SecretStorage,
     Capability::Notifications,
     Capability::FileWatching,
@@ -485,12 +498,39 @@ fn discovery_and_launching_stay_available_in_every_session() {
     }
 }
 
+/// The clipboard is claimed against the session it is reached through.
+///
+/// Kills two bugs in opposite directions. Claiming `Available` for a headless
+/// unit hands the user a copy action whose only outcome is a failure at the
+/// moment they select it -- the clipboard implementation is an X11 client and a
+/// headless session has no server to be a client of. Reporting `Unavailable`
+/// under Wayland would be the other lie: the clipboard is reached there, through
+/// XWayland, and only the absence of XWayland can stop it, which is a runtime
+/// gate and therefore `Partial` (spec 18.2).
+///
+/// That the *service* agrees with this report is pinned in `clipboard_x11.rs`,
+/// where a reachable display exists to make the assertion mean something.
+#[test]
+fn the_clipboard_is_claimed_against_the_session_it_is_reached_through() {
+    for (environment, expected) in [
+        (DesktopEnvironment::X11, CapabilityState::Available),
+        (DesktopEnvironment::Wayland, CapabilityState::Partial),
+        (DesktopEnvironment::Headless, CapabilityState::Unavailable),
+    ] {
+        let backend = LinuxBackend::with_desktop_environment(environment);
+        assert_eq!(
+            backend.capability(Capability::Clipboard),
+            expected,
+            "{environment:?} must report the clipboard it can actually reach"
+        );
+    }
+}
+
 /// Nothing is claimed without an implementation behind it.
 ///
 /// Kills the bug where making the backend session-aware turns into optimism:
-/// a session upgrade must not promote clipboard, secrets, notifications,
-/// file watching, URI opening or shell integration, none of which have a Linux
-/// implementation.
+/// a session upgrade must not promote secrets, notifications, file watching,
+/// URI opening or shell integration, none of which have a Linux implementation.
 #[test]
 fn no_capability_is_claimed_available_without_a_backend_behind_it() {
     for environment in ALL_ENVIRONMENTS {

@@ -33,6 +33,13 @@
 //! window control there stays unavailable, because no Wayland protocol lets an
 //! ordinary client enumerate another client's windows.
 //!
+//! The clipboard is reported against the session for the same reason, in
+//! [`clipboard`]: X11 has selections in its core protocol and needs nothing
+//! installed, Wayland is reached through XWayland and is therefore `Partial`,
+//! and a session with no display server has no clipboard at all. It is also the
+//! one service handed out by value rather than by reference, because an X11
+//! selection lives exactly as long as the client that owns it.
+//!
 //! A root is only as trustworthy as whatever last wrote into it, so a
 //! candidate is stat checked and read through a cap before it is parsed:
 //! discovery must not block on a FIFO, follow a device node, or pull an
@@ -57,9 +64,13 @@ use std::thread;
 
 use crikey_core::{CoreError, PlatformPath, Result};
 use crikey_platform::{
-    ApplicationDiscovery, Capability, CapabilityState, DiscoveredApplication, FileOpener, FileSearchService,
-    HotkeyService, IconLoader, IconProvider, ProcessLauncher, StandardDirectories, WindowService,
+    ApplicationDiscovery, Capability, CapabilityState, Clipboard, DiscoveredApplication, FileOpener,
+    FileSearchService, HotkeyService, IconLoader, IconProvider, ProcessLauncher, StandardDirectories,
+    WindowService,
 };
+
+pub mod clipboard;
+pub use clipboard::X11Clipboard;
 
 pub mod icons;
 pub use icons::XdgIconSource;
@@ -732,8 +743,22 @@ impl LinuxBackend {
                 Some(_) => CapabilityState::Available,
                 None => CapabilityState::Unavailable,
             },
-            Capability::Clipboard
-            | Capability::UriOpen
+            // The clipboard follows the session, and does it without opening a
+            // display: an X11 session has selections in the core protocol, so
+            // the claim needs nothing installed beyond the server that defines
+            // the session. A Wayland session is `Partial` because this backend
+            // reaches its clipboard through XWayland (see [`clipboard`]), which
+            // every compositor it targets runs and none of them is obliged to:
+            // "supported by this session, subject to a runtime gate" is exactly
+            // what `Partial` says (spec 18.2). A session with no display server
+            // has no clipboard to claim -- there is no process holding one and
+            // no protocol to reach it with.
+            Capability::Clipboard => match self.desktop {
+                DesktopEnvironment::X11 => CapabilityState::Available,
+                DesktopEnvironment::Wayland => CapabilityState::Partial,
+                DesktopEnvironment::Headless => CapabilityState::Unavailable,
+            },
+            Capability::UriOpen
             | Capability::Notifications
             | Capability::FileWatching
             | Capability::SecretStorage
@@ -749,6 +774,33 @@ impl LinuxBackend {
     /// The launcher behind [`Capability::ProcessLaunch`].
     pub fn process_launcher(&self) -> &dyn ProcessLauncher {
         &self.processes
+    }
+
+    /// The service behind [`Capability::Clipboard`], connected on this call, or
+    /// `None` when this session has no clipboard to hand out.
+    ///
+    /// Owned rather than borrowed, unlike every other accessor here, and that
+    /// is the whole contract: an X11 selection lives only as long as the client
+    /// that owns it, so whoever asks for the clipboard must keep the value for
+    /// as long as copies made through it are meant to be pasteable -- in the
+    /// launcher, the lifetime of the process. Handing out a `&dyn` from a cached
+    /// field would put that lifetime here, in a backend a caller is free to
+    /// drop, and a copy would then vanish the moment it did (see [`clipboard`]).
+    ///
+    /// `None` for a session with no display server without attempting to
+    /// connect: the answer is already known from the detected session, and the
+    /// alternative would let a headless unit's report depend on whether some
+    /// unrelated `DISPLAY` happened to be inherited. Also `None` when the
+    /// connection itself fails, which is the runtime gate
+    /// [`CapabilityState::Partial`] warns about under Wayland: no XWayland, no
+    /// clipboard.
+    pub fn clipboard(&self) -> Option<Box<dyn Clipboard>> {
+        match self.desktop {
+            DesktopEnvironment::X11 | DesktopEnvironment::Wayland => {
+                X11Clipboard::for_session().map(|clipboard| Box::new(clipboard) as Box<dyn Clipboard>)
+            }
+            DesktopEnvironment::Headless => None,
+        }
     }
 
     /// The provider behind [`Capability::Icons`], built on first use.
