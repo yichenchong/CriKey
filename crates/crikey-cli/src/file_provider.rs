@@ -48,6 +48,20 @@ pub(crate) const FILE_SEARCH_PLUGIN: &str = "builtin.crikey.files";
 /// — every keystroke cancels the one before it — not a short clock.
 const FILE_SEARCH_DEADLINE: Duration = Duration::from_secs(1);
 
+/// How long the driver waits for the worker before settling a generation
+/// itself.
+///
+/// [`FILE_SEARCH_DEADLINE`] is a promise the backend is asked to keep, not one
+/// the launcher can enforce: nothing here can interrupt a call that is wedged
+/// in a hung mount or an index socket that never replies. One job makes at most
+/// two backend calls — the prefix, then the full query when the prefix answer
+/// turned out to be a fragment — so two seconds is the longest wait a backend
+/// that keeps its promise can impose, and the third second is slack. Past that
+/// the answer is not late, it is not coming, and a source that goes on being
+/// claimed as outstanding leaves the launcher saying "Providers are still
+/// responding" for the rest of the session.
+const FILE_SETTLE_DEADLINE_MS: u64 = 3 * FILE_SEARCH_DEADLINE.as_millis() as u64;
+
 /// Characters of the query the backend is actually asked about.
 ///
 /// A backend matches a name by case-insensitive substring, so the hits for a
@@ -108,7 +122,10 @@ struct FileJob {
     query: String,
     now: u64,
     cancel: CancelToken,
-    builtin_rows: Vec<ResultRow>,
+    /// Shared with the settlement frame the driver holds for this same job, so
+    /// the rows the launcher already has on screen are cloned once per query
+    /// rather than once per holder.
+    builtin_rows: Arc<[ResultRow]>,
     builtin_pending: bool,
     selected: usize,
 }
@@ -117,6 +134,22 @@ struct FileJob {
 struct FileMailbox {
     job: Option<FileJob>,
     stop: bool,
+}
+
+/// The generation the driver has accepted and not yet seen answered.
+///
+/// The launcher marks the file source pending the moment a query is handed
+/// over, and only an outcome under that generation takes the mark off again.
+/// This is the driver's own copy of the answer it owes, so a worker that
+/// cannot produce one — wedged in a backend that ignores its deadline, or gone
+/// — does not strand the mark.
+struct Outstanding {
+    /// What settles the generation: the rows the launcher published for it and
+    /// nothing of this provider's own, which is exactly what the worker itself
+    /// would send back after a search that found nothing.
+    frame: ViewModel,
+    /// Clock reading, on the caller's monotonic query clock, at hand-over.
+    submitted_at: u64,
 }
 
 /// The hits of one prefix, kept so the rest of a typing burst costs no search.
@@ -154,6 +187,9 @@ pub(crate) struct FileSearchDriver {
     cancel: Mutex<Option<CancelToken>>,
     published: Arc<Mutex<PublishedFileItems>>,
     forget_cache: Arc<AtomicBool>,
+    /// The generation this driver has accepted and owes an answer for. See
+    /// [`Outstanding`].
+    outstanding: Mutex<Option<Outstanding>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -164,8 +200,9 @@ impl FileSearchDriver {
     /// `pipeline` must already have `owner` registered with
     /// [`file_provider_policy`]. `publish` runs on the worker thread with each
     /// merged frame. A thread that fails to spawn degrades to a driver that
-    /// accepts queries and answers nothing, rather than a panic in the
-    /// composition root.
+    /// refuses every submission, so the launcher never marks file work
+    /// outstanding it will not get, rather than a panic in the composition
+    /// root.
     pub(crate) fn spawn<P>(
         owner: PluginId,
         pipeline: QueryPipeline,
@@ -258,6 +295,7 @@ impl FileSearchDriver {
             cancel: Mutex::new(None),
             published,
             forget_cache,
+            outstanding: Mutex::new(None),
             worker: spawned.ok(),
         }
     }
@@ -266,6 +304,14 @@ impl FileSearchDriver {
     ///
     /// `builtin_rows` are the built-in provider's rows for `generation`, which
     /// the merged frame keeps ahead of the file rows.
+    ///
+    /// Returns whether this driver accepted `generation` and will therefore
+    /// settle it. This is the *only* honest answer to "may the caller mark the
+    /// file source pending", and it is returned rather than asked separately so
+    /// the two cannot drift apart: every reason a submission is refused —
+    /// no worker thread, a rewound generation, a driver being dropped — is a
+    /// reason nothing will ever come back.
+    #[must_use]
     pub(crate) fn submit(
         &self,
         generation: Generation,
@@ -274,14 +320,17 @@ impl FileSearchDriver {
         builtin_rows: Vec<ResultRow>,
         builtin_pending: bool,
         selected: usize,
-    ) {
+    ) -> bool {
+        if !self.has_worker_thread() {
+            return false;
+        }
         // Intake is monotonic: a delayed caller must not rewind the live
         // generation and make an obsolete job eligible for publication again.
         let generation_value = generation.get();
         let mut observed = self.current.load(Ordering::Acquire);
         loop {
             if generation_value < observed {
-                return;
+                return false;
             }
             match self.current.compare_exchange_weak(
                 observed,
@@ -318,8 +367,28 @@ impl FileSearchDriver {
         let (lock, cvar) = &*self.mailbox;
         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
         if slot.stop {
-            return;
+            return false;
         }
+        // Built before the job takes the rows, and sharing them with it: this is
+        // what the driver publishes on its own if the worker never answers, so
+        // it has to carry the rows the launcher already put on screen. A
+        // settlement frame with no rows would clear the built-in group when it
+        // folded in.
+        let builtin_rows: Arc<[ResultRow]> = builtin_rows.into();
+        *self.outstanding.lock().unwrap_or_else(|error| error.into_inner()) = Some(Outstanding {
+            frame: ViewModel {
+                generation,
+                query: query.to_owned(),
+                rows: Arc::clone(&builtin_rows),
+                selected,
+                pending_plugins: builtin_pending,
+                actions_open: false,
+                settings_open: false,
+                settings: Arc::default(),
+                settings_focus: None,
+            },
+            submitted_at: now,
+        });
         slot.job = Some(FileJob {
             generation,
             query: query.to_owned(),
@@ -331,16 +400,46 @@ impl FileSearchDriver {
         });
         drop(slot);
         cvar.notify_one();
+        true
     }
 
     /// Takes the latest merged frame the worker produced, for the UI thread to
     /// fold into its retained rows. Single slot, replace-oldest: only the newest
     /// matters.
-    pub(crate) fn take_outcome(&self) -> Option<ViewModel> {
-        self.outcome
+    ///
+    /// `now` is the caller's monotonic query clock, the same one `submit` was
+    /// given. Past [`FILE_SETTLE_DEADLINE_MS`] the driver answers for a worker
+    /// that has not: the frame it hands back settles the generation the caller
+    /// marked pending and contributes no file rows. A worker that answers after
+    /// that is not discarded — its rows fold in under the same generation on a
+    /// later turn, exactly as an early answer would.
+    pub(crate) fn take_outcome(&self, now: u64) -> Option<ViewModel> {
+        let taken = self
+            .outcome
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take()
+            .take();
+        let mut outstanding = self.outstanding.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(outcome) = taken {
+            // Only what this outcome actually answers. A newer generation may
+            // have been submitted since the worker published, and discharging
+            // that one on the strength of an older answer is the whole bug this
+            // guards against.
+            if outstanding
+                .as_ref()
+                .is_some_and(|owed| owed.frame.generation <= outcome.generation)
+            {
+                *outstanding = None;
+            }
+            return Some(outcome);
+        }
+        if outstanding
+            .as_ref()
+            .is_some_and(|owed| now.saturating_sub(owed.submitted_at) >= FILE_SETTLE_DEADLINE_MS)
+        {
+            return outstanding.take().map(|owed| owed.frame);
+        }
+        None
     }
 
     /// The item behind a published file row, if that row is still current.
@@ -368,12 +467,14 @@ impl FileSearchDriver {
         self.forget_cache.store(true, Ordering::Release);
     }
 
-    /// Whether the worker thread exists to answer a query.
+    /// Whether `spawn` got a thread — nothing more.
     ///
-    /// A driver whose thread failed to spawn accepts submissions and answers
-    /// nothing, so the caller must not mark file work outstanding: the frame
-    /// would say "Providers are still responding" for the rest of the session.
-    pub(crate) fn is_serving(&self) -> bool {
+    /// Deliberately not called `is_serving`: it says nothing about whether a
+    /// backend exists, whether the worker is still answering, or whether this
+    /// session can search files at all. It is the one precondition
+    /// [`Self::submit`] checks before accepting a generation, and callers ask
+    /// about readiness by reading `submit`'s answer instead.
+    fn has_worker_thread(&self) -> bool {
         self.worker.is_some()
     }
 }
@@ -422,9 +523,16 @@ struct FileSearchWorker {
 impl FileSearchWorker {
     /// The frame to publish for `job`: the built-in rows it carried, followed by
     /// this provider's own.
+    ///
+    /// Always a frame, never an `Option`. Every way a search can come to
+    /// nothing — no backend in this session, a backend that failed, a pipeline
+    /// that refused the batch — is answered here with the rows the launcher
+    /// already had and none of ours, because the caller marked this source
+    /// pending when it handed the job over and only a frame under this
+    /// generation takes that mark off again.
     fn answer(&mut self, job: &FileJob) -> ViewModel {
         let files = self.serve(job);
-        let mut rows = job.builtin_rows.clone();
+        let mut rows = job.builtin_rows.to_vec();
         let mut pending = job.builtin_pending;
         if let Some(frame) = files {
             rows.extend(frame.rows.iter().cloned());
@@ -445,9 +553,10 @@ impl FileSearchWorker {
 
     /// Drives the pipeline through one query and returns this provider's frame.
     ///
-    /// `None` when the pipeline reported an error or the frame belongs to a
-    /// superseded pipeline generation, so a partial or stale set of file rows is
-    /// never published.
+    /// `None` when this session has no file search, when the pipeline reported
+    /// an error, or when the frame belongs to a superseded pipeline generation,
+    /// so a partial or stale set of file rows is never published. It is not a
+    /// refusal to settle: [`Self::answer`] publishes a frame regardless.
     fn serve(&mut self, job: &FileJob) -> Option<ViewModel> {
         let generation = self.pipeline.keystroke(&job.query, job.now);
         let mut at = job.now;
@@ -816,7 +925,7 @@ mod tests {
             query: query.to_owned(),
             now,
             cancel: CancelToken::new(),
-            builtin_rows: Vec::new(),
+            builtin_rows: Vec::new().into(),
             builtin_pending: false,
             selected: 0,
         }
@@ -1137,14 +1246,14 @@ mod tests {
             },
         );
 
-        driver.submit(Generation::from_raw(1), "qu", 1_000, Vec::new(), false, 0);
+        assert!(driver.submit(Generation::from_raw(1), "qu", 1_000, Vec::new(), false, 0));
         // Ordered by handshake, not by hoping: the first query is provably
         // inside the backend before the second is submitted, and provably
         // finishes after it.
         entries.recv().expect("the worker reaches the backend");
         // A query outside the first one's prefix, so the second answer is a
         // second backend call rather than a cache hit with nothing to observe.
-        driver.submit(Generation::from_raw(2), "budget", 2_000, Vec::new(), false, 0);
+        assert!(driver.submit(Generation::from_raw(2), "budget", 2_000, Vec::new(), false, 0));
         {
             let (lock, cvar) = &*release;
             *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
@@ -1158,6 +1267,161 @@ mod tests {
         assert!(
             !frames.contains(&Generation::from_raw(1)),
             "the superseded query's late answer must be dropped, saw {frames:?}"
+        );
+    }
+
+    /// A session with no file backend at all.
+    ///
+    /// `search_file_items` returning `None` is the platform contract for "this
+    /// machine has nothing to search" — on Linux, an empty `FilesystemSearch`
+    /// root set. It is not an error and not an empty answer.
+    struct NoBackend;
+
+    impl FileItemSearch for NoBackend {
+        fn search_file_items(
+            &self,
+            _plugin: &PluginId,
+            _query: &FileSearchQuery,
+        ) -> Option<crikey_core::Result<(Vec<Item>, FileSearchResults)>> {
+            None
+        }
+    }
+
+    /// A built-in row, so a settling frame can be shown to carry the rows the
+    /// launcher already had rather than to erase them.
+    fn builtin_row(label: &str) -> ResultRow {
+        ResultRow {
+            item: ItemId(label.to_owned()),
+            label: label.to_owned(),
+            description: String::new(),
+            icon_reference: None,
+            icon: None,
+            category: String::new(),
+            plugin_name: "builtin.crikey.applications".to_owned(),
+            highlights: Vec::new(),
+            argument_hint: None,
+            status: None,
+            default_action: None,
+            alternate_actions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_session_without_a_file_backend_still_settles_the_generation() {
+        let driver = FileSearchDriver::spawn(
+            owner(),
+            pipeline(),
+            Box::new(|| Box::new(NoBackend)),
+            |_frame: &ViewModel| {},
+        );
+
+        assert!(driver.submit(
+            Generation::from_raw(1),
+            "quarterly",
+            1_000,
+            vec![builtin_row("Terminal")],
+            false,
+            0
+        ));
+
+        // Always the submission instant, so the driver's own settlement
+        // deadline can never be what answers here: this is the worker's frame
+        // or nothing.
+        let wait = std::time::Instant::now() + Duration::from_secs(5);
+        let outcome = loop {
+            if let Some(outcome) = driver.take_outcome(1_000) {
+                break Some(outcome);
+            }
+            if std::time::Instant::now() >= wait {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        let outcome = outcome.expect("a source that marked itself pending must settle its generation");
+        assert_eq!(outcome.generation, Generation::from_raw(1));
+        assert!(
+            !outcome.pending_plugins,
+            "the settling frame must not still claim work outstanding"
+        );
+        let labels: Vec<&str> = outcome.rows.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Terminal"],
+            "a session with no file backend contributes no rows and removes none"
+        );
+    }
+
+    /// A backend that takes the query and does not come back.
+    ///
+    /// `FILE_SEARCH_DEADLINE` is a promise, not a mechanism: nothing in the
+    /// launcher can interrupt a call wedged in a hung mount or an index socket
+    /// that never replies. It returns on cancellation only so that dropping the
+    /// driver, which is the last thing every test does, can join the thread —
+    /// the call is still outstanding for the whole of the test proper.
+    struct WedgedSearch {
+        entered: std::sync::mpsc::Sender<()>,
+    }
+
+    impl FileItemSearch for WedgedSearch {
+        fn search_file_items(
+            &self,
+            _plugin: &PluginId,
+            query: &FileSearchQuery,
+        ) -> Option<crikey_core::Result<(Vec<Item>, FileSearchResults)>> {
+            let _ = self.entered.send(());
+            while !query.cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            None
+        }
+    }
+
+    /// Before the driver settled generations itself, a wedged backend left the
+    /// file source marked pending with no answer owed by anyone, and the
+    /// launcher said "Providers are still responding" until it was restarted.
+    #[test]
+    fn a_backend_that_never_answers_stops_owing_the_generation() {
+        let (entered, entries) = std::sync::mpsc::channel();
+        let search = WedgedSearch { entered };
+
+        let driver = FileSearchDriver::spawn(
+            owner(),
+            pipeline(),
+            Box::new(move || Box::new(search)),
+            |_frame: &ViewModel| {},
+        );
+
+        assert!(driver.submit(
+            Generation::from_raw(1),
+            "quarterly",
+            1_000,
+            vec![builtin_row("Terminal")],
+            false,
+            0
+        ));
+        // Provably inside the backend, so what follows is a worker that is
+        // stuck rather than one that has not started.
+        entries.recv().expect("the worker reaches the backend");
+
+        assert!(
+            driver.take_outcome(1_000 + FILE_SETTLE_DEADLINE_MS - 1).is_none(),
+            "a backend still inside the time it was promised is still owed an answer"
+        );
+
+        let settled = driver
+            .take_outcome(1_000 + FILE_SETTLE_DEADLINE_MS)
+            .expect("a generation the driver accepted must settle even if the worker never answers");
+        assert_eq!(settled.generation, Generation::from_raw(1));
+        assert!(
+            !settled.pending_plugins,
+            "the settling frame is what takes the pending mark off, so it cannot carry one"
+        );
+        let labels: Vec<&str> = settled.rows.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Terminal"],
+            "settling for a wedged worker must not erase the rows already on screen"
         );
     }
 }

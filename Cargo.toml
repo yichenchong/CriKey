@@ -174,6 +174,28 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 png = "0.18"
 resvg = { version = "0.48", default-features = false }
 
+# The OS clipboard, behind `Capability::Clipboard` in all three platform
+# backends (spec 18.2), and named here rather than three times over because all
+# three want the same mechanism.
+#
+# A crate rather than a hand-written binding per target, because "put this text
+# on the clipboard" is not one call on any of them. X11 has no clipboard store
+# at all: a selection has an *owner*, and some client must stay resident and
+# answer `SelectionRequest` for as long as the value is supposed to exist --
+# `arboard` runs exactly that server on a helper thread for the lifetime of the
+# instance. Win32 wants `OpenClipboard` retried while another process holds it,
+# and macOS wants a pasteboard whose `generalPasteboard` really can be null in a
+# daemon. Three unreviewed FFI implementations of that, two of which nobody in
+# this workspace can run, is the alternative.
+#
+# It costs no new dependency tree either: `arboard` is already in this
+# workspace's lock as `egui-winit`'s clipboard, and on Linux it speaks X11
+# through the same `x11rb` the hotkey and window backends already use.
+# `default-features = false` drops `image-data`, which would pull the whole
+# `image` crate in to move pixels a launcher never puts on a clipboard -- and
+# would be the one line here that changed `Cargo.lock`.
+arboard = { version = "3.6", default-features = false }
+
 # Microsoft's generated Win32/COM bindings, used by Windows-specific code
 # (the platform backend and the native named-pipe transport) and pulled in
 # only on that target (spec 18.4). Hand-written `extern "system"` declarations

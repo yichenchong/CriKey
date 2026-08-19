@@ -7,6 +7,7 @@
 //! binaries rather than one.
 
 mod activation_commands;
+mod calculator;
 mod catalog_commands;
 mod config_commands;
 mod dev_commands;
@@ -18,6 +19,7 @@ mod package_commands;
 mod plugin_commands;
 mod settings;
 
+use calculator::Calculator;
 use crikey_app::{
     admitted_plugin_roots, ActionSubmission, AliasTable, App, BatchState, DefaultCatalogFetcher,
     DisabledPlugins, LegacyDriver, LegacyProvider, ModernDriver, ModernProvider, NativeDriver,
@@ -737,6 +739,15 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             eprintln!("crikey: the startup log could not be written: {error}");
         }
     }
+    // The built-in calculator, holding this session's clipboard if it has one.
+    // Taken here, before the event loop, and then owned by the closure for the
+    // rest of the process: on X11 a copied value is served by the client that
+    // owns the selection, so the clipboard has to outlive every copy made
+    // through it, and this is the one place in the launcher with that lifetime.
+    // Still an `Option`: a session with no display server has no clipboard, and
+    // the calculator renders its row and explains itself instead of pretending
+    // a copy happened.
+    let mut calculator = Calculator::new(search.clipboard());
     let mut retained = RetainedRows::default();
     // Per-plugin refusal totals already reported, so a growing counter is
     // announced once per increase rather than on every turn of the loop.
@@ -865,7 +876,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             // File rows fold in the same way: the search ran on the driver's
             // worker thread, so its answer arrives on some later turn of this
             // loop and under the generation that asked for it or not at all.
-            if let Some(outcome) = file_driver.take_outcome() {
+            // The clock is what lets the driver answer for a worker that never
+            // will: it accepted the generation this source was marked pending
+            // for, so it, and not this loop, owes the frame that settles it.
+            let file_now = u64::try_from(query_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if let Some(outcome) = file_driver.take_outcome(file_now) {
                 retained.absorb(
                     outcome.generation,
                     RowSource::Files,
@@ -975,7 +990,17 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             drive_application_provider(&mut query_pipeline, &owner, &raw, items, now);
                         if let Some(frame) = application_frame {
                             if frame.generation == generation {
-                                let rows = search.result_rows();
+                                // The calculator answers from the query text
+                                // alone, in this frame and on this thread: it
+                                // owes nothing asynchronously, so it never
+                                // marks itself pending and can never be the
+                                // source that leaves the view waiting. Its row
+                                // leads because when a query parses as
+                                // arithmetic, the arithmetic is what was asked
+                                // for. At most one row, so the merged frame
+                                // grows by one.
+                                let mut rows = calculator.rows(generation, &raw);
+                                rows.extend(search.result_rows());
                                 // Legacy plugins are driven off the UI thread
                                 // (Finding 8): hand the query to the supervisor
                                 // and return. The built-in rows publish now, with
@@ -1032,9 +1057,15 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                 // nothing to search for, and walking the user's
                                 // home directory to prove it would be the most
                                 // expensive answer the launcher ever produced.
-                                let files_outstanding = file_driver.is_serving() && !raw.trim().is_empty();
-                                if files_outstanding {
-                                    file_driver.submit(
+                                //
+                                // Pending is read off the submission rather than
+                                // asked as a separate question. The driver is the
+                                // only party that knows whether it took the
+                                // generation on, and marking a source pending on
+                                // any other evidence is how a frame ends up
+                                // waiting forever for an answer nobody owes.
+                                let files_outstanding = !raw.trim().is_empty()
+                                    && file_driver.submit(
                                         generation,
                                         &raw,
                                         now,
@@ -1042,7 +1073,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                         frame.pending_plugins,
                                         0,
                                     );
-                                }
                                 retained.set_builtin(generation, rows, frame.pending_plugins);
                                 retained.mark_pending(generation, RowSource::Legacy, legacy_outstanding);
                                 retained.mark_pending(generation, RowSource::Native, native_outstanding);
@@ -1083,39 +1113,67 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     eprintln!("crikey: {report}");
                 }
                 Some(UiEffect::Execute { item, action }) => {
-                    // A file item never entered the catalog, so the search
-                    // service cannot find it: it lives in the driver that
-                    // published the row, under the generation the rows on
-                    // screen belong to. Resolving there first is what makes a
-                    // file row selectable at all; anything the driver does not
-                    // own is an ordinary catalog or plugin selection.
-                    let file_item = retained
+                    // A calculated row is resolved first and settled entirely
+                    // here. Its value never entered the catalog and copying it
+                    // is not one of the three host-mediated catalog actions, so
+                    // neither `execute` nor `execute_host_action` could do
+                    // anything but refuse it; the calculator owns the clipboard
+                    // capability and makes the call itself.
+                    let calculated = retained
                         .generation()
-                        .and_then(|generation| file_driver.resolve(generation, &item));
-                    let submission = match file_item.as_ref() {
-                        Some(file_item) => search.execute_host_action(file_item, &action),
-                        None => search.execute(&item, &action),
-                    };
-                    match submission {
-                        Ok(ActionSubmission::Completed) => {
-                            search.set_history_time(history_clock.advance());
-                            if search.record_selection(&item) {
-                                commit_selection_history(selection_history.as_ref(), &search);
+                        .and_then(|generation| calculator.resolve(generation, &item))
+                        .map(str::to_owned);
+                    if let Some(text) = calculated {
+                        match calculator.copy(&text) {
+                            Ok(()) => {
+                                view_model.dismiss();
+                                if let Some(session) = command_session {
+                                    let _ = render_handle.request_hide_session(session);
+                                }
                             }
-                            view_model.dismiss();
-                            if let Some(session) = command_session {
-                                let _ = render_handle.request_hide_session(session);
+                            // The launcher stays open on a failed copy: the
+                            // result is still on screen for the user to read,
+                            // which is the only thing left that can be done
+                            // for them.
+                            Err(error) => {
+                                report_status(&mut view_model, format!("Copy failed: {error}"));
                             }
                         }
-                        Ok(ActionSubmission::Pending(request_id)) => {
-                            let message = format!(
-                                "Action pending ({} / request {})",
-                                request_id.plugin.0, request_id.sequence
-                            );
-                            report_status(&mut view_model, message);
-                        }
-                        Err(error) => {
-                            report_status(&mut view_model, format!("Launch failed: {error}"));
+                    } else {
+                        // A file item never entered the catalog either, so the
+                        // search service cannot find it: it lives in the driver
+                        // that published the row, under the generation the rows
+                        // on screen belong to. Resolving there is what makes a
+                        // file row selectable at all; anything the driver does
+                        // not own is an ordinary catalog or plugin selection.
+                        let file_item = retained
+                            .generation()
+                            .and_then(|generation| file_driver.resolve(generation, &item));
+                        let submission = match file_item.as_ref() {
+                            Some(file_item) => search.execute_host_action(file_item, &action),
+                            None => search.execute(&item, &action),
+                        };
+                        match submission {
+                            Ok(ActionSubmission::Completed) => {
+                                search.set_history_time(history_clock.advance());
+                                if search.record_selection(&item) {
+                                    commit_selection_history(selection_history.as_ref(), &search);
+                                }
+                                view_model.dismiss();
+                                if let Some(session) = command_session {
+                                    let _ = render_handle.request_hide_session(session);
+                                }
+                            }
+                            Ok(ActionSubmission::Pending(request_id)) => {
+                                let message = format!(
+                                    "Action pending ({} / request {})",
+                                    request_id.plugin.0, request_id.sequence
+                                );
+                                report_status(&mut view_model, message);
+                            }
+                            Err(error) => {
+                                report_status(&mut view_model, format!("Launch failed: {error}"));
+                            }
                         }
                     }
                 }
@@ -3021,6 +3079,127 @@ mod tests {
         assert!(
             !retained.pending(),
             "once every source has answered the merged frame is no longer pending",
+        );
+    }
+
+    /// A file backend that takes the query and does not answer, the way a hung
+    /// mount or an index socket that never replies does. `FILE_SEARCH_DEADLINE`
+    /// is a promise the backend is asked to keep, not one the launcher can
+    /// enforce.
+    ///
+    /// It returns on cancellation only so that dropping the driver at the end of
+    /// the test can join the worker thread; the call is still outstanding for
+    /// the whole of the test proper.
+    struct WedgedFileSearch {
+        entered: std::sync::mpsc::Sender<()>,
+    }
+
+    impl crikey_app::FileItemSearch for WedgedFileSearch {
+        fn search_file_items(
+            &self,
+            _plugin: &PluginId,
+            query: &crikey_platform::FileSearchQuery,
+        ) -> Option<crikey_core::Result<(Vec<Item>, crikey_platform::FileSearchResults)>> {
+            let _ = self.entered.send(());
+            while !query.cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            None
+        }
+    }
+
+    /// The readiness invariant, end to end: a source that marks itself pending
+    /// settles that generation.
+    ///
+    /// The file source is the only one whose pending mark nothing else can
+    /// clear — no later query for the same generation, no sibling provider — so
+    /// a generation it takes on and never answers leaves the launcher saying
+    /// "Providers are still responding" for the rest of the session.
+    #[test]
+    fn a_file_source_marked_pending_settles_even_when_its_backend_never_answers() {
+        let generation = Generation::from_raw(9);
+        let owner = PluginId(FILE_SEARCH_PLUGIN.to_owned());
+        let (entered, entries) = std::sync::mpsc::channel();
+        let search = WedgedFileSearch { entered };
+        let mut pipeline = crikey_app::QueryPipeline::new(crikey_app::PipelineConfig::default());
+        pipeline
+            .register_plugin(owner.clone(), file_provider::file_provider_policy())
+            .expect("the file provider registers once");
+        let driver = file_provider::FileSearchDriver::spawn(
+            owner,
+            pipeline,
+            Box::new(move || Box::new(search)),
+            |_frame: &crikey_ui::ViewModel| {},
+        );
+
+        // Exactly the query arm's order: hand the query over, then mark the
+        // source pending on the driver's own answer to whether it took it.
+        let builtin = vec![row("builtin.app", "app")];
+        let mut retained = RetainedRows::default();
+        let files_outstanding = driver.submit(generation, "quarterly", 1_000, builtin.clone(), false, 0);
+        retained.set_builtin(generation, builtin, false);
+        retained.mark_pending(generation, RowSource::Files, files_outstanding);
+        assert!(
+            files_outstanding && retained.pending(),
+            "the frame is pending while the file source owes an answer, or this test proves nothing"
+        );
+        // Provably inside the backend: the worker is stuck, not merely slow to
+        // start.
+        entries.recv().expect("the worker reaches the backend");
+
+        // A later turn of the event loop, a minute on — long past any deadline
+        // the driver could still be waiting on.
+        if let Some(outcome) = driver.take_outcome(61_000) {
+            retained.absorb(
+                outcome.generation,
+                RowSource::Files,
+                &outcome.rows,
+                outcome.pending_plugins,
+            );
+        }
+
+        assert!(
+            !retained.pending(),
+            "a generation the file source took on must settle, even with no answer from the backend"
+        );
+        let sources: Vec<String> = retained.merged().iter().map(|r| r.plugin_name.clone()).collect();
+        assert_eq!(
+            sources,
+            ["builtin.app"],
+            "settling contributes no file rows and removes none of the built-in group"
+        );
+    }
+
+    #[test]
+    fn a_calculated_row_leads_the_built_in_group_and_survives_an_asynchronous_fold() {
+        let generation = Generation::from_raw(3);
+        let mut calculator = Calculator::new(None);
+        // Exactly what the query arm builds: the calculator's answer first,
+        // then the catalog's ranked rows.
+        let mut rows = calculator.rows(generation, "2+2");
+        rows.push(row("builtin.app", "app"));
+
+        let mut retained = RetainedRows::default();
+        retained.set_builtin(generation, rows.clone(), false);
+        retained.mark_pending(generation, RowSource::Legacy, true);
+        // The legacy supervisor republishes the built-in rows ahead of its own,
+        // and `absorb` rebuilds the built-in group by classifying each row's
+        // owner. A calculated row that classified as anything but built-in
+        // would be filtered out of both groups and vanish from the frame.
+        rows.push(row("legacy.files", "file"));
+        retained.absorb(generation, RowSource::Legacy, &rows, false);
+
+        let merged = retained.merged();
+        let labels: Vec<&str> = merged.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["4", "app", "file"],
+            "the calculated row leads the frame and outlives the legacy fold"
+        );
+        assert_eq!(merged[0].plugin_name, calculator::CALCULATOR_PLUGIN);
+        assert!(
+            !retained.pending(),
+            "the calculator answers synchronously and never owes the frame anything"
         );
     }
 

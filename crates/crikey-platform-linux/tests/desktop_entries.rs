@@ -829,9 +829,10 @@ fn capabilities_without_a_linux_implementation_report_unavailable() {
     // (`file_search.rs`), and what it reports depends on the running user's
     // `$HOME` and on whether `plocate` is installed. Asserting it here would be
     // a statement about the build host; `capabilities.rs` pins it instead, with
-    // the service injected.
+    // the service injected. The clipboard is absent for the neighbouring reason:
+    // it has an implementation (`clipboard.rs`) and what it may claim depends on
+    // the session, so `capabilities.rs` pins it per session instead.
     let unimplemented = [
-        Capability::Clipboard,
         Capability::UriOpen,
         Capability::Notifications,
         Capability::FileWatching,

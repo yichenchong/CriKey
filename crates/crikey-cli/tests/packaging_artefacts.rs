@@ -241,9 +241,10 @@ fn no_declared_field_of_a_distribution_artefact_carries_keypirinha_branding() {
 #[test]
 fn the_macos_entitlements_grant_nothing_because_the_backend_asks_for_nothing() {
     // `MacOsBackend::capability` reports GlobalHotkeys, WindowActivation,
-    // WindowEnumeration, Clipboard, Notifications, SecretStorage and FileSearch
-    // as Unavailable, and the crate's only outward call is
-    // `Command::new("/usr/bin/open")`. Nothing in it needs a hole in the
+    // WindowEnumeration, Notifications and SecretStorage as Unavailable, and the
+    // two services it does stand behind need no entitlement: `/usr/bin/open` is
+    // an ordinary child process, and `NSPasteboard` is available to any
+    // application in a user session. Nothing in the crate needs a hole in the
     // hardened runtime. An entitlement added here without a call site behind it
     // is a privilege in the signature that the program never redeems, so this
     // test fails on the first one and whoever adds it has to bring the

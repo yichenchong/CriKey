@@ -21,6 +21,10 @@ crikey-platform.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = "0.13"
 libc = "0.2"
+# The session clipboard, and target-gated with the X11 client above for the same
+# reason: on this target it *is* an X11 client, and the Windows and macOS
+# cross-target checks must never see it.
+arboard.workspace = true
 # D-Bus for the Wayland half of the backend: global shortcuts there are the
 # `org.freedesktop.portal.GlobalShortcuts` portal and nothing else (ADR-0011).
 # Target-gated with the X11 client for the same reason -- the Windows and macOS
