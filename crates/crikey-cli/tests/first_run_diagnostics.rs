@@ -30,10 +30,11 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// The binary under test, as built by cargo for this integration target.
@@ -47,15 +48,14 @@ const CRIKEY_LAUNCHER: &str = env!("CARGO_BIN_EXE_crikey-launcher");
 /// launcher never exits on its own: the deadline is a failure, not a schedule.
 const STARTUP_LIMIT: Duration = Duration::from_secs(60);
 
-/// How long `Xvfb` is given to accept connections.
+/// Ceiling on `Xvfb` reporting the display it came up on. Not a performance
+/// assertion: it turns a server that never reports into a named failure rather
+/// than a stall.
 const SERVER_READY_LIMIT: Duration = Duration::from_secs(15);
 
 /// Gap between polls. Polling, not sleeping-as-synchronisation: every loop below
-/// ends on an observable — the display socket, or a line of output.
+/// ends on an observable — a line of output.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-
-/// Hands out a distinct display number per server within this process.
-static NEXT_DISPLAY_OFFSET: AtomicU32 = AtomicU32::new(0);
 
 /// A private `Xvfb` instance, killed when the guard is dropped.
 ///
@@ -63,70 +63,81 @@ static NEXT_DISPLAY_OFFSET: AtomicU32 = AtomicU32::new(0);
 /// unwinds through this, so no orphaned server outlives the run.
 struct XvfbServer {
     display: String,
+    socket: PathBuf,
     child: Child,
 }
 
 impl XvfbServer {
-    /// Starts a server on an unused display number and waits until its socket
-    /// exists.
+    /// Starts a private server and takes the display number it reports.
     ///
-    /// Panics — loudly and by name — if `Xvfb` is absent. This test cannot
-    /// observe what it is about without a display, so a missing server is a
-    /// failure, never a skip.
+    /// The number is chosen by `Xvfb` itself and reported through
+    /// `-displayfd`, never picked here. Picking one and then spawning is a
+    /// check-then-act race that two concurrently running test binaries really
+    /// do lose: both see the same number free, the loser then finds the
+    /// winner's socket where it expected its own, concludes its server is up,
+    /// and drives a display it does not own. `Xvfb` binds or moves on
+    /// internally, so asking it is the only atomic way to get a number.
+    ///
+    /// The write to that descriptor happens once the server is listening, so
+    /// reading it is also the readiness check: there is nothing left to poll.
+    ///
+    /// Panics — loudly and by name — if `Xvfb` is absent or never comes up.
+    /// This test cannot observe what it is about without a display, so a
+    /// missing server is a failure, never a skip.
     fn start() -> Self {
-        let base = 100 + (std::process::id() % 700);
-        let offset = NEXT_DISPLAY_OFFSET.fetch_add(1, Ordering::Relaxed);
-        let mut last_error = String::new();
-        for attempt in 0..16 {
-            let number = base + offset * 16 + attempt;
-            let display = format!(":{number}");
-            let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
-            if socket.exists() || Path::new(&format!("/tmp/.X{number}-lock")).exists() {
-                continue;
-            }
-            let child = match Command::new("Xvfb")
-                .arg(&display)
-                .args(["-screen", "0", "640x480x24", "-nolisten", "tcp"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(error) => panic!(
-                    "this test requires a real X server; spawning `Xvfb {display}` failed: \
-                     {error}. A missing Xvfb is a test failure, never a skip."
-                ),
-            };
-            let mut server = Self { display, child };
-            match server.wait_until_ready(&socket) {
-                Ok(()) => return server,
-                Err(error) => last_error = error,
-            }
-            // `server` drops here, killing the failed attempt.
+        let mut child = match Command::new("Xvfb")
+            .args(["-displayfd", "1"])
+            .args(["-screen", "0", "640x480x24", "-nolisten", "tcp"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => panic!(
+                "this test requires a real X server; spawning `Xvfb` failed: {error}. \
+                 A missing Xvfb is a test failure, never a skip."
+            ),
+        };
+
+        let number = Self::reported_display(&mut child);
+        Self {
+            display: format!(":{number}"),
+            socket: PathBuf::from(format!("/tmp/.X11-unix/X{number}")),
+            child,
         }
-        panic!("no Xvfb came up after 16 display numbers from :{base}; last failure: {last_error}");
     }
 
-    fn wait_until_ready(&mut self, socket: &Path) -> Result<(), String> {
-        let deadline = Instant::now() + SERVER_READY_LIMIT;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Err(format!("Xvfb {} exited early with {status}", self.display)),
-                Ok(None) => {}
-                Err(error) => return Err(format!("Xvfb {} could not be polled: {error}", self.display)),
+    /// The display number the server reports, bounded by
+    /// [`SERVER_READY_LIMIT`].
+    ///
+    /// Read on another thread because the read blocks: a server that starts and
+    /// then never reports would otherwise wedge the test rather than fail it.
+    /// `read_line`, never `read_to_string`: `Xvfb` keeps the descriptor open,
+    /// so a read to EOF would never return.
+    fn reported_display(child: &mut Child) -> u32 {
+        let descriptor = child
+            .stdout
+            .take()
+            .expect("`-displayfd 1` was asked for, so stdout is a pipe");
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let outcome = BufReader::new(descriptor).read_line(&mut line).map(|_| line);
+            let _ = sender.send(outcome);
+        });
+
+        match receiver.recv_timeout(SERVER_READY_LIMIT) {
+            Ok(Ok(line)) => line.trim().parse().unwrap_or_else(|error| {
+                panic!("Xvfb reported {line:?} as its display, which is not a number: {error}")
+            }),
+            Ok(Err(error)) => panic!("Xvfb's display descriptor could not be read: {error}"),
+            Err(_) => {
+                // The child is killed here rather than left for the guard: this
+                // path has no `XvfbServer` to drop yet.
+                let _ = child.kill();
+                panic!("Xvfb did not report a display within {SERVER_READY_LIMIT:?}")
             }
-            if socket.exists() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "Xvfb {} never created {}",
-                    self.display,
-                    socket.display()
-                ));
-            }
-            std::thread::sleep(POLL_INTERVAL);
         }
     }
 }
@@ -135,6 +146,12 @@ impl Drop for XvfbServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Xvfb normally removes these itself; a killed one may not, and a stale
+        // lock file is a display number no later server can be handed.
+        let _ = fs::remove_file(&self.socket);
+        if let Some(number) = self.display.strip_prefix(':') {
+            let _ = fs::remove_file(format!("/tmp/.X{number}-lock"));
+        }
     }
 }
 
