@@ -141,6 +141,22 @@ check "the tarball ships the attribution notice" \
 check "the tarball is prefix-relative, so it unpacks over any prefix" \
 	bash -c '! printf "%s" "$1" | grep -q "^crikey-[^/]*/usr/"' _ "$tarball_listing"
 
+# Every other check here reads the staging tree, where the links were always
+# right. The archive is a separate artefact and it was wrong for at least two
+# releases: the member-renaming transform also rewrote link *targets*, so
+# `../lib/crikey/crikey` shipped as `crikey-<version>./lib/crikey/crikey` and
+# an installed `bin/crikey` was a dangling link. Nothing caught it because
+# nothing had ever unpacked the tarball and followed them.
+extracted="$workspace/extracted"
+mkdir -p "$extracted"
+tar xzf "$tarball" -C "$extracted"
+unpacked="$extracted/$(printf "%s" "$tarball_listing" | head -1 | cut -d/ -f1)"
+for link in crikey crikey-launcher; do
+	check "the unpacked bin/$link resolves to the executable it names" \
+		bash -c 'test -x "$(readlink -f "$1/bin/$2")" &&
+			test "$(readlink -f "$1/bin/$2")" = "$(readlink -f "$1/lib/crikey/$2")"' _ "$unpacked" "$link"
+done
+
 # Reproducibility is the whole reason for the fixed mtime, ownership and sort
 # order; a second build into a different directory must agree byte for byte.
 second="$workspace/second"

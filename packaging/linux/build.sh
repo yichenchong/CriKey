@@ -426,9 +426,14 @@ tarball() {
 	# `--sort=name`, a fixed mtime, fixed ownership and `gzip -n` are what make
 	# two builds of one commit compare equal; without them the archive embeds
 	# the build host's clock, uid and directory order.
+	# The `S` on the transform is load-bearing: without it GNU tar rewrites
+	# symbolic link *targets* too, and `bin/crikey -> ../lib/crikey/crikey`
+	# begins with the `.` this expression anchors on, so it shipped pointing at
+	# `crikey-$version./lib/crikey/crikey` -- a link that resolves nowhere. The
+	# rename is only ever meant for the archive's own member names.
 	tar --create \
 		--directory "$stage_directory" \
-		--transform "s,^\\.,crikey-$version," \
+		--transform "s,^\\.,crikey-$version,S" \
 		--owner=0 --group=0 --numeric-owner \
 		--sort=name \
 		--mtime="@$SOURCE_DATE_EPOCH" \
