@@ -41,15 +41,16 @@
 //!
 //! Waits are bounded polling against an explicit deadline, never a fixed sleep
 //! used as synchronisation: the loops end on an observable -- the display
-//! socket, or an event arriving -- so a regression becomes a named failure
-//! instead of a stall or a flake.
+//! number the server reports, or an event arriving -- so a regression becomes a
+//! named failure instead of a stall or a flake.
 
 #![cfg(target_os = "linux")]
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -78,9 +79,6 @@ const EVENT_LIMIT: Duration = Duration::from_secs(10);
 /// ends on its observable, never on elapsed time.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Hands out a distinct display number per server within this process.
-static NEXT_DISPLAY_OFFSET: AtomicU32 = AtomicU32::new(0);
-
 // ---------------------------------------------------------------------------
 // The server
 // ---------------------------------------------------------------------------
@@ -97,74 +95,72 @@ struct XvfbServer {
 }
 
 impl XvfbServer {
-    /// Starts a server on an unused display number and waits until it accepts
-    /// connections.
+    /// Starts a private server and waits until it accepts connections.
+    ///
+    /// The number is chosen by `Xvfb` itself and reported through
+    /// `-displayfd`, never picked here. Picking one and then spawning is a
+    /// check-then-act race that two concurrently running test binaries really
+    /// do lose: both see the same number free, the loser then finds the
+    /// winner's socket where it expected its own, concludes its server is up,
+    /// and talks to a display it does not own. `Xvfb` binds or moves on
+    /// internally, so asking it is the only atomic way to get a number.
+    ///
+    /// The write to that descriptor happens once the server is listening, so
+    /// reading it is also the readiness check: there is nothing left to poll.
     ///
     /// Panics -- loudly and by name -- if `Xvfb` is absent or never comes up.
     fn start() -> Self {
-        // Derived from the pid so that two concurrently running test binaries
-        // never pick the same number, and offset well clear of `:0`.
-        let base = 100 + (std::process::id() % 700);
-        let offset = NEXT_DISPLAY_OFFSET.fetch_add(1, Ordering::Relaxed);
+        let mut child = match Command::new("Xvfb")
+            .args(["-displayfd", "1"])
+            .args(["-screen", "0", "640x480x24", "-nolisten", "tcp"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => panic!(
+                "these tests require a real X server; spawning `Xvfb` failed: {error}. \
+                 A missing Xvfb is a test failure, never a skip."
+            ),
+        };
 
-        let mut last_error = String::new();
-        for attempt in 0..16 {
-            let number = base + offset * 16 + attempt;
-            let display = format!(":{number}");
-            let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
-            if socket.exists() || PathBuf::from(format!("/tmp/.X{number}-lock")).exists() {
-                continue;
-            }
-
-            let child = match Command::new("Xvfb")
-                .arg(&display)
-                .args(["-screen", "0", "640x480x24", "-nolisten", "tcp"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(error) => panic!(
-                    "these tests require a real X server; spawning `Xvfb {display}` failed: {error}. \
-                     A missing Xvfb is a test failure, never a skip."
-                ),
-            };
-
-            let mut server = Self {
-                display,
-                socket,
-                child,
-            };
-            match server.wait_until_ready() {
-                Ok(()) => return server,
-                Err(error) => last_error = error,
-            }
-            // `server` drops here, killing the failed attempt.
+        let number = Self::reported_display(&mut child);
+        Self {
+            display: format!(":{number}"),
+            socket: PathBuf::from(format!("/tmp/.X11-unix/X{number}")),
+            child,
         }
-
-        panic!("no Xvfb came up after 16 display numbers from :{base}; last failure: {last_error}");
     }
 
-    /// Polls until the display socket exists and the server is still alive.
-    fn wait_until_ready(&mut self) -> Result<(), String> {
-        let deadline = Instant::now() + SERVER_READY_LIMIT;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Err(format!("Xvfb {} exited early with {status}", self.display)),
-                Ok(None) => {}
-                Err(error) => return Err(format!("Xvfb {} could not be polled: {error}", self.display)),
+    /// The display number the server reports, bounded by
+    /// [`SERVER_READY_LIMIT`].
+    ///
+    /// Read on another thread because the read blocks: a server that starts and
+    /// then never reports would otherwise wedge the test rather than fail it.
+    fn reported_display(child: &mut Child) -> u32 {
+        let descriptor = child
+            .stdout
+            .take()
+            .expect("`-displayfd 1` was asked for, so stdout is a pipe");
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let outcome = BufReader::new(descriptor).read_line(&mut line).map(|_| line);
+            let _ = sender.send(outcome);
+        });
+
+        match receiver.recv_timeout(SERVER_READY_LIMIT) {
+            Ok(Ok(line)) => line.trim().parse().unwrap_or_else(|error| {
+                panic!("Xvfb reported {line:?} as its display, which is not a number: {error}")
+            }),
+            Ok(Err(error)) => panic!("Xvfb's display descriptor could not be read: {error}"),
+            Err(_) => {
+                // The child is killed here rather than left for the guard: this
+                // path has no `XvfbServer` to drop yet.
+                let _ = child.kill();
+                panic!("Xvfb did not report a display within {SERVER_READY_LIMIT:?}")
             }
-            if self.socket.exists() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "Xvfb {} did not accept connections within {SERVER_READY_LIMIT:?}",
-                    self.display
-                ));
-            }
-            thread::sleep(POLL_INTERVAL);
         }
     }
 

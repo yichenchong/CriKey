@@ -50,6 +50,21 @@ const ROW_DELIVERY_WINDOW: Duration = Duration::from_secs(5);
 /// stuck run takes to say so, and a passing run never waits it out.
 const RESOURCE_DELIVERY_WINDOW: Duration = Duration::from_secs(60);
 
+/// Liveness ceiling for an answer that is *deliberately* late, from a plugin
+/// whose child is also cold.
+///
+/// [`ROW_DELIVERY_WINDOW`] covers a warm round trip. This test's subject
+/// arrives after the collection window on purpose, and the package it comes
+/// from spawns its child on first query, so one run pays a process spawn, a
+/// handshake and the fixture's own delay before the first row can exist. Five
+/// seconds covered that everywhere except a loaded macOS runner, where it
+/// expired while the production path was still inside the startup budget it is
+/// allowed to take -- a test failing for being *quicker to give up* than the
+/// code it tests is permitted to be.
+///
+/// Its value asserts nothing, and a passing run never waits it out.
+const LATE_ANSWER_DELIVERY_WINDOW: Duration = Duration::from_secs(60);
+
 /// A private directory removed when the test that made it ends. Every package
 /// manifest and mode witness is written at test time, never committed.
 #[derive(Debug)]
@@ -1312,7 +1327,7 @@ fn a_native_answer_after_the_collection_window_still_reaches_the_user() {
     let generation = Generation::from_raw(1);
     driver.submit(generation, "late", 17, Vec::new(), false, 0);
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + LATE_ANSWER_DELIVERY_WINDOW;
     let mut delivered = false;
     while Instant::now() < deadline {
         delivered = published

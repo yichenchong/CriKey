@@ -43,8 +43,10 @@
 
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -85,73 +87,72 @@ struct XvfbServer {
 }
 
 impl XvfbServer {
-    /// Starts a server on an unused display number and waits until it accepts
-    /// connections.
+    /// Starts a private server and waits until it accepts connections.
+    ///
+    /// The number is chosen by `Xvfb` itself and reported through
+    /// `-displayfd`, never picked here. Picking one and then spawning is a
+    /// check-then-act race that two concurrently running test binaries really
+    /// do lose: both see the same number free, the loser then finds the
+    /// winner's socket where it expected its own, concludes its server is up,
+    /// and talks to a display it does not own. `Xvfb` binds or moves on
+    /// internally, so asking it is the only atomic way to get a number.
+    ///
+    /// The write to that descriptor happens once the server is listening, so
+    /// reading it is also the readiness check: there is nothing left to poll.
     ///
     /// Panics -- loudly and by name -- if `Xvfb` is absent or never comes up.
     fn start() -> Self {
-        // Derived from the pid so that two concurrently running test binaries
-        // never pick the same number, and offset well clear of `:0`.
-        let base = 100 + (std::process::id() % 700);
+        let mut child = match Command::new("Xvfb")
+            .args(["-displayfd", "1"])
+            .args(["-screen", "0", "640x480x24", "-nolisten", "tcp"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => panic!(
+                "this test requires a real X server; spawning `Xvfb` failed: {error}. \
+                 A missing Xvfb is a test failure, never a skip."
+            ),
+        };
 
-        let mut last_error = String::new();
-        for attempt in 0..16 {
-            let number = base + attempt;
-            let display = format!(":{number}");
-            let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
-            if socket.exists() || PathBuf::from(format!("/tmp/.X{number}-lock")).exists() {
-                continue;
-            }
-
-            let child = match Command::new("Xvfb")
-                .arg(&display)
-                .args(["-screen", "0", "640x480x24", "-nolisten", "tcp"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(error) => panic!(
-                    "this test requires a real X server; spawning `Xvfb {display}` failed: {error}. \
-                     A missing Xvfb is a test failure, never a skip."
-                ),
-            };
-
-            let mut server = Self {
-                display,
-                socket,
-                child,
-            };
-            match server.wait_until_ready() {
-                Ok(()) => return server,
-                Err(error) => last_error = error,
-            }
-            // `server` drops here, killing the failed attempt.
+        let number = Self::reported_display(&mut child);
+        Self {
+            display: format!(":{number}"),
+            socket: PathBuf::from(format!("/tmp/.X11-unix/X{number}")),
+            child,
         }
-
-        panic!("no Xvfb came up after 16 display numbers from :{base}; last failure: {last_error}");
     }
 
-    /// Polls until the display socket exists and the server is still alive.
-    fn wait_until_ready(&mut self) -> Result<(), String> {
-        let deadline = Instant::now() + SERVER_READY_LIMIT;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Err(format!("Xvfb {} exited early with {status}", self.display)),
-                Ok(None) => {}
-                Err(error) => return Err(format!("Xvfb {} could not be polled: {error}", self.display)),
+    /// The display number the server reports, bounded by
+    /// [`SERVER_READY_LIMIT`].
+    ///
+    /// Read on another thread because the read blocks: a server that starts and
+    /// then never reports would otherwise wedge the test rather than fail it.
+    fn reported_display(child: &mut Child) -> u32 {
+        let descriptor = child
+            .stdout
+            .take()
+            .expect("`-displayfd 1` was asked for, so stdout is a pipe");
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let outcome = BufReader::new(descriptor).read_line(&mut line).map(|_| line);
+            let _ = sender.send(outcome);
+        });
+
+        match receiver.recv_timeout(SERVER_READY_LIMIT) {
+            Ok(Ok(line)) => line.trim().parse().unwrap_or_else(|error| {
+                panic!("Xvfb reported {line:?} as its display, which is not a number: {error}")
+            }),
+            Ok(Err(error)) => panic!("Xvfb's display descriptor could not be read: {error}"),
+            Err(_) => {
+                // The child is killed here rather than left for the guard: this
+                // path has no `XvfbServer` to drop yet.
+                let _ = child.kill();
+                panic!("Xvfb did not report a display within {SERVER_READY_LIMIT:?}")
             }
-            if self.socket.exists() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "Xvfb {} did not accept connections within {SERVER_READY_LIMIT:?}",
-                    self.display
-                ));
-            }
-            thread::sleep(POLL_INTERVAL);
         }
     }
 
@@ -231,6 +232,31 @@ impl Reader {
             destination: atom("CRIKEY_TEST_SELECTION"),
             connection,
             window,
+        }
+    }
+
+    /// The clipboard's text once it has settled on `expected`, or the last
+    /// answer seen before [`REPLY_LIMIT`] ran out.
+    ///
+    /// A copy is not visible to another client the instant `write_text`
+    /// returns. X orders requests within one connection, not across two: the
+    /// writer's `SetSelectionOwner` and this reader's `ConvertSelection` are on
+    /// separate connections, so the server may answer the request before it
+    /// processes the claim, and the honest answer at that moment is that nobody
+    /// owns the selection. Waiting for the handover is what makes the copy
+    /// observable; asking once measures the scheduler.
+    ///
+    /// This still fails a writer that never serves the value, and still fails
+    /// one that keeps serving a previous value, because the wait ends on the
+    /// value rather than on a clock and the caller compares what it returns.
+    fn pasted_once_settled(&self, expected: &str) -> Option<String> {
+        let deadline = Instant::now() + REPLY_LIMIT;
+        loop {
+            let seen = self.clipboard_text();
+            if seen.as_deref() == Some(expected) || Instant::now() >= deadline {
+                return seen;
+            }
+            thread::sleep(POLL_INTERVAL);
         }
     }
 
@@ -375,7 +401,7 @@ fn a_copy_is_served_to_an_independent_client_that_pastes_it() {
 
     clipboard.write_text("42").expect("an X11 session accepts a copy");
     assert_eq!(
-        reader.clipboard_text().as_deref(),
+        reader.pasted_once_settled("42").as_deref(),
         Some("42"),
         "the copied text must be what another application pastes"
     );
@@ -387,7 +413,7 @@ fn a_copy_is_served_to_an_independent_client_that_pastes_it() {
         .write_text("6 * 7 = 42")
         .expect("an X11 session accepts a second copy");
     assert_eq!(
-        reader.clipboard_text().as_deref(),
+        reader.pasted_once_settled("6 * 7 = 42").as_deref(),
         Some("6 * 7 = 42"),
         "a second copy must replace what a pasting application sees"
     );
