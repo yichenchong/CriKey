@@ -15,6 +15,14 @@ use crikey_core::{Action, ActionId, Generation, ItemId};
 use crikey_platform::IconImage;
 
 mod native;
+mod session_end;
+/// The one Windows message the launcher's window procedure must rewrite before
+/// `DefWindowProc` can turn a keystroke into an alert sound.
+///
+/// Public because the mapping is a pure function of a message id and is
+/// therefore compiled and tested on every host, not only the one that can run
+/// it.
+pub mod system_char;
 mod theme;
 
 pub use egui;

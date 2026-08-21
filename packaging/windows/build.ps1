@@ -403,9 +403,17 @@ if ($Format -eq 'msi' -or $Format -eq 'both') {
     # not fail the build: `wix` would report an unknown `ui:WixUI` element, and
     # the fix for that reads like an authoring mistake rather than an absent
     # tool. Checked up front so the error names the install command.
+    #
+    # The Util extension is checked the same way and for a worse failure: its
+    # `util:CloseApplication` is what asks the running launcher to exit before
+    # its own executable is replaced, and without the extension the build stops
+    # on an unknown element in the middle of the package.
     $extensions = & $wix extension list --global 2>&1 | Out-String
     if ($extensions -notmatch 'WixToolset\.UI\.wixext') {
         Stop-WithError "the WiX UI extension is not installed (the MSI would have no dialogs and would appear to open and close). Install it with: wix extension add --global WixToolset.UI.wixext/5.0.2"
+    }
+    if ($extensions -notmatch 'WixToolset\.Util\.wixext') {
+        Stop-WithError "the WiX Util extension is not installed (the MSI could not close a running CriKey before replacing it). Install it with: wix extension add --global WixToolset.Util.wixext/5.0.2"
     }
 
     # The licence dialog reads RTF and nothing else, so the repository's plain
@@ -445,6 +453,7 @@ if ($Format -eq 'msi' -or $Format -eq 'both') {
         (Join-Path $scriptDir 'crikey.wxs'),
         '-arch', 'x64',
         '-ext', 'WixToolset.UI.wixext',
+        '-ext', 'WixToolset.Util.wixext',
         '-d', "Version=$Version",
         '-d', "StageDir=$stage",
         '-d', "LicenseRtf=$licenseRtf",

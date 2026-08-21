@@ -66,8 +66,6 @@ pub(crate) enum CalculationError {
     NotACalculation,
 }
 
-/// Evaluates `query` as an arithmetic expression.
-///
 /// The grammar, in precedence order from loosest to tightest:
 ///
 /// ```text
@@ -75,22 +73,24 @@ pub(crate) enum CalculationError {
 /// term       := unary (('*' | '/' | '%') unary)*
 /// unary      := ('-' | '+') unary | power
 /// power      := atom (('^' | '**') unary)?
-/// atom       := number | '(' expression ')'
-/// number     := digits ['.' digits] | '.' digits
+/// atom       := number | identifier | name '(' expression ')'
 /// ```
+///
+/// Identifiers are the constants `pi`, `e`, and `tau`, or one of the
+/// single-argument functions `sqrt`, `cbrt`, `abs`, `ln`, `log`, `log2`,
+/// `exp`, `floor`, `ceil`, `round`, `sin`, `cos`, `tan`, `asin`, `acos`, and
+/// `atan`. Names are matched case-insensitively; this is friendlier for
+/// keyboard input while remaining strict because unknown names are refused.
+/// Trigonometric functions use radians, as `f64`'s mathematical functions do.
+///
+/// A bare number is refused, but a constant or function call is accepted:
+/// those compute or reveal information beyond text the user just typed, while
+/// echoing `42` (or `(42)` or `-42`) adds nothing useful to a launcher query.
 ///
 /// `power` takes a `unary` on its right and sits *below* `unary` on its left,
 /// which is what makes `-2^2` evaluate to `-4` rather than `4` and `2^-3` to
 /// `0.125`: exponentiation binds tighter than negation and is
 /// right-associative, while `+ - * / %` are left-associative.
-///
-/// A bare number is refused with [`CalculationError::NotACalculation`]. `42` is
-/// not a calculation — it is a query, and quite possibly a query about a file,
-/// a version or a port number. Answering it would put a row saying `42` under
-/// every numeric query in exchange for telling the user something they just
-/// typed. The gate is therefore "at least one binary operator was applied",
-/// which also refuses `(42)` and `-42`: parentheses and a sign rearrange a
-/// number, they do not compute one.
 pub(crate) fn evaluate(query: &str) -> Result<f64, CalculationError> {
     let tokens = tokenize(query)?;
     if tokens.is_empty() {
@@ -100,17 +100,16 @@ pub(crate) fn evaluate(query: &str) -> Result<f64, CalculationError> {
         tokens: &tokens,
         position: 0,
         binary_operations: 0,
+        informative_atom: false,
     };
     let value = parser.expression()?;
     if parser.position != tokens.len() {
-        // A `)` that closes nothing lands here rather than in `atom`, which
-        // only ever consumes a `)` it opened.
         return Err(match tokens[parser.position] {
             Token::CloseParenthesis => CalculationError::UnbalancedParentheses,
             _ => CalculationError::TrailingInput,
         });
     }
-    if parser.binary_operations == 0 {
+    if parser.binary_operations == 0 && !parser.informative_atom {
         return Err(CalculationError::NotACalculation);
     }
     finite(value)
@@ -230,9 +229,10 @@ fn copy_action() -> Action {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Token {
     Number(f64),
+    Identifier(String),
     Plus,
     Minus,
     Star,
@@ -241,6 +241,7 @@ enum Token {
     Caret,
     OpenParenthesis,
     CloseParenthesis,
+    Comma,
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, CalculationError> {
@@ -250,6 +251,17 @@ fn tokenize(input: &str) -> Result<Vec<Token>, CalculationError> {
     while index < bytes.len() {
         match bytes[index] {
             b' ' | b'\t' => index += 1,
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
+                let start = index;
+                index += 1;
+                while matches!(
+                    bytes.get(index),
+                    Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+                ) {
+                    index += 1;
+                }
+                tokens.push(Token::Identifier(input[start..index].to_ascii_lowercase()));
+            }
             b'+' => {
                 tokens.push(Token::Plus);
                 index += 1;
@@ -258,8 +270,6 @@ fn tokenize(input: &str) -> Result<Vec<Token>, CalculationError> {
                 tokens.push(Token::Minus);
                 index += 1;
             }
-            // `**` is the same operator as `^`, spelled the way a programmer
-            // types it; two tokens would make `2**3` parse as `2 * (*3)`.
             b'*' if bytes.get(index + 1) == Some(&b'*') => {
                 tokens.push(Token::Caret);
                 index += 2;
@@ -288,6 +298,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, CalculationError> {
                 tokens.push(Token::CloseParenthesis);
                 index += 1;
             }
+            b',' => {
+                tokens.push(Token::Comma);
+                index += 1;
+            }
             b'0'..=b'9' | b'.' => {
                 let start = index;
                 while index < bytes.len() && bytes[index].is_ascii_digit() {
@@ -299,14 +313,13 @@ fn tokenize(input: &str) -> Result<Vec<Token>, CalculationError> {
                     while index < bytes.len() && bytes[index].is_ascii_digit() {
                         index += 1;
                     }
-                    // `1.` and a bare `.` are refused: a trailing separator is
-                    // an unfinished number, and `budget.` must not evaluate.
                     if index == fraction_start {
                         return Err(CalculationError::MalformedNumber);
                     }
                 }
-                let literal = &input[start..index];
-                let value: f64 = literal.parse().map_err(|_| CalculationError::MalformedNumber)?;
+                let value: f64 = input[start..index]
+                    .parse()
+                    .map_err(|_| CalculationError::MalformedNumber)?;
                 tokens.push(Token::Number(finite(value)?));
             }
             _ => return Err(CalculationError::UnexpectedCharacter),
@@ -315,40 +328,34 @@ fn tokenize(input: &str) -> Result<Vec<Token>, CalculationError> {
     Ok(tokens)
 }
 
-/// Refuses a value an `f64` could not represent: an overflowing literal, an
-/// overflowing power, or a `0.0 / 0.0` the division guard cannot see.
+/// Refuses a value an `f64` could not represent.
 fn finite(value: f64) -> Result<f64, CalculationError> {
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err(CalculationError::NotFinite)
-    }
+    value
+        .is_finite()
+        .then_some(value)
+        .ok_or(CalculationError::NotFinite)
 }
 
 struct Parser<'tokens> {
     tokens: &'tokens [Token],
     position: usize,
-    /// How many binary operators were applied, which is what separates a
-    /// calculation from a number that was merely typed. See [`evaluate`].
     binary_operations: usize,
+    informative_atom: bool,
 }
 
 impl Parser<'_> {
-    fn peek(&self) -> Option<Token> {
-        self.tokens.get(self.position).copied()
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.position)
     }
 
     fn expression(&mut self) -> Result<f64, CalculationError> {
         let mut value = self.term()?;
-        while let Some(token @ (Token::Plus | Token::Minus)) = self.peek() {
+        while matches!(self.peek(), Some(Token::Plus | Token::Minus)) {
+            let plus = matches!(self.peek(), Some(Token::Plus));
             self.position += 1;
             self.binary_operations += 1;
             let right = self.term()?;
-            value = if token == Token::Plus {
-                value + right
-            } else {
-                value - right
-            };
+            value = if plus { value + right } else { value - right };
             finite(value)?;
         }
         Ok(value)
@@ -356,17 +363,19 @@ impl Parser<'_> {
 
     fn term(&mut self) -> Result<f64, CalculationError> {
         let mut value = self.unary()?;
-        while let Some(token @ (Token::Star | Token::Slash | Token::Percent)) = self.peek() {
+        while matches!(self.peek(), Some(Token::Star | Token::Slash | Token::Percent)) {
+            let operator = self.peek().cloned();
             self.position += 1;
             self.binary_operations += 1;
             let right = self.unary()?;
-            value = match token {
-                Token::Star => value * right,
-                // Refused rather than answered with an infinity: `1/0` has no
-                // value, and `inf` is a claim the user did not ask for.
-                _ if right == 0.0 => return Err(CalculationError::DivisionByZero),
-                Token::Slash => value / right,
-                _ => value % right,
+            value = match operator {
+                Some(Token::Star) => value * right,
+                Some(Token::Slash | Token::Percent) if right == 0.0 => {
+                    return Err(CalculationError::DivisionByZero)
+                }
+                Some(Token::Slash) => value / right,
+                Some(Token::Percent) => value % right,
+                _ => unreachable!(),
             };
             finite(value)?;
         }
@@ -377,7 +386,7 @@ impl Parser<'_> {
         match self.peek() {
             Some(Token::Minus) => {
                 self.position += 1;
-                self.unary().map(|value| -value)
+                self.unary().map(|v| -v)
             }
             Some(Token::Plus) => {
                 self.position += 1;
@@ -389,19 +398,17 @@ impl Parser<'_> {
 
     fn power(&mut self) -> Result<f64, CalculationError> {
         let base = self.atom()?;
-        if self.peek() != Some(Token::Caret) {
+        if !matches!(self.peek(), Some(Token::Caret)) {
             return Ok(base);
         }
         self.position += 1;
         self.binary_operations += 1;
-        // A `unary` on the right, so `2^-3` is legal and `2^3^2` groups to the
-        // right without a second loop.
         let exponent = self.unary()?;
         finite(base.powf(exponent))
     }
 
     fn atom(&mut self) -> Result<f64, CalculationError> {
-        match self.peek() {
+        match self.peek().cloned() {
             Some(Token::Number(value)) => {
                 self.position += 1;
                 Ok(value)
@@ -409,11 +416,60 @@ impl Parser<'_> {
             Some(Token::OpenParenthesis) => {
                 self.position += 1;
                 let value = self.expression()?;
-                if self.peek() != Some(Token::CloseParenthesis) {
+                if !matches!(self.peek(), Some(Token::CloseParenthesis)) {
                     return Err(CalculationError::UnbalancedParentheses);
                 }
                 self.position += 1;
                 Ok(value)
+            }
+            Some(Token::Identifier(name)) => {
+                self.position += 1;
+                let constants = match name.as_str() {
+                    "pi" => Some(std::f64::consts::PI),
+                    "e" => Some(std::f64::consts::E),
+                    "tau" => Some(std::f64::consts::TAU),
+                    _ => None,
+                };
+                if let Some(value) = constants {
+                    self.informative_atom = true;
+                    return Ok(value);
+                }
+                if !matches!(self.peek(), Some(Token::OpenParenthesis)) {
+                    return Err(CalculationError::UnexpectedCharacter);
+                }
+                self.position += 1;
+                let argument = self.expression()?;
+                if !matches!(self.peek(), Some(Token::CloseParenthesis)) {
+                    return Err(CalculationError::UnbalancedParentheses);
+                }
+                self.position += 1;
+                // Radians, which is what `f64` provides and what a calculator
+                // is expected to mean. `log` is base 10 and `ln` is natural:
+                // the other convention would silently give a different answer
+                // to an expression that still looks right.
+                let value = match name.as_str() {
+                    "sqrt" => argument.sqrt(),
+                    "cbrt" => argument.cbrt(),
+                    "abs" => argument.abs(),
+                    "ln" => argument.ln(),
+                    "log" => argument.log10(),
+                    "log2" => argument.log2(),
+                    "exp" => argument.exp(),
+                    "floor" => argument.floor(),
+                    "ceil" => argument.ceil(),
+                    "round" => argument.round(),
+                    "sin" => argument.sin(),
+                    "cos" => argument.cos(),
+                    "tan" => argument.tan(),
+                    "asin" => argument.asin(),
+                    "acos" => argument.acos(),
+                    "atan" => argument.atan(),
+                    // An unknown name is not a calculation at all, so the
+                    // launcher shows no row rather than guessing a function.
+                    _ => return Err(CalculationError::UnexpectedCharacter),
+                };
+                self.informative_atom = true;
+                finite(value)
             }
             _ => Err(CalculationError::ExpectedOperand),
         }
@@ -487,10 +543,75 @@ mod tests {
         assert_eq!(error("*2"), CalculationError::ExpectedOperand);
         assert_eq!(error("(2+3"), CalculationError::UnbalancedParentheses);
         assert_eq!(error("2+3)"), CalculationError::UnbalancedParentheses);
-        assert_eq!(error("2 apples"), CalculationError::UnexpectedCharacter);
-        assert_eq!(error("budget.ods"), CalculationError::UnexpectedCharacter);
+        // `apples` lexes as an identifier now that names exist, so the parser
+        // finishes a complete expression at `2` and refuses what follows.
+        // Which refusal it is matters less than that it is one: the row is
+        // withheld either way, which `a_non_expression_query_publishes_no_row`
+        // is what actually pins.
+        assert_eq!(error("2 apples"), CalculationError::TrailingInput);
+        // `budget` is an identifier and `.ods` then starts a number that has
+        // no digits. A different refusal from the line above, and for the same
+        // reason: names exist now, so junk is diagnosed further in.
+        assert_eq!(error("budget.ods"), CalculationError::MalformedNumber);
         assert_eq!(error("2+3."), CalculationError::MalformedNumber);
         assert_eq!(error(""), CalculationError::Empty);
+    }
+
+    #[test]
+    fn functions_constants_and_precedence() {
+        let cases = [
+            ("sqrt(9)", 3.0),
+            ("cbrt(8)", 2.0),
+            ("abs(-3)", 3.0),
+            ("ln(e)", 1.0),
+            ("log(100)", 2.0),
+            ("log2(8)", 3.0),
+            ("exp(1)", std::f64::consts::E),
+            ("floor(2.9)", 2.0),
+            ("ceil(2.1)", 3.0),
+            ("round(2.5)", 3.0),
+            ("sin(pi/2)", 1.0),
+            ("cos(0)", 1.0),
+            ("tan(0)", 0.0),
+            ("asin(1)", std::f64::consts::FRAC_PI_2),
+            ("acos(1)", 0.0),
+            ("atan(1)", std::f64::consts::FRAC_PI_4),
+            ("-sqrt(4)", -2.0),
+            ("sqrt(4)^2", 4.0),
+            ("2^sqrt(4)", 4.0),
+        ];
+        for (expression, expected) in cases {
+            assert!((value(expression) - expected).abs() < 1e-10, "{expression}");
+        }
+        assert!((value("LOG(100)") - value("ln(100)")).abs() > 1.0);
+        assert!((value("PI") - std::f64::consts::PI).abs() < 1e-12);
+        assert!((value("tau") - 2.0 * std::f64::consts::PI).abs() < 1e-12);
+    }
+
+    #[test]
+    fn function_refusals_and_activation_gate_are_strict() {
+        for expression in [
+            "sqrt(-1)",
+            "ln(0)",
+            "log(-5)",
+            "asin(2)",
+            "sqrt()",
+            "sqrt(1,2)",
+            "sqrt(2",
+        ] {
+            assert!(evaluate(expression).is_err(), "{expression} must be refused");
+        }
+        assert_eq!(error("foo(2)"), CalculationError::UnexpectedCharacter);
+        assert!(evaluate("pi").is_ok());
+        assert!(evaluate("sqrt(16)").is_ok());
+        for expression in ["42", "(42)", "-42"] {
+            assert_eq!(error(expression), CalculationError::NotACalculation);
+        }
+    }
+
+    #[test]
+    fn irrational_results_are_readable() {
+        assert_eq!(format_value(value("sqrt(2)")), "1.4142135624");
     }
 
     #[test]

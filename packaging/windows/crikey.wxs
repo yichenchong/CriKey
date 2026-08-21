@@ -105,7 +105,8 @@
   and python-runtime\ when -d PythonRuntime=1 is also passed.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package
       Name="CriKey"
       Manufacturer="The CriKey Authors"
@@ -149,6 +150,88 @@
         DowngradeErrorMessage="A newer version of CriKey is already installed. Uninstall it first if you really want this older one." />
 
     <MediaTemplate EmbedCab="yes" />
+
+    <!--
+      CLOSING THE RUNNING LAUNCHER
+      ===========================
+      `crikey-launcher.exe` is a resident process and it is one of the files
+      this package replaces, so every install over a running launcher is a
+      file-in-use install. Left to itself, Windows Installer's Restart Manager
+      asks the process to shut down, waits, finds it still there, and reports
+      that it was unable to close the applications — which was exactly right:
+      until `crikey-ui`'s `session_end` module the launcher answered a
+      session-end request the way `DefWindowProc` does, by consenting and then
+      staying. The launcher now exits on `WM_ENDSESSION`, and this element is
+      the half that makes sure something actually asks.
+
+      Asked by name, not by window. `WixCloseApplications` finds the process
+      from `Target` with a process-list snapshot and then sends to every
+      top-level window that process owns. Both halves are independent of
+      whether the window is visible, and that matters here more than for most
+      programs: an idle launcher is hidden — `set_visible(false)`, not
+      minimised — so any mechanism that looks for a visible window finds
+      nothing to ask.
+
+      EndSessionMessage rather than CloseMessage. A `WM_CLOSE` is what the
+      launcher's close button, Escape and a click away all arrive as, and all
+      three mean "dismiss": the window hides and the process stays. Sending it
+      here would close the user's launcher window and leave the file locked.
+      `WM_QUERYENDSESSION`/`WM_ENDSESSION` is the pair that means the operating
+      system wants the process gone, and it is the only pair the launcher
+      treats that way.
+
+      Polite, and only polite. TerminateProcess is deliberately absent, and so
+      is RebootPrompt, whose schema default is "yes" — either one makes the
+      custom action schedule its deferred half, and a deferred action scheduled
+      from an immediate action sequenced ahead of InstallInitialize fails the
+      install with error 2762. Being ahead of InstallInitialize is the point
+      (see the sequence override below), so terminating is not available here
+      at any price, and it would not be free: the launcher persists its
+      selection history and reaps its plugin child processes as it exits, and a
+      terminated launcher loses the first and orphans the second until the
+      supervisor's own cleanup notices.
+
+      What happens if the launcher does not go: nothing worse than before.
+      Windows Installer's own Restart Manager still runs afterwards at
+      InstallValidate and still handles the file in use, by asking again or by
+      scheduling the replacement for the next reboot. No user data is at stake
+      in either path.
+
+      Timeout is in seconds. Ten, because the exit is orderly — the event loop
+      unwinds, the history is written, the plugin hosts are reaped — and the
+      default five would be a report of failure on a slow disk rather than a
+      slow shutdown.
+    -->
+    <util:CloseApplication
+        Id="CloseCrikeyLauncher"
+        Target="crikey-launcher.exe"
+        Description="CriKey is running. Setup will ask it to close so it can be updated."
+        EndSessionMessage="yes"
+        RebootPrompt="no"
+        Timeout="10" />
+
+    <!--
+      Rescheduled from where the Util extension puts it, which is before
+      InstallFiles, to before InstallValidate.
+
+      InstallValidate is where Windows Installer looks for files in use, and so
+      it is where the "unable to close the applications" report the user sees
+      comes from. A close that runs before InstallFiles runs after that report
+      has already been made, which makes it useless for the defect it is here
+      to fix; Microsoft's own guidance for custom actions that shut
+      applications down is to sequence them before InstallValidate
+      (https://learn.microsoft.com/windows/win32/msi/using-windows-installer-with-restart-manager).
+
+      `override` is how WiX v5 lets a package reschedule an extension action:
+      the extension declares the row `virtual` for exactly this. The decorated
+      name carries the extension's version prefix and the build architecture,
+      which build.ps1 pins with `-arch x64`; an architecture change here is a
+      build failure naming this action rather than a package that silently
+      stops closing the launcher.
+    -->
+    <InstallExecuteSequence>
+      <Custom Action="override Wix4CloseApplications_X64" Before="InstallValidate" />
+    </InstallExecuteSequence>
 
     <!--
       Add/Remove Programs metadata. No ARPPRODUCTICON: no icon is checked into

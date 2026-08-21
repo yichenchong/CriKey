@@ -890,6 +890,7 @@ dependencies = [
  "pollster",
  "thiserror 2.0.19",
  "wgpu",
+ "windows 0.61.3",
  "winit",
 ]
 

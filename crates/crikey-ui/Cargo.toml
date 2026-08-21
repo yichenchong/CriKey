@@ -26,6 +26,24 @@ thiserror.workspace = true
 wgpu = { workspace = true, features = ["dx12", "metal", "wgsl"] }
 winit = { workspace = true, features = ["rwh_06", "wayland", "wayland-dlopen", "x11"] }
 
+# Only the Windows target links Win32, so a Linux or macOS build of this crate
+# still compiles. `session_end` needs a real dependency rather than the
+# hand-written constants `system_char` gets away with: a window subclass is
+# `comctl32` entry points, not numbers.
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+workspace = true
+features = [
+    # The crate's own default, restored explicitly because the workspace
+    # declaration turns defaults off to keep the feature list auditable.
+    "std",
+    # `HWND`, `WPARAM`, `LPARAM`, `LRESULT`.
+    "Win32_Foundation",
+    # `SetWindowSubclass`, `DefSubclassProc`, `RemoveWindowSubclass`.
+    "Win32_UI_Shell",
+    # `WM_QUERYENDSESSION`, `WM_ENDSESSION`, `WM_NCDESTROY`.
+    "Win32_UI_WindowsAndMessaging",
+]
+
 [dev-dependencies]
 # The renderer tests build rows carrying real decoded pixels, because the
 # assertion is that those exact bytes reach the frame's texture uploads.

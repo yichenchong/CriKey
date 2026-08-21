@@ -1028,6 +1028,11 @@ where
             NativeEvent::Exit => {
                 self.exiting = true;
                 self.active_session = None;
+                // Cleared here rather than only in `request_exit`, so that the
+                // event means the same thing whoever sends it: the Windows
+                // session-end subclass sends it from a window procedure that
+                // holds no handle.
+                self.shared.lifecycle.fetch_and(!VISIBLE_BIT, Ordering::AcqRel);
                 self.shared.clear_all_frames();
                 self.hide();
                 event_loop.exit();
@@ -1348,6 +1353,23 @@ impl GraphicsState {
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_visible(false);
         let window = Arc::new(event_loop.create_window(attributes)?);
+        // A hidden launcher is still the process a Windows installer has to
+        // replace, and it has to leave when the operating system asks it to.
+        // The request cannot travel as a `UiCommand`: `dispatch_command` drops
+        // commands that arrive with no active session and an idle launcher has
+        // none. `NativeEvent::Exit` is where the settings surface's quit
+        // control ends up too, so the host's orderly shutdown -- selection
+        // history, plugin children -- is the one that already exists.
+        #[cfg(target_os = "windows")]
+        {
+            let exit_proxy = proxy.clone();
+            let _installed = crate::session_end::watch(
+                window.as_ref(),
+                Box::new(move || {
+                    let _ = exit_proxy.send(NativeEvent::Exit);
+                }),
+            );
+        }
         pollster::block_on(Self::initialize(
             window,
             proxy,
