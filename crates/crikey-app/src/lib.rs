@@ -93,8 +93,8 @@ use crikey_platform::{
 #[cfg(any(windows, target_os = "linux"))]
 use crikey_platform::{HotkeyActivationHandler, HotkeyBinding};
 use crikey_query::{
-    DefaultMatcher, DefaultNormalizer, MatchMethod, MatchOutcome, MatchPolicy, NormalizedQuery, Normalizer,
-    PreparedLabel,
+    DefaultMatcher, DefaultNormalizer, MatchMethod, MatchOutcome, MatchPolicy, Matcher, NormalizedQuery,
+    Normalizer, PreparedLabel,
 };
 use crikey_ranking::{DefaultRanker, QueryAffinity, RankingSignals, Score, SelectionHistory};
 use crikey_result_aggregator::{MemoryResultAggregator, ResultAggregator};
@@ -554,6 +554,15 @@ pub struct SearchHit {
     /// Byte ranges within the item label the matcher credited, ordered and
     /// disjoint.
     pub highlights: Vec<(usize, usize)>,
+    /// True when this hit was merged in for the current generation only by
+    /// [`SearchService::merge_query_items`], rather than coming from the
+    /// catalog.
+    ///
+    /// Provenance is recorded on the hit rather than in a side table because
+    /// the answer vector is replaced wholesale by every accepted query: a
+    /// flag that lives in the answer cannot outlive it, whereas a side table
+    /// would have to be cleared in every path that clears `results`.
+    pub ephemeral: bool,
 }
 
 /// Match evidence for one query, keyed by owner and then by stable id.
@@ -620,6 +629,19 @@ impl Ord for RankedCandidate<'_> {
             .then_with(|| other.item.stable_id.cmp(&self.item.stable_id))
             .then_with(|| other.item.plugin_id.cmp(&self.item.plugin_id))
     }
+}
+
+/// Presentation order for a published answer: strongest score first, then a
+/// stable identity so equal scores order the same way on every host.
+///
+/// The single definition is what lets a merged item and a catalog item share
+/// one ordering instead of being interleaved by two comparators.
+fn by_rank(left: &SearchHit, right: &SearchHit) -> Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| left.item.stable_id.cmp(&right.item.stable_id))
+        .then_with(|| left.item.plugin_id.cmp(&right.item.plugin_id))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1430,33 +1452,106 @@ impl SearchService {
             else {
                 continue;
             };
-            let mut signals = RankingSignals::default();
-            self.history.augment(
-                item,
-                &affinity,
-                self.now_secs,
-                self.foreground_category.as_ref(),
-                &mut signals,
-            );
-            let score = self.ranker.score_outcome_with_signals(item, &outcome, signals);
-            hits.push(SearchHit {
-                item: item.clone(),
-                score,
-                method: outcome.method,
-                highlights: outcome.highlights,
-            });
+            hits.push(self.rank_hit(item.clone(), outcome, &affinity, false));
         }
 
-        hits.sort_unstable_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| left.item.stable_id.cmp(&right.item.stable_id))
-                .then_with(|| left.item.plugin_id.cmp(&right.item.plugin_id))
-        });
+        hits.sort_unstable_by(by_rank);
 
         self.results = hits;
         Ok(generation)
+    }
+
+    /// Scores one matched item exactly as the catalog pass does.
+    ///
+    /// Shared by [`Self::submit_query_at`] and [`Self::merge_query_items`] so
+    /// that a merged item and a catalog item cannot be placed by two
+    /// independently maintained formulas.
+    fn rank_hit(
+        &self,
+        item: Item,
+        outcome: MatchOutcome,
+        affinity: &QueryAffinity<'_>,
+        ephemeral: bool,
+    ) -> SearchHit {
+        let mut signals = RankingSignals::default();
+        self.history.augment(
+            &item,
+            affinity,
+            self.now_secs,
+            self.foreground_category.as_ref(),
+            &mut signals,
+        );
+        let score = self.ranker.score_outcome_with_signals(&item, &outcome, signals);
+        SearchHit {
+            item,
+            score,
+            method: outcome.method,
+            highlights: outcome.highlights,
+            ephemeral,
+        }
+    }
+
+    /// Ranks `items` into the answer for `generation` alongside the catalog
+    /// hits. Returns false when `generation` is not the current one (a stale
+    /// batch).
+    ///
+    /// This is how a provider that answers asynchronously - file search, above
+    /// all - gets its items *ranked against* the catalog rather than appended
+    /// after it. A file whose name the query prefixes therefore outranks an
+    /// application the query merely occurs inside, because both are placed by
+    /// the same match method, history and ranker.
+    ///
+    /// The items are ephemeral: they never reach the catalog, the catalog
+    /// cache or the candidate cache, and the next accepted query replaces the
+    /// answer that holds them. They do become selectable history, which is the
+    /// point - [`Self::record_selection`] resolves ids against the answer, so
+    /// before this existed selecting a file recorded nothing at all.
+    ///
+    /// Calling this twice for one generation and plugin replaces that plugin's
+    /// previous batch; other plugins' merged items and the catalog hits stand.
+    ///
+    /// An item whose stable id already appears in the answer is dropped. Ids
+    /// address rows for selection and for history, so a duplicated id would
+    /// make both arbitrary, and the incumbent - a catalog item, or an earlier
+    /// batch's item - is the one already on screen.
+    pub fn merge_query_items(&mut self, generation: Generation, plugin: &PluginId, items: Vec<Item>) -> bool {
+        if !self.app.generations().is_current(generation) {
+            return false;
+        }
+        let Some(query) = self.last_query.clone() else {
+            return false;
+        };
+        // Replacing this plugin's batch before matching keeps the collision
+        // check from rejecting a re-sent item against its own earlier copy.
+        self.results
+            .retain(|hit| !(hit.ephemeral && hit.item.plugin_id == *plugin));
+
+        let affinity = self.history.affinities_for(&query);
+        let mut merged = Vec::new();
+        for item in items {
+            let Some(outcome) = self.matcher.match_item(&query, &item) else {
+                continue;
+            };
+            if self
+                .results
+                .iter()
+                .chain(merged.iter())
+                .any(|hit: &SearchHit| hit.item.stable_id == item.stable_id)
+            {
+                continue;
+            }
+            merged.push(self.rank_hit(item, outcome, &affinity, true));
+        }
+        self.results.append(&mut merged);
+        self.results.sort_unstable_by(by_rank);
+        // The catalog pass bounds its answer inside `select_best`; appending to
+        // it re-opens that bound, so it is re-applied here. Sorting first is
+        // what makes this a truncation of the *worst* rows rather than of
+        // whichever provider happened to answer last -- a merged file that
+        // outranks a catalog hit displaces it, which is the whole point of
+        // ranking the two together.
+        self.results.truncate(self.app.limits().max_items_per_query);
+        true
     }
 
     /// The ranked answer to the most recently accepted query.
@@ -1619,45 +1714,6 @@ impl SearchService {
                 .submit(&hit.item.plugin_id, &hit.item, action_id, argument)
                 .map(ActionSubmission::Pending),
         }
-    }
-
-    /// Runs a host-mediated action on an item the caller resolved itself.
-    ///
-    /// [`Self::execute_with_argument`] finds its item in the ranked answer to
-    /// the last query, which is the catalog's answer. A per-query provider --
-    /// file search is the one -- deliberately does not publish through the
-    /// catalog, so its rows are unknown there and their owner keeps its own
-    /// table of what it just delivered. This is the entry point for that
-    /// caller, and it exists so there is still exactly *one* host-mediated
-    /// gate: same action lookup, same category check, same authorisation, same
-    /// dispatch. A second copy of those four would be the copy that drifts.
-    ///
-    /// Plugin-owned actions are refused here rather than routed. This path
-    /// bypasses the ranked answer, so accepting one would let a caller submit
-    /// an action for an item the pipeline never selected.
-    pub fn execute_host_action(&self, item: &Item, action_id: &ActionId) -> CoreResult<ActionSubmission> {
-        let action = item
-            .actions
-            .iter()
-            .find(|action| &action.action_id == action_id)
-            .ok_or_else(|| {
-                crikey_core::CoreError::Invalid("selected action is no longer available".to_owned())
-            })?;
-        if action.execution_policy != ExecutionPolicy::HostMediated {
-            return Err(crikey_core::CoreError::Invalid(format!(
-                "action `{}` is plugin-owned and cannot be run as a host action",
-                action.action_id.0
-            )));
-        }
-        if !action.applicable_categories.is_empty() && !action.applicable_categories.contains(&item.category)
-        {
-            return Err(crikey_core::CoreError::Invalid(format!(
-                "action `{}` is not applicable to item category `{}`",
-                action.action_id.0,
-                item.category.as_str()
-            )));
-        }
-        self.dispatch_host_mediated(item, action, None)
     }
 
     /// The one place the host performs an action on its own behalf.

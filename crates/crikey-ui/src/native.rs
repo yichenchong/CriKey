@@ -207,6 +207,15 @@ pub enum NativeLauncherEvent {
     /// `session` scopes effects such as hiding after a successful action. A
     /// late command from an older activation must never hide a newer one.
     Command { session: u64, command: UiCommand },
+    /// A provider driver has an answer waiting for the UI thread to merge.
+    ///
+    /// Carries nothing: the answer itself lives in the driver the host will
+    /// poll, and this event says only that polling is now worth doing. It is
+    /// inert with respect to visibility — it neither shows nor hides the
+    /// window — and it is delivered only for the session that is currently
+    /// active, so an answer belonging to a dismissed or superseded activation
+    /// is dropped rather than merged into a newer one.
+    ProviderAnswer,
 }
 
 /// Creates an egui context configured with the launcher's shared visual tokens.
@@ -247,6 +256,7 @@ enum NativeEvent {
     Toggle { session: u64 },
     Hide { session: u64 },
     FrameReady { session: u64 },
+    ProviderAnswer { session: u64 },
     RepaintAfter(Duration),
     DriverError(String),
     Exit,
@@ -278,6 +288,15 @@ struct PendingFrame {
 struct FrameMailbox {
     latest: Option<PendingFrame>,
     wake_session: Option<u64>,
+    /// The session an unconsumed [`NativeEvent::ProviderAnswer`] was announced
+    /// for, coalescing answer wakes exactly as `wake_session` coalesces frame
+    /// wakes: several drivers can answer before the loop next runs, and the
+    /// host merges all of them in one turn, so a second event would only make
+    /// the loop turn again for nothing. It is a separate flag rather than a
+    /// share of `wake_session` because a frame wake and an answer wake mean
+    /// different things — "draw this" against "merge, then decide what to
+    /// draw" — and one must never swallow the other.
+    answer_session: Option<u64>,
     /// The host-owned half of the view model, and the session it was published
     /// for.
     ///
@@ -460,6 +479,36 @@ impl SharedState {
         }
     }
 
+    /// Claims the right to announce that a provider answer is waiting for
+    /// `session`, returning false when an announcement is already outstanding.
+    ///
+    /// The same promise discipline `wake_session` uses, for the same reason: a
+    /// driver may answer several times before the loop next runs, and every
+    /// answer after the first would buy a wake the host has already been given.
+    /// Nothing is lost by refusing them — the host polls the drivers when it
+    /// runs, so the one announcement covers whatever has accumulated by then.
+    fn claim_answer_wake(&self, session: u64) -> bool {
+        let mut mailbox = lock_recover(&self.frames);
+        if mailbox.answer_session == Some(session) {
+            return false;
+        }
+        mailbox.answer_session = Some(session);
+        true
+    }
+
+    /// Retires the outstanding answer announcement for `session`.
+    ///
+    /// Called before the host is given the event rather than after: merging is
+    /// what makes the next answer worth announcing, and a promise still held
+    /// while the host runs would swallow the wake for an answer that landed
+    /// during the merge.
+    fn acknowledge_answer_wake(&self, session: u64) {
+        let mut mailbox = lock_recover(&self.frames);
+        if mailbox.answer_session == Some(session) {
+            mailbox.answer_session = None;
+        }
+    }
+
     fn clear_all_frames(&self) {
         let mut mailbox = lock_recover(&self.frames);
         mailbox.latest = None;
@@ -571,6 +620,34 @@ impl NativeLauncherHandle {
     fn finish_hide_request(&self, session: u64) -> Result<(), RendererError> {
         self.shared.clear_frames(session);
         self.proxy.send(NativeEvent::Hide { session })
+    }
+
+    /// Tells the UI thread that a provider driver has an answer to merge.
+    ///
+    /// Some provider answers cannot be turned into a frame on the thread that
+    /// produced them: the launcher's file search is ranked against the catalog,
+    /// and the ranker lives on the UI thread. Those drivers park their answer
+    /// and call this, and the host merges it on the next turn of the loop.
+    ///
+    /// Deliberately inert with respect to the window. It says "there is work to
+    /// merge" and nothing about visibility: a hidden launcher has no session to
+    /// merge into, so the announcement is dropped rather than allowed to wake
+    /// one back up. Coalesced per session, so a burst of answers costs one
+    /// wake; see [`SharedState::claim_answer_wake`].
+    pub fn request_provider_answer(&self) -> Result<(), RendererError> {
+        let state = self.shared.snapshot();
+        if !lifecycle_visible(state) {
+            return Ok(());
+        }
+        let session = lifecycle_session(state);
+        if !self.shared.claim_answer_wake(session) {
+            return Ok(());
+        }
+        if let Err(error) = self.proxy.send(NativeEvent::ProviderAnswer { session }) {
+            self.shared.acknowledge_answer_wake(session);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Replaces the frame waiting for the UI thread with the newest immutable
@@ -1019,6 +1096,20 @@ where
                     // the next submission for that session never wakes the
                     // loop and the list stops updating.
                     self.shared.acknowledge_wake(session);
+                }
+            }
+            NativeEvent::ProviderAnswer { session } => {
+                // Retired first, whatever happens next: the merge the host is
+                // about to perform is exactly when the next answer can land,
+                // and a promise still outstanding then would lose its wake.
+                self.shared.acknowledge_answer_wake(session);
+                // Nothing about the window changes here. An answer for a
+                // session this thread has already left is simply dropped: the
+                // rows it would merge into are gone, and merging it into
+                // whatever came after would be the older query's answer under
+                // the newer query's generation.
+                if self.active_session == Some(session) {
+                    (self.on_event)(NativeLauncherEvent::ProviderAnswer);
                 }
             }
             NativeEvent::RepaintAfter(delay) => self.schedule_repaint(delay),
@@ -2716,6 +2807,50 @@ mod lifecycle_tests {
     fn gaining_focus_is_never_a_dismissal() {
         assert!(!should_dismiss_on_focus_change(true, true, false));
         assert!(!should_dismiss_on_focus_change(true, true, true));
+    }
+
+    /// One announcement per session until it is consumed.
+    ///
+    /// A file search answering three times before the loop next runs must buy
+    /// one wake, not three: the host drains every driver when it runs, so the
+    /// extra events would each turn the loop for nothing.
+    #[test]
+    fn answer_wakes_coalesce_until_the_loop_consumes_one() {
+        let state = SharedState::default();
+        let session = state.claim_activation().expect("the session is claimed");
+
+        assert!(state.claim_answer_wake(session), "the first answer is announced");
+        assert!(
+            !state.claim_answer_wake(session),
+            "an answer arriving before the loop ran must not buy a second wake"
+        );
+
+        state.acknowledge_answer_wake(session);
+        assert!(
+            state.claim_answer_wake(session),
+            "once the loop has consumed the announcement the next answer must be able to make one"
+        );
+    }
+
+    /// The promise is per session, so an announcement left outstanding by a
+    /// session that ended cannot silence the next one.
+    #[test]
+    fn an_unconsumed_answer_wake_does_not_silence_the_next_session() {
+        let state = SharedState::default();
+        let first = state.claim_activation().expect("the first session is claimed");
+        assert!(state.claim_answer_wake(first));
+        assert!(state.claim_hide(first));
+
+        let second = state.claim_activation().expect("the second session is claimed");
+        assert!(
+            state.claim_answer_wake(second),
+            "a new session starts owing nothing, whatever the last one left behind"
+        );
+        state.acknowledge_answer_wake(first);
+        assert!(
+            !state.claim_answer_wake(second),
+            "acknowledging the old session's announcement must not retire the live one"
+        );
     }
 }
 

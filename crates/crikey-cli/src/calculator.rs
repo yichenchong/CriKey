@@ -7,8 +7,10 @@
 //!   of the query text itself, so it has no corpus to be absent from. The only
 //!   thing standing between "a calculator" and "a row on every keystroke" is
 //!   the parser: a query earns a row exactly when it parses, whole, as an
-//!   arithmetic expression with at least one binary operator. `2+2` answers,
-//!   `budget.ods` and `2 apples` and `report` do not.
+//!   arithmetic expression with at least one binary operator, with one
+//!   tolerance — a group still open at end of input is closed for the user, so
+//!   `sqrt(2` answers while it is being typed. `2+2` answers, `budget.ods` and
+//!   `2 apples` and `report` do not.
 //! * **It is pure and synchronous.** No I/O, no worker thread, no deadline. It
 //!   therefore never marks itself pending, which is the only way a source can
 //!   leave the view saying "Providers are still responding" forever.
@@ -49,7 +51,8 @@ pub(crate) enum CalculationError {
     UnexpectedCharacter,
     /// An operand was expected and something else was found.
     ExpectedOperand,
-    /// A `(` with no `)`, or a `)` with no `(`.
+    /// A `)` with no `(`, or a `(` closed by something other than `)` or end
+    /// of input.
     UnbalancedParentheses,
     /// Input remained after a complete expression, as in `2+2 apples`.
     TrailingInput,
@@ -64,6 +67,16 @@ pub(crate) enum CalculationError {
     /// Separate from the other refusals because it is not an error in the
     /// input — see [`evaluate`] for why it is still a refusal.
     NotACalculation,
+}
+
+/// A query that earned a row: its value, and how much punctuation the
+/// grammar supplied at end of input.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Calculation {
+    pub(crate) value: f64,
+    /// `)` characters end of input stood in for, so the row can echo the
+    /// expression that was actually evaluated.
+    pub(crate) implied_closers: usize,
 }
 
 /// The grammar, in precedence order from loosest to tightest:
@@ -87,11 +100,17 @@ pub(crate) enum CalculationError {
 /// those compute or reveal information beyond text the user just typed, while
 /// echoing `42` (or `(42)` or `-42`) adds nothing useful to a launcher query.
 ///
+/// End of input closes any group still open, so `(2+3` is `(2+3)` and
+/// `sqrt(2` is `sqrt(2)`: the user is answered while still typing instead of
+/// only on the keystroke that balances the expression. A `)` with no `(`
+/// remains `UnbalancedParentheses`, and so does a closer missing anywhere but
+/// at end of input.
+///
 /// `power` takes a `unary` on its right and sits *below* `unary` on its left,
 /// which is what makes `-2^2` evaluate to `-4` rather than `4` and `2^-3` to
 /// `0.125`: exponentiation binds tighter than negation and is
 /// right-associative, while `+ - * / %` are left-associative.
-pub(crate) fn evaluate(query: &str) -> Result<f64, CalculationError> {
+pub(crate) fn evaluate(query: &str) -> Result<Calculation, CalculationError> {
     let tokens = tokenize(query)?;
     if tokens.is_empty() {
         return Err(CalculationError::Empty);
@@ -101,6 +120,7 @@ pub(crate) fn evaluate(query: &str) -> Result<f64, CalculationError> {
         position: 0,
         binary_operations: 0,
         informative_atom: false,
+        implied_closers: 0,
     };
     let value = parser.expression()?;
     if parser.position != tokens.len() {
@@ -112,7 +132,10 @@ pub(crate) fn evaluate(query: &str) -> Result<f64, CalculationError> {
     if parser.binary_operations == 0 && !parser.informative_atom {
         return Err(CalculationError::NotACalculation);
     }
-    finite(value)
+    Ok(Calculation {
+        value: finite(value)?,
+        implied_closers: parser.implied_closers,
+    })
 }
 
 /// Renders `value` the way a person writes it.
@@ -165,18 +188,23 @@ impl Calculator {
     /// that crosses `max_items_per_plugin_per_query` and gets refused whole.
     pub(crate) fn rows(&mut self, generation: Generation, query: &str) -> Vec<ResultRow> {
         let expression = query.trim();
-        let Ok(value) = evaluate(expression) else {
+        let Ok(calculation) = evaluate(expression) else {
             // Dropped rather than retained: a row the user can no longer see
             // must not stay selectable through a stale item id.
             self.published = None;
             return Vec::new();
         };
-        let text = format_value(value);
-        let item = ItemId::derived(&self.owner, &Category::Expression, expression);
+        // The row shows the expression that was evaluated, closers and all, so
+        // the parenthesis the user has not typed yet is visible rather than
+        // assumed silently.
+        let mut expression = expression.to_owned();
+        expression.extend(std::iter::repeat_n(')', calculation.implied_closers));
+        let text = format_value(calculation.value);
+        let item = ItemId::derived(&self.owner, &Category::Expression, &expression);
         let row = ResultRow {
             item: item.clone(),
             label: text.clone(),
-            description: expression.to_owned(),
+            description: expression,
             icon_reference: None,
             icon: None,
             category: Category::Expression.as_str().to_owned(),
@@ -341,11 +369,30 @@ struct Parser<'tokens> {
     position: usize,
     binary_operations: usize,
     informative_atom: bool,
+    implied_closers: usize,
 }
 
 impl Parser<'_> {
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.position)
+    }
+
+    /// Consumes the `)` that closes a group, or accepts end of input in its
+    /// place: a user mid-keystroke has typed `sqrt(2`, and the only reading of
+    /// that is `sqrt(2)`. A closer missing with tokens still to come is not an
+    /// unfinished expression but a malformed one, so it stays a refusal.
+    fn close_group(&mut self) -> Result<(), CalculationError> {
+        match self.peek() {
+            Some(Token::CloseParenthesis) => {
+                self.position += 1;
+                Ok(())
+            }
+            None => {
+                self.implied_closers += 1;
+                Ok(())
+            }
+            Some(_) => Err(CalculationError::UnbalancedParentheses),
+        }
     }
 
     fn expression(&mut self) -> Result<f64, CalculationError> {
@@ -416,10 +463,7 @@ impl Parser<'_> {
             Some(Token::OpenParenthesis) => {
                 self.position += 1;
                 let value = self.expression()?;
-                if !matches!(self.peek(), Some(Token::CloseParenthesis)) {
-                    return Err(CalculationError::UnbalancedParentheses);
-                }
-                self.position += 1;
+                self.close_group()?;
                 Ok(value)
             }
             Some(Token::Identifier(name)) => {
@@ -439,10 +483,7 @@ impl Parser<'_> {
                 }
                 self.position += 1;
                 let argument = self.expression()?;
-                if !matches!(self.peek(), Some(Token::CloseParenthesis)) {
-                    return Err(CalculationError::UnbalancedParentheses);
-                }
-                self.position += 1;
+                self.close_group()?;
                 // Radians, which is what `f64` provides and what a calculator
                 // is expected to mean. `log` is base 10 and `ln` is natural:
                 // the other convention would silently give a different answer
@@ -482,7 +523,9 @@ mod tests {
     use std::cell::RefCell;
 
     fn value(expression: &str) -> f64 {
-        evaluate(expression).unwrap_or_else(|error| panic!("`{expression}` must evaluate, got {error:?}"))
+        evaluate(expression)
+            .unwrap_or_else(|error| panic!("`{expression}` must evaluate, got {error:?}"))
+            .value
     }
 
     fn error(expression: &str) -> CalculationError {
@@ -541,7 +584,6 @@ mod tests {
     fn malformed_input_is_refused() {
         assert_eq!(error("2+"), CalculationError::ExpectedOperand);
         assert_eq!(error("*2"), CalculationError::ExpectedOperand);
-        assert_eq!(error("(2+3"), CalculationError::UnbalancedParentheses);
         assert_eq!(error("2+3)"), CalculationError::UnbalancedParentheses);
         // `apples` lexes as an identifier now that names exist, so the parser
         // finishes a complete expression at `2` and refuses what follows.
@@ -590,15 +632,7 @@ mod tests {
 
     #[test]
     fn function_refusals_and_activation_gate_are_strict() {
-        for expression in [
-            "sqrt(-1)",
-            "ln(0)",
-            "log(-5)",
-            "asin(2)",
-            "sqrt()",
-            "sqrt(1,2)",
-            "sqrt(2",
-        ] {
+        for expression in ["sqrt(-1)", "ln(0)", "log(-5)", "asin(2)", "sqrt()", "sqrt(1,2)"] {
             assert!(evaluate(expression).is_err(), "{expression} must be refused");
         }
         assert_eq!(error("foo(2)"), CalculationError::UnexpectedCharacter);
@@ -607,6 +641,49 @@ mod tests {
         for expression in ["42", "(42)", "-42"] {
             assert_eq!(error(expression), CalculationError::NotACalculation);
         }
+    }
+
+    #[test]
+    fn end_of_input_closes_groups_the_user_has_not_closed() {
+        assert_eq!(value("(2+3"), 5.0);
+        assert_eq!(value("2*(3+4"), 14.0);
+        assert_eq!(value("((2+3"), 5.0);
+        assert!((value("sqrt(2") - std::f64::consts::SQRT_2).abs() < 1e-12);
+        assert!((value("sin(pi/2") - 1.0).abs() < 1e-12);
+        // Still refusals: a closer that is missing anywhere but at the end,
+        // and a `)` with no `(` at all.
+        assert_eq!(error("2+3)"), CalculationError::UnbalancedParentheses);
+        assert_eq!(error("(2+2))"), CalculationError::UnbalancedParentheses);
+        assert_eq!(error("sqrt(1,2"), CalculationError::UnbalancedParentheses);
+        // `apples` sits where the group's `)` belongs, so the closer is
+        // missing somewhere other than end of input: refused as unbalanced
+        // rather than reaching the trailing-input check.
+        assert_eq!(error("(2+2 apples"), CalculationError::UnbalancedParentheses);
+        assert_eq!(error("2+("), CalculationError::ExpectedOperand);
+        assert_eq!(error("sqrt("), CalculationError::ExpectedOperand);
+        // The activation gate is untouched by auto-closing.
+        assert_eq!(error("(42"), CalculationError::NotACalculation);
+    }
+
+    #[test]
+    fn an_auto_closed_row_echoes_the_completed_expression() {
+        let mut calculator = Calculator::new(None);
+        let rows = calculator.rows(Generation::ZERO, "2*(3+4");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "14");
+        assert_eq!(
+            rows[0].description, "2*(3+4)",
+            "the echo shows the closer the calculator supplied"
+        );
+        assert_eq!(calculator.resolve(Generation::ZERO, &rows[0].item), Some("14"));
+        // The keystroke that finally balances the expression changes nothing
+        // the user can see, and a stray closer drops the row entirely.
+        let closed = calculator.rows(Generation::ZERO, "2*(3+4)");
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].label, "14");
+        assert_eq!(closed[0].description, "2*(3+4)");
+        assert_eq!(closed[0].item, rows[0].item);
+        assert!(calculator.rows(Generation::ZERO, "2+3)").is_empty());
     }
 
     #[test]

@@ -656,15 +656,19 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     file_pipeline
         .register_plugin(file_owner.clone(), file_provider_policy())
         .map_err(|error| format!("cannot register the file provider with the query pipeline: {error}"))?;
-    let file_publish_handle = render_handle.clone();
+    // The worker cannot build this provider's frame: its items are ranked
+    // against the catalog by a service that lives on the UI thread. So the
+    // driver only says "there is an answer", and the merge happens on the next
+    // turn of the event loop, which this wake is what causes.
+    let file_wake_handle = render_handle.clone();
     let file_driver = FileSearchDriver::spawn(
         file_owner.clone(),
         file_pipeline,
         // Built on the driver's own worker thread rather than here: a platform
         // backend need not be `Send`, and this one never has to be.
         Box::new(|| Box::new(App::new())),
-        move |frame| {
-            let _ = file_publish_handle.submit_results(frame);
+        move || {
+            let _ = file_wake_handle.request_provider_answer();
         },
     );
     // Plugin-owned actions use the same exact-owner endpoints and budget
@@ -873,21 +877,19 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 );
                 view_model.publish(outcome.generation, retained.merged(), retained.pending());
             }
-            // File rows fold in the same way: the search ran on the driver's
-            // worker thread, so its answer arrives on some later turn of this
-            // loop and under the generation that asked for it or not at all.
-            // The clock is what lets the driver answer for a worker that never
-            // will: it accepted the generation this source was marked pending
-            // for, so it, and not this loop, owes the frame that settles it.
+            // File items are ranked in, not appended: the search ran on the
+            // driver's worker thread, so its answer arrives on some later turn
+            // of this loop — under the generation that asked for it or not at
+            // all — and is scored against the catalog here before anything is
+            // published. The clock is what lets the driver answer for a worker
+            // that never will: it accepted the generation this source was
+            // marked pending for, so it, and not this loop, owes the outcome
+            // that settles it.
             let file_now = u64::try_from(query_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
             if let Some(outcome) = file_driver.take_outcome(file_now) {
-                retained.absorb(
-                    outcome.generation,
-                    RowSource::Files,
-                    &outcome.rows,
-                    outcome.pending_plugins,
-                );
-                view_model.publish(outcome.generation, retained.merged(), retained.pending());
+                let generation = outcome.generation;
+                absorb_file_items(&mut search, &mut retained, &file_owner, outcome);
+                view_model.publish(generation, retained.merged(), retained.pending());
             }
             // Catalog outcomes use the same SearchService instance/owner
             // publication edge as persisted slices. Obsolete and failed
@@ -960,6 +962,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 NativeLauncherEvent::Command { session, command } => {
                     (Some(session), view_model.apply(command))
                 }
+                // The wake that brought this turn about. Everything it asks
+                // for — draining the drivers and republishing — happened
+                // above, before the match, exactly as it does for every other
+                // event; there is no command and no effect.
+                NativeLauncherEvent::ProviderAnswer => (None, None),
             };
 
             // Read before the match consumes the effect: the window and the
@@ -999,8 +1006,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                 // arithmetic, the arithmetic is what was asked
                                 // for. At most one row, so the merged frame
                                 // grows by one.
-                                let mut rows = calculator.rows(generation, &raw);
-                                rows.extend(search.result_rows());
+                                retained.set_calculated(generation, calculator.rows(generation, &raw));
+                                retained.set_builtin(generation, search.result_rows());
+                                retained.mark_pending(generation, RowSource::Builtin, frame.pending_plugins);
+                                // What the asynchronous providers publish ahead
+                                // of their own rows, which is exactly what is
+                                // on screen at this instant.
+                                let rows = retained.merged();
                                 // Legacy plugins are driven off the UI thread
                                 // (Finding 8): hand the query to the supervisor
                                 // and return. The built-in rows publish now, with
@@ -1051,8 +1063,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                 }
                                 // The file search runs on its own worker thread
                                 // under a deadline no synchronous provider could
-                                // afford, so it is handed the query here and
-                                // folds its rows in whenever it answers. An
+                                // afford, so it is handed the query here and its
+                                // items are ranked in whenever it answers. An
                                 // empty query is not submitted at all: there is
                                 // nothing to search for, and walking the user's
                                 // home directory to prove it would be the most
@@ -1064,16 +1076,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                 // generation on, and marking a source pending on
                                 // any other evidence is how a frame ends up
                                 // waiting forever for an answer nobody owes.
-                                let files_outstanding = !raw.trim().is_empty()
-                                    && file_driver.submit(
-                                        generation,
-                                        &raw,
-                                        now,
-                                        rows.clone(),
-                                        frame.pending_plugins,
-                                        0,
-                                    );
-                                retained.set_builtin(generation, rows, frame.pending_plugins);
+                                let files_outstanding =
+                                    !raw.trim().is_empty() && file_driver.submit(generation, &raw, now);
                                 retained.mark_pending(generation, RowSource::Legacy, legacy_outstanding);
                                 retained.mark_pending(generation, RowSource::Native, native_outstanding);
                                 retained.mark_pending(generation, RowSource::Modern, modern_outstanding);
@@ -1140,19 +1144,14 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             }
                         }
                     } else {
-                        // A file item never entered the catalog either, so the
-                        // search service cannot find it: it lives in the driver
-                        // that published the row, under the generation the rows
-                        // on screen belong to. Resolving there is what makes a
-                        // file row selectable at all; anything the driver does
-                        // not own is an ordinary catalog or plugin selection.
-                        let file_item = retained
-                            .generation()
-                            .and_then(|generation| file_driver.resolve(generation, &item));
-                        let submission = match file_item.as_ref() {
-                            Some(file_item) => search.execute_host_action(file_item, &action),
-                            None => search.execute(&item, &action),
-                        };
+                        // Everything else — catalog item, plugin item, or a
+                        // file the search merged into this generation's answer
+                        // — is looked up in that answer. A file item is in
+                        // `results` like any other now, so `execute` finds it,
+                        // applies the same host-mediated gate, and
+                        // `record_selection` below can finally record having
+                        // opened it.
+                        let submission = search.execute(&item, &action);
                         match submission {
                             Ok(ActionSubmission::Completed) => {
                                 search.set_history_time(history_clock.advance());
@@ -2003,9 +2002,14 @@ fn create_private_dir(dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The provider group a published row belongs to, used to merge the built-in,
-/// file, legacy, modern and native row sets into one presented frame without one
+/// The provider group a published row belongs to, used to merge the ranked,
+/// legacy, modern and native row sets into one presented frame without one
 /// clobbering another.
+///
+/// `Files` names no row group. The host's file search is ranked into the
+/// catalog's own answer rather than appended after it, so its rows arrive as
+/// part of the built-in group; what remains source-specific about it is only
+/// whether it still owes this generation an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowSource {
     Builtin,
@@ -2017,13 +2021,11 @@ enum RowSource {
 
 /// Classifies a published row by the source group its owning plugin belongs to
 /// (spec 10.2 namespacing): `legacy.*`, `modern.*` and `native.*` are the three
-/// asynchronous providers, the host's file search is its own group because it
-/// answers asynchronously too, and everything else — the built-in application
-/// catalog included — is built-in.
+/// asynchronous plugin providers, and everything else — the built-in
+/// application catalog, the calculator and the host's file search — is the
+/// host's own.
 fn row_source(plugin_name: &str) -> RowSource {
-    if plugin_name == FILE_SEARCH_PLUGIN {
-        RowSource::Files
-    } else if plugin_name.starts_with("legacy.") {
+    if plugin_name.starts_with("legacy.") {
         RowSource::Legacy
     } else if plugin_name.starts_with("modern.") {
         RowSource::Modern
@@ -2037,18 +2039,28 @@ fn row_source(plugin_name: &str) -> RowSource {
 /// The presented row set kept between UI turns, grouped by source so folding one
 /// provider's asynchronous outcome never clobbers another's rows.
 ///
-/// Each asynchronous provider publishes the built-in rows ahead of its own,
-/// and each calls back independently through `take_outcome`; without per-source
-/// retention the second fold of a turn would overwrite the first provider's
-/// rows. Keeping the five groups and re-merging on every fold makes file,
-/// legacy, modern and native rows coexist under one generation (contract §8). A new
-/// generation drops every retained group first, so stale rows never cross a
+/// Each asynchronous plugin provider publishes the built-in rows ahead of its
+/// own, and each calls back independently through `take_outcome`; without
+/// per-source retention the second fold of a turn would overwrite the first
+/// provider's rows. Keeping the groups and re-merging on every fold makes
+/// legacy, modern and native rows coexist under one generation (contract §8). A
+/// new generation drops every retained group first, so stale rows never cross a
 /// query boundary.
+///
+/// The built-in group is owned by the UI thread alone and is never rebuilt from
+/// a provider's frame: those frames carry a snapshot of it taken when the query
+/// was handed over, and the file search's rows are ranked into it *after* that.
+/// Rebuilding it from a stale snapshot would drop them on the next plugin fold.
 #[derive(Debug, Default)]
 struct RetainedRows {
     generation: Option<Generation>,
+    /// The calculator's answer, which leads the frame because when a query
+    /// parses as arithmetic the arithmetic is what was asked for. Its own group
+    /// so that re-publishing the ranked rows — which is what a file answer
+    /// does — cannot drop it.
+    calculated: Vec<crikey_ui::ResultRow>,
+    /// The ranked answer: catalog items, and the file items merged into them.
     builtin: Vec<crikey_ui::ResultRow>,
-    files: Vec<crikey_ui::ResultRow>,
     legacy: Vec<crikey_ui::ResultRow>,
     modern: Vec<crikey_ui::ResultRow>,
     native: Vec<crikey_ui::ResultRow>,
@@ -2086,13 +2098,25 @@ impl RetainedRows {
         self.generation
     }
 
-    /// Refreshes the built-in group from the synchronous publish.
-    fn set_builtin(&mut self, generation: Generation, rows: Vec<crikey_ui::ResultRow>, pending: bool) {
+    /// Refreshes the calculator's group, which leads the frame.
+    fn set_calculated(&mut self, generation: Generation, rows: Vec<crikey_ui::ResultRow>) {
+        if !self.begin(generation) {
+            return;
+        }
+        self.calculated = rows;
+    }
+
+    /// Refreshes the ranked group.
+    ///
+    /// Called twice for one generation whenever a file answer lands: once for
+    /// the catalog's own answer and again once the file items have been ranked
+    /// into it. Pending is not a parameter for that reason — the second call
+    /// says nothing new about who still owes an answer.
+    fn set_builtin(&mut self, generation: Generation, rows: Vec<crikey_ui::ResultRow>) {
         if !self.begin(generation) {
             return;
         }
         self.builtin = rows;
-        self.builtin_pending = pending;
     }
 
     /// Records that a provider's answer is still outstanding for `generation`, so
@@ -2110,10 +2134,10 @@ impl RetainedRows {
         }
     }
 
-    /// Folds one provider's outcome. `rows` are the built-in rows followed by
-    /// `source`'s own rows; only the built-in group and `source`'s group are
-    /// refreshed, so a sibling provider's rows survive this fold. A stale
-    /// (already-superseded) outcome is ignored.
+    /// Folds one plugin provider's outcome. `rows` are the built-in rows
+    /// followed by `source`'s own rows; only `source`'s group is refreshed, so
+    /// a sibling provider's rows survive this fold and so does the ranked group
+    /// the UI thread owns. A stale (already-superseded) outcome is ignored.
     fn absorb(
         &mut self,
         generation: Generation,
@@ -2124,55 +2148,34 @@ impl RetainedRows {
         if !self.begin(generation) {
             return;
         }
-        self.builtin = rows
+        let own: Vec<crikey_ui::ResultRow> = rows
             .iter()
-            .filter(|row| row_source(&row.plugin_name) == RowSource::Builtin)
+            .filter(|row| row_source(&row.plugin_name) == source)
             .cloned()
             .collect();
         match source {
-            RowSource::Builtin => self.builtin_pending = pending,
-            RowSource::Files => {
-                self.files = rows
-                    .iter()
-                    .filter(|row| row_source(&row.plugin_name) == RowSource::Files)
-                    .cloned()
-                    .collect();
-                self.files_pending = pending;
-            }
-            RowSource::Legacy => {
-                self.legacy = rows
-                    .iter()
-                    .filter(|row| row_source(&row.plugin_name) == RowSource::Legacy)
-                    .cloned()
-                    .collect();
-                self.legacy_pending = pending;
-            }
-            RowSource::Modern => {
-                self.modern = rows
-                    .iter()
-                    .filter(|row| row_source(&row.plugin_name) == RowSource::Modern)
-                    .cloned()
-                    .collect();
-                self.modern_pending = pending;
-            }
-            RowSource::Native => {
-                self.native = rows
-                    .iter()
-                    .filter(|row| row_source(&row.plugin_name) == RowSource::Native)
-                    .cloned()
-                    .collect();
-                self.native_pending = pending;
-            }
+            // Neither the host's own groups nor the file source publish rows
+            // through this path; both are refreshed by the UI thread directly.
+            RowSource::Builtin | RowSource::Files => {}
+            RowSource::Legacy => self.legacy = own,
+            RowSource::Modern => self.modern = own,
+            RowSource::Native => self.native = own,
         }
+        self.mark_pending(generation, source, pending);
     }
-    /// The merged presentation order: built-in rows, then file, legacy, modern
-    /// and native.
+
+    /// The merged presentation order: the calculated row, the ranked answer,
+    /// then legacy, modern and native.
     fn merged(&self) -> Vec<crikey_ui::ResultRow> {
         let mut rows = Vec::with_capacity(
-            self.builtin.len() + self.files.len() + self.legacy.len() + self.modern.len() + self.native.len(),
+            self.calculated.len()
+                + self.builtin.len()
+                + self.legacy.len()
+                + self.modern.len()
+                + self.native.len(),
         );
+        rows.extend(self.calculated.iter().cloned());
         rows.extend(self.builtin.iter().cloned());
-        rows.extend(self.files.iter().cloned());
         rows.extend(self.legacy.iter().cloned());
         rows.extend(self.modern.iter().cloned());
         rows.extend(self.native.iter().cloned());
@@ -2187,6 +2190,30 @@ impl RetainedRows {
             || self.modern_pending
             || self.native_pending
     }
+}
+
+/// Ranks one file-search outcome into the answer and refreshes the retained
+/// rows from it.
+///
+/// This is where the launcher stopped concatenating. The file items go through
+/// the same matcher, the same history signals and the same ranker as the
+/// catalog's, so a file whose name the query is a prefix of outranks an
+/// application the query merely appears inside — which no amount of appending
+/// after the catalog could ever produce. Republishing the whole ranked group is
+/// the point: the file rows are *in* it, at whatever position they earned.
+///
+/// The pending mark comes off either way. A generation the merge refuses is one
+/// the retained rows have already moved past, and `mark_pending` ignores it.
+fn absorb_file_items(
+    search: &mut SearchService,
+    retained: &mut RetainedRows,
+    owner: &PluginId,
+    outcome: file_provider::FileOutcome,
+) {
+    if search.merge_query_items(outcome.generation, owner, outcome.items) {
+        retained.set_builtin(outcome.generation, search.result_rows());
+    }
+    retained.mark_pending(outcome.generation, RowSource::Files, outcome.pending);
 }
 
 fn application_provider_policy() -> PluginPolicy {
@@ -3032,12 +3059,13 @@ mod tests {
     }
 
     #[test]
-    fn retained_rows_merge_files_legacy_and_modern_by_source() {
+    fn retained_rows_merge_ranked_legacy_and_modern_by_source() {
         let generation = Generation::from_raw(7);
         let mut retained = RetainedRows::default();
 
-        // The synchronous built-in publish, with every async source still out.
-        retained.set_builtin(generation, vec![row("builtin.app", "app")], false);
+        // The synchronous publish, with every async source still out.
+        retained.set_builtin(generation, vec![row("builtin.app", "app")]);
+        retained.mark_pending(generation, RowSource::Builtin, false);
         retained.mark_pending(generation, RowSource::Files, true);
         retained.mark_pending(generation, RowSource::Legacy, true);
         retained.mark_pending(generation, RowSource::Modern, true);
@@ -3050,17 +3078,17 @@ mod tests {
             &[row("builtin.app", "app"), row("legacy.files", "file")],
             false,
         );
-        // Then the file provider, whose rows are neither built-in nor any
-        // plugin's: classified by owner, so the built-in refresh below cannot
-        // absorb them and the modern fold cannot drop them.
-        retained.absorb(
+        // Then the file provider, whose items were ranked into the answer, so
+        // its row arrives as part of the ranked group and not beside it.
+        retained.set_builtin(
             generation,
-            RowSource::Files,
-            &[row("builtin.app", "app"), row(FILE_SEARCH_PLUGIN, "report.txt")],
-            false,
+            vec![row(FILE_SEARCH_PLUGIN, "report.txt"), row("builtin.app", "app")],
         );
-        // Then the modern supervisor answers with built-in + modern rows. A
-        // merge that replaced the whole frame would drop the legacy row here.
+        retained.mark_pending(generation, RowSource::Files, false);
+        // Then the modern supervisor answers with the built-in rows it was
+        // handed at submission time — which predate the file merge — and its
+        // own. A fold that rebuilt the ranked group from that stale snapshot
+        // would drop the file row the user is looking at.
         retained.absorb(
             generation,
             RowSource::Modern,
@@ -3069,12 +3097,14 @@ mod tests {
         );
 
         let sources: Vec<String> = retained.merged().iter().map(|r| r.plugin_name.clone()).collect();
-        // Kills the "each supervisor's publish clobbers the other" mutation:
-        // whole-frame replacement would leave only built-in + `modern.web`.
+        // Kills two mutations at once: "each supervisor's publish clobbers the
+        // other" would leave only the ranked group + `modern.web`, and
+        // "rebuild the ranked group from the provider's frame" would lose the
+        // file row.
         assert_eq!(
             sources,
-            vec!["builtin.app", FILE_SEARCH_PLUGIN, "legacy.files", "modern.web"],
-            "built-in, file, legacy and modern rows coexist in that presentation order",
+            vec![FILE_SEARCH_PLUGIN, "builtin.app", "legacy.files", "modern.web"],
+            "the ranked group keeps its own order, and legacy and modern rows follow it",
         );
         assert!(
             !retained.pending(),
@@ -3126,18 +3156,18 @@ mod tests {
             .register_plugin(owner.clone(), file_provider::file_provider_policy())
             .expect("the file provider registers once");
         let driver = file_provider::FileSearchDriver::spawn(
-            owner,
+            owner.clone(),
             pipeline,
             Box::new(move || Box::new(search)),
-            |_frame: &crikey_ui::ViewModel| {},
+            || {},
         );
 
         // Exactly the query arm's order: hand the query over, then mark the
         // source pending on the driver's own answer to whether it took it.
-        let builtin = vec![row("builtin.app", "app")];
+        let mut search_service = ranked_service(&[]);
         let mut retained = RetainedRows::default();
-        let files_outstanding = driver.submit(generation, "quarterly", 1_000, builtin.clone(), false, 0);
-        retained.set_builtin(generation, builtin, false);
+        let files_outstanding = driver.submit(generation, "quarterly", 1_000);
+        retained.set_builtin(generation, vec![row("builtin.app", "app")]);
         retained.mark_pending(generation, RowSource::Files, files_outstanding);
         assert!(
             files_outstanding && retained.pending(),
@@ -3150,12 +3180,7 @@ mod tests {
         // A later turn of the event loop, a minute on — long past any deadline
         // the driver could still be waiting on.
         if let Some(outcome) = driver.take_outcome(61_000) {
-            retained.absorb(
-                outcome.generation,
-                RowSource::Files,
-                &outcome.rows,
-                outcome.pending_plugins,
-            );
+            absorb_file_items(&mut search_service, &mut retained, &owner, outcome);
         }
 
         assert!(
@@ -3166,28 +3191,29 @@ mod tests {
         assert_eq!(
             sources,
             ["builtin.app"],
-            "settling contributes no file rows and removes none of the built-in group"
+            "settling contributes no file rows and removes none of the ranked group"
         );
     }
 
     #[test]
-    fn a_calculated_row_leads_the_built_in_group_and_survives_an_asynchronous_fold() {
+    fn a_calculated_row_leads_the_frame_and_survives_an_asynchronous_fold() {
         let generation = Generation::from_raw(3);
         let mut calculator = Calculator::new(None);
-        // Exactly what the query arm builds: the calculator's answer first,
-        // then the catalog's ranked rows.
-        let mut rows = calculator.rows(generation, "2+2");
-        rows.push(row("builtin.app", "app"));
-
+        // Exactly what the query arm builds: the calculator's answer in its own
+        // group, then the catalog's ranked rows.
         let mut retained = RetainedRows::default();
-        retained.set_builtin(generation, rows.clone(), false);
+        retained.set_calculated(generation, calculator.rows(generation, "2+2"));
+        retained.set_builtin(generation, vec![row("builtin.app", "app")]);
         retained.mark_pending(generation, RowSource::Legacy, true);
-        // The legacy supervisor republishes the built-in rows ahead of its own,
-        // and `absorb` rebuilds the built-in group by classifying each row's
-        // owner. A calculated row that classified as anything but built-in
-        // would be filtered out of both groups and vanish from the frame.
-        rows.push(row("legacy.files", "file"));
-        retained.absorb(generation, RowSource::Legacy, &rows, false);
+
+        // The legacy supervisor republishes the rows it was handed ahead of its
+        // own. A fold that rebuilt the host's groups from that frame would have
+        // to classify the calculated row correctly to keep it; keeping those
+        // groups out of the fold entirely is what makes that impossible to get
+        // wrong.
+        let mut published = retained.merged();
+        published.push(row("legacy.files", "file"));
+        retained.absorb(generation, RowSource::Legacy, &published, false);
 
         let merged = retained.merged();
         let labels: Vec<&str> = merged.iter().map(|row| row.label.as_str()).collect();
@@ -3220,6 +3246,260 @@ mod tests {
             sources,
             vec!["modern.new"],
             "stale legacy rows from an older generation are dropped",
+        );
+    }
+
+    /// A discovered application, as the host's own catalog publishes it.
+    fn application(label: &str) -> Item {
+        let owner = PluginId(APPLICATION_CATALOG_PLUGIN.to_owned());
+        let category = crikey_core::Category::Application;
+        Item {
+            stable_id: crikey_core::ItemId::derived(&owner, &category, label),
+            plugin_id: owner,
+            category,
+            label: label.to_owned(),
+            description: String::new(),
+            target: format!("/usr/bin/{label}"),
+            search_terms: Vec::new(),
+            icon_reference: None,
+            argument_policy: crikey_core::ArgumentPolicy::Forbidden,
+            hit_policy: crikey_core::HitPolicy::Recorded,
+            score_hint: 0,
+            metadata: Default::default(),
+            actions: Vec::new(),
+        }
+    }
+
+    /// A search service that has reached the query-accepting stage with
+    /// `labels` in its application catalog.
+    fn ranked_service(labels: &[&str]) -> SearchService {
+        let mut service = SearchService::new(App::new());
+        for (stage, next) in [
+            (StartupStage::WindowAndHotkey, StartupStage::PersistedCatalog),
+            (StartupStage::PersistedCatalog, StartupStage::AcceptQueries),
+            (StartupStage::AcceptQueries, StartupStage::RequiredWorkers),
+        ] {
+            assert_eq!(service.complete_stage(stage), Ok(Some(next)));
+        }
+        service
+            .replace_catalog(
+                &PluginId(APPLICATION_CATALOG_PLUGIN.to_owned()),
+                1,
+                labels.iter().map(|label| application(label)).collect(),
+            )
+            .expect("the application catalog accepts its items");
+        service
+    }
+
+    /// The file items a backend would produce for `names`, through the real
+    /// mapping, so their ids, categories and actions are the ones the launcher
+    /// actually has to rank.
+    fn file_items(names: &[&str]) -> Vec<Item> {
+        let hits: Vec<crikey_platform::FileHit> = names
+            .iter()
+            .map(|name| crikey_platform::FileHit {
+                name: (*name).to_owned(),
+                path: crikey_core::PlatformPath::from(std::path::PathBuf::from(format!("/home/user/{name}"))),
+                kind: crikey_platform::FileKind::File,
+                modified_unix_seconds: None,
+            })
+            .collect();
+        crikey_platform::file_items(&PluginId(FILE_SEARCH_PLUGIN.to_owned()), &hits)
+    }
+
+    /// The whole point of ranking the two together.
+    ///
+    /// `mor` is a prefix of "Mortgage Analysis.pdf" and merely a substring of
+    /// "Memory Diagnostics Tool". The match-method bands put a prefix above a
+    /// substring, and the file category's lower weight is not enough to close
+    /// that gap — but only if both are scored in the same pass. While file rows
+    /// were concatenated after the catalog's, the application came first no
+    /// matter what the user typed or how often they chose the file.
+    #[test]
+    fn a_better_matching_file_outranks_an_application() {
+        let owner = PluginId(FILE_SEARCH_PLUGIN.to_owned());
+        let mut search = ranked_service(&["Memory Diagnostics Tool"]);
+        let generation = search.submit_query("mor").expect("the query is accepted");
+        let mut retained = RetainedRows::default();
+        retained.set_builtin(generation, search.result_rows());
+        retained.mark_pending(generation, RowSource::Files, true);
+        assert_eq!(
+            retained
+                .merged()
+                .iter()
+                .map(|row| row.label.clone())
+                .collect::<Vec<String>>(),
+            ["Memory Diagnostics Tool"],
+            "the catalog answers first, or this test proves nothing"
+        );
+
+        absorb_file_items(
+            &mut search,
+            &mut retained,
+            &owner,
+            file_provider::FileOutcome {
+                generation,
+                items: file_items(&["Mortgage Analysis.pdf"]),
+                pending: false,
+            },
+        );
+
+        let labels: Vec<String> = retained.merged().iter().map(|row| row.label.clone()).collect();
+        assert_eq!(
+            labels,
+            ["Mortgage Analysis.pdf", "Memory Diagnostics Tool"],
+            "a prefix-matching file outranks a substring-matching application"
+        );
+        assert!(!retained.pending(), "the merged answer settles the file source");
+    }
+
+    /// The merged file item is in the ranked answer, so `execute` finds it.
+    ///
+    /// This is what let the launcher drop its second execution path: the
+    /// driver's own generation-scoped item store and the `execute_host_action`
+    /// entry point it fed. Both existed only because a file item was not in
+    /// `results`, and both would have been a second copy of the host-mediated
+    /// gate to keep in step.
+    ///
+    /// Asserted through a *nonexistent* action rather than the real open, so
+    /// the assertion is about the lookup and nothing on this machine is
+    /// launched. The two refusals are the two answers to "is this item in the
+    /// ranked answer at all".
+    #[test]
+    fn a_merged_file_item_is_found_by_the_execution_path() {
+        let owner = PluginId(FILE_SEARCH_PLUGIN.to_owned());
+        let mut search = ranked_service(&["Memory Diagnostics Tool"]);
+        let generation = search.submit_query("mor").expect("the query is accepted");
+        let items = file_items(&["Mortgage Analysis.pdf"]);
+        let file_id = items[0].stable_id.clone();
+        let absent = crikey_core::ItemId("no such item".to_owned());
+        let action = crikey_core::ActionId("no such action".to_owned());
+
+        let mut retained = RetainedRows::default();
+        retained.set_builtin(generation, search.result_rows());
+        absorb_file_items(
+            &mut search,
+            &mut retained,
+            &owner,
+            file_provider::FileOutcome {
+                generation,
+                items,
+                pending: false,
+            },
+        );
+
+        let found = search
+            .execute(&file_id, &action)
+            .expect_err("the action does not exist");
+        assert!(
+            found.to_string().contains("action"),
+            "a merged file item must be found in the ranked answer and refused on its action, got {found}"
+        );
+        let missing = search
+            .execute(&absent, &action)
+            .expect_err("the item does not exist");
+        assert!(
+            missing.to_string().contains("result"),
+            "an item that is not in the answer is refused on the item, got {missing}"
+        );
+    }
+
+    /// A file item that does not answer the current query is dropped, not
+    /// ranked to the bottom.
+    #[test]
+    fn a_file_that_does_not_match_the_query_is_not_shown() {
+        let owner = PluginId(FILE_SEARCH_PLUGIN.to_owned());
+        let mut search = ranked_service(&["Memory Diagnostics Tool"]);
+        let generation = search.submit_query("mor").expect("the query is accepted");
+        let mut retained = RetainedRows::default();
+        retained.set_builtin(generation, search.result_rows());
+
+        absorb_file_items(
+            &mut search,
+            &mut retained,
+            &owner,
+            file_provider::FileOutcome {
+                generation,
+                items: file_items(&["Mortgage Analysis.pdf", "budget.ods"]),
+                pending: false,
+            },
+        );
+
+        let labels: Vec<String> = retained.merged().iter().map(|row| row.label.clone()).collect();
+        assert_eq!(
+            labels,
+            ["Mortgage Analysis.pdf", "Memory Diagnostics Tool"],
+            "a file the query does not match contributes no row at all"
+        );
+    }
+
+    /// A late file batch must not move what the user has selected.
+    ///
+    /// Driven through the view model's own publish path, because that is where
+    /// the anchoring lives: the selection follows its `ItemId` wherever the
+    /// republished rows put it. Ranking file items in reorders the list under
+    /// the user's cursor far more readily than appending them ever did, so this
+    /// is the property that had to survive the change.
+    #[test]
+    fn a_late_file_batch_does_not_move_the_selection() {
+        let owner = PluginId(FILE_SEARCH_PLUGIN.to_owned());
+        let mut search = ranked_service(&["Memory Diagnostics Tool", "Morse Trainer"]);
+        let mut view_model = LauncherViewModel::new();
+        view_model.activate();
+        let Some(UiEffect::Query(raw)) = view_model.apply(crikey_ui::UiCommand::SetQuery("mor".to_owned()))
+        else {
+            panic!("typing a query asks the host to run it");
+        };
+
+        let generation = search.submit_query(&raw).expect("the query is accepted");
+        view_model.begin_generation(generation);
+        let mut retained = RetainedRows::default();
+        retained.set_builtin(generation, search.result_rows());
+        retained.mark_pending(generation, RowSource::Files, true);
+        view_model.publish(generation, retained.merged(), retained.pending());
+
+        // The user moves off the first row while the file search is still out.
+        // Row 1 is the substring match, which the merge will push down a place.
+        view_model.apply(crikey_ui::UiCommand::SelectNext);
+        let selected = view_model
+            .frame()
+            .expect("the selection is a change worth drawing");
+        assert_eq!(selected.selected, 1);
+        let chosen = selected.rows[1].item.clone();
+
+        absorb_file_items(
+            &mut search,
+            &mut retained,
+            &owner,
+            file_provider::FileOutcome {
+                generation,
+                items: file_items(&["Mortgage Analysis.pdf"]),
+                pending: false,
+            },
+        );
+        view_model.publish(generation, retained.merged(), retained.pending());
+
+        let frame = view_model.frame().expect("the merged answer is a new frame");
+        assert_eq!(
+            frame
+                .rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<&str>>(),
+            [
+                "Morse Trainer",
+                "Mortgage Analysis.pdf",
+                "Memory Diagnostics Tool"
+            ],
+            "the file really did land above the row the user was on, or this test proves nothing"
+        );
+        assert_eq!(
+            frame.selected, 2,
+            "the selection followed its item down the list rather than staying at index 1"
+        );
+        assert_eq!(
+            frame.rows[frame.selected].item, chosen,
+            "the selection stays on the item the user chose, wherever the merge moved it"
         );
     }
 

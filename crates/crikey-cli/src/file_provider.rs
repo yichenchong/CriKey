@@ -16,24 +16,24 @@
 //!   worth answering. Each new query cancels the previous one's token and any
 //!   answer that arrives for a superseded generation is dropped rather than
 //!   shown.
-//! * **The items are retained.** A file item is not in the catalog, so
-//!   `SearchService::execute` cannot find it: the rows would render and then
-//!   refuse to open. The driver therefore keeps the items it published, keyed
-//!   by owner and item id and scoped to the generation that produced them.
+//! * **The merge is not ours.** A file item is ranked against the application
+//!   catalog rather than appended after it, and the ranker lives on the UI
+//!   thread. So this driver's answer is a set of *items* under a generation,
+//!   not a frame: the UI thread merges them into the ranked answer and
+//!   republishes from it. What crosses the thread boundary is the search, not
+//!   the presentation.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crikey_app::{BatchState, FileItemSearch, QueryPipeline, ResultBatch};
-use crikey_core::{Generation, Item, ItemId, PluginId};
+use crikey_core::{Generation, Item, PluginId};
 use crikey_input_scheduler::{
     ActivationPolicy, DebouncePolicy, PluginPolicy, QueuePolicy, SchedulingProfile,
 };
 use crikey_platform::{CancelToken, FileSearchCoverage, FileSearchQuery, MAX_FILE_HITS};
-use crikey_ui::{ResultRow, ViewModel};
 
 /// Owner of the host's own file-search results (spec 10.2 namespacing).
 pub(crate) const FILE_SEARCH_PLUGIN: &str = "builtin.crikey.files";
@@ -122,12 +122,6 @@ struct FileJob {
     query: String,
     now: u64,
     cancel: CancelToken,
-    /// Shared with the settlement frame the driver holds for this same job, so
-    /// the rows the launcher already has on screen are cloned once per query
-    /// rather than once per holder.
-    builtin_rows: Arc<[ResultRow]>,
-    builtin_pending: bool,
-    selected: usize,
 }
 
 /// The single-slot mailbox between the UI thread and the worker.
@@ -144,10 +138,10 @@ struct FileMailbox {
 /// cannot produce one — wedged in a backend that ignores its deadline, or gone
 /// — does not strand the mark.
 struct Outstanding {
-    /// What settles the generation: the rows the launcher published for it and
-    /// nothing of this provider's own, which is exactly what the worker itself
-    /// would send back after a search that found nothing.
-    frame: ViewModel,
+    /// The generation owed, which is what the settlement outcome carries: this
+    /// provider contributes no items to it, exactly as the worker itself would
+    /// report after a search that found nothing.
+    generation: Generation,
     /// Clock reading, on the caller's monotonic query clock, at hand-over.
     submitted_at: u64,
 }
@@ -162,30 +156,32 @@ struct PrefixCache {
     items: Vec<Item>,
 }
 
-/// The file items behind the rows currently on screen.
+/// One generation's worth of file items, for the UI thread to rank.
 ///
-/// Keyed by owner and item id because a stable id is only unique within its
-/// owner. Cleared once per query rather than once per batch: a generation can
-/// be answered across several batches, and clearing per batch would throw away
-/// the items the previous batch just published.
-#[derive(Default)]
-struct PublishedFileItems {
-    generation: Option<Generation>,
-    items: BTreeMap<(PluginId, ItemId), Item>,
+/// Items rather than rows: a file row is ranked against the catalog's rows in
+/// one answer, and the ranker is the UI thread's. Producing rows here would be
+/// producing the thing that has to be thrown away.
+pub(crate) struct FileOutcome {
+    /// The generation these items answer. Not necessarily the newest one the
+    /// UI has: a late answer is refused by the merge rather than by silence.
+    pub(crate) generation: Generation,
+    pub(crate) items: Vec<Item>,
+    /// Whether the provider still owes this generation anything. Always false
+    /// in practice — the worker drains its own pipeline before answering — and
+    /// carried rather than assumed so the caller's pending mark is taken off
+    /// by what happened, not by what is expected to have happened.
+    pub(crate) pending: bool,
 }
 
-/// The launcher's file provider: a worker thread, one in-flight search, and the
-/// items it published.
+/// The launcher's file provider: a worker thread and one in-flight search.
 pub(crate) struct FileSearchDriver {
-    owner: PluginId,
     mailbox: Arc<(Mutex<FileMailbox>, Condvar)>,
-    outcome: Arc<Mutex<Option<ViewModel>>>,
+    outcome: Arc<Mutex<Option<FileOutcome>>>,
     /// Newest search generation the UI submitted. The worker re-reads it before
-    /// publishing and drops an answer that is no longer current.
+    /// parking an answer and drops one that is no longer current.
     current: Arc<AtomicU64>,
     /// Cancel token of the search that is or is about to be in flight.
     cancel: Mutex<Option<CancelToken>>,
-    published: Arc<Mutex<PublishedFileItems>>,
     forget_cache: Arc<AtomicBool>,
     /// The generation this driver has accepted and owes an answer for. See
     /// [`Outstanding`].
@@ -198,19 +194,21 @@ impl FileSearchDriver {
     /// returns a handle the UI thread drives without ever blocking.
     ///
     /// `pipeline` must already have `owner` registered with
-    /// [`file_provider_policy`]. `publish` runs on the worker thread with each
-    /// merged frame. A thread that fails to spawn degrades to a driver that
-    /// refuses every submission, so the launcher never marks file work
-    /// outstanding it will not get, rather than a panic in the composition
-    /// root.
-    pub(crate) fn spawn<P>(
+    /// [`file_provider_policy`]. `wake` runs on the worker thread once an
+    /// answer has been parked, and its only job is to make the UI thread turn
+    /// and call [`Self::take_outcome`]; it carries no answer, because the
+    /// answer is not presentable until the UI thread has ranked it. A thread
+    /// that fails to spawn degrades to a driver that refuses every submission,
+    /// so the launcher never marks file work outstanding it will not get,
+    /// rather than a panic in the composition root.
+    pub(crate) fn spawn<W>(
         owner: PluginId,
         pipeline: QueryPipeline,
         search: FileSearchFactory,
-        publish: P,
+        wake: W,
     ) -> Self
     where
-        P: Fn(&ViewModel) + Send + 'static,
+        W: Fn() + Send + 'static,
     {
         let mailbox = Arc::new((
             Mutex::new(FileMailbox {
@@ -221,14 +219,11 @@ impl FileSearchDriver {
         ));
         let outcome = Arc::new(Mutex::new(None));
         let current = Arc::new(AtomicU64::new(0));
-        let published = Arc::new(Mutex::new(PublishedFileItems::default()));
         let forget_cache = Arc::new(AtomicBool::new(false));
 
         let thread_mailbox = Arc::clone(&mailbox);
         let thread_outcome = Arc::clone(&outcome);
         let thread_current = Arc::clone(&current);
-        let thread_owner = owner.clone();
-        let thread_published = Arc::clone(&published);
         let thread_forget = Arc::clone(&forget_cache);
         let spawned = std::thread::Builder::new()
             .name("crikey-files".to_owned())
@@ -237,10 +232,9 @@ impl FileSearchDriver {
                 // one part of this worker that may not be `Send`, so it is built
                 // on the thread that will own it for the rest of the session.
                 let mut worker = FileSearchWorker {
-                    owner: thread_owner,
+                    owner,
                     pipeline,
                     cache: None,
-                    published: thread_published,
                     forget_cache: thread_forget,
                     search: search(),
                     last_error: None,
@@ -265,15 +259,16 @@ impl FileSearchDriver {
 
                     // The search happens here, on this thread, never on the
                     // caller's.
-                    let merged = worker.answer(&job);
+                    let answered = worker.answer(&job);
 
-                    // A late answer must never appear under a newer generation.
-                    // The whole check-store-publish is held under the mailbox
-                    // lock so the gate cannot race a `submit`: `submit` records
-                    // the newer generation into `current` before it takes this
-                    // lock, so either we observe the newer generation and drop
-                    // this frame, or no supersession has happened yet. A job
-                    // already queued is likewise a supersession in flight.
+                    // A late answer must never be offered under a newer
+                    // generation. The whole check-store-wake is held under the
+                    // mailbox lock so the gate cannot race a `submit`: `submit`
+                    // records the newer generation into `current` before it
+                    // takes this lock, so either we observe the newer
+                    // generation and drop this answer, or no supersession has
+                    // happened yet. A job already queued is likewise a
+                    // supersession in flight.
                     let slot = lock.lock().unwrap_or_else(|error| error.into_inner());
                     if slot.stop
                         || slot.job.is_some()
@@ -281,19 +276,17 @@ impl FileSearchDriver {
                     {
                         continue;
                     }
-                    *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) = Some(merged.clone());
-                    publish(&merged);
+                    *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) = Some(answered);
+                    wake();
                     drop(slot);
                 }
             });
 
         Self {
-            owner,
             mailbox,
             outcome,
             current,
             cancel: Mutex::new(None),
-            published,
             forget_cache,
             outstanding: Mutex::new(None),
             worker: spawned.ok(),
@@ -302,9 +295,6 @@ impl FileSearchDriver {
 
     /// Submits a query for asynchronous file search and returns at once.
     ///
-    /// `builtin_rows` are the built-in provider's rows for `generation`, which
-    /// the merged frame keeps ahead of the file rows.
-    ///
     /// Returns whether this driver accepted `generation` and will therefore
     /// settle it. This is the *only* honest answer to "may the caller mark the
     /// file source pending", and it is returned rather than asked separately so
@@ -312,18 +302,11 @@ impl FileSearchDriver {
     /// no worker thread, a rewound generation, a driver being dropped — is a
     /// reason nothing will ever come back.
     #[must_use]
-    pub(crate) fn submit(
-        &self,
-        generation: Generation,
-        query: &str,
-        now: u64,
-        builtin_rows: Vec<ResultRow>,
-        builtin_pending: bool,
-        selected: usize,
-    ) -> bool {
+    pub(crate) fn submit(&self, generation: Generation, query: &str, now: u64) -> bool {
         if !self.has_worker_thread() {
             return false;
         }
+
         // Intake is monotonic: a delayed caller must not rewind the live
         // generation and make an obsolete job eligible for publication again.
         let generation_value = generation.get();
@@ -356,37 +339,13 @@ impl FileSearchDriver {
             previous.cancel();
         }
 
-        // The rows about to be replaced are the rows whose items were retained,
-        // so the store is emptied and re-stamped in the same breath.
-        {
-            let mut published = self.published.lock().unwrap_or_else(|error| error.into_inner());
-            published.generation = Some(generation);
-            published.items.clear();
-        }
-
         let (lock, cvar) = &*self.mailbox;
         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
         if slot.stop {
             return false;
         }
-        // Built before the job takes the rows, and sharing them with it: this is
-        // what the driver publishes on its own if the worker never answers, so
-        // it has to carry the rows the launcher already put on screen. A
-        // settlement frame with no rows would clear the built-in group when it
-        // folded in.
-        let builtin_rows: Arc<[ResultRow]> = builtin_rows.into();
         *self.outstanding.lock().unwrap_or_else(|error| error.into_inner()) = Some(Outstanding {
-            frame: ViewModel {
-                generation,
-                query: query.to_owned(),
-                rows: Arc::clone(&builtin_rows),
-                selected,
-                pending_plugins: builtin_pending,
-                actions_open: false,
-                settings_open: false,
-                settings: Arc::default(),
-                settings_focus: None,
-            },
+            generation,
             submitted_at: now,
         });
         slot.job = Some(FileJob {
@@ -394,26 +353,22 @@ impl FileSearchDriver {
             query: query.to_owned(),
             now,
             cancel,
-            builtin_rows,
-            builtin_pending,
-            selected,
         });
         drop(slot);
         cvar.notify_one();
         true
     }
 
-    /// Takes the latest merged frame the worker produced, for the UI thread to
-    /// fold into its retained rows. Single slot, replace-oldest: only the newest
-    /// matters.
+    /// Takes the items the worker found, for the UI thread to rank into the
+    /// answer. Single slot, replace-oldest: only the newest matters.
     ///
     /// `now` is the caller's monotonic query clock, the same one `submit` was
     /// given. Past [`FILE_SETTLE_DEADLINE_MS`] the driver answers for a worker
-    /// that has not: the frame it hands back settles the generation the caller
-    /// marked pending and contributes no file rows. A worker that answers after
-    /// that is not discarded — its rows fold in under the same generation on a
-    /// later turn, exactly as an early answer would.
-    pub(crate) fn take_outcome(&self, now: u64) -> Option<ViewModel> {
+    /// that has not: the outcome it hands back settles the generation the
+    /// caller marked pending and contributes no items. A worker that answers
+    /// after that is not discarded — its items merge under the same generation
+    /// on a later turn, exactly as an early answer would.
+    pub(crate) fn take_outcome(&self, now: u64) -> Option<FileOutcome> {
         let taken = self
             .outcome
             .lock()
@@ -421,13 +376,22 @@ impl FileSearchDriver {
             .take();
         let mut outstanding = self.outstanding.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(outcome) = taken {
+            // The worker parked this under the live generation, but a `submit`
+            // may have overtaken it since. The merge would refuse a stale
+            // generation anyway; refusing it here as well is what keeps the
+            // driver's own settlement mark honest, because this driver knows
+            // which generation it is serving and the merge only knows which one
+            // it was asked about.
+            if outcome.generation.get() != self.current.load(Ordering::Acquire) {
+                return None;
+            }
             // Only what this outcome actually answers. A newer generation may
-            // have been submitted since the worker published, and discharging
-            // that one on the strength of an older answer is the whole bug this
-            // guards against.
+            // have been submitted since the worker parked its answer, and
+            // discharging that one on the strength of an older answer is the
+            // whole bug this guards against.
             if outstanding
                 .as_ref()
-                .is_some_and(|owed| owed.frame.generation <= outcome.generation)
+                .is_some_and(|owed| owed.generation <= outcome.generation)
             {
                 *outstanding = None;
             }
@@ -437,24 +401,13 @@ impl FileSearchDriver {
             .as_ref()
             .is_some_and(|owed| now.saturating_sub(owed.submitted_at) >= FILE_SETTLE_DEADLINE_MS)
         {
-            return outstanding.take().map(|owed| owed.frame);
+            return outstanding.take().map(|owed| FileOutcome {
+                generation: owed.generation,
+                items: Vec::new(),
+                pending: false,
+            });
         }
         None
-    }
-
-    /// The item behind a published file row, if that row is still current.
-    ///
-    /// `generation` is the generation the presented rows belong to. A lookup
-    /// against any other generation resolves nothing: the rows on screen and
-    /// the items they can execute have to describe the same query, or selecting
-    /// a row would open whatever the previous query happened to have found in
-    /// the same position.
-    pub(crate) fn resolve(&self, generation: Generation, item: &ItemId) -> Option<Item> {
-        let published = self.published.lock().unwrap_or_else(|error| error.into_inner());
-        if published.generation != Some(generation) {
-            return None;
-        }
-        published.items.get(&(self.owner.clone(), item.clone())).cloned()
     }
 
     /// Drops the prefix cache, so the next query reaches the backend.
@@ -510,7 +463,6 @@ struct FileSearchWorker {
     owner: PluginId,
     pipeline: QueryPipeline,
     cache: Option<PrefixCache>,
-    published: Arc<Mutex<PublishedFileItems>>,
     forget_cache: Arc<AtomicBool>,
     /// Built on the worker thread and never leaving it. See
     /// [`FileSearchFactory`].
@@ -520,47 +472,44 @@ struct FileSearchWorker {
     last_error: Option<String>,
 }
 
+/// What one query found, before anything has been ranked or rendered.
+struct FileAnswer {
+    items: Vec<Item>,
+    pending: bool,
+}
+
 impl FileSearchWorker {
-    /// The frame to publish for `job`: the built-in rows it carried, followed by
-    /// this provider's own.
+    /// The outcome to park for `job`: the items this provider found under the
+    /// generation that asked for them.
     ///
-    /// Always a frame, never an `Option`. Every way a search can come to
+    /// Always an outcome, never an `Option`. Every way a search can come to
     /// nothing — no backend in this session, a backend that failed, a pipeline
-    /// that refused the batch — is answered here with the rows the launcher
-    /// already had and none of ours, because the caller marked this source
-    /// pending when it handed the job over and only a frame under this
-    /// generation takes that mark off again.
-    fn answer(&mut self, job: &FileJob) -> ViewModel {
-        let files = self.serve(job);
-        let mut rows = job.builtin_rows.to_vec();
-        let mut pending = job.builtin_pending;
-        if let Some(frame) = files {
-            rows.extend(frame.rows.iter().cloned());
-            pending |= frame.pending_plugins;
-        }
-        ViewModel {
+    /// that refused the batch — is answered here with no items at all, because
+    /// the caller marked this source pending when it handed the job over and
+    /// only an outcome under this generation takes that mark off again.
+    fn answer(&mut self, job: &FileJob) -> FileOutcome {
+        let (items, pending) = match self.serve(job) {
+            Some(found) => (found.items, found.pending),
+            None => (Vec::new(), false),
+        };
+        FileOutcome {
             generation: job.generation,
-            query: job.query.clone(),
-            rows: rows.into(),
-            selected: job.selected,
-            pending_plugins: pending,
-            actions_open: false,
-            settings_open: false,
-            settings: Arc::default(),
-            settings_focus: None,
+            items,
+            pending,
         }
     }
 
-    /// Drives the pipeline through one query and returns this provider's frame.
+    /// Drives the pipeline through one query and returns what it accepted.
     ///
     /// `None` when this session has no file search, when the pipeline reported
-    /// an error, or when the frame belongs to a superseded pipeline generation,
-    /// so a partial or stale set of file rows is never published. It is not a
-    /// refusal to settle: [`Self::answer`] publishes a frame regardless.
-    fn serve(&mut self, job: &FileJob) -> Option<ViewModel> {
+    /// an error, or when the presented frame belongs to a superseded pipeline
+    /// generation, so a partial or stale set of file items is never offered to
+    /// the ranker. It is not a refusal to settle: [`Self::answer`] parks an
+    /// outcome regardless.
+    fn serve(&mut self, job: &FileJob) -> Option<FileAnswer> {
         let generation = self.pipeline.keystroke(&job.query, job.now);
         let mut at = job.now;
-        let mut delivered = false;
+        let mut accepted: Option<Vec<Item>> = None;
         // Advance the pipeline until it has dispatched this generation. The
         // provider debounces and has no leading edge, so the dispatch lands on a
         // later scheduler wake-up rather than this tick; following the
@@ -594,8 +543,7 @@ impl FileSearchWorker {
 
             for request in requests {
                 let items = self.items_for(job);
-                self.retain(job.generation, &items);
-                delivered = self.deliver(&request.plugin, request.generation, items, at);
+                accepted = self.deliver(&request.plugin, request.generation, items, at);
                 let _ = self.pipeline.complete(&request.plugin, request.generation, at);
             }
 
@@ -610,13 +558,24 @@ impl FileSearchWorker {
         // unsettled and the frame permanently pending.
         let frame = self.pipeline.present_drained(at);
         let presented = self.pipeline.take_errors().is_empty();
-        if !presented || !delivered {
+        let (Some(items), true) = (accepted, presented) else {
             return None;
-        }
-        frame.filter(|frame| frame.generation == generation)
+        };
+        // The frame is built and then thrown away, which is the price of asking
+        // the aggregator whether it would present these items at all: the rows
+        // it composes answer the previous query if this generation was
+        // superseded inside the pipeline, and the items would then be a stale
+        // answer with a current generation stamped on it. Building rows nobody
+        // renders costs the worker thread, not the frame.
+        let frame = frame.filter(|frame| frame.generation == generation)?;
+        Some(FileAnswer {
+            items,
+            pending: frame.pending_plugins,
+        })
     }
 
-    /// Delivers one answer as batches the aggregator will accept.
+    /// Delivers one answer as batches the aggregator will accept, and returns
+    /// the items it actually took.
     ///
     /// Split to the aggregator's ceiling because an over-large batch is refused
     /// whole rather than truncated, and a refused batch leaves the request
@@ -624,7 +583,18 @@ impl FileSearchWorker {
     /// saying "Providers are still responding". A file search can return
     /// hundreds of hits, so this is the ordinary case rather than the extreme
     /// one.
-    fn deliver(&mut self, plugin: &PluginId, generation: Generation, items: Vec<Item>, at: u64) -> bool {
+    ///
+    /// `None` is a refusal. The items come back rather than the caller keeping
+    /// its own copy because the quota below truncates them here, and ranking a
+    /// set the pipeline never accepted would put rows on screen that the
+    /// launcher's own limits say are not there.
+    fn deliver(
+        &mut self,
+        plugin: &PluginId,
+        generation: Generation,
+        items: Vec<Item>,
+        at: u64,
+    ) -> Option<Vec<Item>> {
         let ceiling = self.pipeline.max_items_per_batch().max(1);
         // Two different ceilings, and both bite. `ceiling` above splits the
         // stream; this one ends it. The per-owner quota is not a truncation the
@@ -656,7 +626,8 @@ impl FileSearchWorker {
                     },
                     at,
                 )
-                .is_ok();
+                .is_ok()
+                .then(Vec::new);
         }
         let batches = items.len().div_ceil(ceiling);
         let mut accepted = true;
@@ -682,24 +653,7 @@ impl FileSearchWorker {
                 )
                 .is_ok();
         }
-        accepted
-    }
-
-    /// Retains the items of one batch so the rows they become can be executed.
-    ///
-    /// Refuses to write under a generation the UI has already moved past: the
-    /// store is stamped and cleared by `submit`, so a stamp that no longer
-    /// matches means this answer is stale and its items must not be resolvable.
-    fn retain(&self, generation: Generation, items: &[Item]) {
-        let mut published = self.published.lock().unwrap_or_else(|error| error.into_inner());
-        if published.generation != Some(generation) {
-            return;
-        }
-        for item in items {
-            published
-                .items
-                .insert((item.plugin_id.clone(), item.stable_id.clone()), item.clone());
-        }
+        accepted.then_some(items)
     }
 
     /// The items answering `job`, from the prefix cache wherever it can answer.
@@ -912,7 +866,6 @@ mod tests {
             owner: owner(),
             pipeline: pipeline(),
             cache: None,
-            published: Arc::new(Mutex::new(PublishedFileItems::default())),
             forget_cache: Arc::new(AtomicBool::new(false)),
             search,
             last_error: None,
@@ -925,41 +878,39 @@ mod tests {
             query: query.to_owned(),
             now,
             cancel: CancelToken::new(),
-            builtin_rows: Vec::new().into(),
-            builtin_pending: false,
-            selected: 0,
         }
     }
 
-    /// Stamps the store the way `submit` does, since these tests drive the
-    /// worker half directly.
-    fn begin(worker: &FileSearchWorker, generation: u64) {
-        let mut published = worker.published.lock().unwrap_or_else(|error| error.into_inner());
-        published.generation = Some(Generation::from_raw(generation));
-        published.items.clear();
+    /// The labels of what one query found, in the order the pipeline accepted
+    /// them.
+    fn labels(answer: &FileAnswer) -> Vec<&str> {
+        answer.items.iter().map(|item| item.label.as_str()).collect()
     }
 
     #[test]
-    fn a_query_produces_rows_owned_by_the_file_provider() {
+    fn a_query_produces_items_owned_by_the_file_provider() {
         let queries = Arc::new(Mutex::new(Vec::new()));
         let mut worker = worker(Box::new(RecordingSearch::new(
             &["quarterly-report.txt", "budget.ods"],
             Arc::clone(&queries),
         )));
-        begin(&worker, 1);
 
-        let frame = worker
+        let answer = worker
             .serve(&job(1, "quarterly", 1_000))
-            .expect("the provider presents a frame for its own query");
+            .expect("the provider answers its own query");
 
-        let labels: Vec<&str> = frame.rows.iter().map(|row| row.label.as_str()).collect();
-        assert_eq!(labels, ["quarterly-report.txt"]);
-        for row in frame.rows.iter() {
+        assert_eq!(labels(&answer), ["quarterly-report.txt"]);
+        for item in &answer.items {
             assert_eq!(
-                row.plugin_name, FILE_SEARCH_PLUGIN,
-                "a file row must be owned by the file provider"
+                item.plugin_id,
+                owner(),
+                "a file item must be owned by the file provider"
             );
-            assert_eq!(row.category, Category::File.as_str());
+            assert_eq!(item.category, Category::File);
+            assert!(
+                !item.target.is_empty(),
+                "the item handed to the ranker must carry the target the open action needs"
+            );
         }
     }
 
@@ -970,10 +921,10 @@ mod tests {
     /// per-owner quota is 250, and the quota is not a truncation the pipeline
     /// performs: it refuses the batch that would cross it whole, the refusal
     /// leaves the request unsettled, `serve` finds a pipeline error and returns
-    /// no frame at all. So the launcher answered a two-hundred-and-fifty-first
+    /// nothing at all. So the launcher answered a two-hundred-and-fifty-first
     /// match with an empty list and "providers are still responding".
     #[test]
-    fn a_query_with_more_matches_than_the_quota_still_presents_a_frame() {
+    fn a_query_with_more_matches_than_the_quota_still_answers() {
         let queries = Arc::new(Mutex::new(Vec::new()));
         // Deliberately more than the default quota and more than one batch, so
         // both ceilings are crossed by the same answer.
@@ -985,24 +936,23 @@ mod tests {
             names.len() > quota,
             "the fixture must exceed the quota or this test proves nothing"
         );
-        begin(&worker, 1);
 
-        let frame = worker
+        let answer = worker
             .serve(&job(1, "report", 1_000))
-            .expect("a broad query presents a frame rather than being refused whole");
+            .expect("a broad query answers rather than being refused whole");
 
         assert!(
-            !frame.rows.is_empty(),
+            !answer.items.is_empty(),
             "the quota truncates the answer, it does not erase it"
         );
         assert!(
-            frame.rows.len() <= quota,
-            "no more than the quota is published, got {} against {quota}",
-            frame.rows.len()
+            answer.items.len() <= quota,
+            "no more than the quota is offered, got {} against {quota}",
+            answer.items.len()
         );
         assert!(
-            frame.rows.iter().all(|row| row.label.starts_with("report-")),
-            "the published rows are the real matches"
+            answer.items.iter().all(|item| item.label.starts_with("report-")),
+            "the offered items are the real matches"
         );
     }
 
@@ -1034,7 +984,6 @@ mod tests {
             owner: owner(),
             pipeline,
             cache: None,
-            published: Arc::new(Mutex::new(PublishedFileItems::default())),
             forget_cache: Arc::new(AtomicBool::new(false)),
             search: Box::new(RecordingSearch::new(&borrowed, Arc::clone(&queries))),
             last_error: None,
@@ -1044,53 +993,19 @@ mod tests {
             "the configured ceiling must be the binding one, got {}",
             worker.quota()
         );
-        begin(&worker, 1);
 
-        let frame = worker
+        let answer = worker
             .serve(&job(1, "report", 1_000))
-            .expect("a configured launcher still presents file rows");
+            .expect("a configured launcher still gets file items");
 
-        assert!(!frame.rows.is_empty(), "the ceiling truncates, it does not erase");
         assert!(
-            frame.rows.len() <= 100,
-            "no more than the configured ceiling is published, got {}",
-            frame.rows.len()
-        );
-    }
-
-    #[test]
-    fn a_published_row_resolves_to_its_item_only_under_its_own_generation() {
-        let queries = Arc::new(Mutex::new(Vec::new()));
-        let mut worker = worker(Box::new(RecordingSearch::new(
-            &["quarterly-report.txt"],
-            Arc::clone(&queries),
-        )));
-        let published = Arc::clone(&worker.published);
-        begin(&worker, 7);
-
-        let frame = worker
-            .serve(&job(7, "quarterly", 1_000))
-            .expect("the provider presents a frame");
-        let row = frame.rows.first().expect("one file row").clone();
-
-        // The same resolution the execution path performs, over the same store.
-        let driver_lookup = |generation: u64| -> Option<Item> {
-            let store = published.lock().unwrap_or_else(|error| error.into_inner());
-            if store.generation != Some(Generation::from_raw(generation)) {
-                return None;
-            }
-            store.items.get(&(owner(), row.item.clone())).cloned()
-        };
-
-        let item = driver_lookup(7).expect("a published file row resolves to its item");
-        assert_eq!(item.label, "quarterly-report.txt");
-        assert!(
-            !item.target.is_empty(),
-            "the resolved item must carry the target the open action needs"
+            !answer.items.is_empty(),
+            "the ceiling truncates, it does not erase"
         );
         assert!(
-            driver_lookup(8).is_none(),
-            "a lookup under a generation the store was not stamped with must resolve nothing"
+            answer.items.len() <= 100,
+            "no more than the configured ceiling is offered, got {}",
+            answer.items.len()
         );
     }
 
@@ -1102,21 +1017,18 @@ mod tests {
             Arc::clone(&queries),
         )));
 
-        begin(&worker, 1);
         worker.serve(&job(1, "qu", 1_000));
-        begin(&worker, 2);
-        let frame = worker
+        let answer = worker
             .serve(&job(2, "quarterly", 2_000))
-            .expect("the extending query presents a frame");
+            .expect("the extending query answers");
 
         assert_eq!(
             &*queries.lock().unwrap_or_else(|error| error.into_inner()),
             &["qu".to_owned()],
             "an extending query must be answered from the cached prefix hits"
         );
-        let labels: Vec<&str> = frame.rows.iter().map(|row| row.label.as_str()).collect();
         assert_eq!(
-            labels,
+            labels(&answer),
             ["quarterly-report.txt"],
             "the cached hits must be filtered down to the longer query"
         );
@@ -1130,20 +1042,17 @@ mod tests {
             Arc::clone(&queries),
         )));
 
-        begin(&worker, 1);
         worker.serve(&job(1, "qu", 1_000));
-        begin(&worker, 2);
-        let frame = worker
+        let answer = worker
             .serve(&job(2, "budget", 2_000))
-            .expect("the new prefix presents a frame");
+            .expect("the new prefix answers");
 
         assert_eq!(
             &*queries.lock().unwrap_or_else(|error| error.into_inner()),
             &["qu".to_owned(), "bu".to_owned()],
             "a query outside the cached prefix must reach the backend again"
         );
-        let labels: Vec<&str> = frame.rows.iter().map(|row| row.label.as_str()).collect();
-        assert_eq!(labels, ["budget.ods"]);
+        assert_eq!(labels(&answer), ["budget.ods"]);
     }
 
     #[test]
@@ -1155,10 +1064,8 @@ mod tests {
         )));
         let forget = Arc::clone(&worker.forget_cache);
 
-        begin(&worker, 1);
         worker.serve(&job(1, "qu", 1_000));
         forget.store(true, Ordering::Release);
-        begin(&worker, 2);
         worker.serve(&job(2, "quarterly", 2_000));
 
         assert_eq!(
@@ -1185,9 +1092,7 @@ mod tests {
             search.coverage = coverage;
             let mut worker = worker(Box::new(search));
 
-            begin(&worker, 1);
             worker.serve(&job(1, "quarterly", 1_000));
-            begin(&worker, 2);
             worker.serve(&job(2, "quarterly", 2_000));
 
             assert_eq!(
@@ -1211,7 +1116,6 @@ mod tests {
             Arc::clone(&queries),
         )));
 
-        begin(&worker, 1);
         worker.serve(&job(1, "   ", 1_000));
 
         assert!(
@@ -1223,8 +1127,14 @@ mod tests {
         );
     }
 
+    /// A superseded query's answer must never reach the ranker.
+    ///
+    /// Two gates guard this and both are exercised here: the worker refuses to
+    /// park an answer once a newer generation has been submitted, and
+    /// `take_outcome` refuses to hand out one that was parked just before the
+    /// supersession. What the caller must never see is generation 1.
     #[test]
-    fn a_superseded_query_never_publishes_its_answer() {
+    fn a_superseded_query_never_offers_its_answer() {
         let queries = Arc::new(Mutex::new(Vec::new()));
         let mut search = RecordingSearch::new(&["quarterly-report.txt"], Arc::clone(&queries));
         let (entered, entries) = std::sync::mpsc::channel();
@@ -1232,28 +1142,25 @@ mod tests {
         search.entered = Some(entered);
         search.release = Some(Arc::clone(&release));
 
-        let published = Arc::new(Mutex::new(Vec::new()));
-        let recorder = Arc::clone(&published);
+        let wakes = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&wakes);
         let driver = FileSearchDriver::spawn(
             owner(),
             pipeline(),
             Box::new(move || Box::new(search)),
-            move |frame: &ViewModel| {
-                recorder
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .push(frame.generation);
+            move || {
+                counter.fetch_add(1, Ordering::Release);
             },
         );
 
-        assert!(driver.submit(Generation::from_raw(1), "qu", 1_000, Vec::new(), false, 0));
+        assert!(driver.submit(Generation::from_raw(1), "qu", 1_000));
         // Ordered by handshake, not by hoping: the first query is provably
         // inside the backend before the second is submitted, and provably
         // finishes after it.
         entries.recv().expect("the worker reaches the backend");
         // A query outside the first one's prefix, so the second answer is a
         // second backend call rather than a cache hit with nothing to observe.
-        assert!(driver.submit(Generation::from_raw(2), "budget", 2_000, Vec::new(), false, 0));
+        assert!(driver.submit(Generation::from_raw(2), "budget", 2_000));
         {
             let (lock, cvar) = &*release;
             *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
@@ -1261,12 +1168,34 @@ mod tests {
         }
         // The second query's own search, so both answers have been produced.
         entries.recv().expect("the second query reaches the backend");
+
+        // Everything the caller is ever offered, drained until the worker is
+        // provably finished with both queries.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut offered = Vec::new();
+        while std::time::Instant::now() < deadline {
+            if let Some(outcome) = driver.take_outcome(2_000) {
+                offered.push(outcome.generation);
+                if outcome.generation == Generation::from_raw(2) {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         drop(driver);
 
-        let frames = published.lock().unwrap_or_else(|error| error.into_inner());
         assert!(
-            !frames.contains(&Generation::from_raw(1)),
-            "the superseded query's late answer must be dropped, saw {frames:?}"
+            !offered.contains(&Generation::from_raw(1)),
+            "the superseded query's late answer must be dropped, saw {offered:?}"
+        );
+        assert_eq!(
+            offered.last(),
+            Some(&Generation::from_raw(2)),
+            "the live query's answer must still arrive, saw {offered:?}"
+        );
+        assert!(
+            wakes.load(Ordering::Acquire) > 0,
+            "an answer the UI thread has to merge is worthless unless the UI thread is woken for it"
         );
     }
 
@@ -1287,45 +1216,17 @@ mod tests {
         }
     }
 
-    /// A built-in row, so a settling frame can be shown to carry the rows the
-    /// launcher already had rather than to erase them.
-    fn builtin_row(label: &str) -> ResultRow {
-        ResultRow {
-            item: ItemId(label.to_owned()),
-            label: label.to_owned(),
-            description: String::new(),
-            icon_reference: None,
-            icon: None,
-            category: String::new(),
-            plugin_name: "builtin.crikey.applications".to_owned(),
-            highlights: Vec::new(),
-            argument_hint: None,
-            status: None,
-            default_action: None,
-            alternate_actions: Vec::new(),
-        }
-    }
-
+    /// A generation the driver settles itself, or one the worker answers with
+    /// nothing found, contributes no items — and that is what takes the
+    /// caller's pending mark off.
     #[test]
     fn a_session_without_a_file_backend_still_settles_the_generation() {
-        let driver = FileSearchDriver::spawn(
-            owner(),
-            pipeline(),
-            Box::new(|| Box::new(NoBackend)),
-            |_frame: &ViewModel| {},
-        );
+        let driver = FileSearchDriver::spawn(owner(), pipeline(), Box::new(|| Box::new(NoBackend)), || {});
 
-        assert!(driver.submit(
-            Generation::from_raw(1),
-            "quarterly",
-            1_000,
-            vec![builtin_row("Terminal")],
-            false,
-            0
-        ));
+        assert!(driver.submit(Generation::from_raw(1), "quarterly", 1_000));
 
         // Always the submission instant, so the driver's own settlement
-        // deadline can never be what answers here: this is the worker's frame
+        // deadline can never be what answers here: this is the worker's outcome
         // or nothing.
         let wait = std::time::Instant::now() + Duration::from_secs(5);
         let outcome = loop {
@@ -1341,14 +1242,12 @@ mod tests {
         let outcome = outcome.expect("a source that marked itself pending must settle its generation");
         assert_eq!(outcome.generation, Generation::from_raw(1));
         assert!(
-            !outcome.pending_plugins,
-            "the settling frame must not still claim work outstanding"
+            !outcome.pending,
+            "the settling outcome must not still claim work outstanding"
         );
-        let labels: Vec<&str> = outcome.rows.iter().map(|row| row.label.as_str()).collect();
-        assert_eq!(
-            labels,
-            ["Terminal"],
-            "a session with no file backend contributes no rows and removes none"
+        assert!(
+            outcome.items.is_empty(),
+            "a session with no file backend contributes no items"
         );
     }
 
@@ -1385,21 +1284,9 @@ mod tests {
         let (entered, entries) = std::sync::mpsc::channel();
         let search = WedgedSearch { entered };
 
-        let driver = FileSearchDriver::spawn(
-            owner(),
-            pipeline(),
-            Box::new(move || Box::new(search)),
-            |_frame: &ViewModel| {},
-        );
+        let driver = FileSearchDriver::spawn(owner(), pipeline(), Box::new(move || Box::new(search)), || {});
 
-        assert!(driver.submit(
-            Generation::from_raw(1),
-            "quarterly",
-            1_000,
-            vec![builtin_row("Terminal")],
-            false,
-            0
-        ));
+        assert!(driver.submit(Generation::from_raw(1), "quarterly", 1_000));
         // Provably inside the backend, so what follows is a worker that is
         // stuck rather than one that has not started.
         entries.recv().expect("the worker reaches the backend");
@@ -1414,14 +1301,61 @@ mod tests {
             .expect("a generation the driver accepted must settle even if the worker never answers");
         assert_eq!(settled.generation, Generation::from_raw(1));
         assert!(
-            !settled.pending_plugins,
-            "the settling frame is what takes the pending mark off, so it cannot carry one"
+            !settled.pending,
+            "the settling outcome is what takes the pending mark off, so it cannot carry one"
         );
-        let labels: Vec<&str> = settled.rows.iter().map(|row| row.label.as_str()).collect();
+        assert!(
+            settled.items.is_empty(),
+            "settling for a wedged worker contributes nothing to the ranked answer"
+        );
+    }
+
+    /// The second gate, on the taking side.
+    ///
+    /// The worker refuses to park an answer once a newer generation exists, but
+    /// it can only refuse what it has not parked yet: an answer parked an
+    /// instant before the next keystroke is already in the slot when `submit`
+    /// runs, and `submit` does not clear it. Handing that out would rank the
+    /// previous query's files into this query's answer. The merge would refuse
+    /// the stale generation too, but only this side knows *which* generation is
+    /// live, and only this side is holding the settlement mark that must stay
+    /// owed.
+    ///
+    /// The outcome is planted rather than raced into place, because the window
+    /// it lives in is a few instructions wide and a test that had to hit it
+    /// would prove nothing on the runs where it missed.
+    #[test]
+    fn an_answer_parked_just_before_a_new_query_is_never_handed_out() {
+        let (entered, entries) = std::sync::mpsc::channel();
+        let search = WedgedSearch { entered };
+        let driver = FileSearchDriver::spawn(owner(), pipeline(), Box::new(move || Box::new(search)), || {});
+
+        assert!(driver.submit(Generation::from_raw(1), "quarterly", 1_000));
+        entries.recv().expect("the worker reaches the backend");
+        assert!(driver.submit(Generation::from_raw(2), "budget", 2_000));
+
+        // The first query's answer, in the slot, under the generation the user
+        // has already typed past.
+        *driver.outcome.lock().unwrap_or_else(|error| error.into_inner()) = Some(FileOutcome {
+            generation: Generation::from_raw(1),
+            items: Vec::new(),
+            pending: false,
+        });
+
+        assert!(
+            driver.take_outcome(2_000).is_none(),
+            "an answer to a query the user has typed past must never be offered"
+        );
+
+        // And the newer generation is still owed, so its pending mark is still
+        // the driver's to take off.
+        let settled = driver
+            .take_outcome(2_000 + FILE_SETTLE_DEADLINE_MS)
+            .expect("the live generation is still owed an answer");
         assert_eq!(
-            labels,
-            ["Terminal"],
-            "settling for a wedged worker must not erase the rows already on screen"
+            settled.generation,
+            Generation::from_raw(2),
+            "the stale answer must not have discharged the live generation"
         );
     }
 }

@@ -25,8 +25,8 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use crikey_app::{ActionSubmission, App, PluginActionRouter, SearchService};
-use crikey_core::{ActionId, Item, PluginId};
+use crikey_app::{ActionSubmission, App, PluginActionRouter, SearchService, StartupStage};
+use crikey_core::{ActionId, Item, ItemId, PluginId};
 use crikey_platform::{
     encode_target, file_items, FileHit, FileKind, FILE_OPEN_ACTION_ID, FILE_REVEAL_ACTION_ID,
 };
@@ -50,11 +50,12 @@ fn selecting_a_file_result_opens_its_path() {
     let path = recorder.sibling("Quarterly Report; final $(x).ods");
     let owner = PluginId(FILE_CATALOG_PLUGIN.to_owned());
     let item = file_item(&owner, &path);
-    let service = granted_service(&recorder, &owner);
+    let mut service = granted_service(&recorder, &owner);
+    let selected = merged(&mut service, item);
 
     let reading = recorder.reading();
     let submission = service
-        .execute_host_action(&item, &ActionId(FILE_OPEN_ACTION_ID.to_owned()))
+        .execute(&selected, &ActionId(FILE_OPEN_ACTION_ID.to_owned()))
         .expect("a granted owner's file row opens");
 
     assert!(
@@ -83,11 +84,12 @@ fn a_file_whose_name_is_not_valid_unicode_still_opens() {
     let path = recorder.scratch.join(&raw);
     let owner = PluginId(FILE_CATALOG_PLUGIN.to_owned());
     let item = file_item(&owner, &path);
-    let service = granted_service(&recorder, &owner);
+    let mut service = granted_service(&recorder, &owner);
+    let selected = merged(&mut service, item);
 
     let reading = recorder.reading();
     service
-        .execute_host_action(&item, &ActionId(FILE_OPEN_ACTION_ID.to_owned()))
+        .execute(&selected, &ActionId(FILE_OPEN_ACTION_ID.to_owned()))
         .expect("a path that is not valid Unicode is still a path");
 
     assert_eq!(
@@ -104,11 +106,12 @@ fn revealing_a_file_result_opens_its_containing_directory() {
     let path = recorder.sibling("receipt.pdf");
     let owner = PluginId(FILE_CATALOG_PLUGIN.to_owned());
     let item = file_item(&owner, &path);
-    let service = granted_service(&recorder, &owner);
+    let mut service = granted_service(&recorder, &owner);
+    let selected = merged(&mut service, item);
 
     let reading = recorder.reading();
     service
-        .execute_host_action(&item, &ActionId(FILE_REVEAL_ACTION_ID.to_owned()))
+        .execute(&selected, &ActionId(FILE_REVEAL_ACTION_ID.to_owned()))
         .expect("a granted owner's file row reveals");
 
     assert_eq!(
@@ -131,11 +134,14 @@ fn a_file_item_from_an_unknown_owner_is_refused() {
     let item = file_item(&stranger, &path);
     // The router knows the real file catalog and nothing else, which is the
     // situation a plugin-carrying build is always in.
-    let service = granted_service(&recorder, &PluginId(FILE_CATALOG_PLUGIN.to_owned()));
+    let mut service = granted_service(&recorder, &PluginId(FILE_CATALOG_PLUGIN.to_owned()));
+    // The stranger's row still reaches the answer: an unknown owner is refused
+    // at the grant map, not by being unable to publish a result.
+    let selected = merged(&mut service, item);
 
     for action in [FILE_OPEN_ACTION_ID, FILE_REVEAL_ACTION_ID] {
         let refusal = service
-            .execute_host_action(&item, &ActionId(action.to_owned()))
+            .execute(&selected, &ActionId(action.to_owned()))
             .expect_err("an owner outside the grant map must not have the host open anything")
             .to_string();
 
@@ -162,10 +168,11 @@ fn an_unimplemented_host_action_is_refused_by_name() {
     let owner = PluginId(FILE_CATALOG_PLUGIN.to_owned());
     let mut item = file_item(&owner, &path);
     item.actions[0].action_id = ActionId("crikey.file.shred".to_owned());
-    let service = granted_service(&recorder, &owner);
+    let mut service = granted_service(&recorder, &owner);
+    let selected = merged(&mut service, item);
 
     let refusal = service
-        .execute_host_action(&item, &ActionId("crikey.file.shred".to_owned()))
+        .execute(&selected, &ActionId("crikey.file.shred".to_owned()))
         .expect_err("the host implements a closed set of actions")
         .to_string();
 
@@ -210,7 +217,58 @@ fn granted_service(recorder: &Recorder, owner: &PluginId) -> SearchService {
 
     let mut service = SearchService::new(app);
     service.set_plugin_action_router(Arc::new(router));
+    for stage in PRE_QUERY_STAGES {
+        service
+            .complete_stage(stage)
+            .expect("startup milestones are acknowledged in order");
+    }
     service
+}
+
+/// The milestones that must be acknowledged before a query is accepted.
+const PRE_QUERY_STAGES: [StartupStage; 3] = [
+    StartupStage::WindowAndHotkey,
+    StartupStage::PersistedCatalog,
+    StartupStage::AcceptQueries,
+];
+
+/// Puts `item` into the ranked answer the way the launcher does, and hands back
+/// the id the execution path resolves against.
+///
+/// This is the whole route a selected file takes. The launcher never hands an
+/// item to the service: the file provider answers a query asynchronously, its
+/// batch is merged into the answer for that generation, and execution then
+/// happens by id against that answer. Handing a hand-built item straight to a
+/// dispatcher would assert the gate while asserting nothing about whether a
+/// file row can reach it -- which is precisely the defect this file exists for.
+fn merged(service: &mut SearchService, item: Item) -> ItemId {
+    let selected = item.stable_id.clone();
+    let owner = item.plugin_id.clone();
+    let query = matching_query(&item.label);
+    let generation = service.submit_query(&query).expect("the query is accepted");
+    assert!(
+        service.merge_query_items(generation, &owner, vec![item]),
+        "the provider's batch answers the current generation"
+    );
+    assert!(
+        service.results().iter().any(|hit| hit.item.stable_id == selected),
+        "the merged file must be in the answer the execution path resolves against"
+    );
+    selected
+}
+
+/// A query the item's label matches: its leading run of ASCII alphanumerics.
+///
+/// Derived from the label rather than written per test because one fixture's
+/// name is not valid Unicode, and its label -- the lossy spelling -- is only
+/// reliably typeable up to the byte that has no character.
+fn matching_query(label: &str) -> String {
+    let query: String = label.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+    assert!(
+        query.chars().count() >= 3,
+        "the fixture's name must give the matcher something to prefix, got: {label:?}"
+    );
+    query
 }
 
 /// A recording program standing where `xdg-open` goes.

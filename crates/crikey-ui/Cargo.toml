@@ -56,3 +56,10 @@ crikey-platform.workspace = true
 [[test]]
 name = "ime_x11"
 harness = false
+
+# Same reason as `ime_x11`: it drives the shipped `NativeLauncher`, so it owns
+# `main`. A separate binary rather than a case inside that one because winit
+# allows one event loop per process.
+[[test]]
+name = "provider_answer_wake"
+harness = false
