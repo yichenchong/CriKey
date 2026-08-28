@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-core"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "regex",
  "thiserror",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-native-protocol"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "thiserror",
@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-plugin-model"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "serde",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-plugin-sdk"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-native-protocol",

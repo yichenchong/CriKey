@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-app"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-catalog",
  "crikey-core",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-benchmarks"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-app",
  "crikey-catalog",
@@ -639,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-cabi-host"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-native-host",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-catalog"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-query",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-cli"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-app",
  "crikey-benchmarks",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-config"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-platform",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-core"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "regex",
  "thiserror 2.0.19",
@@ -704,14 +704,14 @@ dependencies = [
 
 [[package]]
 name = "crikey-input-scheduler"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
 ]
 
 [[package]]
 name = "crikey-legacy-compat"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-input-scheduler",
@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-native-host"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-native-protocol",
@@ -739,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-native-protocol"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "thiserror 2.0.19",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-package-manager"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-platform",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-platform"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-query",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-platform-linux"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "arboard",
  "crikey-core",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-platform-macos"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "arboard",
  "crikey-core",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-platform-windows"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "arboard",
  "crikey-core",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-plugin-model"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "serde",
@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-plugin-sdk"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-native-protocol",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-plugin-supervisor"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-plugin-model",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-python-host"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-native-protocol",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-query"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "unicode-casefold",
@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-ranking"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-query",
@@ -869,18 +869,18 @@ dependencies = [
 
 [[package]]
 name = "crikey-result-aggregator"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
 ]
 
 [[package]]
 name = "crikey-sandbox"
-version = "0.1.12"
+version = "0.1.13"
 
 [[package]]
 name = "crikey-ui"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-platform",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "crikey-wasm-host"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "crikey-core",
  "crikey-plugin-model",
