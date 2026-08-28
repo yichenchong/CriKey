@@ -316,7 +316,13 @@ pub fn measure_activation(args: &[String]) -> ExitCode {
         }
     };
 
+    // The same question `run_launcher` asks, and for the same reason it has to
+    // be asked here: whether the desktop composites decides the surface's
+    // alpha mode, and this harness exists to measure the path the application
+    // pays for. A window built opaque while the launcher's is composited would
+    // report a presentation cost nobody is charged.
     let config = NativeLauncherConfig {
+        composited: crikey_app::App::new().desktop_composites(),
         present_mode: if vsync {
             wgpu::PresentMode::AutoVsync
         } else {

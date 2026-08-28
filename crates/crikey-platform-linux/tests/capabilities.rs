@@ -89,7 +89,7 @@ fn fixture(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
 }
 
 /// Every [`Capability`] variant, listed once, in declaration order.
-const ALL_CAPABILITIES: [Capability; 14] = [
+const ALL_CAPABILITIES: [Capability; 15] = [
     Capability::ApplicationDiscovery,
     Capability::FileSearch,
     Capability::Clipboard,
@@ -104,6 +104,7 @@ const ALL_CAPABILITIES: [Capability; 14] = [
     Capability::FileWatching,
     Capability::SecretStorage,
     Capability::ShellIntegration,
+    Capability::Compositing,
 ];
 
 /// The three sessions the backend must answer for.
@@ -135,20 +136,26 @@ fn index_of(capability: Capability) -> usize {
         Capability::FileWatching => 11,
         Capability::SecretStorage => 12,
         Capability::ShellIntegration => 13,
+        Capability::Compositing => 14,
     }
 }
 
 /// The state the Linux backend is required to report, capability by capability
 /// and session by session. This is the contract table, written out rather than
 /// derived, so that an implementation cannot satisfy it by construction.
+///
+/// `None` for the one entry that has no fixed answer to write down: compositing
+/// under X11 is read off the display the suite happens to have inherited, so a
+/// row here would pin the build host rather than the backend. That entry is
+/// pinned against a server this suite owns, in `compositing_x11.rs`.
 fn required_state(
     environment: DesktopEnvironment,
     portal: bool,
     indexed: bool,
     opener: bool,
     capability: Capability,
-) -> CapabilityState {
-    match capability {
+) -> Option<CapabilityState> {
+    let state = match capability {
         // No display server needed: honest everywhere.
         Capability::ApplicationDiscovery | Capability::ProcessLaunch => CapabilityState::Available,
         // Global shortcuts: optional on Linux (spec 18.6). `GrabKey` is core X
@@ -211,6 +218,18 @@ fn required_state(
             DesktopEnvironment::Wayland => CapabilityState::Partial,
             DesktopEnvironment::Headless => CapabilityState::Unavailable,
         },
+        // Compositing: `Available` under Wayland with nothing to check, because
+        // compositing is what a Wayland compositor *is* -- there is no Wayland
+        // session that omits it and still has a display. `Unavailable` with no
+        // display server, which composites nothing. Under X11 a compositing
+        // manager is a separate, optional program, so the answer is whatever
+        // the display says at the moment of asking and no row here can state
+        // it; see this function's documentation.
+        Capability::Compositing => match environment {
+            DesktopEnvironment::X11 => return None,
+            DesktopEnvironment::Wayland => CapabilityState::Available,
+            DesktopEnvironment::Headless => CapabilityState::Unavailable,
+        },
         // Nothing else has a Linux implementation behind it yet, so nothing
         // else may be claimed in any session.
         Capability::UriOpen
@@ -218,7 +237,9 @@ fn required_state(
         | Capability::FileWatching
         | Capability::SecretStorage
         | Capability::ShellIntegration => CapabilityState::Unavailable,
-    }
+    };
+
+    Some(state)
 }
 
 /// The capabilities that must never be claimed, whatever the session is.
@@ -571,9 +592,17 @@ fn every_capability_has_a_deliberate_answer_in_every_session() {
                     let label = format!("{environment:?}");
                     let backend = reporting_backend(environment, portal, indexed, opener);
                     for capability in ALL_CAPABILITIES {
+                        // `None` is the table declining to state an answer that
+                        // depends on the display this suite inherited rather
+                        // than on the reporting rules; `compositing_x11.rs`
+                        // owns that one.
+                        let Some(required) = required_state(environment, portal, indexed, opener, capability)
+                        else {
+                            continue;
+                        };
                         assert_eq!(
                             backend.capability(capability),
-                            required_state(environment, portal, indexed, opener, capability),
+                            required,
                             "{capability:?} under {label} with portal={portal} indexed={indexed} \
                              opener={opener} does not match the reporting table (spec 18.2)"
                         );

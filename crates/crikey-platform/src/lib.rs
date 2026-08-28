@@ -67,6 +67,22 @@ pub enum Capability {
     FileWatching,
     SecretStorage,
     ShellIntegration,
+    /// Whether the desktop composites window transparency.
+    ///
+    /// The launcher's window is a rounded rectangle, so it presents pixels
+    /// outside that shape which are not opaque. A desktop that composites
+    /// shows the wallpaper through them. A desktop that does not discards the
+    /// alpha channel and presents whatever is in those bytes, which is solid
+    /// black — a notch cut out of each corner, which is worse than the square
+    /// window the shape was meant to improve on. The launcher squares itself
+    /// off rather than take that risk, so this is asked before the window is
+    /// created.
+    ///
+    /// Not a rendering detail promoted into the platform layer: answering it
+    /// means reading session state — an X11 selection owner — and reaching for
+    /// the display server anywhere but a backend is what this workspace does
+    /// not do.
+    Compositing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

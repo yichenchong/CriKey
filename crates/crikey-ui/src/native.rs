@@ -40,14 +40,28 @@ pub struct NativeLauncherConfig {
     pub title: String,
     pub width: u32,
     pub height: u32,
-    /// Whether the launcher window is composited with what is behind it.
+    /// Whether the launcher's canvas is drawn see-through.
     ///
-    /// Drives both `with_transparent` on the window and the surface's
-    /// compositing mode, so the two cannot disagree. The shipped theme is
-    /// currently opaque, but that is a theming decision rather than a renderer
-    /// invariant: a translucent launcher backdrop is enabled here, not by
-    /// editing the surface configuration.
+    /// A theme decision, and only that: it chooses whether the area *inside*
+    /// the launcher's shape is filled with the canvas colour or left
+    /// see-through. The shipped theme is opaque. Whether the window has a
+    /// shape at all is [`Self::composited`].
     pub transparent: bool,
+    /// Whether the desktop composites window transparency, as reported by the
+    /// platform backend.
+    ///
+    /// The launcher's corners are rounded, which means presenting pixels that
+    /// are not opaque. A desktop that composites shows the wallpaper through
+    /// them; one that does not discards the alpha and presents solid black,
+    /// turning each corner into a notch. The renderer squares the window off
+    /// when this is false, so the fallback is the plain rectangle the launcher
+    /// had before rather than four black corners.
+    ///
+    /// It is an input rather than something the renderer works out because the
+    /// answer is session state — on X11, who owns `_NET_WM_CM_S0` — and
+    /// reaching for the display server outside a platform backend is what this
+    /// workspace does not do.
+    pub composited: bool,
     /// How the surface paces presentation.
     ///
     /// [`wgpu::PresentMode::AutoVsync`] is the shipped default and the right
@@ -66,6 +80,10 @@ impl Default for NativeLauncherConfig {
             width: theme::DEFAULT_WINDOW_WIDTH,
             height: theme::DEFAULT_WINDOW_HEIGHT,
             transparent: false,
+            // The conservative default: a caller that has not asked its
+            // platform backend gets the square window, because the failure
+            // mode of guessing the other way is four black corners.
+            composited: false,
             present_mode: wgpu::PresentMode::AutoVsync,
         }
     }
@@ -1262,7 +1280,16 @@ where
 
 struct GraphicsState {
     window: Arc<Window>,
+    /// Whether the canvas itself is drawn see-through, which is a theme
+    /// decision carried from [`NativeLauncherConfig`].
     transparent: bool,
+    /// Whether the surface can present the pixels outside the launcher's
+    /// rounded silhouette as nothing at all.
+    ///
+    /// Separate from `transparent`, because they answer different questions: a
+    /// launcher with an opaque canvas still needs its corners left unpainted,
+    /// and only this says whether the surface can do that.
+    shaped: bool,
     /// The height the window returns to as soon as it has something to show
     /// below the query field, in logical pixels.
     expanded_height: u32,
@@ -1380,24 +1407,28 @@ fn centred_origin(screen: PhysicalSize<u32>, window_width: u32, expanded_height_
     (x, y)
 }
 
-/// Picks the surface compositing mode that matches how the window was created.
+/// Picks the surface compositing mode that matches the shape the window is
+/// allowed to have.
 ///
-/// This is deliberately *not* a judgement about how the launcher should look.
-/// `transparent` is whatever [`NativeLauncherConfig`] asked for, and the same
-/// flag drives `with_transparent` on the window and the renderer's transparent
-/// canvas, so the surface, window and frame cannot disagree.
+/// The launcher is a rounded rectangle on an undecorated window, so its
+/// corners are *outside* what it paints, and it needs a surface that carries
+/// alpha to leave them unpainted. That is only worth asking for where the
+/// desktop composites: on a session that does not, the channel is discarded
+/// downstream and the corners present as solid black, so `composited` false
+/// asks for an opaque surface and the launcher keeps its square window.
 ///
-/// egui produces premultiplied colours, so a transparent window wants
-/// [`CompositeAlphaMode::PreMultiplied`] and an opaque one wants
-/// [`CompositeAlphaMode::Opaque`]. `Auto` — which resolves to opaque or inherit
-/// against the real surface — is the fallback for both, and the first
-/// advertised mode is the last resort so a backend offering neither still
-/// starts.
+/// egui produces premultiplied colours, so
+/// [`CompositeAlphaMode::PreMultiplied`] is the match for a shaped window and
+/// `PostMultiplied` its fallback. `Auto` — which resolves to opaque or inherit
+/// against the real surface — is the shared fallback, and the first advertised
+/// mode is the last resort so a backend offering none of them still starts. A
+/// shaped window that ends up opaque anyway is handled where the shape is
+/// drawn, not here.
 fn preferred_alpha_mode(
     modes: &[wgpu::CompositeAlphaMode],
-    transparent: bool,
+    composited: bool,
 ) -> Option<wgpu::CompositeAlphaMode> {
-    let ranked: [wgpu::CompositeAlphaMode; 2] = if transparent {
+    let ranked: [wgpu::CompositeAlphaMode; 2] = if composited {
         [
             wgpu::CompositeAlphaMode::PreMultiplied,
             wgpu::CompositeAlphaMode::PostMultiplied,
@@ -1440,7 +1471,13 @@ impl GraphicsState {
             ))
             .with_resizable(true)
             .with_decorations(false)
-            .with_transparent(config.transparent)
+            // Not a theming choice: the launcher's corners are rounded, and a
+            // window declared opaque has nowhere to put the pixels outside
+            // that shape. Asked for only where the desktop actually
+            // composites -- an X11 session with no compositing manager
+            // discards the alpha and presents those pixels black, so there the
+            // launcher stays the rectangle it was.
+            .with_transparent(config.composited)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_visible(false);
         let window = Arc::new(event_loop.create_window(attributes)?);
@@ -1465,6 +1502,7 @@ impl GraphicsState {
             window,
             proxy,
             config.transparent,
+            config.composited,
             config.height,
             config.present_mode,
         ))
@@ -1474,6 +1512,7 @@ impl GraphicsState {
         window: Arc<Window>,
         proxy: Arc<EventProxy>,
         transparent: bool,
+        composited: bool,
         expanded_height: u32,
         present_mode: wgpu::PresentMode,
     ) -> Result<Self, RendererError> {
@@ -1514,13 +1553,17 @@ impl GraphicsState {
         let capabilities = surface.get_capabilities(&adapter);
         let format = egui_wgpu::preferred_framebuffer_format(&capabilities.formats)
             .map_err(|_| RendererError::NoSurfaceFormat)?;
-        let alpha_mode = preferred_alpha_mode(&capabilities.alpha_modes, transparent)
+        let alpha_mode = preferred_alpha_mode(&capabilities.alpha_modes, composited)
             .ok_or(RendererError::NoSurfaceAlphaMode)?;
-        // A surface that advertises only `Opaque` ignores the alpha channel
-        // altogether, so a transparent canvas would be composited as solid
-        // black instead of disappearing. Draw the opaque theme in that case, so
-        // the window, the surface and the frame keep agreeing.
-        let transparent = transparent && alpha_mode != wgpu::CompositeAlphaMode::Opaque;
+        // Two independent ways to lose alpha, and the shape needs both to hold:
+        // the desktop has to composite the window, and the surface has to
+        // advertise a mode that carries the channel. Either one missing and
+        // anything left unpainted would present as solid black instead of
+        // disappearing, so both give way together -- the window is cleared to
+        // the canvas colour, which squares the corners off honestly, and a
+        // translucent canvas is drawn opaque.
+        let shaped = composited && alpha_mode != wgpu::CompositeAlphaMode::Opaque;
+        let transparent = transparent && shaped;
         let size = window.inner_size();
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1553,6 +1596,7 @@ impl GraphicsState {
         Ok(Self {
             window,
             transparent,
+            shaped,
             expanded_height,
             surface,
             device,
@@ -1762,7 +1806,10 @@ impl GraphicsState {
             self.renderer
                 .update_buffers(&self.device, &self.queue, &mut encoder, &paint_jobs, &screen);
         {
-            let color = clear_color(self.transparent);
+            // The shape decides this, not the theme: whatever the canvas is
+            // filled with, the corners the panel leaves unpainted keep whatever
+            // was cleared here.
+            let color = clear_color(self.shaped);
             let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("crikey launcher render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1902,6 +1949,12 @@ fn draw_launcher(
         .frame(
             Frame::default()
                 .fill(canvas_fill(colors, transparent))
+                // The window is undecorated, so this fill *is* the launcher's
+                // silhouette: nothing else paints its edge, and the corners it
+                // leaves unpainted are the corners the desktop shows through.
+                // The surface is configured to carry alpha for exactly this
+                // reason -- see `GraphicsState::initialize`.
+                .rounding(Rounding::same(theme::RADIUS_WINDOW))
                 .inner_margin(Margin::same(theme::PANEL_MARGIN)),
         )
         .show(context, |ui| {
@@ -2568,12 +2621,22 @@ fn draw_setting_row(
 /// clamped frame out and fails if the status row stops matching this, which is
 /// what let a 120-result list push the "120 results" line off the bottom of
 /// the window.
-const STATUS_BLOCK_HEIGHT: f32 = theme::CONTROL_HEIGHT;
+const STATUS_BLOCK_HEIGHT: f32 = theme::FOOTER_HEIGHT;
 
 fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
+    // A horizontal row is at least one interactive control tall, because that
+    // is the touch target egui reserves for the widgets it usually holds. This
+    // row holds text, and the launcher's height is arithmetic over
+    // `STATUS_BLOCK_HEIGHT`, so leaving the default would put a strip of empty
+    // canvas under the hint line in every window the launcher opens.
+    ui.spacing_mut().interact_size.y = theme::FOOTER_HEIGHT;
     ui.horizontal(|ui| {
         if model.pending_plugins {
-            ui.spinner();
+            // Sized to the line it sits on. At its default size the spinner is
+            // a whole control tall, which would make the footer grow by six
+            // pixels for as long as a provider is answering -- and the window
+            // is sized from the footer, so the whole launcher would twitch.
+            ui.add(egui::Spinner::new().size(theme::FOOTER_HEIGHT));
             ui.label(
                 RichText::new("Providers are still responding")
                     .small()
@@ -2591,10 +2654,30 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
             );
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            // The one control that is on screen no matter what the launcher is
-            // doing: without it a first-time user has no way of discovering
-            // that the launcher can be configured or told to quit at all.
-            if ui.button("Settings  Ctrl+,").clicked() {
+            // Set in the footer's own type rather than raised into a button:
+            // this line is a legend of what the keyboard can do, and `Ctrl+,`
+            // belongs in it beside `Tab` and `Esc`. It is still the one control
+            // on screen no matter what the launcher is doing, so it keeps a
+            // click -- a first-time user with no idea the shortcut exists must
+            // still be able to reach settings with the mouse.
+            let settings = ui
+                .add(
+                    egui::Label::new(RichText::new("Settings  Ctrl+,").small().color(colors.text))
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            // Drawn in the same frame the hover is detected in, so the
+            // underline is the answer to this pointer position rather than to
+            // the last one. Recolouring the text instead would paint a frame
+            // late, because the glyphs are already laid out by here.
+            if settings.hovered() {
+                let edge = settings.rect;
+                ui.painter().line_segment(
+                    [edge.left_bottom(), edge.right_bottom()],
+                    Stroke::new(1.0, colors.text),
+                );
+            }
+            if settings.clicked() {
                 commands.push(UiCommand::OpenSettings);
             }
             ui.label(
@@ -2606,12 +2689,19 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
     });
 }
 
-fn clear_color(transparent: bool) -> wgpu::Color {
-    // A transparent surface is composited premultiplied, where the colour
+/// What the window is cleared to underneath everything the launcher draws.
+///
+/// `shaped` is whether the surface can carry alpha. When it can, the clear is
+/// nothing at all, so the corners outside the launcher's rounded silhouette
+/// show the desktop. When it cannot, clearing to nothing would present as
+/// solid black, so the canvas colour is used instead and the window reads as
+/// the square it is being forced to be.
+fn clear_color(shaped: bool) -> wgpu::Color {
+    // A surface carrying alpha is composited premultiplied, where the colour
     // channels are already scaled by alpha: at alpha zero every other channel
     // must be zero too, or the desktop showing through gets the canvas colour
     // added on top of it instead of being left alone.
-    if transparent {
+    if shaped {
         return wgpu::Color::TRANSPARENT;
     }
 
@@ -2683,16 +2773,19 @@ mod transparency_tests {
             .any(|clipped| contains_fill(&clipped.shape, egui::Color32::TRANSPARENT)));
     }
 
+    /// The clear is what the launcher's corners are left showing, so a surface
+    /// that cannot blend has to be cleared to the canvas rather than to
+    /// nothing.
     #[test]
-    fn clear_color_tracks_the_selected_alpha_mode() {
-        let opaque = clear_color(false);
+    fn an_unshaped_surface_is_cleared_to_the_canvas_rather_than_to_nothing() {
+        let squared = clear_color(false);
         let canvas = theme::palette().canvas;
-        assert_eq!(opaque.a, 1.0);
-        assert_eq!(opaque.r, f64::from(canvas.r()) / 255.0);
+        assert_eq!(squared.a, 1.0);
+        assert_eq!(squared.r, f64::from(canvas.r()) / 255.0);
 
         // Premultiplied compositing adds the clear colour straight onto the
-        // desktop, so a transparent canvas must be zero in every channel and
-        // not merely zero in alpha.
+        // desktop, so the pixels outside the shape must be zero in every
+        // channel and not merely zero in alpha.
         assert_eq!(clear_color(true), wgpu::Color::TRANSPARENT);
     }
 
@@ -2932,25 +3025,10 @@ mod label_tests {
 mod surface_tests {
     use super::*;
 
-    /// An opaque window takes an advertised `Opaque` mode no matter where the
-    /// backend lists it. This is the case `.first()` got right only by luck.
+    /// A shaped window needs a blending mode even when the backend advertises
+    /// an opaque one first. This is the case `.first()` got right only by luck.
     #[test]
-    fn an_opaque_window_chooses_opaque_even_when_listed_late() {
-        let modes = [
-            wgpu::CompositeAlphaMode::PreMultiplied,
-            wgpu::CompositeAlphaMode::Opaque,
-        ];
-        assert_eq!(
-            preferred_alpha_mode(&modes, false),
-            Some(wgpu::CompositeAlphaMode::Opaque)
-        );
-    }
-
-    /// The renderer must not impose opacity on a theme that asked for
-    /// transparency: a transparent window takes a blending mode even when an
-    /// opaque one is advertised first.
-    #[test]
-    fn a_transparent_window_is_not_forced_opaque() {
+    fn an_opaque_mode_never_wins_over_one_that_blends() {
         let modes = [
             wgpu::CompositeAlphaMode::Opaque,
             wgpu::CompositeAlphaMode::PreMultiplied,
@@ -2961,10 +3039,25 @@ mod surface_tests {
         );
     }
 
-    /// egui emits premultiplied colours, so that mode is preferred over
-    /// postmultiplied when a transparent surface offers both.
+    /// The reverse, and the reason the desktop is asked at all: where nothing
+    /// composites, a blending surface would present the corners black. An
+    /// opaque one is what the square fallback is drawn on.
     #[test]
-    fn a_transparent_window_prefers_premultiplied() {
+    fn an_uncomposited_desktop_takes_the_opaque_mode() {
+        let modes = [
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::Opaque,
+        ];
+        assert_eq!(
+            preferred_alpha_mode(&modes, false),
+            Some(wgpu::CompositeAlphaMode::Opaque)
+        );
+    }
+
+    /// egui emits premultiplied colours, so that mode is preferred over
+    /// postmultiplied when a shaped surface offers both.
+    #[test]
+    fn premultiplied_is_preferred_over_postmultiplied() {
         let modes = [
             wgpu::CompositeAlphaMode::PostMultiplied,
             wgpu::CompositeAlphaMode::PreMultiplied,
@@ -2981,17 +3074,18 @@ mod surface_tests {
     fn auto_is_the_fallback_for_either_intent() {
         let modes = [wgpu::CompositeAlphaMode::Auto];
         assert_eq!(
-            preferred_alpha_mode(&modes, false),
+            preferred_alpha_mode(&modes, true),
             Some(wgpu::CompositeAlphaMode::Auto)
         );
         assert_eq!(
-            preferred_alpha_mode(&modes, true),
+            preferred_alpha_mode(&modes, false),
             Some(wgpu::CompositeAlphaMode::Auto)
         );
     }
 
-    /// A surface offering none of the preferred modes still starts rather than
-    /// refusing to open.
+    /// A surface offering neither preference still opens: the window loses its
+    /// rounded corners rather than the launcher losing its window, and
+    /// `clear_color` is what keeps that honest.
     #[test]
     fn the_first_advertised_mode_is_the_last_resort() {
         let modes = [wgpu::CompositeAlphaMode::PostMultiplied];
@@ -3005,8 +3099,8 @@ mod surface_tests {
     /// the surface with.
     #[test]
     fn no_advertised_mode_is_an_error_rather_than_a_guess() {
-        assert_eq!(preferred_alpha_mode(&[], false), None);
         assert_eq!(preferred_alpha_mode(&[], true), None);
+        assert_eq!(preferred_alpha_mode(&[], false), None);
     }
 }
 
@@ -3502,6 +3596,39 @@ mod window_geometry_tests {
         );
     }
 
+    /// The same height, at the narrowest the user may drag the window to.
+    ///
+    /// The footer is text now, and text wraps: at some width the hint line and
+    /// the settings control stop fitting side by side, and a footer that
+    /// answers by taking a second line is a footer taller than the window
+    /// reserves for it. The hints may wrap away, because they are a legend;
+    /// the control may not, because the window height is arithmetic over it.
+    #[test]
+    fn the_footer_stays_one_line_at_the_narrowest_window() {
+        let model = view("", false);
+        let input = RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(
+                    f32::from(theme::MIN_WINDOW_WIDTH as u16),
+                    f32::from(theme::COMPACT_WINDOW_HEIGHT as u16),
+                ),
+            )),
+            ..Default::default()
+        };
+        let frame = build_launcher_frame(&create_launcher_context(), input, &model);
+
+        let bottom = frame_bottom(&frame);
+        let needed = bottom + theme::PANEL_MARGIN;
+        let window = f32::from(theme::COMPACT_WINDOW_HEIGHT as u16);
+        assert!(
+            needed <= window,
+            "at {} px wide the compact frame draws down to {bottom}, so it needs {needed} \
+             and the window is only {window} tall: the footer wrapped",
+            theme::MIN_WINDOW_WIDTH
+        );
+    }
+
     /// The same clipping check with the action list open.
     ///
     /// A long result set hides this: it clamps to the expanded height, which is
@@ -3630,20 +3757,37 @@ mod window_geometry_tests {
                 .collect();
             rects.sort_by(|left, right| left.min.y.total_cmp(&right.min.y));
 
-            // The footer is the last thing the frame draws and its one
-            // rectangle is the `Settings  Ctrl+,` button, whose interact_size
-            // is what makes the status row as tall as it is. There is no
-            // separator to find it by any more, so it is found by being last.
-            // The unexpanded `rect` is the layout rect; `visual_bounding_rect`
-            // would add half the stroke.
-            let footer = *rects.last().expect("a listed frame paints the footer button");
+            // The footer paints no rectangle any more -- it is two runs of
+            // text -- so it is found as the lowest text the frame draws, and
+            // its height is the union of everything sharing that line. The
+            // rectangles above are still what proves nothing else is down
+            // there.
+            let mut lines: Vec<egui::Rect> = shapes
+                .iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Text(text) => Some(egui::Rect::from_min_size(
+                        text.pos,
+                        egui::vec2(text.galley.rect.width(), text.galley.rect.height()),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            lines.sort_by(|left, right| left.min.y.total_cmp(&right.min.y));
+            let last = lines
+                .last()
+                .copied()
+                .expect("a listed frame paints the footer text");
+            let footer = lines
+                .iter()
+                .filter(|line| line.min.y >= last.min.y - 1.0)
+                .fold(last, |joined, line| joined.union(*line));
             // Where a rectangle *starts*, not where it ends: the last row of a
             // clamped list is cut off by the scroll area's clip rect, so its
             // rectangle reaches under the footer while none of it is drawn
             // there.
             assert!(
-                rects.iter().filter(|rect| rect.min.y >= footer.min.y).count() == 1,
-                "the footer is one control, not {:?}",
+                rects.iter().filter(|rect| rect.min.y >= footer.min.y).count() == 0,
+                "nothing but text belongs in the footer, found {:?}",
                 rects
                     .iter()
                     .filter(|rect| rect.min.y >= footer.min.y)

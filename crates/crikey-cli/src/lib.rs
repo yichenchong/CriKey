@@ -308,9 +308,17 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         .as_ref()
         .map(|configuration| DisabledPlugins::from_ids(configuration.store.disabled_plugins()))
         .unwrap_or_default();
-    let launcher = NativeLauncher::new(NativeLauncherConfig::default()).map_err(|error| error.to_string())?;
+    // The backend is asked before the window exists, because whether the
+    // desktop composites decides whether the window may be a rounded shape at
+    // all -- and that is fixed at creation, not per frame.
+    let app = App::new();
+    let window = NativeLauncherConfig {
+        composited: app.desktop_composites(),
+        ..NativeLauncherConfig::default()
+    };
+    let launcher = NativeLauncher::new(window).map_err(|error| error.to_string())?;
     let render_handle = launcher.handle();
-    let mut search = SearchService::new(App::new());
+    let mut search = SearchService::new(app);
     if let Some(configuration) = configuration.as_ref() {
         search.set_aliases(configured_aliases(&configuration.store));
     }

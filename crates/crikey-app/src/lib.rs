@@ -504,6 +504,22 @@ impl App {
     pub fn platform_backend_name() -> &'static str {
         Backend::NAME
     }
+
+    /// Whether this session's desktop composites window transparency.
+    ///
+    /// Asked before the launcher window is created, because it decides whether
+    /// the window may have a shape: a rounded window on a desktop that
+    /// discards alpha presents black corners rather than rounded ones. Only
+    /// [`CapabilityState::Available`] is an answer to build a shape on —
+    /// `Partial` and the rest describe a capability that works sometimes,
+    /// which for a window that is either the right shape or visibly wrong is
+    /// the same as no.
+    pub fn desktop_composites(&self) -> bool {
+        matches!(
+            self.backend.capability(crikey_platform::Capability::Compositing),
+            crikey_platform::CapabilityState::Available
+        )
+    }
 }
 
 /// The path a file item names, or the refusal that says why it names none.

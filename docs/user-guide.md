@@ -53,8 +53,9 @@ crikey config layers [<key>]
 
 The launcher's own settings — the activation hotkey, the result ceiling, the
 selected profile — also have a surface that does not require knowing a key
-name. Press `Ctrl+,` in the launcher, or use the footer's Settings button, to
-edit them in place; the same rows are readable and writable from a terminal:
+name. Press `Ctrl+,` in the launcher, or click `Settings` in the hint line
+along the bottom, to edit them in place; the same rows are readable and
+writable from a terminal:
 
 ```sh
 crikey settings

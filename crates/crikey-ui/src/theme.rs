@@ -14,12 +14,12 @@ pub(crate) const MIN_WINDOW_WIDTH: u32 = 480;
 /// because a minimum above it would keep the compact window from compacting.
 ///
 /// It is the whole compact frame, both panel margins included:
-/// [`PANEL_MARGIN`] + [`FIELD_HEIGHT`] + the block gap + [`CONTROL_HEIGHT`] +
-/// [`PANEL_MARGIN`]. `desired_window_height` adds the result list to it rather
-/// than re-deriving the field and the footer, and
+/// [`PANEL_MARGIN`] + [`FIELD_HEIGHT`] + the block gap +
+/// [`FOOTER_HEIGHT`] + [`PANEL_MARGIN`]. `desired_window_height` adds the
+/// result list to it rather than re-deriving the field and the footer, and
 /// `a_compact_window_leaves_room_for_the_field_and_the_footer` lays the
 /// compact frame out and fails if this stops covering what it draws.
-pub(crate) const COMPACT_WINDOW_HEIGHT: u32 = 104;
+pub(crate) const COMPACT_WINDOW_HEIGHT: u32 = 94;
 pub(crate) const MIN_WINDOW_HEIGHT: u32 = COMPACT_WINDOW_HEIGHT;
 
 pub(crate) const SPACE_1: f32 = 4.0;
@@ -52,9 +52,10 @@ pub(crate) const FIELD_HEIGHT: f32 = 40.0;
 /// The height of one interactive control, in logical pixels
 /// (`Spacing::interact_size.y`).
 ///
-/// The footer's `Settings  Ctrl+,` button and every button in the action list
-/// are this tall, which makes it part of both `STATUS_BLOCK_HEIGHT` and
-/// `actions_overlay_height`.
+/// Every button in the action list is this tall, which makes it part of
+/// `actions_overlay_height`. The footer no longer contains one: `Settings
+/// Ctrl+,` is set in the footer's own small type, so `STATUS_BLOCK_HEIGHT` is
+/// [`FOOTER_HEIGHT`] instead.
 pub(crate) const CONTROL_HEIGHT: f32 = 24.0;
 
 /// The height of one result row, in logical pixels.
@@ -94,6 +95,16 @@ pub(crate) const ROW_LINE_GAP: f32 = 2.0;
 pub(crate) const RADIUS_SMALL: f32 = 4.0;
 pub(crate) const RADIUS_MEDIUM: f32 = 8.0;
 
+/// The radius of the launcher window's own corners, in logical pixels.
+///
+/// Concentric with the query field rather than a size of its own: an arc of
+/// [`RADIUS_MEDIUM`] set [`PANEL_MARGIN`] inside this one begins turning on
+/// exactly the same horizontal and vertical lines, so the window's curve runs
+/// parallel to the field's at a constant distance. Any other outer radius
+/// starts its turn early or late against the field it encloses, which is what
+/// reads as the corner being wrong even when both are rounded.
+pub(crate) const RADIUS_WINDOW: f32 = RADIUS_MEDIUM + PANEL_MARGIN;
+
 /// The edge of a result row's icon slot, in logical pixels.
 ///
 /// The slot is a fixed square whether or not an icon fills it, so the label
@@ -106,6 +117,20 @@ pub(crate) const TEXT_SMALL: f32 = 12.0;
 pub(crate) const TEXT_BODY: f32 = 14.0;
 pub(crate) const TEXT_LABEL: f32 = 16.0;
 pub(crate) const TEXT_QUERY: f32 = 24.0;
+
+/// The height of the footer, in logical pixels: one line of [`TEXT_SMALL`]
+/// and nothing else.
+///
+/// The footer holds no buttons any more, so it is as tall as its own text
+/// rather than as tall as a control. Left at the control height it would
+/// reserve five pixels of empty canvas under the hint line, and the window
+/// height is arithmetic over this, so that strip would appear in every window
+/// the launcher opens.
+///
+/// Measured rather than chosen — egui lays [`TEXT_SMALL`] out 14 px tall —
+/// and `a_compact_window_leaves_room_for_the_field_and_the_footer` lays a real
+/// footer out and fails if the two ever disagree.
+pub(crate) const FOOTER_HEIGHT: f32 = 14.0;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Palette {

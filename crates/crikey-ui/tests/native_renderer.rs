@@ -630,6 +630,59 @@ fn the_footer_offers_the_settings_surface_to_a_user_who_knows_no_shortcut() {
     assert!(clicked.commands.contains(&UiCommand::OpenSettings));
 }
 
+/// Set as text, the settings control has no button frame to say it can be
+/// clicked, so the pointer has to be answered some other way or it reads as
+/// part of the hint line beside it. It underlines under the pointer, and only
+/// under the pointer.
+#[test]
+fn the_settings_text_answers_the_pointer_it_is_under() {
+    fn underlines(frame: &crikey_ui::NativeUiFrame) -> usize {
+        fn count(shape: &egui::Shape, found: &mut usize) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| count(shape, found)),
+                // A horizontal hairline is the underline; the launcher draws
+                // no other line segment, and a rule under the footer was
+                // removed precisely because it read as a border.
+                egui::Shape::LineSegment { points, .. } if points[0].y == points[1].y => *found += 1,
+                _ => {}
+            }
+        }
+
+        let mut found = 0;
+        for clipped in &frame.output.shapes {
+            count(&clipped.shape, &mut found);
+        }
+        found
+    }
+
+    let context = create_launcher_context();
+    let view = model("");
+    let located = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let settings = position_of(&located, "Settings");
+
+    let elsewhere = build_launcher_frame(
+        &context,
+        launcher_input(vec![egui::Event::PointerMoved(egui::pos2(8.0, 8.0))]),
+        &view,
+    );
+    assert_eq!(
+        underlines(&elsewhere),
+        0,
+        "a pointer away from the control must leave the footer as plain text"
+    );
+
+    let over = build_launcher_frame(
+        &context,
+        launcher_input(vec![egui::Event::PointerMoved(settings + egui::vec2(4.0, 4.0))]),
+        &view,
+    );
+    assert_eq!(
+        underlines(&over),
+        1,
+        "text that opens a surface when clicked must show the pointer that it will"
+    );
+}
+
 #[test]
 fn the_settings_surface_lists_the_activation_hotkey_and_commits_an_edit() {
     let context = create_launcher_context();
@@ -694,4 +747,54 @@ fn the_settings_surface_offers_a_quit_control() {
     );
 
     assert!(clicked.commands.contains(&UiCommand::Quit));
+}
+
+/// The window's corner and the query field's corner have to begin turning on
+/// the same horizontal and vertical lines.
+///
+/// Two arcs a fixed distance apart do that exactly when the outer radius is
+/// the inner radius plus that distance, which here is the panel margin. The
+/// reported defect was both corners being rounded and the outer one still
+/// looking wrong, so what this pins is the relationship, not the two numbers:
+/// a later theme may round both more or less, but not independently.
+#[test]
+fn the_window_corner_is_concentric_with_the_query_field() {
+    fn rounded_rects(shape: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| rounded_rects(shape, out)),
+            egui::Shape::Rect(rect) => out.push(*rect),
+            _ => {}
+        }
+    }
+
+    let context = create_launcher_context();
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &model(""));
+    let mut rects = Vec::new();
+    for clipped in &frame.output.shapes {
+        rounded_rects(&clipped.shape, &mut rects);
+    }
+
+    // The canvas is the whole window and the field is the one sheet on it, so
+    // widest-first is outer then inner without naming a colour.
+    rects.sort_by(|left, right| right.rect.width().total_cmp(&left.rect.width()));
+    let window = rects.first().expect("the launcher paints its canvas");
+    let field = rects.get(1).expect("the launcher paints its query field");
+
+    let gap = field.rect.min.x - window.rect.min.x;
+    assert!(gap > 0.0, "the field must sit inside the window, not on its edge");
+    assert_eq!(
+        window.rounding.nw - field.rounding.nw,
+        gap,
+        "the window rounds by {} and the field by {} across a {gap} px margin, so their \
+         arcs start on different lines: the outer corner cuts across the inner one",
+        window.rounding.nw,
+        field.rounding.nw
+    );
+    // A corner cannot be concentric on one side only.
+    for radius in [window.rounding.ne, window.rounding.sw, window.rounding.se] {
+        assert_eq!(
+            radius, window.rounding.nw,
+            "every window corner is the same corner"
+        );
+    }
 }

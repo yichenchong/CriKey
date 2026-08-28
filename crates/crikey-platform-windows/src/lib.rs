@@ -181,6 +181,16 @@ impl WindowsBackend {
                     CapabilityState::Unavailable
                 }
             }
+            // The Desktop Window Manager composites every top-level window it
+            // presents, and since Windows 8 that is not optional: the Basic
+            // theme and the service switch that turned Aero composition off in
+            // Vista and 7 were both removed, so no supported release has a path
+            // on which a layered window's alpha is discarded and its corners
+            // painted opaque. Unconditional rather than gated on
+            // `cfg!(target_os = "windows")` like the arms above, because this
+            // answer is a property of the presentation model rather than a
+            // Win32 entry point the build has to be able to reach.
+            Capability::Compositing => CapabilityState::Available,
             Capability::WindowEnumeration
             | Capability::WindowActivation
             | Capability::Notifications

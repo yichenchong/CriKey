@@ -594,6 +594,13 @@ impl MacOsBackend {
                     CapabilityState::Unavailable
                 }
             }
+            // The window server composites every window it presents -- that is
+            // how `NSWindow` alpha, shadows and rounded corners exist at all --
+            // and no release this backend targets has ever offered a
+            // non-composited path to fall back to. Unlike the pasteboard above
+            // there is no per-process or per-session state that could make the
+            // answer come out any other way, so nothing is probed.
+            Capability::Compositing => CapabilityState::Available,
             Capability::GlobalHotkeys
             | Capability::WindowEnumeration
             | Capability::WindowActivation

@@ -78,6 +78,9 @@ pub use icons::XdgIconSource;
 pub mod file_search;
 pub use file_search::FilesystemSearch;
 
+pub mod compositing;
+pub use compositing::compositor_is_running;
+
 pub mod hotkeys;
 pub mod wayland;
 pub mod window;
@@ -673,9 +676,9 @@ impl LinuxBackend {
     /// is a fact about the compositor and not a CriKey defect to report or a
     /// permission prompt away.
     ///
-    /// Global shortcuts under Wayland are the one answer this function cannot
-    /// derive from the session label, and the one place it reaches outside the
-    /// process. The compositor withholds key grabs, but the
+    /// Global shortcuts under Wayland are one of the two answers this function
+    /// cannot derive from the session label, and one of the two places it
+    /// reaches outside the process. The compositor withholds key grabs, but the
     /// `GlobalShortcuts` portal grants them back (ADR-0011) -- and the portal
     /// is a separate service that may not be installed. So the portal is
     /// probed, once, and `Available` means it answered while `Unavailable`
@@ -694,6 +697,12 @@ impl LinuxBackend {
     /// connecting. Global shortcuts stay `Available` under X11: `GrabKey` is
     /// core protocol, so an X11 display with no window manager still delivers
     /// them.
+    ///
+    /// Compositing is the other answer that opens a display, and it is the one
+    /// that is *not* cached: a portal is installed or not for a whole run,
+    /// while a user starts and stops a compositor whenever they please, so the
+    /// `_NET_WM_CM_S<screen>` selection is read afresh on every ask (see
+    /// [`compositing`]).
     pub fn capability(&self, capability: Capability) -> CapabilityState {
         match capability {
             Capability::ApplicationDiscovery | Capability::ProcessLaunch => CapabilityState::Available,
@@ -756,6 +765,34 @@ impl LinuxBackend {
             Capability::Clipboard => match self.desktop {
                 DesktopEnvironment::X11 => CapabilityState::Available,
                 DesktopEnvironment::Wayland => CapabilityState::Partial,
+                DesktopEnvironment::Headless => CapabilityState::Unavailable,
+            },
+            // Compositing is the second answer here that cannot be derived
+            // from the session label, and the second place this function
+            // reaches outside the process (the first being the portal probe
+            // above). Wayland needs no probe: compositing is what a Wayland
+            // compositor is, and a session that had none would have no
+            // display. X11 predates the idea entirely -- a compositing manager
+            // is a separate, optional program -- so the session type says
+            // nothing and the display has to be asked, by reading the owner of
+            // the `_NET_WM_CM_S<screen>` selection that such a manager holds
+            // for as long as it runs (see [`compositing`]). A session with no
+            // display server composites nothing.
+            //
+            // Deliberately not `Partial` under X11, which is what the
+            // session-plus-runtime-gate capabilities above report. There is no
+            // gate left to fail: the answer *is* the runtime state, asked at
+            // the moment of asking, and a caller that gets `Available` may put
+            // transparency on the screen.
+            Capability::Compositing => match self.desktop {
+                DesktopEnvironment::X11 => {
+                    if compositing::compositor_is_running(None) {
+                        CapabilityState::Available
+                    } else {
+                        CapabilityState::Unavailable
+                    }
+                }
+                DesktopEnvironment::Wayland => CapabilityState::Available,
                 DesktopEnvironment::Headless => CapabilityState::Unavailable,
             },
             Capability::UriOpen
