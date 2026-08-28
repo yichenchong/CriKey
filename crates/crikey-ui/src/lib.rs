@@ -214,6 +214,18 @@ pub struct LauncherViewModel {
     /// renderer is still holding must keep describing what it was given.
     rows: Arc<[ResultRow]>,
     selected: usize,
+    /// Whether the user has moved the selection themselves within the current
+    /// generation.
+    ///
+    /// Row zero is where every generation starts, and until an arrow key is
+    /// pressed it is a *default* rather than a choice. The distinction decides
+    /// what a republish does: results arrive in waves -- the catalog answers
+    /// first and a provider's ranked rows can land afterwards and outrank it --
+    /// so following the previously selected item would drag the highlight down
+    /// the list as better rows appear above it, which is the launcher moving
+    /// the selection the user never touched. Once they have chosen a row, the
+    /// opposite is true and the row must be followed wherever it moves.
+    navigated: bool,
     /// Whether the selected row's action list is open (spec 6.3).
     actions_open: bool,
     pending_plugins: bool,
@@ -261,6 +273,7 @@ impl LauncherViewModel {
             query: String::new(),
             rows: Arc::default(),
             selected: 0,
+            navigated: false,
             actions_open: false,
             pending_plugins: false,
             settings_open: false,
@@ -313,6 +326,7 @@ impl LauncherViewModel {
         self.query.clear();
         self.rows = Arc::default();
         self.selected = 0;
+        self.navigated = false;
         self.actions_open = false;
         self.pending_plugins = false;
         self.settings_open = false;
@@ -339,6 +353,9 @@ impl LauncherViewModel {
         }
 
         self.floor = Some(generation);
+        // A new query is a new default. Whatever the user had chosen belonged
+        // to the answer they were choosing from.
+        self.navigated = false;
         self.active = Some(generation);
         self.pending_plugins = true;
         self.dirty = true;
@@ -503,6 +520,7 @@ impl LauncherViewModel {
         if self.query.is_empty() {
             self.rows = Arc::default();
             self.selected = 0;
+            self.navigated = false;
             self.actions_open = false;
         }
         self.dirty = true;
@@ -657,6 +675,9 @@ impl LauncherViewModel {
         }
 
         self.selected = target;
+        // The only path a person's arrow or page key reaches, so this is where
+        // a default becomes a choice.
+        self.navigated = true;
         // The action list belongs to the row it was opened over, so moving off
         // that row closes it instead of silently retargeting it.
         self.actions_open = false;
@@ -676,6 +697,14 @@ impl LauncherViewModel {
         };
 
         if self.published != Some(generation) {
+            return 0;
+        }
+
+        // Untouched selections stay at the top. A later wave of results can
+        // outrank what the first wave put in row zero, and following the item
+        // the user never chose would walk the highlight down the list under
+        // them.
+        if !self.navigated {
             return 0;
         }
 

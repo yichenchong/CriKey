@@ -92,9 +92,11 @@ jobs:
         # package built without it installs with no window but a progress bar,
         # which reads to everyone who double-clicks it as an installer that
         # opened and then closed.
-        # The Util extension supplies `util:CloseApplication`, which is what
-        # asks a running launcher to exit before the installer replaces its own
-        # executable. Without it `wix build` stops on an unknown element.
+        # The Util extension supplies two things: `util:CloseApplication`,
+        # which asks a running launcher to exit before the installer replaces
+        # its own executable, and the `Wix4UtilCA_X64` custom action DLL behind
+        # the finish dialog's "Start CriKey now" checkbox. Without it `wix
+        # build` stops on an unknown element or an unresolved binary reference.
         run: |
           dotnet tool install --global wix --version "5.*"
           wix extension add --global WixToolset.UI.wixext/5.0.2
@@ -191,6 +193,128 @@ jobs:
           }
           if ($targets -notcontains 'crikey-launcher.exe') {
             throw "the close-application table targets $($targets -join ', '), not crikey-launcher.exe"
+          }
+      - name: Prove the finish dialog can start the launcher, and only the dialog can
+        # `crikey.wxs` offers "Start CriKey now" on the exit dialog. Nothing
+        # else in this pipeline can see it: every install here runs `/qn`, which
+        # never opens a dialog, so the whole feature could be silently absent
+        # and every other gate would still pass. A `DoAction` whose custom
+        # action stopped being emitted, a WixUI control that got renamed under
+        # it, or a condition somebody widened are all invisible until a user
+        # double-clicks the package. Read the rows the feature is made of out of
+        # the built database instead.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem target/packaging/windows/*.msi | Select-Object -First 1).FullName
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $database = $installer.GetType().InvokeMember(
+            'OpenDatabase', 'InvokeMethod', $null, $installer, @($msi, 0))
+          # Four tables are read below, so the fetch loop the steps above write
+          # out by hand is a function here. Rows come back as objects rather
+          # than arrays because PowerShell unrolls an array written to the
+          # pipeline, which silently flattens a one-row result set.
+          function Get-MsiRows($sql, $columns) {
+            $view = $database.GetType().InvokeMember(
+              'OpenView', 'InvokeMethod', $null, $database, @($sql))
+            $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+            $rows = New-Object System.Collections.ArrayList
+            while ($true) {
+              $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+              if ($null -eq $record) { break }
+              $row = [ordered]@{}
+              for ($i = 0; $i -lt $columns.Count; $i++) {
+                $row[$columns[$i]] = $record.GetType().InvokeMember(
+                  'StringData', 'GetProperty', $null, $record, @($i + 1))
+              }
+              [void]$rows.Add([pscustomobject]$row)
+            }
+            return $rows
+          }
+
+          $launch = Get-MsiRows 'SELECT `Action`, `Type`, `Source`, `Target` FROM `CustomAction`' `
+            @('Action', 'Type', 'Source', 'Target') |
+            Where-Object { $_.Action -eq 'LaunchCrikeyLauncher' }
+          if (-not $launch) {
+            throw 'the MSI has no LaunchCrikeyLauncher custom action, so the finish dialog checkbox cannot start anything'
+          }
+          $type = [int]$launch.Type
+          Write-Host "LaunchCrikeyLauncher: type $type, binary $($launch.Source), entry point $($launch.Target)"
+          # Only the unelevated entry point routes the launch through the
+          # desktop shell. WixShellExec would hand a launcher started from an
+          # elevated install the installer's high-integrity token, and every
+          # plugin process the launcher supervises would inherit it.
+          if ($launch.Target -ne 'WixUnelevatedShellExec') {
+            throw "LaunchCrikeyLauncher calls $($launch.Target), not WixUnelevatedShellExec, so an install started from an elevated shell would leave an elevated launcher behind"
+          }
+          # msidbCustomActionTypeInScript (1024) makes an action deferred, which
+          # the ShellExec family cannot be, and msidbCustomActionTypeNoImpersonate
+          # (2048) would run it as the installing account rather than the user.
+          if ($type -band 1024) {
+            throw 'LaunchCrikeyLauncher is deferred; the ShellExec custom actions only work as immediate actions'
+          }
+          if ($type -band 2048) {
+            throw 'LaunchCrikeyLauncher no longer impersonates, so it would start the launcher as the installing account'
+          }
+          # msidbCustomActionTypeContinue (64): the product is installed and
+          # committed by the time the Finish button exists, so a launch that
+          # fails must not report the completed install as a failure.
+          if (-not ($type -band 64)) {
+            throw 'LaunchCrikeyLauncher does not ignore its return code, so a launcher that would not start would fail an install that had already succeeded'
+          }
+
+          $properties = @{}
+          foreach ($row in (Get-MsiRows 'SELECT `Property`, `Value` FROM `Property`' @('Property', 'Value'))) {
+            $properties[$row.Property] = $row.Value
+          }
+          # The target is a formatted file reference, resolved by the installer
+          # to wherever the launcher landed. Asserted by name for the same
+          # reason the close-application target is: the custom action does
+          # whatever this property says and nothing checks it at build time.
+          if ($properties['WixUnelevatedShellExecTarget'] -ne '[#CrikeyLauncherExe]') {
+            throw "the launch target is '$($properties['WixUnelevatedShellExecTarget'])', not the installed crikey-launcher.exe"
+          }
+          if (-not $properties['WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT']) {
+            throw 'the exit dialog has no optional checkbox text, so WixUI never draws the checkbox and the action can never be published'
+          }
+          if ($properties['WIXUI_EXITDIALOGOPTIONALCHECKBOX'] -ne '1') {
+            throw 'the exit dialog checkbox no longer defaults to checked'
+          }
+
+          $events = Get-MsiRows 'SELECT `Dialog_`, `Control_`, `Event`, `Argument`, `Condition`, `Ordering` FROM `ControlEvent`' `
+            @('Dialog', 'Control', 'Event', 'Argument', 'Condition', 'Ordering')
+          $finish = $events | Where-Object { $_.Dialog -eq 'ExitDialog' -and $_.Control -eq 'Finish' }
+          $doAction = $finish | Where-Object { $_.Event -eq 'DoAction' -and $_.Argument -eq 'LaunchCrikeyLauncher' }
+          if (-not $doAction) {
+            throw 'the Finish button of ExitDialog does not publish LaunchCrikeyLauncher, so the checkbox does nothing'
+          }
+          Write-Host "launch condition: $($doAction.Condition)"
+          # Unchecked box, repair, or uninstall: WixUI_Minimal routes all three
+          # through this same dialog, and the checkbox property is public and
+          # can be set on the command line.
+          foreach ($required in @('WIXUI_EXITDIALOGOPTIONALCHECKBOX', 'NOT Installed')) {
+            if ($doAction.Condition -notlike "*$required*") {
+              throw "the launch condition is '$($doAction.Condition)', which does not require '$required': it would fire on a repair or an uninstall, or with the box unchecked"
+            }
+          }
+          # Control events fire in ascending order and EndDialog/Return closes
+          # the UI sequence, so a launch ordered after it never runs.
+          foreach ($end in ($finish | Where-Object { $_.Event -eq 'EndDialog' })) {
+            Write-Host "DoAction at $($doAction.Ordering), EndDialog at $($end.Ordering)"
+            if ([int]$doAction.Ordering -ge [int]$end.Ordering) {
+              throw "the launch is published at order $($doAction.Ordering), at or after the EndDialog at $($end.Ordering), so clicking Finish would close the dialog without starting anything"
+            }
+          }
+          # And the half that keeps an unattended install quiet: a control event
+          # only exists inside a dialog, and `/qn` opens none. An action also
+          # scheduled in either sequence table would run with no one watching
+          # and put a GUI process on an unattended machine.
+          foreach ($table in @('InstallExecuteSequence', 'InstallUISequence')) {
+            $sql = 'SELECT `Action` FROM `' + $table + '`'
+            $scheduled = Get-MsiRows $sql @('Action') | Where-Object { $_.Action -eq 'LaunchCrikeyLauncher' }
+            if ($scheduled) {
+              throw "LaunchCrikeyLauncher is scheduled in $table, so a silent /qn install would start the launcher with nobody watching"
+            }
           }
       - name: Archive the staged tree as a portable zip
         # The MSI is a per-user install; the zip is what someone who wants to

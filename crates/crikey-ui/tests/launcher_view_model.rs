@@ -582,6 +582,73 @@ fn selection_follows_the_same_item_when_a_republish_reorders_the_rows() {
     assert_eq!(selected_id(&model), "gamma");
 }
 
+/// The reported defect: results arrive in waves, and a later wave outranking
+/// the first must not drag the highlight down the list.
+///
+/// Typing `mor` answers from the catalog first, putting a substring match on
+/// "Memory Diagnostics Tool" in row zero. The file provider's prefix match on
+/// "Mortgage Analysis" is ranked in afterwards and takes the top. Anchoring on
+/// row zero's item would follow "Memory" to row one, moving a selection the
+/// user never made; the launcher would then open the wrong thing on Enter.
+#[test]
+fn an_untouched_selection_stays_at_the_top_when_a_later_answer_outranks_it() {
+    let generation = fresh_generation();
+    let mut view_model = open_showing(generation, &["memory", "water"]);
+    assert_eq!(selected_id(&expect_frame(&mut view_model)), "memory");
+
+    view_model.publish(generation, rows(&["mortgage", "memory", "water"]), false);
+
+    let model = expect_frame(&mut view_model);
+    assert_eq!(model.selected, 0);
+    assert_eq!(
+        selected_id(&model),
+        "mortgage",
+        "an unchosen selection belongs to whatever now ranks first"
+    );
+}
+
+/// The other half of the same rule, and the reason it is a flag rather than a
+/// removal: once the user has chosen a row, a later wave must not move it.
+#[test]
+fn a_chosen_selection_still_holds_its_row_when_a_later_answer_arrives_above_it() {
+    let generation = fresh_generation();
+    let mut view_model = open_showing(generation, &["memory", "water"]);
+    select_index(&mut view_model, 1);
+    assert_eq!(selected_id(&expect_frame(&mut view_model)), "water");
+
+    view_model.publish(generation, rows(&["mortgage", "memory", "water"]), false);
+
+    let model = expect_frame(&mut view_model);
+    assert_eq!(model.selected, 2);
+    assert_eq!(
+        selected_id(&model),
+        "water",
+        "a chosen row is followed, not abandoned"
+    );
+}
+
+/// The choice belongs to the answer it was made in. A new query starts over at
+/// the top even for a user who had navigated in the previous one.
+#[test]
+fn a_new_generation_forgets_that_the_user_had_navigated() {
+    let tracker = GenerationTracker::new();
+    let first = tracker.advance();
+    let second = tracker.advance();
+
+    let mut view_model = open_showing(first, &["memory", "water"]);
+    select_index(&mut view_model, 1);
+    let _ = expect_frame(&mut view_model);
+
+    view_model.begin_generation(second);
+    view_model.publish(second, rows(&["memory", "water"]), false);
+    let _ = expect_frame(&mut view_model);
+    view_model.publish(second, rows(&["mortgage", "memory", "water"]), false);
+
+    let model = expect_frame(&mut view_model);
+    assert_eq!(model.selected, 0);
+    assert_eq!(selected_id(&model), "mortgage");
+}
+
 #[test]
 fn selection_keeps_its_index_when_the_anchor_vanishes_but_the_index_still_fits() {
     let generation = fresh_generation();

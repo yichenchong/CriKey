@@ -528,5 +528,138 @@
       LICENSE into RTF because that is the only format this control reads.
     -->
     <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+
+    <!--
+      STARTING CRIKEY WHEN SETUP FINISHES
+      ===================================
+      A hotkey launcher that is installed but not running does nothing at all:
+      the hotkey is registered by the process, so until something starts
+      crikey-launcher.exe an install has produced a Start Menu entry and no
+      launcher. Every report this package has collected is a variant of that —
+      "it installs and the app opens once, then vanishes", "I double-clicked
+      crikey.exe and got usage" — so the finish dialog offers to start it.
+
+      CHECKED BY DEFAULT
+      ==================
+      The state a user installed a launcher to reach is "CriKey is running and
+      the hotkey works", and this box is the only thing on the finish dialog
+      that reaches it. The wrong default is cheap and reversible in the
+      direction it is wrong in: a user who did not want it running unchecks the
+      box, or exits the launcher from its own window, and nothing has been
+      written that has to be undone — the launcher persists nothing until it is
+      used. Unchecked by default, the same user clicks Finish, sees nothing
+      happen, and has to be told where the Start Menu entry is, which is the
+      complaint this package already has on file.
+
+      The label says the launcher runs in the background, because an idle
+      launcher is hidden — `set_visible(false)` in crikey-ui, not minimised —
+      so "it started" and "no window appeared" are the same observation here. A
+      label reading only "Start CriKey" would present as a checkbox that did
+      nothing.
+
+      NOT ON UNINSTALL, NOT ON REPAIR, NEVER SILENTLY
+      ===============================================
+      Three mechanisms, and the one that matters most is free.
+
+      The stock ExitDialog control carries
+      ShowCondition="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT AND NOT Installed",
+      so the box is not drawn in maintenance mode at all. The condition on the
+      Publish below repeats `NOT Installed` rather than trusting that: the
+      property is public and can be set on the command line, and WixUI_Minimal
+      routes uninstall and repair through this same ExitDialog. On a major
+      upgrade `Installed` is empty — the new package is a new ProductCode — so
+      the box does appear there, which is right: the upgrade just asked a
+      running launcher to exit (see util:CloseApplication above) and this is
+      what puts it back.
+
+      Silence is the free half, and it is the reason this is a ControlEvent
+      rather than a `Custom` in InstallExecuteSequence conditioned on
+      `NOT Installed`. A control event exists only inside a dialog; `/qn` and
+      `/qb` never create ExitDialog, so under an unattended or policy-driven
+      install there is no code path here to take. A sequenced custom action
+      would have run, and an install nobody was watching spawning a GUI process
+      onto somebody's desktop is a defect, not a feature.
+
+      UNELEVATED, WHATEVER THE INSTALLER IS
+      =====================================
+      Impersonate="yes" is the usual answer and it is not the answer here,
+      though it is still set: it matches the Util extension's own rows for
+      every immediate ShellExec action, and Impersonate only governs whether a
+      *deferred* action runs in the elevated installer service, which an
+      immediate action never does. What it buys is that rescheduling this
+      action into the execute sequence later cannot quietly turn it into a
+      SYSTEM-context launch.
+
+      The case Impersonate does not cover is the one this package can actually
+      meet: perUser needs no elevation, but nothing stops `msiexec /i` from an
+      administrator prompt. Then the whole client process — dialog and
+      immediate custom action included — holds a high-integrity token, and a
+      plain WixShellExec would hand that token straight to the launcher.
+      WixUnelevatedShellExec does not: it routes the launch through the desktop
+      shell's IShellDispatch2, so the new process gets the interactive user's
+      ordinary token no matter what the installer had.
+
+      Getting that wrong would be worse here than for most programs, and in
+      particular it would break the element above. The launcher is a process
+      supervisor: it spawns one child per plugin, and those children inherit
+      its token, so an elevated launcher means every Python, WASM and C-ABI
+      plugin the user runs for the rest of the session is elevated too. Its
+      window would also be high-integrity, and UIPI does not let a
+      lower-integrity process send messages to a higher-integrity window — so
+      the next upgrade's util:CloseApplication, running as the plain user,
+      could not deliver WM_QUERYENDSESSION, and the file-in-use defect this
+      package just fixed would come back wearing an elevation prompt.
+
+      WHICH EXECUTABLE, AND WHAT A FAILURE MEANS
+      ==========================================
+      crikey-launcher.exe, the file the Start Menu shortcut already targets,
+      for the reason recorded there: bare `crikey.exe` does start the same
+      resident launcher now, but it is console-subsystem, so starting it
+      through the shell allocates a console window that stays for as long as
+      the launcher lives. The launcher binary is GUI-subsystem and takes no
+      arguments, which is exactly the shape a ShellExecute with no parameters
+      wants. The custom action derives its working directory from the target's
+      own directory, which is INSTALLFOLDER — the same working directory the
+      shortcut sets.
+
+      Return="ignore", against the extension's own "check". By the time a
+      Finish button exists, InstallFinalize has run and the product is
+      installed; a ShellExecute that fails then is a launcher that did not
+      start, not an install that did not happen, and Return="check" would
+      report the second and hand back a failure exit code for a package that is
+      correctly installed. That failure is reachable rather than theoretical:
+      the unelevated path needs a desktop shell to route through, and a session
+      without one has nothing to ask.
+
+      Order="1", ahead of the EndDialog the dialog set publishes at Order 999.
+      Control events fire in ascending order and EndDialog/Return closes the UI
+      sequence, so anything published after it does not run.
+
+      BinaryRef carries $(sys.BUILDARCHSHORT) rather than the hardcoded _X64
+      the sequence override above uses. The two are different references: that
+      one names a row whose decoration must be pinned so an architecture change
+      fails the build, this one names the custom action DLL itself, which has
+      to match whatever architecture the package is built for.
+    -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT"
+              Value="Start CriKey now. It runs in the background; press the hotkey to open it." />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixUnelevatedShellExecTarget" Value="[#CrikeyLauncherExe]" />
+
+    <CustomAction Id="LaunchCrikeyLauncher"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixUnelevatedShellExec"
+                  Execute="immediate"
+                  Impersonate="yes"
+                  Return="ignore" />
+
+    <UI>
+      <Publish Dialog="ExitDialog"
+               Control="Finish"
+               Event="DoAction"
+               Value="LaunchCrikeyLauncher"
+               Order="1"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />
+    </UI>
   </Package>
 </Wix>

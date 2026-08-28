@@ -19,11 +19,10 @@ use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crikey_app::{ActionSubmission, App, PluginActionRouter, SearchService, StartupStage};
 use crikey_core::{ActionId, Item, ItemId, PluginId};
@@ -155,9 +154,14 @@ fn a_file_item_from_an_unknown_owner_is_refused() {
         );
     }
 
-    // And no helper ran: the fifo has no writer, so a read would block forever
-    // rather than return. Checking that the refusals came back at all is the
-    // observable half; the recorder is dropped unused.
+    // And no helper ran. With a fifo this could only be left as a remark -- an
+    // unread fifo is indistinguishable from an unwritten one without blocking.
+    // A recording that was never created is a positive fact, so the refusal is
+    // now proved rather than described.
+    assert!(
+        !recorder.ran(),
+        "a refused action must not have launched the helper"
+    );
 }
 
 /// An action id the host does not implement is refused by name.
@@ -273,7 +277,7 @@ fn matching_query(label: &str) -> String {
 
 /// A recording program standing where `xdg-open` goes.
 ///
-/// It writes the argv it was handed to a fifo, NUL separated and preceded by a
+/// It writes the argv it was handed to a file, NUL separated and preceded by a
 /// count, because NUL is the one byte an argument cannot contain and the count
 /// catches a trailing empty argument that a separator based reading would
 /// otherwise lose.
@@ -281,7 +285,7 @@ fn matching_query(label: &str) -> String {
 struct Recorder {
     scratch: PathBuf,
     program: PathBuf,
-    fifo: PathBuf,
+    recording: PathBuf,
 }
 
 impl Recorder {
@@ -296,8 +300,16 @@ impl Recorder {
         let _ = fs::remove_dir_all(&scratch);
         fs::create_dir_all(&scratch).expect("scratch directory is creatable");
 
-        let fifo = scratch.join("argv");
-        make_fifo(&fifo);
+        // A plain file, written atomically, rather than a fifo. A fifo makes
+        // the helper and the test rendezvous, which reads well until one side
+        // never arrives: `exec > fifo` blocks in `open` until a reader appears,
+        // and a helper blocked there holds the file descriptors it inherited
+        // from the test harness, so `cargo test` waits on it forever rather
+        // than reporting anything. A refusal test that never reads, or a run
+        // interrupted between the two, is enough to reach that state. Writing
+        // a regular file cannot block, and the rename is what keeps a reader
+        // from seeing half an argv.
+        let recording = scratch.join("argv");
 
         let program = scratch.join("record-argv");
         // The scratch path is built from a pid and a counter, so it holds
@@ -306,17 +318,18 @@ impl Recorder {
             &program,
             &format!(
                 "#!/bin/sh\n\
-                 exec > '{fifo}'\n\
+                 exec > '{recording}.part'\n\
                  printf '%s\\0' \"$#\"\n\
-                 for argument in \"$@\"; do printf '%s\\0' \"$argument\"; done\n",
-                fifo = fifo.display()
+                 for argument in \"$@\"; do printf '%s\\0' \"$argument\"; done\n\
+                 mv '{recording}.part' '{recording}'\n",
+                recording = recording.display()
             ),
         );
 
         Self {
             scratch,
             program,
-            fifo,
+            recording,
         }
     }
 
@@ -328,17 +341,29 @@ impl Recorder {
         self.scratch.join(name)
     }
 
-    /// Drains the fifo on a worker thread.
+    /// Whether the helper ran at all.
+    fn ran(&self) -> bool {
+        self.recording.exists()
+    }
+
+    /// Waits for the helper's argv on a worker thread.
     ///
-    /// Started before the action runs: an opener that waited for its child
-    /// would otherwise deadlock against a fifo nobody is reading. Reading one
-    /// returns exactly when the writer closes it, so nothing here sleeps.
+    /// Bounded, and ending on the observable rather than on a clock: the
+    /// rename publishes the whole recording at once, so seeing the path is
+    /// seeing a complete argv. A helper that never runs leaves this to expire,
+    /// which `collect` reports by name instead of hanging the run.
     fn reading(&self) -> mpsc::Receiver<Vec<u8>> {
-        let fifo = self.fifo.clone();
+        let recording = self.recording.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let recorded = fs::read(&fifo).expect("the recording fifo is readable");
-            let _ = sender.send(recorded);
+            let deadline = Instant::now() + RESPONSE_LIMIT;
+            while Instant::now() < deadline {
+                if let Ok(recorded) = fs::read(&recording) {
+                    let _ = sender.send(recorded);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
         });
 
         receiver
@@ -393,13 +418,4 @@ fn write_program(path: &Path, body: &str) {
     fs::write(&staged, body).expect("fixture program is writable");
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("fixture mode is settable");
     fs::rename(&staged, path).expect("fixture program is movable into place");
-}
-
-fn make_fifo(path: &Path) {
-    let status = Command::new("mkfifo")
-        .arg(path)
-        .status()
-        .expect("mkfifo is available on a Linux host");
-
-    assert!(status.success(), "mkfifo could not create {}", path.display());
 }

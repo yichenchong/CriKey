@@ -404,16 +404,18 @@ if ($Format -eq 'msi' -or $Format -eq 'both') {
     # the fix for that reads like an authoring mistake rather than an absent
     # tool. Checked up front so the error names the install command.
     #
-    # The Util extension is checked the same way and for a worse failure: its
+    # The Util extension is checked the same way and for two failures now: its
     # `util:CloseApplication` is what asks the running launcher to exit before
-    # its own executable is replaced, and without the extension the build stops
-    # on an unknown element in the middle of the package.
+    # its own executable is replaced, and its `Wix4UtilCA_X64` binary is the
+    # custom action DLL behind the finish dialog's "Start CriKey now" box.
+    # Without the extension the build stops on an unknown element or an
+    # unresolved binary reference in the middle of the package.
     $extensions = & $wix extension list --global 2>&1 | Out-String
     if ($extensions -notmatch 'WixToolset\.UI\.wixext') {
         Stop-WithError "the WiX UI extension is not installed (the MSI would have no dialogs and would appear to open and close). Install it with: wix extension add --global WixToolset.UI.wixext/5.0.2"
     }
     if ($extensions -notmatch 'WixToolset\.Util\.wixext') {
-        Stop-WithError "the WiX Util extension is not installed (the MSI could not close a running CriKey before replacing it). Install it with: wix extension add --global WixToolset.Util.wixext/5.0.2"
+        Stop-WithError "the WiX Util extension is not installed (the MSI could neither close a running CriKey before replacing it nor start it when setup finishes). Install it with: wix extension add --global WixToolset.Util.wixext/5.0.2"
     }
 
     # The licence dialog reads RTF and nothing else, so the repository's plain
