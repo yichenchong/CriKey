@@ -892,6 +892,7 @@ dependencies = [
  "wgpu",
  "windows 0.61.3",
  "winit",
+ "x11rb",
 ]
 
 [[package]]

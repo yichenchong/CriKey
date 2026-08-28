@@ -1419,26 +1419,35 @@ fn centred_origin(screen: PhysicalSize<u32>, window_width: u32, expanded_height_
 ///
 /// egui produces premultiplied colours, so
 /// [`CompositeAlphaMode::PreMultiplied`] is the match for a shaped window and
-/// `PostMultiplied` its fallback. `Auto` — which resolves to opaque or inherit
-/// against the real surface — is the shared fallback, and the first advertised
-/// mode is the last resort so a backend offering none of them still starts. A
-/// shaped window that ends up opaque anyway is handled where the shape is
-/// drawn, not here.
+/// `PostMultiplied` its fallback. Those two, and nothing else: they are the
+/// only modes that *state* the surface blends. `Inherit` is deliberately not
+/// ranked, even though it is the one non-opaque mode Mesa's X11 surfaces
+/// advertise and taking it would round the window on many of them —
+/// `VkCompositeAlphaFlagBitsKHR` defines it as the alpha behaviour being
+/// unknown to Vulkan and settable only through native window-system calls, so
+/// a surface offering it has promised nothing. Choosing it and leaving the
+/// corners unpainted is how they come back as black notches on the platforms
+/// where the guess is wrong. X11 gets its shape by clipping the window
+/// instead, which needs no promise about alpha.
+///
+/// `Auto` is the shared fallback, and the first advertised mode is the last
+/// resort so a backend offering none of them still starts. A shaped window
+/// that ends up opaque anyway is handled where the shape is drawn, not here.
 fn preferred_alpha_mode(
     modes: &[wgpu::CompositeAlphaMode],
     composited: bool,
 ) -> Option<wgpu::CompositeAlphaMode> {
-    let ranked: [wgpu::CompositeAlphaMode; 2] = if composited {
-        [
+    let ranked: &[wgpu::CompositeAlphaMode] = if composited {
+        &[
             wgpu::CompositeAlphaMode::PreMultiplied,
             wgpu::CompositeAlphaMode::PostMultiplied,
         ]
     } else {
-        [wgpu::CompositeAlphaMode::Opaque, wgpu::CompositeAlphaMode::Auto]
+        &[wgpu::CompositeAlphaMode::Opaque, wgpu::CompositeAlphaMode::Auto]
     };
     for preferred in ranked {
-        if modes.contains(&preferred) {
-            return Some(preferred);
+        if modes.contains(preferred) {
+            return Some(*preferred);
         }
     }
     if modes.contains(&wgpu::CompositeAlphaMode::Auto) {
@@ -1447,12 +1456,50 @@ fn preferred_alpha_mode(
     modes.first().copied()
 }
 
+/// Why the launcher's corners came out square, if they did.
+///
+/// A window gets its shape one of two ways -- drawn into a surface that
+/// blends, or clipped out by the window system -- so it is square only when
+/// both are gone, and `None` is a launcher that got its shape either way. The
+/// two remaining messages name the half that was reachable and failed, because
+/// a desktop that will not composite and a graphics stack that will not blend
+/// are fixed in different places, and the corner looks identical from the
+/// outside.
+///
+/// `alpha_surface` is whether the window was created able to carry alpha,
+/// `shaped` whether it ended up doing so, and `clipped` whether the window
+/// system cut the shape out instead.
+fn square_corner_reason(alpha_surface: bool, shaped: bool, clipped: bool) -> Option<&'static str> {
+    if shaped || clipped {
+        return None;
+    }
+    if alpha_surface {
+        return Some(
+            "this graphics surface will not blend and the window could not be clipped, \
+             so the launcher's corners are square",
+        );
+    }
+    Some(
+        "the desktop is not compositing window transparency and the window could not be clipped, \
+         so the launcher's corners are square",
+    )
+}
+
 impl GraphicsState {
     fn new(
         event_loop: &ActiveEventLoop,
         config: &NativeLauncherConfig,
         proxy: Arc<EventProxy>,
     ) -> Result<Self, RendererError> {
+        // Two ways to give the window its rounded shape, and a platform uses
+        // exactly one. Everywhere but Windows the corners are simply not
+        // painted, which needs a surface carrying alpha and a desktop that
+        // composites it. Windows has neither available to it -- the Direct3D
+        // swapchain attached to an `HWND` presents one composite mode, and it
+        // is opaque -- so there the shape is clipped out of the window by
+        // [`crate::window_shape`] instead, and asking for a transparent window
+        // as well would only turn on a blur nothing can see through.
+        let alpha_surface = config.composited && !cfg!(target_os = "windows");
         let attributes = Window::default_attributes()
             .with_title(config.title.clone())
             // The launcher opens on an empty query, which is the compact
@@ -1471,13 +1518,12 @@ impl GraphicsState {
             ))
             .with_resizable(true)
             .with_decorations(false)
-            // Not a theming choice: the launcher's corners are rounded, and a
-            // window declared opaque has nowhere to put the pixels outside
-            // that shape. Asked for only where the desktop actually
-            // composites -- an X11 session with no compositing manager
-            // discards the alpha and presents those pixels black, so there the
-            // launcher stays the rectangle it was.
-            .with_transparent(config.composited)
+            // The corners outside the launcher's shape are left unpainted, and
+            // an opaque window has nowhere to put them. Asked for only where
+            // the desktop actually composites: an X11 session with no
+            // compositing manager discards the alpha and presents those pixels
+            // black, so there the launcher stays the rectangle it was.
+            .with_transparent(alpha_surface)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_visible(false);
         let window = Arc::new(event_loop.create_window(attributes)?);
@@ -1502,7 +1548,7 @@ impl GraphicsState {
             window,
             proxy,
             config.transparent,
-            config.composited,
+            alpha_surface,
             config.height,
             config.present_mode,
         ))
@@ -1512,7 +1558,10 @@ impl GraphicsState {
         window: Arc<Window>,
         proxy: Arc<EventProxy>,
         transparent: bool,
-        composited: bool,
+        // Whether this window was created able to carry alpha, which is
+        // `NativeLauncherConfig::composited` resolved against how the platform
+        // shapes a window at all.
+        alpha_surface: bool,
         expanded_height: u32,
         present_mode: wgpu::PresentMode,
     ) -> Result<Self, RendererError> {
@@ -1553,7 +1602,7 @@ impl GraphicsState {
         let capabilities = surface.get_capabilities(&adapter);
         let format = egui_wgpu::preferred_framebuffer_format(&capabilities.formats)
             .map_err(|_| RendererError::NoSurfaceFormat)?;
-        let alpha_mode = preferred_alpha_mode(&capabilities.alpha_modes, composited)
+        let alpha_mode = preferred_alpha_mode(&capabilities.alpha_modes, alpha_surface)
             .ok_or(RendererError::NoSurfaceAlphaMode)?;
         // Two independent ways to lose alpha, and the shape needs both to hold:
         // the desktop has to composite the window, and the surface has to
@@ -1562,7 +1611,7 @@ impl GraphicsState {
         // disappearing, so both give way together -- the window is cleared to
         // the canvas colour, which squares the corners off honestly, and a
         // translucent canvas is drawn opaque.
-        let shaped = composited && alpha_mode != wgpu::CompositeAlphaMode::Opaque;
+        let shaped = alpha_surface && alpha_mode != wgpu::CompositeAlphaMode::Opaque;
         let transparent = transparent && shaped;
         let size = window.inner_size();
         let surface_config = wgpu::SurfaceConfiguration {
@@ -1576,6 +1625,26 @@ impl GraphicsState {
             view_formats: Vec::new(),
         };
         surface.configure(&device, &surface_config);
+        // A window whose surface would not promise to blend has its shape cut
+        // out instead of drawn -- see [`crate::window_shape`]. Applied before
+        // the first frame, so the launcher is never briefly square, and only
+        // where the shape was not already drawn: clipping a composited window
+        // would trade its smooth arc for a stepped one.
+        let clipped = !shaped
+            && crate::window_shape::clip(
+                window.as_ref(),
+                surface_config.width,
+                surface_config.height,
+                window.scale_factor(),
+            );
+        // A launcher that quietly squares itself gives the user nothing to act
+        // on: the corners look the same whether the desktop refused, the
+        // graphics stack refused, or the window system would not clip. One
+        // line naming which, printed only once both ways of having a shape
+        // have been tried and lost.
+        if let Some(reason) = square_corner_reason(alpha_surface, shaped, clipped) {
+            eprintln!("crikey: {reason}");
+        }
 
         let egui_context = create_launcher_context();
         let repaint_proxy = proxy;
@@ -1688,6 +1757,13 @@ impl GraphicsState {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
+        // A clip is in window coordinates and does not follow the window, so a
+        // launcher that grew as results arrived would keep the corners of the
+        // size it opened at. A window that draws its shape redraws it with the
+        // frame and needs nothing here.
+        if !self.shaped {
+            let _ = crate::window_shape::clip(&self.window, width, height, self.window.scale_factor());
+        }
     }
 
     /// Resizes the window to the height the next frame needs, and answers with
@@ -3101,6 +3177,55 @@ mod surface_tests {
     fn no_advertised_mode_is_an_error_rather_than_a_guess() {
         assert_eq!(preferred_alpha_mode(&[], true), None);
         assert_eq!(preferred_alpha_mode(&[], false), None);
+    }
+
+    /// The exact pair Mesa advertises for an X11 surface, and a mode that must
+    /// not be mistaken for a blending one.
+    ///
+    /// `Inherit` says the alpha behaviour is unknown to Vulkan and settable
+    /// only outside it, so a surface offering it has promised nothing.
+    /// Selecting it would leave the corners unpainted on the strength of a
+    /// guess, and where the guess is wrong they present as black notches. The
+    /// opaque surface is the honest choice, and X11 is rounded by clipping the
+    /// window rather than by trusting this.
+    #[test]
+    fn an_unpromised_blend_is_not_mistaken_for_one() {
+        let modes = [
+            wgpu::CompositeAlphaMode::Opaque,
+            wgpu::CompositeAlphaMode::Inherit,
+        ];
+        assert_eq!(
+            preferred_alpha_mode(&modes, true),
+            Some(wgpu::CompositeAlphaMode::Opaque),
+            "a mode that promises nothing must not be taken for one that blends"
+        );
+        assert_eq!(
+            preferred_alpha_mode(&modes, false),
+            Some(wgpu::CompositeAlphaMode::Opaque)
+        );
+    }
+
+    /// The two ways of losing the shape are fixed in different places, so a
+    /// user who reports square corners has to be told which one they hit.
+    ///
+    #[test]
+    fn a_square_window_says_which_of_the_two_refusals_it_hit() {
+        let desktop = square_corner_reason(false, false, false).expect("a desktop refusal is reported");
+        let surface = square_corner_reason(true, false, false).expect("a surface refusal is reported");
+        assert_ne!(
+            desktop, surface,
+            "one message for both refusals tells a user nothing they did not already see"
+        );
+        assert!(desktop.contains("desktop"), "got {desktop:?}");
+        assert!(surface.contains("surface"), "got {surface:?}");
+    }
+
+    /// Silence is for a launcher that has its shape. Reporting one anyway
+    /// would train everybody to ignore the line that matters.
+    #[test]
+    fn a_shaped_window_reports_nothing() {
+        assert_eq!(square_corner_reason(true, true, false), None);
+        assert_eq!(square_corner_reason(false, false, true), None);
     }
 }
 

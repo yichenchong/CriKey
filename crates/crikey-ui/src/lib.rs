@@ -24,6 +24,17 @@ mod session_end;
 /// it.
 pub mod system_char;
 mod theme;
+/// Clipping the launcher window to its rounded shape, where the surface in
+/// front of it cannot be composited.
+///
+/// Clipping the launcher window to its rounded shape on Windows, whose
+/// swapchain cannot present a corner as nothing.
+///
+/// Public for the same reason [`system_char`] is: the clip is Windows-only,
+/// but the pixel arithmetic behind it is a pure function of a scale factor and
+/// is therefore compiled and tested on every host rather than only on the one
+/// that can run it.
+pub mod window_shape;
 
 pub use egui;
 pub use native::{
