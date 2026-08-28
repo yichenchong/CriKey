@@ -217,7 +217,12 @@ jobs:
           function Get-MsiRows($sql, $columns) {
             $view = $database.GetType().InvokeMember(
               'OpenView', 'InvokeMethod', $null, $database, @($sql))
-            $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+            # `[void]`, because this runs inside a function: `Execute` returns a
+            # value, an unsuppressed value is output, and everything a function
+            # outputs joins what it returns. The rows would then arrive mixed
+            # with COM leftovers whose `.Property` is null, and indexing a
+            # hashtable with a null key is an error rather than a miss.
+            [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
             $rows = New-Object System.Collections.ArrayList
             while ($true) {
               $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
