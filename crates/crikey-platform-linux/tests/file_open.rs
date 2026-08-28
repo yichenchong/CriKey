@@ -23,11 +23,10 @@ use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crikey_core::{CoreError, PlatformPath};
 use crikey_platform::{Capability, CapabilityState, FileOpener};
@@ -229,7 +228,7 @@ fn a_session_with_no_helper_claims_no_file_opening_at_all() {
 struct Recorder {
     scratch: PathBuf,
     program: PathBuf,
-    fifo: PathBuf,
+    recording: PathBuf,
 }
 
 impl Recorder {
@@ -245,8 +244,15 @@ impl Recorder {
         let _ = fs::remove_dir_all(&scratch);
         fs::create_dir_all(&scratch).expect("scratch directory is creatable");
 
-        let fifo = scratch.join("argv");
-        make_fifo(&fifo);
+        // A plain file written atomically, not a fifo. Two reasons, both of
+        // which cost this suite a red build. A fifo is a rendezvous: the helper
+        // blocks in `open` until a reader arrives, holding the descriptors it
+        // inherited from the harness, so a run that never reads waits forever
+        // instead of reporting. And creating one meant shelling out to
+        // `mkfifo`, which is a fork in one test thread while another is writing
+        // the program it is about to exec -- the forked child inherits that
+        // write descriptor, and the exec then fails with ETXTBSY.
+        let recording = scratch.join("argv");
 
         let program = scratch.join("record-argv");
         // The scratch path is built from a pid and a counter, so it holds
@@ -255,17 +261,18 @@ impl Recorder {
             &program,
             &format!(
                 "#!/bin/sh\n\
-                 exec > '{fifo}'\n\
+                 exec > '{recording}.part'\n\
                  printf '%s\\0' \"$#\"\n\
-                 for argument in \"$@\"; do printf '%s\\0' \"$argument\"; done\n",
-                fifo = fifo.display()
+                 for argument in \"$@\"; do printf '%s\\0' \"$argument\"; done\n\
+                 mv '{recording}.part' '{recording}'\n",
+                recording = recording.display()
             ),
         );
 
         Self {
             scratch,
             program,
-            fifo,
+            recording,
         }
     }
 
@@ -296,19 +303,25 @@ impl Recorder {
         argv(&collect(reading))
     }
 
-    /// Drains the fifo on a worker thread.
+    /// Waits for the helper's argv on a worker thread.
     ///
-    /// Reading a fifo blocks until the writer opens it and returns when the
-    /// writer closes it, which is exactly the synchronisation this needs: no
-    /// polling, no sleeping, and no assumption about how long a process takes
-    /// to start.
+    /// Bounded, and ending on the observable: the rename publishes the whole
+    /// recording at once, so seeing the path is seeing a complete argv. A
+    /// helper that never runs lets this expire, which `collect` reports by
+    /// name rather than hanging the run.
     fn reading(&self) -> mpsc::Receiver<Vec<u8>> {
-        let fifo = self.fifo.clone();
+        let recording = self.recording.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let recorded = fs::read(&fifo).expect("the recording fifo is readable");
-            // A failed send only means this test already gave up.
-            let _ = sender.send(recorded);
+            let deadline = Instant::now() + RESPONSE_LIMIT;
+            while Instant::now() < deadline {
+                if let Ok(recorded) = fs::read(&recording) {
+                    // A failed send only means this test already gave up.
+                    let _ = sender.send(recorded);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
         });
 
         receiver
@@ -374,13 +387,4 @@ fn write_program(path: &Path, body: &str) {
     fs::write(&staged, body).expect("fixture program is writable");
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("fixture mode is settable");
     fs::rename(&staged, path).expect("fixture program is movable into place");
-}
-
-fn make_fifo(path: &Path) {
-    let status = Command::new("mkfifo")
-        .arg(path)
-        .status()
-        .expect("mkfifo is available on a Linux host");
-
-    assert!(status.success(), "mkfifo could not create {}", path.display());
 }
