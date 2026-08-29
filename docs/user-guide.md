@@ -52,10 +52,10 @@ crikey config layers [<key>]
 ```
 
 The launcher's own settings — the activation hotkey, the result ceiling, the
-selected profile — also have a surface that does not require knowing a key
-name. Press `Ctrl+,` in the launcher, or click `Settings` in the hint line
-along the bottom, to edit them in place; the same rows are readable and
-writable from a terminal:
+selected profile, whether the footer shows its keyboard hints — also have a
+surface that does not require knowing a key name. Press `Ctrl+,` in the
+launcher, or click `Settings` in the hint line along the bottom, to edit them
+in place; the same rows are readable and writable from a terminal:
 
 ```sh
 crikey settings
@@ -65,6 +65,13 @@ crikey settings set launcher.activation-hotkey Ctrl+Alt+K
 Both write the user-global layer, so the panel and the command line always
 agree. A hotkey the desktop refuses leaves the previous one working and says
 so rather than leaving the launcher unreachable.
+
+The hint line along the bottom — `Up/Down navigate   Tab complete   Esc
+cancel` — is a legend for keys you have not learned yet, so once you have,
+turn it off with `launcher.show-hints = false` or the matching row in the
+panel. `Settings  Ctrl+,` stays where it is: it is the only way into the
+settings surface with the mouse, so hiding the hints must never be a choice
+you cannot take back.
 
 Secret fields are redacted. Configuration read errors are reported and a
 launcher run continues with built-in defaults; fix the reported file before

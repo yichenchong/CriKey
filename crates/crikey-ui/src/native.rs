@@ -357,11 +357,30 @@ struct SharedState {
 /// about a settings panel the user opened a moment ago. Taken at face value,
 /// the first suggestion to arrive would blank that panel under the user's
 /// hands.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct Overlay {
     settings_open: bool,
     settings: Arc<[SettingRow]>,
     settings_focus: Option<String>,
+    /// Whether the footer draws its hint line, which is a preference the host
+    /// read from configuration and no provider knows anything about. Left out
+    /// of the overlay, a user who turned the hints off would watch them come
+    /// back on the first suggestion that arrived.
+    show_hints: bool,
+}
+
+impl Default for Overlay {
+    /// Written out rather than derived, because `show_hints` derives to the
+    /// wrong answer: the hint line is shown unless a user has said otherwise,
+    /// and `false` is what the derive would supply.
+    fn default() -> Self {
+        Self {
+            settings_open: false,
+            settings: Arc::from([] as [SettingRow; 0]),
+            settings_focus: None,
+            show_hints: true,
+        }
+    }
 }
 
 /// Who composed a frame, and therefore who owns its overlay.
@@ -379,6 +398,7 @@ fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
         settings_open: model.settings_open,
         settings: Arc::clone(&model.settings),
         settings_focus: model.settings_focus.clone(),
+        show_hints: model.show_hints,
     };
     mailbox.overlay_session = Some(session);
 }
@@ -395,6 +415,7 @@ fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> View
         settings_open: mailbox.overlay.settings_open,
         settings: Arc::clone(&mailbox.overlay.settings),
         settings_focus: mailbox.overlay.settings_focus.clone(),
+        show_hints: mailbox.overlay.show_hints,
         ..model.clone()
     }
 }
@@ -1302,6 +1323,23 @@ struct GraphicsState {
     egui_state: egui_winit::State,
 }
 
+/// Whether this frame shows a result list at all.
+///
+/// Both halves of the launcher's geometry ask this -- the height the window is
+/// resized to and the layout drawn inside it -- and they must not answer
+/// differently. When they did, a query that matched nothing was sized as the
+/// compact window and laid out with a result area anyway, and because
+/// `draw_results` floors the list at a minimum height, the footer was pushed
+/// onto the bottom edge of a window that had never reserved room for a list.
+///
+/// Both conditions carry weight. Rows with no query are the stale answer to a
+/// query the user has already cleared, and an untyped launcher is the query
+/// field and nothing else. A query with no rows has nothing to list, and the
+/// count in the footer already says so.
+fn shows_results(model: &ViewModel) -> bool {
+    !model.query.is_empty() && !model.rows.is_empty()
+}
+
 /// How tall the window has to be to show `model`, in logical pixels.
 ///
 /// The launcher is a query field that grows a list under itself and shrinks
@@ -1322,10 +1360,10 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     if model.settings_open {
         return expanded_height;
     }
-    let rows = model.rows.len();
-    if rows == 0 {
+    if !shows_results(model) {
         return theme::COMPACT_WINDOW_HEIGHT;
     }
+    let rows = model.rows.len();
     // The list, plus the gap above it, added to the compact frame -- the field
     // and the footer inside both panel margins -- which
     // [`theme::COMPACT_WINDOW_HEIGHT`] already is. Nothing here re-derives the
@@ -1460,11 +1498,14 @@ fn preferred_alpha_mode(
 ///
 /// A window gets its shape one of two ways -- drawn into a surface that
 /// blends, or clipped out by the window system -- so it is square only when
-/// both are gone, and `None` is a launcher that got its shape either way. The
-/// two remaining messages name the half that was reachable and failed, because
-/// a desktop that will not composite and a graphics stack that will not blend
-/// are fixed in different places, and the corner looks identical from the
-/// outside.
+/// both are gone, and `None` is a launcher that got its shape either way.
+///
+/// The remaining messages name the half that was reachable and failed, which
+/// is the whole point of printing one: a desktop that will not composite, a
+/// graphics stack that will not blend, and a window system that would not clip
+/// are fixed in three different places, and the corner looks identical from
+/// the outside. A platform that never takes the alpha route at all is not
+/// missing a compositor and must not be told it is.
 ///
 /// `alpha_surface` is whether the window was created able to carry alpha,
 /// `shaped` whether it ended up doing so, and `clipped` whether the window
@@ -1472,6 +1513,12 @@ fn preferred_alpha_mode(
 fn square_corner_reason(alpha_surface: bool, shaped: bool, clipped: bool) -> Option<&'static str> {
     if shaped || clipped {
         return None;
+    }
+    // Windows is never handed an alpha-carrying surface -- `wgpu` has one
+    // composite mode for an `HWND` swapchain and it is opaque -- so the clip
+    // is the only route it has, and its failure is the only thing to report.
+    if cfg!(target_os = "windows") {
+        return Some("this window could not be clipped, so the launcher's corners are square");
     }
     if alpha_surface {
         return Some(
@@ -2041,10 +2088,14 @@ fn draw_launcher(
                 // user cannot reach behind a panel is only noise.
                 ui.add_space(theme::SPACE_3);
                 draw_settings(ui, model, commands, colors);
-            } else if !model.query.is_empty() {
-                // An untyped launcher is the query field and nothing else: no
-                // card, no list, and none of the spacing that would hold room
-                // for one.
+            } else if shows_results(model) {
+                // A launcher with nothing to list is the query field and
+                // nothing else: no card, no list, and none of the spacing that
+                // would hold room for one. The predicate is shared with
+                // `desired_window_height` so the layout and the window it is
+                // laid out in cannot disagree about whether there is a list --
+                // when they did, a search that matched nothing put the footer
+                // on the window's bottom edge.
                 ui.add_space(theme::SPACE_3);
                 draw_results(ui, model, commands, colors);
                 if model.actions_open {
@@ -2756,11 +2807,21 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
             if settings.clicked() {
                 commands.push(UiCommand::OpenSettings);
             }
-            ui.label(
-                RichText::new("Up/Down navigate   Tab complete   Esc cancel")
-                    .small()
-                    .color(colors.text_muted),
-            );
+            // Only the legend is optional; the `Settings  Ctrl+,` control above
+            // is drawn unconditionally, because it is the one mouse route into
+            // the settings surface and hiding it would make the setting that
+            // hid it unreachable by anything but the command line. The row's
+            // height is unaffected either way: it is set from
+            // `interact_size.y` above, and what remains is the same one line of
+            // small text the window arithmetic in `STATUS_BLOCK_HEIGHT` is
+            // measured against.
+            if model.show_hints {
+                ui.label(
+                    RichText::new("Up/Down navigate   Tab complete   Esc cancel")
+                        .small()
+                        .color(colors.text_muted),
+                );
+            }
         });
     });
 }
@@ -2822,6 +2883,7 @@ mod transparency_tests {
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,
+            show_hints: true,
         };
         let input = RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -2933,6 +2995,7 @@ mod lifecycle_tests {
                     settings_open: false,
                     settings: Arc::default(),
                     settings_focus: None,
+                    show_hints: true,
                 },
             });
             mailbox.wake_session = Some(7);
@@ -3040,6 +3103,7 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
                 settings_open: false,
                 settings: Arc::default(),
                 settings_focus: None,
+                show_hints: true,
             },
         });
         mailbox.wake_session = Some(1);
@@ -3209,7 +3273,16 @@ mod surface_tests {
     /// user who reports square corners has to be told which one they hit.
     ///
     #[test]
-    fn a_square_window_says_which_of_the_two_refusals_it_hit() {
+    fn a_square_window_says_which_refusal_it_hit() {
+        // Windows has one route to a shape and reports only its failure.
+        // Telling a Windows user their desktop is not compositing would send
+        // them after a setting that platform does not have.
+        if cfg!(target_os = "windows") {
+            let clip = square_corner_reason(false, false, false).expect("a clip failure is reported");
+            assert!(!clip.contains("compositing"), "got {clip:?}");
+            assert!(clip.contains("clipped"), "got {clip:?}");
+            return;
+        }
         let desktop = square_corner_reason(false, false, false).expect("a desktop refusal is reported");
         let surface = square_corner_reason(true, false, false).expect("a surface refusal is reported");
         assert_ne!(
@@ -3326,6 +3399,7 @@ mod window_geometry_tests {
             settings_open,
             settings: Arc::default(),
             settings_focus: None,
+            show_hints: true,
         }
     }
 
@@ -3391,6 +3465,37 @@ mod window_geometry_tests {
         assert!(
             !with_overlay(&mailbox, 7, &view("term", false)).settings_open,
             "closing the surface is the host's to say, and it sticks"
+        );
+    }
+
+    /// The hint-line preference is the host's half of a frame too, and a
+    /// provider's view model does not carry it.
+    ///
+    /// Without it in the overlay, a user who turned the hint line off would
+    /// see it return on the first suggestion that arrived and stay off again
+    /// as soon as they typed -- a setting that appears not to work rather than
+    /// one that does nothing, which is worse.
+    #[test]
+    fn a_provider_frame_keeps_the_hint_line_the_host_last_published() {
+        let mut mailbox = FrameMailbox::default();
+        let mut host = view("", false);
+        host.show_hints = false;
+        record_overlay(&mut mailbox, 7, &host);
+
+        // A provider builds its frame from results and defaults everything
+        // else, so this is the frame the renderer would have drawn.
+        let provider = view("term", false);
+        assert!(provider.show_hints, "a provider frame defaults to showing them");
+        assert!(
+            !with_overlay(&mailbox, 7, &provider).show_hints,
+            "a suggestion must not bring back a hint line the user turned off"
+        );
+
+        host.show_hints = true;
+        record_overlay(&mut mailbox, 7, &host);
+        assert!(
+            with_overlay(&mailbox, 7, &provider).show_hints,
+            "turning them back on is the host's to say, and it sticks too"
         );
     }
 
@@ -3721,6 +3826,33 @@ mod window_geometry_tests {
         );
     }
 
+    /// Hiding the footer's hint line must not move a single pixel of the
+    /// window's arithmetic.
+    ///
+    /// The footer's height is what [`STATUS_BLOCK_HEIGHT`] and therefore
+    /// [`theme::COMPACT_WINDOW_HEIGHT`] are measured against, and the row still
+    /// holds the `Settings  Ctrl+,` control -- the same one line of small text
+    /// the hint label was. If dropping the label were ever to shrink the row,
+    /// every window the launcher opens would carry a strip of dead canvas under
+    /// its footer, and nothing about the setting itself would say why.
+    #[test]
+    fn hiding_the_hints_leaves_the_footer_and_the_window_height_alone() {
+        let shown = view("", false);
+        let mut hidden = view("", false);
+        hidden.show_hints = false;
+
+        assert_eq!(
+            desired_window_height(&hidden, theme::DEFAULT_WINDOW_HEIGHT),
+            desired_window_height(&shown, theme::DEFAULT_WINDOW_HEIGHT),
+            "the hint line is not part of any height the launcher computes"
+        );
+        assert_eq!(
+            frame_bottom(&frame_at(&hidden, theme::COMPACT_WINDOW_HEIGHT)),
+            frame_bottom(&frame_at(&shown, theme::COMPACT_WINDOW_HEIGHT)),
+            "a footer without its hint label must reach exactly as low as one with it"
+        );
+    }
+
     /// The same height, at the narrowest the user may drag the window to.
     ///
     /// The footer is text now, and text wraps: at some width the hint line and
@@ -3751,6 +3883,36 @@ mod window_geometry_tests {
             "at {} px wide the compact frame draws down to {bottom}, so it needs {needed} \
              and the window is only {window} tall: the footer wrapped",
             theme::MIN_WINDOW_WIDTH
+        );
+    }
+
+    /// A search that matched nothing is sized like an untyped launcher, so it
+    /// has to be laid out like one.
+    ///
+    /// The reported defect: the hint line sat on the bottom edge of the window
+    /// with no margin under it. `desired_window_height` returns the compact
+    /// height as soon as there are no rows, while the frame drew a result area
+    /// for any non-empty query -- and `draw_results` floors the list at a
+    /// minimum height, so the footer was pushed out of a window that had never
+    /// reserved room for a list.
+    #[test]
+    fn a_search_that_found_nothing_keeps_the_margin_under_the_footer() {
+        let model = view("no such thing", false);
+        let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
+        assert_eq!(
+            height,
+            theme::COMPACT_WINDOW_HEIGHT,
+            "a search with no rows is the compact window, or this tests the wrong height"
+        );
+
+        let window = f32::from(height as u16);
+        let bottom = frame_bottom(&frame_at(&model, height));
+        let gap = window - bottom;
+        assert!(
+            (gap - theme::PANEL_MARGIN).abs() <= 1.0,
+            "the frame draws down to {bottom} in a {window} tall window, leaving {gap} under \
+             the footer where the panel's own margin is {}",
+            theme::PANEL_MARGIN
         );
     }
 

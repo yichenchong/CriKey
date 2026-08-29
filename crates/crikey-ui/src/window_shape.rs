@@ -24,11 +24,30 @@
 //!   cost of the guess being wrong is four black notches.
 //!
 //! On both, the shape is cut instead of drawn: the window manager is told to
-//! remove the corner pixels from the window, which needs no promise about
-//! alpha because there is no alpha involved. A clip is quantised to whole
-//! pixels, so its arc is stepped where a composited one is smooth. That is the
-//! price of having the shape at all on these two, and it is not paid anywhere
-//! else.
+//! remove the corner pixels, which needs no promise about alpha because no
+//! alpha is involved.
+//!
+//! # A cut corner is a stepped corner
+//!
+//! A clip is a set of whole pixels, in or out, so its arc has visible stairs
+//! where a composited one is smooth. Nothing inside the window can hide them:
+//! the step is the boundary between the window and the desktop, and the
+//! launcher cannot antialias against pixels it does not own.
+//!
+//! Windows 11 has the one way out. `DWMWA_WINDOW_CORNER_PREFERENCE` asks the
+//! compositor itself to round the window, which it does smoothly because it
+//! *is* the thing compositing the desktop underneath. It is preferred wherever
+//! it is honoured, and the cost is the radius: the corner becomes the system's
+//! 8 px rather than [`theme::RADIUS_WINDOW`], so the window and the query
+//! field inside it are no longer concentric. That trade is worth taking and
+//! the reverse is not -- a stepped arc is visible at a glance, a corner 12 px
+//! tighter than the ideal is not -- but it is a trade, and the concentric rule
+//! the theme states holds only where the shape is drawn or clipped.
+//!
+//! Windows 10 has no such attribute and X11 has no equivalent at all, so both
+//! keep the stepped clip at the theme's own radius. On X11 the smooth path is
+//! available by running a compositing manager, which is what moves the window
+//! onto the drawn shape.
 
 use crate::theme;
 
@@ -145,26 +164,55 @@ pub(crate) fn clip(_window: &winit::window::Window, _width: u32, _height: u32, _
 
 #[cfg(target_os = "windows")]
 mod win32 {
-    // Two `unsafe` calls: creating the region and handing it to the window.
-    // The workspace warns on unsafe code, and there is no safe route to a
-    // window manager call.
+    // Three `unsafe` calls: the corner request, creating the region and
+    // handing it to the window. The workspace warns on unsafe code, and there
+    // is no safe route to a window manager call.
     #![allow(unsafe_code)]
 
     use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DWM_WINDOW_CORNER_PREFERENCE,
+    };
     use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::Window;
 
     use super::corner_radius;
 
-    /// Clips `window` to a rounded rectangle `width` x `height` physical
-    /// pixels across.
+    /// Asks the compositor to round the window itself.
     ///
-    /// Answers whether the window is now clipped, so a caller can say why the
-    /// corners are square when nothing worked. No failure here is worth
-    /// recovering from -- the shape is decoration and the launcher is entirely
-    /// usable without it -- but a silent one leaves a user with nothing to
-    /// report.
+    /// Windows 11 only. The attribute did not exist before it, and the call
+    /// answers an error on anything older, which is the version check: asking
+    /// and reading the answer beats reading a build number, because the
+    /// question is whether this DWM honours it rather than which release it
+    /// shipped in.
+    ///
+    /// Worth preferring over a region wherever it works, because the
+    /// compositor is the thing drawing the desktop underneath and can
+    /// therefore blend the arc into it. A region cannot: it is whole pixels,
+    /// in or out.
+    fn round_with_the_compositor(hwnd: HWND) -> bool {
+        let preference = DWMWCP_ROUND;
+        // SAFETY: the attribute id and the size describe the value pointed at,
+        // which is a live local of exactly that type, read and not retained.
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                std::ptr::from_ref(&preference).cast(),
+                size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+            )
+        }
+        .is_ok()
+    }
+
+    /// Gives `window` its rounded corners, by whichever mechanism this
+    /// Windows has.
+    ///
+    /// Answers whether it now has them, so a caller can say why the corners
+    /// are square when nothing worked. No failure here is worth recovering
+    /// from -- the shape is decoration and the launcher is entirely usable
+    /// without it -- but a silent one leaves a user with nothing to report.
     pub(crate) fn clip(window: &Window, width: u32, height: u32, scale: f64) -> bool {
         if width == 0 || height == 0 {
             return false;
@@ -176,6 +224,14 @@ mod win32 {
             return false;
         };
         let hwnd = HWND(win32.hwnd.get() as *mut _);
+        // A smooth arc at the system's radius beats a stepped one at the
+        // theme's, so this is tried first and the region is what Windows 10
+        // falls back to. The corner preference outlives a resize -- it is a
+        // property of the window, not of its current size -- so repeating it
+        // here costs one call and keeps the two paths on one code path.
+        if round_with_the_compositor(hwnd) {
+            return true;
+        }
         // `CreateRoundRectRgn` takes the width and height of the ellipse it
         // corners the rectangle with, which is twice the radius, and an
         // exclusive bottom-right corner -- so the rectangle covering the whole

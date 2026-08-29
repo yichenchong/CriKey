@@ -59,6 +59,16 @@ pub const KEY_MAX_RESULTS: &str = "launcher.max-results";
 /// has never been configured.
 pub const KEY_ACTIVATION_HOTKEY: &str = "launcher.activation-hotkey";
 
+/// Whether the launcher's footer shows the navigation hint line (spec 21.2).
+///
+/// Defaulted here rather than in the renderer for the same reason
+/// [`KEY_ACTIVATION_HOTKEY`] is: a user who has turned the hints off has taken
+/// away the one line on screen that would have named them, so `crikey config
+/// get launcher.show-hints` has to answer on a machine that has never been
+/// configured — otherwise the setting is one nothing reports and nothing can
+/// explain.
+pub const KEY_SHOW_HINTS: &str = "launcher.show-hints";
+
 /// The values the host itself supplies, forming [`ConfigLayer::BuiltInDefaults`].
 ///
 /// Only keys whose default this crate genuinely owns. A key defaulted by another
@@ -68,6 +78,7 @@ pub const BUILT_IN_DEFAULTS: &[(&str, &str)] = &[
     (KEY_MAXIMUM_WAIT_MS, "1000"),
     (KEY_RELOAD_INTERVAL_MS, "500"),
     (KEY_ACTIVATION_HOTKEY, "Ctrl+Alt+Space"),
+    (KEY_SHOW_HINTS, "true"),
 ];
 /// Keys under this prefix are operator-pinned: a user may supply a source
 /// declaration, but cannot redirect one an administrator has specified.

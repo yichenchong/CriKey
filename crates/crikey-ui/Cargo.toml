@@ -43,6 +43,9 @@ features = [
     # `CreateRoundRectRgn`, which cuts the launcher's rounded shape out of a
     # window whose swapchain cannot carry alpha.
     "Win32_Graphics_Gdi",
+    # `DwmSetWindowAttribute`, which asks Windows 11 to round the same window
+    # smoothly instead -- a region is whole pixels and cannot be.
+    "Win32_Graphics_Dwm",
     # `WM_QUERYENDSESSION`, `WM_ENDSESSION`, `WM_NCDESTROY`.
     "Win32_UI_WindowsAndMessaging",
 ]

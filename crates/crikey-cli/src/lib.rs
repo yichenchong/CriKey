@@ -741,6 +741,12 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     view_model.set_settings(settings::rows(
         configuration.as_ref().map(|configuration| &configuration.store),
     ));
+    // And the hint line's visibility, from the same store, before the first
+    // frame: a launcher that showed the hints once and hid them on the next
+    // activation would look like the setting had not taken.
+    view_model.set_show_hints(settings::configured_show_hints(
+        configuration.as_ref().map(|configuration| &configuration.store),
+    ));
     if let Some(reason) = hotkey_refusal {
         let diagnostic = settings::surface_hotkey_failure(&mut view_model, &hotkey_accelerator, &reason);
         eprintln!("{diagnostic}");
@@ -805,6 +811,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         }
                     }
                     view_model.set_settings(settings::rows(Some(&configuration.store)));
+                    view_model.set_show_hints(settings::configured_show_hints(Some(&configuration.store)));
                     // Aliases are host configuration, so a hand edit takes
                     // effect on the next query rather than the next restart.
                     search.set_aliases(configured_aliases(&configuration.store));
@@ -1120,6 +1127,9 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     // layer outranks, must leave the panel showing what the
                     // launcher will actually do.
                     view_model.set_settings(settings::rows(
+                        configuration.as_ref().map(|configuration| &configuration.store),
+                    ));
+                    view_model.set_show_hints(settings::configured_show_hints(
                         configuration.as_ref().map(|configuration| &configuration.store),
                     ));
                     eprintln!("crikey: {report}");

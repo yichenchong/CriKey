@@ -813,6 +813,7 @@ impl QueryPipeline {
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,
+            show_hints: true,
         })
     }
 

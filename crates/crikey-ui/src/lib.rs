@@ -128,6 +128,14 @@ pub struct ViewModel {
     /// The setting whose editor should take the keyboard when the surface
     /// opens, by key. `None` leaves the focus where the user put it.
     pub settings_focus: Option<String>,
+    /// Whether the footer's navigation hint line is drawn.
+    ///
+    /// Carried on the frame rather than looked up by key in the renderer,
+    /// because [`SettingRow`] is the only thing the UI knows about
+    /// configuration: a renderer that read `launcher.show-hints` itself would
+    /// be a second, silent copy of the configuration schema living in the crate
+    /// that is documented not to have one.
+    pub show_hints: bool,
 }
 
 /// Keyboard-only interaction surface (spec 6.3).
@@ -251,6 +259,10 @@ pub struct LauncherViewModel {
     settings: Arc<[SettingRow]>,
     /// The setting an opening surface should put the keyboard in, by key.
     settings_focus: Option<String>,
+    /// Whether published frames draw the footer's navigation hint line. Host
+    /// configuration rather than session state, like `settings` above, so it
+    /// survives `dismiss`.
+    show_hints: bool,
     /// Highest generation ever begun, across every session of this launcher.
     /// Monotonic and deliberately kept by `dismiss`, so a generation retired
     /// before the launcher closed can never be begun again after it reopens
@@ -290,6 +302,7 @@ impl LauncherViewModel {
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,
+            show_hints: true,
             floor: None,
             active: None,
             published: None,
@@ -426,6 +439,7 @@ impl LauncherViewModel {
             // Shared for the same reason the rows are.
             settings: Arc::clone(&self.settings),
             settings_focus: self.settings_focus.clone(),
+            show_hints: self.show_hints,
         })
     }
 
@@ -597,6 +611,25 @@ impl LauncherViewModel {
         // A hidden launcher has no frame to dirty; the next activation carries
         // the new rows anyway.
         self.dirty |= self.visible;
+    }
+
+    /// Chooses whether published frames draw the footer's hint line, and
+    /// reports whether that changed the model.
+    ///
+    /// Accepted while hidden for the same reason `set_settings` is: the host
+    /// reads the key once at startup, long before the first activation, and a
+    /// launcher that only learned the answer on its second showing would come
+    /// up with the hints the user turned off.
+    pub fn set_show_hints(&mut self, show: bool) -> bool {
+        if self.show_hints == show {
+            return false;
+        }
+
+        self.show_hints = show;
+        // A hidden launcher has no frame to dirty; the next activation carries
+        // the new value anyway.
+        self.dirty |= self.visible;
+        true
     }
 
     /// The settings the surface would list right now.

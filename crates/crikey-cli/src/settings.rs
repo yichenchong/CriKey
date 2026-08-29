@@ -22,7 +22,7 @@
 use std::fmt::Write as _;
 use std::process::ExitCode;
 
-use crikey_config::{ConfigStore, KEY_ACTIVATION_HOTKEY, KEY_MAX_RESULTS, KEY_PROFILE};
+use crikey_config::{ConfigStore, KEY_ACTIVATION_HOTKEY, KEY_MAX_RESULTS, KEY_PROFILE, KEY_SHOW_HINTS};
 use crikey_platform::Accelerator;
 use crikey_ui::{LauncherViewModel, SettingRow, UiEffect};
 
@@ -40,6 +40,7 @@ pub(crate) const LAUNCHER_SETTINGS: &[(&str, &str)] = &[
     (KEY_ACTIVATION_HOTKEY, "Activation hotkey"),
     (KEY_MAX_RESULTS, "Maximum results"),
     (KEY_PROFILE, "Configuration profile"),
+    (KEY_SHOW_HINTS, "Show keyboard hints"),
 ];
 
 /// What the source column says for a key no layer supplies.
@@ -95,6 +96,16 @@ pub(crate) fn configured_hotkey(store: Option<&ConfigStore>) -> String {
         })
 }
 
+/// Whether this launch draws the footer's navigation hint line.
+///
+/// Only the exact text `false` hides it, matching
+/// [`ConfigStore::plugin_enabled`]: a launcher that read any unrecognised text
+/// as "off" would take the hint line away over a typo, and the hint line is
+/// where the user would have looked to find out why.
+pub(crate) fn configured_show_hints(store: Option<&ConfigStore>) -> bool {
+    store.and_then(|store| store.get(KEY_SHOW_HINTS)) != Some("false")
+}
+
 /// Refuses a value the launcher could not honour, before it reaches the file.
 ///
 /// Validation happens on the way in rather than on the way out, because the
@@ -123,6 +134,17 @@ pub(crate) fn validate(key: &str, value: &str) -> Result<(), String> {
                 Err(format!("`{key}` must be a plain profile name, got `{value}`"))
             } else {
                 Ok(())
+            }
+        }
+        // The renderer reads this as a plain boolean, so anything else would be
+        // a value the launcher silently treats as "off" — and a user who typed
+        // `yes` would be looking at a hidden hint line with a file that says
+        // they asked for something else.
+        KEY_SHOW_HINTS => {
+            if value == "true" || value == "false" {
+                Ok(())
+            } else {
+                Err(format!("`{key}` must be `true` or `false`, got `{value}`"))
             }
         }
         other => Err(format!("`{other}` is not a launcher setting")),
@@ -893,12 +915,83 @@ mod tests {
         let rows = rows(Some(&store));
 
         let keys: Vec<&str> = rows.iter().map(|row| row.key.as_str()).collect();
-        assert_eq!(keys, vec![KEY_ACTIVATION_HOTKEY, KEY_MAX_RESULTS, KEY_PROFILE]);
+        assert_eq!(
+            keys,
+            vec![
+                KEY_ACTIVATION_HOTKEY,
+                KEY_MAX_RESULTS,
+                KEY_PROFILE,
+                KEY_SHOW_HINTS
+            ]
+        );
         assert_eq!(rows[0].value, "Ctrl+Alt+Space");
         assert_eq!(rows[0].source, ConfigLayer::BuiltInDefaults.as_str());
         assert_eq!(
             rows[1].source, UNSET,
             "a key no layer supplies must say so rather than show an empty value"
+        );
+    }
+
+    /// The hint line's setting has to survive the whole way round: the panel
+    /// offers it, a write lands in the layer `crikey config` reports, and the
+    /// panel then reads back what was written. A key the renderer honours but
+    /// the surface never lists is a setting only someone who read the source
+    /// could find.
+    #[test]
+    fn the_hint_line_setting_round_trips_through_the_settings_rows() {
+        let directory = ConfigDir::new("show-hints");
+        let mut store = directory.store();
+
+        let default = rows(Some(&store))
+            .into_iter()
+            .find(|row| row.key == KEY_SHOW_HINTS)
+            .expect("the panel offers the hint line");
+        assert_eq!(default.label, "Show keyboard hints");
+        assert_eq!(default.value, "true", "an unconfigured launcher shows its hints");
+        assert_eq!(default.source, ConfigLayer::BuiltInDefaults.as_str());
+        assert!(configured_show_hints(Some(&store)));
+
+        let report = persist(&mut store, KEY_SHOW_HINTS, "false").expect("the key is a setting");
+        assert_eq!(report, "launcher.show-hints = false");
+
+        let reloaded = directory.store();
+        let saved = rows(Some(&reloaded))
+            .into_iter()
+            .find(|row| row.key == KEY_SHOW_HINTS)
+            .expect("the panel still offers the hint line");
+        assert_eq!(saved.value, "false");
+        assert_eq!(saved.source, ConfigLayer::UserGlobal.as_str());
+        assert!(
+            !configured_show_hints(Some(&reloaded)),
+            "the launcher reads back the choice the panel wrote"
+        );
+    }
+
+    /// The renderer takes this as a plain boolean, so a value it cannot read is
+    /// refused on the way in rather than silently treated as "off" -- a user who
+    /// typed `yes` would otherwise be looking at a hidden hint line and a
+    /// configuration file that says they asked for something else.
+    #[test]
+    fn a_hint_line_value_that_is_not_a_boolean_is_refused_before_it_is_written() {
+        for accepted in ["true", "false"] {
+            assert!(
+                validate(KEY_SHOW_HINTS, accepted).is_ok(),
+                "{accepted} is one of the two values the renderer honours"
+            );
+        }
+
+        for refused in ["yes", "no", "1", "0", "True", "off"] {
+            let error = validate(KEY_SHOW_HINTS, refused).expect_err("only `true` and `false` are honoured");
+            assert!(error.contains("must be `true` or `false`"), "{error}");
+            assert!(error.contains(refused), "the message names the value: {error}");
+        }
+
+        let directory = ConfigDir::new("show-hints-refused");
+        let mut store = directory.store();
+        assert!(persist(&mut store, KEY_SHOW_HINTS, "yes").is_err());
+        assert!(
+            configured_show_hints(Some(&directory.store())),
+            "a refused edit leaves the launcher showing what it showed before"
         );
     }
 

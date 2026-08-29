@@ -1639,6 +1639,7 @@ impl LegacyDriver {
                         settings_open: false,
                         settings: Arc::default(),
                         settings_focus: None,
+                        show_hints: true,
                     };
 
                     // Keep the staleness check, queued-job check, and

@@ -19,6 +19,7 @@ fn model(query: &str) -> ViewModel {
         settings_open: false,
         settings: Arc::default(),
         settings_focus: None,
+        show_hints: true,
     }
 }
 
@@ -628,6 +629,60 @@ fn the_footer_offers_the_settings_surface_to_a_user_who_knows_no_shortcut() {
     );
 
     assert!(clicked.commands.contains(&UiCommand::OpenSettings));
+}
+
+/// The hint line is a legend for a user who has not learned the keys yet, and a
+/// user who has learned them asked to be rid of it. `launcher.show-hints`
+/// reaches the renderer as a field on the frame, so this is the whole of what
+/// the setting does on screen.
+#[test]
+fn the_footer_hides_its_hint_line_when_the_setting_says_so() {
+    const HINTS: &str = "Up/Down navigate   Tab complete   Esc cancel";
+    let context = create_launcher_context();
+
+    let shown = build_launcher_frame(&context, launcher_input(Vec::new()), &model(""));
+    assert!(
+        painted(&shown, HINTS),
+        "the launcher shows the hints by default, or this tests nothing"
+    );
+
+    let mut hidden_view = model("");
+    hidden_view.show_hints = false;
+    let hidden = build_launcher_frame(&context, launcher_input(Vec::new()), &hidden_view);
+    assert!(
+        !painted(&hidden, HINTS),
+        "a user who turned the hints off must not be shown them anyway"
+    );
+}
+
+/// The one thing hiding the hints must never hide.
+///
+/// `Settings  Ctrl+,` sits in the same footer row and is the only mouse route
+/// into the settings surface: if it went with the hints, the setting that hid
+/// them could only be undone from a terminal, by a user who no longer has
+/// anything on screen telling them the surface exists.
+#[test]
+fn the_settings_control_survives_a_footer_with_no_hints() {
+    let context = create_launcher_context();
+    let mut view = model("");
+    view.show_hints = false;
+
+    let located = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(painted(&located, "Settings  Ctrl+,"));
+    // And it is still the control, not just still painted: it answers a click
+    // exactly as it does with the hints beside it.
+    let affordance = position_of(&located, "Settings");
+    let clicked = build_launcher_frame(
+        &context,
+        launcher_input(click_at(affordance + egui::vec2(4.0, 4.0))),
+        &view,
+    );
+    assert!(clicked.commands.contains(&UiCommand::OpenSettings));
+
+    // The same assertion with the hints shown, so a change that broke only one
+    // of the two cases cannot pass by looking like the other.
+    let with_hints = build_launcher_frame(&context, launcher_input(Vec::new()), &model(""));
+    assert!(painted(&with_hints, "Settings  Ctrl+,"));
 }
 
 /// Set as text, the settings control has no button frame to say it can be

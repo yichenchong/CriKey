@@ -1852,6 +1852,47 @@ fn settings_published_before_the_first_activation_are_already_there_when_it_open
     assert_eq!(model.settings.len(), 1);
 }
 
+/// The host reads `launcher.show-hints` at startup, before the launcher has
+/// ever been shown, and again after every write. The value therefore has to be
+/// accepted while hidden and has to be carried by every frame afterwards --
+/// including the frames a later mutation produces, which is where a value
+/// stored but not published would go missing.
+#[test]
+fn the_hint_line_choice_reaches_every_frame_the_launcher_publishes() {
+    let mut view_model = LauncherViewModel::new();
+    assert!(
+        !view_model.set_show_hints(true),
+        "the launcher already shows its hints, so this changed nothing"
+    );
+
+    assert!(view_model.set_show_hints(false), "hiding them is a change");
+    // Hidden: nothing to redraw, and nothing was drawn.
+    expect_idle(&mut view_model);
+
+    view_model.activate();
+    let opened = expect_frame(&mut view_model);
+    assert!(
+        !opened.show_hints,
+        "the first frame after activation must already honour the setting"
+    );
+
+    view_model.set_settings(vec![setting("launcher.show-hints", "false")]);
+    let later = expect_frame(&mut view_model);
+    assert!(
+        !later.show_hints,
+        "an unrelated mutation must not republish the hints the user hid"
+    );
+
+    assert!(view_model.set_show_hints(true), "showing them again is a change");
+    let restored = expect_frame(&mut view_model);
+    assert!(restored.show_hints);
+    assert!(
+        !view_model.set_show_hints(true),
+        "and setting the value it already has produces no frame"
+    );
+    expect_idle(&mut view_model);
+}
+
 #[test]
 fn the_host_can_open_the_settings_surface_on_the_row_it_needs_answered() {
     let mut view_model = LauncherViewModel::new();
