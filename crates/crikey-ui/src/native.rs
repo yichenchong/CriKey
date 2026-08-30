@@ -2764,7 +2764,7 @@ fn draw_setting_row(
                 // keep, so it commits the moment it moves. Offering a Save
                 // beside it would imply the click had not counted yet.
                 let mut switched = on;
-                let response = ui.checkbox(&mut switched, "");
+                let response = draw_switch(ui, &mut switched, colors);
                 focus_once(ui, &response, row, focus_key);
                 if response.changed() {
                     commands.push(UiCommand::SetSetting {
@@ -2799,6 +2799,56 @@ fn draw_setting_row(
         });
         ui.data_mut(|data| data.remove::<String>(draft_id));
     }
+}
+
+/// A switch: a track with a knob at one end, the width of a short word.
+///
+/// Drawn rather than taken from egui, because the stock checkbox is an empty
+/// box on a dark sheet. Its *off* state came out as a rounded square barely a
+/// shade from the surface behind it -- no visible control at all, which is a
+/// worse affordance than the text field this replaced, and the shipped
+/// screenshot is what showed it. A switch reads as a switch in both positions:
+/// the track changes colour, and the knob moves.
+///
+/// Answers the pointer and the keyboard alike. It takes focus, so a row the
+/// host focused is operable with the space bar, and it paints a ring when it
+/// has the keyboard -- a launcher this keyboard-driven cannot have a control
+/// whose focus is invisible.
+fn draw_switch(ui: &mut egui::Ui, on: &mut bool, colors: theme::Palette) -> egui::Response {
+    // Two thirds of a control tall and twice that wide: enough to read as a
+    // track with travel in it, and no taller than the row it sits in.
+    let height = theme::FOOTER_HEIGHT;
+    let size = vec2(height * 2.0, height);
+    let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if response.clicked() || (response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Space))) {
+        *on = !*on;
+        // Marked by hand because the flip may come from the keyboard, which
+        // `allocate_exact_size` has no way to know changed anything.
+        response.mark_changed();
+    }
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let radius = rect.height() / 2.0;
+    // The accent for on, the tier below the sheet for off: both are a step from
+    // the surface, so neither position is the absence of a control.
+    let track = if *on { colors.accent_soft } else { colors.input };
+    let painter = ui.painter();
+    painter.rect_filled(rect, Rounding::same(radius), track);
+    if response.has_focus() {
+        painter.rect_stroke(rect, Rounding::same(radius), Stroke::new(1.0, colors.accent));
+    }
+    let travel = rect.width() - rect.height();
+    let centre = egui::pos2(
+        rect.left() + radius + if *on { travel } else { 0.0 },
+        rect.center().y,
+    );
+    // The knob carries the state as well as the track does, so the switch
+    // survives a palette where the two track colours are close.
+    let knob = if *on { colors.accent } else { colors.text_muted };
+    painter.circle_filled(centre, radius - 2.0, knob);
+    response
 }
 
 /// Gives `response` the keyboard when the host asked for this row, once.

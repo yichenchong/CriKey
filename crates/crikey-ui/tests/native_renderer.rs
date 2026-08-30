@@ -1074,3 +1074,130 @@ fn the_settings_sheet_says_how_each_control_commits() {
     );
     assert!(painted(&both, "Enter or Save"), "a mixed sheet says both");
 }
+
+/// A switch has to look like a control in *both* positions.
+///
+/// The stock checkbox did not: its off state was an empty rounded square a
+/// shade from the surface behind it, which reads as nothing being there at
+/// all. So this asserts the two states differ in what they paint, not merely
+/// that a click commits -- a switch nobody can see is a switch nobody uses,
+/// and that is the defect the shipped screenshot showed.
+#[test]
+fn a_switch_is_visible_in_both_positions() {
+    /// Every filled shape's colour, which is the switch's whole appearance:
+    /// a track and a knob.
+    fn fills(frame: &crikey_ui::NativeUiFrame) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, out)),
+                egui::Shape::Rect(rect) => out.push(rect.fill),
+                egui::Shape::Circle(circle) => out.push(circle.fill),
+                _ => {}
+            }
+        }
+
+        let mut found = Vec::new();
+        for clipped in &frame.output.shapes {
+            walk(&clipped.shape, &mut found);
+        }
+        found
+    }
+
+    fn sheet(on: bool) -> ViewModel {
+        let mut view = model("");
+        view.settings_open = true;
+        view.settings = Arc::from(vec![SettingRow {
+            key: "launcher.show-hints".to_owned(),
+            label: "Show keyboard hints".to_owned(),
+            value: on.to_string(),
+            source: "built-in-defaults".to_owned(),
+            control: SettingControl::Toggle { on },
+        }]);
+        view
+    }
+
+    let context = create_launcher_context();
+    let on = fills(&build_launcher_frame(
+        &context,
+        launcher_input(Vec::new()),
+        &sheet(true),
+    ));
+    let off = fills(&build_launcher_frame(
+        &context,
+        launcher_input(Vec::new()),
+        &sheet(false),
+    ));
+
+    assert_ne!(
+        on, off,
+        "the two positions of a switch must not paint the same thing"
+    );
+
+    // The knob is the only circle this sheet paints, which is what makes it
+    // findable without reaching into the renderer. Asserting on the switch's
+    // own shapes rather than on every fill in the frame: the query field and
+    // the buttons stand out from the sheet whatever the switch does, so a
+    // frame-wide search would have passed with the invisible checkbox still
+    // in place.
+    for (state, view) in [("on", sheet(true)), ("off", sheet(false))] {
+        let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        let (knob, track) = switch_shapes(&frame);
+        assert_ne!(
+            knob, track,
+            "the {state} switch's knob is the colour of its own track, so there is no knob"
+        );
+        assert!(
+            !sheet_colours().contains(&track),
+            "the {state} switch's track is the colour of the sheet, so there is no switch"
+        );
+    }
+}
+
+/// The two surface tiers a settings row is drawn on: the sheet it stands on
+/// and the window under that.
+///
+/// Spelled out rather than read from the theme, because a test that took them
+/// from the theme would agree with the renderer by construction and prove
+/// nothing about contrast. Their being written here is also why they have to
+/// be right: an earlier guess at the sheet's colour let a switch painted in
+/// exactly that colour pass, which is the whole defect.
+fn sheet_colours() -> [egui::Color32; 2] {
+    [
+        // `theme::palette().surface`
+        egui::Color32::from_rgb(34, 38, 45),
+        // `theme::palette().canvas`
+        egui::Color32::from_rgb(20, 22, 26),
+    ]
+}
+
+/// The switch's knob and track colours: the sheet's only circle, and the
+/// rectangle under it.
+fn switch_shapes(frame: &crikey_ui::NativeUiFrame) -> (egui::Color32, egui::Color32) {
+    fn walk(
+        shape: &egui::Shape,
+        knob: &mut Option<(egui::Pos2, egui::Color32)>,
+        rects: &mut Vec<egui::epaint::RectShape>,
+    ) {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, knob, rects)),
+            egui::Shape::Circle(circle) => *knob = Some((circle.center, circle.fill)),
+            egui::Shape::Rect(rect) => rects.push(*rect),
+            _ => {}
+        }
+    }
+
+    let mut knob = None;
+    let mut rects = Vec::new();
+    for clipped in &frame.output.shapes {
+        walk(&clipped.shape, &mut knob, &mut rects);
+    }
+    let (centre, colour) = knob.expect("a switch paints a knob");
+    let track = rects
+        .iter()
+        .filter(|rect| rect.rect.contains(centre))
+        // The innermost rectangle containing the knob is its track; the sheet
+        // and the window contain it too.
+        .min_by(|left, right| left.rect.area().total_cmp(&right.rect.area()))
+        .expect("the knob sits on a track");
+    (colour, track.fill)
+}
