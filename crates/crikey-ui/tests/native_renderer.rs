@@ -1010,3 +1010,67 @@ fn a_boolean_setting_is_a_switch_that_commits_when_it_moves() {
 fn theme_margin() -> f32 {
     12.0 + 12.0
 }
+
+/// The sheet's legend tells the truth about both controls it draws.
+///
+/// The switch and the text field commit differently, so the footer that used
+/// to read "Enter or Save commits an edit" was telling a user of a switch to
+/// press a key that does nothing. Asserted on the rendered sheet rather than
+/// on the sentence alone, because a legend nothing paints is not a legend.
+#[test]
+fn the_settings_sheet_says_how_each_control_commits() {
+    fn sheet(controls: &[SettingControl]) -> ViewModel {
+        let mut view = model("");
+        view.settings_open = true;
+        view.settings = Arc::from(
+            controls
+                .iter()
+                .enumerate()
+                .map(|(index, control)| SettingRow {
+                    key: format!("launcher.thing-{index}"),
+                    label: format!("Thing {index}"),
+                    value: "value".to_owned(),
+                    source: "default".to_owned(),
+                    control: *control,
+                })
+                .collect::<Vec<_>>(),
+        );
+        view
+    }
+
+    let context = create_launcher_context();
+
+    let switches = build_launcher_frame(
+        &context,
+        launcher_input(Vec::new()),
+        &sheet(&[SettingControl::Toggle { on: true }]),
+    );
+    assert!(painted(&switches, "Switches apply at once"), "switches say so");
+    assert!(
+        !painted(&switches, "Enter or Save"),
+        "a sheet with no text field must not send the user after Enter"
+    );
+
+    let editors = build_launcher_frame(
+        &context,
+        launcher_input(Vec::new()),
+        &sheet(&[SettingControl::Text]),
+    );
+    assert!(painted(&editors, "Enter or Save"), "editors say so");
+    assert!(
+        !painted(&editors, "Switches"),
+        "a sheet with no switch must not explain switches"
+    );
+
+    // What the shipped launcher actually presents.
+    let both = build_launcher_frame(
+        &context,
+        launcher_input(Vec::new()),
+        &sheet(&[SettingControl::Text, SettingControl::Toggle { on: false }]),
+    );
+    assert!(
+        painted(&both, "Switches apply at once"),
+        "a mixed sheet says both"
+    );
+    assert!(painted(&both, "Enter or Save"), "a mixed sheet says both");
+}

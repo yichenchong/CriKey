@@ -2682,11 +2682,13 @@ fn draw_settings(
             // rule: it is the last thing on a surface that has already ended.
             ui.add_space(theme::SPACE_2);
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Enter or Save commits an edit")
-                        .size(theme::TEXT_SMALL)
-                        .color(colors.text_muted),
-                );
+                if let Some(hint) = commit_hint(&model.settings) {
+                    ui.label(
+                        RichText::new(hint)
+                            .size(theme::TEXT_SMALL)
+                            .color(colors.text_muted),
+                    );
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Quit CriKey").clicked() {
                         commands.push(UiCommand::Quit);
@@ -2694,6 +2696,34 @@ fn draw_settings(
                 });
             });
         });
+}
+
+/// How the sheet says an edit is committed, for the controls it is actually
+/// showing.
+///
+/// The two controls commit differently -- a switch the moment it moves, an
+/// editor on Enter or Save -- so one sentence cannot describe both without
+/// being wrong about one of them. It used to read "Enter or Save commits an
+/// edit", which told a user of a switch to press a key that does nothing and
+/// implied their click had not counted.
+///
+/// Tailored to the rows rather than listing every rule always: a sheet of
+/// switches that explained Enter is noise, and noise in a legend is what
+/// teaches people to stop reading legends. `None` when there is nothing to
+/// commit, where the empty-state sentence above has already said so.
+fn commit_hint(settings: &[SettingRow]) -> Option<&'static str> {
+    let switches = settings
+        .iter()
+        .any(|row| matches!(row.control, SettingControl::Toggle { .. }));
+    let editors = settings
+        .iter()
+        .any(|row| matches!(row.control, SettingControl::Text));
+    match (switches, editors) {
+        (true, true) => Some("Switches apply at once   Enter or Save commits a typed edit"),
+        (true, false) => Some("Switches apply at once"),
+        (false, true) => Some("Enter or Save commits an edit"),
+        (false, false) => None,
+    }
 }
 
 /// One editable setting.
@@ -3176,6 +3206,52 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
     let mailbox = lock_recover(&state.frames);
     assert!(mailbox.latest.is_none());
     assert!(mailbox.wake_session.is_none());
+}
+
+#[cfg(test)]
+mod settings_hint_tests {
+    use super::*;
+
+    fn row(control: SettingControl) -> SettingRow {
+        SettingRow {
+            key: "launcher.thing".to_owned(),
+            label: "Thing".to_owned(),
+            value: "value".to_owned(),
+            source: "default".to_owned(),
+            control,
+        }
+    }
+
+    /// The legend has to describe the controls on screen. A sheet of switches
+    /// told to press Enter is being told to press a key that does nothing, and
+    /// a typed edit told that it applies at once is being lied to about
+    /// whether it has saved.
+    #[test]
+    fn the_commit_hint_describes_the_controls_the_sheet_is_showing() {
+        let switch = row(SettingControl::Toggle { on: true });
+        let editor = row(SettingControl::Text);
+
+        let switches_only = commit_hint(&[switch.clone()]).expect("a sheet of switches says so");
+        assert!(!switches_only.contains("Enter"), "got {switches_only:?}");
+        assert!(switches_only.contains("Switches"), "got {switches_only:?}");
+
+        let editors_only = commit_hint(&[editor.clone()]).expect("a sheet of editors says so");
+        assert!(editors_only.contains("Enter"), "got {editors_only:?}");
+        assert!(!editors_only.contains("Switches"), "got {editors_only:?}");
+
+        // The shipped launcher is this case: a hotkey and a ceiling to type,
+        // and two switches.
+        let both = commit_hint(&[switch, editor]).expect("a mixed sheet says both");
+        assert!(both.contains("Enter"), "got {both:?}");
+        assert!(both.contains("Switches"), "got {both:?}");
+    }
+
+    /// Nothing to commit, nothing to say: the empty-state sentence above the
+    /// footer has already explained that the host published no settings.
+    #[test]
+    fn an_empty_sheet_offers_no_commit_hint() {
+        assert_eq!(commit_hint(&[]), None);
+    }
 }
 
 #[cfg(test)]
