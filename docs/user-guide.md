@@ -73,6 +73,17 @@ panel. `Settings  Ctrl+,` stays where it is: it is the only way into the
 settings surface with the mouse, so hiding the hints must never be a choice
 you cannot take back.
 
+The launcher window is drawn with rounded corners where the desktop can
+composite them smoothly: a Wayland session, an X11 session with a compositing
+manager running, macOS, and Windows 11. Where nothing can — an X11 session
+with no compositing manager, or Windows 10 — the window is square, because the
+only other way to round it is to clip whole pixels out of the window, and the
+stepped edge that leaves looks like a rendering fault rather than a rounded
+corner. Turn them off anywhere with `launcher.rounded-corners = false` or the
+matching row in the panel. If you expected rounded corners and have square
+ones, the launcher says why on startup; run `crikey run` from a terminal to
+read it.
+
 Secret fields are redacted. Configuration read errors are reported and a
 launcher run continues with built-in defaults; fix the reported file before
 relying on the setting. For isolated development, the standard-directory

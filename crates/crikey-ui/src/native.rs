@@ -362,23 +362,26 @@ struct Overlay {
     settings_open: bool,
     settings: Arc<[SettingRow]>,
     settings_focus: Option<String>,
-    /// Whether the footer draws its hint line, which is a preference the host
-    /// read from configuration and no provider knows anything about. Left out
-    /// of the overlay, a user who turned the hints off would watch them come
-    /// back on the first suggestion that arrived.
+    /// Whether the footer draws its hint line, and whether the window is
+    /// rounded. Both are preferences the host read from configuration and no
+    /// provider knows anything about. Left out of the overlay, a user who
+    /// turned either off would watch it come back on the first suggestion that
+    /// arrived.
     show_hints: bool,
+    rounded_corners: bool,
 }
 
 impl Default for Overlay {
-    /// Written out rather than derived, because `show_hints` derives to the
-    /// wrong answer: the hint line is shown unless a user has said otherwise,
-    /// and `false` is what the derive would supply.
+    /// Written out rather than derived, because both flags derive to the wrong
+    /// answer: the hint line is shown and the window is rounded unless a user
+    /// has said otherwise, and `false` is what the derive would supply.
     fn default() -> Self {
         Self {
             settings_open: false,
             settings: Arc::from([] as [SettingRow; 0]),
             settings_focus: None,
             show_hints: true,
+            rounded_corners: true,
         }
     }
 }
@@ -399,6 +402,7 @@ fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
         settings: Arc::clone(&model.settings),
         settings_focus: model.settings_focus.clone(),
         show_hints: model.show_hints,
+        rounded_corners: model.rounded_corners,
     };
     mailbox.overlay_session = Some(session);
 }
@@ -416,6 +420,7 @@ fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> View
         settings: Arc::clone(&mailbox.overlay.settings),
         settings_focus: mailbox.overlay.settings_focus.clone(),
         show_hints: mailbox.overlay.show_hints,
+        rounded_corners: mailbox.overlay.rounded_corners,
         ..model.clone()
     }
 }
@@ -1311,6 +1316,25 @@ struct GraphicsState {
     /// launcher with an opaque canvas still needs its corners left unpainted,
     /// and only this says whether the surface can do that.
     shaped: bool,
+    /// Whether the window was created able to carry alpha at all, which is
+    /// what separates a desktop that will not composite from a graphics stack
+    /// that will not blend. The two are fixed in different places, so the
+    /// launcher has to be able to say which one it hit.
+    alpha_surface: bool,
+    /// The rounding preference last applied to the window, or `None` before
+    /// any frame has said what it should be.
+    ///
+    /// Kept so the window manager is asked only when the answer changes: the
+    /// preference outlives the frame that set it, and re-asking on every frame
+    /// would be a syscall per repaint for a value that changes when a user
+    /// opens settings and almost never otherwise.
+    rounded: Option<bool>,
+    /// Whether this launcher has already said it cannot round its corners.
+    ///
+    /// Once per process, not once per frame: the reason cannot change while
+    /// the window lives, and a line repeated on every repaint is a line
+    /// nobody reads.
+    reported_square: bool,
     /// The height the window returns to as soon as it has something to show
     /// below the query field, in logical pixels.
     expanded_height: u32,
@@ -1494,42 +1518,27 @@ fn preferred_alpha_mode(
     modes.first().copied()
 }
 
-/// Why the launcher's corners came out square, if they did.
+/// Why a launcher that was asked for rounded corners has square ones.
 ///
-/// A window gets its shape one of two ways -- drawn into a surface that
-/// blends, or clipped out by the window system -- so it is square only when
-/// both are gone, and `None` is a launcher that got its shape either way.
+/// Called only once both routes to a shape are gone -- the surface would not
+/// blend a drawn one and no window manager would round the window -- so this
+/// names the half that was reachable and failed rather than deciding anything.
+/// A desktop that will not composite and a graphics stack that will not blend
+/// are fixed in different places, and the corner looks identical from the
+/// outside.
 ///
-/// The remaining messages name the half that was reachable and failed, which
-/// is the whole point of printing one: a desktop that will not composite, a
-/// graphics stack that will not blend, and a window system that would not clip
-/// are fixed in three different places, and the corner looks identical from
-/// the outside. A platform that never takes the alpha route at all is not
-/// missing a compositor and must not be told it is.
-///
-/// `alpha_surface` is whether the window was created able to carry alpha,
-/// `shaped` whether it ended up doing so, and `clipped` whether the window
-/// system cut the shape out instead.
-fn square_corner_reason(alpha_surface: bool, shaped: bool, clipped: bool) -> Option<&'static str> {
-    if shaped || clipped {
-        return None;
-    }
-    // Windows is never handed an alpha-carrying surface -- `wgpu` has one
-    // composite mode for an `HWND` swapchain and it is opaque -- so the clip
-    // is the only route it has, and its failure is the only thing to report.
+/// `alpha_surface` is whether the window was created able to carry alpha at
+/// all. Windows never is, and is never missing a compositor for it: its route
+/// is the corner preference, and only a release too old to have one lands
+/// here.
+fn square_corner_reason(alpha_surface: bool) -> Option<&'static str> {
     if cfg!(target_os = "windows") {
-        return Some("this window could not be clipped, so the launcher's corners are square");
+        return Some("this Windows is too old to round a window, so the launcher's corners are square");
     }
     if alpha_surface {
-        return Some(
-            "this graphics surface will not blend and the window could not be clipped, \
-             so the launcher's corners are square",
-        );
+        return Some("this graphics surface will not blend, so the launcher's corners are square");
     }
-    Some(
-        "the desktop is not compositing window transparency and the window could not be clipped, \
-         so the launcher's corners are square",
-    )
+    Some("the desktop is not compositing window transparency, so the launcher's corners are square")
 }
 
 impl GraphicsState {
@@ -1672,26 +1681,10 @@ impl GraphicsState {
             view_formats: Vec::new(),
         };
         surface.configure(&device, &surface_config);
-        // A window whose surface would not promise to blend has its shape cut
-        // out instead of drawn -- see [`crate::window_shape`]. Applied before
-        // the first frame, so the launcher is never briefly square, and only
-        // where the shape was not already drawn: clipping a composited window
-        // would trade its smooth arc for a stepped one.
-        let clipped = !shaped
-            && crate::window_shape::clip(
-                window.as_ref(),
-                surface_config.width,
-                surface_config.height,
-                window.scale_factor(),
-            );
-        // A launcher that quietly squares itself gives the user nothing to act
-        // on: the corners look the same whether the desktop refused, the
-        // graphics stack refused, or the window system would not clip. One
-        // line naming which, printed only once both ways of having a shape
-        // have been tried and lost.
-        if let Some(reason) = square_corner_reason(alpha_surface, shaped, clipped) {
-            eprintln!("crikey: {reason}");
-        }
+        // Nothing is asked of the window here. Whether it should be rounded is
+        // a preference that arrives on the frame, and it can change while the
+        // launcher runs, so it is applied where the frames are -- see
+        // `apply_window_rounding`.
 
         let egui_context = create_launcher_context();
         let repaint_proxy = proxy;
@@ -1713,6 +1706,9 @@ impl GraphicsState {
             window,
             transparent,
             shaped,
+            alpha_surface,
+            rounded: None,
+            reported_square: false,
             expanded_height,
             surface,
             device,
@@ -1804,12 +1800,38 @@ impl GraphicsState {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
-        // A clip is in window coordinates and does not follow the window, so a
-        // launcher that grew as results arrived would keep the corners of the
-        // size it opened at. A window that draws its shape redraws it with the
-        // frame and needs nothing here.
-        if !self.shaped {
-            let _ = crate::window_shape::clip(&self.window, width, height, self.window.scale_factor());
+        // Nothing shape-related belongs here any more. A region had to be
+        // rebuilt at every size because it was expressed in window
+        // coordinates; a corner preference is a property of the window and
+        // survives a resize on its own.
+    }
+
+    /// Asks the window manager for the shape this frame wants, when that has
+    /// changed since the last one.
+    ///
+    /// Three ways a launcher ends up with rounded corners and only one of them
+    /// is here. Where the surface blends, the shape is drawn into the frame
+    /// and this finds nothing to do. Where it does not -- Windows -- the
+    /// compositor is asked to round the window itself. Where neither is
+    /// available, the window stays square, because the remaining option is a
+    /// clip and a clip is whole pixels: it was shipped once, in 0.1.14, and
+    /// the stepped arc it left was reported as a rendering fault.
+    ///
+    /// The refusal is reported once and only when the user asked for the
+    /// corners, because a square window looks the same however it got that way
+    /// and nobody should be told about a shape they turned off.
+    fn apply_window_rounding(&mut self, rounded: bool) {
+        if self.rounded == Some(rounded) {
+            return;
+        }
+        self.rounded = Some(rounded);
+        let by_window_manager = crate::window_shape::round(&self.window, rounded);
+        if !rounded || self.shaped || by_window_manager || self.reported_square {
+            return;
+        }
+        if let Some(reason) = square_corner_reason(self.alpha_surface) {
+            self.reported_square = true;
+            eprintln!("crikey: {reason}");
         }
     }
 
@@ -1864,6 +1886,9 @@ impl GraphicsState {
                 frame_size.height as f32 / points,
             ),
         ));
+        // The window's own shape follows the frame, because the preference
+        // that decides it can be changed while the launcher is running.
+        self.apply_window_rounding(model.rounded_corners);
         let NativeUiFrame { output, commands } =
             build_launcher_frame_with_transparency(&self.egui_context, input, model, self.transparent);
         let egui::FullOutput {
@@ -2077,7 +2102,15 @@ fn draw_launcher(
                 // leaves unpainted are the corners the desktop shows through.
                 // The surface is configured to carry alpha for exactly this
                 // reason -- see `GraphicsState::initialize`.
-                .rounding(Rounding::same(theme::RADIUS_WINDOW))
+                //
+                // Zero when the user has turned the corners off, which squares
+                // the silhouette rather than hiding a rounded one: there would
+                // be nothing behind the corners to show.
+                .rounding(Rounding::same(if model.rounded_corners {
+                    theme::RADIUS_WINDOW
+                } else {
+                    0.0
+                }))
                 .inner_margin(Margin::same(theme::PANEL_MARGIN)),
         )
         .show(context, |ui| {
@@ -2884,6 +2917,7 @@ mod transparency_tests {
             settings: Arc::default(),
             settings_focus: None,
             show_hints: true,
+            rounded_corners: true,
         };
         let input = RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -2996,6 +3030,7 @@ mod lifecycle_tests {
                     settings: Arc::default(),
                     settings_focus: None,
                     show_hints: true,
+                    rounded_corners: true,
                 },
             });
             mailbox.wake_session = Some(7);
@@ -3104,6 +3139,7 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
                 settings: Arc::default(),
                 settings_focus: None,
                 show_hints: true,
+                rounded_corners: true,
             },
         });
         mailbox.wake_session = Some(1);
@@ -3269,36 +3305,28 @@ mod surface_tests {
         );
     }
 
-    /// The two ways of losing the shape are fixed in different places, so a
-    /// user who reports square corners has to be told which one they hit.
-    ///
+    /// The ways of losing the shape are fixed in different places, so a user
+    /// who reports square corners has to be told which one they hit.
     #[test]
     fn a_square_window_says_which_refusal_it_hit() {
-        // Windows has one route to a shape and reports only its failure.
-        // Telling a Windows user their desktop is not compositing would send
-        // them after a setting that platform does not have.
+        // Windows reaches this only on a release with no corner preference,
+        // and is never missing a compositor: telling a Windows user their
+        // desktop is not compositing would send them after a setting that
+        // platform does not have.
         if cfg!(target_os = "windows") {
-            let clip = square_corner_reason(false, false, false).expect("a clip failure is reported");
-            assert!(!clip.contains("compositing"), "got {clip:?}");
-            assert!(clip.contains("clipped"), "got {clip:?}");
+            let old = square_corner_reason(false).expect("an unsupported Windows is reported");
+            assert!(!old.contains("compositing"), "got {old:?}");
+            assert!(old.contains("Windows"), "got {old:?}");
             return;
         }
-        let desktop = square_corner_reason(false, false, false).expect("a desktop refusal is reported");
-        let surface = square_corner_reason(true, false, false).expect("a surface refusal is reported");
+        let desktop = square_corner_reason(false).expect("a desktop refusal is reported");
+        let surface = square_corner_reason(true).expect("a surface refusal is reported");
         assert_ne!(
             desktop, surface,
             "one message for both refusals tells a user nothing they did not already see"
         );
         assert!(desktop.contains("desktop"), "got {desktop:?}");
         assert!(surface.contains("surface"), "got {surface:?}");
-    }
-
-    /// Silence is for a launcher that has its shape. Reporting one anyway
-    /// would train everybody to ignore the line that matters.
-    #[test]
-    fn a_shaped_window_reports_nothing() {
-        assert_eq!(square_corner_reason(true, true, false), None);
-        assert_eq!(square_corner_reason(false, false, true), None);
     }
 }
 
@@ -3400,6 +3428,7 @@ mod window_geometry_tests {
             settings: Arc::default(),
             settings_focus: None,
             show_hints: true,
+            rounded_corners: true,
         }
     }
 
@@ -3495,6 +3524,34 @@ mod window_geometry_tests {
         record_overlay(&mut mailbox, 7, &host);
         assert!(
             with_overlay(&mailbox, 7, &provider).show_hints,
+            "turning them back on is the host's to say, and it sticks too"
+        );
+    }
+
+    /// The window's shape is the host's half of a frame for the same reason
+    /// the hint line is: a provider knows nothing about it, so a suggestion
+    /// would otherwise put the corners back the moment one arrived.
+    #[test]
+    fn a_provider_frame_keeps_the_window_shape_the_host_last_published() {
+        let mut mailbox = FrameMailbox::default();
+        let mut host = view("", false);
+        host.rounded_corners = false;
+        record_overlay(&mut mailbox, 7, &host);
+
+        let provider = view("term", false);
+        assert!(
+            provider.rounded_corners,
+            "a provider frame defaults to asking for them"
+        );
+        assert!(
+            !with_overlay(&mailbox, 7, &provider).rounded_corners,
+            "a suggestion must not round a window the user squared"
+        );
+
+        host.rounded_corners = true;
+        record_overlay(&mut mailbox, 7, &host);
+        assert!(
+            with_overlay(&mailbox, 7, &provider).rounded_corners,
             "turning them back on is the host's to say, and it sticks too"
         );
     }

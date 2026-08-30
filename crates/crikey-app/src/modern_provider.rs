@@ -2083,6 +2083,7 @@ impl ModernDriver {
                         settings: Arc::default(),
                         settings_focus: None,
                         show_hints: true,
+                        rounded_corners: true,
                     };
 
                     // A late answer must never appear under a newer generation.

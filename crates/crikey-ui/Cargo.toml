@@ -40,22 +40,12 @@ features = [
     "Win32_Foundation",
     # `SetWindowSubclass`, `DefSubclassProc`, `RemoveWindowSubclass`.
     "Win32_UI_Shell",
-    # `CreateRoundRectRgn`, which cuts the launcher's rounded shape out of a
-    # window whose swapchain cannot carry alpha.
-    "Win32_Graphics_Gdi",
     # `DwmSetWindowAttribute`, which asks Windows 11 to round the same window
     # smoothly instead -- a region is whole pixels and cannot be.
     "Win32_Graphics_Dwm",
     # `WM_QUERYENDSESSION`, `WM_ENDSESSION`, `WM_NCDESTROY`.
     "Win32_UI_WindowsAndMessaging",
 ]
-
-# X11 is the other window system whose surfaces will not state that they
-# blend, so the launcher's shape is clipped there too -- see `window_shape`.
-# Same footing as the Win32 dependency above: this is the crate that owns the
-# launcher's window, and shaping that window is not a platform service.
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-x11rb = { version = "0.13", features = ["shape"] }
 
 [dev-dependencies]
 # The renderer tests build rows carrying real decoded pixels, because the

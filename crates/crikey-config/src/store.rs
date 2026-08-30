@@ -69,6 +69,16 @@ pub const KEY_ACTIVATION_HOTKEY: &str = "launcher.activation-hotkey";
 /// explain.
 pub const KEY_SHOW_HINTS: &str = "launcher.show-hints";
 
+/// Whether the launcher's window is drawn with rounded corners (spec 21.2).
+///
+/// Defaulted here rather than in the renderer for the same reason
+/// [`KEY_SHOW_HINTS`] is: the setting changes nothing but the shape of the
+/// window it is read from, so a user who cannot tell whether their edit took
+/// has only `crikey config get launcher.rounded-corners` to ask — and that has
+/// to answer on a machine that has never been configured, or the one report
+/// that could settle the question is the one that says nothing.
+pub const KEY_ROUNDED_CORNERS: &str = "launcher.rounded-corners";
+
 /// The values the host itself supplies, forming [`ConfigLayer::BuiltInDefaults`].
 ///
 /// Only keys whose default this crate genuinely owns. A key defaulted by another
@@ -79,6 +89,7 @@ pub const BUILT_IN_DEFAULTS: &[(&str, &str)] = &[
     (KEY_RELOAD_INTERVAL_MS, "500"),
     (KEY_ACTIVATION_HOTKEY, "Ctrl+Alt+Space"),
     (KEY_SHOW_HINTS, "true"),
+    (KEY_ROUNDED_CORNERS, "true"),
 ];
 /// Keys under this prefix are operator-pinned: a user may supply a source
 /// declaration, but cannot redirect one an administrator has specified.

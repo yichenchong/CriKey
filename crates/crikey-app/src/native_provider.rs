@@ -2099,6 +2099,7 @@ impl NativeDriver {
                                 settings: Arc::default(),
                                 settings_focus: None,
                                 show_hints: true,
+                                rounded_corners: true,
                             };
                             *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) =
                                 Some(merged.clone());
@@ -2137,6 +2138,7 @@ impl NativeDriver {
                         settings: Arc::default(),
                         settings_focus: None,
                         show_hints: true,
+                        rounded_corners: true,
                     };
 
                     // Hold the mailbox lock across the staleness check and the

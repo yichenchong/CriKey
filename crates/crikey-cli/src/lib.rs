@@ -747,6 +747,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     view_model.set_show_hints(settings::configured_show_hints(
         configuration.as_ref().map(|configuration| &configuration.store),
     ));
+    // And the window's shape, from that same store, for the same reason: the
+    // corners are drawn once per frame, so a launcher that came up round and
+    // squared off on the next activation would look like the setting had not
+    // taken.
+    view_model.set_rounded_corners(settings::configured_rounded_corners(
+        configuration.as_ref().map(|configuration| &configuration.store),
+    ));
     if let Some(reason) = hotkey_refusal {
         let diagnostic = settings::surface_hotkey_failure(&mut view_model, &hotkey_accelerator, &reason);
         eprintln!("{diagnostic}");
@@ -812,6 +819,9 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     }
                     view_model.set_settings(settings::rows(Some(&configuration.store)));
                     view_model.set_show_hints(settings::configured_show_hints(Some(&configuration.store)));
+                    view_model.set_rounded_corners(settings::configured_rounded_corners(Some(
+                        &configuration.store,
+                    )));
                     // Aliases are host configuration, so a hand edit takes
                     // effect on the next query rather than the next restart.
                     search.set_aliases(configured_aliases(&configuration.store));
@@ -1130,6 +1140,9 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         configuration.as_ref().map(|configuration| &configuration.store),
                     ));
                     view_model.set_show_hints(settings::configured_show_hints(
+                        configuration.as_ref().map(|configuration| &configuration.store),
+                    ));
+                    view_model.set_rounded_corners(settings::configured_rounded_corners(
                         configuration.as_ref().map(|configuration| &configuration.store),
                     ));
                     eprintln!("crikey: {report}");

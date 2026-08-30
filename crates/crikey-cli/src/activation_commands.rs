@@ -197,6 +197,7 @@ fn measurement_frame(generation: Generation) -> ViewModel {
         settings: Arc::default(),
         settings_focus: None,
         show_hints: true,
+        rounded_corners: true,
     }
 }
 

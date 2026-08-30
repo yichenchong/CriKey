@@ -20,6 +20,7 @@ fn model(query: &str) -> ViewModel {
         settings: Arc::default(),
         settings_focus: None,
         show_hints: true,
+        rounded_corners: true,
     }
 }
 
@@ -852,4 +853,55 @@ fn the_window_corner_is_concentric_with_the_query_field() {
             "every window corner is the same corner"
         );
     }
+}
+
+/// Turning the corners off squares the silhouette the launcher paints, rather
+/// than leaving a rounded one and hoping something clips it.
+///
+/// The window is undecorated, so this fill is the only edge there is. A
+/// rounded fill with the setting off would leave the corners unpainted with
+/// nothing behind them: transparent on a desktop that composites, and solid
+/// black on one that does not.
+#[test]
+fn turning_the_corners_off_squares_what_the_launcher_paints() {
+    fn widest_rect(frame: &crikey_ui::NativeUiFrame) -> egui::epaint::RectShape {
+        fn rects(shape: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| rects(shape, out)),
+                egui::Shape::Rect(rect) => out.push(*rect),
+                _ => {}
+            }
+        }
+
+        let mut found = Vec::new();
+        for clipped in &frame.output.shapes {
+            rects(&clipped.shape, &mut found);
+        }
+        found.sort_by(|left, right| right.rect.width().total_cmp(&left.rect.width()));
+        *found.first().expect("the launcher paints its canvas")
+    }
+
+    let context = create_launcher_context();
+    let mut view = model("");
+
+    let rounded = widest_rect(&build_launcher_frame(&context, launcher_input(Vec::new()), &view));
+    assert!(
+        rounded.rounding.nw > 0.0,
+        "the default is a rounded window, or this tests nothing"
+    );
+
+    view.rounded_corners = false;
+    let square = widest_rect(&build_launcher_frame(&context, launcher_input(Vec::new()), &view));
+    for radius in [
+        square.rounding.nw,
+        square.rounding.ne,
+        square.rounding.sw,
+        square.rounding.se,
+    ] {
+        assert_eq!(radius, 0.0, "every corner is square once the setting says so");
+    }
+    assert_eq!(
+        square.rect, rounded.rect,
+        "the window keeps its size; only its corners change"
+    );
 }

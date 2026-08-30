@@ -22,7 +22,9 @@
 use std::fmt::Write as _;
 use std::process::ExitCode;
 
-use crikey_config::{ConfigStore, KEY_ACTIVATION_HOTKEY, KEY_MAX_RESULTS, KEY_PROFILE, KEY_SHOW_HINTS};
+use crikey_config::{
+    ConfigStore, KEY_ACTIVATION_HOTKEY, KEY_MAX_RESULTS, KEY_PROFILE, KEY_ROUNDED_CORNERS, KEY_SHOW_HINTS,
+};
 use crikey_platform::Accelerator;
 use crikey_ui::{LauncherViewModel, SettingRow, UiEffect};
 
@@ -41,6 +43,7 @@ pub(crate) const LAUNCHER_SETTINGS: &[(&str, &str)] = &[
     (KEY_MAX_RESULTS, "Maximum results"),
     (KEY_PROFILE, "Configuration profile"),
     (KEY_SHOW_HINTS, "Show keyboard hints"),
+    (KEY_ROUNDED_CORNERS, "Rounded corners"),
 ];
 
 /// What the source column says for a key no layer supplies.
@@ -106,6 +109,17 @@ pub(crate) fn configured_show_hints(store: Option<&ConfigStore>) -> bool {
     store.and_then(|store| store.get(KEY_SHOW_HINTS)) != Some("false")
 }
 
+/// Whether this launch draws its window with rounded corners.
+///
+/// Only the exact text `false` squares them off, for the same reason
+/// [`configured_show_hints`] is lenient: a launcher that read any unrecognised
+/// text as "off" would change the shape of its own window over a typo, and the
+/// window is the only place the change shows — nothing on screen would name the
+/// misspelled value that caused it.
+pub(crate) fn configured_rounded_corners(store: Option<&ConfigStore>) -> bool {
+    store.and_then(|store| store.get(KEY_ROUNDED_CORNERS)) != Some("false")
+}
+
 /// Refuses a value the launcher could not honour, before it reaches the file.
 ///
 /// Validation happens on the way in rather than on the way out, because the
@@ -141,6 +155,18 @@ pub(crate) fn validate(key: &str, value: &str) -> Result<(), String> {
         // `yes` would be looking at a hidden hint line with a file that says
         // they asked for something else.
         KEY_SHOW_HINTS => {
+            if value == "true" || value == "false" {
+                Ok(())
+            } else {
+                Err(format!("`{key}` must be `true` or `false`, got `{value}`"))
+            }
+        }
+        // The window shape is read as a plain boolean too, and this one is
+        // worse to get wrong than the hint line: the only report of the value
+        // is the shape of the window itself, so `yes` would leave a user
+        // looking at square corners with a file that says they asked for round
+        // ones and nothing to tell them which text the launcher honours.
+        KEY_ROUNDED_CORNERS => {
             if value == "true" || value == "false" {
                 Ok(())
             } else {
@@ -921,7 +947,8 @@ mod tests {
                 KEY_ACTIVATION_HOTKEY,
                 KEY_MAX_RESULTS,
                 KEY_PROFILE,
-                KEY_SHOW_HINTS
+                KEY_SHOW_HINTS,
+                KEY_ROUNDED_CORNERS
             ]
         );
         assert_eq!(rows[0].value, "Ctrl+Alt+Space");
@@ -993,6 +1020,101 @@ mod tests {
             configured_show_hints(Some(&directory.store())),
             "a refused edit leaves the launcher showing what it showed before"
         );
+    }
+
+    /// The corner setting has to survive the whole way round for the same
+    /// reason the hint line does: the panel offers it, the write lands in the
+    /// layer `crikey config` reports, and the panel reads back what was
+    /// written. A key the renderer honours but the surface never lists is a
+    /// setting only someone who read the source could find.
+    #[test]
+    fn the_rounded_corner_setting_round_trips_through_the_settings_rows() {
+        let directory = ConfigDir::new("rounded-corners");
+        let mut store = directory.store();
+
+        let default = rows(Some(&store))
+            .into_iter()
+            .find(|row| row.key == KEY_ROUNDED_CORNERS)
+            .expect("the panel offers the window's corners");
+        assert_eq!(default.label, "Rounded corners");
+        assert_eq!(
+            default.value, "true",
+            "an unconfigured launcher rounds its corners"
+        );
+        assert_eq!(default.source, ConfigLayer::BuiltInDefaults.as_str());
+        assert!(configured_rounded_corners(Some(&store)));
+
+        let report = persist(&mut store, KEY_ROUNDED_CORNERS, "false").expect("the key is a setting");
+        assert_eq!(report, "launcher.rounded-corners = false");
+
+        let reloaded = directory.store();
+        let saved = rows(Some(&reloaded))
+            .into_iter()
+            .find(|row| row.key == KEY_ROUNDED_CORNERS)
+            .expect("the panel still offers the window's corners");
+        assert_eq!(saved.value, "false");
+        assert_eq!(saved.source, ConfigLayer::UserGlobal.as_str());
+        assert!(
+            !configured_rounded_corners(Some(&reloaded)),
+            "the launcher reads back the choice the panel wrote"
+        );
+    }
+
+    /// The window shape is a plain boolean, so a value the renderer cannot read
+    /// is refused on the way in rather than silently squaring the corners off:
+    /// the shape of the window is the only report of this setting, so a user who
+    /// typed `yes` would have nothing on screen naming the value at fault.
+    #[test]
+    fn a_rounded_corner_value_that_is_not_a_boolean_is_refused_before_it_is_written() {
+        for accepted in ["true", "false"] {
+            assert!(
+                validate(KEY_ROUNDED_CORNERS, accepted).is_ok(),
+                "{accepted} is one of the two values the renderer honours"
+            );
+        }
+
+        for refused in ["yes", "no", "1", "0", "True", "off"] {
+            let error =
+                validate(KEY_ROUNDED_CORNERS, refused).expect_err("only `true` and `false` are honoured");
+            assert!(error.contains("must be `true` or `false`"), "{error}");
+            assert!(error.contains(refused), "the message names the value: {error}");
+        }
+
+        let directory = ConfigDir::new("rounded-corners-refused");
+        let mut store = directory.store();
+        assert!(persist(&mut store, KEY_ROUNDED_CORNERS, "yes").is_err());
+        assert!(
+            configured_rounded_corners(Some(&directory.store())),
+            "a refused edit leaves the window the shape it already had"
+        );
+    }
+
+    /// A hand-edited configuration file is the one place an unrecognised value
+    /// can reach the reader, because [`validate`] never saw it. Only the exact
+    /// text `false` may square the corners off: any other text is a typo, and
+    /// changing the shape of the window over one would leave the user with no
+    /// way to tell a rejected edit from an applied one.
+    #[test]
+    fn only_the_exact_text_false_squares_the_launchers_corners_off() {
+        let directory = ConfigDir::new("rounded-corners-lenient");
+
+        assert!(
+            configured_rounded_corners(None),
+            "a launch whose configuration would not load still draws a window"
+        );
+
+        let mut store = directory.store();
+        assert!(persist(&mut store, KEY_ROUNDED_CORNERS, "false").is_ok());
+        assert!(!configured_rounded_corners(Some(&directory.store())));
+
+        for typo in ["False", "FALSE", "no", "0", "off", " false"] {
+            let mut store = directory.store();
+            store.set_user_global(KEY_ROUNDED_CORNERS, typo);
+            assert!(
+                configured_rounded_corners(Some(&store)),
+                "`{typo}` is not `false`, so the corners stay round"
+            );
+        }
     }
 
     /// The command line and the panel must be one settings surface, not two:

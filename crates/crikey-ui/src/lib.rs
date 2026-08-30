@@ -136,6 +136,17 @@ pub struct ViewModel {
     /// be a second, silent copy of the configuration schema living in the crate
     /// that is documented not to have one.
     pub show_hints: bool,
+    /// Whether the launcher window is drawn with rounded corners.
+    ///
+    /// Carried for the same reason [`Self::show_hints`] is, and live for the
+    /// same reason: a preference the user changes in the settings surface has
+    /// to take effect in the next frame, not the next launch.
+    ///
+    /// A window can only round its corners smoothly where something composites
+    /// them. Where nothing does, the launcher stays square rather than cutting
+    /// a stepped arc out of itself, so this asks for rounded corners rather
+    /// than promising them.
+    pub rounded_corners: bool,
 }
 
 /// Keyboard-only interaction surface (spec 6.3).
@@ -263,6 +274,10 @@ pub struct LauncherViewModel {
     /// configuration rather than session state, like `settings` above, so it
     /// survives `dismiss`.
     show_hints: bool,
+    /// Whether published frames ask for a rounded window. Host configuration
+    /// too, and kept across a dismissal for the same reason: it describes the
+    /// launcher rather than the query being typed into it.
+    rounded_corners: bool,
     /// Highest generation ever begun, across every session of this launcher.
     /// Monotonic and deliberately kept by `dismiss`, so a generation retired
     /// before the launcher closed can never be begun again after it reopens
@@ -303,6 +318,7 @@ impl LauncherViewModel {
             settings: Arc::default(),
             settings_focus: None,
             show_hints: true,
+            rounded_corners: true,
             floor: None,
             active: None,
             published: None,
@@ -440,6 +456,7 @@ impl LauncherViewModel {
             settings: Arc::clone(&self.settings),
             settings_focus: self.settings_focus.clone(),
             show_hints: self.show_hints,
+            rounded_corners: self.rounded_corners,
         })
     }
 
@@ -626,6 +643,24 @@ impl LauncherViewModel {
         }
 
         self.show_hints = show;
+        // A hidden launcher has no frame to dirty; the next activation carries
+        // the new value anyway.
+        self.dirty |= self.visible;
+        true
+    }
+
+    /// Chooses whether published frames ask for a rounded window, and reports
+    /// whether that changed the model.
+    ///
+    /// Accepted while hidden for the same reason [`Self::set_show_hints`] is:
+    /// the host reads the key once at startup, and the shape has to be right
+    /// on the first frame the user ever sees rather than the second.
+    pub fn set_rounded_corners(&mut self, rounded: bool) -> bool {
+        if self.rounded_corners == rounded {
+            return false;
+        }
+
+        self.rounded_corners = rounded;
         // A hidden launcher has no frame to dirty; the next activation carries
         // the new value anyway.
         self.dirty |= self.visible;
