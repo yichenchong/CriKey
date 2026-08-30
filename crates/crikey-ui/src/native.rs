@@ -23,7 +23,7 @@ use winit::{
     window::{Window, WindowId, WindowLevel},
 };
 
-use crate::{theme, LauncherWindow, ResultRow, SettingRow, UiCommand, ViewModel};
+use crate::{theme, LauncherWindow, ResultRow, SettingControl, SettingRow, UiCommand, ViewModel};
 
 /// Maximum number of activation-to-present observations retained in memory.
 ///
@@ -2729,6 +2729,23 @@ fn draw_setting_row(
             );
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if let SettingControl::Toggle { on } = row.control {
+                // No draft and no Save: a switch has no half-typed state to
+                // keep, so it commits the moment it moves. Offering a Save
+                // beside it would imply the click had not counted yet.
+                let mut switched = on;
+                let response = ui.checkbox(&mut switched, "");
+                focus_once(ui, &response, row, focus_key);
+                if response.changed() {
+                    commands.push(UiCommand::SetSetting {
+                        key: row.key.clone(),
+                        // The two words the host validates. A switch cannot
+                        // produce anything else, which is the point of it.
+                        value: if switched { "true" } else { "false" }.to_owned(),
+                    });
+                }
+                return;
+            }
             if ui.button("Save").clicked() {
                 committed = true;
             }
@@ -2737,17 +2754,7 @@ fn draw_setting_row(
                     .id(draft_id.with("editor"))
                     .desired_width(theme::SPACE_8 * 6.0),
             );
-            // Focus is honoured once per request rather than on every frame:
-            // repeating it would pin the keyboard to this row and leave the
-            // user unable to reach any other.
-            if focus_key == Some(row.key.as_str()) {
-                let honoured_id = egui::Id::new("crikey-settings-honoured-focus");
-                let honoured = ui.data(|data| data.get_temp::<String>(honoured_id));
-                if honoured.as_deref() != Some(row.key.as_str()) {
-                    response.request_focus();
-                    ui.data_mut(|data| data.insert_temp(honoured_id, row.key.clone()));
-                }
-            }
+            focus_once(ui, &response, row, focus_key);
             if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 committed = true;
             } else if response.changed() {
@@ -2761,6 +2768,25 @@ fn draw_setting_row(
             value: draft,
         });
         ui.data_mut(|data| data.remove::<String>(draft_id));
+    }
+}
+
+/// Gives `response` the keyboard when the host asked for this row, once.
+///
+/// Honoured once per request rather than on every frame: repeating it would
+/// pin the keyboard to this row and leave the user unable to reach any other.
+/// Shared by both controls, because a switch the host focused has to answer
+/// the space bar exactly as an editor answers typing -- a settings surface
+/// that can only be operated with the mouse is not one this launcher ships.
+fn focus_once(ui: &egui::Ui, response: &egui::Response, row: &SettingRow, focus_key: Option<&str>) {
+    if focus_key != Some(row.key.as_str()) {
+        return;
+    }
+    let honoured_id = egui::Id::new("crikey-settings-honoured-focus");
+    let honoured = ui.data(|data| data.get_temp::<String>(honoured_id));
+    if honoured.as_deref() != Some(row.key.as_str()) {
+        response.request_focus();
+        ui.data_mut(|data| data.insert_temp(honoured_id, row.key.clone()));
     }
 }
 
@@ -3470,6 +3496,7 @@ mod window_geometry_tests {
             label: "Activation hotkey".to_owned(),
             value: "Ctrl+Alt+Space".to_owned(),
             source: "default".to_owned(),
+            control: SettingControl::Text,
         }]
         .into();
         host.settings_focus = Some("launcher.activation-hotkey".to_owned());

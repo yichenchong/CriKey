@@ -26,10 +26,10 @@ use crikey_config::{
     ConfigStore, KEY_ACTIVATION_HOTKEY, KEY_MAX_RESULTS, KEY_PROFILE, KEY_ROUNDED_CORNERS, KEY_SHOW_HINTS,
 };
 use crikey_platform::Accelerator;
-use crikey_ui::{LauncherViewModel, SettingRow, UiEffect};
+use crikey_ui::{LauncherViewModel, SettingControl, SettingRow, UiEffect};
 
-/// The launcher-wide keys the settings surface offers, with the label the panel
-/// shows for each.
+/// The launcher-wide keys the settings surface offers: the key, the label the
+/// panel shows, and whether the value is a boolean.
 ///
 /// Launcher keys only. A plugin's settings live in that plugin's own file
 /// (spec 21.2, layer 6) and writing one through the user-global layer would put
@@ -38,12 +38,17 @@ use crikey_ui::{LauncherViewModel, SettingRow, UiEffect};
 /// (`launcher.configuration-*-ms`) are deliberately absent: they are tuning for
 /// an operator diagnosing a slow publication rather than choices a user makes,
 /// and `crikey config` already reports them.
-pub(crate) const LAUNCHER_SETTINGS: &[(&str, &str)] = &[
-    (KEY_ACTIVATION_HOTKEY, "Activation hotkey"),
-    (KEY_MAX_RESULTS, "Maximum results"),
-    (KEY_PROFILE, "Configuration profile"),
-    (KEY_SHOW_HINTS, "Show keyboard hints"),
-    (KEY_ROUNDED_CORNERS, "Rounded corners"),
+///
+/// The boolean column is what stops the renderer guessing. A free-text setting
+/// is allowed to hold the word `true`, so a panel that decided by looking at
+/// the value would turn that row into a switch and leave the user no way to
+/// type anything else into it.
+pub(crate) const LAUNCHER_SETTINGS: &[(&str, &str, bool)] = &[
+    (KEY_ACTIVATION_HOTKEY, "Activation hotkey", false),
+    (KEY_MAX_RESULTS, "Maximum results", false),
+    (KEY_PROFILE, "Configuration profile", false),
+    (KEY_SHOW_HINTS, "Show keyboard hints", true),
+    (KEY_ROUNDED_CORNERS, "Rounded corners", true),
 ];
 
 /// What the source column says for a key no layer supplies.
@@ -62,7 +67,7 @@ const UNSET: &str = "unset";
 pub(crate) fn rows(store: Option<&ConfigStore>) -> Vec<SettingRow> {
     LAUNCHER_SETTINGS
         .iter()
-        .map(|(key, label)| {
+        .map(|(key, label, boolean)| {
             let value = store
                 .and_then(|store| store.display_value(key))
                 .unwrap_or_default()
@@ -71,14 +76,42 @@ pub(crate) fn rows(store: Option<&ConfigStore>) -> Vec<SettingRow> {
                 .and_then(|store| store.layer_of(key))
                 .map_or(UNSET, |layer| layer.as_str())
                 .to_owned();
+            // A switch is drawn from the same reading of the key that decides
+            // the launcher's own behaviour, rather than from the displayed
+            // text: the readers treat anything but the exact word `false` as
+            // on, so a panel that parsed the text itself would show a switch
+            // that disagreed with the window beside it.
+            let control = if *boolean {
+                SettingControl::Toggle {
+                    on: boolean_reader(key)(store),
+                }
+            } else {
+                SettingControl::Text
+            };
             SettingRow {
                 key: (*key).to_owned(),
                 label: (*label).to_owned(),
                 value,
                 source,
+                control,
             }
         })
         .collect()
+}
+
+/// The reader that decides what a boolean key means to the launcher.
+///
+/// Indirection with exactly one purpose: the switch in the panel and the
+/// behaviour it controls read the key through the same function, so they
+/// cannot drift apart. A key added to [`LAUNCHER_SETTINGS`] as a boolean
+/// without a reader here is a compile-time hole this closes by panicking in
+/// the one place that can see both lists.
+fn boolean_reader(key: &str) -> fn(Option<&ConfigStore>) -> bool {
+    match key {
+        KEY_SHOW_HINTS => configured_show_hints,
+        KEY_ROUNDED_CORNERS => configured_rounded_corners,
+        other => unreachable!("`{other}` is declared boolean with no reader to say what it means"),
+    }
 }
 
 /// The accelerator this launch binds.

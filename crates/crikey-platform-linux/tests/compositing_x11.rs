@@ -134,23 +134,25 @@ impl XvfbServer {
     ///
     /// `-displayfd` reports the number as soon as the socket is bound, which is
     /// a moment before the server finishes accepting clients on it, and this
-    /// test's first assertion is a *negative* one: an "no compositor here"
+    /// test's first assertion is a *negative* one: a "no compositor here"
     /// derived from a connection the server was not yet answering would be a
-    /// pass with no evidence behind it. Every later step needs the same
-    /// guarantee, so it is established once, here.
+    /// pass with no evidence behind it.
     fn await_connectable(&self) {
-        let deadline = Instant::now() + SERVER_READY_LIMIT;
-        loop {
-            match RustConnection::connect(Some(&self.display)) {
-                Ok(_) => return,
-                Err(error) if Instant::now() >= deadline => panic!(
-                    "Xvfb reported {} but never accepted a connection within {SERVER_READY_LIMIT:?}: \
-                     {error}",
-                    self.display
-                ),
-                Err(_) => thread::sleep(POLL_INTERVAL),
-            }
-        }
+        drop(connect_within(&self.display));
+    }
+
+    /// The display this server owns, for a client that needs its own
+    /// connection.
+    ///
+    /// Every client goes through the same bounded retry rather than connecting
+    /// once, because one success does not make the next one certain: a server
+    /// still finishing its startup accepts a connection and then closes it
+    /// during the X11 handshake, and a fixture that took that for a dead
+    /// display failed this test roughly one run in three. What the test needs
+    /// is not "a connection worked once" but "connections work", and the only
+    /// honest way to have the second is to retry the observable.
+    fn client(&self) -> (RustConnection, usize) {
+        connect_within(&self.display)
     }
 
     /// The display number the server reports, bounded by
@@ -202,6 +204,31 @@ impl Drop for XvfbServer {
     }
 }
 
+/// Connects to `display`, retrying until [`SERVER_READY_LIMIT`] runs out.
+///
+/// Bounded on an observable rather than a sleep, like everything else in this
+/// suite: what is being waited for is a connection this server actually
+/// answers, and the wait ends the moment there is one.
+///
+/// The retry exists because a freshly started Xvfb will accept a connection
+/// and then close it partway through the X11 handshake, which x11rb reports as
+/// a reset or a short read. That is a server still starting, not a server that
+/// is not there, and a fixture that could not tell the two apart failed about
+/// one run in three on a loaded machine.
+fn connect_within(display: &str) -> (RustConnection, usize) {
+    let deadline = Instant::now() + SERVER_READY_LIMIT;
+    loop {
+        match RustConnection::connect(Some(display)) {
+            Ok(connected) => return connected,
+            Err(error) if Instant::now() >= deadline => panic!(
+                "Xvfb reported {display} but never answered a connection within \
+                 {SERVER_READY_LIMIT:?}: {error}"
+            ),
+            Err(_) => thread::sleep(POLL_INTERVAL),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The compositing manager
 // ---------------------------------------------------------------------------
@@ -227,8 +254,7 @@ impl CompositingManager {
     /// itself on screen 0 while the probe asked about screen 1 would be a
     /// fixture that tested nothing.
     fn connect(server: &XvfbServer) -> Self {
-        let (connection, screen) = RustConnection::connect(Some(server.display()))
-            .unwrap_or_else(|error| panic!("the fixture could not reach {}: {error}", server.display()));
+        let (connection, screen) = server.client();
         let root = connection.setup().roots[screen].root;
         let window = connection.generate_id().expect("generating a fixture window id");
         connection

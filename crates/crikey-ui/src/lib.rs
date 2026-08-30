@@ -94,6 +94,29 @@ pub struct SettingRow {
     /// Which configuration layer supplied `value`, shown so the user can tell
     /// a default apart from something they set themselves.
     pub source: String,
+    /// Which control the value is edited with.
+    pub control: SettingControl,
+}
+
+/// What kind of control edits a [`SettingRow`].
+///
+/// Host-supplied like everything else on the row, and for the same reason: the
+/// renderer must not decide that a value spelled `true` is a boolean, because
+/// a free-text setting is allowed to hold that word and would then be
+/// undraggable out of it. The host owns the schema and says which control the
+/// value takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingControl {
+    /// Free text, edited in a field and committed with Enter or Save.
+    Text,
+    /// Exactly on or off, shown as a switch that commits the moment it moves.
+    ///
+    /// The state is carried here rather than parsed from
+    /// [`SettingRow::value`], so the renderer never interprets a configuration
+    /// value: the host has already read the key the same way the launcher
+    /// reads it to decide its own behaviour, which is what keeps the switch
+    /// and the thing it switches from disagreeing.
+    Toggle { on: bool },
 }
 
 /// Everything the renderer needs for one frame.

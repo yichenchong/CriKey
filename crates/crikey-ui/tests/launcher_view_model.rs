@@ -78,7 +78,8 @@ use std::sync::Arc;
 
 use crikey_core::{Action, ActionId, Category, ExecutionPolicy, Generation, GenerationTracker, ItemId};
 use crikey_ui::{
-    LauncherViewModel, LauncherWindow, ResultRow, SettingRow, UiCommand, UiEffect, ViewModel, PAGE_SIZE,
+    LauncherViewModel, LauncherWindow, ResultRow, SettingControl, SettingRow, UiCommand, UiEffect, ViewModel,
+    PAGE_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -1812,6 +1813,7 @@ fn setting(key: &str, value: &str) -> SettingRow {
         label: key.to_owned(),
         value: value.to_owned(),
         source: "default".to_owned(),
+        control: SettingControl::Text,
     }
 }
 

@@ -4,8 +4,8 @@ use crikey_core::{Generation, ItemId};
 use crikey_platform::IconImage;
 use crikey_ui::{
     build_launcher_frame, create_launcher_context, egui, ActivationLatencyTracker, NativeLauncher,
-    NativeLauncherConfig, NativeLauncherHandle, RendererError, ResultRow, SettingRow, UiCommand, ViewModel,
-    ACTIVATION_SAMPLE_CAPACITY,
+    NativeLauncherConfig, NativeLauncherHandle, RendererError, ResultRow, SettingControl, SettingRow,
+    UiCommand, ViewModel, ACTIVATION_SAMPLE_CAPACITY,
 };
 
 fn model(query: &str) -> ViewModel {
@@ -595,6 +595,7 @@ fn hotkey_settings_model() -> ViewModel {
         label: "Activation hotkey".to_owned(),
         value: "Ctrl+Alt+Space".to_owned(),
         source: "default".to_owned(),
+        control: SettingControl::Text,
     }]);
     view
 }
@@ -904,4 +905,108 @@ fn turning_the_corners_off_squares_what_the_launcher_paints() {
         square.rect, rounded.rect,
         "the window keeps its size; only its corners change"
     );
+}
+
+/// A boolean setting is a switch, and moving it commits the opposite value
+/// straight away.
+///
+/// Reported: a text field for a boolean is lame. It was also lossy -- the only
+/// thing standing between a user and a rejected `yes` was that they happened
+/// to type one of two words -- and a switch cannot produce a third answer.
+#[test]
+fn a_boolean_setting_is_a_switch_that_commits_when_it_moves() {
+    fn boolean_model(on: bool) -> ViewModel {
+        let mut view = model("");
+        view.settings_open = true;
+        view.settings = Arc::from(vec![SettingRow {
+            key: "launcher.show-hints".to_owned(),
+            label: "Show keyboard hints".to_owned(),
+            value: on.to_string(),
+            source: "built-in-defaults".to_owned(),
+            control: SettingControl::Toggle { on },
+        }]);
+        view
+    }
+
+    let context = create_launcher_context();
+    let view = boolean_model(true);
+    let drawn = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+
+    // A button's label is a galley of exactly that word. `painted` is a
+    // substring search and the sheet's own footer reads "Enter or Save commits
+    // an edit", which is about the text rows and matches either way.
+    fn labelled_exactly(frame: &crikey_ui::NativeUiFrame, label: &str) -> bool {
+        fn walk(shape: &egui::Shape, label: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => text.galley.text() == label,
+                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| walk(shape, label)),
+                _ => false,
+            }
+        }
+
+        frame
+            .output
+            .shapes
+            .iter()
+            .any(|clipped| walk(&clipped.shape, label))
+    }
+
+    assert!(painted(&drawn, "Show keyboard hints"), "the label still names it");
+    assert!(
+        !labelled_exactly(&drawn, "Save"),
+        "a switch commits when it moves, so a Save beside it would say the click had not counted"
+    );
+
+    // The switch sits at the right of its row, where the editor used to be.
+    let label = position_of(&drawn, "Show keyboard hints");
+    let switch = egui::pos2(
+        NativeLauncherConfig::default().width as f32 - theme_margin() - 8.0,
+        label.y + 8.0,
+    );
+    let clicked = build_launcher_frame(&context, launcher_input(click_at(switch)), &view);
+
+    let committed = clicked
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            UiCommand::SetSetting { key, value } => Some((key.as_str(), value.as_str())),
+            _ => None,
+        })
+        .expect("moving the switch commits the setting");
+    assert_eq!(
+        committed,
+        ("launcher.show-hints", "false"),
+        "an on switch turns off"
+    );
+
+    // And back, from the other position.
+    let off = boolean_model(false);
+    let drawn_off = build_launcher_frame(&context, launcher_input(Vec::new()), &off);
+    let label_off = position_of(&drawn_off, "Show keyboard hints");
+    let switch_off = egui::pos2(
+        NativeLauncherConfig::default().width as f32 - theme_margin() - 8.0,
+        label_off.y + 8.0,
+    );
+    let clicked_off = build_launcher_frame(&context, launcher_input(click_at(switch_off)), &off);
+    let committed_off = clicked_off
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            UiCommand::SetSetting { key, value } => Some((key.as_str(), value.as_str())),
+            _ => None,
+        })
+        .expect("moving the switch back commits the setting");
+    assert_eq!(
+        committed_off,
+        ("launcher.show-hints", "true"),
+        "an off switch turns on"
+    );
+}
+
+/// The panel's own margin plus the sheet's, which is where the right-hand
+/// controls of a settings row end up. Written here rather than exported from
+/// the theme, because a test that reached into the theme for it would agree
+/// with the renderer by construction.
+fn theme_margin() -> f32 {
+    12.0 + 12.0
 }
