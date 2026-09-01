@@ -1795,18 +1795,18 @@ impl SearchService {
     }
 
     /// Opens a plugin-drawn page and starts asking its plugin for frames
-    /// (spec 27.2).
+    /// (spec 32.2).
     ///
     /// A plugin with no loaded runtime is refused: nothing would ever answer
     /// a frame request, and an empty surface no one draws into is worse than
     /// a refused action the caller can report.
     ///
-    /// A second page while one is open is refused as well, rather than
-    /// replacing the first. Replacing it silently would leave the first
-    /// plugin still believing it owns the screen — still being asked for
-    /// frames, still holding whatever the user typed into it — while the user
-    /// looks at someone else's page. Closing the open page is the caller's
-    /// decision to make, so it is the caller who must make it.
+    /// A page opened while another is already open replaces it, and the one
+    /// being replaced is closed first. A launcher shows one surface at a
+    /// time, so the alternatives are worse: refusing would strand whichever
+    /// plugin asked second, and replacing silently would leave the first
+    /// still believing it owns the screen — still being asked for frames,
+    /// still holding whatever the user typed into it.
     pub fn open_page(
         &mut self,
         plugin: &PluginId,
