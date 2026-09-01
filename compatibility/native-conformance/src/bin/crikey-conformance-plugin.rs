@@ -667,7 +667,7 @@ impl Plugin for ConformancePlugin {
 
     /// Opens the demo page when the page item is run, and behaves exactly as
     /// before for everything else: the outcome is what tells the host to keep
-    /// the launcher on a surface instead of dismissing it (§27.4).
+    /// the launcher on a surface instead of dismissing it (§32.2).
     fn execute_outcome(
         &mut self,
         request: ExecuteRequest,

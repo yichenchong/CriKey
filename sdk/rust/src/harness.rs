@@ -400,7 +400,7 @@ impl TestHarness {
 
     /// Executes an action and reports what it told the host to do next, so a
     /// test can prove an action opened a page rather than merely succeeding
-    /// (spec 10.4, 27.4).
+    /// (spec 10.4, 32.2).
     pub fn execute_outcome(
         &mut self,
         item: &str,
@@ -455,7 +455,7 @@ impl TestHarness {
         }
     }
 
-    /// Asks the plugin for one page frame and returns what it drew (spec 27.3).
+    /// Asks the plugin for one page frame and returns what it drew (spec 32.3).
     ///
     /// Mirrors the host exactly: one request, one frame, the events the user
     /// produced since the previous frame, and the generation the frame must

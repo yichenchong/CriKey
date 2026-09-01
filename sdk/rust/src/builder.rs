@@ -1,4 +1,4 @@
-//! Fluent item, action and page builders (spec 10.1, 10.4, 27.3).
+//! Fluent item, action and page builders (spec 10.1, 10.4, 32.3).
 
 use std::collections::BTreeMap;
 
@@ -223,7 +223,7 @@ fn centred_line_top(y: f32, height: f32, size: f32) -> f32 {
     y + (height - size * LINE_HEIGHT) / 2.0
 }
 
-/// Builds one frame of a plugin-drawn page (spec 27.3).
+/// Builds one frame of a plugin-drawn page (spec 32.3).
 ///
 /// A thin constructor over [`PageNode`], never a layout engine: it fills in
 /// the fields a control needs to be drawable, hit-testable and announceable at

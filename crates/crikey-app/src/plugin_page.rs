@@ -1,4 +1,4 @@
-//! Host-driven plugin page sessions (spec 27.2-27.5, 32.10).
+//! Host-driven plugin page sessions (spec 32.2-32.5, 32.10).
 //!
 //! A page is a display list a plugin draws and the host renders. Nothing about
 //! it is pushed: the host asks for a frame, the plugin answers one, and the

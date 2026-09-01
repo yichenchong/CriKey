@@ -156,7 +156,7 @@ pub struct ExecuteRequest {
     pub argument: Option<String>,
 }
 
-/// What the host should do once an action has run (spec 10.4, 27.4).
+/// What the host should do once an action has run (spec 10.4, 32.2).
 ///
 /// An action that opened a page has not finished the user's task, it has
 /// handed the user a surface, and the host has to be told which one: the
@@ -193,7 +193,7 @@ impl From<()> for ExecuteOutcome {
 }
 
 /// The launcher's own colours, handed to a page so it can match the theme it
-/// is drawn inside (spec 27.3).
+/// is drawn inside (spec 32.3).
 ///
 /// A page never reads the host's configuration, so this is the only way its
 /// surface can look like part of the launcher rather than pasted onto it.
@@ -209,7 +209,7 @@ pub struct PagePalette {
     pub muted: PageColor,
 }
 
-/// One host request for a page frame (spec 27.3).
+/// One host request for a page frame (spec 32.3).
 ///
 /// Pages are host-driven exactly like suggestions: the plugin is asked for a
 /// frame and answers once. It never pushes, so a page cannot repaint the
@@ -284,7 +284,7 @@ pub trait Plugin {
     fn execute(&mut self, request: ExecuteRequest, context: &dyn PluginContext) -> Result<()>;
 
     /// Executes one selected item or action and reports what the host should
-    /// do next (spec 10.4, 27.4).
+    /// do next (spec 10.4, 32.2).
     ///
     /// This is the method the host calls; the default forwards to
     /// [`Plugin::execute`] and reports [`ExecuteOutcome::Completed`], which is
@@ -301,7 +301,7 @@ pub trait Plugin {
         self.execute(request, context).map(ExecuteOutcome::from)
     }
 
-    /// Draws one frame of a page the plugin opened (spec 27.3).
+    /// Draws one frame of a page the plugin opened (spec 32.3).
     ///
     /// The default closes the page. A plugin that returned
     /// [`ExecuteOutcome::ShowPage`] without implementing this has opened a

@@ -1306,7 +1306,7 @@ fn handle_execute(
     )
 }
 
-/// Answers one host request for a page frame (spec 27.3).
+/// Answers one host request for a page frame (spec 32.3).
 ///
 /// The reply always carries the requested generation and always carries a
 /// frame. A page whose plugin failed is closed rather than left as a surface

@@ -30,7 +30,7 @@ pub struct ActionRequestId {
 /// the screen to that plugin rather than dismiss, and it can only do that if
 /// the completion says so and names the surface. Reporting it as `Ok(())`
 /// would leave the caller guessing from a side channel which action, if any,
-/// wanted the window kept open (spec 27.2).
+/// wanted the window kept open (spec 32.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionEffect {
     /// The action ran and is finished.

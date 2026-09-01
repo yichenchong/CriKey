@@ -1162,7 +1162,7 @@ impl NativeWorker {
         }
     }
 
-    /// Asks the plugin for the next frame of an open page (spec 27.3).
+    /// Asks the plugin for the next frame of an open page (spec 32.3).
     ///
     /// Host-driven, exactly like [`Self::suggest`]: the plugin answers the
     /// request it was given or it answers nothing. That is why the reply is
@@ -2240,7 +2240,7 @@ fn validate_inbound(envelope: &Envelope, context: &ReaderContext) -> bool {
 /// zero when it is waiting for none. A page frame is a reply and only a
 /// reply: an unsolicited one is refused here exactly as an unsolicited
 /// `Event` is, because a plugin that could draw whenever it wanted would own
-/// the user's screen rather than borrow it (spec 27.3).
+/// the user's screen rather than borrow it (spec 32.3).
 fn legal_plugin_payload(envelope: &Envelope, page_request: u64) -> bool {
     if let Some(Payload::PageFrame(_)) = envelope.payload {
         return page_request != 0 && envelope.request_id == page_request;
@@ -2631,7 +2631,7 @@ fn execute_outcome(result: &message::ExecuteResult) -> Result<ExecuteOutcome, &'
 /// Validation is not advisory here. A frame with a duplicate node id makes
 /// the host's own hit testing ambiguous, and one with non-finite geometry
 /// makes the renderer's arithmetic meaningless, so the frame is refused whole
-/// rather than drawn as far as it happens to parse (spec 27.4).
+/// rather than drawn as far as it happens to parse (spec 32.7).
 fn decode_page_frame(frame: &message::PageFrame) -> Result<PageFrame, String> {
     let frame = from_proto_page_frame(frame);
     match frame.validate() {

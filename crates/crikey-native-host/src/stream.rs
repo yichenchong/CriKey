@@ -78,7 +78,7 @@ pub enum ExecuteOutcome {
     Failed(PluginError),
     Unsupported,
     /// The action asked the host to open the named plugin-drawn page
-    /// (spec 27.2). The id is the plugin's own handle for the surface; every
+    /// (spec 32.2). The id is the plugin's own handle for the surface; every
     /// later frame request quotes it back, so an empty one names nothing the
     /// plugin could serve and is refused as a protocol violation instead.
     ShowPage {
@@ -118,7 +118,7 @@ pub struct NativeSuggestRequest {
     pub selected_item_id: Option<String>,
 }
 
-/// One host-to-plugin request for the next frame of an open page (spec 27.3).
+/// One host-to-plugin request for the next frame of an open page (spec 32.3).
 ///
 /// The host drives the page: a plugin never pushes a frame, so this request is
 /// the only thing that can produce one. `events` carries everything the user

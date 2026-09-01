@@ -1,5 +1,5 @@
-//! Red-first tests for plugin-drawn pages across the SDK boundary (spec 27.3,
-//! 27.4, 16.7).
+//! Red-first tests for plugin-drawn pages across the SDK boundary (spec 32.3,
+//! 32.7, 16.7).
 
 use crikey_core::{NodeRole, PageFrame, PageInput, PageInputKind, Result};
 use crikey_native_protocol::{Capabilities, Endpoint};
