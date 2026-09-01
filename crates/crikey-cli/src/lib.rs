@@ -1333,13 +1333,21 @@ fn open_plugin_page(
     let _ = view_model.set_selected_status(String::new());
     // Empty until the plugin answers: the host draws the sheet, so an unfilled
     // page is a blank panel rather than a hole, and `stale` says why.
-    view_model.open_page(PageSurface {
+    let shown = view_model.open_page(PageSurface {
         plugin: plugin.clone(),
         page_id: page_id.to_owned(),
         plugin_name: plugin.0.clone(),
         frame: Arc::new(crikey_core::PageFrame::default()),
         stale: true,
     });
+    if !shown {
+        // The launcher was dismissed while the action ran, so the model has no
+        // surface to put this on. The session started a moment ago, and
+        // leaving it would be the same leak dismissal itself was fixed for:
+        // a plugin drawing frames for a screen that is gone. Nothing failed
+        // here -- the user closed the launcher -- so this is not an error.
+        search.close_page();
+    }
     Ok(())
 }
 
@@ -2704,6 +2712,119 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    /// A runtime that accepts every page and counts the closes, so a test can
+    /// tell "never opened" apart from "opened and rolled back".
+    #[derive(Default)]
+    struct PageRuntime {
+        opens: std::sync::Mutex<u32>,
+        closes: std::sync::Mutex<u32>,
+    }
+
+    impl crikey_app::PluginActionExecutor for PageRuntime {
+        fn submit_plugin_action(
+            &self,
+            _plugin: &PluginId,
+            _item: &crikey_core::Item,
+            _action_id: &crikey_core::ActionId,
+            _argument: Option<&str>,
+        ) -> crikey_core::Result<crikey_app::ActionRequestId> {
+            Err(crikey_core::CoreError::Invalid("not used".to_owned()))
+        }
+
+        fn open_plugin_page(
+            &self,
+            _plugin: &PluginId,
+            _page_id: &str,
+            _width: u32,
+            _height: u32,
+            _palette: crikey_core::PagePalette,
+        ) -> crikey_core::Result<()> {
+            *self.opens.lock().expect("stub state") += 1;
+            Ok(())
+        }
+
+        fn close_plugin_page(&self) {
+            *self.closes.lock().expect("stub state") += 1;
+        }
+    }
+
+    fn page_service(runtime: &Arc<PageRuntime>) -> SearchService {
+        let mut router = PluginActionRouter::default();
+        router
+            .register(
+                [PluginId("test.page".to_owned())],
+                Arc::clone(runtime) as Arc<dyn crikey_app::PluginActionExecutor>,
+            )
+            .expect("the stub registers once");
+        let mut service = SearchService::new(App::new());
+        service.set_plugin_action_router(Arc::new(router));
+        service
+    }
+
+    /// An action can finish after the user has dismissed the launcher, and the
+    /// hidden model refuses the surface. The session started a moment earlier
+    /// has to go with it: keeping it would leave the plugin drawing frames for
+    /// a screen that is gone, which is the leak dismissal itself closes.
+    #[test]
+    fn a_page_opening_into_a_dismissed_launcher_is_rolled_back() {
+        let runtime = Arc::new(PageRuntime::default());
+        let mut search = page_service(&runtime);
+        let mut view_model = LauncherViewModel::default();
+        view_model.dismiss();
+        assert!(!view_model.is_visible(), "the launcher starts dismissed");
+
+        open_plugin_page(
+            &mut search,
+            &mut view_model,
+            &PluginId("test.page".to_owned()),
+            "page",
+            (800, 600),
+        )
+        .expect("a dismissed launcher is not a failure");
+
+        assert_eq!(
+            *runtime.closes.lock().expect("stub state"),
+            1,
+            "the session opened for the refused surface was closed again"
+        );
+        assert!(
+            search.page_owner().is_none(),
+            "no page owns a screen the user cannot see"
+        );
+        assert!(view_model.page().is_none(), "the model took no surface");
+    }
+
+    /// The rollback must not fire on the ordinary path, or no page could ever
+    /// open.
+    #[test]
+    fn a_page_opening_into_a_visible_launcher_survives() {
+        let runtime = Arc::new(PageRuntime::default());
+        let mut search = page_service(&runtime);
+        let mut view_model = LauncherViewModel::default();
+        view_model.activate();
+
+        open_plugin_page(
+            &mut search,
+            &mut view_model,
+            &PluginId("test.page".to_owned()),
+            "page",
+            (800, 600),
+        )
+        .expect("the page opens");
+
+        assert_eq!(
+            *runtime.closes.lock().expect("stub state"),
+            0,
+            "an accepted page is not closed behind the user's back"
+        );
+        assert_eq!(
+            search.page_owner(),
+            Some((PluginId("test.page".to_owned()), "page".to_owned())),
+            "the page owns the screen"
+        );
+        assert!(view_model.page().is_some(), "the model shows the surface");
     }
 
     /// A report of a run that went exactly as asked, for `config()`.
