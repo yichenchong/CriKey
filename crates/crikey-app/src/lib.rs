@@ -15,6 +15,7 @@ mod modern_provider;
 mod native_provider;
 mod plugin_action;
 mod plugin_icons;
+mod plugin_page;
 mod query_pipeline;
 mod remote_catalog;
 mod selection_history_store;
@@ -40,12 +41,13 @@ pub use legacy_provider::{
 pub use modern_provider::{ModernDriver, ModernProvider, ModernUnavailable};
 pub use native_provider::{NativeDriver, NativeProvider, NativeUnavailable};
 pub use plugin_action::{
-    ActionRequestId, ActionSubmission, HostCapability, PluginActionCompletion, PluginActionExecutor,
-    PluginActionRouter,
+    ActionEffect, ActionRequestId, ActionSubmission, HostCapability, PluginActionCompletion,
+    PluginActionExecutor, PluginActionRouter,
 };
 pub use plugin_icons::{
     IconFetch, PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
 };
+pub use plugin_page::PageUpdate;
 pub use query_pipeline::{PipelineConfig, PipelineError, PipelineTick, QueryPipeline};
 pub use remote_catalog::{
     fetch_source, remote_owner, CatalogFetcher, DefaultCatalogFetcher, RemoteCatalogError,
@@ -909,6 +911,12 @@ pub struct SearchService {
     last_query: Option<NormalizedQuery>,
     /// Exact-owner runtime endpoints for plugin-owned actions.
     plugin_actions: Option<Arc<PluginActionRouter>>,
+    /// The plugin and page id of the one open plugin-drawn page.
+    ///
+    /// One at a time, and the host remembers which: every later page call
+    /// names no plugin, so without this the launcher could not tell which
+    /// runtime a keystroke on the visible surface belongs to.
+    page: Option<(PluginId, String)>,
     /// Icons already resolved for this session, keyed by reference.
     ///
     /// A miss is recorded too. A themed name no installed theme carries costs a
@@ -944,6 +952,7 @@ impl SearchService {
             now_secs: 0,
             last_query: None,
             plugin_actions: None,
+            page: None,
             icons: Mutex::new(HashMap::new()),
         }
     }
@@ -1785,6 +1794,94 @@ impl SearchService {
             .is_some_and(|router| router.cancel(request_id))
     }
 
+    /// Opens a plugin-drawn page and starts asking its plugin for frames
+    /// (spec 27.2).
+    ///
+    /// A plugin with no loaded runtime is refused: nothing would ever answer
+    /// a frame request, and an empty surface no one draws into is worse than
+    /// a refused action the caller can report.
+    ///
+    /// A second page while one is open is refused as well, rather than
+    /// replacing the first. Replacing it silently would leave the first
+    /// plugin still believing it owns the screen — still being asked for
+    /// frames, still holding whatever the user typed into it — while the user
+    /// looks at someone else's page. Closing the open page is the caller's
+    /// decision to make, so it is the caller who must make it.
+    pub fn open_page(
+        &mut self,
+        plugin: &PluginId,
+        page_id: &str,
+        width: u32,
+        height: u32,
+        palette: crikey_core::PagePalette,
+    ) -> CoreResult<()> {
+        // A launcher shows one surface at a time, so the page already open is
+        // ended before the new one starts rather than refused (spec 32.2).
+        // Refusing would strand whichever plugin asked second, and silently
+        // replacing would leave the first believing it still owns the screen;
+        // closing tells it, and the transport orders the two so the old page's
+        // `Closed` cannot overtake the new page's `Opened`.
+        if self.page.is_some() {
+            self.close_page();
+        }
+        let router = self.plugin_actions.as_ref().ok_or_else(|| {
+            crikey_core::CoreError::Invalid("plugin page runtime is unavailable".to_owned())
+        })?;
+        router.open_page(plugin, page_id, width, height, palette)?;
+        self.page = Some((plugin.clone(), page_id.to_owned()));
+        Ok(())
+    }
+
+    /// Hands one host-hit-tested event to the open page's plugin.
+    pub fn send_page_input(&mut self, input: crikey_core::PageInput) -> CoreResult<()> {
+        let (plugin, _) = self
+            .page
+            .as_ref()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("no plugin page is open".to_owned()))?;
+        let router = self.plugin_actions.as_ref().ok_or_else(|| {
+            crikey_core::CoreError::Invalid("plugin page runtime is unavailable".to_owned())
+        })?;
+        router.send_page_input(plugin, input)
+    }
+
+    /// Tells the open page its viewport changed.
+    pub fn resize_page(&mut self, width: u32, height: u32) {
+        let (Some((plugin, _)), Some(router)) = (self.page.as_ref(), self.plugin_actions.as_ref()) else {
+            return;
+        };
+        router.resize_page(plugin, width, height);
+    }
+
+    /// Closes the open page, telling its plugin the surface is gone.
+    pub fn close_page(&mut self) {
+        let Some((plugin, _)) = self.page.take() else {
+            return;
+        };
+        if let Some(router) = self.plugin_actions.as_ref() {
+            router.close_page(&plugin);
+        }
+    }
+
+    /// Takes at most one finished page update, without waiting for a plugin.
+    ///
+    /// A [`PageUpdate::closed`] update is the last one a page produces, so
+    /// the host forgets the owner as it hands that update over: the caller
+    /// dismisses the surface and every later page call correctly reports that
+    /// nothing is open.
+    pub fn poll_page(&mut self) -> Option<PageUpdate> {
+        let (plugin, _) = self.page.as_ref()?;
+        let update = self.plugin_actions.as_ref()?.poll_page(plugin)?;
+        if update.closed {
+            self.page = None;
+        }
+        Some(update)
+    }
+
+    /// The plugin and page id of the open page, if there is one.
+    pub fn page_owner(&self) -> Option<(PluginId, String)> {
+        self.page.clone()
+    }
+
     pub fn last_query_stats(&self) -> SearchStats {
         self.last_query_stats
     }
@@ -2301,5 +2398,172 @@ mod tests {
         assert_eq!(empty_reader.catalog.plugin_len(&owner), 0);
 
         fs::remove_dir_all(root).expect("remove the round-trip cache");
+    }
+}
+
+/// Page ownership at the service seam: which plugin the host believes is
+/// drawing, and when it stops believing it.
+#[cfg(test)]
+mod page_ownership {
+    use std::sync::{Arc, Mutex};
+
+    use crikey_core::{PageFrame, PageInput, PageInputKind};
+
+    use super::*;
+
+    const OWNER: &str = "dev.crikey.page-tests";
+
+    /// A runtime that records what the service asked it to do, with no plugin
+    /// behind it: what is under test here is the service's own bookkeeping.
+    #[derive(Debug, Default)]
+    struct PageStub {
+        opened: Mutex<Vec<(PluginId, String)>>,
+        inputs: Mutex<Vec<PageInputKind>>,
+        closes: Mutex<u32>,
+        next: Mutex<Option<PageUpdate>>,
+    }
+
+    impl PluginActionExecutor for PageStub {
+        fn submit_plugin_action(
+            &self,
+            _plugin: &PluginId,
+            _item: &Item,
+            _action_id: &ActionId,
+            _argument: Option<&str>,
+        ) -> CoreResult<ActionRequestId> {
+            Err(crikey_core::CoreError::Invalid("not under test".to_owned()))
+        }
+
+        fn open_plugin_page(
+            &self,
+            plugin: &PluginId,
+            page_id: &str,
+            _width: u32,
+            _height: u32,
+            _palette: crikey_core::PagePalette,
+        ) -> CoreResult<()> {
+            self.opened
+                .lock()
+                .expect("stub state")
+                .push((plugin.clone(), page_id.to_owned()));
+            Ok(())
+        }
+
+        fn send_plugin_page_input(&self, input: PageInput) -> CoreResult<()> {
+            self.inputs.lock().expect("stub state").push(input.kind);
+            Ok(())
+        }
+
+        fn close_plugin_page(&self) {
+            *self.closes.lock().expect("stub state") += 1;
+        }
+
+        fn poll_plugin_page(&self) -> Option<PageUpdate> {
+            self.next.lock().expect("stub state").take()
+        }
+    }
+
+    fn service(stub: &Arc<PageStub>) -> SearchService {
+        let mut router = PluginActionRouter::default();
+        router
+            .register(
+                [PluginId(OWNER.to_owned())],
+                Arc::clone(stub) as Arc<dyn PluginActionExecutor>,
+            )
+            .expect("the stub registers once");
+        let mut service = SearchService::new(App::new());
+        service.set_plugin_action_router(Arc::new(router));
+        service
+    }
+
+    /// A launcher shows one surface at a time, and the replaced plugin has to
+    /// be told (spec 32.2). Asserting the close reached the runtime is what
+    /// separates this from silently dropping the first page's session.
+    #[test]
+    fn opening_a_page_closes_the_one_already_open() {
+        let stub = Arc::new(PageStub::default());
+        let mut service = service(&stub);
+        let owner = PluginId(OWNER.to_owned());
+        service
+            .open_page(&owner, "first", 800, 600, crikey_core::PagePalette::default())
+            .expect("the first page opens");
+        service
+            .open_page(&owner, "second", 800, 600, crikey_core::PagePalette::default())
+            .expect("the second page opens over the first");
+        assert_eq!(
+            *stub.closes.lock().expect("stub state"),
+            1,
+            "the replaced page was closed rather than abandoned"
+        );
+        assert_eq!(
+            stub.opened
+                .lock()
+                .expect("stub state")
+                .iter()
+                .map(|(_, page)| page.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"],
+            "both pages reached the runtime, in order"
+        );
+        assert_eq!(
+            service.page_owner(),
+            Some((owner, "second".to_owned())),
+            "the newest page owns the screen"
+        );
+    }
+
+    #[test]
+    fn a_plugin_with_no_runtime_cannot_open_a_page() {
+        let stub = Arc::new(PageStub::default());
+        let mut service = service(&stub);
+        service
+            .open_page(
+                &PluginId("dev.crikey.absent".to_owned()),
+                "page",
+                800,
+                600,
+                crikey_core::PagePalette::default(),
+            )
+            .expect_err("a plugin that is not loaded has nothing to draw a page");
+        assert_eq!(service.page_owner(), None);
+        assert!(stub.opened.lock().expect("stub state").is_empty());
+    }
+
+    #[test]
+    fn a_closing_update_releases_the_page_owner() {
+        let stub = Arc::new(PageStub::default());
+        let mut service = service(&stub);
+        let owner = PluginId(OWNER.to_owned());
+        service
+            .open_page(&owner, "page", 800, 600, crikey_core::PagePalette::default())
+            .expect("the page opens");
+        service
+            .send_page_input(PageInput::new(PageInputKind::KeyPressed))
+            .expect("input reaches the open page");
+        assert_eq!(
+            stub.inputs.lock().expect("stub state").as_slice(),
+            [PageInputKind::KeyPressed]
+        );
+
+        *stub.next.lock().expect("stub state") = Some(PageUpdate {
+            frame: PageFrame {
+                generation: 4,
+                ..PageFrame::default()
+            },
+            closed: true,
+        });
+        let update = service.poll_page().expect("the closing update is delivered");
+        assert!(update.closed);
+        assert_eq!(
+            update.frame.generation, 4,
+            "the last drawable frame comes with the close"
+        );
+        assert_eq!(service.page_owner(), None);
+        service
+            .send_page_input(PageInput::new(PageInputKind::KeyPressed))
+            .expect_err("input after the page closed has nowhere to go");
+        // A page the host already saw close needs no second close call.
+        service.close_page();
+        assert_eq!(*stub.closes.lock().expect("stub state"), 0);
     }
 }

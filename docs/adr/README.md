@@ -31,3 +31,4 @@ tree. Provisional ADRs must state their revisit trigger.
 | [0017](0017-shared-memory-transport.md) | Shared-memory transport stays deferred; ADR-0004's profiling gate measured and not met | Rejected for v1 |
 | [0018](0018-interpreter-precedence.md) | Interpreter discovery order; a bundled runtime outranks the search path | Accepted; amends ADR-0005 |
 | [0019](0019-plugin-sandbox.md) | Plugin processes are write-confined with Landlock on Linux; reads, syscalls and non-TCP networking stay unrestricted | Accepted |
+| [0020](0020-plugin-pages.md) | Plugin pages cross the boundary as a display list; pixel canvas and embedded webview rejected | Accepted |

@@ -21,7 +21,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crikey_core::{ActionId, CoreError, Item, ItemId, PluginId, Result};
+use crikey_core::{ActionId, CoreError, Item, ItemId, PageColor, PageFrame, PluginId, Result};
 use crikey_native_protocol::message::{
     self, BatchState, Envelope, ErrorCode, EventKind, ExecuteOutcomeCode, Payload, StructuredError,
 };
@@ -29,8 +29,8 @@ use crikey_native_protocol::transport::Transport;
 use crikey_native_protocol::{Capabilities, Endpoint, ProtocolError, RequestId, PROTOCOL_VERSION};
 
 use crate::{
-    CancellationToken, CatalogSink, ExecuteRequest, LogLevel, Plugin, PluginContext, PluginEvent,
-    PluginResource, Query, ResourceKind, SdkError, SuggestionSink,
+    CancellationToken, CatalogSink, ExecuteOutcome, ExecuteRequest, LogLevel, PagePalette, PageRequest,
+    Plugin, PluginContext, PluginEvent, PluginResource, Query, ResourceKind, SdkError, SuggestionSink,
 };
 
 /// Maximum number of decoded control frames retained while a plugin callback
@@ -910,6 +910,20 @@ fn serve_requests(
                     return Err(error);
                 }
             }
+            Payload::PageRequest(request) => {
+                handle_page(
+                    plugin,
+                    request,
+                    request_id,
+                    generation,
+                    transport,
+                    &request_context,
+                    metrics,
+                )?;
+                if let Some(error) = request_context.take_log_error() {
+                    return Err(error);
+                }
+            }
             Payload::Configuration(configuration) => {
                 let callback_result = {
                     let _in_flight = metrics.enter();
@@ -1254,16 +1268,23 @@ fn handle_execute(
     };
     let callback = {
         let _in_flight = metrics.enter();
-        invoke_callback(|| plugin.execute(plugin_request, context))
+        invoke_callback(|| plugin.execute_outcome(plugin_request, context))
     };
-    let (outcome, error) = match callback {
-        Ok(Ok(())) => (ExecuteOutcomeCode::from_i32(1), None),
+    let (outcome, page_id, error) = match callback {
+        Ok(Ok(ExecuteOutcome::Completed)) => (ExecuteOutcomeCode::from_i32(1), String::new(), None),
+        // An action that opened a page reports the page rather than
+        // completion: the host keeps the launcher open on that surface, so
+        // folding this onto the OK outcome would dismiss the window the page
+        // was about to be drawn in.
+        Ok(Ok(ExecuteOutcome::ShowPage { page_id })) => (ExecuteOutcomeCode::from_i32(4), page_id, None),
         Ok(Err(error)) => (
             ExecuteOutcomeCode::from_i32(2),
+            String::new(),
             Some(structured_error(&error.to_string(), request_id)),
         ),
         Err(detail) => (
             ExecuteOutcomeCode::from_i32(2),
+            String::new(),
             Some(structured_error(&detail, request_id)),
         ),
     };
@@ -1277,11 +1298,92 @@ fn handle_execute(
             payload: Some(Payload::ExecuteResult(message::ExecuteResult {
                 outcome,
                 error,
+                page_id,
                 unknown: Default::default(),
             })),
             unknown: Default::default(),
         },
     )
+}
+
+/// Answers one host request for a page frame (spec 27.3).
+///
+/// The reply always carries the requested generation and always carries a
+/// frame. A page whose plugin failed is closed rather than left as a surface
+/// the user cannot dismiss, and the failure is logged instead of raised: a
+/// broken page must not cost the connection every other request on it.
+fn handle_page(
+    plugin: &mut dyn Plugin,
+    request: message::PageRequest,
+    request_id: u64,
+    generation: u64,
+    transport: &Arc<Mutex<Box<dyn Transport>>>,
+    context: &RuntimeContext,
+    metrics: &RuntimeMetrics,
+) -> Result<(), SdkError> {
+    let page_generation = request.generation;
+    let plugin_request = PageRequest {
+        page_id: request.page_id,
+        generation: page_generation,
+        width: request.width,
+        height: request.height,
+        events: request
+            .events
+            .iter()
+            .map(crikey_native_protocol::convert::from_proto_page_input)
+            .collect(),
+        focused: request.focused,
+        palette: PagePalette {
+            surface: PageColor::from_u32(request.colour_surface),
+            text: PageColor::from_u32(request.colour_text),
+            accent: PageColor::from_u32(request.colour_accent),
+            muted: PageColor::from_u32(request.colour_muted),
+        },
+    };
+    let callback = {
+        let _in_flight = metrics.enter();
+        invoke_callback(|| plugin.page(plugin_request, context))
+    };
+    let mut frame = match callback {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(error)) => closing_frame(context, page_generation, &error.to_string()),
+        Err(detail) => closing_frame(context, page_generation, &detail),
+    };
+    // The host drops a frame whose generation does not match the request it
+    // answers, so the SDK stamps it rather than trusting a plugin to copy a
+    // number it has no reason to care about: a page silently refusing to
+    // repaint is far harder to diagnose than one that never drew at all.
+    frame.generation = page_generation;
+    // Refused frames are reported here, at the plugin that built them, and not
+    // only at the host that rejects them: the host knows the frame is invalid
+    // but nothing about which line of plugin code produced it.
+    if let Err(error) = frame.validate() {
+        frame = closing_frame(context, page_generation, &format!("invalid page frame: {error}"));
+    }
+    send_envelope(
+        transport,
+        Envelope {
+            connection_id: context.connection_id,
+            request_id,
+            generation,
+            deadline_ms: 0,
+            payload: Some(Payload::PageFrame(
+                crikey_native_protocol::convert::to_proto_page_frame(&frame),
+            )),
+            unknown: Default::default(),
+        },
+    )
+}
+
+/// The frame a failed page answers with: nothing drawn, page closed, reason
+/// logged where the plugin author will see it.
+fn closing_frame(context: &RuntimeContext, generation: u64, detail: &str) -> PageFrame {
+    context.log(LogLevel::Error, &format!("page callback failed: {detail}"));
+    PageFrame {
+        generation,
+        close: true,
+        ..PageFrame::default()
+    }
 }
 
 fn send_error(

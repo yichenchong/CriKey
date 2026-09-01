@@ -9,8 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
-use crikey_core::{ActionId, CoreError, Item, ItemId, PluginId, Result as CoreResult};
+use crikey_core::{ActionId, CoreError, Item, ItemId, PageInput, PluginId, Result as CoreResult};
 use crikey_plugin_model::{FilesystemScope, Permissions};
+
+use crate::plugin_page::PageUpdate;
 
 /// Identifier assigned when a plugin action is admitted to an endpoint.
 ///
@@ -20,6 +22,22 @@ use crikey_plugin_model::{FilesystemScope, Permissions};
 pub struct ActionRequestId {
     pub plugin: PluginId,
     pub sequence: u64,
+}
+
+/// What a plugin action did, beyond succeeding.
+///
+/// An action that opens a page is not a plain success: the launcher must hand
+/// the screen to that plugin rather than dismiss, and it can only do that if
+/// the completion says so and names the surface. Reporting it as `Ok(())`
+/// would leave the caller guessing from a side channel which action, if any,
+/// wanted the window kept open (spec 27.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionEffect {
+    /// The action ran and is finished.
+    Completed,
+    /// The action asked the host to open this plugin-drawn page. The owning
+    /// plugin is [`PluginActionCompletion::plugin`].
+    ShowPage { page_id: String },
 }
 
 /// Terminal result emitted by a plugin action endpoint.
@@ -32,7 +50,7 @@ pub struct PluginActionCompletion {
     pub plugin: PluginId,
     pub item_id: ItemId,
     pub action_id: ActionId,
-    pub outcome: CoreResult<()>,
+    pub outcome: CoreResult<ActionEffect>,
 }
 
 /// What a validated action did at submission time.
@@ -92,6 +110,42 @@ pub trait PluginActionExecutor: Send + Sync {
         Err(CoreError::Invalid(
             "plugin action item snapshot is unavailable".to_owned(),
         ))
+    }
+
+    /// Opens the named plugin-drawn page and starts asking for frames.
+    ///
+    /// Returning immediately is part of the contract: a page is a stream of
+    /// round trips to a child process, and none of them may happen on the
+    /// caller's thread. A runtime with no page support refuses rather than
+    /// pretending to open one, so the launcher never shows an empty surface
+    /// nothing will ever draw into.
+    fn open_plugin_page(
+        &self,
+        _plugin: &PluginId,
+        _page_id: &str,
+        _width: u32,
+        _height: u32,
+        _palette: crikey_core::PagePalette,
+    ) -> CoreResult<()> {
+        Err(CoreError::Invalid(
+            "this plugin runtime cannot draw pages".to_owned(),
+        ))
+    }
+
+    /// Queues one host-hit-tested page event for the open page.
+    fn send_plugin_page_input(&self, _input: PageInput) -> CoreResult<()> {
+        Err(CoreError::Invalid("no plugin page is open".to_owned()))
+    }
+
+    /// Tells the open page the viewport changed.
+    fn resize_plugin_page(&self, _width: u32, _height: u32) {}
+
+    /// Closes the open page, telling its plugin the surface is gone.
+    fn close_plugin_page(&self) {}
+
+    /// Takes the newest finished page frame, if one is waiting.
+    fn poll_plugin_page(&self) -> Option<PageUpdate> {
+        None
     }
 }
 /// One privileged operation the host performs on a plugin's behalf.
@@ -364,6 +418,53 @@ impl PluginActionRouter {
     /// Returns whether this registry has an exact endpoint for `plugin`.
     pub fn owns(&self, plugin: &PluginId) -> bool {
         self.providers.contains_key(plugin)
+    }
+
+    /// Opens a page on the runtime registered for `plugin`.
+    ///
+    /// An owner this router does not know is refused rather than routed to a
+    /// sibling runtime, for the same reason action dispatch is: a page is a
+    /// plugin drawing on the user's screen, and the wrong plugin drawing is
+    /// worse than no page at all.
+    pub fn open_page(
+        &self,
+        plugin: &PluginId,
+        page_id: &str,
+        width: u32,
+        height: u32,
+        palette: crikey_core::PagePalette,
+    ) -> CoreResult<()> {
+        self.providers
+            .get(plugin)
+            .ok_or_else(|| CoreError::Invalid(format!("no action runtime owns plugin `{}`", plugin.0)))?
+            .open_plugin_page(plugin, page_id, width, height, palette)
+    }
+
+    /// Queues one page event for the page `plugin` has open.
+    pub fn send_page_input(&self, plugin: &PluginId, input: PageInput) -> CoreResult<()> {
+        self.providers
+            .get(plugin)
+            .ok_or_else(|| CoreError::Invalid(format!("no action runtime owns plugin `{}`", plugin.0)))?
+            .send_plugin_page_input(input)
+    }
+
+    /// Tells the page `plugin` has open that the viewport changed.
+    pub fn resize_page(&self, plugin: &PluginId, width: u32, height: u32) {
+        if let Some(executor) = self.providers.get(plugin) {
+            executor.resize_plugin_page(width, height);
+        }
+    }
+
+    /// Closes the page `plugin` has open.
+    pub fn close_page(&self, plugin: &PluginId) {
+        if let Some(executor) = self.providers.get(plugin) {
+            executor.close_plugin_page();
+        }
+    }
+
+    /// Takes the newest frame the page `plugin` has open produced.
+    pub fn poll_page(&self, plugin: &PluginId) -> Option<PageUpdate> {
+        self.providers.get(plugin)?.poll_plugin_page()
     }
 }
 
@@ -709,7 +810,7 @@ mod tests {
                     plugin,
                     item_id,
                     action_id,
-                    outcome: Ok(()),
+                    outcome: Ok(super::ActionEffect::Completed),
                 });
             });
             Ok(request_id)

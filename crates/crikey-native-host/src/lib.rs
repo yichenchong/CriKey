@@ -13,8 +13,8 @@ pub use launch::{
     LaunchSpec, LimitEnforcement, ResourceLimitReport, ResourceLimits, TransportKind, WorkerOptions,
 };
 pub use stream::{
-    BatchState, EchoMismatch, ExecuteOutcome, HealthSnapshot, NativeSuggestRequest, PluginError,
-    ProtocolObservation, StreamDiagnostics, Suggestions, MAX_LOG_RECORDS, OBSERVATION_CAPACITY,
+    BatchState, EchoMismatch, ExecuteOutcome, HealthSnapshot, NativePageRequest, NativeSuggestRequest,
+    PluginError, ProtocolObservation, StreamDiagnostics, Suggestions, MAX_LOG_RECORDS, OBSERVATION_CAPACITY,
     READER_QUEUE_CAPACITY, READER_QUEUE_MAX_BYTES,
 };
 pub use supervisor::{NativeSupervisor, SupervisorConfig};

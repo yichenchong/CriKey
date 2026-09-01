@@ -8,9 +8,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crikey_core::{NodeRole, NodeShape, PageColor, PageFrame, PageInput, PageInputKind, PageNode};
 use egui::{
-    load::SizedTexture, text::LayoutJob, vec2, Align, ColorImage, FontFamily, FontId, Frame, Layout, Margin,
-    RawInput, RichText, Rounding, Stroke, TextEdit, TextFormat, TextStyle, TextureHandle, TextureOptions,
+    load::SizedTexture, text::LayoutJob, vec2, Align, Align2, ColorImage, FontFamily, FontId, Frame, Layout,
+    Margin, RawInput, RichText, Rounding, Stroke, TextEdit, TextFormat, TextStyle, TextureHandle,
+    TextureOptions, UiBuilder,
 };
 use egui_wgpu::{wgpu, Renderer, ScreenDescriptor};
 use thiserror::Error;
@@ -23,7 +25,9 @@ use winit::{
     window::{Window, WindowId, WindowLevel},
 };
 
-use crate::{theme, LauncherWindow, ResultRow, SettingControl, SettingRow, UiCommand, ViewModel};
+use crate::{
+    theme, LauncherWindow, PageSurface, ResultRow, SettingControl, SettingRow, UiCommand, ViewModel,
+};
 
 /// Maximum number of activation-to-present observations retained in memory.
 ///
@@ -213,7 +217,10 @@ impl fmt::Debug for NativeUiFrame {
 }
 
 /// Event delivered by [`NativeLauncher::run`] on the UI thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not [`Eq`], because [`UiCommand`] is not: a page's pointer event carries
+/// float coordinates.
+#[derive(Debug, Clone, PartialEq)]
 pub enum NativeLauncherEvent {
     /// A platform activation request has reached the native event loop.
     ///
@@ -369,6 +376,11 @@ struct Overlay {
     /// arrived.
     show_hints: bool,
     rounded_corners: bool,
+    /// The plugin-drawn surface the user is looking at. Host-owned for the
+    /// same reason: a provider frame describes results and knows nothing about
+    /// a page, so leaving it out would blank the page the moment any plugin
+    /// answered a query behind it.
+    page: Option<PageSurface>,
 }
 
 impl Default for Overlay {
@@ -382,6 +394,7 @@ impl Default for Overlay {
             settings_focus: None,
             show_hints: true,
             rounded_corners: true,
+            page: None,
         }
     }
 }
@@ -403,6 +416,7 @@ fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
         settings_focus: model.settings_focus.clone(),
         show_hints: model.show_hints,
         rounded_corners: model.rounded_corners,
+        page: model.page.clone(),
     };
     mailbox.overlay_session = Some(session);
 }
@@ -421,6 +435,7 @@ fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> View
         settings_focus: mailbox.overlay.settings_focus.clone(),
         show_hints: mailbox.overlay.show_hints,
         rounded_corners: mailbox.overlay.rounded_corners,
+        page: mailbox.overlay.page.clone(),
         ..model.clone()
     }
 }
@@ -1381,7 +1396,11 @@ fn shows_results(model: &ViewModel) -> bool {
 /// `a_listed_window_leaves_the_status_line_room_to_be_read`, which fails if
 /// the sum below stops covering everything the frame actually draws.
 fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
-    if model.settings_open {
+    // A page and the settings surface are the two full-height surfaces, and
+    // both get the whole window: the page's own extent is the plugin's to
+    // choose, so there is nothing to compute it from, and a page laid out into
+    // the compact window would have almost no room to draw in.
+    if model.settings_open || model.page.is_some() {
         return expanded_height;
     }
     if !shows_results(model) {
@@ -2029,6 +2048,20 @@ fn translate_keyboard(
     if event.state != ElementState::Pressed {
         return None;
     }
+    // While a page is open the plugin's surface owns the keyboard, exactly as
+    // the settings surface does below: Enter presses the focused node, Tab
+    // walks the page's focus ring, and typing goes into whatever field the
+    // page has focused, so none of those may still drive the result list.
+    //
+    // Escape is the host's and is answered here rather than left to the frame.
+    // Returning `Some` is what keeps it from reaching egui at all -- the
+    // window loop forwards an event to `egui_winit` only when this returns
+    // `None` -- so the page never sees the key that closes it and a plugin
+    // cannot trap the user inside its own surface.
+    if model.is_some_and(|model| model.page.is_some()) {
+        return matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
+            .then_some(UiCommand::ClosePage);
+    }
     // While the settings surface is open its editors own the keyboard: Enter
     // commits an edit and Tab walks between rows, so neither may still run a
     // result. Escape is the exception, because closing the surface is what it
@@ -2115,7 +2148,15 @@ fn draw_launcher(
         )
         .show(context, |ui| {
             draw_query(ui, model, commands, colors);
-            if model.settings_open {
+            if let Some(page) = &model.page {
+                // A page takes the result area for the same reason the
+                // settings surface does, and it is drawn in the same place:
+                // below the query field, above the status line. The model
+                // keeps the two mutually exclusive, so this is a branch rather
+                // than a stack.
+                ui.add_space(theme::SPACE_3);
+                draw_page(ui, page, commands, colors);
+            } else if model.settings_open {
                 // The settings surface takes the result area rather than
                 // floating over it: the launcher is one column, and a list the
                 // user cannot reach behind a panel is only noise.
@@ -2167,9 +2208,19 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
             );
             // The query field takes the keyboard back on every frame, which is
             // right for a launcher whose only job is typing -- except while the
-            // settings surface is open, where it would tear focus out of the
-            // editor the user is typing into.
-            if !model.settings_open {
+            // settings surface or a page is open, where it would tear focus out
+            // of the editor or node the user is working in.
+            //
+            // A page needs the focus *surrendered* as well as not re-taken.
+            // The field held the keyboard on the frame before the page opened,
+            // and an editor that keeps it goes on swallowing every `Text`
+            // event, so the user would type into a query they cannot see
+            // instead of into the field the page is showing them.
+            if model.page.is_some() {
+                if response.has_focus() {
+                    response.surrender_focus();
+                }
+            } else if !model.settings_open {
                 response.request_focus();
             }
             if response.changed() {
@@ -2635,6 +2686,614 @@ fn draw_actions(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
         });
 }
 
+/// Draws the plugin-drawn page and turns this frame's input into page events
+/// (spec 32).
+///
+/// The launcher draws the display list itself: what crosses the plugin
+/// boundary is a vocabulary of shapes and the semantics attached to them,
+/// never pixels and never code. That is what makes a page safe to show at all
+/// -- a plugin can describe an ugly surface, but it cannot reach the GPU, the
+/// window, or anything the launcher draws outside the rectangle below.
+///
+/// The rectangle is the whole point of the clip. Node coordinates are the
+/// plugin's, so a negative `y` or a `height` larger than the surface is a
+/// thing a plugin will do, by accident or otherwise, and without the clip it
+/// would paint over the query field or the status line -- the one place the
+/// user can read whose surface they are looking at.
+/// The launcher's own surface colours, in the host-neutral form a plugin is
+/// given with every frame request.
+///
+/// Exported because the transport is what puts them on the wire and it cannot
+/// see the theme: a page that had to guess would stop matching the launcher
+/// the moment the palette changed.
+pub fn page_palette() -> crikey_core::PagePalette {
+    let colors = theme::palette();
+    let convert =
+        |colour: egui::Color32| crikey_core::PageColor::rgba(colour.r(), colour.g(), colour.b(), colour.a());
+    crikey_core::PagePalette {
+        surface: convert(colors.surface),
+        text: convert(colors.text),
+        accent: convert(colors.accent),
+        muted: convert(colors.text_muted),
+    }
+}
+
+/// The page area a window of this size will roughly offer, used only to open
+/// a page before anything has been drawn.
+///
+/// An estimate, and honestly so: the exact area depends on a layout pass that
+/// has not run yet. The renderer measures the real rectangle on the first
+/// frame and reports it through [`UiCommand::ResizePage`], so this number is
+/// what the plugin's very first display list is laid out against and nothing
+/// more. Getting it close matters anyway - a first frame laid out for the
+/// wrong width is a visible jump.
+pub fn initial_page_viewport(window_width: u32, window_height: u32) -> (u32, u32) {
+    let margins = (theme::PANEL_MARGIN * 2.0).round() as u32;
+    let chrome = theme::COMPACT_WINDOW_HEIGHT;
+    (
+        window_width.saturating_sub(margins).max(1),
+        window_height.saturating_sub(chrome).max(1),
+    )
+}
+
+/// Tells the host how big the page area actually came out.
+///
+/// The size is remembered per page in egui's temporary store and reported only
+/// when it changes. Sending it every frame would turn a page that redraws on a
+/// timer into a stream of resize requests, and sending it never would leave
+/// the plugin laying out against whatever the host guessed when it opened the
+/// surface -- which is right only until the first window resize.
+fn report_page_size(ui: &egui::Ui, page: &PageSurface, rect: egui::Rect, commands: &mut Vec<UiCommand>) {
+    let width = rect.width().max(0.0).round() as u32;
+    let height = rect.height().max(0.0).round() as u32;
+    if width == 0 || height == 0 {
+        return;
+    }
+    let id = egui::Id::new(("crikey-page-size", page.page_id.as_str()));
+    let previous: Option<(u32, u32)> = ui.data(|data| data.get_temp(id));
+    if previous == Some((width, height)) {
+        return;
+    }
+    ui.data_mut(|data| data.insert_temp(id, (width, height)));
+    commands.push(UiCommand::ResizePage { width, height });
+}
+
+fn draw_page(ui: &mut egui::Ui, page: &PageSurface, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
+    // What the page may occupy is what is left after the footer and the gap
+    // above it, measured the way `draw_results` measures the list's room. The
+    // central panel's bottom inner margin is already outside
+    // `available_height` and must not be counted again. A surface that took
+    // everything left would push the status line onto the window's bottom
+    // edge, which is the same footer bug a matchless query used to cause from
+    // the other direction.
+    let room = (ui.available_height() - (BLOCK_GAP + STATUS_BLOCK_HEIGHT)).max(0.0);
+    let (_, rect) = ui.allocate_space(vec2(ui.available_width(), room));
+
+    // Intersected with the clip already in force rather than replacing it, so
+    // a parent that has narrowed the clip -- a scroll area, the panel's own
+    // margin -- still wins over the page.
+    let mut page_ui = ui.new_child(UiBuilder::new().max_rect(rect));
+    page_ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+
+    // The sheet the display list stands on, in the same surface tier as the
+    // settings and action surfaces. Drawn by the host rather than left to the
+    // plugin so that a page that draws nothing -- a first frame, a plugin that
+    // has stopped answering -- is an empty panel instead of a hole in the
+    // launcher.
+    page_ui
+        .painter()
+        .rect_filled(rect, Rounding::same(theme::RADIUS_MEDIUM), colors.surface);
+
+    // Escape is the host's key. `translate_keyboard` already answers it on the
+    // window path and, by answering, keeps it out of egui entirely; this is the
+    // same decision for every other way input can reach a frame -- the
+    // headless builder, a synthetic event, a key that arrived while an input
+    // method was composing. Consuming it here is what makes those routes close
+    // the page too, and the two can never both fire for one keystroke because
+    // the window loop hands an event to egui only when `translate_keyboard`
+    // declined it.
+    if page_ui.input_mut(|state| state.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        commands.push(UiCommand::ClosePage);
+    }
+
+    // The host opened this page with a guess at its size; only the renderer
+    // knows what the layout actually left it. Reporting the measurement is
+    // what lets a plugin lay out against the surface it really has, and it is
+    // sent only when the number changes so a static page still costs one
+    // request per interaction rather than one per repaint.
+    report_page_size(&page_ui, page, rect, commands);
+
+    let ring = page.frame.focus_ring();
+    // The pointer is read before the focus is resolved, because a press on a
+    // control is a focus move: resolving focus first and then handling the
+    // press would spend a frame with the ring on the node the user just left.
+    let pointer = page_pointer(&page_ui, page, rect);
+    let focus = page_focus(&page_ui, page, &ring, pointer.as_ref(), commands);
+
+    for (index, node) in page.frame.nodes.iter().enumerate() {
+        let node_rect = node_rect(rect.min, node);
+        paint_node(page_ui.painter(), node, node_rect);
+        page_node_semantics(&page_ui, index, node, node_rect, focus, commands);
+    }
+
+    // Last, so nothing in the display list can paint over it. The ring is
+    // host-drawn because the focus is host-owned: a plugin only learns of a
+    // move through a `FocusChanged` event, which is one round trip later, so a
+    // page drawing its own ring would always show it a frame behind the
+    // keyboard.
+    if let Some(node) = page.frame.node(focus) {
+        let rect = node_rect(rect.min, node);
+        page_ui.painter().rect_stroke(
+            rect,
+            Rounding::same(node_rounding(node, rect)),
+            Stroke::new(1.0, colors.accent),
+        );
+    }
+
+    if let Some(pointer) = pointer {
+        pointer.report(commands);
+    }
+    page_keyboard(&page_ui, page, focus, commands);
+}
+
+/// Where a node lands on screen: the plugin's own coordinates, offset by the
+/// page origin.
+///
+/// A negative or non-finite extent collapses to zero rather than producing an
+/// inverted rectangle, which egui paints as nothing in some places and as a
+/// shape mirrored about its own corner in others. `f32::NAN.max(0.0)` is zero,
+/// so one clamp covers both.
+fn node_rect(origin: egui::Pos2, node: &PageNode) -> egui::Rect {
+    egui::Rect::from_min_size(
+        origin + vec2(node.x, node.y),
+        vec2(node.width.max(0.0), node.height.max(0.0)),
+    )
+}
+
+/// The corner radius a node is actually drawn with.
+///
+/// Half the shorter side is the largest arc that still fits inside a
+/// rectangle. egui takes a larger radius literally and tessellates the corners
+/// past one another, so a wide flat button asking for a radius of 500 comes out
+/// as a pinched hourglass rather than a pill. The plugin's number is therefore
+/// clamped rather than trusted, and the same clamp is what the host's focus
+/// ring uses so the outline follows the shape underneath it.
+fn node_rounding(node: &PageNode, rect: egui::Rect) -> f32 {
+    node.rounding.clamp(0.0, rect.size().min_elem() / 2.0)
+}
+
+/// A page colour as egui stores colour.
+///
+/// [`PageColor`] is straight RGBA, which is what a plugin can reason about;
+/// egui stores premultiplied, so this is a conversion rather than a field copy.
+/// Copying the channels across would darken every translucent fill a page
+/// draws.
+fn node_color(color: PageColor) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a)
+}
+
+/// The font size a node's text is drawn at.
+///
+/// A `text_size` of zero is the plugin declining to choose, which the protocol
+/// spells as the host's body size: a page that wants to look like the launcher
+/// must not have to know the launcher's type scale, and one that hard coded
+/// this number would stop matching the moment the scale moved.
+fn node_text_size(node: &PageNode) -> f32 {
+    if node.text_size > 0.0 {
+        node.text_size
+    } else {
+        theme::TEXT_BODY
+    }
+}
+
+/// Draws one display-list node (spec 32.4).
+fn paint_node(painter: &egui::Painter, node: &PageNode, rect: egui::Rect) {
+    match node.shape {
+        // A node that paints nothing is still a node: it carries a rect, a
+        // role and a name, which is how an invisible hit target or a region
+        // that exists only to be announced is spelled.
+        NodeShape::None => {}
+        NodeShape::Rect => {
+            let rounding = Rounding::same(node_rounding(node, rect));
+            // An invisible fill is not an error: alpha zero is how the
+            // vocabulary spells a hit target with no appearance of its own, so
+            // the fill is skipped rather than the node refused.
+            if node.fill.is_visible() {
+                painter.rect_filled(rect, rounding, node_color(node.fill));
+            }
+            if let Some(stroke) = node_stroke(node) {
+                painter.rect_stroke(rect, rounding, stroke);
+            }
+        }
+        NodeShape::Text => {
+            if node.fill.is_visible() && !node.text.is_empty() {
+                // Anchored at the node's top-left and never laid out inside
+                // its width and height: the plugin owns the layout, so a host
+                // that centred or wrapped the run would be second-guessing
+                // coordinates the plugin has already computed everything else
+                // against. The extent still matters -- it is the rect that
+                // hit-tests and carries the node's semantics.
+                painter.text(
+                    rect.min,
+                    Align2::LEFT_TOP,
+                    &node.text,
+                    FontId::proportional(node_text_size(node)),
+                    node_color(node.fill),
+                );
+            }
+        }
+        NodeShape::Line => {
+            if let Some(stroke) = node_stroke(node) {
+                painter.line_segment([rect.min, rect.max], stroke);
+            }
+        }
+        NodeShape::Circle => {
+            // Inscribed rather than circumscribed: the node's rect is the room
+            // the plugin reserved, and a circle drawn to the longer side would
+            // leave it.
+            painter.circle(
+                rect.center(),
+                rect.size().min_elem() / 2.0,
+                node_color(node.fill),
+                node_stroke(node).unwrap_or(Stroke::NONE),
+            );
+        }
+    }
+}
+
+/// The outline a node is drawn with, or `None` when it has none.
+///
+/// Both halves have to say yes. A stroke colour with no width and a width with
+/// no colour are each the plugin asking for nothing, and egui would tessellate
+/// a degenerate shape for either.
+fn node_stroke(node: &PageNode) -> Option<Stroke> {
+    (node.stroke.is_visible() && node.stroke_width > 0.0)
+        .then(|| Stroke::new(node.stroke_width, node_color(node.stroke)))
+}
+
+/// Gives one node the interaction and the widget semantics its role claims
+/// (spec 32.5).
+///
+/// This is the whole reason the display-list vocabulary carries roles at all.
+/// A plugin cannot reach into the launcher's widget tree, so the only way a
+/// button it drew is *a button* to anything other than the eye is for the host
+/// to allocate a real response over it and describe what it is.
+///
+/// Two tiers, because the roles are two kinds of thing. An interactive role
+/// with a node id is a control: it takes a click sense, it can hold the
+/// keyboard, and egui already reads Enter or Space on a focused clickable
+/// widget as a primary click, so a keyboard press and a mouse press arrive by
+/// the same route. An announced role -- Label, Heading -- is not operable and
+/// must not become clickable, because a heading that answered the mouse would
+/// be a control the plugin never asked for; it is registered with a hover
+/// sense so that it still describes the region it covers.
+///
+/// What that delivers is bounded by how this workspace builds egui. AccessKit
+/// is not enabled, so the information below reaches `PlatformOutput::events`
+/// and stops there: no screen reader sees it. Carrying it correctly anyway is
+/// what makes enabling AccessKit a build-configuration change rather than a
+/// redesign of the vocabulary.
+fn page_node_semantics(
+    ui: &egui::Ui,
+    index: usize,
+    node: &PageNode,
+    rect: egui::Rect,
+    focus: u32,
+    commands: &mut Vec<UiCommand>,
+) {
+    // Keyed by position in the display list rather than by node id: an
+    // announced label is allowed to be anonymous, and two anonymous nodes must
+    // not share one widget id. Node ids are unique within a validated frame,
+    // but zero is not a node id at all.
+    let id = ui.id().with(("crikey-page-node", index));
+    if node.is_focusable() {
+        let response = ui.interact(rect, id, egui::Sense::click());
+        // The host owns the ring, so the keyboard is put where the ring says
+        // rather than where egui's own Tab order would have left it.
+        if focus == node.node_id && !response.has_focus() {
+            response.request_focus();
+        }
+        if response.clicked() {
+            commands.push(UiCommand::PageInput(page_event(
+                PageInputKind::Activated,
+                node.node_id,
+            )));
+        }
+        response.widget_info(|| node_widget_info(node));
+    } else if node.role.is_announced() {
+        ui.interact(rect, id, egui::Sense::hover())
+            .widget_info(|| node_widget_info(node));
+    }
+}
+
+/// How a node describes itself to anything that asks what is under the pixels.
+///
+/// The name is [`crikey_core::PageNode::accessible_name`], which prefers the
+/// node's explicit label over the text it happens to be drawing: a button
+/// reading "OK" beside a label saying what it will do is named by the label,
+/// and a node with neither has nothing worth announcing.
+fn node_widget_info(node: &PageNode) -> egui::WidgetInfo {
+    let name = node.accessible_name().unwrap_or_default();
+    match node.role {
+        // A checkbox carries its state as well as its name: "checked" is the
+        // whole of what a checkbox says, and a role that dropped it would
+        // describe two opposite controls identically.
+        NodeRole::Checkbox => {
+            egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, node.checked, name)
+        }
+        NodeRole::Button => egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name),
+        // The text a field is showing is its value, not its name, and the page
+        // draws that text itself as an ordinary node; what the field
+        // contributes here is that it *is* an editor, which is what decides
+        // whether typing reaches the plugin at all.
+        NodeRole::TextField => egui::WidgetInfo::text_edit(true, node.text.as_str(), node.text.as_str()),
+        // Headings are labels to egui, which has no heading type. The label is
+        // still carried, so the region is named even where its rank is not.
+        NodeRole::Label | NodeRole::Heading => egui::WidgetInfo::labeled(egui::WidgetType::Label, true, name),
+        // Reached only through the interactive tier above, and only if a role
+        // is ever added to the vocabulary without being described here.
+        NodeRole::None => egui::WidgetInfo::labeled(egui::WidgetType::Other, true, name),
+    }
+}
+
+/// A page event carrying nothing but its kind and the node it is about.
+fn page_event(kind: PageInputKind, node_id: u32) -> PageInput {
+    PageInput {
+        node_id,
+        ..PageInput::new(kind)
+    }
+}
+
+/// What one frame's pointer state means to the page.
+///
+/// Built before the focus is resolved and reported after the display list is
+/// drawn, because those are two different questions about the same gesture: a
+/// press moves the host's focus ring, and it is also an event the plugin has to
+/// be told about.
+struct PagePointer {
+    /// Where the pointer is, in the page's own coordinates rather than the
+    /// window's. The plugin issued the node coordinates and has no idea where
+    /// the launcher put its surface, so a window-relative position would be
+    /// meaningless to it.
+    at: egui::Vec2,
+    /// The topmost focusable node under the pointer, or zero for none.
+    node: u32,
+    moved: bool,
+    pressed: bool,
+    released: bool,
+}
+
+impl PagePointer {
+    fn report(&self, commands: &mut Vec<UiCommand>) {
+        for (report, kind) in [
+            (self.moved, PageInputKind::PointerMoved),
+            (self.pressed, PageInputKind::PointerPressed),
+            (self.released, PageInputKind::PointerReleased),
+        ] {
+            if !report {
+                continue;
+            }
+            let mut event = page_event(kind, self.node);
+            event.x = self.at.x;
+            event.y = self.at.y;
+            commands.push(UiCommand::PageInput(event));
+        }
+    }
+}
+
+/// Reads this frame's pointer, hit-tested against the display list.
+///
+/// `None` when the pointer is outside the page, which covers a pointer that is
+/// over the query field, over the footer, or off the window entirely: a plugin
+/// must not be told about gestures aimed at the launcher's own chrome.
+///
+/// Motion is reported only when the position actually changed. The pointer
+/// sitting still over a page that repaints on a timer is not a gesture, and
+/// reporting it every frame would put one round trip per repaint on a plugin
+/// that has nothing to answer.
+fn page_pointer(ui: &egui::Ui, page: &PageSurface, rect: egui::Rect) -> Option<PagePointer> {
+    let (at, pressed, released) = ui.input(|state| {
+        (
+            state.pointer.interact_pos(),
+            state.pointer.button_pressed(egui::PointerButton::Primary),
+            state.pointer.button_released(egui::PointerButton::Primary),
+        )
+    });
+    let at = at?;
+    if !rect.contains(at) {
+        return None;
+    }
+
+    let id = egui::Id::new(("crikey-page-pointer", page.page_id.as_str()));
+    let previous = ui.data(|data| data.get_temp::<egui::Pos2>(id));
+    ui.data_mut(|data| data.insert_temp(id, at));
+    Some(PagePointer {
+        at: at - rect.min,
+        node: page_hit_test(rect.min, &page.frame, at),
+        moved: previous != Some(at),
+        pressed,
+        released,
+    })
+}
+
+/// The node a pointer at `at` is on, or zero when it is on none.
+///
+/// Searched from the end of the display list, because the list is painted in
+/// order and the node drawn last is the one the user can see. Focusable nodes
+/// only: a node id is what the plugin is told, and an anonymous node has none
+/// to tell it.
+fn page_hit_test(origin: egui::Pos2, frame: &PageFrame, at: egui::Pos2) -> u32 {
+    frame
+        .nodes
+        .iter()
+        .rev()
+        .find(|node| node.is_focusable() && node_rect(origin, node).contains(at))
+        .map_or(0, |node| node.node_id)
+}
+
+/// Which node holds the page's keyboard, after this frame's press and Tab
+/// (spec 32.5).
+///
+/// The ring is the host's. Tab and Shift+Tab walk
+/// [`crikey_core::PageFrame::focus_ring`] -- the plugin's `focus_order`, then
+/// document order -- and are consumed here rather than forwarded: a plugin that
+/// saw them could not move the host's focus anyway, and one that swallowed
+/// them would trap the keyboard inside its own surface. Where the ring has
+/// moved *to* is reported, because a plugin that could not tell which control
+/// the user is on could not draw anything that depends on it.
+///
+/// The plugin still gets to ask, through `PageFrame::focus_node`, and the
+/// request wins on the frame it changes and not afterwards -- the same
+/// once-only honouring [`focus_once`] gives the settings surface, and for the
+/// same reason: a request re-applied every frame would pin the keyboard where
+/// the plugin put it and leave Tab unable to move it at all.
+fn page_focus(
+    ui: &egui::Ui,
+    page: &PageSurface,
+    ring: &[u32],
+    pointer: Option<&PagePointer>,
+    commands: &mut Vec<UiCommand>,
+) -> u32 {
+    let id = egui::Id::new(("crikey-page-focus", page.page_id.as_str()));
+    let stored = ui.data(|data| data.get_temp::<PageFocus>(id));
+    let requested = page.frame.focus_node;
+    let mut focus = match stored {
+        // The stored focus stands while the plugin is asking for what it asked
+        // for last time and the node it names is still in the ring: a frame
+        // that dropped the focused node has to hand the keyboard somewhere.
+        Some(state) if state.requested == requested && ring.contains(&state.node) => state.node,
+        _ if ring.contains(&requested) => requested,
+        _ => ring.first().copied().unwrap_or(0),
+    };
+
+    // A press on a control focuses it, which is why the pointer is read before
+    // this runs. Tab is consumed either way, so a frame carrying both a press
+    // and a Tab still spends the Tab rather than leaving it for the next frame
+    // to replay.
+    let step = ui.input_mut(|state| {
+        if state.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
+            Some(false)
+        } else if state.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+            Some(true)
+        } else {
+            None
+        }
+    });
+    let pressed = pointer
+        .filter(|pointer| pointer.pressed)
+        .map(|pointer| pointer.node)
+        .filter(|node| ring.contains(node));
+    if let Some(node) = pressed {
+        focus = node;
+    } else if let Some(forward) = step {
+        focus = page_focus_step(ring, focus, forward);
+    }
+
+    if stored.map(|state| state.node) != Some(focus) && focus != 0 {
+        commands.push(UiCommand::PageInput(page_event(
+            PageInputKind::FocusChanged,
+            focus,
+        )));
+    }
+    ui.data_mut(|data| {
+        data.insert_temp(
+            id,
+            PageFocus {
+                node: focus,
+                requested,
+            },
+        )
+    });
+    focus
+}
+
+/// Where the keyboard is on the open page, and what the plugin was asking for
+/// when it was put there.
+///
+/// Renderer state rather than view-model state, like [`ScrollAnchor`]: it
+/// describes where this context left the keyboard, which no host and no other
+/// renderer can answer. `requested` is carried so that a *change* in the
+/// plugin's `focus_node` can be told apart from the same request arriving
+/// again on every frame of a page that redraws on a timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PageFocus {
+    node: u32,
+    requested: u32,
+}
+
+/// The ring entry one step from `from`, wrapping.
+///
+/// Wrapping, unlike result navigation: a page is a closed surface and Tab at
+/// its end has nowhere else to go, where the result list's Down key must stop
+/// at the last row.
+fn page_focus_step(ring: &[u32], from: u32, forward: bool) -> u32 {
+    if ring.is_empty() {
+        return 0;
+    }
+
+    let at = ring.iter().position(|node| *node == from).unwrap_or(0);
+    let step = if forward { 1 } else { ring.len() - 1 };
+    ring[(at + step) % ring.len()]
+}
+
+/// Reports this frame's keystrokes to the plugin (spec 32.5).
+///
+/// Read out of the accumulated egui events rather than translated from window
+/// key events, so the headless frame builder answers a keystroke exactly as the
+/// window does. The keys the host reserves are already gone by here: `draw_page`
+/// consumed Escape and [`page_focus`] consumed Tab, and a consumed key is not
+/// in this list.
+fn page_keyboard(ui: &egui::Ui, page: &PageSurface, focus: u32, commands: &mut Vec<UiCommand>) {
+    let editing = page
+        .frame
+        .node(focus)
+        .is_some_and(|node| node.role == NodeRole::TextField);
+    ui.input(|state| {
+        for event in &state.events {
+            match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => {
+                    let mut report = page_event(PageInputKind::KeyPressed, focus);
+                    report.key = key_spelling(*key);
+                    report.ctrl = modifiers.ctrl;
+                    report.shift = modifiers.shift;
+                    report.alt = modifiers.alt;
+                    commands.push(UiCommand::PageInput(report));
+                }
+                // Typed text is only ever an edit, so it crosses the boundary
+                // only while the keyboard is in a field that can hold one.
+                // Anywhere else it is swallowed: a keystroke that lands nowhere
+                // is better than one silently editing a field the user cannot
+                // see.
+                egui::Event::Text(text) if editing && !text.is_empty() => {
+                    let mut report = page_event(PageInputKind::TextInput, focus);
+                    report.text.clone_from(text);
+                    commands.push(UiCommand::PageInput(report));
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+/// How the host spells a key for a plugin (spec 32.5): `Enter`, `ArrowDown`,
+/// `A`.
+///
+/// `egui::Key`'s variant names are already exactly that spelling, so they are
+/// what crosses the boundary. `Key::name` deliberately is not used: it
+/// shortens `ArrowDown` to `Down`, which is a different word from the one the
+/// protocol documents, and a plugin matching on the documented name would
+/// never fire. `page_keys_are_spelled_the_way_the_protocol_documents` pins the
+/// three spellings the protocol gives as examples, so an egui upgrade that
+/// renamed a variant fails a test rather than silently changing the wire.
+fn key_spelling(key: egui::Key) -> String {
+    format!("{key:?}")
+}
+
 /// Draws the settings surface (spec 6.3).
 ///
 /// Every row is host-supplied, including the labels, so the renderer decides
@@ -2897,7 +3556,32 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
     // canvas under the hint line in every window the launcher opens.
     ui.spacing_mut().interact_size.y = theme::FOOTER_HEIGHT;
     ui.horizontal(|ui| {
-        if model.pending_plugins {
+        if let Some(page) = &model.page {
+            // A surface that takes the whole result area has to say whose it
+            // is. The page's own title leads and the owning plugin follows it
+            // in muted type: a page cannot be trusted to name itself honestly,
+            // and the user is about to type into it.
+            let title = if page.frame.title.is_empty() {
+                page.page_id.as_str()
+            } else {
+                page.frame.title.as_str()
+            };
+            ui.label(RichText::new(title).small().color(colors.text));
+            ui.label(RichText::new(&page.plugin_name).small().color(colors.text_muted));
+            // A stale page is the previous frame still standing while the host
+            // waits for an answer. It keeps being drawn rather than blanked --
+            // blanking would flicker every page that redraws on a timer -- so
+            // this is the only thing telling the user that what they are
+            // looking at is not the answer to what they just did.
+            if page.stale {
+                ui.add(egui::Spinner::new().size(theme::FOOTER_HEIGHT));
+                ui.label(
+                    RichText::new("Waiting for the plugin")
+                        .small()
+                        .color(colors.warning),
+                );
+            }
+        } else if model.pending_plugins {
             // Sized to the line it sits on. At its default size the spinner is
             // a whole control tall, which would make the footer grow by six
             // pixels for as long as a provider is answering -- and the window
@@ -3022,6 +3706,7 @@ mod transparency_tests {
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,
+            page: None,
             show_hints: true,
             rounded_corners: true,
         };
@@ -3135,6 +3820,7 @@ mod lifecycle_tests {
                     settings_open: false,
                     settings: Arc::default(),
                     settings_focus: None,
+                    page: None,
                     show_hints: true,
                     rounded_corners: true,
                 },
@@ -3244,6 +3930,7 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
                 settings_open: false,
                 settings: Arc::default(),
                 settings_focus: None,
+                page: None,
                 show_hints: true,
                 rounded_corners: true,
             },
@@ -3579,6 +4266,7 @@ mod window_geometry_tests {
             settings_open,
             settings: Arc::default(),
             settings_focus: None,
+            page: None,
             show_hints: true,
             rounded_corners: true,
         }
@@ -3742,6 +4430,19 @@ mod window_geometry_tests {
             desired_window_height(&view("", true), expanded),
             expanded,
             "the settings surface needs the room even with nothing typed"
+        );
+        let mut page = view("", false);
+        page.page = Some(crate::PageSurface {
+            plugin: crikey_core::PluginId("demo".to_owned()),
+            page_id: "page-1".to_owned(),
+            plugin_name: "Demo Plugin".to_owned(),
+            frame: Arc::new(crikey_core::PageFrame::default()),
+            stale: false,
+        });
+        assert_eq!(
+            desired_window_height(&page, expanded),
+            expanded,
+            "a page's extent is the plugin's to choose, so it gets the whole window"
         );
     }
 

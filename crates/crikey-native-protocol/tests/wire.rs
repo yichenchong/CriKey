@@ -253,6 +253,7 @@ fn proto3_defaults_elide_and_decode_from_empty() {
     assert_default_encoding(message::ExecuteResult {
         outcome: message::ExecuteOutcomeCode::from_i32(0),
         error: None,
+        page_id: String::new(),
         unknown: unknown(),
     });
     assert_default_encoding(message::ConfigurationChange {
@@ -399,6 +400,7 @@ fn every_message_round_trips_all_non_default_fields() {
     assert_round_trip(message::ExecuteResult {
         outcome: message::ExecuteOutcomeCode::from_i32(1),
         error: Some(error.clone()),
+        page_id: String::new(),
         unknown: unknown(),
     });
     assert_round_trip(message::ConfigurationChange {
@@ -612,6 +614,7 @@ fn minimal_messages_pin_frozen_field_numbers() {
         message::ExecuteResult {
             outcome: message::ExecuteOutcomeCode::from_i32(1),
             error: None,
+            page_id: String::new(),
             unknown: unknown(),
         },
         0x08
@@ -777,6 +780,7 @@ fn envelope_oneof_tags_are_frozen() {
             message::Payload::ExecuteResult(message::ExecuteResult {
                 outcome: message::ExecuteOutcomeCode::from_i32(1),
                 error: None,
+                page_id: String::new(),
                 unknown: unknown(),
             }),
             vec![0x9a, 0x01],
@@ -869,6 +873,34 @@ fn envelope_oneof_tags_are_frozen() {
                 unknown: unknown(),
             }),
             vec![0xf2, 0x01],
+        ),
+        (
+            message::Payload::PageRequest(message::PageRequest {
+                page_id: "p".to_owned(),
+                generation: 1,
+                width: 0,
+                height: 0,
+                events: Vec::new(),
+                focused: false,
+                colour_surface: 0,
+                colour_text: 0,
+                colour_accent: 0,
+                colour_muted: 0,
+                unknown: unknown(),
+            }),
+            vec![0xfa, 0x01],
+        ),
+        (
+            message::Payload::PageFrame(message::PageFrame {
+                generation: 1,
+                title: String::new(),
+                nodes: Vec::new(),
+                focus_node: 0,
+                redraw_after_ms: 0,
+                close: false,
+                unknown: unknown(),
+            }),
+            vec![0x82, 0x02],
         ),
     ];
 
@@ -1231,4 +1263,130 @@ fn maximum_magnitude_integer_fields_round_trip() {
         detail: "max".to_owned(),
         unknown: unknown(),
     });
+}
+
+#[test]
+fn page_geometry_survives_the_float_codec_exactly() {
+    // Coordinates are IEEE-754 on the wire, not scaled integers, so a value
+    // a plugin computed must come back bit-identical rather than quantised.
+    let node = message::PageNode {
+        shape: message::PageShapeCode::Rect,
+        x: 12.5,
+        y: -0.125,
+        width: 640.0,
+        height: 0.1,
+        fill: 0x1234_56ff,
+        stroke: 0x00ff_00ff,
+        stroke_width: 1.5,
+        rounding: 6.0,
+        text: "hello".to_owned(),
+        text_size: 13.0,
+        role: message::PageRoleCode::Button,
+        label: "Say hello".to_owned(),
+        node_id: 9,
+        focus_order: 2,
+        checked: true,
+        unknown: unknown(),
+    };
+    let decoded = message::PageNode::decode(&node.encode()).expect("a page node round-trips");
+    assert_eq!(decoded, node);
+    assert_eq!(decoded.x.to_bits(), 12.5_f32.to_bits());
+    assert_eq!(decoded.y.to_bits(), (-0.125_f32).to_bits());
+}
+
+#[test]
+fn a_not_a_number_coordinate_crosses_the_codec_and_is_refused_above_it() {
+    // The codec stays faithful to the bytes; the semantic layer is what
+    // refuses them. Proving both halves here keeps the split honest: if the
+    // codec ever started sanitising, the second assertion would be testing
+    // nothing.
+    let node = message::PageNode {
+        x: f32::NAN,
+        ..message::PageNode::decode(&[]).expect("an empty node is a valid default")
+    };
+    let decoded = message::PageNode::decode(&node.encode()).expect("NaN is legal protobuf");
+    assert!(
+        decoded.x.is_nan(),
+        "the codec must not silently sanitise a coordinate"
+    );
+
+    let frame = message::PageFrame {
+        nodes: vec![decoded],
+        ..message::PageFrame::decode(&[]).expect("an empty frame is a valid default")
+    };
+    let core = crikey_native_protocol::convert::from_proto_page_frame(&frame);
+    assert_eq!(
+        core.validate(),
+        Err(crikey_core::PageError::NonFiniteGeometry { index: 0 })
+    );
+}
+
+#[test]
+fn a_page_frame_round_trips_through_both_conversions() {
+    let frame = crikey_core::PageFrame {
+        generation: 7,
+        title: "Preview".to_owned(),
+        nodes: vec![crikey_core::PageNode {
+            shape: crikey_core::NodeShape::Text,
+            x: 8.0,
+            y: 4.0,
+            text: "Ready".to_owned(),
+            fill: crikey_core::PageColor::rgba(235, 238, 242, 255),
+            role: crikey_core::NodeRole::Heading,
+            label: "Status".to_owned(),
+            node_id: 3,
+            ..crikey_core::PageNode::default()
+        }],
+        focus_node: 3,
+        redraw_after_ms: 250,
+        close: false,
+    };
+    let wire = crikey_native_protocol::convert::to_proto_page_frame(&frame);
+    let bytes = wire.encode();
+    let decoded = message::PageFrame::decode(&bytes).expect("a page frame round-trips");
+    assert_eq!(
+        crikey_native_protocol::convert::from_proto_page_frame(&decoded),
+        frame
+    );
+}
+
+#[test]
+fn an_unknown_page_node_field_is_retained_for_forward_compatibility() {
+    // A newer plugin drawing with a node property this host has never heard
+    // of must not lose it on the way through, which is what ADR-0004's
+    // additive-evolution promise means in practice.
+    let known = message::PageNode {
+        node_id: 4,
+        ..message::PageNode::decode(&[]).expect("an empty node is a valid default")
+    }
+    .encode();
+    let mut input = known.clone();
+    // Field 200, varint, value 1: beyond anything this schema defines.
+    input.extend_from_slice(&[0xc0, 0x0c, 0x01]);
+    let decoded = message::PageNode::decode(&input).expect("unknown fields are forward compatible");
+    assert_eq!(decoded.node_id, 4);
+    assert_eq!(decoded.unknown.as_bytes(), &[0xc0, 0x0c, 0x01]);
+    assert_eq!(
+        decoded.encode(),
+        input,
+        "the unknown field must survive re-encoding"
+    );
+}
+
+#[test]
+fn a_page_input_event_round_trips_with_its_modifiers() {
+    let input = message::PageInput {
+        kind: message::PageInputCode::KeyPressed,
+        x: 0.0,
+        y: 0.0,
+        key: "ArrowDown".to_owned(),
+        text: String::new(),
+        node_id: 2,
+        ctrl: true,
+        shift: false,
+        alt: true,
+        unknown: unknown(),
+    };
+    let decoded = message::PageInput::decode(&input.encode()).expect("an input event round-trips");
+    assert_eq!(decoded, input);
 }

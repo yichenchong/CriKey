@@ -471,7 +471,15 @@ pub(crate) fn residency(effect: &UiEffect) -> Option<Residency> {
     match effect {
         UiEffect::Dismissed => Some(Residency::Hide),
         UiEffect::Quit => Some(Residency::Exit),
-        UiEffect::Query(_) | UiEffect::Execute { .. } | UiEffect::SetSetting { .. } => None,
+        // A page keeps the launcher exactly where it is. Closing one returns
+        // the user to their results, which is a change of surface and not a
+        // reason to hide the window or end the process.
+        UiEffect::Query(_)
+        | UiEffect::Execute { .. }
+        | UiEffect::SetSetting { .. }
+        | UiEffect::PageInput(_)
+        | UiEffect::ResizePage { .. }
+        | UiEffect::ClosePage => None,
     }
 }
 

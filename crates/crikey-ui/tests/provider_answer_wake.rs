@@ -235,6 +235,7 @@ mod linux {
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,
+            page: None,
             show_hints: true,
             rounded_corners: true,
         }

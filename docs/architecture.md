@@ -10,7 +10,7 @@ processes and threads. For the mechanics of building and testing the tree, see
 ```mermaid
 graph TB
   subgraph main[Main process]
-    UI[UI event-loop thread: window, keyboard, presentation]
+    UI[UI event-loop thread: window, keyboard, presentation, page display lists]
     SCHED[Provider schedulers: generations, debounce, obsolete-work, cancellation]
     CORE[Core: query engine, catalog, ranking, aggregator]
     SUP[Plugin supervisors]
@@ -36,6 +36,15 @@ platform-dependent. Each provider driver owns a query pipeline and its own curre
 the provider generations are advanced in step with the launcher query. No
 third-party code runs inside the main process.
 
+That claim survives plugin pages, and pages are the reason to state why. A page
+is drawn by the plugin only in the sense that the plugin decides what it
+contains: what crosses the boundary is a display list of shapes, text and
+semantic roles, which the UI thread draws with the launcher's own renderer. No
+plugin code is loaded, executed or JIT-compiled in the main process, and no
+plugin-rasterized pixels are blitted into the surface — the alternatives that
+would have broken the sentence above, and the reason both were rejected
+(ADR-0020).
+
 The native worker uses the versioned proto3 protocol. The legacy and modern
 Python workers currently use separate bounded newline-delimited JSON protocols;
 they do not speak the native proto3 wire format.
@@ -51,8 +60,8 @@ boundary above remains the primary isolation everywhere.
 
 | Thread | Work | Blocking rules |
 | --- | --- | --- |
-| UI event loop | winit event loop, input, immediate local catalog search, and presentation | Never waits for plugin I/O or a child process; small in-process Rust work may run in the event callback |
-| Provider supervisor threads | `LegacyDriver`, `ModernDriver`, and `NativeDriver`; each owns its `QueryPipeline`, scheduling decisions, result aggregation, and worker dispatch | Blocking child I/O stays off the UI thread; request slots and result intake are bounded |
+| UI event loop | winit event loop, input, immediate local catalog search, presentation, and drawing the retained page display list | Never waits for plugin I/O or a child process; small in-process Rust work may run in the event callback |
+| Provider supervisor threads | `LegacyDriver`, `ModernDriver`, and `NativeDriver`; each owns its `QueryPipeline`, scheduling decisions, result aggregation, worker dispatch, and the page request/response cycle | Blocking child I/O stays off the UI thread; request slots and result intake are bounded |
 | Provider dispatch threads | Modern/native catalog builds and native per-plugin calls where the provider needs parallel work | Work is cancellable or joined during shutdown; no provider thread blocks the UI event loop |
 
 There is no standalone Tokio runtime or general shared CPU pool in the current
@@ -60,6 +69,16 @@ implementation. Scheduling is a deterministic state machine driven by the
 provider supervisor thread with caller-supplied millisecond timestamps; the
 driver's bounded mailbox and condition variable provide the waiting outside
 that state machine.
+
+A page uses those two threads and no others. The UI thread draws the last
+accepted frame and accumulates input; the native supervisor thread asks the
+owning plugin for the next frame, validates the answer and publishes it. The UI
+thread therefore never waits for a plugin page: a plugin that stops answering
+leaves the previous frame on screen, marked stale, at full frame rate. Pages
+borrow the query pipeline's staleness rule rather than adding one — generations
+are monotonic per open page and a frame answering an older generation is
+dropped — and the host reserves Escape, so a page cannot capture the user's way
+out of it.
 
 ## Query pipeline
 

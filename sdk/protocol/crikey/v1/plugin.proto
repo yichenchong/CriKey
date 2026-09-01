@@ -37,6 +37,8 @@ message Envelope {
     ResourceResponse resource_response = 28;
     Lifecycle lifecycle = 29;
     LifecycleAck lifecycle_ack = 30;
+    PageRequest page_request = 31;
+    PageFrame page_frame = 32;
   }
 }
 
@@ -192,9 +194,15 @@ message ExecuteResult {
     OK = 1;
     FAILED = 2;
     UNSUPPORTED = 3;
+    // The action opened a page instead of finishing. `page_id` names it and
+    // the host begins asking the plugin to draw (spec 32.2).
+    SHOW_PAGE = 4;
   }
   Outcome outcome = 1;
   Error error = 2;
+  // Set only with SHOW_PAGE. Identifies the page in every later
+  // PageRequest, so one plugin may own several distinct pages.
+  string page_id = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -304,4 +312,120 @@ message FlowControl {
 
 message Shutdown {
   bool immediate = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Plugin-drawn pages (spec 32)
+// ---------------------------------------------------------------------------
+
+// Asks the plugin to draw one frame of a page it opened. Host-driven, exactly
+// like SuggestRequest: a plugin never pushes a frame, so pages inherit the
+// generation, deadline and cancellation discipline that already governs
+// suggestions rather than needing a channel of their own.
+message PageRequest {
+  string page_id = 1;
+  // Monotonic per page. A frame answering an older generation is dropped.
+  uint64 generation = 2;
+  // The area the page may draw in, in logical pixels.
+  uint32 width = 3;
+  uint32 height = 4;
+  // Input since the previous frame, in the order it happened.
+  repeated PageInput events = 5;
+  // Whether the page currently holds the keyboard.
+  bool focused = 6;
+  // The host palette, so a page can match the launcher instead of guessing
+  // at colours that a theme change would strand. 0xRRGGBBAA.
+  uint32 colour_surface = 7;
+  uint32 colour_text = 8;
+  uint32 colour_accent = 9;
+  uint32 colour_muted = 10;
+}
+
+message PageInput {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    OPENED = 1;
+    POINTER_MOVED = 2;
+    POINTER_PRESSED = 3;
+    POINTER_RELEASED = 4;
+    KEY_PRESSED = 5;
+    TEXT_INPUT = 6;
+    ACTIVATED = 7;
+    FOCUS_CHANGED = 8;
+    CLOSED = 9;
+  }
+  Kind kind = 1;
+  float x = 2;
+  float y = 3;
+  // Named rather than numeric so the meaning survives an SDK version skew:
+  // "Enter", "ArrowDown", "A".
+  string key = 4;
+  // Committed text only; the host resolves input-method composition first.
+  string text = 5;
+  // The node the event landed on, or 0 for none. The host hit-tests.
+  uint32 node_id = 6;
+  bool ctrl = 7;
+  bool shift = 8;
+  bool alt = 9;
+}
+
+// One frame of a page: a flat display list the host draws with its own
+// renderer. Drawing commands and semantics cross, never pixels and never
+// code.
+message PageFrame {
+  uint64 generation = 1;
+  string title = 2;
+  repeated PageNode nodes = 3;
+  // The node the plugin wants focused, or 0 to leave focus where it is.
+  uint32 focus_node = 4;
+  // Ask for another frame this many milliseconds from now even without
+  // input. 0 means the page is static until the user acts.
+  uint32 redraw_after_ms = 5;
+  // The plugin closing its own page.
+  bool close = 6;
+}
+
+message PageNode {
+  enum Shape {
+    SHAPE_UNSPECIFIED = 0;
+    RECT = 1;
+    TEXT = 2;
+    LINE = 3;
+    CIRCLE = 4;
+  }
+  // What the node *is*, as opposed to what it looks like. This is the whole
+  // accessibility contract: a painted glyph is not an accessible name, so a
+  // node left ROLE_UNSPECIFIED is decoration to assistive technology.
+  enum Role {
+    ROLE_UNSPECIFIED = 0;
+    BUTTON = 1;
+    LABEL = 2;
+    HEADING = 3;
+    TEXT_FIELD = 4;
+    CHECKBOX = 5;
+  }
+  Shape shape = 1;
+  // Logical pixels relative to the page's own top-left corner. A plugin
+  // never learns where its page sits on screen, and the host clips.
+  float x = 2;
+  float y = 3;
+  float width = 4;
+  float height = 5;
+  // 0xRRGGBBAA. `fill` is the glyph colour for TEXT.
+  uint32 fill = 6;
+  uint32 stroke = 7;
+  float stroke_width = 8;
+  float rounding = 9;
+  string text = 10;
+  // 0 takes the host's body size, so a page inherits launcher typography.
+  float text_size = 11;
+  Role role = 12;
+  // The accessible name; falls back to `text` when empty.
+  string label = 13;
+  // Non-zero makes the node addressable: input events name it, and only an
+  // addressable interactive node joins the focus ring.
+  uint32 node_id = 14;
+  // Position in the Tab ring; ties break by emission order.
+  uint32 focus_order = 15;
+  bool checked = 16;
 }

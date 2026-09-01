@@ -21,10 +21,11 @@ mod settings;
 
 use calculator::Calculator;
 use crikey_app::{
-    admitted_plugin_roots, ActionSubmission, AliasTable, App, BatchState, DefaultCatalogFetcher,
-    DisabledPlugins, LegacyDriver, LegacyProvider, ModernDriver, ModernProvider, NativeDriver,
-    NativeProvider, PipelineConfig, PluginActionRouter, QueryPipeline, RemoteCatalogService, RemoteSource,
-    ResultBatch, SearchService, SelectionHistoryStore, StartupJournal, StartupMode, StartupStage,
+    admitted_plugin_roots, ActionEffect, ActionSubmission, AliasTable, App, BatchState,
+    DefaultCatalogFetcher, DisabledPlugins, LegacyDriver, LegacyProvider, ModernDriver, ModernProvider,
+    NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, QueryPipeline, RemoteCatalogService,
+    RemoteSource, ResultBatch, SearchService, SelectionHistoryStore, StartupJournal, StartupMode,
+    StartupStage,
 };
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
@@ -42,7 +43,8 @@ use crikey_legacy_compat::LegacyDeadlines;
 use crikey_package_manager::LauncherLock;
 use crikey_platform::{DirectoryConvention, PluginKind, StandardDirectories};
 use crikey_ui::{
-    LauncherViewModel, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, UiEffect, ViewModel,
+    initial_page_viewport, page_palette, LauncherViewModel, NativeLauncher, NativeLauncherConfig,
+    NativeLauncherEvent, PageSurface, UiEffect, ViewModel,
 };
 use file_provider::{file_provider_policy, FileSearchDriver, FILE_SEARCH_PLUGIN};
 use std::cell::RefCell;
@@ -316,6 +318,9 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         composited: app.desktop_composites(),
         ..NativeLauncherConfig::default()
     };
+    // Read before the config is consumed: a page opened later is laid out
+    // against the window it will appear in.
+    let page_window = (window.width, window.height);
     let launcher = NativeLauncher::new(window).map_err(|error| error.to_string())?;
     let render_handle = launcher.handle();
     let mut search = SearchService::new(app);
@@ -679,6 +684,14 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             let _ = file_wake_handle.request_provider_answer();
         },
     );
+    // Page frames and action completions are produced on the native
+    // supervisor's threads, so they need the same wake the file driver uses:
+    // the loop is asleep between keystrokes, and a page that only repainted
+    // when the user pressed an unrelated key would look frozen.
+    let page_wake_handle = render_handle.clone();
+    native_driver.set_wake(move || {
+        let _ = page_wake_handle.request_provider_answer();
+    });
     // Plugin-owned actions use the same exact-owner endpoints and budget
     // handles retained by the provider drivers. Registering this router before
     // the event loop makes `crikey run` execute selected legacy/modern/native
@@ -855,16 +868,44 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     }
                 }
                 let message = match completion.outcome {
-                    Ok(()) => format!(
+                    Ok(ActionEffect::Completed) => format!(
                         "Action completed: {} / {}",
                         completion.plugin.0, completion.action_id.0
                     ),
+                    // The action did not finish, it took over the window. The
+                    // launcher stays open and the plugin starts drawing; a
+                    // dismissal here would close the surface it just asked
+                    // for.
+                    Ok(ActionEffect::ShowPage { page_id }) => {
+                        match open_plugin_page(
+                            &mut search,
+                            &mut view_model,
+                            &completion.plugin,
+                            &page_id,
+                            page_window,
+                        ) {
+                            Ok(()) => continue,
+                            Err(error) => {
+                                format!("Page failed ({} / {page_id}): {error}", completion.plugin.0)
+                            }
+                        }
+                    }
                     Err(error) => format!(
                         "Action failed ({} / {}): {error}",
                         completion.plugin.0, completion.action_id.0
                     ),
                 };
                 report_status(&mut view_model, message);
+            }
+            // A page answers on its own thread like any other provider, so its
+            // finished frames are folded in here rather than on the keystroke
+            // that caused them. `poll_page` yields at most one update a turn.
+            if let Some(update) = search.poll_page() {
+                if update.closed {
+                    view_model.close_page();
+                } else {
+                    view_model.update_page(Arc::new(update.frame), false);
+                }
             }
             // into the retained view model, so a later navigation keystroke
             // keeps them. `publish` refuses a superseded or retired generation,
@@ -1114,7 +1155,14 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 }
                 // Hiding is the shared disposition below; the arm itself has
                 // nothing left to do.
-                Some(UiEffect::Dismissed) => {}
+                Some(UiEffect::Dismissed) => {
+                    // The window is going away, so the surface is too. Without
+                    // this the plugin keeps a page session alive for a screen
+                    // nobody is looking at, and goes on being asked to draw it
+                    // (spec 32.10). `close_page` is inert when none is open.
+                    search.close_page();
+                    view_model.close_page();
+                }
                 Some(UiEffect::Quit) => {}
                 Some(UiEffect::SetSetting { key, value }) => {
                     let report = {
@@ -1146,6 +1194,26 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         configuration.as_ref().map(|configuration| &configuration.store),
                     ));
                     eprintln!("crikey: {report}");
+                }
+                Some(UiEffect::PageInput(input)) => {
+                    // A page that has stopped answering is reported once, on
+                    // the input that discovered it, rather than leaving the
+                    // user pressing keys at a surface nobody owns.
+                    if let Err(error) = search.send_page_input(input) {
+                        search.close_page();
+                        view_model.close_page();
+                        report_status(&mut view_model, format!("Page closed: {error}"));
+                    }
+                }
+                Some(UiEffect::ResizePage { width, height }) => {
+                    search.resize_page(width, height);
+                }
+                Some(UiEffect::ClosePage) => {
+                    // The model has already forgotten the page; this is what
+                    // tells the plugin, and it runs even when the model had
+                    // nothing open so a session can never outlive its surface.
+                    search.close_page();
+                    view_model.close_page();
                 }
                 Some(UiEffect::Execute { item, action }) => {
                     // A calculated row is resolved first and settled entirely
@@ -1239,6 +1307,40 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         ledger.borrow_mut().mark_clean_shutdown();
     }
     outcome
+}
+
+/// Opens a plugin-drawn page and puts it on screen.
+///
+/// Both halves have to happen or neither: a session with no surface leaves a
+/// plugin drawing frames nobody shows, and a surface with no session leaves
+/// the user looking at a page that will never answer a keystroke. The session
+/// is started first because it is the half that can fail -- the plugin may
+/// have gone away between asking for the page and the host acting on it.
+fn open_plugin_page(
+    search: &mut SearchService,
+    view_model: &mut LauncherViewModel,
+    plugin: &PluginId,
+    page_id: &str,
+    window: (u32, u32),
+) -> Result<(), String> {
+    let (width, height) = initial_page_viewport(window.0, window.1);
+    search
+        .open_page(plugin, page_id, width, height, page_palette())
+        .map_err(|error| error.to_string())?;
+    // The submission left "Action pending" on the row. The action did not stay
+    // pending, it became a page; leaving the message there would go on telling
+    // the user to wait after the page has opened and closed again.
+    let _ = view_model.set_selected_status(String::new());
+    // Empty until the plugin answers: the host draws the sheet, so an unfilled
+    // page is a blank panel rather than a hole, and `stale` says why.
+    view_model.open_page(PageSurface {
+        plugin: plugin.clone(),
+        page_id: page_id.to_owned(),
+        plugin_name: plugin.0.clone(),
+        frame: Arc::new(crikey_core::PageFrame::default()),
+        stale: true,
+    });
+    Ok(())
 }
 
 /// Tells the operator about an action's outcome and puts it on the selected

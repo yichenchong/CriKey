@@ -2325,3 +2325,228 @@ The first public compatibility release shall satisfy the following:
 30. The main process does not load arbitrary third-party native libraries.
 31. Windows-specific legacy plugins are not presented as cross-platform unless they actually support other platforms.
 32. CriKey branding and documentation do not imply affiliation with or endorsement by Keypirinha.
+
+---
+
+## 32. Plugin Pages
+
+### 32.1 Purpose and scope
+
+A page is a plugin-drawn surface the launcher presents in place of the result
+list.
+
+A page shall be expressed as a display list: a flat, retained frame of drawing
+nodes that the host draws with its own renderer.
+
+Neither pixels nor executable code shall cross the plugin boundary for a page.
+The plugin sends drawing commands and semantics; the host performs all
+rasterization (ADR-0020).
+
+A page shall not learn its position on screen, and shall not draw outside the
+area the host gave it. The host clips.
+
+### 32.2 Opening a page
+
+A page shall be opened only as the result of an action the user executed.
+
+An action result shall be able to report the outcome `SHOW_PAGE` together with
+a plugin-chosen page identifier. The identifier names which of the plugin's
+pages to open and is echoed back to the plugin on every subsequent request for
+that page.
+
+An outcome of `SHOW_PAGE` without a page identifier shall be treated as a
+protocol violation for that execution, and no page shall open.
+
+At most one page shall be open at a time. Opening a page while another page is
+open shall close the previous page first, and the previous page's owner shall
+receive its close notification.
+
+### 32.3 Frame cycle
+
+The page cycle shall be host-driven request/response, with the same shape as a
+suggestion request.
+
+For each frame the host shall send one page request containing:
+
+- The page identifier.
+- The requested generation.
+- The surface width and height in logical pixels.
+- The input events accumulated since the previous request, in the order they
+  occurred.
+- Whether the page currently holds the keyboard.
+- The host palette: surface, text, accent, and muted colours.
+
+The plugin shall answer with exactly one page frame.
+
+A plugin shall never publish a page frame that no request asked for. The host
+shall reject an unsolicited page frame as a protocol violation, as it does any
+other unsolicited response.
+
+A frame may request another frame after a stated delay, in milliseconds, so
+that an animating or polling page does not require user input to advance. A
+delay of zero shall mean the page is static until further input arrives.
+
+The host shall carry the host palette into the request rather than requiring a
+plugin to choose colours, so a theme change does not strand a page's
+appearance.
+
+### 32.4 Generations and staleness
+
+Page generations shall be monotonically increasing per open page.
+
+A page frame shall carry the generation it answers.
+
+A frame answering a generation older than the newest requested generation shall
+be discarded and shall never be drawn.
+
+While the host is waiting for a frame that answers the newest generation, the
+previously accepted frame shall remain on screen and shall be reported as
+stale, so that a slow plugin produces an unresponsive page rather than a blank
+one.
+
+A resize shall advance the generation, because the previous frame was laid out
+for a different surface.
+
+### 32.5 Node vocabulary
+
+A page frame shall consist of:
+
+- A generation.
+- A title.
+- An ordered list of nodes, drawn in list order.
+- An optional node to focus, or zero to leave focus unchanged.
+- An optional redraw delay in milliseconds.
+- A close request.
+
+Each node shall carry:
+
+- A shape: none, rectangle, text, line, or circle.
+- Geometry `x`, `y`, `width`, `height` in logical pixels, relative to the
+  page's own top-left corner.
+- A fill colour and a stroke colour, each `0xRRGGBBAA`; a zero alpha is not
+  drawn.
+- A stroke width and a corner rounding.
+- Text, and a text size where zero shall mean the host's body size.
+- A role: none, button, label, heading, text field, or checkbox.
+- An accessible label.
+- A node identifier, where zero shall mean the node is anonymous and cannot be
+  addressed by an input event.
+- A focus-order position, where ties shall break by list order.
+- A checked state.
+
+The shape set shall be closed. A plugin shall not be able to introduce a shape
+the host cannot draw with its own renderer.
+
+Layout shall be the plugin's responsibility. The host shall not reflow, wrap,
+stack, or otherwise reposition nodes.
+
+### 32.6 Bounds
+
+A page frame shall be bounded:
+
+- At most `MAX_PAGE_NODES` (4,096) nodes per frame.
+- At most `MAX_NODE_TEXT_BYTES` (8,192) bytes of text per node.
+- Every coordinate within `MAX_PAGE_EDGE` (4,096.0) logical pixels of the
+  page origin in absolute value.
+
+These bounds exist so that one keypress cannot become an unbounded host layout
+or text-shaping pass, and so that the host's per-frame cost stays predictable
+under §25.1.
+
+A page frame shall additionally remain within the protocol's 8 MiB
+`MAX_FRAME_BYTES` cap like any other message (ADR-0004).
+
+### 32.7 Refusal
+
+Every page frame arriving from a plugin shall be validated before any other
+component observes it.
+
+A frame shall be refused when:
+
+- It carries more than `MAX_PAGE_NODES` nodes.
+- Any node's text exceeds `MAX_NODE_TEXT_BYTES`.
+- Any coordinate is not a finite number.
+- Any coordinate lies outside `MAX_PAGE_EDGE`.
+- Two nodes claim the same non-zero node identifier, which would make an
+  input event naming that identifier ambiguous.
+
+A refused frame shall not be drawn in whole or in part. A refusal is a protocol
+violation: the supervisor shall terminate the offending plugin process, the
+previously accepted frame shall remain on screen, and the page shall then end
+closed, reporting the failure with its named reason. A plugin that cannot
+produce a valid display list is not asked to keep trying.
+
+A frame answering an older generation is not a refusal and shall not be
+escalated. It shall be discarded silently, the previously accepted frame shall
+remain, and the page shall keep running.
+
+Refusal shall be reported to diagnostics under §26.1 and shall count toward
+plugin health under §24.3.
+
+### 32.8 Semantics and accessibility
+
+A drawn glyph shall not be treated as an accessible name. Roles, labels, and
+focus order shall be carried by the protocol beside the drawing.
+
+The focus ring shall be derived from the frame: a node joins it when its role
+is interactive and its node identifier is non-zero, ordered by focus-order
+position and then by list order.
+
+A node's accessible name shall be its label, or its text when the label is
+empty. A node whose role is none shall have no accessible name and shall be
+treated as decoration.
+
+An interactive node with no accessible name shall be reported as a defect of
+that page rather than silently drawn, so that the omission reaches the plugin
+author through `crikey plugin doctor` and developer mode.
+
+Carrying these semantics shall not be described as screen-reader support. The
+semantics are a prerequisite for delivering a page to a platform accessibility
+tree; delivering them is separate work (ADR-0002, ADR-0020).
+
+### 32.9 Keyboard ownership and input
+
+While a page is open the page shall own the keyboard, as the settings surface
+does. Keystrokes shall not be interpreted as launcher query text.
+
+The host shall hit-test pointer events against the frame and shall name the
+node an event landed on, or zero for none. A plugin shall not perform its own
+hit-testing against coordinates the host already resolved.
+
+Input events shall be delivered in the order they occurred, batched into the
+next page request, and shall distinguish at least: page opened, pointer moved,
+pointer pressed, pointer released, key pressed, committed text input,
+activation, focus changed, and page closed.
+
+Committed text only shall be delivered as text input. The host shall resolve
+input-method composition before delivery.
+
+Key names shall be host spellings — for example `Enter`, `ArrowDown`, `A` — so
+that meaning survives version skew between host and SDK.
+
+Escape shall be reserved by the host. Escape shall close the page and shall
+never be forwarded to the plugin. A plugin therefore cannot capture the user's
+way out of a page.
+
+### 32.10 Closing
+
+A page shall be closable from either side.
+
+The host shall close a page when the user presses Escape, when the launcher
+window is dismissed, when another page opens, or when the owning plugin stops,
+crashes, or is suspended by circuit breaking under §13.7.
+
+A plugin shall close its own page by setting the close request on a frame. That
+frame's drawing shall not be presented; the close takes effect instead.
+
+On any close the plugin shall receive a closed input event, so that a page's
+state machine has a defined end regardless of which side ended it. When the
+host closed the page, that event shall be delivered in one final page request
+whose frame is discarded; when the plugin closed its own page, the close it
+requested is the notification and no further request is sent.
+
+A closed page's frame shall be released, and the launcher shall return to the
+result list with the query state it had before the page opened.
+
+No further page request shall be sent for a closed page, and a frame arriving
+for a closed page shall be discarded.

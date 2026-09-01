@@ -77,6 +77,13 @@ pub enum ExecuteOutcome {
     Ok,
     Failed(PluginError),
     Unsupported,
+    /// The action asked the host to open the named plugin-drawn page
+    /// (spec 27.2). The id is the plugin's own handle for the surface; every
+    /// later frame request quotes it back, so an empty one names nothing the
+    /// plugin could serve and is refused as a protocol violation instead.
+    ShowPage {
+        page_id: String,
+    },
 }
 
 /// Health report returned by a native plugin (spec 24.3, 26.1).
@@ -109,6 +116,33 @@ pub struct NativeSuggestRequest {
     pub text: String,
     pub normalized: String,
     pub selected_item_id: Option<String>,
+}
+
+/// One host-to-plugin request for the next frame of an open page (spec 27.3).
+///
+/// The host drives the page: a plugin never pushes a frame, so this request is
+/// the only thing that can produce one. `events` carries everything the user
+/// did since the previous request, already hit-tested by the host, which is
+/// what lets a burst of pointer motion cost one round trip rather than one
+/// each.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativePageRequest {
+    pub page_id: String,
+    /// Monotonic per page. The worker echoes it, and a frame answering an
+    /// older generation is dropped rather than drawn.
+    pub generation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub events: Vec<crikey_core::PageInput>,
+    /// Whether the launcher window itself holds focus, so a page can dim its
+    /// caret rather than pretend it is being typed into.
+    pub focused: bool,
+    /// Host palette as `0xRRGGBBAA`. Zero states no colour, leaving the
+    /// plugin its own default rather than painting everything transparent.
+    pub colour_surface: u32,
+    pub colour_text: u32,
+    pub colour_accent: u32,
+    pub colour_muted: u32,
 }
 
 /// Combines a plugin error message and detail for host diagnostics.

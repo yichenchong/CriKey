@@ -17,8 +17,8 @@ use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use crikey_core::{ActionId, Item, ItemId, PluginId};
-use crikey_native_protocol::convert::from_proto_item;
+use crikey_core::{ActionId, Item, ItemId, PageFrame, PluginId};
+use crikey_native_protocol::convert::{from_proto_item, from_proto_page_frame, to_proto_page_input};
 use crikey_native_protocol::frame::{read_frame, write_frame};
 use crikey_native_protocol::message::{self, Envelope, Payload};
 use crikey_native_protocol::transport::{Listener, Transport};
@@ -26,9 +26,9 @@ use crikey_native_protocol::{Capabilities, Endpoint, Message, ProtocolError, PRO
 
 use crate::launch::{configure_command, LaunchSpec, TransportKind, WorkerOptions};
 use crate::stream::{
-    error_detail, BatchState, EchoMismatch, ExecuteOutcome, HealthSnapshot, NativeSuggestRequest,
-    PluginError, ProtocolObservation, StreamDiagnostics, Suggestions, MAX_LOG_RECORDS, OBSERVATION_CAPACITY,
-    READER_QUEUE_CAPACITY, READER_QUEUE_MAX_BYTES,
+    error_detail, BatchState, EchoMismatch, ExecuteOutcome, HealthSnapshot, NativePageRequest,
+    NativeSuggestRequest, PluginError, ProtocolObservation, StreamDiagnostics, Suggestions, MAX_LOG_RECORDS,
+    OBSERVATION_CAPACITY, READER_QUEUE_CAPACITY, READER_QUEUE_MAX_BYTES,
 };
 
 const SOCKET_POLL_MS: u64 = 20;
@@ -181,6 +181,11 @@ struct ReaderContext {
     handshake_seen: Arc<AtomicBool>,
     observations: Arc<Mutex<VecDeque<ProtocolObservation>>>,
     mismatch: Arc<Mutex<Option<EchoMismatch>>>,
+    /// Request id of the page frame the host is currently waiting for, or
+    /// zero when it is waiting for none. A page frame is a reply and nothing
+    /// else; without this the reader could not tell the answer the host asked
+    /// for from a plugin repainting the screen whenever it pleased.
+    page_request: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -217,6 +222,8 @@ struct WorkerLink {
     peak_queue_depth: Arc<AtomicUsize>,
     observations: Arc<Mutex<VecDeque<ProtocolObservation>>>,
     mismatch: Arc<Mutex<Option<EchoMismatch>>>,
+    /// Shared with the reader; see [`ReaderContext::page_request`].
+    page_request: Arc<AtomicU64>,
     reader: Mutex<Option<JoinHandle<()>>>,
     writer_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -579,6 +586,7 @@ impl NativeWorker {
         let handshake_seen = Arc::new(AtomicBool::new(false));
         let observations = Arc::new(Mutex::new(VecDeque::with_capacity(OBSERVATION_CAPACITY)));
         let mismatch = Arc::new(Mutex::new(None));
+        let page_request = Arc::new(AtomicU64::new(0));
         let writer_pending = Arc::new(AtomicUsize::new(0));
         let (transport, writer, outgoing, writer_thread) = match options.transport {
             TransportKind::Stdio => {
@@ -653,6 +661,7 @@ impl NativeWorker {
             handshake_seen: Arc::clone(&handshake_seen),
             observations: Arc::clone(&observations),
             mismatch: Arc::clone(&mismatch),
+            page_request: Arc::clone(&page_request),
         };
         let reader = if let Some(outgoing_receiver) = outgoing {
             spawn_multiplex_reader(
@@ -682,6 +691,7 @@ impl NativeWorker {
             peak_queue_depth: Arc::clone(&peak),
             observations,
             mismatch,
+            page_request,
             reader: Mutex::new(Some(reader)),
             writer_thread: Mutex::new(writer_thread),
         });
@@ -1133,35 +1143,91 @@ impl NativeWorker {
             ReaderEvent::Failure(failure) => return Err(self.transport_error(failure)),
         };
         match envelope.payload {
-            Some(Payload::ExecuteResult(result)) => match result.outcome.as_i32() {
-                1 => {
-                    self.mark_call_succeeded();
-                    Ok(ExecuteOutcome::Ok)
-                }
-                2 => {
+            Some(Payload::ExecuteResult(result)) => {
+                if result.outcome.as_i32() == 2 {
                     if let Some(error) = result.error.as_ref() {
                         self.validate_nested_error(error, request_id, "execute")?;
                     }
-                    self.mark_call_succeeded();
-                    Ok(ExecuteOutcome::Failed(
-                        result
-                            .error
-                            .as_ref()
-                            .map(plugin_error)
-                            .unwrap_or_else(|| PluginError {
-                                message: "plugin execution failed".to_owned(),
-                                detail: String::new(),
-                            }),
-                    ))
                 }
-                3 => {
-                    self.mark_call_succeeded();
-                    Ok(ExecuteOutcome::Unsupported)
+                match execute_outcome(&result) {
+                    Ok(outcome) => {
+                        self.mark_call_succeeded();
+                        Ok(outcome)
+                    }
+                    Err(detail) => Err(self.protocol_failure(detail)),
                 }
-                _ => Err(self.protocol_failure("unknown execute outcome".to_owned())),
-            },
+            }
             Some(Payload::Error(error)) => Err(self.error_payload(error, request_id)),
             _ => Err(self.protocol_failure("unexpected execute response".to_owned())),
+        }
+    }
+
+    /// Asks the plugin for the next frame of an open page (spec 27.3).
+    ///
+    /// Host-driven, exactly like [`Self::suggest`]: the plugin answers the
+    /// request it was given or it answers nothing. That is why the reply is
+    /// latched as the only legal `PageFrame` for the duration of this call —
+    /// a plugin that could push a frame whenever it liked could repaint the
+    /// user's screen from behind whatever surface they were actually looking
+    /// at.
+    ///
+    /// The frame is validated before it is returned, so a caller never sees a
+    /// partially drawable page. A frame that fails validation is the plugin
+    /// sending something no host may draw, which is a protocol violation and
+    /// is reaped like any other.
+    pub fn page(&mut self, request: &NativePageRequest) -> Result<PageFrame, HostError> {
+        self.ensure_alive()?;
+        let request_id = self.begin_request(request.generation);
+        let envelope = Envelope {
+            connection_id: self.link.connection_id,
+            request_id,
+            generation: request.generation,
+            deadline_ms: self.options.call_timeout_ms,
+            payload: Some(Payload::PageRequest(message::PageRequest {
+                page_id: request.page_id.clone(),
+                generation: request.generation,
+                width: request.width,
+                height: request.height,
+                events: request.events.iter().map(to_proto_page_input).collect(),
+                focused: request.focused,
+                colour_surface: request.colour_surface,
+                colour_text: request.colour_text,
+                colour_accent: request.colour_accent,
+                colour_muted: request.colour_muted,
+                unknown: Default::default(),
+            })),
+            unknown: Default::default(),
+        };
+        // Latched before the request is written: the answer can be back
+        // before `send_control` has returned on a fast transport.
+        self.link.page_request.store(request_id, Ordering::Release);
+        let outcome = self.page_reply(&envelope, request_id, request.generation);
+        self.link.page_request.store(0, Ordering::Release);
+        outcome
+    }
+
+    fn page_reply(
+        &mut self,
+        envelope: &Envelope,
+        request_id: u64,
+        generation: u64,
+    ) -> Result<PageFrame, HostError> {
+        self.send_control(envelope)?;
+        let event = self.next_event(deadline(self.options.call_timeout_ms), request_id, generation)?;
+        let reply = match event {
+            ReaderEvent::Envelope(value) => value,
+            ReaderEvent::Failure(failure) => return Err(self.transport_error(failure)),
+        };
+        match reply.payload {
+            Some(Payload::PageFrame(frame)) => match decode_page_frame(&frame) {
+                Ok(frame) => {
+                    self.mark_call_succeeded();
+                    Ok(frame)
+                }
+                Err(detail) => Err(self.protocol_failure(detail)),
+            },
+            Some(Payload::Error(error)) => Err(self.error_payload(error, request_id)),
+            _ => Err(self.protocol_failure("unexpected page response".to_owned())),
         }
     }
 
@@ -2148,7 +2214,7 @@ fn validate_inbound(envelope: &Envelope, context: &ReaderContext) -> bool {
     let first_handshake = matches!(envelope.payload, Some(Payload::Handshake(_)))
         && !context.handshake_seen.swap(true, Ordering::AcqRel);
     if first_handshake {
-        return envelope.connection_id == 0 && legal_plugin_payload(envelope);
+        return envelope.connection_id == 0 && legal_plugin_payload(envelope, 0);
     }
     if matches!(envelope.payload, Some(Payload::Handshake(_))) {
         return false;
@@ -2165,10 +2231,20 @@ fn validate_inbound(envelope: &Envelope, context: &ReaderContext) -> bool {
         );
         return false;
     }
-    legal_plugin_payload(envelope)
+    legal_plugin_payload(envelope, context.page_request.load(Ordering::Acquire))
 }
 
-fn legal_plugin_payload(envelope: &Envelope) -> bool {
+/// Whether a plugin may send this payload at all.
+///
+/// `page_request` is the request id of the frame the host is waiting for, or
+/// zero when it is waiting for none. A page frame is a reply and only a
+/// reply: an unsolicited one is refused here exactly as an unsolicited
+/// `Event` is, because a plugin that could draw whenever it wanted would own
+/// the user's screen rather than borrow it (spec 27.3).
+fn legal_plugin_payload(envelope: &Envelope, page_request: u64) -> bool {
+    if let Some(Payload::PageFrame(_)) = envelope.payload {
+        return page_request != 0 && envelope.request_id == page_request;
+    }
     matches!(
         envelope.payload,
         Some(Payload::Handshake(_))
@@ -2517,6 +2593,50 @@ fn plugin_error(error: &message::StructuredError) -> PluginError {
     PluginError {
         message: error.message.clone(),
         detail: error.detail.clone(),
+    }
+}
+
+/// Folds one execute reply into a host outcome, or names the violation that
+/// makes the reply unusable.
+///
+/// A plugin that reports it opened a page without naming one has told the
+/// host to display a surface it cannot ask anything about: every later frame
+/// request quotes the page id back, so an empty id is an action that can
+/// never be drawn and never be closed by its owner. It is refused here rather
+/// than allowed to become a permanently blank page.
+fn execute_outcome(result: &message::ExecuteResult) -> Result<ExecuteOutcome, &'static str> {
+    match result.outcome.as_i32() {
+        1 => Ok(ExecuteOutcome::Ok),
+        2 => Ok(ExecuteOutcome::Failed(
+            result
+                .error
+                .as_ref()
+                .map(plugin_error)
+                .unwrap_or_else(|| PluginError {
+                    message: "plugin execution failed".to_owned(),
+                    detail: String::new(),
+                }),
+        )),
+        3 => Ok(ExecuteOutcome::Unsupported),
+        4 if result.page_id.is_empty() => Err("execute opened a page without naming it"),
+        4 => Ok(ExecuteOutcome::ShowPage {
+            page_id: result.page_id.clone(),
+        }),
+        _ => Err("unknown execute outcome"),
+    }
+}
+
+/// Decodes and validates one page frame before any of it can be drawn.
+///
+/// Validation is not advisory here. A frame with a duplicate node id makes
+/// the host's own hit testing ambiguous, and one with non-finite geometry
+/// makes the renderer's arithmetic meaningless, so the frame is refused whole
+/// rather than drawn as far as it happens to parse (spec 27.4).
+fn decode_page_frame(frame: &message::PageFrame) -> Result<PageFrame, String> {
+    let frame = from_proto_page_frame(frame);
+    match frame.validate() {
+        Ok(()) => Ok(frame),
+        Err(error) => Err(format!("plugin page frame is not drawable: {error}")),
     }
 }
 
@@ -2980,6 +3100,94 @@ impl ExitKind {
         } else {
             Self::Crashed
         }
+    }
+}
+
+/// The three decisions a page makes at the protocol boundary, each of which
+/// is invisible from an integration test because the fixture plugin is
+/// well-behaved by construction: which execute outcome opens a page, which
+/// page frame the reader will accept at all, and which one is drawable.
+#[cfg(test)]
+mod page_protocol {
+    use crikey_core::{PageFrame, PageNode};
+    use crikey_native_protocol::convert::to_proto_page_frame;
+    use crikey_native_protocol::message::{self, Envelope, ExecuteOutcomeCode, Payload};
+
+    use super::{decode_page_frame, execute_outcome, legal_plugin_payload, ExecuteOutcome};
+
+    fn execute_result(outcome: ExecuteOutcomeCode, page_id: &str) -> message::ExecuteResult {
+        message::ExecuteResult {
+            outcome,
+            error: None,
+            page_id: page_id.to_owned(),
+            unknown: Default::default(),
+        }
+    }
+
+    fn envelope(request_id: u64, payload: Payload) -> Envelope {
+        Envelope {
+            connection_id: 1,
+            request_id,
+            generation: 0,
+            deadline_ms: 0,
+            payload: Some(payload),
+            unknown: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_named_show_page_outcome_opens_that_page() {
+        assert_eq!(
+            execute_outcome(&execute_result(ExecuteOutcomeCode::ShowPage, "settings")),
+            Ok(ExecuteOutcome::ShowPage {
+                page_id: "settings".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_show_page_outcome_without_a_page_id_is_refused() {
+        assert!(execute_outcome(&execute_result(ExecuteOutcomeCode::ShowPage, "")).is_err());
+    }
+
+    #[test]
+    fn the_settled_outcomes_are_unchanged_by_pages() {
+        assert_eq!(
+            execute_outcome(&execute_result(ExecuteOutcomeCode::Ok, "")),
+            Ok(ExecuteOutcome::Ok)
+        );
+        assert_eq!(
+            execute_outcome(&execute_result(ExecuteOutcomeCode::Unsupported, "")),
+            Ok(ExecuteOutcome::Unsupported)
+        );
+        assert!(execute_outcome(&execute_result(ExecuteOutcomeCode::from_i32(9), "")).is_err());
+    }
+
+    #[test]
+    fn an_unsolicited_page_frame_is_refused_and_the_awaited_one_is_not() {
+        let frame = envelope(7, Payload::PageFrame(to_proto_page_frame(&PageFrame::default())));
+        assert!(!legal_plugin_payload(&frame, 0));
+        assert!(!legal_plugin_payload(&frame, 6));
+        assert!(legal_plugin_payload(&frame, 7));
+    }
+
+    #[test]
+    fn a_frame_that_fails_validation_never_becomes_a_page() {
+        let ambiguous = to_proto_page_frame(&PageFrame {
+            nodes: vec![
+                PageNode {
+                    node_id: 4,
+                    ..PageNode::default()
+                },
+                PageNode {
+                    node_id: 4,
+                    ..PageNode::default()
+                },
+            ],
+            ..PageFrame::default()
+        });
+        assert!(decode_page_frame(&ambiguous).is_err());
+        assert!(decode_page_frame(&to_proto_page_frame(&PageFrame::default())).is_ok());
     }
 }
 

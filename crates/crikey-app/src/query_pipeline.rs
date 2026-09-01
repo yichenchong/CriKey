@@ -809,12 +809,14 @@ impl QueryPipeline {
             pending_plugins,
             actions_open: false,
             // A pipeline frame carries results, never the launcher's own
-            // settings: the panel is host state that no query can open or fill.
+            // settings or a plugin's page: both are host state that no query
+            // can open or fill, and both are restored from the host overlay.
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,
             show_hints: true,
             rounded_corners: true,
+            page: None,
         })
     }
 

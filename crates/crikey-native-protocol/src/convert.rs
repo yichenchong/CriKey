@@ -1,7 +1,8 @@
 //! Conversion between core catalog values and the native wire schema.
 
 use crikey_core::{
-    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, PluginId,
+    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, NodeRole,
+    NodeShape, PageColor, PageFrame, PageInput, PageInputKind, PageNode, PluginId,
 };
 
 use crate::message;
@@ -138,4 +139,163 @@ pub fn category_tag(category: &Category) -> String {
 /// Parses a category tag, retaining unknown plugin-defined categories.
 pub fn category_from_tag(tag: &str) -> Category {
     Category::from_wire_tag(tag)
+}
+
+// ---------------------------------------------------------------------------
+// Plugin-drawn pages (spec 27)
+// ---------------------------------------------------------------------------
+
+/// Converts a decoded page frame to the host's own model.
+///
+/// Deliberately total: every wire value maps to something, including the
+/// values a host must refuse. Rejection is
+/// [`crikey_core::PageFrame::validate`]'s job and happens once, on the whole
+/// frame, rather than being scattered through the field mapping where a
+/// missed case would silently clamp instead of refusing.
+pub fn from_proto_page_frame(frame: &message::PageFrame) -> PageFrame {
+    PageFrame {
+        generation: frame.generation,
+        title: frame.title.clone(),
+        nodes: frame.nodes.iter().map(from_proto_page_node).collect(),
+        focus_node: frame.focus_node,
+        redraw_after_ms: frame.redraw_after_ms,
+        close: frame.close,
+    }
+}
+
+fn from_proto_page_node(node: &message::PageNode) -> PageNode {
+    PageNode {
+        shape: match node.shape {
+            message::PageShapeCode::Rect => NodeShape::Rect,
+            message::PageShapeCode::Text => NodeShape::Text,
+            message::PageShapeCode::Line => NodeShape::Line,
+            message::PageShapeCode::Circle => NodeShape::Circle,
+            message::PageShapeCode::ShapeUnspecified => NodeShape::None,
+        },
+        x: node.x,
+        y: node.y,
+        width: node.width,
+        height: node.height,
+        fill: PageColor::from_u32(node.fill),
+        stroke: PageColor::from_u32(node.stroke),
+        stroke_width: node.stroke_width,
+        rounding: node.rounding,
+        text: node.text.clone(),
+        text_size: node.text_size,
+        role: match node.role {
+            message::PageRoleCode::Button => NodeRole::Button,
+            message::PageRoleCode::Label => NodeRole::Label,
+            message::PageRoleCode::Heading => NodeRole::Heading,
+            message::PageRoleCode::TextField => NodeRole::TextField,
+            message::PageRoleCode::Checkbox => NodeRole::Checkbox,
+            message::PageRoleCode::RoleUnspecified => NodeRole::None,
+        },
+        label: node.label.clone(),
+        node_id: node.node_id,
+        focus_order: node.focus_order,
+        checked: node.checked,
+    }
+}
+
+/// Converts a host input event to the wire form sent to the plugin.
+pub fn to_proto_page_input(input: &PageInput) -> message::PageInput {
+    message::PageInput {
+        kind: match input.kind {
+            PageInputKind::Opened => message::PageInputCode::Opened,
+            PageInputKind::PointerMoved => message::PageInputCode::PointerMoved,
+            PageInputKind::PointerPressed => message::PageInputCode::PointerPressed,
+            PageInputKind::PointerReleased => message::PageInputCode::PointerReleased,
+            PageInputKind::KeyPressed => message::PageInputCode::KeyPressed,
+            PageInputKind::TextInput => message::PageInputCode::TextInput,
+            PageInputKind::Activated => message::PageInputCode::Activated,
+            PageInputKind::FocusChanged => message::PageInputCode::FocusChanged,
+            PageInputKind::Closed => message::PageInputCode::Closed,
+            PageInputKind::Unspecified => message::PageInputCode::KindUnspecified,
+        },
+        x: input.x,
+        y: input.y,
+        key: input.key.clone(),
+        text: input.text.clone(),
+        node_id: input.node_id,
+        ctrl: input.ctrl,
+        shift: input.shift,
+        alt: input.alt,
+        unknown: UnknownFields::default(),
+    }
+}
+
+/// Converts an input event received by a plugin back to the core model, which
+/// is what an SDK hands its author.
+pub fn from_proto_page_input(input: &message::PageInput) -> PageInput {
+    PageInput {
+        kind: match input.kind {
+            message::PageInputCode::Opened => PageInputKind::Opened,
+            message::PageInputCode::PointerMoved => PageInputKind::PointerMoved,
+            message::PageInputCode::PointerPressed => PageInputKind::PointerPressed,
+            message::PageInputCode::PointerReleased => PageInputKind::PointerReleased,
+            message::PageInputCode::KeyPressed => PageInputKind::KeyPressed,
+            message::PageInputCode::TextInput => PageInputKind::TextInput,
+            message::PageInputCode::Activated => PageInputKind::Activated,
+            message::PageInputCode::FocusChanged => PageInputKind::FocusChanged,
+            message::PageInputCode::Closed => PageInputKind::Closed,
+            message::PageInputCode::KindUnspecified => PageInputKind::Unspecified,
+        },
+        x: input.x,
+        y: input.y,
+        key: input.key.clone(),
+        text: input.text.clone(),
+        node_id: input.node_id,
+        ctrl: input.ctrl,
+        shift: input.shift,
+        alt: input.alt,
+    }
+}
+
+/// Converts a page frame produced by a plugin to the wire form. Used by the
+/// SDK rather than the host.
+pub fn to_proto_page_frame(frame: &PageFrame) -> message::PageFrame {
+    message::PageFrame {
+        generation: frame.generation,
+        title: frame.title.clone(),
+        nodes: frame.nodes.iter().map(to_proto_page_node).collect(),
+        focus_node: frame.focus_node,
+        redraw_after_ms: frame.redraw_after_ms,
+        close: frame.close,
+        unknown: UnknownFields::default(),
+    }
+}
+
+fn to_proto_page_node(node: &PageNode) -> message::PageNode {
+    message::PageNode {
+        shape: match node.shape {
+            NodeShape::Rect => message::PageShapeCode::Rect,
+            NodeShape::Text => message::PageShapeCode::Text,
+            NodeShape::Line => message::PageShapeCode::Line,
+            NodeShape::Circle => message::PageShapeCode::Circle,
+            NodeShape::None => message::PageShapeCode::ShapeUnspecified,
+        },
+        x: node.x,
+        y: node.y,
+        width: node.width,
+        height: node.height,
+        fill: node.fill.to_u32(),
+        stroke: node.stroke.to_u32(),
+        stroke_width: node.stroke_width,
+        rounding: node.rounding,
+        text: node.text.clone(),
+        text_size: node.text_size,
+        role: match node.role {
+            NodeRole::Button => message::PageRoleCode::Button,
+            NodeRole::Label => message::PageRoleCode::Label,
+            NodeRole::Heading => message::PageRoleCode::Heading,
+            NodeRole::TextField => message::PageRoleCode::TextField,
+            NodeRole::Checkbox => message::PageRoleCode::Checkbox,
+            NodeRole::None => message::PageRoleCode::RoleUnspecified,
+        },
+        label: node.label.clone(),
+        node_id: node.node_id,
+        focus_order: node.focus_order,
+        checked: node.checked,
+        unknown: UnknownFields::default(),
+    }
 }

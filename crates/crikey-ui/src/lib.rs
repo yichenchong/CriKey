@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use crikey_core::{Action, ActionId, Generation, ItemId};
+use crikey_core::{Action, ActionId, Generation, ItemId, PageFrame, PageInput, PluginId};
 use crikey_platform::IconImage;
 
 mod native;
@@ -38,9 +38,9 @@ pub mod window_shape;
 
 pub use egui;
 pub use native::{
-    build_launcher_frame, create_launcher_context, ActivationLatencySnapshot, ActivationLatencyTracker,
-    NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, NativeLauncherHandle, NativeUiFrame,
-    RendererError, ACTIVATION_SAMPLE_CAPACITY,
+    build_launcher_frame, create_launcher_context, initial_page_viewport, page_palette,
+    ActivationLatencySnapshot, ActivationLatencyTracker, NativeLauncher, NativeLauncherConfig,
+    NativeLauncherEvent, NativeLauncherHandle, NativeUiFrame, RendererError, ACTIVATION_SAMPLE_CAPACITY,
 };
 /// Re-exported so a caller can name [`NativeLauncherConfig::present_mode`]
 /// without taking its own `wgpu` dependency and risking a version skew with
@@ -119,6 +119,44 @@ pub enum SettingControl {
     Toggle { on: bool },
 }
 
+/// The plugin-drawn surface the launcher is showing, if any (spec 6.3, 33).
+///
+/// A page is a display list the plugin returns and the *host* draws: the
+/// vocabulary crosses the boundary, never pixels and never code, so a
+/// misbehaving plugin can make the launcher draw an ugly page but cannot make
+/// it draw outside one.
+///
+/// The frame is shared rather than owned for the same reason the result rows
+/// are: a page that redraws on a timer republishes the same node list many
+/// times over, and a repaint that changes nothing about it costs a refcount
+/// bump instead of a copy of every node and every string in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageSurface {
+    /// Which plugin owns the page, so the host can route input back to the
+    /// process that asked for it.
+    pub plugin: PluginId,
+    /// The plugin's own name for this page, echoed in every request so a
+    /// plugin that offers several pages knows which one is being drawn.
+    pub page_id: String,
+    /// The owning plugin's display name, shown in the status line: a surface
+    /// that takes the whole launcher must always say whose it is.
+    pub plugin_name: String,
+    /// The display list the last accepted frame carried. Already validated by
+    /// the host transport, so the renderer draws it without re-checking:
+    /// nothing that failed [`crikey_core::PageFrame::validate`] ever reaches
+    /// here.
+    pub frame: Arc<PageFrame>,
+    /// Whether the host is still waiting for the plugin to answer the request
+    /// it has already sent.
+    ///
+    /// The nodes below are then the previous frame, which is the right thing to
+    /// keep drawing -- blanking the surface on every round trip would flicker
+    /// a page that redraws on a timer -- but the user has to be able to tell
+    /// that what they are looking at is not the answer to what they just did,
+    /// so the status line says so.
+    pub stale: bool,
+}
+
 /// Everything the renderer needs for one frame.
 ///
 /// The row set is *shared* with the view model, never copied into the frame: a
@@ -170,10 +208,19 @@ pub struct ViewModel {
     /// a stepped arc out of itself, so this asks for rounded corners rather
     /// than promising them.
     pub rounded_corners: bool,
+    /// The plugin-drawn page the launcher is showing, if any (spec 32).
+    ///
+    /// Mutually exclusive with [`Self::settings_open`] by construction, not by
+    /// convention: both take the whole result area and both claim the
+    /// keyboard, so the model closes one when the other opens and the renderer
+    /// never has to decide which of two full-height surfaces wins.
+    pub page: Option<PageSurface>,
 }
 
 /// Keyboard-only interaction surface (spec 6.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not [`Eq`]: a page input carries pointer coordinates, which are floats.
+#[derive(Debug, Clone, PartialEq)]
 pub enum UiCommand {
     SetQuery(String),
     SelectNext,
@@ -191,6 +238,20 @@ pub enum UiCommand {
     OpenSettings,
     /// Hides the settings surface again.
     CloseSettings,
+    /// One pointer, key or focus event the open page must be told about
+    /// (spec 32). The renderer has already hit-tested it and translated its
+    /// coordinates into the page's own space.
+    PageInput(PageInput),
+    /// Closes the open page. Reserved by the host -- Escape produces this and
+    /// is never forwarded -- so a plugin can never trap the user inside its
+    /// own surface.
+    ClosePage,
+    /// The renderer measured the page area. Sent when the size changes so the
+    /// plugin can lay out against the surface it actually has (spec 32.3).
+    ResizePage {
+        width: u32,
+        height: u32,
+    },
     /// Asks the host to persist one setting; the UI neither validates nor
     /// stores it.
     SetSetting {
@@ -223,7 +284,9 @@ pub const PAGE_SIZE: usize = 8;
 ///
 /// The view model schedules no query, runs no action and drives no window: it
 /// reports the intent and leaves the work to the composition root.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not [`Eq`], for the same reason [`UiCommand`] is not.
+#[derive(Debug, Clone, PartialEq)]
 pub enum UiEffect {
     /// The query text changed; schedule a generation for it (spec 6.2.2).
     Query(String),
@@ -236,6 +299,19 @@ pub enum UiEffect {
     /// settings surface is the UI's own business, but the value behind a row
     /// belongs to the host's configuration store.
     SetSetting { key: String, value: String },
+    /// Deliver `PageInput` to the plugin that owns the open page (spec 32.9).
+    /// The model holds no transport, so the round trip is the host's.
+    PageInput(PageInput),
+    /// Tear the page session down with the plugin that owns it.
+    ///
+    /// Produced even when the model had no page open, and even while the
+    /// launcher is hidden: the model forgets a page the instant the user asks
+    /// it to close, and if that also swallowed the effect the plugin would be
+    /// left holding a session nobody will ever answer again.
+    ClosePage,
+    /// Tell the owning plugin how large its surface actually is, so the next
+    /// frame it draws is laid out for the space it has.
+    ResizePage { width: u32, height: u32 },
     /// The user asked the launcher to exit for good, not to hide until the
     /// next hotkey press.
     Quit,
@@ -293,6 +369,12 @@ pub struct LauncherViewModel {
     settings: Arc<[SettingRow]>,
     /// The setting an opening surface should put the keyboard in, by key.
     settings_focus: Option<String>,
+    /// The plugin-drawn page the launcher is showing, if any (spec 32).
+    ///
+    /// Session state, unlike the settings rows above: a page belongs to the
+    /// plugin round trip that opened it, so `dismiss` drops it and the host
+    /// tears the plugin's side down when it sees [`UiEffect::Dismissed`].
+    page: Option<PageSurface>,
     /// Whether published frames draw the footer's navigation hint line. Host
     /// configuration rather than session state, like `settings` above, so it
     /// survives `dismiss`.
@@ -340,6 +422,7 @@ impl LauncherViewModel {
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,
+            page: None,
             show_hints: true,
             rounded_corners: true,
             floor: None,
@@ -378,7 +461,9 @@ impl LauncherViewModel {
     /// The settings *rows* survive, because they describe the host's
     /// configuration rather than this session, but the surface itself closes:
     /// the next activation is a fresh launcher, not the panel the user left
-    /// open.
+    /// open. An open page closes for the same reason, and the host's own
+    /// handling of [`UiEffect::Dismissed`] is what ends the plugin's side of
+    /// it: the model holds no transport and cannot tell the plugin anything.
     pub fn dismiss(&mut self) {
         if !self.visible {
             return;
@@ -394,6 +479,7 @@ impl LauncherViewModel {
         self.pending_plugins = false;
         self.settings_open = false;
         self.settings_focus = None;
+        self.page = None;
         self.active = None;
         self.published = None;
     }
@@ -478,6 +564,10 @@ impl LauncherViewModel {
             // Shared for the same reason the rows are.
             settings: Arc::clone(&self.settings),
             settings_focus: self.settings_focus.clone(),
+            // One refcount bump on the node list plus the surface's own three
+            // short strings, so a page redrawing on a timer does not copy its
+            // display list once per frame.
+            page: self.page.clone(),
             show_hints: self.show_hints,
             rounded_corners: self.rounded_corners,
         })
@@ -487,9 +577,15 @@ impl LauncherViewModel {
     ///
     /// Returns the work the host must do, or `None` when the command changed
     /// nothing. A hidden launcher ignores every command: only `activate` moves
-    /// it.
+    /// it, and [`UiCommand::ClosePage`] -- which has a plugin session to end
+    /// however the launcher got into this state.
     pub fn apply(&mut self, command: UiCommand) -> Option<UiEffect> {
-        if !self.visible {
+        // Closing a page is the one command whose work outlives the launcher
+        // session, so it is the one command a hidden launcher still answers:
+        // the model may already have forgotten the page -- a dismissal clears
+        // it -- but the plugin has not, and swallowing this would leave it
+        // holding a session nothing will ever answer again.
+        if !self.visible && !matches!(command, UiCommand::ClosePage) {
             return None;
         }
 
@@ -531,23 +627,45 @@ impl LauncherViewModel {
                 self.close_actions();
                 Some(effect)
             }
-            // Opening and closing the settings surface is pure UI state, so
-            // the host has nothing to do about either; only the value behind a
-            // row is the host's to keep.
             UiCommand::OpenSettings => {
-                self.open_settings(None);
-                None
+                // The one settings transition that is not purely UI state: it
+                // evicts a page, and the plugin behind that page has a session
+                // to end.
+                self.open_settings(None).then_some(UiEffect::ClosePage)
             }
             UiCommand::CloseSettings => {
                 self.close_settings();
                 None
             }
+            // The page's own input is the host's to deliver: the model holds no
+            // transport and the plugin is the only thing that can answer.
+            UiCommand::PageInput(input) => Some(UiEffect::PageInput(input)),
+            // Pure measurement: nothing in the model changes, and the frame
+            // already on screen stays exactly as it is.
+            UiCommand::ResizePage { width, height } => {
+                self.page.as_ref().map(|_| UiEffect::ResizePage { width, height })
+            }
+            // The surface goes the moment the user asks, without waiting on a
+            // plugin round trip: a page the plugin has stopped answering must
+            // still close.
+            UiCommand::ClosePage => {
+                self.close_page();
+                Some(UiEffect::ClosePage)
+            }
             UiCommand::SetSetting { key, value } => Some(UiEffect::SetSetting { key, value }),
             UiCommand::Quit => Some(UiEffect::Quit),
-            // Cancel backs out one rung at a time: it closes the settings
-            // surface first, then an open action list, then clears a non-empty
-            // query, and closes only an already-bare launcher. Dismiss skips
-            // the ladder entirely.
+            // Cancel backs out one rung at a time: it closes an open page
+            // first, then the settings surface, then an open action list, then
+            // clears a non-empty query, and closes only an already-bare
+            // launcher. Dismiss skips the ladder entirely.
+            //
+            // A page rung ends the plugin's session as well as the surface,
+            // which is why this one carries an effect where the other UI-state
+            // rungs do not.
+            UiCommand::Cancel if self.page.is_some() => {
+                self.close_page();
+                Some(UiEffect::ClosePage)
+            }
             UiCommand::Cancel if self.settings_open => {
                 self.close_settings();
                 None
@@ -707,15 +825,25 @@ impl LauncherViewModel {
     /// the row that needs their attention instead of being told to go looking
     /// for it. Reopening an open surface still re-aims the focus, because the
     /// second reason to open it need not be the first one.
-    pub fn open_settings(&mut self, focus_key: Option<&str>) {
+    ///
+    /// An open page closes: both surfaces take the whole result area and both
+    /// claim the keyboard, so only one of them can exist. Reports whether a
+    /// page was closed, because the plugin holding it still has to be told;
+    /// [`UiCommand::OpenSettings`] turns that into
+    /// [`UiEffect::ClosePage`], and a host reaching this directly -- the
+    /// startup path, where a misconfiguration opens the surface before any
+    /// page could exist -- owns the same duty.
+    pub fn open_settings(&mut self, focus_key: Option<&str>) -> bool {
         let focus = focus_key.map(str::to_owned);
         if self.settings_open && self.settings_focus == focus {
-            return;
+            return false;
         }
 
+        let had_page = self.page.take().is_some();
         self.settings_open = true;
         self.settings_focus = focus;
         self.dirty |= self.visible;
+        had_page
     }
 
     /// Hides the settings surface, leaving the query and the rows alone. An
@@ -728,6 +856,86 @@ impl LauncherViewModel {
         self.settings_open = false;
         self.settings_focus = None;
         self.dirty |= self.visible;
+    }
+
+    /// The page the launcher is showing right now, if any (spec 32).
+    pub fn page(&self) -> Option<&PageSurface> {
+        self.page.as_ref()
+    }
+
+    /// Shows `surface` as the launcher's page, reporting whether the model
+    /// took it.
+    ///
+    /// Refused while hidden, like `publish` and unlike `set_settings`: a page
+    /// is one plugin's session rather than a description of the host's
+    /// configuration, and a surface opened into a launcher nobody can see
+    /// would own a keyboard that is not there.
+    ///
+    /// An open settings surface closes for the reason
+    /// [`open_settings`](Self::open_settings) gives. Every accepted call is a
+    /// change: opening a page replaces whatever page was open rather than
+    /// comparing display lists, because reopening is the host answering a new
+    /// action and [`update_page`](Self::update_page) is how the same page
+    /// redraws.
+    pub fn open_page(&mut self, surface: PageSurface) -> bool {
+        if !self.visible {
+            return false;
+        }
+
+        self.settings_open = false;
+        self.settings_focus = None;
+        self.page = Some(surface);
+        self.dirty = true;
+        true
+    }
+
+    /// Replaces the open page's display list, reporting whether the model took
+    /// it.
+    ///
+    /// `stale` is whether the host is still waiting on a request it has
+    /// already sent, which the status line shows: the nodes keep standing
+    /// across a round trip so a page that redraws on a timer does not flicker,
+    /// and the user has to be able to tell the difference.
+    ///
+    /// Two frames are refused. One that arrives with no page open belongs to a
+    /// session the user has already closed. One whose generation is older than
+    /// the frame already standing answers a request that has been superseded,
+    /// and drawing it would walk the page backwards -- generations are
+    /// monotonic per page precisely so that this is decidable here rather than
+    /// left to whichever renderer notices.
+    pub fn update_page(&mut self, frame: Arc<PageFrame>, stale: bool) -> bool {
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        if frame.generation < page.frame.generation {
+            return false;
+        }
+        // Redrawing the identical display list at the identical staleness is
+        // not a change, so a page that answers a poll with the frame it
+        // already published costs no repaint.
+        if page.stale == stale && Arc::ptr_eq(&page.frame, &frame) {
+            return false;
+        }
+
+        page.frame = frame;
+        page.stale = stale;
+        self.dirty = true;
+        true
+    }
+
+    /// Closes the open page, reporting whether there was one.
+    ///
+    /// The surface goes immediately and unconditionally. Ending the plugin's
+    /// side of the session is the host's work, which is why every route into
+    /// here reports [`UiEffect::ClosePage`] whatever this answers: the model
+    /// forgetting a page is not the plugin learning of it.
+    pub fn close_page(&mut self) -> bool {
+        if self.page.take().is_none() {
+            return false;
+        }
+
+        self.dirty |= self.visible;
+        true
     }
 
     /// Opens the action list of the selected row (spec 6.3).

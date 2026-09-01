@@ -198,6 +198,7 @@ fn measurement_frame(generation: Generation) -> ViewModel {
         settings_focus: None,
         show_hints: true,
         rounded_corners: true,
+        page: None,
     }
 }
 

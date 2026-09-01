@@ -1,11 +1,14 @@
 use std::{sync::Arc, time::Duration};
 
-use crikey_core::{Generation, ItemId};
+use crikey_core::{
+    Generation, ItemId, NodeRole, NodeShape, PageColor, PageFrame, PageInput, PageInputKind, PageNode,
+    PluginId,
+};
 use crikey_platform::IconImage;
 use crikey_ui::{
     build_launcher_frame, create_launcher_context, egui, ActivationLatencyTracker, NativeLauncher,
-    NativeLauncherConfig, NativeLauncherHandle, RendererError, ResultRow, SettingControl, SettingRow,
-    UiCommand, ViewModel, ACTIVATION_SAMPLE_CAPACITY,
+    NativeLauncherConfig, NativeLauncherHandle, PageSurface, RendererError, ResultRow, SettingControl,
+    SettingRow, UiCommand, ViewModel, ACTIVATION_SAMPLE_CAPACITY,
 };
 
 fn model(query: &str) -> ViewModel {
@@ -19,6 +22,7 @@ fn model(query: &str) -> ViewModel {
         settings_open: false,
         settings: Arc::default(),
         settings_focus: None,
+        page: None,
         show_hints: true,
         rounded_corners: true,
     }
@@ -1200,4 +1204,497 @@ fn switch_shapes(frame: &crikey_ui::NativeUiFrame) -> (egui::Color32, egui::Colo
         .min_by(|left, right| left.rect.area().total_cmp(&right.rect.area()))
         .expect("the knob sits on a track");
     (colour, track.fill)
+}
+
+// ---------------------------------------------------------------------------
+// Plugin-drawn pages (spec 33)
+//
+// Every assertion here is on the frame the shipped renderer builds, because
+// the whole claim of a page is that the *host* draws it: a plugin hands over a
+// display list and semantics, and what ends up on screen has to be the
+// launcher's own shapes inside the launcher's own rectangle.
+// ---------------------------------------------------------------------------
+
+/// A colour nothing else in the launcher paints, used by the probe node below.
+const PROBE: PageColor = PageColor::rgba(1, 2, 3, 255);
+
+/// A one-pixel node every page fixture draws at the page's own origin.
+///
+/// The page's position is a layout result, and a test that recomputed it from
+/// the theme's margins would agree with the renderer by construction and prove
+/// nothing about where nodes actually land. Measuring it from a node the plugin
+/// drew at (0, 0) is the only way to assert that a page-relative coordinate is
+/// page-relative.
+fn probe_node() -> PageNode {
+    PageNode {
+        shape: NodeShape::Rect,
+        width: 1.0,
+        height: 1.0,
+        fill: PROBE,
+        ..PageNode::default()
+    }
+}
+
+fn page_node(shape: NodeShape, x: f32, y: f32, width: f32, height: f32) -> PageNode {
+    PageNode {
+        shape,
+        x,
+        y,
+        width,
+        height,
+        ..PageNode::default()
+    }
+}
+
+/// A focusable control: an interactive role and a node id are both required,
+/// which is what `PageNode::is_focusable` says.
+fn page_control(role: NodeRole, node_id: u32, x: f32, y: f32, width: f32, height: f32) -> PageNode {
+    PageNode {
+        role,
+        node_id,
+        ..page_node(NodeShape::Rect, x, y, width, height)
+    }
+}
+
+fn page_view(nodes: Vec<PageNode>) -> ViewModel {
+    let mut view = model("");
+    let mut all = vec![probe_node()];
+    all.extend(nodes);
+    let frame = PageFrame {
+        generation: 1,
+        title: "Demo Page".to_owned(),
+        nodes: all,
+        ..PageFrame::default()
+    };
+    frame
+        .validate()
+        .expect("a page fixture must be a frame the host would have accepted");
+    view.page = Some(PageSurface {
+        plugin: PluginId("demo".to_owned()),
+        page_id: "page-1".to_owned(),
+        plugin_name: "Demo Plugin".to_owned(),
+        frame: Arc::new(frame),
+        stale: false,
+    });
+    view
+}
+
+/// Every rectangle the frame paints, with the clip rectangle it was painted
+/// under.
+///
+/// The clip travels with the shape because that is how egui expresses
+/// clipping: a node outside the page is still tessellated, and what keeps it
+/// off the launcher's chrome is the rectangle it is drawn under.
+fn rect_shapes(frame: &crikey_ui::NativeUiFrame) -> Vec<(egui::epaint::RectShape, egui::Rect)> {
+    fn walk(shape: &egui::Shape, clip: egui::Rect, found: &mut Vec<(egui::epaint::RectShape, egui::Rect)>) {
+        match shape {
+            egui::Shape::Rect(rect) => found.push((*rect, clip)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, clip, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut found = Vec::new();
+    for clipped in &frame.output.shapes {
+        walk(&clipped.shape, clipped.clip_rect, &mut found);
+    }
+    found
+}
+
+#[track_caller]
+fn page_origin(frame: &crikey_ui::NativeUiFrame) -> egui::Pos2 {
+    rect_shapes(frame)
+        .into_iter()
+        .find(|(rect, _)| rect.fill == egui::Color32::from_rgb(PROBE.r, PROBE.g, PROBE.b))
+        .map(|(rect, _)| rect.rect.min)
+        .expect("the probe node the fixture draws at the page origin must be painted")
+}
+
+fn page_inputs(frame: &crikey_ui::NativeUiFrame) -> Vec<PageInput> {
+    frame
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            UiCommand::PageInput(input) => Some(input.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn events_of_kind(frame: &crikey_ui::NativeUiFrame, kind: PageInputKind) -> Vec<PageInput> {
+    page_inputs(frame)
+        .into_iter()
+        .filter(|input| input.kind == kind)
+        .collect()
+}
+
+fn key_press(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+
+#[test]
+fn a_page_rect_node_is_painted_in_the_colour_the_plugin_asked_for() {
+    let context = create_launcher_context();
+    let mut node = page_node(NodeShape::Rect, 10.0, 20.0, 80.0, 24.0);
+    node.fill = PageColor::rgba(200, 30, 40, 255);
+    let view = page_view(vec![node]);
+
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+
+    let origin = page_origin(&frame);
+    let expected = egui::Rect::from_min_size(origin + egui::vec2(10.0, 20.0), egui::vec2(80.0, 24.0));
+    assert!(
+        rect_shapes(&frame)
+            .iter()
+            .any(|(rect, _)| rect.rect == expected && rect.fill == egui::Color32::from_rgb(200, 30, 40)),
+        "a Rect node must be painted at its own coordinates, offset by the page origin, in its own fill"
+    );
+}
+
+#[test]
+fn a_page_text_node_paints_its_text() {
+    let context = create_launcher_context();
+    let mut node = page_node(NodeShape::Text, 8.0, 8.0, 200.0, 20.0);
+    node.text = "Nothing here but us nodes".to_owned();
+    node.fill = PageColor::rgba(240, 240, 240, 255);
+    let view = page_view(vec![node]);
+
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+
+    assert!(
+        painted(&frame, "Nothing here but us nodes"),
+        "a Text node's string must reach the frame"
+    );
+}
+
+/// A rounding larger than the rectangle it rounds must be clamped, not obeyed.
+///
+/// egui tessellates a corner arc of whatever radius it is handed, so a radius
+/// past half the shorter side sends the two arcs of one side through each
+/// other: a wide flat button asking for a pill by naming a huge radius comes
+/// out pinched in the middle instead. Half the shorter side is the largest
+/// radius that still fits.
+#[test]
+fn an_over_large_page_rounding_is_clamped_instead_of_inverting_the_rect() {
+    let context = create_launcher_context();
+    let mut node = page_node(NodeShape::Rect, 0.0, 40.0, 120.0, 30.0);
+    node.fill = PageColor::rgba(90, 140, 220, 255);
+    node.rounding = 500.0;
+    let view = page_view(vec![node]);
+
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+
+    let (shape, _) = rect_shapes(&frame)
+        .into_iter()
+        .find(|(rect, _)| rect.fill == egui::Color32::from_rgb(90, 140, 220))
+        .expect("the node is painted");
+    assert_eq!(
+        shape.rounding.nw, 15.0,
+        "the rounding must be clamped to half the shorter side (30 / 2), not taken literally"
+    );
+}
+
+/// A node whose coordinates leave the page must not paint over the launcher.
+///
+/// Node coordinates are the plugin's, so a negative `y` is a thing a plugin
+/// will produce -- and the launcher's query field is directly above the page,
+/// so an unclipped one would draw over the text the user is typing. The node
+/// below sits far enough above the page's top edge to be entirely inside the
+/// query field's band.
+#[test]
+fn a_page_node_outside_the_page_is_clipped_away_from_the_launcher_chrome() {
+    let context = create_launcher_context();
+    let mut node = page_node(NodeShape::Rect, 0.0, -40.0, 200.0, 20.0);
+    node.fill = PageColor::rgba(255, 0, 255, 255);
+    let view = page_view(vec![node]);
+
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+
+    let (shape, clip) = rect_shapes(&frame)
+        .into_iter()
+        .find(|(rect, _)| rect.fill == egui::Color32::from_rgb(255, 0, 255))
+        .expect("the node is still tessellated; the clip is what keeps it off the screen");
+    assert!(
+        !clip.intersects(shape.rect),
+        "a node above the page must be clipped entirely away, not drawn over the query field"
+    );
+}
+
+/// Alpha zero is how the vocabulary spells a hit target with no appearance.
+///
+/// So it must paint nothing and still answer the pointer. Refusing it instead
+/// would take away the only way a page can put an invisible control over
+/// something it drew itself.
+#[test]
+fn a_zero_alpha_page_fill_paints_nothing_and_still_hit_tests() {
+    let context = create_launcher_context();
+    let invisible = page_control(NodeRole::Button, 1, 0.0, 0.0, 100.0, 30.0);
+    // A second control, ahead of the first in the ring, so the host's focus
+    // outline is drawn somewhere else and cannot be mistaken for the invisible
+    // node painting itself.
+    let mut visible = page_control(NodeRole::Button, 2, 0.0, 120.0, 100.0, 30.0);
+    visible.fill = PageColor::rgba(60, 60, 60, 255);
+    visible.focus_order = 0;
+    let mut invisible = invisible;
+    invisible.focus_order = 1;
+    let view = page_view(vec![invisible, visible]);
+
+    let origin = {
+        let probe = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        page_origin(&probe)
+    };
+    let hidden = egui::Rect::from_min_size(origin, egui::vec2(100.0, 30.0));
+    let frame = build_launcher_frame(&context, launcher_input(click_at(hidden.center())), &view);
+
+    // Nothing the *plugin* asked for is painted here: a zero-alpha fill is a
+    // hit target, not a shape. The host's own focus outline is a different
+    // matter and is expected -- clicking a control focuses it, and a user who
+    // cannot see what they just focused has been told nothing -- so the
+    // assertion is about fills rather than about rectangles.
+    let painted: Vec<_> = rect_shapes(&frame)
+        .into_iter()
+        .filter(|(shape, _)| shape.rect == hidden)
+        .collect();
+    assert!(
+        painted.iter().all(|(shape, _)| shape.fill.a() == 0),
+        "an invisible fill must paint no filled rectangle"
+    );
+    assert!(
+        painted.iter().any(|(shape, _)| shape.stroke.width > 0.0),
+        "the focus the click moved must still be visible to the user"
+    );
+    let pressed = events_of_kind(&frame, PageInputKind::PointerPressed);
+    assert_eq!(
+        pressed.iter().map(|input| input.node_id).collect::<Vec<_>>(),
+        vec![1],
+        "the invisible node must still be the node the pointer reports"
+    );
+}
+
+/// Tab walks `PageFrame::focus_ring`, which is the plugin's `focus_order` and
+/// then document order -- never the order the nodes happen to be listed in.
+///
+/// The fixture lists the nodes in the opposite order to their focus order, so
+/// a renderer that walked the display list instead would produce a different
+/// sequence on the very first frame.
+#[test]
+fn tab_walks_the_page_focus_ring_in_ring_order_and_wraps() {
+    let context = create_launcher_context();
+    let mut first = page_control(NodeRole::Button, 10, 0.0, 0.0, 60.0, 20.0);
+    first.focus_order = 2;
+    let mut second = page_control(NodeRole::Button, 20, 0.0, 30.0, 60.0, 20.0);
+    second.focus_order = 0;
+    let mut third = page_control(NodeRole::Button, 30, 0.0, 60.0, 60.0, 20.0);
+    third.focus_order = 1;
+    let view = page_view(vec![first, second, third]);
+
+    let mut reached = Vec::new();
+    for events in [
+        Vec::new(),
+        vec![key_press(egui::Key::Tab, egui::Modifiers::NONE)],
+        vec![key_press(egui::Key::Tab, egui::Modifiers::NONE)],
+        vec![key_press(egui::Key::Tab, egui::Modifiers::NONE)],
+        vec![key_press(egui::Key::Tab, egui::Modifiers::SHIFT)],
+    ] {
+        let frame = build_launcher_frame(&context, launcher_input(events), &view);
+        reached.extend(
+            events_of_kind(&frame, PageInputKind::FocusChanged)
+                .into_iter()
+                .map(|input| input.node_id),
+        );
+        assert!(
+            events_of_kind(&frame, PageInputKind::KeyPressed).is_empty(),
+            "Tab is the host's key and must never be forwarded to the plugin"
+        );
+    }
+
+    assert_eq!(
+        reached,
+        vec![20, 30, 10, 20, 10],
+        "focus starts at the head of the ring, walks it in ring order, wraps, and Shift+Tab \
+         walks back"
+    );
+}
+
+/// Escape closes the page and is never forwarded.
+///
+/// It is the host's one reserved key: a plugin that could see it could swallow
+/// it, and a user inside a surface with no way out is a launcher that has to be
+/// killed from a terminal.
+#[test]
+fn escape_closes_the_page_and_never_reaches_the_plugin() {
+    let context = create_launcher_context();
+    let view = page_view(vec![page_control(NodeRole::Button, 1, 0.0, 0.0, 60.0, 20.0)]);
+
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![key_press(egui::Key::Escape, egui::Modifiers::NONE)]),
+        &view,
+    );
+
+    assert!(
+        frame.commands.contains(&UiCommand::ClosePage),
+        "Escape must close the page"
+    );
+    assert!(
+        !page_inputs(&frame).iter().any(|input| input.key == "Escape"),
+        "Escape must not be reported to the plugin as a keystroke"
+    );
+}
+
+#[test]
+fn a_page_pointer_press_reports_the_node_under_it_in_page_coordinates() {
+    let context = create_launcher_context();
+    let view = page_view(vec![page_control(NodeRole::Button, 7, 20.0, 30.0, 60.0, 20.0)]);
+
+    let origin = {
+        let probe = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        page_origin(&probe)
+    };
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(click_at(origin + egui::vec2(35.0, 40.0))),
+        &view,
+    );
+
+    let pressed = events_of_kind(&frame, PageInputKind::PointerPressed);
+    let [pressed] = pressed.as_slice() else {
+        panic!("one press must be reported, got {pressed:?}");
+    };
+    assert_eq!(pressed.node_id, 7, "the press must name the node under it");
+    assert_eq!(
+        (pressed.x, pressed.y),
+        (35.0, 40.0),
+        "the coordinates must be the page's own, not the window's"
+    );
+    assert!(
+        events_of_kind(&frame, PageInputKind::Activated)
+            .iter()
+            .any(|input| input.node_id == 7),
+        "a click on a control is an activation as well as a press"
+    );
+}
+
+/// Typed text reaches a field and nothing else.
+///
+/// A keystroke that lands nowhere is better than one silently editing a field
+/// the user cannot see, so text is delivered only while the focused node is a
+/// `TextField` and is dropped for every other role.
+#[test]
+fn typed_text_reaches_a_page_text_field_and_is_swallowed_by_a_button() {
+    fn typed(role: NodeRole) -> Vec<PageInput> {
+        let context = create_launcher_context();
+        let view = page_view(vec![page_control(role, 1, 0.0, 0.0, 120.0, 24.0)]);
+        // Two frames: the first puts the host's focus on the node, the second
+        // types into it. A single frame would be testing a keystroke that
+        // arrived before anything was focused.
+        let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        let frame = build_launcher_frame(
+            &context,
+            launcher_input(vec![egui::Event::Text("q".to_owned())]),
+            &view,
+        );
+        events_of_kind(&frame, PageInputKind::TextInput)
+    }
+
+    let into_field = typed(NodeRole::TextField);
+    let [into_field] = into_field.as_slice() else {
+        panic!("typing into a focused field must reach the plugin, got {into_field:?}");
+    };
+    assert_eq!(into_field.text, "q");
+    assert_eq!(into_field.node_id, 1);
+
+    assert!(
+        typed(NodeRole::Button).is_empty(),
+        "text typed while a button holds the keyboard has nowhere to land and must be dropped"
+    );
+}
+
+/// The three key spellings the protocol documents by example.
+///
+/// The host's spelling is what a plugin matches on, so it is part of the wire
+/// contract rather than an implementation detail: `Key::name` would have sent
+/// `Down` where the protocol says `ArrowDown`, and a plugin waiting for the
+/// documented word would never have fired.
+#[test]
+fn page_keys_are_spelled_the_way_the_protocol_documents() {
+    let context = create_launcher_context();
+    let view = page_view(vec![page_control(NodeRole::Button, 1, 0.0, 0.0, 60.0, 20.0)]);
+
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::A, egui::Modifiers::SHIFT),
+        ]),
+        &view,
+    );
+
+    let keys: Vec<String> = events_of_kind(&frame, PageInputKind::KeyPressed)
+        .into_iter()
+        .map(|input| input.key)
+        .collect();
+    assert_eq!(keys, vec!["Enter", "ArrowDown", "A"]);
+}
+
+/// The footer must stay inside the window while a page is open.
+///
+/// The page area is measured from what is left after the footer and the gap
+/// above it, exactly as the result list is. A surface that took everything
+/// available would push the status line past the bottom edge -- and the status
+/// line is the only thing telling the user whose surface they are looking at,
+/// which makes losing it worse here than in a result list.
+#[test]
+fn an_open_page_still_leaves_the_footer_inside_the_window() {
+    let context = create_launcher_context();
+    // A page taller than the window, which is what a plugin drawing a long
+    // form produces: the page is clipped, the footer is not moved.
+    let mut tall = page_node(NodeShape::Rect, 0.0, 0.0, 400.0, 900.0);
+    tall.fill = PageColor::rgba(40, 44, 52, 255);
+    let view = page_view(vec![tall]);
+
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+
+    let window = NativeLauncherConfig::default();
+    let footer = position_of(&frame, "Demo Page");
+    assert!(
+        footer.y + crikey_ui::egui::TextStyle::Small.resolve(&context.style()).size <= window.height as f32,
+        "the page's title line is the footer, and it must be drawn inside the window: found at \
+         {footer:?} in a {}px window",
+        window.height
+    );
+    assert!(
+        painted(&frame, "Demo Plugin"),
+        "the footer must name the plugin whose surface is showing"
+    );
+}
+
+/// A page waiting on its plugin has to look different from one that is up to
+/// date, because the nodes on screen are the previous answer and the user
+/// cannot otherwise tell.
+#[test]
+fn a_stale_page_says_so_in_the_status_line() {
+    let context = create_launcher_context();
+    let mut view = page_view(vec![page_node(NodeShape::Rect, 0.0, 0.0, 40.0, 40.0)]);
+
+    let fresh = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(!painted(&fresh, "Waiting for the plugin"));
+
+    view.page.as_mut().expect("the fixture opens a page").stale = true;
+    let stale = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(
+        painted(&stale, "Waiting for the plugin"),
+        "a stale page must be visibly distinguishable from a fresh one"
+    );
 }

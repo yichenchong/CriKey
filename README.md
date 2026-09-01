@@ -169,7 +169,10 @@ edit. It takes Cargo's own build lock and holds it while it works, so it will
 not delete artefacts out from under a running build.
 
 To have it happen without being asked, install the timer described in
-[docs/development.md](docs/development.md).
+[docs/development.md](docs/development.md). To tie the clearing to a build
+instead of to the clock, `scripts/dev-rebuild.sh test --workspace` prunes and
+then forwards to Cargo; it costs a cold build every time, so it is a separate
+command rather than a change to `cargo`.
 
 ### Python
 

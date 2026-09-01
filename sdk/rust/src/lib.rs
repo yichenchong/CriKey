@@ -17,7 +17,10 @@ pub mod bench;
 pub mod harness;
 pub mod packaging;
 
-pub use builder::{ActionBuilder, ItemBuilder};
+pub use builder::{ActionBuilder, ItemBuilder, PageBuilder, PageRect};
+pub use crikey_core::{
+    NodeRole, NodeShape, PageColor, PageError, PageFrame, PageInput, PageInputKind, PageNode,
+};
 pub use crikey_native_protocol as protocol;
 pub use serve::{serve, serve_on, HandshakeInfo, ServeConfig};
 
@@ -153,6 +156,86 @@ pub struct ExecuteRequest {
     pub argument: Option<String>,
 }
 
+/// What the host should do once an action has run (spec 10.4, 27.4).
+///
+/// An action that opened a page has not finished the user's task, it has
+/// handed the user a surface, and the host has to be told which one: the
+/// launcher stays open on the named page instead of dismissing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ExecuteOutcome {
+    /// The action did its work and the host may dismiss the launcher.
+    #[default]
+    Completed,
+    /// The action opened a page; the host draws it by asking the plugin for
+    /// frames under this identifier.
+    ShowPage {
+        /// The page the plugin will draw. Chosen by the plugin and echoed
+        /// back in every [`PageRequest`], so one plugin can own several.
+        page_id: String,
+    },
+}
+
+impl ExecuteOutcome {
+    /// Reports that this action opened `page_id`.
+    pub fn show_page(page_id: impl Into<String>) -> Self {
+        Self::ShowPage {
+            page_id: page_id.into(),
+        }
+    }
+}
+
+/// Lets a plugin whose action merely ran keep writing the outcome it has
+/// always written, so extending the vocabulary costs existing authors nothing.
+impl From<()> for ExecuteOutcome {
+    fn from((): ()) -> Self {
+        Self::Completed
+    }
+}
+
+/// The launcher's own colours, handed to a page so it can match the theme it
+/// is drawn inside (spec 27.3).
+///
+/// A page never reads the host's configuration, so this is the only way its
+/// surface can look like part of the launcher rather than pasted onto it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagePalette {
+    /// Background of the page area.
+    pub surface: PageColor,
+    /// Body text on `surface`.
+    pub text: PageColor,
+    /// Selection and primary-control colour.
+    pub accent: PageColor,
+    /// Secondary text and hairlines.
+    pub muted: PageColor,
+}
+
+/// One host request for a page frame (spec 27.3).
+///
+/// Pages are host-driven exactly like suggestions: the plugin is asked for a
+/// frame and answers once. It never pushes, so a page cannot repaint the
+/// user's screen at a moment the host did not choose.
+#[derive(Debug, Clone)]
+pub struct PageRequest {
+    /// The page the plugin named when its action returned
+    /// [`ExecuteOutcome::ShowPage`].
+    pub page_id: String,
+    /// Monotonic per page. The frame answering it carries it back, and the
+    /// host drops any frame answering an older one.
+    pub generation: u64,
+    /// Viewport width in logical pixels.
+    pub width: u32,
+    /// Viewport height in logical pixels.
+    pub height: u32,
+    /// Everything the user did since the previous frame, in order. The host
+    /// has already hit-tested each event, so [`PageInput::node_id`] names the
+    /// node it landed on.
+    pub events: Vec<PageInput>,
+    /// Whether the page currently owns the keyboard.
+    pub focused: bool,
+    /// The launcher's colours for this frame.
+    pub palette: PagePalette,
+}
+
 /// What a host [`ResourceRequest`] is asking for (spec 16.4).
 ///
 /// [`ResourceRequest`]: protocol::message::ResourceRequest
@@ -199,6 +282,39 @@ pub trait Plugin {
 
     /// Executes one selected item or action.
     fn execute(&mut self, request: ExecuteRequest, context: &dyn PluginContext) -> Result<()>;
+
+    /// Executes one selected item or action and reports what the host should
+    /// do next (spec 10.4, 27.4).
+    ///
+    /// This is the method the host calls; the default forwards to
+    /// [`Plugin::execute`] and reports [`ExecuteOutcome::Completed`], which is
+    /// exactly what every plugin written before pages existed already meant.
+    /// A plugin that opens a page overrides this one instead, because Rust
+    /// cannot widen the `Ok(())` those authors already wrote into a richer
+    /// outcome and silently changing what their action reports would be worse
+    /// than asking the page-drawing minority for one more method.
+    fn execute_outcome(
+        &mut self,
+        request: ExecuteRequest,
+        context: &dyn PluginContext,
+    ) -> Result<ExecuteOutcome> {
+        self.execute(request, context).map(ExecuteOutcome::from)
+    }
+
+    /// Draws one frame of a page the plugin opened (spec 27.3).
+    ///
+    /// The default closes the page. A plugin that returned
+    /// [`ExecuteOutcome::ShowPage`] without implementing this has opened a
+    /// surface nobody owns, and closing it immediately is the only honest
+    /// answer: the alternative leaves the user looking at an empty rectangle
+    /// they cannot dismiss except by escaping the launcher.
+    fn page(&mut self, request: PageRequest, _context: &dyn PluginContext) -> Result<PageFrame> {
+        Ok(PageFrame {
+            generation: request.generation,
+            close: true,
+            ..PageFrame::default()
+        })
+    }
 
     /// Stops plugin state during orderly shutdown.
     fn stop(&mut self, context: &dyn PluginContext) -> Result<()>;

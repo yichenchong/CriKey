@@ -1,10 +1,13 @@
-//! Fluent item and action builders (spec 10.1, 10.4).
+//! Fluent item, action and page builders (spec 10.1, 10.4, 27.3).
 
 use std::collections::BTreeMap;
 
 use crikey_core::{
-    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, PluginId,
+    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, NodeRole,
+    NodeShape, PageColor, PageFrame, PageNode, PluginId,
 };
+
+use crate::PagePalette;
 
 /// Builds a core [`Item`] with the plugin-author defaults (spec 10.1–10.3).
 #[must_use = "call ItemBuilder::build to create the item"]
@@ -167,6 +170,334 @@ impl ActionBuilder {
             applicable_categories: self.applicable_categories,
             icon_reference: self.icon_reference,
             execution_policy: self.execution_policy,
+        }
+    }
+}
+
+/// The host's body text size, used to estimate where a label sits when the
+/// node leaves [`PageNode::text_size`] at zero.
+const HOST_BODY_TEXT_SIZE: f32 = 14.0;
+
+/// Fraction of the text size one glyph advances, averaged over a proportional
+/// face. Font metrics do not cross the plugin boundary - the host lays out no
+/// glyphs and the plugin owns every coordinate - so a centred label is centred
+/// from an estimate. A long proportional string therefore sits a pixel or two
+/// off centre, which is the price of not shipping a font engine to every
+/// plugin author.
+const AVERAGE_GLYPH_ADVANCE: f32 = 0.5;
+
+/// Height of one line as a multiple of the text size, matching the host's
+/// single-line galley closely enough to centre a control's label vertically.
+const LINE_HEIGHT: f32 = 1.25;
+
+/// Size of a page heading: above the launcher's body and label text so a
+/// page's own title reads as a heading, below its query row so a page never
+/// competes with the launcher's own chrome.
+const HEADING_TEXT_SIZE: f32 = 20.0;
+
+/// Corner radius shared by the page controls, so a page built from these
+/// helpers looks like one surface rather than an assortment.
+const CONTROL_ROUNDING: f32 = 6.0;
+
+/// Side of a checkbox indicator, and therefore the height of a checkbox row.
+const CHECKBOX_EDGE: f32 = 18.0;
+
+/// Gap between a checkbox indicator and its text.
+const CHECKBOX_LABEL_GAP: f32 = 10.0;
+
+/// Inset of a text field's contents from its frame.
+const FIELD_TEXT_INSET: f32 = 8.0;
+
+/// Hairline weight for the frames the page controls draw.
+const CONTROL_STROKE: f32 = 1.5;
+
+/// Width the host will advance drawing `text` at `size`, estimated.
+fn text_advance(text: &str, size: f32) -> f32 {
+    let size = if size > 0.0 { size } else { HOST_BODY_TEXT_SIZE };
+    text.chars().count() as f32 * size * AVERAGE_GLYPH_ADVANCE
+}
+
+/// Top of a single line of `size` text centred inside a `height`-tall box.
+fn centred_line_top(y: f32, height: f32, size: f32) -> f32 {
+    let size = if size > 0.0 { size } else { HOST_BODY_TEXT_SIZE };
+    y + (height - size * LINE_HEIGHT) / 2.0
+}
+
+/// Builds one frame of a plugin-drawn page (spec 27.3).
+///
+/// A thin constructor over [`PageNode`], never a layout engine: it fills in
+/// the fields a control needs to be drawable, hit-testable and announceable at
+/// coordinates the author chose, so an author writes a page without hand-
+/// filling sixteen struct fields per node and without any chance of shipping a
+/// button no screen reader can name.
+#[must_use = "call PageBuilder::build to create the frame"]
+#[derive(Debug, Clone)]
+pub struct PageBuilder {
+    generation: u64,
+    title: String,
+    nodes: Vec<PageNode>,
+    focus_node: u32,
+    redraw_after_ms: u32,
+    close: bool,
+    palette: PagePalette,
+}
+
+/// Where a control sits, in the page's own logical pixels.
+///
+/// Controls take one of these rather than four loose floats: the four always
+/// travel together, and an argument list long enough to transpose two of them
+/// is a bug the compiler cannot catch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl PageRect {
+    pub const fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self { x, y, width, height }
+    }
+}
+
+impl PageBuilder {
+    /// Starts a frame answering `generation`, drawn in the host's palette.
+    ///
+    /// The generation comes straight from the request being answered: the host
+    /// drops a frame that answers an older one, so a builder that invented its
+    /// own counter would blank the page.
+    pub fn new(generation: u64, palette: PagePalette) -> Self {
+        Self {
+            generation,
+            title: String::new(),
+            nodes: Vec::new(),
+            focus_node: 0,
+            redraw_after_ms: 0,
+            close: false,
+            palette,
+        }
+    }
+
+    /// Sets the title the launcher shows beside the page.
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
+        self
+    }
+
+    /// Asks the host to focus one of this frame's nodes.
+    pub fn focus(mut self, node_id: u32) -> Self {
+        self.focus_node = node_id;
+        self
+    }
+
+    /// Asks for another frame after `milliseconds` even without input.
+    pub fn redraw_after_ms(mut self, milliseconds: u32) -> Self {
+        self.redraw_after_ms = milliseconds;
+        self
+    }
+
+    /// Ends the page from the plugin's side.
+    pub fn close(mut self) -> Self {
+        self.close = true;
+        self
+    }
+
+    /// Adds a node the helpers do not cover.
+    pub fn node(mut self, node: PageNode) -> Self {
+        self.nodes.push(node);
+        self
+    }
+
+    /// Fills a rectangle.
+    pub fn rect(self, x: f32, y: f32, width: f32, height: f32, fill: PageColor) -> Self {
+        self.rounded_rect(x, y, width, height, 0.0, fill)
+    }
+
+    /// Fills a rectangle with rounded corners.
+    pub fn rounded_rect(
+        self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        rounding: f32,
+        fill: PageColor,
+    ) -> Self {
+        self.node(PageNode {
+            shape: NodeShape::Rect,
+            x,
+            y,
+            width,
+            height,
+            fill,
+            rounding,
+            ..PageNode::default()
+        })
+    }
+
+    /// Draws one line of text with its top-left corner at `x`, `y`. A `size`
+    /// of zero takes the host's body size.
+    pub fn text(self, x: f32, y: f32, text: impl Into<String>, size: f32, colour: PageColor) -> Self {
+        self.node(PageNode {
+            shape: NodeShape::Text,
+            x,
+            y,
+            fill: colour,
+            text: text.into(),
+            text_size: size,
+            ..PageNode::default()
+        })
+    }
+
+    /// Draws a page heading, announced as one.
+    ///
+    /// Carries a measured rect as well as glyphs because the rect is what the
+    /// host reports upwards: a heading with no extent is text a screen reader
+    /// cannot place.
+    pub fn heading(self, x: f32, y: f32, text: impl Into<String>) -> Self {
+        let text = text.into();
+        let width = text_advance(&text, HEADING_TEXT_SIZE);
+        let fill = self.palette.text;
+        self.node(PageNode {
+            shape: NodeShape::Text,
+            x,
+            y,
+            width,
+            height: HEADING_TEXT_SIZE * LINE_HEIGHT,
+            fill,
+            text,
+            text_size: HEADING_TEXT_SIZE,
+            role: NodeRole::Heading,
+            ..PageNode::default()
+        })
+    }
+
+    /// Draws a button: the accent-filled rect that carries the hit target,
+    /// the role and the accessible name, plus its centred caption.
+    ///
+    /// The caption is a separate anonymous node because only one node may own
+    /// `node_id`, and the one that owns it must be the one the host hit-tests.
+    pub fn button(self, node_id: u32, rect: PageRect, label: impl Into<String>) -> Self {
+        let PageRect { x, y, width, height } = rect;
+        let label = label.into();
+        let caption = label.clone();
+        let accent = self.palette.accent;
+        let surface = self.palette.surface;
+        let caption_x = x + (width - text_advance(&caption, 0.0)) / 2.0;
+        let caption_y = centred_line_top(y, height, 0.0);
+        self.node(PageNode {
+            shape: NodeShape::Rect,
+            x,
+            y,
+            width,
+            height,
+            fill: accent,
+            rounding: CONTROL_ROUNDING,
+            role: NodeRole::Button,
+            label,
+            node_id,
+            ..PageNode::default()
+        })
+        .text(caption_x, caption_y, caption, 0.0, surface)
+    }
+
+    /// Draws a checkbox row: the indicator carries the state and the
+    /// semantics, the text beside it is decoration.
+    pub fn checkbox(self, node_id: u32, x: f32, y: f32, label: impl Into<String>, checked: bool) -> Self {
+        let label = label.into();
+        let caption = label.clone();
+        let accent = self.palette.accent;
+        let muted = self.palette.muted;
+        let surface = self.palette.surface;
+        let text_colour = self.palette.text;
+        let builder = self.node(PageNode {
+            shape: NodeShape::Rect,
+            x,
+            y,
+            width: CHECKBOX_EDGE,
+            height: CHECKBOX_EDGE,
+            fill: if checked { accent } else { PageColor::TRANSPARENT },
+            stroke: muted,
+            stroke_width: CONTROL_STROKE,
+            rounding: CONTROL_ROUNDING / 2.0,
+            role: NodeRole::Checkbox,
+            label,
+            node_id,
+            checked,
+            ..PageNode::default()
+        });
+        let builder = if checked {
+            // The tick is drawn as text rather than a shape because the
+            // vocabulary has no polyline, and it is anonymous so the
+            // indicator it sits on keeps the single hit target.
+            builder.text(
+                x + CHECKBOX_EDGE / 4.0,
+                centred_line_top(y, CHECKBOX_EDGE, 0.0),
+                "\u{2713}",
+                0.0,
+                surface,
+            )
+        } else {
+            builder
+        };
+        builder.text(
+            x + CHECKBOX_EDGE + CHECKBOX_LABEL_GAP,
+            centred_line_top(y, CHECKBOX_EDGE, 0.0),
+            caption,
+            0.0,
+            text_colour,
+        )
+    }
+
+    /// Draws a text field showing `value`.
+    ///
+    /// The page owns the edit state: nothing here tracks a caret or a
+    /// selection, because the host routes committed text and named keys and
+    /// the plugin decides what they mean.
+    pub fn text_field(
+        self,
+        node_id: u32,
+        rect: PageRect,
+        label: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        let PageRect { x, y, width, height } = rect;
+        let muted = self.palette.muted;
+        let text_colour = self.palette.text;
+        self.node(PageNode {
+            shape: NodeShape::Rect,
+            x,
+            y,
+            width,
+            height,
+            fill: PageColor::TRANSPARENT,
+            stroke: muted,
+            stroke_width: CONTROL_STROKE,
+            rounding: CONTROL_ROUNDING,
+            role: NodeRole::TextField,
+            label: label.into(),
+            node_id,
+            ..PageNode::default()
+        })
+        .text(
+            x + FIELD_TEXT_INSET,
+            centred_line_top(y, height, 0.0),
+            value,
+            0.0,
+            text_colour,
+        )
+    }
+
+    /// Consumes the builder and produces the frame.
+    pub fn build(self) -> PageFrame {
+        PageFrame {
+            generation: self.generation,
+            title: self.title,
+            nodes: self.nodes,
+            focus_node: self.focus_node,
+            redraw_after_ms: self.redraw_after_ms,
+            close: self.close,
         }
     }
 }

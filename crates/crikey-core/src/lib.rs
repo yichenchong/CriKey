@@ -8,6 +8,7 @@ pub mod activation;
 pub mod error;
 pub mod generation;
 pub mod item;
+pub mod page;
 pub mod path;
 
 pub use action::{Action, ActionId, ExecutionPolicy};
@@ -15,4 +16,8 @@ pub use activation::{ActivationPattern, ActivationPatternError, COMPILED_SIZE_LI
 pub use error::{CoreError, Result};
 pub use generation::{Generation, GenerationTracker};
 pub use item::{ArgumentPolicy, Category, HitPolicy, Item, ItemId, PluginId, PLUGIN_DEFINED_PREFIX};
+pub use page::{
+    NodeRole, NodeShape, PageColor, PageError, PageFrame, PageInput, PageInputKind, PageNode, PagePalette,
+    MAX_NODE_TEXT_BYTES, MAX_PAGE_EDGE, MAX_PAGE_NODES,
+};
 pub use path::PlatformPath;

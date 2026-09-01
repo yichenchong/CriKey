@@ -1594,7 +1594,7 @@ impl LegacyDriver {
                                     plugin,
                                     item_id,
                                     action_id,
-                                    outcome,
+                                    outcome: outcome.map(|()| crate::ActionEffect::Completed),
                                 },
                             );
                             *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
@@ -1641,6 +1641,7 @@ impl LegacyDriver {
                         settings_focus: None,
                         show_hints: true,
                         rounded_corners: true,
+                        page: None,
                     };
 
                     // Keep the staleness check, queued-job check, and

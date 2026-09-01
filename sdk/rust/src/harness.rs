@@ -7,14 +7,14 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crikey_core::{CoreError, Item, PluginId, Result};
+use crikey_core::{CoreError, Item, PageFrame, PageInput, PluginId, Result};
 use crikey_native_protocol::message::{self, Envelope, HandshakeAck, Payload};
 use crikey_native_protocol::transport::Transport;
 use crikey_native_protocol::{Capabilities, Message, MAX_FRAME_BYTES, PROTOCOL_VERSION};
 
 use crate::{
-    serve_on, CatalogSink, ExecuteRequest, Plugin, PluginContext, PluginEvent, Query, SdkError, ServeConfig,
-    SuggestionSink,
+    serve_on, CatalogSink, ExecuteOutcome, ExecuteRequest, PagePalette, PageRequest, Plugin, PluginContext,
+    PluginEvent, Query, SdkError, ServeConfig, SuggestionSink,
 };
 
 /// Terminal state folded by [`TestHarness::suggest`].
@@ -44,6 +44,21 @@ const HARNESS_MAX_ITEMS_PER_QUERY: usize = 10_000;
 const HARNESS_MAX_BATCHES_PER_QUERY: usize = 512;
 const HARNESS_MAX_BYTES_PER_QUERY: usize = 32 * 1024 * 1024;
 const HARNESS_MAX_CATALOG_ITEMS: usize = 500_000;
+/// Viewport the harness asks a page to draw into: the launcher's own page area
+/// rather than a round number, so a page laid out against the harness looks
+/// the same when a user opens it.
+const HARNESS_PAGE_WIDTH: u32 = 720;
+const HARNESS_PAGE_HEIGHT: u32 = 400;
+
+/// A dark palette in the shape the host hands out, so a page tested here is
+/// tested against non-zero colours and a plugin that ignores the palette shows
+/// up as an invisible surface in the test rather than only on a user's screen.
+const HARNESS_PALETTE: PagePalette = PagePalette {
+    surface: crikey_core::PageColor::rgba(0x1E, 0x1E, 0x1E, 0xFF),
+    text: crikey_core::PageColor::rgba(0xF0, 0xF0, 0xF0, 0xFF),
+    accent: crikey_core::PageColor::rgba(0x3B, 0x82, 0xF6, 0xFF),
+    muted: crikey_core::PageColor::rgba(0x8A, 0x8A, 0x8A, 0xFF),
+};
 
 struct StartupProbe {
     plugin: Box<dyn Plugin + Send>,
@@ -78,6 +93,18 @@ impl Plugin for StartupProbe {
 
     fn execute(&mut self, request: ExecuteRequest, context: &dyn PluginContext) -> Result<()> {
         self.plugin.execute(request, context)
+    }
+
+    fn execute_outcome(
+        &mut self,
+        request: ExecuteRequest,
+        context: &dyn PluginContext,
+    ) -> Result<ExecuteOutcome> {
+        self.plugin.execute_outcome(request, context)
+    }
+
+    fn page(&mut self, request: PageRequest, context: &dyn PluginContext) -> Result<PageFrame> {
+        self.plugin.page(request, context)
     }
 
     fn stop(&mut self, context: &dyn PluginContext) -> Result<()> {
@@ -356,12 +383,30 @@ impl TestHarness {
         self.cancel_latched = true;
     }
 
+    /// Executes an action and requires it to have completed.
     pub fn execute(
         &mut self,
         item: &str,
         action: Option<&str>,
         argument: Option<&str>,
     ) -> Result<(), SdkError> {
+        match self.execute_outcome(item, action, argument)? {
+            ExecuteOutcome::Completed => Ok(()),
+            ExecuteOutcome::ShowPage { page_id } => Err(SdkError::Protocol(format!(
+                "action opened page {page_id} instead of completing"
+            ))),
+        }
+    }
+
+    /// Executes an action and reports what it told the host to do next, so a
+    /// test can prove an action opened a page rather than merely succeeding
+    /// (spec 10.4, 27.4).
+    pub fn execute_outcome(
+        &mut self,
+        item: &str,
+        action: Option<&str>,
+        argument: Option<&str>,
+    ) -> Result<ExecuteOutcome, SdkError> {
         let request_id = self.next_request();
         self.send(Envelope {
             connection_id: 1,
@@ -381,7 +426,17 @@ impl TestHarness {
             self.check_identity(&envelope, request_id, 0)?;
             match envelope.payload {
                 Some(Payload::Log(_)) => {}
-                Some(Payload::ExecuteResult(result)) if result.outcome.as_i32() == 1 => return Ok(()),
+                Some(Payload::ExecuteResult(result)) if result.outcome.as_i32() == 1 => {
+                    return Ok(ExecuteOutcome::Completed)
+                }
+                Some(Payload::ExecuteResult(result)) if result.outcome.as_i32() == 4 => {
+                    if result.page_id.is_empty() {
+                        return Err(SdkError::Protocol(
+                            "action reported a page without naming it".to_owned(),
+                        ));
+                    }
+                    return Ok(ExecuteOutcome::show_page(result.page_id));
+                }
                 Some(Payload::ExecuteResult(result)) => {
                     let detail = result
                         .error
@@ -396,6 +451,64 @@ impl TestHarness {
                     )))
                 }
                 None => return Err(SdkError::Protocol("empty execute response".to_owned())),
+            }
+        }
+    }
+
+    /// Asks the plugin for one page frame and returns what it drew (spec 27.3).
+    ///
+    /// Mirrors the host exactly: one request, one frame, the events the user
+    /// produced since the previous frame, and the generation the frame must
+    /// echo. The frame is returned undecided - the harness does not drop a
+    /// mismatched generation the way the host does, so a test can observe the
+    /// mismatch instead of an empty page.
+    pub fn page(
+        &mut self,
+        page_id: &str,
+        generation: u64,
+        events: Vec<PageInput>,
+        focused: bool,
+    ) -> Result<PageFrame, SdkError> {
+        let request_id = self.next_request();
+        self.send(Envelope {
+            connection_id: 1,
+            request_id,
+            generation: 0,
+            deadline_ms: 0,
+            payload: Some(Payload::PageRequest(message::PageRequest {
+                page_id: page_id.to_owned(),
+                generation,
+                width: HARNESS_PAGE_WIDTH,
+                height: HARNESS_PAGE_HEIGHT,
+                events: events
+                    .iter()
+                    .map(crikey_native_protocol::convert::to_proto_page_input)
+                    .collect(),
+                focused,
+                colour_surface: HARNESS_PALETTE.surface.to_u32(),
+                colour_text: HARNESS_PALETTE.text.to_u32(),
+                colour_accent: HARNESS_PALETTE.accent.to_u32(),
+                colour_muted: HARNESS_PALETTE.muted.to_u32(),
+                unknown: Default::default(),
+            })),
+            unknown: Default::default(),
+        })?;
+        loop {
+            let envelope = self.recv()?;
+            self.check_identity(&envelope, request_id, 0)?;
+            match envelope.payload {
+                Some(Payload::Log(_)) => {}
+                Some(Payload::PageFrame(frame)) => {
+                    return Ok(crikey_native_protocol::convert::from_proto_page_frame(&frame))
+                }
+                Some(Payload::Error(error)) => return Err(SdkError::Protocol(error.message)),
+                Some(payload) => {
+                    return Err(SdkError::Protocol(format!(
+                        "expected page frame, got {}",
+                        payload.kind()
+                    )))
+                }
+                None => return Err(SdkError::Protocol("empty page response".to_owned())),
             }
         }
     }

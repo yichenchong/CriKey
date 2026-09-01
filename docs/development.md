@@ -223,13 +223,29 @@ ExecStart=%h/projects/crikey/scripts/prune-build-cache.sh
 Description=Periodically reclaim disk from the CriKey Cargo build directory
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=1h
+OnCalendar=hourly
 Persistent=true
+RandomizedDelaySec=5min
+AccuracySec=1min
 
 [Install]
 WantedBy=timers.target
 ```
+
+The timer is deliberately **calendar-based rather than monotonic**. An earlier
+version of this recipe used `OnBootSec=10min` with `OnUnitActiveSec=1h`, and it
+silently stopped working. A monotonic timer's elapse points are relative to
+boot and to the service's own last activation, so when the user manager
+restarts — a logout, a session change — both points are already in the past,
+nothing re-arms them, and the timer parks in `active (elapsed)` with
+`Trigger: n/a`, meaning it will never fire again. `Persistent=true` does not
+rescue it, because that key applies to calendar timers only and is ignored for
+a monotonic-only timer. On one machine this left the timer dead for 13 days
+while `target/debug` grew from 3.3 GB to 32 GB and nearly filled the disk.
+
+`OnCalendar=hourly` has an absolute next elapse point that survives a manager
+restart, and with it `Persistent=true` becomes meaningful: a run missed while
+logged out or suspended fires once the manager is back.
 
 Then:
 
@@ -239,6 +255,16 @@ systemctl --user enable --now crikey-prune-build-cache.timer
 systemctl --user list-timers crikey-prune-build-cache.timer
 journalctl --user -u crikey-prune-build-cache.service -n 20
 ```
+
+After installing it, confirm the timer is actually armed rather than merely
+enabled — `enabled` and `active` are both true of the dead state above:
+
+```sh
+systemctl --user list-timers crikey-prune-build-cache.timer
+```
+
+`NEXT` and `LEFT` must name a future time. If `NEXT` is `n/a`, the timer will
+never fire.
 
 Adjust `ExecStart` if your checkout is not at `~/projects/crikey`. The service
 runs at lowest priority and idle input/output scheduling, so it will not
@@ -262,6 +288,33 @@ regardless, enable lingering once (this is the only step needing root):
 ```sh
 sudo loginctl enable-linger "$USER"
 ```
+
+### Clearing on every rebuild
+
+The timer above is periodic, so between two of its runs a heavy session still
+accumulates. When you want the clearing tied to the build itself rather than to
+the clock, use the wrapper:
+
+```sh
+scripts/dev-rebuild.sh                     # prune, then `cargo build`
+scripts/dev-rebuild.sh test --workspace    # prune, then `cargo test --workspace`
+scripts/dev-rebuild.sh clippy --all-targets
+```
+
+It runs `prune-build-cache.sh --force` and then execs Cargo with every argument
+forwarded unchanged, so the exit status is Cargo's own and Ctrl-C reaches the
+compiler. The prune stage reports on stderr, leaving stdout clean for commands
+with machine-readable output such as `metadata` or `--message-format json`.
+
+Two things about it are deliberate. It is a separate entry point rather than
+anything that alters `cargo`, because Cargo has no post-build hook on the stable
+toolchain: aliases in `.cargo/config.toml` may only name Cargo subcommands, and
+a `build.rs` cannot delete the profile the compiler invoking it is writing to.
+And the cost is opt-in, because it is real — every invocation is a cold build of
+whatever the command needs, since the artefacts a previous build left are
+exactly the incremental cache it deletes first. Plain `cargo build`, `cargo
+test` and `cargo clippy` are unaffected by the script existing; reach for the
+wrapper when disk matters more than latency, and use Cargo directly otherwise.
 
 ## Commit identity
 

@@ -11,10 +11,11 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crikey_core::{CoreError, Result};
-use crikey_plugin_sdk::{
-    serve, CatalogSink, ExecuteRequest, ItemBuilder, Plugin, PluginContext, PluginResource, Query,
-    ResourceKind, SdkError, ServeConfig, SuggestionSink,
+use crikey_core::{CoreError, PageFrame, PageInput, PageInputKind, Result};
+use crikey_plugin_sdk::{PageRect, 
+    serve, ActionBuilder, CatalogSink, ExecuteOutcome, ExecuteRequest, ItemBuilder, PageBuilder,
+    PageRequest, Plugin, PluginContext, PluginResource, Query, ResourceKind, SdkError, ServeConfig,
+    SuggestionSink,
 };
 
 const MODE_ENV: &str = "CRIKEY_CONFORMANCE_MODE";
@@ -41,6 +42,9 @@ enum Mode {
     Icon,
     IconSlow,
     IconSilent,
+    /// Publishes the interactive demo page and nothing else, so the surface a
+    /// host draws is attributable to exactly one item.
+    Page,
 }
 
 fn candidate(value: Option<String>) -> Option<String> {
@@ -73,6 +77,7 @@ fn parse_mode(spec: &str) -> Mode {
         "icon" => Mode::Icon,
         "icon-slow" => Mode::IconSlow,
         "icon-silent" => Mode::IconSilent,
+        "page" => Mode::Page,
         _ if spec.starts_with("stream:") => Mode::Stream(
             spec.strip_prefix("stream:")
                 .and_then(|value| value.parse::<usize>().ok())
@@ -257,6 +262,192 @@ fn icon_items() -> Vec<crikey_core::Item> {
     .collect()
 }
 
+/// The page this fixture draws. One plugin may own several, so the identifier
+/// travels in every request rather than being assumed.
+const PAGE_ID: &str = "playground";
+/// The item whose action opens the page.
+const PAGE_ITEM_ID: &str = "page-playground";
+/// The action that opens it. Named separately from the item because the host
+/// may run it as the item's default action or as a chosen one.
+const PAGE_ACTION_ID: &str = "open-page";
+
+/// Node identities, stable across every frame this fixture draws: the host
+/// reports the node an event landed on, so these are the fixture's entire
+/// input routing table.
+const NODE_DECREASE: u32 = 1;
+const NODE_INCREASE: u32 = 2;
+const NODE_ANNOUNCE: u32 = 3;
+const NODE_NOTE: u32 = 4;
+const NODE_CLOSE: u32 = 5;
+
+/// Longest note the page keeps. A page rebuilds its display list on every
+/// keystroke, so the text it carries has to be bounded by the plugin: the host
+/// bounds the frame, not the plugin's own state.
+const MAX_NOTE_CHARS: usize = 48;
+
+/// The item a user searches for to reach the page.
+fn page_item() -> crikey_core::Item {
+    ItemBuilder::new(PAGE_ITEM_ID, "Page Playground")
+        .target(format!("page:{PAGE_ID}"))
+        .description("Open the plugin-drawn demo page")
+        .search_term("page")
+        .search_term("playground")
+        .action(
+            ActionBuilder::new(PAGE_ACTION_ID, "Open Page")
+                .description("Draw the conformance plugin's interactive page")
+                .build(),
+        )
+        .build()
+}
+
+/// Everything the demo page remembers between frames.
+///
+/// The page is redrawn from scratch on every request, so this is the only
+/// place its content exists: a host that dropped a frame or asked twice for
+/// the same generation cannot change what the user sees.
+#[derive(Debug, Default)]
+struct PageState {
+    counter: i64,
+    announce: bool,
+    note: String,
+    /// The node the host last told the page was focused, which is how typed
+    /// text knows where to land. The host owns focus appearance; the page only
+    /// owns what focus means.
+    focused_node: u32,
+    /// The node this page will ask the host to focus on its next frame, and
+    /// only that frame: repeating the request every frame would drag focus
+    /// back out of wherever the user moved it.
+    pending_focus: u32,
+    /// Set when the user asked the page to finish, so the next frame closes it
+    /// from the plugin's side instead of waiting for Escape.
+    closing: bool,
+}
+
+impl PageState {
+    /// Applies one host event. Unknown kinds are ignored rather than guessed
+    /// at: an SDK newer than this fixture may route events it never heard of.
+    fn apply(&mut self, event: &PageInput) {
+        match event.kind {
+            PageInputKind::Opened => {
+                *self = Self {
+                    focused_node: NODE_NOTE,
+                    pending_focus: NODE_NOTE,
+                    ..Self::default()
+                };
+            }
+            PageInputKind::FocusChanged => self.focused_node = event.node_id,
+            PageInputKind::Activated => match event.node_id {
+                NODE_DECREASE => self.counter = self.counter.saturating_sub(1),
+                NODE_INCREASE => self.counter = self.counter.saturating_add(1),
+                NODE_ANNOUNCE => self.announce = !self.announce,
+                NODE_CLOSE => self.closing = true,
+                _ => {}
+            },
+            PageInputKind::KeyPressed => match event.key.as_str() {
+                "ArrowUp" => self.counter = self.counter.saturating_add(1),
+                "ArrowDown" => self.counter = self.counter.saturating_sub(1),
+                "Backspace" if self.focused_node == NODE_NOTE => {
+                    self.note.pop();
+                }
+                _ => {}
+            },
+            PageInputKind::TextInput if self.focused_node == NODE_NOTE => {
+                for character in event.text.chars() {
+                    if self.note.chars().count() >= MAX_NOTE_CHARS {
+                        break;
+                    }
+                    self.note.push(character);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Draws the page: a heading, a counter the user changes, a checkbox, a
+    /// note the user types into, and a button that ends the page.
+    fn frame(&mut self, request: &PageRequest) -> PageFrame {
+        let palette = request.palette;
+        let width = request.width as f32;
+        let height = request.height as f32;
+        let mut page = PageBuilder::new(request.generation, palette)
+            .title("Page Playground")
+            .rect(0.0, 0.0, width, height, palette.surface)
+            .heading(28.0, 24.0, "Page Playground")
+            .text(
+                28.0,
+                58.0,
+                "Drawn by the host from a display list this plugin sent. No pixels crossed.",
+                0.0,
+                palette.muted,
+            )
+            .text(28.0, 100.0, "Counter", 0.0, palette.muted)
+            .text(28.0, 118.0, self.counter.to_string(), 32.0, palette.text)
+            .button(NODE_DECREASE, PageRect::new(150.0, 124.0, 116.0, 36.0), "Decrease")
+            .button(NODE_INCREASE, PageRect::new(278.0, 124.0, 116.0, 36.0), "Increase")
+            .text(
+                408.0,
+                134.0,
+                "Arrow up and down work too",
+                0.0,
+                palette.muted,
+            )
+            .checkbox(
+                NODE_ANNOUNCE,
+                28.0,
+                190.0,
+                "Announce the counter out loud",
+                self.announce,
+            )
+            .text(28.0, 232.0, "Note", 0.0, palette.muted)
+            .text_field(NODE_NOTE, PageRect::new(28.0, 252.0, 420.0, 36.0), "Note", self.note.clone());
+        if self.note.is_empty() {
+            // A placeholder is the page's own doing: the vocabulary has one
+            // text colour per node, so an empty field says so in muted text
+            // rather than the host inventing a hint it cannot know.
+            page = page.text(
+                36.0,
+                262.0,
+                "Type here and the page redraws",
+                0.0,
+                palette.muted,
+            );
+        }
+        let status = format!(
+            "{} characters typed - the counter is {}",
+            self.note.chars().count(),
+            if self.announce { "loud" } else { "quiet" }
+        );
+        page = page
+            .text(
+                28.0,
+                302.0,
+                status,
+                0.0,
+                if self.announce {
+                    palette.accent
+                } else {
+                    palette.muted
+                },
+            )
+            .button(NODE_CLOSE, PageRect::new(28.0, 330.0, 140.0, 36.0), "Close page")
+            .text(
+                184.0,
+                340.0,
+                "Escape closes it too: the host keeps that key.",
+                0.0,
+                palette.muted,
+            );
+        let pending_focus = std::mem::take(&mut self.pending_focus);
+        if pending_focus != 0 {
+            page = page.focus(pending_focus);
+        }
+        if self.closing {
+            page = page.close();
+        }
+        page.build()
+    }
+}
+
 fn wait_for_cancellation(context: &dyn PluginContext, milliseconds: u64) -> bool {
     let deadline = Instant::now()
         .checked_add(Duration::from_millis(milliseconds))
@@ -282,11 +473,18 @@ fn emit_final(sink: &mut dyn SuggestionSink, items: Vec<crikey_core::Item>) -> R
 #[derive(Debug)]
 struct ConformancePlugin {
     mode: Mode,
+    /// State of the demo page. Lives on the plugin rather than in a frame
+    /// because a page is a conversation: the host asks for frame after frame
+    /// and nothing it sends carries the page's own content back.
+    page: PageState,
 }
 
 impl ConformancePlugin {
     fn new(mode: Mode) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            page: PageState::default(),
+        }
     }
 
     fn suggest_echo(&mut self, query: Query, sink: &mut dyn SuggestionSink) -> Result<()> {
@@ -424,10 +622,15 @@ impl Plugin for ConformancePlugin {
             return sink.finish();
         }
 
-        let items = if matches!(self.mode, Mode::EnvWitness) {
-            environment_items()
-        } else {
-            catalog_items()
+        let items = match self.mode {
+            Mode::EnvWitness => environment_items(),
+            // Deliberately empty. The page item is a suggestion, and
+            // publishing the same stable id in the catalog as well makes the
+            // aggregator treat the suggestion as a duplicate of a catalog row
+            // and drop it, so the item never reaches the launcher at all. A
+            // plugin whose whole purpose is one page has nothing to catalog.
+            Mode::Page => Vec::new(),
+            _ => catalog_items(),
         };
         sink.emit_batch(items)?;
         sink.finish()
@@ -454,11 +657,55 @@ impl Plugin for ConformancePlugin {
             Mode::Icon => emit_final(sink, icon_items()),
             Mode::IconSlow => emit_final(sink, vec![icon_item("icon-after-window", ICON_AFTER_WINDOW)]),
             Mode::IconSilent => emit_final(sink, vec![icon_item("icon-never", ICON_NEVER)]),
+            Mode::Page => emit_final(sink, vec![page_item()]),
         }
     }
 
     fn execute(&mut self, _request: ExecuteRequest, _context: &dyn PluginContext) -> Result<()> {
         Ok(())
+    }
+
+    /// Opens the demo page when the page item is run, and behaves exactly as
+    /// before for everything else: the outcome is what tells the host to keep
+    /// the launcher on a surface instead of dismissing it (§27.4).
+    fn execute_outcome(
+        &mut self,
+        request: ExecuteRequest,
+        context: &dyn PluginContext,
+    ) -> Result<ExecuteOutcome> {
+        let opens_page = matches!(self.mode, Mode::Page)
+            && request.item.0 == PAGE_ITEM_ID
+            && request
+                .action
+                .as_ref()
+                .is_none_or(|action| action.0 == PAGE_ACTION_ID);
+        if opens_page {
+            // A fresh session: the host sends `Opened` first, and this makes
+            // the second visit look like the first rather than resuming a
+            // counter the user has forgotten about.
+            self.page = PageState::default();
+            return Ok(ExecuteOutcome::show_page(PAGE_ID));
+        }
+        self.execute(request, context).map(ExecuteOutcome::from)
+    }
+
+    /// Draws one frame of the demo page.
+    ///
+    /// Every event is folded into the page's own state before anything is
+    /// drawn, because the display list is a function of that state: drawing
+    /// while events were still pending would show the user the frame before
+    /// the one they asked for.
+    fn page(&mut self, request: PageRequest, _context: &dyn PluginContext) -> Result<PageFrame> {
+        if request.page_id != PAGE_ID {
+            return Err(invalid(format!(
+                "conformance plugin owns no page {}",
+                request.page_id
+            )));
+        }
+        for event in &request.events {
+            self.page.apply(event);
+        }
+        Ok(self.page.frame(&request))
     }
 
     /// Serves the icon references the icon modes publish, one behaviour per
@@ -529,5 +776,184 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("crikey-conformance-plugin: {error:?}");
         std::process::exit(1);
+    }
+}
+
+/// Proves the demo page is a working surface rather than a picture of one: the
+/// state it holds, the events it honours and the frame it draws.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crikey_core::{NodeRole, PageColor};
+    use crikey_plugin_sdk::PagePalette;
+
+    fn request(generation: u64) -> PageRequest {
+        PageRequest {
+            page_id: PAGE_ID.to_owned(),
+            generation,
+            width: 720,
+            height: 400,
+            events: Vec::new(),
+            focused: true,
+            palette: PagePalette {
+                surface: PageColor::rgba(34, 38, 45, 255),
+                text: PageColor::rgba(235, 238, 242, 255),
+                accent: PageColor::rgba(232, 174, 88, 255),
+                muted: PageColor::rgba(158, 167, 179, 255),
+            },
+        }
+    }
+
+    fn activate(node_id: u32) -> PageInput {
+        PageInput {
+            node_id,
+            ..PageInput::new(PageInputKind::Activated)
+        }
+    }
+
+    fn typed(text: &str) -> PageInput {
+        PageInput {
+            text: text.to_owned(),
+            ..PageInput::new(PageInputKind::TextInput)
+        }
+    }
+
+    fn key(name: &str) -> PageInput {
+        PageInput {
+            key: name.to_owned(),
+            ..PageInput::new(PageInputKind::KeyPressed)
+        }
+    }
+
+    fn draw(state: &mut PageState, generation: u64, events: &[PageInput]) -> PageFrame {
+        for event in events {
+            state.apply(event);
+        }
+        state.frame(&request(generation))
+    }
+
+    #[test]
+    fn the_opening_frame_is_drawable_and_fully_announced() {
+        let mut state = PageState::default();
+        let frame = draw(&mut state, 1, &[PageInput::new(PageInputKind::Opened)]);
+        frame.validate().expect("the demo page must be drawable");
+        assert_eq!(frame.title, "Page Playground");
+        assert!(!frame.close);
+        assert_eq!(
+            frame.unlabelled_interactive(),
+            Vec::<u32>::new(),
+            "every interactive node must carry a name assistive technology can read"
+        );
+        assert_eq!(
+            frame.focus_ring(),
+            vec![NODE_DECREASE, NODE_INCREASE, NODE_ANNOUNCE, NODE_NOTE, NODE_CLOSE]
+        );
+        assert_eq!(frame.focus_node, NODE_NOTE, "an opened page places the caret itself");
+        assert_eq!(
+            frame.node(NODE_ANNOUNCE).map(|node| node.role),
+            Some(NodeRole::Checkbox)
+        );
+        assert_eq!(
+            frame.node(NODE_NOTE).map(|node| node.role),
+            Some(NodeRole::TextField)
+        );
+
+        // Focus is requested once. A page that asked again every frame would
+        // pull the user back out of whatever they had tabbed to.
+        let second = draw(&mut state, 2, &[]);
+        assert_eq!(second.focus_node, 0);
+    }
+
+    #[test]
+    fn the_counter_survives_frames_and_answers_both_buttons_and_keys() {
+        let mut state = PageState::default();
+        draw(&mut state, 1, &[PageInput::new(PageInputKind::Opened)]);
+        draw(&mut state, 2, &[activate(NODE_INCREASE), activate(NODE_INCREASE)]);
+        let frame = draw(&mut state, 3, &[activate(NODE_DECREASE), key("ArrowUp")]);
+        assert!(
+            frame.nodes.iter().any(|node| node.text == "2"),
+            "the counter must be drawn from state held across frames"
+        );
+        let frame = draw(&mut state, 4, &[key("ArrowDown"), key("ArrowDown")]);
+        assert!(frame.nodes.iter().any(|node| node.text == "0"));
+    }
+
+    #[test]
+    fn the_checkbox_toggles_and_carries_its_state() {
+        let mut state = PageState::default();
+        draw(&mut state, 1, &[PageInput::new(PageInputKind::Opened)]);
+        let frame = draw(&mut state, 2, &[activate(NODE_ANNOUNCE)]);
+        assert_eq!(frame.node(NODE_ANNOUNCE).map(|node| node.checked), Some(true));
+        let frame = draw(&mut state, 3, &[activate(NODE_ANNOUNCE)]);
+        assert_eq!(frame.node(NODE_ANNOUNCE).map(|node| node.checked), Some(false));
+    }
+
+    #[test]
+    fn typed_text_lands_in_the_field_only_while_it_has_focus() {
+        let mut state = PageState::default();
+        draw(&mut state, 1, &[PageInput::new(PageInputKind::Opened)]);
+        let frame = draw(&mut state, 2, &[typed("hi"), typed("!")]);
+        assert!(frame.nodes.iter().any(|node| node.text == "hi!"));
+
+        let frame = draw(&mut state, 3, &[key("Backspace")]);
+        assert!(frame.nodes.iter().any(|node| node.text == "hi"));
+
+        // Focus moved to a button: the same keystrokes must not edit the note.
+        let focus_button = PageInput {
+            node_id: NODE_INCREASE,
+            ..PageInput::new(PageInputKind::FocusChanged)
+        };
+        let frame = draw(&mut state, 4, &[focus_button, typed("x"), key("Backspace")]);
+        assert!(frame.nodes.iter().any(|node| node.text == "hi"));
+    }
+
+    #[test]
+    fn the_note_is_bounded_by_the_plugin() {
+        let mut state = PageState::default();
+        draw(&mut state, 1, &[PageInput::new(PageInputKind::Opened)]);
+        let frame = draw(&mut state, 2, &[typed(&"a".repeat(MAX_NOTE_CHARS * 2))]);
+        assert_eq!(state.note.chars().count(), MAX_NOTE_CHARS);
+        frame.validate().expect("a bounded page stays drawable");
+    }
+
+    #[test]
+    fn the_close_button_ends_the_page_from_the_plugin_side() {
+        let mut state = PageState::default();
+        draw(&mut state, 1, &[PageInput::new(PageInputKind::Opened)]);
+        let frame = draw(&mut state, 2, &[activate(NODE_CLOSE)]);
+        assert!(frame.close, "the page must end itself rather than wait for Escape");
+    }
+
+    #[test]
+    fn only_the_page_this_fixture_owns_is_drawn() {
+        let mut plugin = ConformancePlugin::new(Mode::Page);
+        let mut foreign = request(1);
+        foreign.page_id = "someone-elses".to_owned();
+        let context = TestContext;
+        assert!(plugin.page(foreign, &context).is_err());
+        assert!(plugin.page(request(1), &context).is_ok());
+    }
+
+    #[derive(Debug)]
+    struct TestContext;
+
+    impl crikey_plugin_sdk::CancellationToken for TestContext {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    impl PluginContext for TestContext {
+        fn plugin_id(&self) -> &crikey_core::PluginId {
+            static ID: std::sync::LazyLock<crikey_core::PluginId> =
+                std::sync::LazyLock::new(|| crikey_core::PluginId(PLUGIN_ID.to_owned()));
+            &ID
+        }
+
+        fn cancellation(&self) -> &dyn crikey_plugin_sdk::CancellationToken {
+            self
+        }
+
+        fn log(&self, _level: crikey_plugin_sdk::LogLevel, _message: &str) {}
     }
 }

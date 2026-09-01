@@ -2035,7 +2035,7 @@ impl ModernDriver {
                                 plugin,
                                 item_id,
                                 action_id,
-                                outcome: result,
+                                outcome: result.map(|()| crate::ActionEffect::Completed),
                             };
                             enqueue_modern_completion(&thread_completion_mailbox, completion);
                             *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
@@ -2084,6 +2084,7 @@ impl ModernDriver {
                         settings_focus: None,
                         show_hints: true,
                         rounded_corners: true,
+                        page: None,
                     };
 
                     // A late answer must never appear under a newer generation.

@@ -31,7 +31,7 @@ const EX_USAGE: i32 = 64;
 const PANIC_STATUS: i32 = 101;
 
 /// Payload kinds emitted by the frozen protocol schema (contract §2.3).
-const PAYLOAD_KINDS: [&str; 21] = [
+const PAYLOAD_KINDS: [&str; 23] = [
     "handshake",
     "handshake_ack",
     "suggest",
@@ -53,6 +53,8 @@ const PAYLOAD_KINDS: [&str; 21] = [
     "resource_response",
     "lifecycle",
     "lifecycle_ack",
+    "page_request",
+    "page_frame",
 ];
 
 /// Every ordinary echo run must report each of these checks exactly once.
@@ -818,6 +820,8 @@ fn every_payload_kind_matches_its_frozen_proto_field_name() {
         ("resource_response", Payload::ResourceResponse(empty_message())),
         ("lifecycle", Payload::Lifecycle(empty_message())),
         ("lifecycle_ack", Payload::LifecycleAck(empty_message())),
+        ("page_request", Payload::PageRequest(empty_message())),
+        ("page_frame", Payload::PageFrame(empty_message())),
     ];
 
     for (expected, payload) in cases {

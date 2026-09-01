@@ -449,6 +449,34 @@ pub(crate) fn put_varint(field: u32, value: u64, out: &mut Vec<u8>) {
     encode_varint(value, out);
 }
 
+/// Reads a proto3 `float`: four little-endian IEEE-754 bytes.
+///
+/// Deliberately faithful, including to NaN and the infinities. Refusing them
+/// here would put a semantic judgement in the codec and leave the same bytes
+/// legal for some other field; the layer that knows what a number means is
+/// the layer that rejects it, which for page geometry is
+/// `crikey_core::PageFrame::validate`.
+pub(crate) fn decode_f32(field: Field<'_>) -> Result<f32, ProtocolError> {
+    if field.wire_type != WireType::Fixed32 {
+        return Err(ProtocolError::Malformed(
+            "expected a fixed32 float field".to_owned(),
+        ));
+    }
+    let bytes: [u8; 4] = field
+        .value
+        .try_into()
+        .map_err(|_| ProtocolError::Malformed("invalid protobuf float field".to_owned()))?;
+    Ok(f32::from_le_bytes(bytes))
+}
+
+/// Writes a proto3 `float`. Callers elide the default the way every other
+/// writer here does; note that `-0.0 == 0.0` in Rust, so a negative zero is
+/// elided and read back as a positive one. No geometry distinguishes them.
+pub(crate) fn put_f32(field: u32, value: f32, out: &mut Vec<u8>) {
+    encode_key(field, WireType::Fixed32, out);
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
 pub(crate) fn put_string(field: u32, value: &str, out: &mut Vec<u8>) {
     encode_key(field, WireType::Length, out);
     encode_varint(

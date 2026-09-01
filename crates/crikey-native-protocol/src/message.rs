@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 
 pub use crate::wire::UnknownFields;
 use crate::wire::{
-    decode_bytes, decode_field_varint, decode_string, expect_wire, map_entry_charge, push_decoded, put_bytes,
-    put_message, put_string, put_varint, read_field, DecodeBudget, RepeatedFieldCharge, WireType,
-    DECODE_ALLOCATION_BUDGET,
+    decode_bytes, decode_f32, decode_field_varint, decode_string, expect_wire, map_entry_charge,
+    push_decoded, put_bytes, put_f32, put_message, put_string, put_varint, read_field, DecodeBudget,
+    RepeatedFieldCharge, WireType, DECODE_ALLOCATION_BUDGET,
 };
 use crate::{Message, ProtocolError, MAX_FRAME_BYTES};
 
@@ -103,7 +103,38 @@ proto_enum!(
     OutcomeUnspecified,
     Ok = 1,
     Failed = 2,
-    Unsupported = 3
+    Unsupported = 3,
+    ShowPage = 4
+);
+proto_enum!(
+    PageInputCode,
+    KindUnspecified,
+    Opened = 1,
+    PointerMoved = 2,
+    PointerPressed = 3,
+    PointerReleased = 4,
+    KeyPressed = 5,
+    TextInput = 6,
+    Activated = 7,
+    FocusChanged = 8,
+    Closed = 9
+);
+proto_enum!(
+    PageShapeCode,
+    ShapeUnspecified,
+    Rect = 1,
+    Text = 2,
+    Line = 3,
+    Circle = 4
+);
+proto_enum!(
+    PageRoleCode,
+    RoleUnspecified,
+    Button = 1,
+    Label = 2,
+    Heading = 3,
+    TextField = 4,
+    Checkbox = 5
 );
 proto_enum!(
     EventKind,
@@ -217,7 +248,10 @@ fn finish(mut out: Vec<u8>, unknown: &UnknownFields) -> Vec<u8> {
     out
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` stops here: an envelope can now carry page geometry, and IEEE-754
+// equality is not reflexive over NaN. `PartialEq` is what the tests and the
+// round-trip checks actually use.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Envelope {
     pub connection_id: u64,
     pub request_id: u64,
@@ -227,7 +261,7 @@ pub struct Envelope {
     pub unknown: UnknownFields,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Payload {
     Handshake(Handshake),
     HandshakeAck(HandshakeAck),
@@ -250,6 +284,8 @@ pub enum Payload {
     ResourceResponse(ResourceResponse),
     Lifecycle(Lifecycle),
     LifecycleAck(LifecycleAck),
+    PageRequest(PageRequest),
+    PageFrame(PageFrame),
 }
 
 impl Payload {
@@ -276,6 +312,8 @@ impl Payload {
             Self::ResourceResponse(_) => "resource_response",
             Self::Lifecycle(_) => "lifecycle",
             Self::LifecycleAck(_) => "lifecycle_ack",
+            Self::PageRequest(_) => "page_request",
+            Self::PageFrame(_) => "page_frame",
         }
     }
 }
@@ -318,6 +356,8 @@ impl Message for Envelope {
                 Payload::ResourceResponse(value) => put_message(28, value, &mut out),
                 Payload::Lifecycle(value) => put_message(29, value, &mut out),
                 Payload::LifecycleAck(value) => put_message(30, value, &mut out),
+                Payload::PageRequest(value) => put_message(31, value, &mut out),
+                Payload::PageFrame(value) => put_message(32, value, &mut out),
             }
         }
         finish(out, &self.unknown)
@@ -400,6 +440,8 @@ impl DecodeWithBudget for Envelope {
                 28 => value.payload = Some(Payload::ResourceResponse(nested(field, budget)?)),
                 29 => value.payload = Some(Payload::Lifecycle(nested(field, budget)?)),
                 30 => value.payload = Some(Payload::LifecycleAck(nested(field, budget)?)),
+                31 => value.payload = Some(Payload::PageRequest(nested(field, budget)?)),
+                32 => value.payload = Some(Payload::PageFrame(nested(field, budget)?)),
                 _ => unknown(bytes, start, field.end, &mut value.unknown, budget)?,
             }
         }
@@ -417,13 +459,18 @@ macro_rules! field_is_repeated {
 }
 
 macro_rules! impl_simple {
-    (no_debug; $($rest:tt)*) => { impl_simple_impl!(; $($rest)*); };
-    ($($rest:tt)*) => { impl_simple_impl!(Debug; $($rest)*); };
+    (no_debug; $($rest:tt)*) => { impl_simple_impl!(; Eq; $($rest)*); };
+    // A message carrying `float` fields. Equality stays derived but stops at
+    // `PartialEq`, because IEEE-754 equality is not an equivalence relation:
+    // a NaN coordinate is not equal to itself, so `Eq` would be a lie the
+    // compiler happens not to check.
+    (inexact; $($rest:tt)*) => { impl_simple_impl!(Debug; ; $($rest)*); };
+    ($($rest:tt)*) => { impl_simple_impl!(Debug; Eq; $($rest)*); };
 }
 
 macro_rules! impl_simple_impl {
-    ($($debug:ident)?; $type:ident { $( $field_name:ident : $fty:ty = $default:expr ),* $(,)? } repeated $repeated:tt encode($this:ident, $out:ident) { $( $enc:tt )* } decode($value:ident, $field:ident, $budget:ident) { $( $number:literal => $body:expr, )* }) => {
-        #[derive($($debug,)? Clone, PartialEq, Eq)]
+    ($($debug:ident)?; $($eq:ident)?; $type:ident { $( $field_name:ident : $fty:ty = $default:expr ),* $(,)? } repeated $repeated:tt encode($this:ident, $out:ident) { $( $enc:tt )* } decode($value:ident, $field:ident, $budget:ident) { $( $number:literal => $body:expr, )* }) => {
+        #[derive($($debug,)? Clone, PartialEq $(, $eq)?)]
         pub struct $type { $( pub $field_name: $fty, )* pub unknown: UnknownFields }
         impl Message for $type {
             fn encode(&self) -> Vec<u8> {
@@ -823,13 +870,159 @@ impl_simple!(ExecuteRequest {
 
 impl_simple!(ExecuteResult {
     outcome: ExecuteOutcomeCode = ExecuteOutcomeCode::OutcomeUnspecified,
-    error: Option<StructuredError> = None
+    error: Option<StructuredError> = None,
+    page_id: String = String::new()
 } repeated [] encode(this, out) {
     if this.outcome.as_i32() != 0 { encode_enum(1, this.outcome.as_i32(), &mut out); }
     if let Some(error) = &this.error { put_message(2, error, &mut out); }
+    if !this.page_id.is_empty() { put_string(3, &this.page_id, &mut out); }
 } decode(value, field, budget) {
     1 => value.outcome = ExecuteOutcomeCode::from_i32(decode_i32(field)?),
     2 => value.error = Some(nested(field, budget)?),
+    3 => value.page_id = decode_string(field, budget)?,
+});
+
+impl_simple!(inexact; PageInput {
+    kind: PageInputCode = PageInputCode::KindUnspecified,
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+    key: String = String::new(),
+    text: String = String::new(),
+    node_id: u32 = 0,
+    ctrl: bool = false,
+    shift: bool = false,
+    alt: bool = false
+} repeated [] encode(this, out) {
+    if this.kind.as_i32() != 0 { encode_enum(1, this.kind.as_i32(), &mut out); }
+    if this.x != 0.0 { put_f32(2, this.x, &mut out); }
+    if this.y != 0.0 { put_f32(3, this.y, &mut out); }
+    if !this.key.is_empty() { put_string(4, &this.key, &mut out); }
+    if !this.text.is_empty() { put_string(5, &this.text, &mut out); }
+    if this.node_id != 0 { put_varint(6, u64::from(this.node_id), &mut out); }
+    if this.ctrl { put_varint(7, 1, &mut out); }
+    if this.shift { put_varint(8, 1, &mut out); }
+    if this.alt { put_varint(9, 1, &mut out); }
+} decode(value, field, budget) {
+    1 => value.kind = PageInputCode::from_i32(decode_i32(field)?),
+    2 => value.x = decode_f32(field)?,
+    3 => value.y = decode_f32(field)?,
+    4 => value.key = decode_string(field, budget)?,
+    5 => value.text = decode_string(field, budget)?,
+    6 => value.node_id = decode_u32(field)?,
+    7 => value.ctrl = decode_field_varint(field)? != 0,
+    8 => value.shift = decode_field_varint(field)? != 0,
+    9 => value.alt = decode_field_varint(field)? != 0,
+});
+
+impl_simple!(inexact; PageNode {
+    shape: PageShapeCode = PageShapeCode::ShapeUnspecified,
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+    width: f32 = 0.0,
+    height: f32 = 0.0,
+    fill: u32 = 0,
+    stroke: u32 = 0,
+    stroke_width: f32 = 0.0,
+    rounding: f32 = 0.0,
+    text: String = String::new(),
+    text_size: f32 = 0.0,
+    role: PageRoleCode = PageRoleCode::RoleUnspecified,
+    label: String = String::new(),
+    node_id: u32 = 0,
+    focus_order: u32 = 0,
+    checked: bool = false
+} repeated [] encode(this, out) {
+    if this.shape.as_i32() != 0 { encode_enum(1, this.shape.as_i32(), &mut out); }
+    if this.x != 0.0 { put_f32(2, this.x, &mut out); }
+    if this.y != 0.0 { put_f32(3, this.y, &mut out); }
+    if this.width != 0.0 { put_f32(4, this.width, &mut out); }
+    if this.height != 0.0 { put_f32(5, this.height, &mut out); }
+    if this.fill != 0 { put_varint(6, u64::from(this.fill), &mut out); }
+    if this.stroke != 0 { put_varint(7, u64::from(this.stroke), &mut out); }
+    if this.stroke_width != 0.0 { put_f32(8, this.stroke_width, &mut out); }
+    if this.rounding != 0.0 { put_f32(9, this.rounding, &mut out); }
+    if !this.text.is_empty() { put_string(10, &this.text, &mut out); }
+    if this.text_size != 0.0 { put_f32(11, this.text_size, &mut out); }
+    if this.role.as_i32() != 0 { encode_enum(12, this.role.as_i32(), &mut out); }
+    if !this.label.is_empty() { put_string(13, &this.label, &mut out); }
+    if this.node_id != 0 { put_varint(14, u64::from(this.node_id), &mut out); }
+    if this.focus_order != 0 { put_varint(15, u64::from(this.focus_order), &mut out); }
+    if this.checked { put_varint(16, 1, &mut out); }
+} decode(value, field, budget) {
+    1 => value.shape = PageShapeCode::from_i32(decode_i32(field)?),
+    2 => value.x = decode_f32(field)?,
+    3 => value.y = decode_f32(field)?,
+    4 => value.width = decode_f32(field)?,
+    5 => value.height = decode_f32(field)?,
+    6 => value.fill = decode_u32(field)?,
+    7 => value.stroke = decode_u32(field)?,
+    8 => value.stroke_width = decode_f32(field)?,
+    9 => value.rounding = decode_f32(field)?,
+    10 => value.text = decode_string(field, budget)?,
+    11 => value.text_size = decode_f32(field)?,
+    12 => value.role = PageRoleCode::from_i32(decode_i32(field)?),
+    13 => value.label = decode_string(field, budget)?,
+    14 => value.node_id = decode_u32(field)?,
+    15 => value.focus_order = decode_u32(field)?,
+    16 => value.checked = decode_field_varint(field)? != 0,
+});
+
+impl_simple!(inexact; PageRequest {
+    page_id: String = String::new(),
+    generation: u64 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    events: Vec<PageInput> = Vec::new(),
+    focused: bool = false,
+    colour_surface: u32 = 0,
+    colour_text: u32 = 0,
+    colour_accent: u32 = 0,
+    colour_muted: u32 = 0
+} repeated [5] encode(this, out) {
+    if !this.page_id.is_empty() { put_string(1, &this.page_id, &mut out); }
+    if this.generation != 0 { put_varint(2, this.generation, &mut out); }
+    if this.width != 0 { put_varint(3, u64::from(this.width), &mut out); }
+    if this.height != 0 { put_varint(4, u64::from(this.height), &mut out); }
+    for event in &this.events { put_message(5, event, &mut out); }
+    if this.focused { put_varint(6, 1, &mut out); }
+    if this.colour_surface != 0 { put_varint(7, u64::from(this.colour_surface), &mut out); }
+    if this.colour_text != 0 { put_varint(8, u64::from(this.colour_text), &mut out); }
+    if this.colour_accent != 0 { put_varint(9, u64::from(this.colour_accent), &mut out); }
+    if this.colour_muted != 0 { put_varint(10, u64::from(this.colour_muted), &mut out); }
+} decode(value, field, budget) {
+    1 => value.page_id = decode_string(field, budget)?,
+    2 => value.generation = decode_field_varint(field)?,
+    3 => value.width = decode_u32(field)?,
+    4 => value.height = decode_u32(field)?,
+    5 => push_decoded(&mut value.events, nested(field, budget)?, budget)?,
+    6 => value.focused = decode_field_varint(field)? != 0,
+    7 => value.colour_surface = decode_u32(field)?,
+    8 => value.colour_text = decode_u32(field)?,
+    9 => value.colour_accent = decode_u32(field)?,
+    10 => value.colour_muted = decode_u32(field)?,
+});
+
+impl_simple!(inexact; PageFrame {
+    generation: u64 = 0,
+    title: String = String::new(),
+    nodes: Vec<PageNode> = Vec::new(),
+    focus_node: u32 = 0,
+    redraw_after_ms: u32 = 0,
+    close: bool = false
+} repeated [3] encode(this, out) {
+    if this.generation != 0 { put_varint(1, this.generation, &mut out); }
+    if !this.title.is_empty() { put_string(2, &this.title, &mut out); }
+    for node in &this.nodes { put_message(3, node, &mut out); }
+    if this.focus_node != 0 { put_varint(4, u64::from(this.focus_node), &mut out); }
+    if this.redraw_after_ms != 0 { put_varint(5, u64::from(this.redraw_after_ms), &mut out); }
+    if this.close { put_varint(6, 1, &mut out); }
+} decode(value, field, budget) {
+    1 => value.generation = decode_field_varint(field)?,
+    2 => value.title = decode_string(field, budget)?,
+    3 => push_decoded(&mut value.nodes, nested(field, budget)?, budget)?,
+    4 => value.focus_node = decode_u32(field)?,
+    5 => value.redraw_after_ms = decode_u32(field)?,
+    6 => value.close = decode_field_varint(field)? != 0,
 });
 
 impl_simple!(no_debug; ConfigurationChange {

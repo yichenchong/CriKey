@@ -42,11 +42,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crikey_core::{ActionId, ArgumentPolicy, ExecutionPolicy, Generation, Item, ItemId, PluginId};
+use crikey_core::{ActionId, ArgumentPolicy, ExecutionPolicy, Generation, Item, ItemId, PageInput, PluginId};
 use crikey_input_scheduler::Millis;
 use crikey_native_host::{
-    CancelHandle, ExecuteOutcome, HostError, LaunchSpec, NativeSuggestRequest, NativeSupervisor,
-    ResourceKind, ResourceOutcome, Suggestions, SupervisorConfig, WorkerOptions,
+    CancelHandle, ExecuteOutcome, HostError, LaunchSpec, NativePageRequest, NativeSuggestRequest,
+    NativeSupervisor, ResourceKind, ResourceOutcome, Suggestions, SupervisorConfig, WorkerOptions,
 };
 use crikey_plugin_model::{Manifest, Permissions, Runtime, Startup};
 use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
@@ -55,8 +55,11 @@ use crikey_ui::{ResultRow, ViewModel};
 use crate::plugin_icons::{
     IconFetch, PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
 };
+use crate::plugin_page::{
+    PageBackend, PageClosing, PageDeadlines, PageDraw, PageOpen, PageSession, PageUpdate, PageWake,
+};
 use crate::{
-    ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError, DisabledPlugins,
+    ActionEffect, ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError, DisabledPlugins,
     ObsoleteCatalogBuild, PluginActionCompletion, QueryPipeline, ResultBatch, DISABLED_BY_CONFIGURATION,
 };
 
@@ -510,6 +513,47 @@ impl PluginResourceSource for NativeResourceSource {
             // reference is worth asking again once it has.
             Err(_) => IconFetch::Unavailable,
         }
+    }
+}
+
+/// Serves one plugin's page frames from the worker that opened the page.
+///
+/// Deliberately the query supervisor and not a child of its own, which is the
+/// opposite of the choice [`NativeResourceSource`] makes. An icon is a pure
+/// function of a reference and any child of that plugin can serve it; a page
+/// is a conversation, and the state behind it — what the action opened, what
+/// the user has typed into it since — lives in the process that ran the
+/// action. Asking a second child would be asking a plugin that never opened
+/// the page to draw it.
+#[derive(Debug)]
+struct NativePageSource {
+    plugin: PluginId,
+    supervisor: Arc<Mutex<NativeSupervisor>>,
+}
+
+impl PageBackend for NativePageSource {
+    fn draw(&mut self, draw: &PageDraw) -> Result<crikey_core::PageFrame, String> {
+        let mut supervisor = self.supervisor.lock().unwrap_or_else(|error| error.into_inner());
+        let worker = supervisor
+            .worker(&self.plugin, 0)
+            .map_err(|error| error.to_string())?;
+        worker
+            .page(&NativePageRequest {
+                page_id: draw.page_id.clone(),
+                generation: draw.generation,
+                width: draw.width,
+                height: draw.height,
+                events: draw.events.clone(),
+                focused: true,
+                // The palette is the launcher's, and the launcher's theme is
+                // not visible from here. Zero states no colour rather than a
+                // transparent one, so a plugin keeps its own defaults.
+                colour_surface: draw.palette.surface.to_u32(),
+                colour_text: draw.palette.text.to_u32(),
+                colour_accent: draw.palette.accent.to_u32(),
+                colour_muted: draw.palette.muted.to_u32(),
+            })
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1114,9 +1158,25 @@ impl NativeProvider {
             .collect()
     }
 
+    /// Clones the query supervisor of every loaded plugin, keyed by plugin.
+    ///
+    /// A page is served by the worker that ran the action which opened it, so
+    /// this is the same supervisor suggestion dispatch uses. The page session
+    /// takes the lock per frame request, exactly as an action does, which is
+    /// what keeps a page and a query from talking to one child at once.
+    fn page_supervisors(&self) -> BTreeMap<PluginId, Arc<Mutex<NativeSupervisor>>> {
+        self.loaded
+            .iter()
+            .filter_map(|loaded| {
+                let supervisor = self.pool.supervisors.get(&loaded.key)?;
+                Some((loaded.plugin.clone(), Arc::clone(supervisor)))
+            })
+            .collect()
+    }
+
     /// Validates and executes one admitted plugin action on the exact native
     /// worker that owns the item's plugin id.
-    fn execute_action_request(&mut self, request: NativeActionRequest) -> crikey_core::Result<()> {
+    fn execute_action_request(&mut self, request: NativeActionRequest) -> crikey_core::Result<ActionEffect> {
         let _guard = request.guard;
         let plugin = request.plugin;
         let item_id = request.item.stable_id.clone();
@@ -1192,7 +1252,8 @@ impl NativeProvider {
                 .map_err(|error| error.to_string())
         }));
         match outcome {
-            Ok(Ok(ExecuteOutcome::Ok)) => Ok(()),
+            Ok(Ok(ExecuteOutcome::Ok)) => Ok(ActionEffect::Completed),
+            Ok(Ok(ExecuteOutcome::ShowPage { page_id })) => Ok(ActionEffect::ShowPage { page_id }),
             Ok(Ok(ExecuteOutcome::Failed(error))) => {
                 let reason = format!("native plugin action failed: {}", error.message);
                 self.pool.record_dispatch_failure(plugin.clone(), reason.clone());
@@ -1693,6 +1754,45 @@ enum NativeWork {
     Refresh,
 }
 
+/// The host's event-loop wake, installed once the renderer exists.
+///
+/// Shared rather than owned so a session can hold a handle that resolves the
+/// callback when it fires: a page may be opened before the renderer has wired
+/// itself up, and it must still ring the loop once it has. Hand-written
+/// `Debug` because a callback has none and the endpoint around it is printed
+/// in diagnostics.
+#[derive(Clone, Default)]
+struct WakeSlot(Arc<Mutex<Option<PageWake>>>);
+
+impl WakeSlot {
+    fn install(&self, wake: PageWake) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = Some(wake);
+    }
+
+    fn ring(&self) {
+        let wake = self.0.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+
+    fn handle(&self) -> PageWake {
+        let slot = self.clone();
+        Arc::new(move || slot.ring())
+    }
+}
+
+impl std::fmt::Debug for WakeSlot {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let installed = self.0.lock().unwrap_or_else(|error| error.into_inner()).is_some();
+        out.write_str(if installed {
+            "WakeSlot(installed)"
+        } else {
+            "WakeSlot(none)"
+        })
+    }
+}
+
 /// Bounded action endpoint retained by the live native driver.
 #[derive(Debug)]
 struct NativeActionEndpoint {
@@ -1704,6 +1804,21 @@ struct NativeActionEndpoint {
     in_flight: Arc<AtomicUsize>,
     next_id: Arc<AtomicU64>,
     mailbox: Arc<(Mutex<NativeRequestSlot>, Condvar)>,
+    /// Query supervisors, so a page can be served by the child that opened it.
+    page_supervisors: BTreeMap<PluginId, Arc<Mutex<NativeSupervisor>>>,
+    /// The one open page, if any. The launcher shows one surface at a time,
+    /// and a second page would be a second plugin drawing over the first.
+    page: Mutex<Option<PageSession>>,
+    /// The previous page's thread while it delivers its closing notification.
+    /// Closing does not block the user's Escape key, so the notification is
+    /// still in flight afterwards; opening the next page waits for it here, or
+    /// a `Closed` for the old page could overtake the `Opened` for the new one
+    /// on the same child.
+    page_closing: Mutex<Option<PageClosing>>,
+    /// Rings the host's event loop when a page frame or an action completion
+    /// lands. Installed after the renderer exists, so it is optional until
+    /// then; a headless caller that never installs one simply polls.
+    wake: WakeSlot,
 }
 impl crate::PluginActionExecutor for NativeActionEndpoint {
     fn submit_plugin_action(
@@ -1874,10 +1989,137 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         }
         self.submit_plugin_action(plugin, &item, action_id, argument)
     }
+
+    fn open_plugin_page(
+        &self,
+        plugin: &PluginId,
+        page_id: &str,
+        width: u32,
+        height: u32,
+        palette: crikey_core::PagePalette,
+    ) -> crikey_core::Result<()> {
+        let supervisor = self.page_supervisors.get(plugin).cloned().ok_or_else(|| {
+            crikey_core::CoreError::Invalid(format!("no native worker owns plugin `{}`", plugin.0))
+        })?;
+        // Before anything else: the page that was just closed may still be
+        // telling its plugin so. Letting a new page start first would let the
+        // old page's `Closed` land after the new page's `Opened`.
+        let settling = self
+            .page_closing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(settling) = settling {
+            settling.settle();
+        }
+        let mut open = self.page.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(session) = open.as_ref() {
+            return Err(crikey_core::CoreError::Invalid(format!(
+                "native plugin `{}` already has page `{}` open",
+                session.plugin().0,
+                session.page_id()
+            )));
+        }
+        let session = PageSession::open(
+            PageOpen {
+                plugin: plugin.clone(),
+                page_id: page_id.to_owned(),
+                width,
+                height,
+                deadlines: PageDeadlines::default(),
+                palette,
+            },
+            Box::new(NativePageSource {
+                plugin: plugin.clone(),
+                supervisor,
+            }),
+            self.wake.handle(),
+        )
+        .map_err(crikey_core::CoreError::Invalid)?;
+        *open = Some(session);
+        Ok(())
+    }
+
+    fn send_plugin_page_input(&self, input: PageInput) -> crikey_core::Result<()> {
+        self.page
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("no native page is open".to_owned()))?
+            .send_input(input)
+            .map_err(crikey_core::CoreError::Invalid)
+    }
+
+    fn resize_plugin_page(&self, width: u32, height: u32) {
+        if let Some(session) = self
+            .page
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            session.resize(width, height);
+        }
+    }
+
+    fn close_plugin_page(&self) {
+        let Some(session) = self.page.lock().unwrap_or_else(|error| error.into_inner()).take() else {
+            return;
+        };
+        report_page_failure(&session);
+        let (_, closing) = session.close();
+        *self
+            .page_closing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(closing);
+    }
+
+    fn poll_plugin_page(&self) -> Option<PageUpdate> {
+        let mut open = self.page.lock().unwrap_or_else(|error| error.into_inner());
+        let update = open.as_ref()?.poll()?;
+        // The session is finished the moment it reports a close, and holding
+        // its thread past that would keep a plugin answering frame requests
+        // for a surface that is already gone.
+        if update.closed {
+            if let Some(session) = open.take() {
+                report_page_failure(&session);
+                let (_, closing) = session.close();
+                *self
+                    .page_closing
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(closing);
+            }
+        }
+        Some(update)
+    }
+}
+
+/// Reports a page that ended in failure rather than letting it vanish.
+///
+/// A page that stops answering is a plugin defect the user just experienced,
+/// and the surface disappearing is all they would otherwise see. The same
+/// stream the rest of this provider's runtime faults go to carries it, named
+/// by plugin and page so the report is attributable.
+fn report_page_failure(session: &PageSession) {
+    if let Some(reason) = session.failure() {
+        eprintln!(
+            "crikey: native page `{}` of {} failed: {reason}",
+            session.page_id(),
+            session.plugin().0
+        );
+    }
+    let soft_timeouts = session.soft_timeouts();
+    if soft_timeouts != 0 {
+        eprintln!(
+            "crikey: native page `{}` of {} missed its soft frame deadline {soft_timeouts} times",
+            session.page_id(),
+            session.plugin().0
+        );
+    }
 }
 fn enqueue_native_completion(
     mailbox: &Mutex<VecDeque<PluginActionCompletion>>,
     completion: PluginActionCompletion,
+    wake: Option<&PageWake>,
 ) {
     let mut mailbox = mailbox.lock().unwrap_or_else(|error| error.into_inner());
     if mailbox.len() >= ACTION_COMPLETION_CAPACITY {
@@ -1888,6 +2130,14 @@ fn enqueue_native_completion(
         return;
     }
     mailbox.push_back(completion);
+    drop(mailbox);
+    // An action that finished on a worker thread is invisible until the loop
+    // turns. That matters most for the completion that opens a page: without
+    // this the surface would appear only once the user pressed some unrelated
+    // key.
+    if let Some(wake) = wake {
+        wake();
+    }
 }
 
 /// Drives [`NativeProvider::drive_query`] away from the UI thread (spec 6.5;
@@ -1913,6 +2163,17 @@ pub struct NativeDriver {
 }
 
 impl NativeDriver {
+    /// Installs the callback that wakes the host's event loop.
+    ///
+    /// Page frames and action completions are produced on worker threads, and
+    /// the launcher sleeps between keystrokes. Without this they would sit in
+    /// their mailboxes until something unrelated woke the loop, which for a
+    /// page means a surface that freezes after every interaction and never
+    /// animates. Optional so a headless caller that polls can skip it.
+    pub fn set_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
+        self.action_endpoint.wake.install(Arc::new(wake));
+    }
+
     /// Moves the provider and pipeline to a supervisor thread. A thread spawn
     /// refusal degrades to an inert driver while dropping the provider reaps
     /// all children (spec 24.1, 24.3).
@@ -1948,6 +2209,10 @@ impl NativeDriver {
             in_flight: Arc::new(AtomicUsize::new(0)),
             next_id: Arc::new(AtomicU64::new(0)),
             mailbox: Arc::clone(&mailbox),
+            page_supervisors: provider.page_supervisors(),
+            page: Mutex::new(None),
+            page_closing: Mutex::new(None),
+            wake: WakeSlot::default(),
         });
         let busy = Arc::new(AtomicBool::new(false));
         let thread_mailbox = Arc::clone(&mailbox);
@@ -1957,6 +2222,7 @@ impl NativeDriver {
         let thread_current = Arc::clone(&current);
         let thread_busy = Arc::clone(&busy);
         let thread_completion_mailbox = Arc::clone(&completion_mailbox);
+        let thread_wake = Some(action_endpoint.wake.handle());
         let spawned = std::thread::Builder::new()
             .name("crikey-native".to_owned())
             .spawn(move || {
@@ -1982,7 +2248,11 @@ impl NativeDriver {
                                         action_id: request.action_id.clone(),
                                         outcome: Err(crikey_core::CoreError::Cancelled),
                                     };
-                                    enqueue_native_completion(&thread_completion_mailbox, completion);
+                                    enqueue_native_completion(
+                                        &thread_completion_mailbox,
+                                        completion,
+                                        thread_wake.as_ref(),
+                                    );
                                 }
                                 drop(slot);
                                 provider.shutdown(last_now);
@@ -2052,7 +2322,11 @@ impl NativeDriver {
                                 action_id,
                                 outcome: result,
                             };
-                            enqueue_native_completion(&thread_completion_mailbox, completion);
+                            enqueue_native_completion(
+                                &thread_completion_mailbox,
+                                completion,
+                                thread_wake.as_ref(),
+                            );
                             *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
                                 pipeline.plugin_health_report();
                             continue;
@@ -2100,6 +2374,7 @@ impl NativeDriver {
                                 settings_focus: None,
                                 show_hints: true,
                                 rounded_corners: true,
+                                page: None,
                             };
                             *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) =
                                 Some(merged.clone());
@@ -2139,6 +2414,7 @@ impl NativeDriver {
                         settings_focus: None,
                         show_hints: true,
                         rounded_corners: true,
+                        page: None,
                     };
 
                     // Hold the mailbox lock across the staleness check and the
