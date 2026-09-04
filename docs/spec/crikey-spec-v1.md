@@ -2514,8 +2514,10 @@ A page frame shall additionally remain within the protocol's 8 MiB
 A self-scheduled redraw shall be clamped to `MIN_PAGE_REDRAW_MS` (16 ms). A
 page requests its next frame with a delay, and the per-frame caps above bound
 one frame without bounding a rate: at a one millisecond period a page carrying
-rasters would demand gigabytes a second for a surface the host presents at
-60 Hz. A request for zero shall keep its meaning of scheduling no redraw, and
+rasters would demand gigabytes a second of encode, transport and decode. The
+value is one frame at the 60 Hz baseline these budgets are written against,
+and is a floor on the page's own timer rather than a statement about any
+display. A request for zero shall keep its meaning of scheduling no redraw, and
 a frame answering user input shall not be delayed by this clamp.
 
 ### 32.7 Refusal

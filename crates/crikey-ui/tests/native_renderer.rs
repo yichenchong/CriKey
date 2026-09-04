@@ -1257,11 +1257,17 @@ fn page_control(role: NodeRole, node_id: u32, x: f32, y: f32, width: f32, height
 }
 
 fn page_view(nodes: Vec<PageNode>) -> ViewModel {
+    page_view_at_generation(nodes, 1)
+}
+
+/// A page whose frame carries `generation`, for the tests that care that the
+/// host keeps advancing it while the picture inside the page does not change.
+fn page_view_at_generation(nodes: Vec<PageNode>, generation: u64) -> ViewModel {
     let mut view = model("");
     let mut all = vec![probe_node()];
     all.extend(nodes);
     let frame = PageFrame {
-        generation: 1,
+        generation,
         title: "Demo Page".to_owned(),
         nodes: all,
         ..PageFrame::default()
@@ -1829,10 +1835,15 @@ fn a_raster_drawn_on_two_consecutive_frames_is_uploaded_once() {
         launcher_input(Vec::new()),
         &page_view(vec![image_node(0.0, 8.0, 30.0, 20.0, colour)]),
     );
+    // A later generation, because that is what a real second frame carries:
+    // the host advances it on every input and resize. Keying the cache on
+    // anything that moves with the frame - the generation above all - would
+    // miss on every keystroke while still passing a two-identical-frames
+    // test, so the fixture deliberately does not hold it still.
     let second = build_launcher_frame(
         &context,
         launcher_input(Vec::new()),
-        &page_view(vec![image_node(0.0, 8.0, 30.0, 20.0, colour)]),
+        &page_view_at_generation(vec![image_node(0.0, 8.0, 30.0, 20.0, colour)], 2),
     );
 
     assert_eq!(raster_uploads(&first), 1, "the first frame uploads the raster");

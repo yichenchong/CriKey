@@ -218,8 +218,10 @@ geometry, colours and a semantic role — and the host draws them with the
 launcher's own renderer. A page of geometry costs kilobytes a frame rather
 than the 1.10 MiB a 720×400 pixel canvas would; add rasters and you pay for
 them on every frame you answer, which is why they are capped and why you
-should reach for shapes first. Either way a page cannot crash or slow the
-launcher's UI thread. The reasoning, including why there is no
+should reach for shapes first. Your code never runs on the launcher's UI
+thread, so a page cannot crash it or block it. The host's own work of drawing
+your frame does run there, including uploading your rasters, which is the
+other reason those caps exist: the cost is bounded, not absent. The reasoning, including why there is no
 embedded webview, is [ADR-0020](adr/0020-plugin-pages.md); the normative rules
 are [spec §32](spec/crikey-spec-v1.md#32-plugin-pages).
 
