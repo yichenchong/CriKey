@@ -213,6 +213,45 @@ fn a_client_that_sends_and_leaves_before_the_accept_is_still_read() {
 /// reports success for the arming rather than for a client — so a listener
 /// that mistook it for one would hand the caller a pipe with nobody on the
 /// other end, and the real client behind it would never be seen.
+/// A connection accepted under a timeout must still wait for its client.
+///
+/// `accept` puts the listener into non-blocking mode to implement the
+/// timeout. Linux hands back a fresh blocking socket regardless, but macOS and
+/// the BSDs give the accepted socket the listener's `O_NONBLOCK`, so without
+/// an explicit reset the first `recv` returns `WouldBlock` - which this layer
+/// reports as `Timeout`. The effect is a plugin that connected and is about to
+/// speak being written off as silent, on one family of platforms only.
+///
+/// This is therefore a test that can only fail on the platforms with the bug;
+/// on Linux it passes either way. It is here so the reset has a stated reason
+/// and CI on macOS keeps enforcing it.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_connection_accepted_under_a_timeout_still_waits_for_its_client() {
+    let endpoint = native_endpoint();
+    let listener = transport::Listener::bind(&endpoint).expect("bind the platform's native endpoint");
+
+    let client_endpoint = endpoint.clone();
+    let client = std::thread::spawn(move || {
+        let mut connection = transport::connect(&client_endpoint, Some(Duration::from_secs(5)))
+            .expect("the client reaches the endpoint");
+        // Long enough that a non-blocking accepted socket has certainly
+        // reported WouldBlock before the frame arrives.
+        std::thread::sleep(Duration::from_millis(300));
+        connection.send(&envelope(11)).expect("client send");
+        std::thread::sleep(Duration::from_millis(200));
+    });
+
+    let mut accepted = listener
+        .accept(Some(Duration::from_secs(5)))
+        .expect("the endpoint accepts the client");
+    let frame = accepted
+        .recv()
+        .expect("a connection accepted under a timeout must wait, not report a silent client");
+    assert_eq!(frame.encode(), envelope(11).encode());
+    client.join().expect("the client finishes");
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn a_client_that_says_nothing_and_leaves_does_not_consume_the_endpoint() {
