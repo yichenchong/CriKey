@@ -338,9 +338,9 @@ struct PageDriver {
 ///
 /// Clamped rather than obeyed. A page may ask for a one millisecond period,
 /// and with a raster aboard every frame that is gigabytes a second of encode,
-/// transport and decode for a surface the host presents at 60 Hz regardless -
-/// so a shorter period costs the machine everything and shows the user
-/// nothing. Zero keeps its meaning of "do not schedule one".
+/// transport and decode. The floor is one frame at the 60 Hz baseline the
+/// launcher's budgets are written against, not a claim about what any display
+/// can present. Zero keeps its meaning of "do not schedule one".
 ///
 /// Only self-scheduled redraws are clamped. A frame answering user input is
 /// never delayed by this.
