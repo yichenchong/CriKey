@@ -40,10 +40,15 @@ That claim survives plugin pages, and pages are the reason to state why. A page
 is drawn by the plugin only in the sense that the plugin decides what it
 contains: what crosses the boundary is a display list of shapes, text and
 semantic roles, which the UI thread draws with the launcher's own renderer. No
-plugin code is loaded, executed or JIT-compiled in the main process, and no
-plugin-rasterized pixels are blitted into the surface — the alternatives that
-would have broken the sentence above, and the reason both were rejected
-(ADR-0020).
+plugin code is loaded, executed or JIT-compiled in the main process — the
+alternative that would have broken the sentence above, and the reason it was
+rejected (ADR-0020).
+
+Plugin-rasterized pixels do reach the surface, but only as the bounded raster
+an image node carries: the host still decides where it lands, scales it to the
+node's rectangle and clips it, and the rest of the frame remains a display
+list with roles and a focus order. A plugin handing over the whole surface as
+pixels is what ADR-0020 rejected.
 
 The native worker uses the versioned proto3 protocol. The legacy and modern
 Python workers currently use separate bounded newline-delimited JSON protocols;

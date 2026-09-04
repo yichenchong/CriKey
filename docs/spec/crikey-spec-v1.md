@@ -2345,8 +2345,11 @@ those commands (ADR-0020).
 Pixels shall cross only as a bounded raster attached to a single node, under
 the limits of 32.5. The distinction is the whole of it: a plugin may hand over
 a picture that occupies one node's rectangle, and may not hand over the page.
-A surface-sized framebuffer per frame is what ADR-0020 rejected, and the
-per-node and per-frame raster caps are what keep the two apart.
+A surface-sized framebuffer per frame is what ADR-0020 rejected. The caps of
+32.5 bound what one frame may cost rather than making that shape unreachable —
+tiled rasters can still sum to a full surface — and what distinguishes a page
+from a canvas is that the rest of the frame remains a display list carrying
+roles, labels and a focus order.
 
 A page shall not learn its position on screen, and shall not draw outside the
 area the host gave it. The host clips.

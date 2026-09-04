@@ -215,9 +215,11 @@ What crosses the boundary is a display list and never code. Pixels cross only
 as a bounded raster on a single node, described under rasters below. You
 return a flat list of nodes — rectangles, text, lines, circles, each with
 geometry, colours and a semantic role — and the host draws them with the
-launcher's own renderer. This is why a page costs kilobytes a frame instead of
-the 1.10 MiB a 720×400 pixel canvas would cost, and why a page cannot crash or
-slow the launcher's UI thread. The reasoning, including why there is no
+launcher's own renderer. A page of geometry costs kilobytes a frame rather
+than the 1.10 MiB a 720×400 pixel canvas would; add rasters and you pay for
+them on every frame you answer, which is why they are capped and why you
+should reach for shapes first. Either way a page cannot crash or slow the
+launcher's UI thread. The reasoning, including why there is no
 embedded webview, is [ADR-0020](adr/0020-plugin-pages.md); the normative rules
 are [spec §32](spec/crikey-spec-v1.md#32-plugin-pages).
 
