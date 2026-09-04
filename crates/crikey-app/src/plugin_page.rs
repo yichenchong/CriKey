@@ -702,10 +702,12 @@ mod tests {
     }
 
     /// The floor exists because a raster rides in every frame: a page asking
-    /// for a one millisecond period would demand gigabytes a second for a
-    /// surface presented at 60 Hz. Zero still means "do not schedule".
+    /// for a one millisecond period would demand gigabytes a second of encode,
+    /// transport and decode. Sixteen milliseconds is one frame at the baseline
+    /// the launcher's budgets are written against, not a claim about any
+    /// particular display. Zero still means "do not schedule".
     #[test]
-    fn a_self_scheduled_redraw_is_clamped_to_the_presentable_rate() {
+    fn a_self_scheduled_redraw_is_clamped_to_the_baseline_frame() {
         assert_eq!(
             redraw_delay(0),
             None,
