@@ -226,8 +226,18 @@ fn a_client_that_sends_and_leaves_before_the_accept_is_still_read() {
 /// client sends *nothing*, so there is no frame that could arrive early and no
 /// ordering between threads to lose. A read that is meant to wait either
 /// consumes its timeout or returns at once, and only a non-blocking socket
-/// does the latter. An earlier version of this test raced a send against the
-/// read, which made the result depend on scheduling.
+/// does the latter. Earlier versions raced a send against the read - first
+/// with a sleep, then with a rendezvous channel - and both left the result
+/// depending on which thread ran first.
+///
+/// What remains is a clock reading around one call, not a proof. Masking the
+/// bug would take the scheduler stalling this thread for most of the timeout
+/// between `Instant::now()` and the read itself, since a non-blocking socket
+/// returns immediately whatever else is happening. That is a far smaller
+/// window than an inter-thread race, and it is the honest limit of this test:
+/// the direct check would be reading `O_NONBLOCK` off the accepted descriptor,
+/// which this crate cannot do without taking a `libc` dependency it otherwise
+/// has no use for.
 #[cfg(any(unix, windows))]
 #[test]
 fn a_connection_accepted_under_a_timeout_still_waits_for_its_client() {
