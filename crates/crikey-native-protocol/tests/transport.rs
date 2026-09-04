@@ -213,6 +213,73 @@ fn a_client_that_sends_and_leaves_before_the_accept_is_still_read() {
 /// reports success for the arming rather than for a client — so a listener
 /// that mistook it for one would hand the caller a pipe with nobody on the
 /// other end, and the real client behind it would never be seen.
+/// A connection accepted under a timeout must still wait for its client.
+///
+/// `accept` puts the listener into non-blocking mode to implement the timeout.
+/// Linux hands back a fresh blocking socket regardless, but macOS and the BSDs
+/// give the accepted socket the listener's `O_NONBLOCK`, so without an explicit
+/// reset every read returns `WouldBlock` - which this layer reports as
+/// `Timeout`. The effect is a plugin that connected and is about to speak being
+/// written off as silent.
+///
+/// Asserted on the clock rather than on a handshake, and deliberately: the
+/// client sends *nothing*, so there is no frame that could arrive early and no
+/// ordering between threads to lose. A read that is meant to wait either
+/// consumes its timeout or returns at once, and only a non-blocking socket
+/// does the latter. Earlier versions raced a send against the read - first
+/// with a sleep, then with a rendezvous channel - and both left the result
+/// depending on which thread ran first.
+///
+/// What remains is a clock reading around one call, not a proof. Masking the
+/// bug would take the scheduler stalling this thread for most of the timeout
+/// between `Instant::now()` and the read itself, since a non-blocking socket
+/// returns immediately whatever else is happening. That is a far smaller
+/// window than an inter-thread race, and it is the honest limit of this test:
+/// the direct check would be reading `O_NONBLOCK` off the accepted descriptor,
+/// which this crate cannot do without taking a `libc` dependency it otherwise
+/// has no use for.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_connection_accepted_under_a_timeout_still_waits_for_its_client() {
+    let endpoint = native_endpoint();
+    let listener = transport::Listener::bind(&endpoint).expect("bind the platform's native endpoint");
+
+    let client_endpoint = endpoint.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let client = std::thread::spawn(move || {
+        let _connection = transport::connect(&client_endpoint, Some(Duration::from_secs(5)))
+            .expect("the client reaches the endpoint");
+        // Connected and silent, held open until the server has finished
+        // reading, so the read waits on a live peer rather than seeing end of
+        // stream from a departed one.
+        let _ = done_rx.recv();
+    });
+
+    let mut accepted = listener
+        .accept(Some(Duration::from_secs(5)))
+        .expect("the endpoint accepts the client");
+    if accepted.supports_read_timeout() {
+        let wait = Duration::from_millis(400);
+        accepted
+            .set_read_timeout(Some(wait))
+            .expect("the accepted transport takes a read timeout");
+        let started = std::time::Instant::now();
+        let outcome = accepted.recv();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, Err(ProtocolError::Timeout)),
+            "a silent client should time the read out, got {outcome:?}"
+        );
+        assert!(
+            elapsed >= wait / 2,
+            "the read returned after {elapsed:?} of a {wait:?} timeout, so the accepted socket \
+             was left non-blocking and a plugin that is merely quiet reads as a dead one"
+        );
+    }
+    let _ = done_tx.send(());
+    client.join().expect("the client finishes");
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn a_client_that_says_nothing_and_leaves_does_not_consume_the_endpoint() {

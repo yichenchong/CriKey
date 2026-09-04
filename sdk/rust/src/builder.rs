@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 
 use crikey_core::{
     Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, NodeRole,
-    NodeShape, PageColor, PageFrame, PageNode, PluginId,
+    NodeShape, PageColor, PageError, PageFrame, PageImage, PageNode, PluginId, MAX_PAGE_IMAGE_BYTES,
+    MAX_PAGE_IMAGE_EDGE,
 };
 
 use crate::PagePalette;
@@ -261,6 +262,65 @@ impl PageRect {
     }
 }
 
+/// The RGBA8 buffer [`PageBuilder::canvas`] hands a plugin to draw into.
+///
+/// Addressed in pixels, in the raster's own coordinates, so the author writes
+/// what they mean and never the stride arithmetic behind it. Writes outside
+/// the buffer are clipped rather than fatal: a bar chart's last column is
+/// computed from plugin state, and a rounding error there should cost a
+/// pixel, not the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageCanvas {
+    pixel_width: u32,
+    pixel_height: u32,
+    rgba: Vec<u8>,
+}
+
+impl PageCanvas {
+    pub const fn width(&self) -> u32 {
+        self.pixel_width
+    }
+
+    pub const fn height(&self) -> u32 {
+        self.pixel_height
+    }
+
+    /// Paints every pixel, replacing what is there.
+    pub fn fill(&mut self, colour: PageColor) {
+        let bytes = [colour.r, colour.g, colour.b, colour.a];
+        for pixel in self.rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&bytes);
+        }
+    }
+
+    /// Paints one pixel, replacing what is there.
+    pub fn set_pixel(&mut self, x: u32, y: u32, colour: PageColor) {
+        if x >= self.pixel_width || y >= self.pixel_height {
+            return;
+        }
+        let offset = ((y as usize) * (self.pixel_width as usize) + x as usize) * 4;
+        self.rgba[offset..offset + 4].copy_from_slice(&[colour.r, colour.g, colour.b, colour.a]);
+    }
+
+    /// Paints an axis-aligned block of pixels, clipped to the buffer.
+    pub fn fill_rect(&mut self, x: u32, y: u32, width: u32, height: u32, colour: PageColor) {
+        let right = x.saturating_add(width).min(self.pixel_width);
+        let bottom = y.saturating_add(height).min(self.pixel_height);
+        if x >= right || y >= bottom {
+            return;
+        }
+        let bytes = [colour.r, colour.g, colour.b, colour.a];
+        let stride = self.pixel_width as usize;
+        for row in y..bottom {
+            let start = ((row as usize) * stride + x as usize) * 4;
+            let end = ((row as usize) * stride + right as usize) * 4;
+            for pixel in self.rgba[start..end].chunks_exact_mut(4) {
+                pixel.copy_from_slice(&bytes);
+            }
+        }
+    }
+}
+
 impl PageBuilder {
     /// Starts a frame answering `generation`, drawn in the host's palette.
     ///
@@ -487,6 +547,128 @@ impl PageBuilder {
             0.0,
             text_colour,
         )
+    }
+
+    /// Draws a raster the plugin already holds as finished pixels.
+    ///
+    /// `rgba` is raw RGBA8 - row-major, non-premultiplied, no padding - and
+    /// nothing else: the host parses no image format, so a plugin shipping a
+    /// PNG decodes it in its own process. The raster is scaled into `rect`,
+    /// which is why the pixel dimensions are given separately.
+    ///
+    /// An empty `label` leaves the node decoration, exactly as an unlabelled
+    /// rect is: a picture says nothing to a screen reader that the author did
+    /// not say for it.
+    pub fn image(
+        self,
+        rect: PageRect,
+        label: impl Into<String>,
+        pixel_width: u32,
+        pixel_height: u32,
+        rgba: impl Into<Vec<u8>>,
+    ) -> Result<Self, PageError> {
+        let rgba = rgba.into();
+        let expected = self.check_raster(pixel_width, pixel_height)?;
+        if rgba.len() != expected {
+            return Err(PageError::ImageSizeMismatch {
+                index: self.nodes.len(),
+                expected,
+                actual: rgba.len(),
+            });
+        }
+        Ok(self.raster_node(rect, label.into(), pixel_width, pixel_height, rgba))
+    }
+
+    /// Draws a raster the plugin paints itself, through a buffer handed to
+    /// `draw`.
+    ///
+    /// The buffer arrives fully transparent and correctly sized, and
+    /// [`PageCanvas`] addresses it by pixel, so an author draws a chart
+    /// without writing `(y * width + x) * 4` once. It is the same node kind
+    /// [`PageBuilder::image`] produces - the host cannot tell a painted
+    /// surface from a shipped picture, and has no reason to.
+    pub fn canvas(
+        self,
+        rect: PageRect,
+        label: impl Into<String>,
+        pixel_width: u32,
+        pixel_height: u32,
+        draw: impl FnOnce(&mut PageCanvas),
+    ) -> Result<Self, PageError> {
+        let expected = self.check_raster(pixel_width, pixel_height)?;
+        let mut canvas = PageCanvas {
+            pixel_width,
+            pixel_height,
+            rgba: vec![0; expected],
+        };
+        draw(&mut canvas);
+        Ok(self.raster_node(rect, label.into(), pixel_width, pixel_height, canvas.rgba))
+    }
+
+    /// The byte count a raster of these dimensions must carry, or the refusal
+    /// the host would answer with.
+    ///
+    /// Checked before the pixels exist rather than after the frame is sent:
+    /// the dimensions decide the allocation, so an author who got them wrong
+    /// learns it at the call that was wrong and pays for no megabyte the host
+    /// was always going to drop.
+    fn check_raster(&self, pixel_width: u32, pixel_height: u32) -> Result<usize, PageError> {
+        let index = self.nodes.len();
+        if pixel_width == 0
+            || pixel_height == 0
+            || pixel_width > MAX_PAGE_IMAGE_EDGE
+            || pixel_height > MAX_PAGE_IMAGE_EDGE
+        {
+            return Err(PageError::ImageEdgeOutOfRange {
+                index,
+                pixel_width,
+                pixel_height,
+            });
+        }
+        let expected = (pixel_width as usize) * (pixel_height as usize) * 4;
+        if expected > MAX_PAGE_IMAGE_BYTES {
+            return Err(PageError::ImageTooLarge {
+                index,
+                bytes: expected,
+            });
+        }
+        Ok(expected)
+    }
+
+    /// Pushes the raster node both raster helpers produce.
+    ///
+    /// A labelled raster takes [`NodeRole::Label`]: it is announced with the
+    /// name the author gave and stays out of the focus ring, because a
+    /// picture is not something Tab should stop on.
+    fn raster_node(
+        self,
+        rect: PageRect,
+        label: String,
+        pixel_width: u32,
+        pixel_height: u32,
+        rgba: Vec<u8>,
+    ) -> Self {
+        let PageRect { x, y, width, height } = rect;
+        let role = if label.is_empty() {
+            NodeRole::None
+        } else {
+            NodeRole::Label
+        };
+        self.node(PageNode {
+            shape: NodeShape::Image,
+            x,
+            y,
+            width,
+            height,
+            role,
+            label,
+            image: Some(PageImage {
+                pixel_width,
+                pixel_height,
+                rgba,
+            }),
+            ..PageNode::default()
+        })
     }
 
     /// Consumes the builder and produces the frame.

@@ -1,8 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use crikey_core::{
-    Generation, ItemId, NodeRole, NodeShape, PageColor, PageFrame, PageInput, PageInputKind, PageNode,
-    PluginId,
+    Generation, ItemId, NodeRole, NodeShape, PageColor, PageFrame, PageImage, PageInput, PageInputKind,
+    PageNode, PluginId,
 };
 use crikey_platform::IconImage;
 use crikey_ui::{
@@ -1207,7 +1207,7 @@ fn switch_shapes(frame: &crikey_ui::NativeUiFrame) -> (egui::Color32, egui::Colo
 }
 
 // ---------------------------------------------------------------------------
-// Plugin-drawn pages (spec 33)
+// Plugin-drawn pages (spec 32)
 //
 // Every assertion here is on the frame the shipped renderer builds, because
 // the whole claim of a page is that the *host* draws it: a plugin hands over a
@@ -1257,11 +1257,17 @@ fn page_control(role: NodeRole, node_id: u32, x: f32, y: f32, width: f32, height
 }
 
 fn page_view(nodes: Vec<PageNode>) -> ViewModel {
+    page_view_at_generation(nodes, 1)
+}
+
+/// A page whose frame carries `generation`, for the tests that care that the
+/// host keeps advancing it while the picture inside the page does not change.
+fn page_view_at_generation(nodes: Vec<PageNode>, generation: u64) -> ViewModel {
     let mut view = model("");
     let mut all = vec![probe_node()];
     all.extend(nodes);
     let frame = PageFrame {
-        generation: 1,
+        generation,
         title: "Demo Page".to_owned(),
         nodes: all,
         ..PageFrame::default()
@@ -1696,5 +1702,179 @@ fn a_stale_page_says_so_in_the_status_line() {
     assert!(
         painted(&stale, "Waiting for the plugin"),
         "a stale page must be visibly distinguishable from a fresh one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Page rasters (spec 32)
+//
+// The one node whose content the host does not compose: the plugin hands over
+// finished pixels, so what is under test is the upload, its reuse and its
+// release rather than any drawing decision.
+// ---------------------------------------------------------------------------
+
+/// The extent of every raster fixture below.
+///
+/// Deliberately unlike the icon slot and unlike any font atlas page, so a
+/// frame's texture deltas can be filtered down to the page's own picture by
+/// size alone.
+const RASTER: [usize; 2] = [3, 2];
+
+/// A solid raster. Opaque, because egui stores premultiplied colour and an
+/// opaque pixel is the one case where the uploaded bytes must equal the ones
+/// the plugin sent.
+fn raster(colour: [u8; 4]) -> PageImage {
+    PageImage {
+        pixel_width: RASTER[0] as u32,
+        pixel_height: RASTER[1] as u32,
+        rgba: colour
+            .iter()
+            .copied()
+            .cycle()
+            .take(RASTER[0] * RASTER[1] * 4)
+            .collect(),
+    }
+}
+
+/// An image node carrying `colour`, with a fill the host must ignore.
+fn image_node(x: f32, y: f32, width: f32, height: f32, colour: [u8; 4]) -> PageNode {
+    let mut node = page_node(NodeShape::Image, x, y, width, height);
+    node.image = Some(raster(colour));
+    // A fill no raster may ever be multiplied by: the plugin already decided
+    // what its pixels look like.
+    node.fill = PageColor::rgba(255, 0, 0, 255);
+    node
+}
+
+/// How many of this frame's texture uploads are page rasters.
+fn raster_uploads(frame: &crikey_ui::NativeUiFrame) -> usize {
+    frame
+        .output
+        .textures_delta
+        .set
+        .iter()
+        .filter(|(_, delta)| delta.image.size() == RASTER)
+        .count()
+}
+
+#[track_caller]
+fn raster_texture(frame: &crikey_ui::NativeUiFrame) -> egui::TextureId {
+    frame
+        .output
+        .textures_delta
+        .set
+        .iter()
+        .find(|(_, delta)| delta.image.size() == RASTER)
+        .map(|(id, _)| *id)
+        .expect("the page's raster is uploaded as a texture of its own pixel extent")
+}
+
+#[test]
+fn a_page_image_node_paints_its_raster_into_its_own_rectangle_untinted() {
+    let context = create_launcher_context();
+    let colour = [10, 200, 90, 255];
+    let view = page_view(vec![image_node(12.0, 16.0, 60.0, 40.0, colour)]);
+
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+
+    let id = raster_texture(&frame);
+    let (_, delta) = frame
+        .output
+        .textures_delta
+        .set
+        .iter()
+        .find(|(uploaded, _)| *uploaded == id)
+        .expect("the raster just found is in this frame's deltas");
+    match &delta.image {
+        egui::ImageData::Color(image) => assert_eq!(
+            image.pixels[0],
+            egui::Color32::from_rgba_premultiplied(colour[0], colour[1], colour[2], colour[3]),
+            "the host uploads the plugin's pixels unaltered"
+        ),
+        egui::ImageData::Font(_) => panic!("a raster uploads colour data, not font coverage"),
+    }
+
+    let origin = page_origin(&frame);
+    let expected = egui::Rect::from_min_size(origin + egui::vec2(12.0, 16.0), egui::vec2(60.0, 40.0));
+    let (shape, clip) = rect_shapes(&frame)
+        .into_iter()
+        .find(|(shape, _)| shape.fill_texture_id == id)
+        .expect("the uploaded raster is painted in this frame");
+    assert_eq!(
+        shape.rect, expected,
+        "a raster is drawn into the node's own rectangle, offset by the page origin"
+    );
+    assert!(
+        clip.contains_rect(expected),
+        "the raster must be drawn under the page's clip, like every other node: {clip:?} does not \
+         contain {expected:?}"
+    );
+    assert_eq!(
+        shape.fill,
+        egui::Color32::WHITE,
+        "a raster must be drawn untinted: the node's fill colours the shapes the host composes, \
+         not the pixels the plugin composed itself"
+    );
+}
+
+/// One upload for a raster the plugin keeps drawing.
+///
+/// This is the memoisation contract, and the reason it is a contract rather
+/// than an optimisation: a page rebuilds its whole display list every frame
+/// and is redrawn on every input event, so a renderer that uploaded per frame
+/// would push the raster across the bus on every keystroke. The second frame
+/// is built from a *separately constructed* page whose pixels merely match, so
+/// nothing here can pass by reusing the first frame's allocation.
+#[test]
+fn a_raster_drawn_on_two_consecutive_frames_is_uploaded_once() {
+    let context = create_launcher_context();
+    let colour = [10, 200, 90, 255];
+
+    let first = build_launcher_frame(
+        &context,
+        launcher_input(Vec::new()),
+        &page_view(vec![image_node(0.0, 8.0, 30.0, 20.0, colour)]),
+    );
+    // A later generation, because that is what a real second frame carries:
+    // the host advances it on every input and resize. Keying the cache on
+    // anything that moves with the frame - the generation above all - would
+    // miss on every keystroke while still passing a two-identical-frames
+    // test, so the fixture deliberately does not hold it still.
+    let second = build_launcher_frame(
+        &context,
+        launcher_input(Vec::new()),
+        &page_view_at_generation(vec![image_node(0.0, 8.0, 30.0, 20.0, colour)], 2),
+    );
+
+    assert_eq!(raster_uploads(&first), 1, "the first frame uploads the raster");
+    assert_eq!(
+        raster_uploads(&second),
+        0,
+        "a page redrawing the same picture must reuse the texture it already holds"
+    );
+    assert!(
+        rect_shapes(&second)
+            .iter()
+            .any(|(shape, _)| shape.fill_texture_id == raster_texture(&first)),
+        "the reused texture is what the second frame paints"
+    );
+}
+
+/// A closed page's rasters are freed, because nothing will ever draw them
+/// again. A launcher that kept them would hold a megabyte of GPU memory for
+/// every page the user opened during the session.
+#[test]
+fn closing_a_page_releases_the_rasters_it_uploaded() {
+    let context = create_launcher_context();
+    let view = page_view(vec![image_node(0.0, 8.0, 30.0, 20.0, [10, 200, 90, 255])]);
+
+    let opened = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let id = raster_texture(&opened);
+
+    let closed = build_launcher_frame(&context, launcher_input(Vec::new()), &model(""));
+
+    assert!(
+        closed.output.textures_delta.free.contains(&id),
+        "the texture the page uploaded must be freed when the page closes"
     );
 }
