@@ -211,7 +211,8 @@ When a result list cannot express what your plugin does — a form, a checklist,
 a converter with a live answer — an action may open a *page*: a surface the
 launcher presents in place of the result list and that you draw yourself.
 
-What crosses the boundary is a display list, never pixels and never code. You
+What crosses the boundary is a display list and never code. Pixels cross only
+as a bounded raster on a single node, described under rasters below. You
 return a flat list of nodes — rectangles, text, lines, circles, each with
 geometry, colours and a semantic role — and the host draws them with the
 launcher's own renderer. This is why a page costs kilobytes a frame instead of
@@ -249,7 +250,11 @@ a resize advances the generation because your previous layout was for a
 different size.
 
 Return `redraw_after_ms` only if your page genuinely changes without input; `0`
-means static until the user acts, which is what a form should be.
+means static until the user acts, which is what a form should be. A shorter
+period than `MIN_PAGE_REDRAW_MS` (16 ms) is raised to it rather than honoured,
+because your whole display list - rasters included - is re-sent on every frame
+you answer, so a fast timer costs real bandwidth for a repaint the user is
+unlikely to perceive. Frames answering input are never delayed by that floor.
 
 Escape is reserved by the host. It closes your page and is never delivered to
 you, so do not plan an Escape binding. You close your own page by returning a
@@ -266,7 +271,7 @@ done button, holding its state across frames:
 ```rust
 use crikey_core::Result;
 use crikey_plugin_sdk::{
-    ExecuteOutcome, ExecuteRequest, PageBuilder, PageFrame, PageInputKind,
+    ExecuteOutcome, ExecuteRequest, PageBuilder, PageFrame, PageInputKind, PageRect,
     PageRequest, Plugin, PluginContext,
 };
 
@@ -350,10 +355,10 @@ impl Plugin for Notes {
 
         page = page
             .heading(16.0, 16.0, "Note")
-            .text_field(FIELD, 16.0, 56.0, width - 32.0, 28.0, "Note text", shown)
+            .text_field(FIELD, PageRect::new(16.0, 56.0, width - 32.0, 28.0), "Note text", shown)
             .checkbox(PINNED, 16.0, 100.0, "Pin to top", self.pinned)
-            .button(SAVE, 16.0, 136.0, 96.0, 28.0, "Save")
-            .button(DONE, 124.0, 136.0, 96.0, 28.0, "Done")
+            .button(SAVE, PageRect::new(16.0, 136.0, 96.0, 28.0), "Save")
+            .button(DONE, PageRect::new(124.0, 136.0, 96.0, 28.0), "Done")
             .text(
                 16.0,
                 176.0,
@@ -400,13 +405,70 @@ budget twice as fast as the call count suggests. Only the rectangle is
 addressable; the caption is decoration, which is exactly why it carries no
 `node_id`.
 
+### Rasters: a picture, or a surface you paint
+
+Every builder above composes shapes the host draws. Two hand the host finished
+pixels instead, and both produce the same node kind:
+
+```rust
+page = page
+    // A picture the plugin already holds, scaled into the node's rectangle.
+    .image(PageRect::new(16.0, 200.0, 48.0, 48.0), "Cover art", 32, 32, cover_rgba)?
+    // A surface the plugin paints, addressed in pixels.
+    .canvas(
+        PageRect::new(80.0, 200.0, 120.0, 48.0),
+        "Load over the last minute",
+        60,
+        24,
+        |canvas| {
+            for (column, sample) in samples.iter().enumerate() {
+                let bar = (canvas.height() * sample) / 100;
+                canvas.fill_rect(column as u32 * 5, canvas.height() - bar, 4, bar, palette.accent);
+            }
+        },
+    )?;
+```
+
+Both take raw RGBA8 and nothing else: four bytes per pixel, row-major,
+non-premultiplied, no row padding. **The host decodes no image format.** There
+is no PNG, JPEG or SVG decoder in the launcher process, deliberately: a decoder
+is an attack surface, and a compressed byte count says nothing about the
+allocation behind it. A plugin that ships a PNG decodes it in its own process,
+where a malformed file costs its author a worker and costs the launcher
+nothing.
+
+`canvas` is there so you never write `(y * width + x) * 4`. It hands your
+closure a correctly sized, fully transparent buffer with `fill`, `fill_rect`
+and `set_pixel` in the raster's own pixel coordinates; writes outside it are
+clipped rather than fatal, because a bar computed from your own state should
+cost a pixel when it overshoots and not the worker. The pixel dimensions are
+separate from the node's rectangle because the host scales one into the other:
+a chart does not need one raster pixel per logical pixel, and a small raster is
+a small frame.
+
+Both refuse a raster that cannot exist — a zero side, a side over the edge
+bound, a byte count that disagrees with the dimensions, or more bytes than one
+node may carry — by returning `PageError` from the call that was wrong, rather
+than building a node the host would refuse the whole frame for. That refusal
+consumes the builder, which is the point: the frame was never going to be
+drawable.
+
+**A raster carries no accessible name.** A screen reader gets nothing from a
+picture of a chart, so a raster with an empty label is decoration and is
+reported as nothing at all; pass a label — which sets a `Label` role for you —
+whenever the raster carries information the rest of your page does not also say
+in text. A raster is never focusable either: when the user has to be able to
+operate it, put a `NodeShape::None` node carrying a `Button` role and a
+`node_id` over it, which is exactly what that shape is for.
+
 ### Roles are the accessibility contract
 
 A painted glyph is not an accessible name. Nothing about drawing the word
 "Save" tells anything that a button exists, so roles, labels and focus order
 travel beside the drawing. `button`, `checkbox`, `text_field` and `heading` set
-a role for you; a bare `rect` or `text` node is decoration by definition, which
-is correct for a divider and wrong for something the user can click.
+a role for you, and `image` and `canvas` do so only when you give them a label;
+a bare `rect` or `text` node is decoration by definition, which is correct for a
+divider and wrong for something the user can click.
 
 An interactive node with no accessible name is reported as a defect of your
 page, not quietly drawn, so give every control a label. The focus ring is
@@ -429,6 +491,15 @@ nodes (`MAX_PAGE_NODES`), at most 8,192 bytes of text per node
 the page origin (`MAX_PAGE_EDGE`). Two nodes claiming the same non-zero
 `node_id` is also a refusal, because an event naming it would be ambiguous, and
 so is any coordinate that is `NaN` or infinite.
+
+Rasters are bounded three ways, and all three are named constants you can
+check against: 1 MiB of pixels per node (`MAX_PAGE_IMAGE_BYTES`), 4 MiB summed
+across every raster in one frame (`MAX_PAGE_IMAGE_TOTAL_BYTES`), and 1,024
+pixels per side (`MAX_PAGE_IMAGE_EDGE`). The edge bound is checked separately
+from the byte count, so a 1x262,144 strip is refused on its shape rather than
+sneaking under the megabyte. A raster on a node of any other shape, and an
+image node carrying no raster, are refusals too: the first would mean the two
+sides disagree about what the node is, the second would draw a hole.
 
 A refused frame is not drawn in part, and refusal is not a warning: it is a
 protocol violation, so the host terminates your process, leaves the last good

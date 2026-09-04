@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crikey_core::{PageFrame, PageInput, PageInputKind, PagePalette, PluginId};
+use crikey_core::{PageFrame, PageInput, PageInputKind, PagePalette, PluginId, MIN_PAGE_REDRAW_MS};
 
 /// How many unanswered input events a page may accumulate before the host
 /// concludes the plugin has stopped drawing.
@@ -334,6 +334,20 @@ struct PageDriver {
     wake: PageWake,
 }
 
+/// How long to wait before asking a page for a frame it scheduled itself.
+///
+/// Clamped rather than obeyed. A page may ask for a one millisecond period,
+/// and with a raster aboard every frame that is gigabytes a second of encode,
+/// transport and decode for a surface the host presents at 60 Hz regardless -
+/// so a shorter period costs the machine everything and shows the user
+/// nothing. Zero keeps its meaning of "do not schedule one".
+///
+/// Only self-scheduled redraws are clamped. A frame answering user input is
+/// never delayed by this.
+fn redraw_delay(redraw_after_ms: u32) -> Option<Duration> {
+    (redraw_after_ms != 0).then(|| Duration::from_millis(u64::from(redraw_after_ms.max(MIN_PAGE_REDRAW_MS))))
+}
+
 impl PageDriver {
     fn run(&mut self, commands: &Receiver<PageCommand>, backend: &mut dyn PageBackend) {
         loop {
@@ -410,8 +424,11 @@ impl PageDriver {
                 continue;
             }
             let close = frame.close;
-            self.redraw_at = (!close && frame.redraw_after_ms != 0)
-                .then(|| Instant::now() + Duration::from_millis(u64::from(frame.redraw_after_ms)));
+            self.redraw_at = if close {
+                None
+            } else {
+                redraw_delay(frame.redraw_after_ms).map(|delay| Instant::now() + delay)
+            };
             self.last_frame = frame.clone();
             self.publish(frame, close);
             // The plugin asking to close IS the notification; sending it a
@@ -587,7 +604,10 @@ mod tests {
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::Arc;
 
-    use super::{PageBackend, PageDeadlines, PageDraw, PageOpen, PageSession, PageUpdate};
+    use super::{
+        redraw_delay, Duration, PageBackend, PageDeadlines, PageDraw, PageOpen, PageSession, PageUpdate,
+        MIN_PAGE_REDRAW_MS,
+    };
     use crikey_core::{PageFrame, PageInput, PageInputKind, PagePalette, PluginId};
 
     /// A plugin that answers exactly what a test tells it to, and records what
@@ -679,6 +699,28 @@ mod tests {
             title: "page".to_owned(),
             ..PageFrame::default()
         }
+    }
+
+    /// The floor exists because a raster rides in every frame: a page asking
+    /// for a one millisecond period would demand gigabytes a second for a
+    /// surface presented at 60 Hz. Zero still means "do not schedule".
+    #[test]
+    fn a_self_scheduled_redraw_is_clamped_to_the_presentable_rate() {
+        assert_eq!(
+            redraw_delay(0),
+            None,
+            "zero stays off rather than becoming the floor"
+        );
+        assert_eq!(
+            redraw_delay(1),
+            Some(Duration::from_millis(u64::from(MIN_PAGE_REDRAW_MS))),
+            "a period the host cannot present is raised to one it can"
+        );
+        assert_eq!(
+            redraw_delay(250),
+            Some(Duration::from_millis(250)),
+            "a period a plugin can afford is left exactly as asked"
+        );
     }
 
     #[test]

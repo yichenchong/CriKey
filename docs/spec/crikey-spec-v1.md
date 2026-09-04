@@ -2338,9 +2338,15 @@ list.
 A page shall be expressed as a display list: a flat, retained frame of drawing
 nodes that the host draws with its own renderer.
 
-Neither pixels nor executable code shall cross the plugin boundary for a page.
-The plugin sends drawing commands and semantics; the host performs all
-rasterization (ADR-0020).
+Executable code shall never cross the plugin boundary for a page. The plugin
+sends drawing commands and semantics; the host performs all rasterization of
+those commands (ADR-0020).
+
+Pixels shall cross only as a bounded raster attached to a single node, under
+the limits of 32.5. The distinction is the whole of it: a plugin may hand over
+a picture that occupies one node's rectangle, and may not hand over the page.
+A surface-sized framebuffer per frame is what ADR-0020 rejected, and the
+per-node and per-frame raster caps are what keep the two apart.
 
 A page shall not learn its position on screen, and shall not draw outside the
 area the host gave it. The host clips.
@@ -2420,7 +2426,7 @@ A page frame shall consist of:
 
 Each node shall carry:
 
-- A shape: none, rectangle, text, line, or circle.
+- A shape: none, rectangle, text, line, circle, or image.
 - Geometry `x`, `y`, `width`, `height` in logical pixels, relative to the
   page's own top-left corner.
 - A fill colour and a stroke colour, each `0xRRGGBBAA`; a zero alpha is not
@@ -2433,9 +2439,55 @@ Each node shall carry:
   addressed by an input event.
 - A focus-order position, where ties shall break by list order.
 - A checked state.
+- A raster, required when the shape is image and refused on every other
+  shape.
 
 The shape set shall be closed. A plugin shall not be able to introduce a shape
 the host cannot draw with its own renderer.
+
+An image node is the one node whose content the host does not compose: the
+plugin supplies finished pixels, so the same shape serves both a picture a
+plugin shipped and a surface a plugin drew itself. A raster shall carry a
+pixel width, a pixel height, and its bytes; the host scales those pixels to
+the node's rectangle. A raster shall carry no meaning of its own: the role and
+the label are the only things that make it more than decoration, exactly as
+for every other node.
+
+A raster shall be raw RGBA8 and nothing else: exactly
+`pixel_width * pixel_height * 4` bytes, row-major, without padding, and not
+premultiplied. The host shall not parse any image format. A decoder is an
+attack surface, and a compressed byte count says nothing about the allocation
+behind it, whereas with raw pixels the wire length is the memory cost and is
+already bounded by `MAX_FRAME_BYTES` and the decoder's allocation budget as the
+bytes arrive. A plugin holding a PNG shall decode it in its own
+process, where a malformed file costs its author a worker and costs the
+launcher nothing.
+
+A raster shall be bounded three ways. These are semantic bounds, checked after
+decoding: the decoder's own allocation budget and `MAX_FRAME_BYTES` are what
+bound the bytes as they arrive, and these bounds are what the frame is refused
+on once it has:
+
+- At most `MAX_PAGE_IMAGE_BYTES` (1 MiB) per node.
+- At most `MAX_PAGE_IMAGE_TOTAL_BYTES` (4 MiB) summed across one frame, so a
+  page full of rasters still leaves room for the rest of the display list
+  inside one protocol frame.
+- At most `MAX_PAGE_IMAGE_EDGE` (1,024) pixels a side, and at least one. The
+  edge bound governs the texture the host uploads independently of the byte
+  count, so a 1x262144 strip is refused on its shape rather than passing under
+  the byte cap.
+
+A shape code the host does not recognise shall decode to the unspecified shape
+and shall paint nothing. A shape a newer plugin knows and an older host does
+not shall therefore cost that host one blank node rather than a refused frame,
+and the rest of the display list shall still be drawn.
+
+The rest of such a node shall survive intact. Its role, its accessible name,
+its identifier and its place in the focus ring shall be unaffected by the
+shape being unknown, so a control an older host cannot draw is still
+announced, still reachable by Tab and still able to be activated. A host
+shall not drop the node, which would leave a gap in the plugin's focus order
+and make the function unreachable.
 
 Layout shall be the plugin's responsibility. The host shall not reflow, wrap,
 stack, or otherwise reposition nodes.
@@ -2456,6 +2508,13 @@ under §25.1.
 A page frame shall additionally remain within the protocol's 8 MiB
 `MAX_FRAME_BYTES` cap like any other message (ADR-0004).
 
+A self-scheduled redraw shall be clamped to `MIN_PAGE_REDRAW_MS` (16 ms). A
+page requests its next frame with a delay, and the per-frame caps above bound
+one frame without bounding a rate: at a one millisecond period a page carrying
+rasters would demand gigabytes a second for a surface the host presents at
+60 Hz. A request for zero shall keep its meaning of scheduling no redraw, and
+a frame answering user input shall not be delayed by this clamp.
+
 ### 32.7 Refusal
 
 Every page frame arriving from a plugin shall be validated before any other
@@ -2469,6 +2528,21 @@ A frame shall be refused when:
 - Any coordinate lies outside `MAX_PAGE_EDGE`.
 - Two nodes claim the same non-zero node identifier, which would make an
   input event naming that identifier ambiguous.
+- A node whose shape is image carries no raster, or a node of any other shape
+  carries one. The first would draw a hole and the second means the plugin and
+  the host disagree about what the node is, so neither is ignored.
+
+  A node whose shape code the host did not recognise is the one exception. It
+  decodes to the unspecified shape, which is indistinguishable from an
+  explicit unspecified, so its raster shall be discarded during conversion and
+  the node shall not be refused on this ground. Discarding rather than
+  refusing is what makes 32.5's forward-compatibility rule hold for a future
+  shape that carries a raster; every shape the host does know keeps its
+  raster, so the refusal above still reports a genuine mismatch.
+- A raster's byte count does not equal `pixel_width * pixel_height * 4`.
+- A raster's width or height is zero or exceeds `MAX_PAGE_IMAGE_EDGE`.
+- A raster exceeds `MAX_PAGE_IMAGE_BYTES`.
+- The frame's rasters together exceed `MAX_PAGE_IMAGE_TOTAL_BYTES`.
 
 A refused frame shall not be drawn in whole or in part. A refusal is a protocol
 violation: the supervisor shall terminate the offending plugin process, the

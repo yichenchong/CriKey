@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
     fmt,
+    hash::{Hash, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
@@ -8,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crikey_core::{NodeRole, NodeShape, PageColor, PageFrame, PageInput, PageInputKind, PageNode};
+use crikey_core::{NodeRole, NodeShape, PageColor, PageFrame, PageImage, PageInput, PageInputKind, PageNode};
 use egui::{
     load::SizedTexture, text::LayoutJob, vec2, Align, Align2, ColorImage, FontFamily, FontId, Frame, Layout,
     Margin, RawInput, RichText, Rounding, Stroke, TextEdit, TextFormat, TextStyle, TextureHandle,
@@ -2126,6 +2127,14 @@ fn draw_launcher(
     if context.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
         commands.push(UiCommand::OpenSettings);
     }
+    // A page's rasters are the page's, and nothing else in the launcher draws
+    // them: keeping them past the close would hold up to `MAX_PAGE_IMAGE_TOTAL_BYTES`
+    // of GPU memory for every page the user ever opened. `page_textures` drops
+    // whatever a live page stopped drawing; a closed page has no draw call to
+    // do it in, which is what this branch is for.
+    if model.page.is_none() {
+        release_page_textures(context);
+    }
     egui::CentralPanel::default()
         .frame(
             Frame::default()
@@ -2691,7 +2700,8 @@ fn draw_actions(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
 ///
 /// The launcher draws the display list itself: what crosses the plugin
 /// boundary is a vocabulary of shapes and the semantics attached to them,
-/// never pixels and never code. That is what makes a page safe to show at all
+/// never code, and pixels only as a bounded per-node raster. That is what
+/// makes a page safe to show at all
 /// -- a plugin can describe an ugly surface, but it cannot reach the GPU, the
 /// window, or anything the launcher draws outside the rectangle below.
 ///
@@ -2810,9 +2820,14 @@ fn draw_page(ui: &mut egui::Ui, page: &PageSurface, commands: &mut Vec<UiCommand
     let pointer = page_pointer(&page_ui, page, rect);
     let focus = page_focus(&page_ui, page, &ring, pointer.as_ref(), commands);
 
+    // Resolved for the whole display list before anything is painted, because
+    // the cache's eviction policy is "the rasters this frame does not draw"
+    // and that is a property of the list rather than of one node.
+    let textures = page_textures(page_ui.ctx(), &page.frame.nodes);
+
     for (index, node) in page.frame.nodes.iter().enumerate() {
         let node_rect = node_rect(rect.min, node);
-        paint_node(page_ui.painter(), node, node_rect);
+        paint_node(page_ui.painter(), node, node_rect, textures.get(&index).copied());
         page_node_semantics(&page_ui, index, node, node_rect, focus, commands);
     }
 
@@ -2886,8 +2901,134 @@ fn node_text_size(node: &PageNode) -> f32 {
     }
 }
 
+/// The whole of a raster, which is the only part of one a node ever draws: the
+/// plugin decides what its picture contains, so the host has no business
+/// showing a window onto it.
+const RASTER_UV: egui::Rect = egui::Rect {
+    min: egui::Pos2::ZERO,
+    max: egui::pos2(1.0, 1.0),
+};
+
+/// Uploaded page rasters, keyed by the content identity of their pixels.
+///
+/// Separate from [`IconTextures`] because the lifetime is different, not
+/// because the mechanism is: an icon belongs to the session and is worth
+/// keeping past the row that showed it, while a raster belongs to the page
+/// that supplied it and is worthless the moment that page stops drawing it.
+#[derive(Default)]
+struct PageTextures {
+    by_content: HashMap<u64, TextureHandle>,
+}
+
+/// `egui::TextureHandle` is not `Debug` and the workspace requires every type
+/// to be; the retained count is what a diagnostic wants anyway.
+impl fmt::Debug for PageTextures {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PageTextures")
+            .field("retained", &self.by_content.len())
+            .finish()
+    }
+}
+
+fn page_textures_id() -> egui::Id {
+    egui::Id::new("crikey-page-textures")
+}
+
+/// Uploads the rasters this frame's display list draws, and says which texture
+/// each image node samples.
+///
+/// Memoisation is the whole point. A page rebuilds its entire display list
+/// every frame and is redrawn on every input event, so uploading here without
+/// a cache would push up to `MAX_PAGE_IMAGE_TOTAL_BYTES` across the bus per
+/// keystroke. Keyed on the pixels rather than on the node's position in the
+/// list, because a plugin reorders and rebuilds nodes freely while the picture
+/// inside them stays the same.
+///
+/// The map is rebuilt from the previous frame's rather than added to, and that
+/// single move is also the eviction policy: what this frame does not draw is a
+/// texture nothing will draw again, so it is dropped as `previous` goes out of
+/// scope. A page that swaps its preview on every keystroke therefore holds one
+/// texture rather than one per keystroke, and a page replaced by another page
+/// keeps only what the new one happens to share. The one case with no draw
+/// call to sweep it is a page that has closed, which [`draw_launcher`] handles
+/// with [`release_page_textures`].
+fn page_textures(context: &egui::Context, nodes: &[PageNode]) -> HashMap<usize, egui::TextureId> {
+    let cache: Arc<Mutex<PageTextures>> = context.data_mut(|data| {
+        Arc::clone(data.get_temp_mut_or_default::<Arc<Mutex<PageTextures>>>(page_textures_id()))
+    });
+    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = std::mem::take(&mut cache.by_content);
+
+    let mut drawn = HashMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let Some(image) = node_raster(node) else {
+            continue;
+        };
+        let key = raster_key(image);
+        let handle = match previous.get(&key) {
+            Some(handle) => handle.clone(),
+            None => {
+                let pixels = ColorImage::from_rgba_unmultiplied(
+                    [image.pixel_width as usize, image.pixel_height as usize],
+                    &image.rgba,
+                );
+                // Linear because a raster is as likely magnified as minified:
+                // the node's rect is the plugin's choice and has no fixed
+                // relationship to the raster's pixel extent.
+                context.load_texture(
+                    format!("crikey-page-raster-{key:016x}"),
+                    pixels,
+                    TextureOptions::LINEAR,
+                )
+            }
+        };
+        drawn.insert(index, handle.id());
+        cache.by_content.insert(key, handle);
+    }
+    drawn
+}
+
+/// Drops every raster a page uploaded.
+fn release_page_textures(context: &egui::Context) {
+    context.data_mut(|data| data.remove::<Arc<Mutex<PageTextures>>>(page_textures_id()));
+}
+
+/// The raster a node draws, or `None` when it has none the host can draw.
+///
+/// `PageFrame::validate` already refuses a raster whose byte count disagrees
+/// with its dimensions, and refuses an image on a non-image node. It is
+/// checked again here because `ColorImage::from_rgba_unmultiplied` *panics* on
+/// the mismatch: this path draws whatever the view model holds and re-derives
+/// nothing, so a number that got past validation must cost the picture rather
+/// than the window.
+fn node_raster(node: &PageNode) -> Option<&PageImage> {
+    let image = node.image.as_ref()?;
+    let sized = !image.rgba.is_empty() && image.expected_bytes() == Some(image.rgba.len());
+    (node.shape == NodeShape::Image && sized).then_some(image)
+}
+
+/// The identity of one raster inside this process's texture cache.
+///
+/// Hashed on every frame that draws it, unlike [`crikey_platform::IconImage`],
+/// which carries an identity computed once when it was decoded: a `PageImage`
+/// arrives from a plugin as bytes and there is nowhere on this side of the
+/// boundary to memoise one. The dimensions are hashed with the pixels so that
+/// two rasters differing only in shape -- a 1x2 and a 2x1 over the same four
+/// pixels -- cannot share a texture.
+fn raster_key(image: &PageImage) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    image.pixel_width.hash(&mut hasher);
+    image.pixel_height.hash(&mut hasher);
+    image.rgba.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Draws one display-list node (spec 32.4).
-fn paint_node(painter: &egui::Painter, node: &PageNode, rect: egui::Rect) {
+///
+/// `texture` is the raster an [`NodeShape::Image`] node draws, already
+/// uploaded by [`page_textures`]; every other shape ignores it.
+fn paint_node(painter: &egui::Painter, node: &PageNode, rect: egui::Rect, texture: Option<egui::TextureId>) {
     match node.shape {
         // A node that paints nothing is still a node: it carries a rect, a
         // role and a name, which is how an invisible hit target or a region
@@ -2937,6 +3078,33 @@ fn paint_node(painter: &egui::Painter, node: &PageNode, rect: egui::Rect) {
                 node_color(node.fill),
                 node_stroke(node).unwrap_or(Stroke::NONE),
             );
+        }
+        NodeShape::Image => {
+            // Stretched into the node's rect: the raster's pixel extent and
+            // the node's logical one are independent numbers, and the node is
+            // the room the plugin reserved for the picture.
+            //
+            // Untinted, unlike every arm above. The plugin composed these
+            // pixels itself, so `fill` -- which is the colour of the shapes
+            // the *host* composes -- has nothing to say about them, and
+            // multiplying it in would recolour a finished image.
+            if let Some(texture) = texture {
+                // A textured rectangle rather than a mesh, which is the same
+                // shape the launcher's own icons come out as: `Painter::image`
+                // would emit a mesh, and a mesh carries no rounding.
+                painter.add(egui::epaint::RectShape {
+                    rect,
+                    // The node's own radius, clamped exactly as `Rect` and the
+                    // host's focus ring clamp it, so a rounded thumbnail and
+                    // the ring drawn around it agree on the corner.
+                    rounding: Rounding::same(node_rounding(node, rect)),
+                    fill: egui::Color32::WHITE,
+                    stroke: Stroke::NONE,
+                    blur_width: 0.0,
+                    fill_texture_id: texture,
+                    uv: RASTER_UV,
+                });
+            }
         }
     }
 }
