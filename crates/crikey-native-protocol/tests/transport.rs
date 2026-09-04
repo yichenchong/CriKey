@@ -215,16 +215,19 @@ fn a_client_that_sends_and_leaves_before_the_accept_is_still_read() {
 /// other end, and the real client behind it would never be seen.
 /// A connection accepted under a timeout must still wait for its client.
 ///
-/// `accept` puts the listener into non-blocking mode to implement the
-/// timeout. Linux hands back a fresh blocking socket regardless, but macOS and
-/// the BSDs give the accepted socket the listener's `O_NONBLOCK`, so without
-/// an explicit reset the first `recv` returns `WouldBlock` - which this layer
-/// reports as `Timeout`. The effect is a plugin that connected and is about to
-/// speak being written off as silent, on one family of platforms only.
+/// `accept` puts the listener into non-blocking mode to implement the timeout.
+/// Linux hands back a fresh blocking socket regardless, but macOS and the BSDs
+/// give the accepted socket the listener's `O_NONBLOCK`, so without an explicit
+/// reset every read returns `WouldBlock` - which this layer reports as
+/// `Timeout`. The effect is a plugin that connected and is about to speak being
+/// written off as silent.
 ///
-/// This is therefore a test that can only fail on the platforms with the bug;
-/// on Linux it passes either way. It is here so the reset has a stated reason
-/// and CI on macOS keeps enforcing it.
+/// Asserted on the clock rather than on a handshake, and deliberately: the
+/// client sends *nothing*, so there is no frame that could arrive early and no
+/// ordering between threads to lose. A read that is meant to wait either
+/// consumes its timeout or returns at once, and only a non-blocking socket
+/// does the latter. An earlier version of this test raced a send against the
+/// read, which made the result depend on scheduling.
 #[cfg(any(unix, windows))]
 #[test]
 fn a_connection_accepted_under_a_timeout_still_waits_for_its_client() {
@@ -232,23 +235,38 @@ fn a_connection_accepted_under_a_timeout_still_waits_for_its_client() {
     let listener = transport::Listener::bind(&endpoint).expect("bind the platform's native endpoint");
 
     let client_endpoint = endpoint.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let client = std::thread::spawn(move || {
-        let mut connection = transport::connect(&client_endpoint, Some(Duration::from_secs(5)))
+        let _connection = transport::connect(&client_endpoint, Some(Duration::from_secs(5)))
             .expect("the client reaches the endpoint");
-        // Long enough that a non-blocking accepted socket has certainly
-        // reported WouldBlock before the frame arrives.
-        std::thread::sleep(Duration::from_millis(300));
-        connection.send(&envelope(11)).expect("client send");
-        std::thread::sleep(Duration::from_millis(200));
+        // Connected and silent, held open until the server has finished
+        // reading, so the read waits on a live peer rather than seeing end of
+        // stream from a departed one.
+        let _ = done_rx.recv();
     });
 
     let mut accepted = listener
         .accept(Some(Duration::from_secs(5)))
         .expect("the endpoint accepts the client");
-    let frame = accepted
-        .recv()
-        .expect("a connection accepted under a timeout must wait, not report a silent client");
-    assert_eq!(frame.encode(), envelope(11).encode());
+    if accepted.supports_read_timeout() {
+        let wait = Duration::from_millis(400);
+        accepted
+            .set_read_timeout(Some(wait))
+            .expect("the accepted transport takes a read timeout");
+        let started = std::time::Instant::now();
+        let outcome = accepted.recv();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, Err(ProtocolError::Timeout)),
+            "a silent client should time the read out, got {outcome:?}"
+        );
+        assert!(
+            elapsed >= wait / 2,
+            "the read returned after {elapsed:?} of a {wait:?} timeout, so the accepted socket \
+             was left non-blocking and a plugin that is merely quiet reads as a dead one"
+        );
+    }
+    let _ = done_tx.send(());
     client.join().expect("the client finishes");
 }
 
