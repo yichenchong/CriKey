@@ -65,7 +65,9 @@ frame would demand one.
 
 ### Why not a webview
 
-Three separate reasons, each sufficient.
+Two decisive reasons, and a third that is usually overstated and is recorded
+here so it stops being repeated. The decisive ones are unaffected by loading
+the engine lazily; the overstated one is mostly answered by it.
 
 `docs/architecture.md:37` states that no third-party code runs inside the main
 process, and spec §31 acceptance criterion 30 pins the same claim for native
@@ -74,13 +76,24 @@ the launcher process would make that sentence false, and the fix would not be a
 sandbox argument — it would be deleting a guarantee the whole plugin model is
 built on.
 
-The cost misses §25.1 in both directions. A webview costs tens of MB resident
-and hundreds of ms cold per surface, against a main-process idle-memory target
-below 100 MiB and warm activation below 30 ms at p95. One surface is therefore
-a double-digit percentage of the entire idle memory budget, and its cold start
-is an order of magnitude over the whole activation budget. ADR-0002 already
-rejected Tauri/Electron for the launcher window itself on exactly these
-grounds; embedding one per plugin surface is the same trade taken repeatedly.
+The cost argument is weaker than it first appears, and it is worth getting
+right rather than repeating. Nothing forces an engine to be loaded at
+activation: one created only when a page opens costs nothing at startup,
+nothing at activation, and nothing in idle memory while no page is open. So
+§25.1's 30 ms warm activation and sub-100 MiB *idle* memory are not the
+budgets a lazily-loaded webview would miss, and a rejection resting on those
+two numbers compares the wrong pair — activating the launcher and opening a
+page are different interactions with different budgets.
+
+What survives lazy loading is real but smaller. The cold start moves onto the
+first page open, which is where a keyboard-driven launcher can least afford
+it: the user has already pressed Enter and is waiting on a form. §25.1 sets no
+page-open budget, but only because pages did not exist when it was written.
+Tens of MB per live surface likewise lands on peak rather than idle memory.
+Neither is decisive, and this decision does not rest on them. ADR-0002
+rejected Tauri/Electron for the launcher window itself, where the activation
+argument genuinely applies; that reasoning does not transfer to a surface
+opened on demand, and it should not be borrowed as though it did.
 
 Embedding is also mechanically hostile to the surface we have. Putting a
 webview inside the launcher's `wgpu` surface means either an overlaid child
@@ -142,10 +155,11 @@ screen-reader support until that wiring exists and is measured.
   framebuffer has no roles, no labels and no focus ring, so accessibility would
   go from "carried but not yet delivered" to "structurally impossible".
 - **Embedded webview per surface.** Runs third-party JavaScript in the main
-  process, contradicting `docs/architecture.md:37`; tens of MB resident and
-  hundreds of ms cold against §25.1's sub-100 MiB idle and 30 ms p95; and
-  either a rectangular child window that breaks the shaped rounded window or an
-  offscreen browser process with shared textures.
+  process, contradicting `docs/architecture.md:37`, and needs either a
+  rectangular child window that breaks the shaped rounded window or an
+  offscreen browser process with shared textures. Creating the engine lazily,
+  only when a page opens, answers the startup and idle-memory objections; it
+  answers neither of these.
 - **Fixed widget vocabulary with no drawing at all.** A closed list of
   `Button`, `Label`, `Field`, `Row` would be easier to draw and easier to make
   accessible, and it is too rigid: it decides on the plugin's behalf what a
@@ -160,11 +174,16 @@ screen-reader support until that wiring exists and is measured.
 
 Reopen the webview decision when all of the following can be measured on the
 ADR-0017 reference system (Intel N150, 2 cores, Linux 7.0) and recorded here:
-an embedded engine that adds under 5 ms to warm activation at p95, holds under
-20 MiB resident per idle surface against the sub-100 MiB budget, cold-starts a
-surface under 50 ms, and composites into the existing `wgpu` surface without a
-child window — *and* only if third-party code execution is answered separately,
-because no measurement makes `docs/architecture.md:37` true again.
+an engine created on demand that cold-starts a surface under 50 ms from the
+keystroke that opens it, holds under 20 MiB resident per *live* surface, and
+composites into the existing `wgpu` surface without a child window — *and*
+only if third-party code execution is answered separately, because no
+measurement makes `docs/architecture.md:37` true again.
+
+The activation criterion this trigger used to carry has been removed on
+purpose: a lazily-created engine satisfies it trivially by never running at
+activation, so leaving it in would have made the trigger look demanding while
+testing nothing.
 
 Reopen the display-list bounds, separately, if a page is observed to need more
 than 4,096 nodes for a legitimate surface, or if host-side draw time for a
