@@ -2,7 +2,7 @@
 
 use crikey_core::{
     Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, NodeRole,
-    NodeShape, PageColor, PageFrame, PageInput, PageInputKind, PageNode, PluginId,
+    NodeShape, PageColor, PageFrame, PageImage, PageInput, PageInputKind, PageNode, PluginId,
 };
 
 use crate::message;
@@ -163,15 +163,33 @@ pub fn from_proto_page_frame(frame: &message::PageFrame) -> PageFrame {
     }
 }
 
+/// Converts one wire node, taking only what this host can act on.
+///
+/// The raster is kept only for the shape that draws one. A newer plugin may
+/// send a shape this host has never heard of *and* attach a raster to it, and
+/// that node decodes to [`NodeShape::None`] here; carrying the pixels along
+/// would leave the frame holding a raster on a shape that cannot draw it,
+/// which [`PageFrame::validate`] refuses — turning one unknown shape into a
+/// refused page and breaking the forward-compatibility rule of spec 32.5.
+///
+/// The test is the *wire* code rather than the mapped shape, which keeps the
+/// diagnostic that matters. Every code this schema knows carries its raster
+/// through, so a plugin attaching one to a rectangle still meets
+/// `ImageShapeMismatch` and is told what it did (spec 32.7). Only the
+/// unspecified bucket — where every unrecognised code lands, indistinguishably
+/// from an explicit zero — gives its raster up, and a node that paints nothing
+/// had no use for pixels anyway.
 fn from_proto_page_node(node: &message::PageNode) -> PageNode {
+    let shape = match node.shape {
+        message::PageShapeCode::Rect => NodeShape::Rect,
+        message::PageShapeCode::Text => NodeShape::Text,
+        message::PageShapeCode::Line => NodeShape::Line,
+        message::PageShapeCode::Circle => NodeShape::Circle,
+        message::PageShapeCode::Image => NodeShape::Image,
+        message::PageShapeCode::ShapeUnspecified => NodeShape::None,
+    };
     PageNode {
-        shape: match node.shape {
-            message::PageShapeCode::Rect => NodeShape::Rect,
-            message::PageShapeCode::Text => NodeShape::Text,
-            message::PageShapeCode::Line => NodeShape::Line,
-            message::PageShapeCode::Circle => NodeShape::Circle,
-            message::PageShapeCode::ShapeUnspecified => NodeShape::None,
-        },
+        shape,
         x: node.x,
         y: node.y,
         width: node.width,
@@ -194,6 +212,15 @@ fn from_proto_page_node(node: &message::PageNode) -> PageNode {
         node_id: node.node_id,
         focus_order: node.focus_order,
         checked: node.checked,
+        image: node
+            .image
+            .as_ref()
+            .filter(|_| node.shape != message::PageShapeCode::ShapeUnspecified)
+            .map(|image| PageImage {
+                pixel_width: image.pixel_width,
+                pixel_height: image.pixel_height,
+                rgba: image.rgba.clone(),
+            }),
     }
 }
 
@@ -272,6 +299,7 @@ fn to_proto_page_node(node: &PageNode) -> message::PageNode {
             NodeShape::Text => message::PageShapeCode::Text,
             NodeShape::Line => message::PageShapeCode::Line,
             NodeShape::Circle => message::PageShapeCode::Circle,
+            NodeShape::Image => message::PageShapeCode::Image,
             NodeShape::None => message::PageShapeCode::ShapeUnspecified,
         },
         x: node.x,
@@ -296,6 +324,12 @@ fn to_proto_page_node(node: &PageNode) -> message::PageNode {
         node_id: node.node_id,
         focus_order: node.focus_order,
         checked: node.checked,
+        image: node.image.as_ref().map(|image| message::PageImage {
+            pixel_width: image.pixel_width,
+            pixel_height: image.pixel_height,
+            rgba: image.rgba.clone(),
+            unknown: UnknownFields::default(),
+        }),
         unknown: UnknownFields::default(),
     }
 }
