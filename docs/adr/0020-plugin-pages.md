@@ -65,16 +65,25 @@ frame would demand one.
 
 ### Why not a webview
 
-Two decisive reasons, and a third that is usually overstated and is recorded
-here so it stops being repeated. The decisive ones are unaffected by loading
-the engine lazily; the overstated one is mostly answered by it.
+One decisive reason, and two that are weaker than they are usually stated. All
+three are recorded precisely, because two of them were previously written here
+in a form that does not survive scrutiny.
 
+The process-invariant objection needs qualifying rather than asserting.
 `docs/architecture.md:37` states that no third-party code runs inside the main
 process, and spec §31 acceptance criterion 30 pins the same claim for native
-libraries. Plugin-authored JavaScript is third-party code. Running it inside
-the launcher process would make that sentence false, and the fix would not be a
-sandbox argument — it would be deleting a guarantee the whole plugin model is
-built on.
+libraries. It does not follow that every webview breaks it: WebView2, WKWebView
+and WebKitGTK all execute web content in separate renderer processes by
+default, so plugin-authored JavaScript would not run in the launcher process
+any more than plugin Python does today. What would be linked into the main
+process is the *embedding library*, which is a third-party native dependency in
+the same category as `wgpu` or `winit` — not plugin-authored code.
+
+So the honest form of this objection is a requirement, not a rejection: any
+embedded engine must keep content execution out of process, and that has to be
+enforced and tested rather than assumed from the engine's defaults. An
+in-process scripting surface — a JS interpreter linked into the launcher, say —
+is what the invariant actually forbids, and that remains categorical.
 
 The cost argument is weaker than it first appears, and it is worth getting
 right rather than repeating. Nothing forces an engine to be loaded at
@@ -95,13 +104,21 @@ rejected Tauri/Electron for the launcher window itself, where the activation
 argument genuinely applies; that reasoning does not transfer to a surface
 opened on demand, and it should not be borrowed as though it did.
 
-Embedding is also mechanically hostile to the surface we have. Putting a
-webview inside the launcher's `wgpu` surface means either an overlaid child
-window — which breaks the shaped rounded window, because a child window is
-rectangular and does not participate in our rounding or clipping — or offscreen
-rendering, which means a browser process plus shared textures, i.e. exactly the
-shared-memory machinery ADR-0017 declined to build, for a decision we do not
-want anyway.
+The decisive objection is compositing, and it is the one lazy loading and
+out-of-process rendering do nothing about. Putting a webview inside the
+launcher's `wgpu` surface means either an overlaid child window — which breaks
+the shaped rounded window, because a child window is rectangular and does not
+participate in our rounding or clipping — or offscreen rendering, which means
+shared textures between the engine's renderer and our surface: exactly the
+shared-memory machinery ADR-0017 declined to build. Note that this cost is
+*caused* by keeping content out of process, so it cannot be traded against the
+invariant; the two objections do not cancel.
+
+Three engines compound it. WebView2, WKWebView and WebKitGTK differ in
+embedding model, in what they will render offscreen, and in whether they are
+present at all — WebView2 is a runtime the user may not have installed. A
+display list has one implementation; an embedded engine has three, each with
+its own failure when absent.
 
 ### Accessibility is a protocol requirement, not a side effect
 
@@ -154,12 +171,16 @@ screen-reader support until that wiring exists and is measured.
   profile ADR-0017 was written to avoid. It also loses every semantic: a
   framebuffer has no roles, no labels and no focus ring, so accessibility would
   go from "carried but not yet delivered" to "structurally impossible".
-- **Embedded webview per surface.** Runs third-party JavaScript in the main
-  process, contradicting `docs/architecture.md:37`, and needs either a
-  rectangular child window that breaks the shaped rounded window or an
-  offscreen browser process with shared textures. Creating the engine lazily,
-  only when a page opens, answers the startup and idle-memory objections; it
-  answers neither of these.
+- **Embedded webview per surface.** Rejected on compositing, not on process
+  placement: the mainstream engines already run content out of process, so the
+  standing requirement is that any embedding keep it there and prove it. What
+  is unresolved is that the surface must be either a rectangular child window,
+  which breaks the shaped rounded window, or an offscreen render sharing
+  textures with our `wgpu` surface — a cost created by out-of-process
+  rendering, not avoidable by it — across three engines with three embedding
+  models, one of which is a runtime the user may not have installed. Creating
+  the engine lazily answers the startup and idle-memory objections; it does not
+  answer this one.
 - **Fixed widget vocabulary with no drawing at all.** A closed list of
   `Button`, `Label`, `Field`, `Row` would be easier to draw and easier to make
   accessible, and it is too rigid: it decides on the plugin's behalf what a
@@ -176,14 +197,17 @@ Reopen the webview decision when all of the following can be measured on the
 ADR-0017 reference system (Intel N150, 2 cores, Linux 7.0) and recorded here:
 an engine created on demand that cold-starts a surface under 50 ms from the
 keystroke that opens it, holds under 20 MiB resident per *live* surface, and
-composites into the existing `wgpu` surface without a child window — *and*
-only if third-party code execution is answered separately, because no
-measurement makes `docs/architecture.md:37` true again.
+composites into the existing `wgpu` surface without a child window — with
+content execution demonstrably out of process, asserted by a test rather than
+inherited from an engine default, since a future engine or configuration that
+moves it in-process is what `docs/architecture.md:37` forbids.
 
-The activation criterion this trigger used to carry has been removed on
-purpose: a lazily-created engine satisfies it trivially by never running at
-activation, so leaving it in would have made the trigger look demanding while
-testing nothing.
+Two criteria this trigger used to carry are gone on purpose. The activation
+bound, because a lazily-created engine satisfies it by never running at
+activation, which made the trigger look demanding while testing nothing. And
+the flat "no measurement makes `docs/architecture.md:37` true again", because
+that was simply wrong: out-of-process content execution does answer it, and
+stating otherwise pre-rejected a design on a fact that is not the case.
 
 Reopen the display-list bounds, separately, if a page is observed to need more
 than 4,096 nodes for a legitimate surface, or if host-side draw time for a
