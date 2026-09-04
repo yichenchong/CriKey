@@ -11,9 +11,11 @@
 //! process.
 //!
 //! Pixels cross only as a [`PageImage`] on a single node, bounded by
-//! [`MAX_PAGE_IMAGE_BYTES`] and [`MAX_PAGE_IMAGE_TOTAL_BYTES`]. Handing over
-//! the whole surface instead would cost 1.10 MiB per 720x400 repaint, which is
-//! the case those caps exist to keep out.
+//! [`MAX_PAGE_IMAGE_BYTES`] and [`MAX_PAGE_IMAGE_TOTAL_BYTES`]. Those caps
+//! bound the worst case rather than forbid a shape: tiled nodes can still add
+//! up to a surface-sized framebuffer. What they buy is a ceiling on what one
+//! frame can cost, and what the display list buys over a bare canvas is the
+//! roles, labels and focus order a framebuffer cannot carry.
 //!
 //! # What a page is not
 //!
