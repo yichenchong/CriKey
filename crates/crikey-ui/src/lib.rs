@@ -119,12 +119,13 @@ pub enum SettingControl {
     Toggle { on: bool },
 }
 
-/// The plugin-drawn surface the launcher is showing, if any (spec 6.3, 33).
+/// The plugin-drawn surface the launcher is showing, if any (spec 6.3, 32).
 ///
 /// A page is a display list the plugin returns and the *host* draws: the
-/// vocabulary crosses the boundary, never pixels and never code, so a
-/// misbehaving plugin can make the launcher draw an ugly page but cannot make
-/// it draw outside one.
+/// vocabulary crosses the boundary and code never does, so a misbehaving
+/// plugin can make the launcher draw an ugly page but cannot make it draw
+/// outside one. Pixels cross only as the bounded raster an image node carries,
+/// which the host still places and clips itself.
 ///
 /// The frame is shared rather than owned for the same reason the result rows
 /// are: a page that redraws on a timer republishes the same node list many

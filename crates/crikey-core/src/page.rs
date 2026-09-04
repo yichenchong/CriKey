@@ -3,13 +3,17 @@
 //!
 //! # What crosses the boundary
 //!
-//! Drawing commands and semantics, never pixels and never code. A page is a
-//! flat list of [`PageNode`]s that the host draws with its own renderer, so
-//! the plugin decides *what* appears while the host keeps the frame budget,
-//! the palette, the DPI scaling and the process boundary. A plugin that could
-//! hand over pixels would cost 1.10 MiB for a 720x400 surface; a plugin that
-//! could hand over code would end the invariant that no third-party code runs
-//! in the main process.
+//! Drawing commands and semantics, never code. A page is a flat list of
+//! [`PageNode`]s that the host draws with its own renderer, so the plugin
+//! decides *what* appears while the host keeps the frame budget, the palette,
+//! the DPI scaling and the process boundary. A plugin that could hand over
+//! code would end the invariant that no third-party code runs in the main
+//! process.
+//!
+//! Pixels cross only as a [`PageImage`] on a single node, bounded by
+//! [`MAX_PAGE_IMAGE_BYTES`] and [`MAX_PAGE_IMAGE_TOTAL_BYTES`]. Handing over
+//! the whole surface instead would cost 1.10 MiB per 720x400 repaint, which is
+//! the case those caps exist to keep out.
 //!
 //! # What a page is not
 //!
@@ -41,6 +45,38 @@ pub const MAX_PAGE_NODES: usize = 4_096;
 /// short enough that the host's text shaping stays bounded per node.
 pub const MAX_NODE_TEXT_BYTES: usize = 8_192;
 
+/// The soonest a self-scheduled redraw is honoured, in milliseconds.
+///
+/// A page asks for its next frame with `redraw_after_ms`, and nothing else
+/// bounds how often it may ask. That is affordable for a display list of
+/// geometry and it is not affordable once a frame may carry
+/// [`MAX_PAGE_IMAGE_TOTAL_BYTES`] of raster: at a one millisecond period those
+/// are gigabytes a second of encode, transport and decode, which is the cost
+/// profile ADR-0017 and ADR-0020 both refused. Sixteen milliseconds is one
+/// frame at the 60 Hz baseline the launcher's own budgets are written against
+/// (spec 25.1). It is a floor on the page's own timer, not a claim about what
+/// the display can present: a page that needs to track something faster
+/// should redraw from input, which this does not clamp.
+///
+/// This bounds self-scheduled redraws only. A frame answering user input is
+/// not delayed: input already arrives no faster than a person generates it.
+pub const MIN_PAGE_REDRAW_MS: u32 = 16;
+
+/// The largest raster a single node may carry. Exactly a 512x512 RGBA
+/// surface, which is the size a launcher page has any business showing: a
+/// preview, a swatch, a chart, an icon at any sane density.
+pub const MAX_PAGE_IMAGE_BYTES: usize = 1024 * 1024;
+
+/// The largest raster a whole frame may carry, summed across its nodes. Half
+/// of `MAX_FRAME_BYTES`, so a page full of rasters still leaves room for the
+/// rest of the display list inside one protocol frame.
+pub const MAX_PAGE_IMAGE_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
+/// The longest side of a raster, in pixels. Bounds the texture the host
+/// uploads independently of the byte count, so a 1x262144 strip is refused
+/// on its shape rather than sneaking under the byte cap.
+pub const MAX_PAGE_IMAGE_EDGE: u32 = 1024;
+
 /// The largest page the host will ask for, in logical pixels. Bounds the
 /// coordinate space a plugin can place nodes in, so a stray offset lands
 /// outside the clip rather than in floating-point territory.
@@ -64,6 +100,50 @@ pub enum NodeShape {
     Line,
     /// A circle inscribed in the node's rectangle.
     Circle,
+    /// A raster drawn into the node's rectangle, carried by
+    /// [`PageNode::image`]. This is the one node whose content the host does
+    /// not compose: the plugin supplies finished pixels, so it covers both a
+    /// picture the plugin shipped and a surface the plugin drew itself.
+    ///
+    /// A raster carries no meaning. `role` and `label` are the only things
+    /// that make it more than decoration, exactly as for every other node.
+    Image,
+}
+
+/// Finished pixels for a [`NodeShape::Image`] node.
+///
+/// Raw RGBA8 and nothing else. The host parses no image format: a decoder is
+/// an attack surface, and a decompression bomb is a byte count that says
+/// nothing about the allocation behind it. With raw pixels the wire length is
+/// the memory cost, already bounded by `MAX_FRAME_BYTES` and the decoder's
+/// allocation budget before this type exists; the dimensions are then
+/// cross-checked against that length by [`PageFrame::validate`], which runs
+/// after decoding rather than before it. A plugin holding a PNG decodes it in
+/// its own process, where a malformed file costs its author a worker and
+/// costs the launcher nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PageImage {
+    /// Width in pixels of the raster, not of the node it is drawn into. The
+    /// host scales to the node's rectangle.
+    pub pixel_width: u32,
+    /// Height in pixels of the raster.
+    pub pixel_height: u32,
+    /// Exactly `pixel_width * pixel_height * 4` bytes, row-major, no padding,
+    /// non-premultiplied.
+    pub rgba: Vec<u8>,
+}
+
+impl PageImage {
+    /// The byte count this raster must carry to match its own dimensions.
+    ///
+    /// Returns `None` when the product overflows, which is itself a refusal:
+    /// a plugin describing a raster that cannot exist is not owed an
+    /// allocation attempt.
+    pub fn expected_bytes(&self) -> Option<usize> {
+        (self.pixel_width as usize)
+            .checked_mul(self.pixel_height as usize)?
+            .checked_mul(4)
+    }
 }
 
 /// What a node *is*, as opposed to what it looks like. This is the entire
@@ -199,6 +279,12 @@ pub struct PageNode {
     /// that leaves this zero gets the order it emitted.
     pub focus_order: u32,
     pub checked: bool,
+    /// Finished pixels, required by [`NodeShape::Image`] and refused on every
+    /// other shape. Carried inline rather than as a path: a reference would
+    /// mean the host opening a file a plugin named, which is a filesystem
+    /// permission surface bought for no gain when the plugin can already read
+    /// its own package.
+    pub image: Option<PageImage>,
 }
 
 impl Default for PageNode {
@@ -220,6 +306,7 @@ impl Default for PageNode {
             node_id: 0,
             focus_order: 0,
             checked: false,
+            image: None,
         }
     }
 }
@@ -266,6 +353,27 @@ pub enum PageError {
     /// Two nodes claimed the same non-zero id, so an input event naming it
     /// would be ambiguous.
     DuplicateNodeId { node_id: u32 },
+    /// A [`NodeShape::Image`] node carried no raster, or a raster arrived on a
+    /// node of some other shape. Both are refused rather than ignored: the
+    /// first would draw a hole, the second means the plugin and the host
+    /// disagree about what the node is.
+    ImageShapeMismatch { index: usize },
+    /// A raster's byte count does not match its own dimensions.
+    ImageSizeMismatch {
+        index: usize,
+        expected: usize,
+        actual: usize,
+    },
+    /// A raster exceeds [`MAX_PAGE_IMAGE_BYTES`].
+    ImageTooLarge { index: usize, bytes: usize },
+    /// A raster's width or height exceeds [`MAX_PAGE_IMAGE_EDGE`], or is zero.
+    ImageEdgeOutOfRange {
+        index: usize,
+        pixel_width: u32,
+        pixel_height: u32,
+    },
+    /// The frame's rasters together exceed [`MAX_PAGE_IMAGE_TOTAL_BYTES`].
+    ImageTotalTooLarge { bytes: usize },
 }
 
 impl std::fmt::Display for PageError {
@@ -287,6 +395,34 @@ impl std::fmt::Display for PageError {
             Self::DuplicateNodeId { node_id } => {
                 write!(out, "node id {node_id} was claimed twice, so input for it would be ambiguous")
             }
+            Self::ImageShapeMismatch { index } => write!(
+                out,
+                "node {index} must carry a raster if and only if its shape is `Image`"
+            ),
+            Self::ImageSizeMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                out,
+                "node {index} declares a raster of {expected} bytes and carried {actual}"
+            ),
+            Self::ImageTooLarge { index, bytes } => write!(
+                out,
+                "node {index} carried a {bytes} byte raster, more than the {MAX_PAGE_IMAGE_BYTES} a node may draw"
+            ),
+            Self::ImageEdgeOutOfRange {
+                index,
+                pixel_width,
+                pixel_height,
+            } => write!(
+                out,
+                "node {index} declares a {pixel_width}x{pixel_height} raster, outside the 1 to {MAX_PAGE_IMAGE_EDGE} pixels a side the host will upload"
+            ),
+            Self::ImageTotalTooLarge { bytes } => write!(
+                out,
+                "the frame carried {bytes} bytes of raster, more than the {MAX_PAGE_IMAGE_TOTAL_BYTES} one frame may draw"
+            ),
         }
     }
 }
@@ -327,6 +463,7 @@ impl PageFrame {
             });
         }
         let mut claimed = BTreeSet::new();
+        let mut raster_bytes: usize = 0;
         for (index, node) in self.nodes.iter().enumerate() {
             if node.text.len() > MAX_NODE_TEXT_BYTES {
                 return Err(PageError::TextTooLong {
@@ -353,6 +490,54 @@ impl PageFrame {
                 return Err(PageError::DuplicateNodeId {
                     node_id: node.node_id,
                 });
+            }
+            // Shape and payload have to agree before the payload is trusted:
+            // a raster on a `Rect` means the two sides disagree about what
+            // this node is, and disagreement is not something to paper over.
+            match (node.shape, node.image.as_ref()) {
+                (NodeShape::Image, Some(image)) => {
+                    // Dimensions first. They decide the allocation, so they
+                    // are checked before any arithmetic that depends on them.
+                    if image.pixel_width == 0
+                        || image.pixel_height == 0
+                        || image.pixel_width > MAX_PAGE_IMAGE_EDGE
+                        || image.pixel_height > MAX_PAGE_IMAGE_EDGE
+                    {
+                        return Err(PageError::ImageEdgeOutOfRange {
+                            index,
+                            pixel_width: image.pixel_width,
+                            pixel_height: image.pixel_height,
+                        });
+                    }
+                    let expected = image.expected_bytes().ok_or(PageError::ImageEdgeOutOfRange {
+                        index,
+                        pixel_width: image.pixel_width,
+                        pixel_height: image.pixel_height,
+                    })?;
+                    if image.rgba.len() != expected {
+                        return Err(PageError::ImageSizeMismatch {
+                            index,
+                            expected,
+                            actual: image.rgba.len(),
+                        });
+                    }
+                    if expected > MAX_PAGE_IMAGE_BYTES {
+                        return Err(PageError::ImageTooLarge {
+                            index,
+                            bytes: expected,
+                        });
+                    }
+                    raster_bytes = raster_bytes.saturating_add(expected);
+                    if raster_bytes > MAX_PAGE_IMAGE_TOTAL_BYTES {
+                        return Err(PageError::ImageTotalTooLarge { bytes: raster_bytes });
+                    }
+                }
+                // An `Image` with nothing to draw, or a raster on a shape the
+                // host composes itself.
+                (NodeShape::Image, None) | (_, Some(_)) => {
+                    return Err(PageError::ImageShapeMismatch { index })
+                }
+                (_, None) => {}
             }
         }
         Ok(())
@@ -454,6 +639,176 @@ mod tests {
             label: "ok".to_owned(),
             ..PageNode::default()
         }
+    }
+
+    /// A raster node whose bytes genuinely match its dimensions.
+    fn raster(pixel_width: u32, pixel_height: u32) -> PageNode {
+        PageNode {
+            shape: NodeShape::Image,
+            image: Some(PageImage {
+                pixel_width,
+                pixel_height,
+                rgba: vec![0; (pixel_width as usize) * (pixel_height as usize) * 4],
+            }),
+            ..PageNode::default()
+        }
+    }
+
+    #[test]
+    fn a_raster_matching_its_own_dimensions_is_drawn() {
+        let frame = PageFrame {
+            nodes: vec![raster(4, 4)],
+            ..PageFrame::default()
+        };
+        assert_eq!(frame.validate(), Ok(()));
+    }
+
+    /// The byte count is the allocation. A frame claiming a 512x512 surface
+    /// and carrying four bytes would have the host size a texture from the
+    /// declaration and read from the buffer, which is the shape of an
+    /// out-of-bounds read rather than a cosmetic mismatch.
+    #[test]
+    fn a_raster_that_lies_about_its_length_is_refused() {
+        let mut node = raster(8, 8);
+        node.image
+            .as_mut()
+            .expect("the raster is present")
+            .rgba
+            .truncate(4);
+        let frame = PageFrame {
+            nodes: vec![node],
+            ..PageFrame::default()
+        };
+        assert_eq!(
+            frame.validate(),
+            Err(PageError::ImageSizeMismatch {
+                index: 0,
+                expected: 256,
+                actual: 4,
+            })
+        );
+    }
+
+    /// Dimensions are checked before the length arithmetic that depends on
+    /// them, so a raster that could never exist is refused on its shape
+    /// rather than through an overflowed multiplication.
+    #[test]
+    fn a_raster_larger_than_the_edge_limit_is_refused_before_its_bytes_are_sized() {
+        let frame = PageFrame {
+            nodes: vec![PageNode {
+                shape: NodeShape::Image,
+                image: Some(PageImage {
+                    pixel_width: u32::MAX,
+                    pixel_height: u32::MAX,
+                    rgba: Vec::new(),
+                }),
+                ..PageNode::default()
+            }],
+            ..PageFrame::default()
+        };
+        assert_eq!(
+            frame.validate(),
+            Err(PageError::ImageEdgeOutOfRange {
+                index: 0,
+                pixel_width: u32::MAX,
+                pixel_height: u32::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn a_zero_sided_raster_is_refused() {
+        let frame = PageFrame {
+            nodes: vec![PageNode {
+                shape: NodeShape::Image,
+                image: Some(PageImage {
+                    pixel_width: 0,
+                    pixel_height: 8,
+                    rgba: Vec::new(),
+                }),
+                ..PageNode::default()
+            }],
+            ..PageFrame::default()
+        };
+        assert_eq!(
+            frame.validate(),
+            Err(PageError::ImageEdgeOutOfRange {
+                index: 0,
+                pixel_width: 0,
+                pixel_height: 8,
+            })
+        );
+    }
+
+    /// One raster inside the per-node cap, many rasters past the per-frame
+    /// one. Without the running total a page could hold megabytes of texture
+    /// while every individual node looked reasonable.
+    #[test]
+    fn rasters_that_are_each_legal_can_still_exceed_the_frame_budget() {
+        let one = MAX_PAGE_IMAGE_BYTES;
+        let nodes = (0..(MAX_PAGE_IMAGE_TOTAL_BYTES / one) + 1)
+            .map(|_| raster(512, 512))
+            .collect::<Vec<_>>();
+        let frame = PageFrame {
+            nodes,
+            ..PageFrame::default()
+        };
+        assert_eq!(
+            frame.validate(),
+            Err(PageError::ImageTotalTooLarge {
+                bytes: MAX_PAGE_IMAGE_TOTAL_BYTES + one,
+            })
+        );
+    }
+
+    /// Both sides within the edge limit, the product past the byte cap. The
+    /// dimensions are what a reader checks first, so the cap that actually
+    /// bounds the upload needs a case where only it can refuse.
+    #[test]
+    fn a_raster_inside_the_edge_limit_can_still_exceed_the_byte_cap() {
+        let frame = PageFrame {
+            nodes: vec![raster(MAX_PAGE_IMAGE_EDGE, MAX_PAGE_IMAGE_EDGE / 2)],
+            ..PageFrame::default()
+        };
+        assert_eq!(
+            frame.validate(),
+            Err(PageError::ImageTooLarge {
+                index: 0,
+                bytes: MAX_PAGE_IMAGE_BYTES * 2,
+            })
+        );
+    }
+
+    /// Shape and payload disagreeing means the two sides do not agree what
+    /// the node is, which is refused in both directions rather than resolved
+    /// in the host's favour.
+    #[test]
+    fn a_raster_on_a_composed_shape_is_refused() {
+        let frame = PageFrame {
+            nodes: vec![PageNode {
+                shape: NodeShape::Rect,
+                image: Some(PageImage {
+                    pixel_width: 1,
+                    pixel_height: 1,
+                    rgba: vec![0; 4],
+                }),
+                ..PageNode::default()
+            }],
+            ..PageFrame::default()
+        };
+        assert_eq!(frame.validate(), Err(PageError::ImageShapeMismatch { index: 0 }));
+    }
+
+    #[test]
+    fn an_image_shape_with_nothing_to_draw_is_refused() {
+        let frame = PageFrame {
+            nodes: vec![PageNode {
+                shape: NodeShape::Image,
+                ..PageNode::default()
+            }],
+            ..PageFrame::default()
+        };
+        assert_eq!(frame.validate(), Err(PageError::ImageShapeMismatch { index: 0 }));
     }
 
     #[test]

@@ -17,7 +17,8 @@ pub use error::{CoreError, Result};
 pub use generation::{Generation, GenerationTracker};
 pub use item::{ArgumentPolicy, Category, HitPolicy, Item, ItemId, PluginId, PLUGIN_DEFINED_PREFIX};
 pub use page::{
-    NodeRole, NodeShape, PageColor, PageError, PageFrame, PageInput, PageInputKind, PageNode, PagePalette,
-    MAX_NODE_TEXT_BYTES, MAX_PAGE_EDGE, MAX_PAGE_NODES,
+    NodeRole, NodeShape, PageColor, PageError, PageFrame, PageImage, PageInput, PageInputKind, PageNode,
+    PagePalette, MAX_NODE_TEXT_BYTES, MAX_PAGE_EDGE, MAX_PAGE_IMAGE_BYTES, MAX_PAGE_IMAGE_EDGE,
+    MAX_PAGE_IMAGE_TOTAL_BYTES, MAX_PAGE_NODES, MIN_PAGE_REDRAW_MS,
 };
 pub use path::PlatformPath;

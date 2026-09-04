@@ -147,6 +147,7 @@ fn unknown_enum_values_are_safe_unspecified_values() {
     assert_eq!(message::ResourceKind::from_i32(i32::MAX).as_i32(), 0);
     assert_eq!(message::LogLevel::from_i32(i32::MAX).as_i32(), 0);
     assert_eq!(message::ErrorCode::from_i32(i32::MAX).as_i32(), 0);
+    assert_eq!(message::PageShapeCode::from_i32(i32::MAX).as_i32(), 0);
 }
 
 #[test]
@@ -704,6 +705,15 @@ fn minimal_messages_pin_frozen_field_numbers() {
     first_key!(
         message::Shutdown {
             immediate: true,
+            unknown: unknown(),
+        },
+        0x08
+    );
+    first_key!(
+        message::PageImage {
+            pixel_width: 1,
+            pixel_height: 0,
+            rgba: Vec::new(),
             unknown: unknown(),
         },
         0x08
@@ -1286,6 +1296,7 @@ fn page_geometry_survives_the_float_codec_exactly() {
         node_id: 9,
         focus_order: 2,
         checked: true,
+        image: None,
         unknown: unknown(),
     };
     let decoded = message::PageNode::decode(&node.encode()).expect("a page node round-trips");
@@ -1389,4 +1400,162 @@ fn a_page_input_event_round_trips_with_its_modifiers() {
     };
     let decoded = message::PageInput::decode(&input.encode()).expect("an input event round-trips");
     assert_eq!(decoded, input);
+}
+
+#[test]
+fn a_raster_node_round_trips_with_its_bytes_intact() {
+    // Pixels are the one payload the host does not interpret, so the only
+    // useful guarantee is that they arrive byte-identical: a shifted or
+    // truncated row would draw plausible-looking garbage instead of failing.
+    let rgba: Vec<u8> = (0..2 * 3 * 4).map(|byte| byte as u8 ^ 0xa5).collect();
+    let frame = crikey_core::PageFrame {
+        generation: 4,
+        title: "Swatch".to_owned(),
+        nodes: vec![crikey_core::PageNode {
+            shape: crikey_core::NodeShape::Image,
+            width: 64.0,
+            height: 96.0,
+            role: crikey_core::NodeRole::Label,
+            label: "Colour swatch".to_owned(),
+            image: Some(crikey_core::PageImage {
+                pixel_width: 2,
+                pixel_height: 3,
+                rgba: rgba.clone(),
+            }),
+            ..crikey_core::PageNode::default()
+        }],
+        focus_node: 0,
+        redraw_after_ms: 0,
+        close: false,
+    };
+    frame.validate().expect("a bounded raster is a valid frame");
+
+    let wire = crikey_native_protocol::convert::to_proto_page_frame(&frame);
+    // Field 17, length-delimited: the tag the raster is frozen at.
+    assert!(
+        wire.nodes[0]
+            .encode()
+            .windows(2)
+            .any(|window| window == [0x8a, 0x01]),
+        "the raster must be carried on PageNode field 17"
+    );
+    let decoded = message::PageFrame::decode(&wire.encode()).expect("a raster frame round-trips");
+    let restored = crikey_native_protocol::convert::from_proto_page_frame(&decoded);
+    assert_eq!(restored, frame);
+    assert_eq!(
+        restored.nodes[0]
+            .image
+            .as_ref()
+            .expect("the raster survives the wire")
+            .rgba,
+        rgba
+    );
+}
+
+/// The other half of the raster-dropping rule. A shape this schema *knows*
+/// keeps its raster, so a plugin that attaches one to a rectangle is told so
+/// instead of watching it vanish. Only the unknown bucket gives pixels up.
+#[test]
+fn a_raster_on_a_known_shape_that_cannot_draw_it_is_still_diagnosed() {
+    // Field 1 varint 1: RECT, a shape this host knows. Field 17: a 1x1 raster.
+    let encoded = [
+        0x08, 0x01, 0x8a, 0x01, 0x0a, 0x08, 0x01, 0x10, 0x01, 0x1a, 0x04, 0x01, 0x02, 0x03, 0x04,
+    ];
+    let node = message::PageNode::decode(&encoded).expect("a rectangle with a raster decodes");
+    let frame = crikey_native_protocol::convert::from_proto_page_frame(&message::PageFrame {
+        nodes: vec![node],
+        ..message::PageFrame::decode(&[]).expect("an empty frame is a valid default")
+    });
+    assert!(
+        frame.nodes[0].image.is_some(),
+        "a known shape carries its raster through, so the mismatch is visible"
+    );
+    assert_eq!(
+        frame.validate(),
+        Err(crikey_core::PageError::ImageShapeMismatch { index: 0 }),
+        "the plugin is told what it got wrong rather than left guessing"
+    );
+}
+
+/// The case that would have turned forward compatibility into a refused page:
+/// a shape this host does not know that *also* carries a raster, which a
+/// future shape reusing the payload would produce. Keeping the pixels would
+/// leave a raster on a shape that cannot draw one, and `validate` refuses
+/// exactly that - so one unknown shape would cost the whole frame.
+#[test]
+fn an_unknown_shape_carrying_a_raster_still_leaves_a_drawable_frame() {
+    // Field 1 varint 99: an unknown shape. Field 17: a 1x1 raster, which this
+    // host must not attach to a shape it decoded as `None`.
+    let encoded = [
+        0x08, 0x63, 0x8a, 0x01, 0x0a, 0x08, 0x01, 0x10, 0x01, 0x1a, 0x04, 0x01, 0x02, 0x03, 0x04,
+    ];
+    let node = message::PageNode::decode(&encoded).expect("an unknown shape code decodes");
+    assert!(
+        node.image.is_some(),
+        "the wire form still carries what the plugin sent"
+    );
+
+    let frame = crikey_native_protocol::convert::from_proto_page_frame(&message::PageFrame {
+        nodes: vec![node],
+        ..message::PageFrame::decode(&[]).expect("an empty frame is a valid default")
+    });
+    assert_eq!(frame.nodes[0].shape, crikey_core::NodeShape::None);
+    assert_eq!(
+        frame.nodes[0].image, None,
+        "a raster this host cannot draw is dropped rather than carried into a refusal"
+    );
+    assert_eq!(
+        frame.validate(),
+        Ok(()),
+        "an unknown shape costs one blank node, never the page"
+    );
+}
+
+/// Forward compatibility for the shape set, in the case that actually decides
+/// whether the policy is safe: an *interactive* node whose shape this host
+/// does not know.
+///
+/// The node degrades to [`NodeShape::None`], which is not a hole but a
+/// documented construct — "a focusable, labelled hit target over other
+/// drawing". So the control keeps its role, its name and its place in the Tab
+/// ring, and only its picture is missing. The alternatives are worse in a way
+/// this test exists to prevent anyone quietly adopting: dropping the node
+/// leaves a gap in the plugin's focus order and makes the function
+/// unreachable, and refusing the frame escalates one unknown shape into
+/// killing the page under spec 32.7.
+#[test]
+fn an_unknown_shape_keeps_an_interactive_node_reachable_rather_than_dropping_it() {
+    // Field 1 varint 99: a shape no version of this schema has. Field 12
+    // varint 1: BUTTON. Field 13: the label. Field 14 varint 7: the node id.
+    let encoded = [
+        0x08, 0x63, 0x60, 0x01, 0x6a, 0x05, b'P', b'r', b'i', b'n', b't', 0x70, 0x07,
+    ];
+    let node = message::PageNode::decode(&encoded).expect("an unknown shape code decodes");
+    assert_eq!(node.shape, message::PageShapeCode::ShapeUnspecified);
+
+    let frame = crikey_native_protocol::convert::from_proto_page_frame(&message::PageFrame {
+        nodes: vec![node],
+        ..message::PageFrame::decode(&[]).expect("an empty frame is a valid default")
+    });
+    let drawn = &frame.nodes[0];
+    assert_eq!(
+        drawn.shape,
+        crikey_core::NodeShape::None,
+        "the unknown shape paints nothing"
+    );
+    assert_eq!(
+        drawn.role,
+        crikey_core::NodeRole::Button,
+        "the role survives, so the node is still a control and not decoration"
+    );
+    assert_eq!(
+        drawn.accessible_name(),
+        Some("Print"),
+        "an old host still announces the control it cannot draw"
+    );
+    assert_eq!(
+        frame.focus_ring(),
+        vec![7],
+        "the control stays reachable by Tab rather than leaving a hole in the ring"
+    );
 }

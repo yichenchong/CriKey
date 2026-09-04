@@ -11,11 +11,11 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crikey_core::{CoreError, PageFrame, PageInput, PageInputKind, Result};
-use crikey_plugin_sdk::{PageRect, 
+use crikey_core::{CoreError, PageColor, PageFrame, PageInput, PageInputKind, Result};
+use crikey_plugin_sdk::{
     serve, ActionBuilder, CatalogSink, ExecuteOutcome, ExecuteRequest, ItemBuilder, PageBuilder,
-    PageRequest, Plugin, PluginContext, PluginResource, Query, ResourceKind, SdkError, ServeConfig,
-    SuggestionSink,
+    PageCanvas, PagePalette, PageRect, PageRequest, Plugin, PluginContext, PluginResource, Query,
+    ResourceKind, SdkError, ServeConfig, SuggestionSink,
 };
 
 const MODE_ENV: &str = "CRIKEY_CONFORMANCE_MODE";
@@ -285,6 +285,32 @@ const NODE_CLOSE: u32 = 5;
 /// bounds the frame, not the plugin's own state.
 const MAX_NOTE_CHARS: usize = 48;
 
+/// Side of the decorative swatch, in pixels.
+const SWATCH_EDGE: u32 = 4;
+
+/// The swatch as finished pixels. A plugin shipping a PNG would have decoded
+/// it into exactly this before building its frame: the host takes raw RGBA8
+/// and parses no image format.
+const SWATCH_RGBA: [u8; (SWATCH_EDGE * SWATCH_EDGE * 4) as usize] = [
+    0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF,
+    0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF,
+    0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF,
+    0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF,
+];
+
+/// Columns the counter chart can show, and therefore the counter value at
+/// which the chart is full.
+const CHART_COLUMNS: u32 = 12;
+
+/// Width of one chart column and the gap after it, in raster pixels.
+const CHART_COLUMN_WIDTH: u32 = 4;
+const CHART_COLUMN_GAP: u32 = 1;
+
+/// The chart's own resolution. Small on purpose: the raster is scaled into the
+/// node's rectangle, so a chart does not need one pixel per logical pixel.
+const CHART_PIXEL_WIDTH: u32 = CHART_COLUMNS * (CHART_COLUMN_WIDTH + CHART_COLUMN_GAP);
+const CHART_PIXEL_HEIGHT: u32 = 24;
+
 /// The item a user searches for to reach the page.
 fn page_item() -> crikey_core::Item {
     ItemBuilder::new(PAGE_ITEM_ID, "Page Playground")
@@ -376,7 +402,7 @@ impl PageState {
             .text(
                 28.0,
                 58.0,
-                "Drawn by the host from a display list this plugin sent. No pixels crossed.",
+                "Drawn by the host from a display list this plugin sent. The chart and the swatch are the only pixels.",
                 0.0,
                 palette.muted,
             )
@@ -437,6 +463,27 @@ impl PageState {
                 0.0,
                 palette.muted,
             );
+        let counter = self.counter;
+        page = page
+            // Decoration, and left unlabelled to say so: a raster announces
+            // nothing unless the author gives it a name.
+            .image(
+                PageRect::new(596.0, 96.0, 40.0, 40.0),
+                "",
+                SWATCH_EDGE,
+                SWATCH_EDGE,
+                SWATCH_RGBA.to_vec(),
+            )
+            .expect("the swatch carries its own dimensions in bytes")
+            .text(480.0, 168.0, "Counter chart", 0.0, palette.muted)
+            .canvas(
+                PageRect::new(480.0, 190.0, 160.0, 48.0),
+                format!("Counter chart, {counter}"),
+                CHART_PIXEL_WIDTH,
+                CHART_PIXEL_HEIGHT,
+                |canvas| draw_counter_chart(canvas, counter, palette),
+            )
+            .expect("the chart's dimensions are constants");
         let pending_focus = std::mem::take(&mut self.pending_focus);
         if pending_focus != 0 {
             page = page.focus(pending_focus);
@@ -445,6 +492,30 @@ impl PageState {
             page = page.close();
         }
         page.build()
+    }
+}
+
+/// Paints the counter as a chart that grows a column per unit.
+///
+/// Repainted from the current counter on every frame, which is the whole
+/// point of it: a surface the plugin draws is worth having only if it can say
+/// something a shipped picture cannot.
+fn draw_counter_chart(canvas: &mut PageCanvas, counter: i64, palette: PagePalette) {
+    let track = PageColor::rgba(palette.muted.r, palette.muted.g, palette.muted.b, 0x40);
+    canvas.fill(track);
+    // Negative counters and counters past the chart's width are the page's
+    // problem, not the host's: a chart that grew without bound would be a
+    // raster that grew without bound.
+    let columns = counter.clamp(0, i64::from(CHART_COLUMNS)) as u32;
+    for column in 0..columns {
+        let bar = (canvas.height() * (column + 1)) / CHART_COLUMNS;
+        canvas.fill_rect(
+            column * (CHART_COLUMN_WIDTH + CHART_COLUMN_GAP),
+            canvas.height() - bar,
+            CHART_COLUMN_WIDTH,
+            bar,
+            palette.accent,
+        );
     }
 }
 
@@ -922,6 +993,47 @@ mod tests {
         draw(&mut state, 1, &[PageInput::new(PageInputKind::Opened)]);
         let frame = draw(&mut state, 2, &[activate(NODE_CLOSE)]);
         assert!(frame.close, "the page must end itself rather than wait for Escape");
+    }
+
+    #[test]
+    fn the_chart_is_repainted_from_the_counter_and_the_swatch_is_not() {
+        let mut state = PageState::default();
+        let frame = draw(&mut state, 1, &[PageInput::new(PageInputKind::Opened)]);
+        frame.validate().expect("a page carrying rasters stays drawable");
+        let rasters = |frame: &PageFrame| -> Vec<crikey_core::PageImage> {
+            frame
+                .nodes
+                .iter()
+                .filter_map(|node| node.image.clone())
+                .collect()
+        };
+        let opening = rasters(&frame);
+        assert_eq!(opening.len(), 2, "the swatch and the chart both reach the host");
+        assert_eq!(opening[0].rgba, SWATCH_RGBA.to_vec());
+
+        let raised = rasters(&draw(&mut state, 2, &[activate(NODE_INCREASE)]));
+        assert_eq!(
+            raised[0].rgba, opening[0].rgba,
+            "a shipped picture has no reason to change"
+        );
+        assert_ne!(
+            raised[1].rgba, opening[1].rgba,
+            "the chart must be painted from the counter, not blitted once"
+        );
+        // Bottom-left pixel: the shortest column starts there, so it is the
+        // one pixel that has to change when the counter leaves zero.
+        let accent = request(2).palette.accent;
+        let bottom_left = ((CHART_PIXEL_HEIGHT - 1) * CHART_PIXEL_WIDTH * 4) as usize;
+        assert_eq!(
+            raised[1].rgba[bottom_left..bottom_left + 4],
+            [accent.r, accent.g, accent.b, accent.a],
+            "the first column must be painted in the host's accent colour"
+        );
+        assert_ne!(
+            opening[1].rgba[bottom_left..bottom_left + 4],
+            [accent.r, accent.g, accent.b, accent.a],
+            "a counter of zero must draw no column at all"
+        );
     }
 
     #[test]
