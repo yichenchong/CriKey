@@ -1509,8 +1509,11 @@ fn centred_origin(screen: PhysicalSize<u32>, window_width: u32, expanded_height_
 /// unknown to Vulkan and settable only through native window-system calls, so
 /// a surface offering it has promised nothing. Choosing it and leaving the
 /// corners unpainted is how they come back as black notches on the platforms
-/// where the guess is wrong. X11 gets its shape by clipping the window
-/// instead, which needs no promise about alpha.
+/// where the guess is wrong. An X11 session with no compositing manager keeps
+/// its square window rather than falling back to a clip: the `SHAPE`
+/// extension could cut the corners out without any promise about alpha, and
+/// [`crate::window_shape`] records why that shipped in 0.1.14 and was
+/// removed.
 ///
 /// `Auto` is the shared fallback, and the first advertised mode is the last
 /// resort so a backend offering none of them still starts. A shaped window
