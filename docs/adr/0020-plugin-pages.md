@@ -220,12 +220,33 @@ screen-reader support until that wiring exists and is measured.
 
 Reopen the webview decision when all of the following can be measured on the
 ADR-0017 reference system (Intel N150, 2 cores, Linux 7.0) and recorded here:
-an engine created on demand that cold-starts a surface under 50 ms from the
-keystroke that opens it, holds under 20 MiB resident per *live* surface, and
-composites into the existing `wgpu` surface without a child window — with
-content execution demonstrably out of process, asserted by a test rather than
-inherited from an engine default, since a future engine or configuration that
-moves it in-process is what `docs/architecture.md:37` forbids.
+an engine created on demand that composites into the existing `wgpu` surface
+without a child window; content execution demonstrably out of process,
+asserted by a test rather than inherited from an engine default, since a
+future engine or configuration that moves it in-process is what
+`docs/architecture.md:37` forbids; a surface whose process is spawned only
+when the page opens and is proven released when it closes; and a page-open
+latency that is disclosed to the user by a loading state rather than a frozen
+panel.
+
+A third borrowed criterion is now gone with the other two. This trigger used
+to require "under 20 MiB resident per live surface" and a 50 ms cold start.
+Neither number came from the specification. Spec 25.1 bounds *main-process
+idle* memory below 100 MiB, and a surface that lives in a separate host
+process and is created when a page opens is neither main-process nor idle; the
+spec's 50 ms is a native plugin's *suggestion* latency (`25.2`), not the cost
+of opening a page. Both were invented here and then read back as though the
+specification had set them, which is the same mistake this ADR already
+corrected once when it measured a lazily-created engine against the warm
+activation budget.
+
+What replaces them is an attribution rule rather than a number. A web surface
+that exists only because a plugin declared it and the user opened its page is
+that plugin's cost, in the way an opened application is: it must not be paid
+at startup, at activation, or while no page is open, and it must be released
+on close. Those are the properties worth testing. A ceiling on how much a
+deliberately opened page may cost is a product decision, and this ADR should
+not smuggle one in as a measurement.
 
 Two criteria this trigger used to carry are gone on purpose. The activation
 bound, because a lazily-created engine satisfies it by never running at
@@ -238,3 +259,48 @@ Reopen the display-list bounds, separately, if a page is observed to need more
 than 4,096 nodes for a legitimate surface, or if host-side draw time for a
 maximal frame exceeds the 16 ms cached-result budget of §25.1. Both are
 measurements, not opinions; take them before changing a constant.
+
+## Measured: WPE WebKit, 2026-09-07
+
+A first measurement now exists, and it is recorded here whatever it says.
+
+Scope, because the result does not generalise past it: WPE WebKit 2.52.6 with
+libwpe 1.16.3 and WPEBackend-fdo 1.16.1, the SHM export path, one 696x410
+view, in a Debian sid container on the ADR-0017 reference system. This is the
+*packaged legacy* generation. WPEPlatform - which carries damage rectangles
+and a headless display - is not packaged anywhere and needs a custom WebKit
+build; it was not measured, and neither was any differently configured
+WebKit. Nothing below rules those out.
+
+- **Out of process, and offscreen: satisfied.** SHM export works with no EGL
+  or GPU: the first exported buffer was 696x410, stride 2784, ARGB8888. Each
+  view spawns its own `WPEWebProcess`; no child window is involved.
+- **Per-surface memory: ~248 MiB RSS, 98-107 MiB marginal PSS.** Measured at
+  1, 2 and 4 concurrent surfaces; RSS is flat per surface because each view
+  gets a dedicated web process. The embedder process itself carries 111-118
+  MiB simply for linking WebKit.
+- **Page open: 276-533 ms** to the first exported frame (533 ms cold, median
+  307 ms warm over five runs), dominated by process spawn.
+- **Compose input is broken on this route, and fixable off it.** Injected
+  `dead_acute` + `a` yields a bare `a` - the accent is *silently* dropped -
+  and `Multi_key ' e` yields two characters rather than one `e-acute`. No
+  composition events fire and no IM context is installed, since the WPE port
+  ships only the abstract `WebKitInputMethodContext` while the GTK port ships
+  a concrete one. A standalone harness demonstrated the remedy outside CriKey:
+  running `xkb_compose_state` before dispatch produced exactly one correct
+  character for five sequences. That is a proof of concept in a test program,
+  not an integrated fix, and a real CJK IME needs more - a
+  `WebKitInputMethodContext` subclass bridged to ibus or fcitx.
+
+What this settles: the transport and pixel path are not the obstacle. The
+host-side cost of a 696x410 frame is 0.149 ms to convert BGRA-premultiplied to
+RGBA-premultiplied and 0.49 ms to cross the worker socket at ADR-0017's
+measured throughput - together about 4% of a 16 ms frame. The cost is process
+spawn and per-process memory, and on this generation there is no
+multi-surface-per-process option to trade against it.
+
+What it leaves open is a product question, not a measurement: whether a
+deliberately opened page may cost a few hundred milliseconds and ~100 MiB
+while it is open, given the attribution rule above. One long-lived pre-warmed
+surface, rather than one per page, would convert the spawn cost into a startup
+cost and cap the memory at a single process.
