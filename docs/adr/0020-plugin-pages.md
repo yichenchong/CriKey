@@ -229,7 +229,7 @@ when the page opens and is proven released when it closes; and a page-open
 latency that is disclosed to the user by a loading state rather than a frozen
 panel.
 
-A third borrowed criterion is now gone with the other two. This trigger used
+Two more borrowed criteria are gone alongside the pair below. This trigger used
 to require "under 20 MiB resident per live surface" and a 50 ms cold start.
 Neither number came from the specification. Spec 25.1 bounds *main-process
 idle* memory below 100 MiB, and a surface that lives in a separate host
@@ -268,13 +268,13 @@ Scope, because the result does not generalise past it: WPE WebKit 2.52.6 with
 libwpe 1.16.3 and WPEBackend-fdo 1.16.1, the SHM export path, one 696x410
 view, in a Debian sid container on the ADR-0017 reference system. This is the
 *packaged legacy* generation. WPEPlatform - which carries damage rectangles
-and a headless display - was absent from every distribution checked: Debian
-sid's `libwpewebkit-2.0-dev` 2.52.6 ships `wpe-webkit-2.0.pc` and no
-`wpe-platform-2.0.pc`, which is the one confirmed against the archive's own
-file list, and Ubuntu, Fedora, Arch and openSUSE were reported the same way
-without being confirmed here. Using it appears to need a custom WebKit build.
-It was not measured, and neither was any differently configured WebKit.
-Nothing below rules those out.
+and a headless display - is absent from the one package checked directly:
+Debian sid's `libwpewebkit-2.0-dev` 2.52.6 ships `wpe-webkit-2.0.pc` and no
+`wpe-platform-2.0.pc`, confirmed against the archive's own file list. Reports
+that Ubuntu, Fedora, Arch and openSUSE are the same were not confirmed here
+and should be treated as unverified. Using it appears to need a custom WebKit
+build. It was not measured, and neither was any differently configured
+WebKit. Nothing below rules those out.
 
 - **Offscreen export: demonstrated. Compositing and process ancestry: still
   unverified.** SHM export works with no EGL or GPU - the first exported
