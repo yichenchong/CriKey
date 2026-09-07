@@ -268,13 +268,24 @@ Scope, because the result does not generalise past it: WPE WebKit 2.52.6 with
 libwpe 1.16.3 and WPEBackend-fdo 1.16.1, the SHM export path, one 696x410
 view, in a Debian sid container on the ADR-0017 reference system. This is the
 *packaged legacy* generation. WPEPlatform - which carries damage rectangles
-and a headless display - is not packaged anywhere and needs a custom WebKit
-build; it was not measured, and neither was any differently configured
-WebKit. Nothing below rules those out.
+and a headless display - was absent from every distribution checked: Debian
+sid's `libwpewebkit-2.0-dev` 2.52.6 ships `wpe-webkit-2.0.pc` and no
+`wpe-platform-2.0.pc`, which is the one confirmed against the archive's own
+file list, and Ubuntu, Fedora, Arch and openSUSE were reported the same way
+without being confirmed here. Using it appears to need a custom WebKit build.
+It was not measured, and neither was any differently configured WebKit.
+Nothing below rules those out.
 
-- **Out of process, and offscreen: satisfied.** SHM export works with no EGL
-  or GPU: the first exported buffer was 696x410, stride 2784, ARGB8888. Each
-  view spawns its own `WPEWebProcess`; no child window is involved.
+- **Offscreen export: demonstrated. Compositing and process ancestry: still
+  unverified.** SHM export works with no EGL or GPU - the first exported
+  buffer was 696x410, stride 2784, ARGB8888 - and each view was observed to
+  spawn its own `WPEWebProcess`, with no child window involved. That is not
+  the trigger's condition met. The harness exported buffers in a container; it
+  never imported one into CriKey's `wgpu` surface, so compositing into the
+  shaped window is unmeasured. And observing that a web process exists is not
+  the test the trigger asks for, which must assert at runtime that content
+  executes in a descendant of the host rather than inheriting the claim from
+  an engine default. Both remain open.
 - **Per-surface memory: ~248 MiB RSS, 98-107 MiB marginal PSS.** Measured at
   1, 2 and 4 concurrent surfaces; RSS is flat per surface because each view
   gets a dedicated web process. The embedder process itself carries 111-118
