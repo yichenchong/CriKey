@@ -1,11 +1,11 @@
 //! Red-first tests for plugin-drawn pages across the SDK boundary (spec 32.3,
 //! 32.7, 16.7).
 
-use crikey_core::{NodeRole, PageFrame, PageInput, PageInputKind, Result};
+use crikey_core::{NodeRole, NodeShape, PageColor, PageError, PageFrame, PageInput, PageInputKind, Result};
 use crikey_native_protocol::{Capabilities, Endpoint};
 use crikey_plugin_sdk::{
-    harness::TestHarness, CatalogSink, ExecuteOutcome, ExecuteRequest, PageBuilder, PageRect, PageRequest,
-    Plugin, PluginContext, Query, ServeConfig, SuggestionSink,
+    harness::TestHarness, CatalogSink, ExecuteOutcome, ExecuteRequest, PageBuilder, PagePalette, PageRect,
+    PageRequest, Plugin, PluginContext, Query, ServeConfig, SuggestionSink,
 };
 
 const PAGE_ID: &str = "counter";
@@ -116,6 +116,21 @@ impl Plugin for PagePlugin {
                     .heading(24.0, 24.0, "Counter")
                     .button(1, PageRect::new(24.0, 72.0, 120.0, 32.0), "Increment")
                     .checkbox(2, 24.0, 120.0, "Loud", request.focused)
+                    .image(
+                        PageRect::new(200.0, 72.0, 32.0, 32.0),
+                        "Swatch",
+                        2,
+                        2,
+                        vec![0x40; 2 * 2 * 4],
+                    )
+                    .expect("the swatch matches its own dimensions")
+                    // Drawn from the event count so the raster path is proven
+                    // live rather than blitted once and cached.
+                    .canvas(PageRect::new(200.0, 120.0, 64.0, 16.0), "", 8, 4, |canvas| {
+                        let bar = self.seen_events.min(canvas.width() as usize) as u32;
+                        canvas.fill_rect(0, 0, bar, canvas.height(), PageColor::rgba(0, 0, 0, 255));
+                    })
+                    .expect("the bar matches its own dimensions")
                     .focus(1)
                     .build())
             }
@@ -156,6 +171,17 @@ impl Plugin for DefaultPagePlugin {
 
 fn opened() -> Vec<PageInput> {
     vec![PageInput::new(PageInputKind::Opened)]
+}
+
+/// Stands in for the colours the host hands a page when a test builds a
+/// frame without going through a request.
+fn palette() -> PagePalette {
+    PagePalette {
+        surface: PageColor::rgba(0x20, 0x20, 0x20, 0xFF),
+        text: PageColor::rgba(0xF0, 0xF0, 0xF0, 0xFF),
+        accent: PageColor::rgba(0x30, 0x80, 0xF0, 0xFF),
+        muted: PageColor::rgba(0x80, 0x80, 0x80, 0xFF),
+    }
 }
 
 #[test]
@@ -256,4 +282,129 @@ fn an_execute_returning_unit_still_reports_completion() {
     );
     harness.execute("item", None, None).expect("execute");
     harness.shutdown().expect("shutdown");
+}
+
+/// The rasters the fixture draws must survive the SDK boundary, and the
+/// painted one must follow the plugin's state: a page whose canvas is
+/// computed once and cached would still pass every other assertion here.
+#[test]
+fn rasters_cross_the_boundary_and_the_painted_one_tracks_plugin_state() {
+    let mut harness = TestHarness::start(PagePlugin::new(PageBehaviour::Draw), config()).expect("harness");
+    let frame = harness.page(PAGE_ID, 1, opened(), true).expect("page frame");
+    frame.validate().expect("a frame carrying rasters is drawable");
+    let rasters: Vec<_> = frame
+        .nodes
+        .iter()
+        .filter(|node| node.shape == NodeShape::Image)
+        .collect();
+    assert_eq!(rasters.len(), 2, "both rasters must reach the host");
+    let swatch = rasters[0].image.as_ref().expect("the swatch carries pixels");
+    assert_eq!(
+        (swatch.pixel_width, swatch.pixel_height, swatch.rgba.len()),
+        (2, 2, 16)
+    );
+    assert_eq!(
+        rasters[0].accessible_name(),
+        Some("Swatch"),
+        "a labelled raster must announce the name the author gave it"
+    );
+    assert_eq!(
+        rasters[1].accessible_name(),
+        None,
+        "an unlabelled raster is decoration, not a nameless announcement"
+    );
+    let first_bar = rasters[1].image.clone().expect("the bar carries pixels");
+    assert_eq!(first_bar.rgba[0..4], [0, 0, 0, 255], "one event, one column");
+    assert_eq!(first_bar.rgba[4..8], [0, 0, 0, 0]);
+
+    let next = harness
+        .page(PAGE_ID, 2, opened(), true)
+        .expect("second page frame");
+    let second_bar = next
+        .nodes
+        .iter()
+        .filter(|node| node.shape == NodeShape::Image)
+        .nth(1)
+        .and_then(|node| node.image.clone())
+        .expect("the bar carries pixels");
+    assert_ne!(
+        second_bar.rgba, first_bar.rgba,
+        "the painted raster must be repainted from current state, not cached"
+    );
+    assert_eq!(second_bar.rgba[4..8], [0, 0, 0, 255], "two events, two columns");
+    harness.shutdown().expect("shutdown");
+}
+
+/// The canvas helper owns the stride arithmetic, so what it writes has to
+/// land where the author asked in the raster's own coordinates.
+#[test]
+fn the_canvas_helper_addresses_pixels_not_bytes() {
+    let frame = PageBuilder::new(1, palette())
+        .canvas(PageRect::new(0.0, 0.0, 8.0, 8.0), "Chart", 3, 2, |canvas| {
+            canvas.fill(PageColor::rgba(1, 2, 3, 4));
+            canvas.set_pixel(2, 1, PageColor::rgba(9, 8, 7, 6));
+            // Off the edge: clipped, because a bar computed from plugin state
+            // must not be able to take the worker down.
+            canvas.set_pixel(3, 1, PageColor::rgba(0, 0, 0, 255));
+            canvas.fill_rect(2, 0, 10, 1, PageColor::rgba(5, 5, 5, 5));
+        })
+        .expect("a 3x2 canvas is a valid raster")
+        .build();
+    frame.validate().expect("a painted frame is drawable");
+    let image = frame.nodes[0].image.as_ref().expect("pixels");
+    assert_eq!(image.rgba.len(), 3 * 2 * 4);
+    assert_eq!(image.rgba[8..12], [5, 5, 5, 5], "row 0, column 2");
+    assert_eq!(image.rgba[20..24], [9, 8, 7, 6], "row 1, column 2");
+    assert_eq!(image.rgba[12..16], [1, 2, 3, 4], "row 1, column 0 keeps the fill");
+}
+
+/// A raster that cannot exist is refused where it was written, not where it
+/// is drawn: the host would drop the whole frame, and the author would be
+/// looking at a blank page for a byte count they could have been told about.
+#[test]
+fn an_impossible_raster_is_refused_at_construction() {
+    let builder = || PageBuilder::new(1, palette()).heading(0.0, 0.0, "Page");
+    assert_eq!(
+        builder()
+            .image(PageRect::new(0.0, 0.0, 8.0, 8.0), "", 4, 4, vec![0; 60])
+            .err(),
+        Some(PageError::ImageSizeMismatch {
+            index: 1,
+            expected: 64,
+            actual: 60
+        })
+    );
+    assert_eq!(
+        builder()
+            .image(PageRect::new(0.0, 0.0, 8.0, 8.0), "", 0, 4, Vec::new())
+            .err(),
+        Some(PageError::ImageEdgeOutOfRange {
+            index: 1,
+            pixel_width: 0,
+            pixel_height: 4
+        })
+    );
+    assert_eq!(
+        builder()
+            .canvas(PageRect::new(0.0, 0.0, 8.0, 8.0), "", 2048, 2, |_| {
+                unreachable!("a refused canvas must never be painted")
+            })
+            .err(),
+        Some(PageError::ImageEdgeOutOfRange {
+            index: 1,
+            pixel_width: 2048,
+            pixel_height: 2
+        })
+    );
+    assert_eq!(
+        builder()
+            .canvas(PageRect::new(0.0, 0.0, 8.0, 8.0), "", 1024, 1024, |_| {
+                unreachable!("a canvas over the per-node cap must never be painted")
+            })
+            .err(),
+        Some(PageError::ImageTooLarge {
+            index: 1,
+            bytes: 1024 * 1024 * 4
+        })
+    );
 }

@@ -370,8 +370,8 @@ message PageInput {
 }
 
 // One frame of a page: a flat display list the host draws with its own
-// renderer. Drawing commands and semantics cross, never pixels and never
-// code.
+// renderer. Drawing commands and semantics cross, and code never does.
+// Pixels cross only as the bounded raster an IMAGE node carries.
 message PageFrame {
   uint64 generation = 1;
   string title = 2;
@@ -379,7 +379,9 @@ message PageFrame {
   // The node the plugin wants focused, or 0 to leave focus where it is.
   uint32 focus_node = 4;
   // Ask for another frame this many milliseconds from now even without
-  // input. 0 means the page is static until the user acts.
+  // input. 0 means the page is static until the user acts. The host clamps a
+  // self-scheduled redraw to MIN_PAGE_REDRAW_MS (16 ms), so a shorter period
+  // is raised rather than honoured; frames answering input are not delayed.
   uint32 redraw_after_ms = 5;
   // The plugin closing its own page.
   bool close = 6;
@@ -392,6 +394,20 @@ message PageNode {
     TEXT = 2;
     LINE = 3;
     CIRCLE = 4;
+    IMAGE = 5;
+  }
+  // Finished pixels for an IMAGE node. Raw RGBA8 and nothing else: the host
+  // parses no image format, because a decoder is an attack surface and a
+  // compressed byte count says nothing about the allocation behind it. A
+  // plugin holding a PNG decodes it in its own process.
+  message Image {
+    // Pixels of the raster, not of the node it is drawn into; the host
+    // scales. 1 to 1024 a side.
+    uint32 pixel_width = 1;
+    uint32 pixel_height = 2;
+    // Exactly pixel_width * pixel_height * 4 bytes, row-major, no padding,
+    // non-premultiplied. At most 1 MiB per node and 4 MiB per frame.
+    bytes rgba = 3;
   }
   // What the node *is*, as opposed to what it looks like. This is the whole
   // accessibility contract: a painted glyph is not an accessible name, so a
@@ -428,4 +444,12 @@ message PageNode {
   // Position in the Tab ring; ties break by emission order.
   uint32 focus_order = 15;
   bool checked = 16;
+  // Required by IMAGE and refused on every other shape this schema defines.
+  // A shape a host does not recognise decodes to SHAPE_UNSPECIFIED, and that
+  // host discards the raster instead of refusing the frame, so a later shape
+  // may reuse this field without breaking older hosts. Carried inline
+  // rather than as a path: a reference would mean the host opening a file a
+  // plugin named, for no gain when the plugin can already read its own
+  // package.
+  Image image = 17;
 }

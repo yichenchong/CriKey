@@ -119,13 +119,17 @@ proto_enum!(
     FocusChanged = 8,
     Closed = 9
 );
+// A code this host does not know decodes to `ShapeUnspecified`, which paints
+// nothing. A newer plugin's shape therefore costs an older host a blank node
+// rather than a refused frame: the rest of the display list still draws.
 proto_enum!(
     PageShapeCode,
     ShapeUnspecified,
     Rect = 1,
     Text = 2,
     Line = 3,
-    Circle = 4
+    Circle = 4,
+    Image = 5
 );
 proto_enum!(
     PageRoleCode,
@@ -914,6 +918,23 @@ impl_simple!(inexact; PageInput {
     9 => value.alt = decode_field_varint(field)? != 0,
 });
 
+impl_simple!(PageImage {
+    pixel_width: u32 = 0,
+    pixel_height: u32 = 0,
+    rgba: Vec<u8> = Vec::new()
+} repeated [] encode(this, out) {
+    if this.pixel_width != 0 { put_varint(1, u64::from(this.pixel_width), &mut out); }
+    if this.pixel_height != 0 { put_varint(2, u64::from(this.pixel_height), &mut out); }
+    if !this.rgba.is_empty() { put_bytes(3, &this.rgba, &mut out); }
+} decode(value, field, budget) {
+    1 => value.pixel_width = decode_u32(field)?,
+    2 => value.pixel_height = decode_u32(field)?,
+    // `decode_bytes` charges the raster against the allocation budget before
+    // reserving for it, so a frame claiming megapixels cannot outspend the
+    // decoder's ceiling on the way to `PageFrame::validate`.
+    3 => value.rgba = decode_bytes(field, budget)?,
+});
+
 impl_simple!(inexact; PageNode {
     shape: PageShapeCode = PageShapeCode::ShapeUnspecified,
     x: f32 = 0.0,
@@ -930,7 +951,8 @@ impl_simple!(inexact; PageNode {
     label: String = String::new(),
     node_id: u32 = 0,
     focus_order: u32 = 0,
-    checked: bool = false
+    checked: bool = false,
+    image: Option<PageImage> = None
 } repeated [] encode(this, out) {
     if this.shape.as_i32() != 0 { encode_enum(1, this.shape.as_i32(), &mut out); }
     if this.x != 0.0 { put_f32(2, this.x, &mut out); }
@@ -948,6 +970,7 @@ impl_simple!(inexact; PageNode {
     if this.node_id != 0 { put_varint(14, u64::from(this.node_id), &mut out); }
     if this.focus_order != 0 { put_varint(15, u64::from(this.focus_order), &mut out); }
     if this.checked { put_varint(16, 1, &mut out); }
+    if let Some(image) = &this.image { put_message(17, image, &mut out); }
 } decode(value, field, budget) {
     1 => value.shape = PageShapeCode::from_i32(decode_i32(field)?),
     2 => value.x = decode_f32(field)?,
@@ -965,6 +988,7 @@ impl_simple!(inexact; PageNode {
     14 => value.node_id = decode_u32(field)?,
     15 => value.focus_order = decode_u32(field)?,
     16 => value.checked = decode_field_varint(field)? != 0,
+    17 => value.image = Some(nested(field, budget)?),
 });
 
 impl_simple!(inexact; PageRequest {

@@ -328,6 +328,14 @@ impl Listener {
                     };
                     listener.set_nonblocking(false).map_err(map_io)?;
                     let (stream, _) = accepted?;
+                    // The accepted socket, not just the listener. Linux gives
+                    // a fresh blocking socket here, but macOS and the BSDs
+                    // hand back one that inherited O_NONBLOCK from the
+                    // listener above, so every later `recv` on it returns
+                    // `WouldBlock` and this layer reports that as `Timeout` -
+                    // a live plugin looking like a silent one, on one family
+                    // of platforms only.
+                    stream.set_nonblocking(false).map_err(map_io)?;
                     return Ok(Box::new(IoTransport::new(IoStream::Unix(stream))));
                 }
                 let (stream, _) = listener.accept().map_err(map_io)?;
