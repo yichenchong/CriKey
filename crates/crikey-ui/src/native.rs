@@ -2797,6 +2797,25 @@ fn draw_page(ui: &mut egui::Ui, page: &PageSurface, commands: &mut Vec<UiCommand
         .painter()
         .rect_filled(rect, Rounding::same(theme::RADIUS_MEDIUM), colors.surface);
 
+    // A page that has never been answered is a bare sheet, and the only sign
+    // that anything is happening sits in the footer -- which is not where the
+    // user is looking after pressing Enter to open it. A plugin, or an engine,
+    // that takes a few hundred milliseconds to produce its first frame reads
+    // as a hang without this.
+    //
+    // Keyed on the page never having been answered, not on the display list
+    // being empty: a plugin may publish an empty page deliberately -- a
+    // cleared canvas, a submitted form -- and covering that with a spinner
+    // would be wrong. Nor on `stale` alone, because a page that redraws on a
+    // timer is stale between every frame, and blinking a spinner over the
+    // picture it is already showing is the flicker the sheet exists to
+    // prevent.
+    if page.stale && !page.answered {
+        let size = theme::ICON_SIZE;
+        let centre = egui::Rect::from_center_size(rect.center(), vec2(size, size));
+        page_ui.put(centre, egui::Spinner::new().size(size).color(colors.text_muted));
+    }
+
     // Escape is the host's key. `translate_keyboard` already answers it on the
     // window path and, by answering, keeps it out of egui entirely; this is the
     // same decision for every other way input can reach a frame -- the
@@ -4609,6 +4628,7 @@ mod window_geometry_tests {
             plugin_name: "Demo Plugin".to_owned(),
             frame: Arc::new(crikey_core::PageFrame::default()),
             stale: false,
+            answered: true,
         });
         assert_eq!(
             desired_window_height(&page, expanded),

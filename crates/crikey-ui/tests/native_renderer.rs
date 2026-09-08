@@ -1281,6 +1281,7 @@ fn page_view_at_generation(nodes: Vec<PageNode>, generation: u64) -> ViewModel {
         plugin_name: "Demo Plugin".to_owned(),
         frame: Arc::new(frame),
         stale: false,
+        answered: true,
     });
     view
 }
@@ -1307,6 +1308,55 @@ fn rect_shapes(frame: &crikey_ui::NativeUiFrame) -> Vec<(egui::epaint::RectShape
     let mut found = Vec::new();
     for clipped in &frame.output.shapes {
         walk(&clipped.shape, clipped.clip_rect, &mut found);
+    }
+    found
+}
+
+/// A page surface whose plugin has, or has not, ever answered.
+///
+/// Unlike [`page_view`] this adds no probe node, because the cases under test
+/// include the frame that carries nothing at all -- both the placeholder the
+/// host puts up on open, and the empty page a plugin may publish on purpose.
+fn lifecycle_page_view(nodes: Vec<PageNode>, stale: bool, answered: bool) -> ViewModel {
+    let mut view = model("");
+    let frame = PageFrame {
+        generation: 1,
+        title: "Demo Page".to_owned(),
+        nodes,
+        ..PageFrame::default()
+    };
+    frame
+        .validate()
+        .expect("a page fixture must be a frame the host would have accepted");
+    view.page = Some(PageSurface {
+        plugin: PluginId("demo".to_owned()),
+        page_id: "page-1".to_owned(),
+        plugin_name: "Demo Plugin".to_owned(),
+        frame: Arc::new(frame),
+        stale,
+        answered,
+    });
+    view
+}
+
+/// How many stroked open paths the frame paints, which is what an
+/// `egui::Spinner` is made of.
+fn spinner_arcs(frame: &crikey_ui::NativeUiFrame) -> usize {
+    fn walk(shape: &egui::Shape, found: &mut usize) {
+        match shape {
+            egui::Shape::Path(path) if !path.closed => *found += 1,
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut found = 0;
+    for clipped in &frame.output.shapes {
+        walk(&clipped.shape, &mut found);
     }
     found
 }
@@ -1876,5 +1926,75 @@ fn closing_a_page_releases_the_rasters_it_uploaded() {
     assert!(
         closed.output.textures_delta.free.contains(&id),
         "the texture the page uploaded must be freed when the page closes"
+    );
+}
+
+/// Opening a page can cost hundreds of milliseconds before its plugin
+/// produces a first frame, and the sheet is blank for all of it. The footer
+/// says why, but the user who just pressed Enter is looking at the sheet, so
+/// a bare panel reads as a hang.
+///
+/// Counted rather than located: a waiting page already puts one spinner in
+/// the footer, so the assertion is that the sheet adds a second one, and the
+/// cases below pin that it adds nothing at any other time.
+#[test]
+fn a_page_that_has_never_been_answered_says_so_on_the_sheet() {
+    let context = create_launcher_context();
+    let opening = lifecycle_page_view(Vec::new(), true, false);
+    let answered = lifecycle_page_view(vec![probe_node()], true, true);
+
+    let opening = build_launcher_frame(&context, launcher_input(Vec::new()), &opening);
+    let answered = build_launcher_frame(&context, launcher_input(Vec::new()), &answered);
+
+    assert_eq!(
+        spinner_arcs(&opening),
+        spinner_arcs(&answered) + 1,
+        "a page that has never been drawn must say it is loading on the sheet, not only in \
+         the footer"
+    );
+}
+
+/// The case that makes the marker necessary rather than a convenience. A
+/// plugin may publish a page with no nodes on purpose -- a cleared canvas, a
+/// form that has just been submitted -- and while the host waits for its next
+/// frame that page is both empty and stale, which is exactly the shape of a
+/// page that has never answered. Covering it with a spinner would tell the
+/// user their finished page is still loading.
+#[test]
+fn an_empty_page_the_plugin_published_is_not_treated_as_loading() {
+    let context = create_launcher_context();
+    let published = lifecycle_page_view(Vec::new(), true, true);
+
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &published);
+
+    assert_eq!(
+        spinner_arcs(&frame),
+        1,
+        "an empty page that was answered is finished, not loading: only the footer's spinner \
+         may show"
+    );
+}
+
+/// And the reason this cannot key on `stale` alone: a page that redraws on a
+/// timer is stale between every frame, and a spinner over the picture it is
+/// already showing would blink on every one of them.
+#[test]
+fn a_page_already_showing_a_frame_is_not_covered_by_a_spinner() {
+    let context = create_launcher_context();
+    let settled = lifecycle_page_view(vec![probe_node()], false, true);
+    let stale = lifecycle_page_view(vec![probe_node()], true, true);
+
+    let settled = build_launcher_frame(&context, launcher_input(Vec::new()), &settled);
+    let stale = build_launcher_frame(&context, launcher_input(Vec::new()), &stale);
+
+    assert_eq!(
+        spinner_arcs(&settled),
+        0,
+        "a settled page must show no spinner at all"
+    );
+    assert_eq!(
+        spinner_arcs(&stale),
+        1,
+        "a stale page keeps the frame it has: the footer is the only thing that says so"
     );
 }

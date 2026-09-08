@@ -156,6 +156,16 @@ pub struct PageSurface {
     /// that what they are looking at is not the answer to what they just did,
     /// so the status line says so.
     pub stale: bool,
+    /// Whether any frame from the plugin has ever been accepted for this
+    /// page.
+    ///
+    /// Distinct from the display list being empty, and the distinction
+    /// matters: a plugin may legitimately publish a page with no nodes -- a
+    /// cleared canvas, a form that has just been submitted -- and that page
+    /// has been answered. What has not been answered is the surface the host
+    /// puts up the instant it opens one, before the plugin has drawn
+    /// anything, which is the only case that should read as loading.
+    pub answered: bool,
 }
 
 /// Everything the renderer needs for one frame.
@@ -920,6 +930,9 @@ impl LauncherViewModel {
 
         page.frame = frame;
         page.stale = stale;
+        // The plugin has now drawn something, whatever it drew. An empty
+        // display list still counts: the page answered.
+        page.answered = true;
         self.dirty = true;
         true
     }
