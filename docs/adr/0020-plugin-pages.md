@@ -312,6 +312,19 @@ multi-surface-per-process option to trade against it.
 
 What it leaves open is a product question, not a measurement: whether a
 deliberately opened page may cost a few hundred milliseconds and ~100 MiB
-while it is open, given the attribution rule above. One long-lived pre-warmed
-surface, rather than one per page, would convert the spawn cost into a startup
-cost and cap the memory at a single process.
+while it is open, given the attribution rule above.
+
+Pre-warming is not the answer to the latency half, and is rejected. One
+long-lived surface would convert the spawn cost into a startup cost and cap
+memory at a single process, but only for one page: a launcher cannot pre-warm
+every web surface every installed plugin might declare, and choosing which one
+to warm means guessing which page the user will open. Paying a few hundred
+milliseconds and ~100 MiB at startup for a page nobody opens is worse than
+paying it on open, and it reintroduces exactly the idle cost the attribution
+rule above exists to avoid.
+
+The latency is therefore disclosed rather than hidden. A page that has not yet
+been answered says so on its own sheet, not only in the status line - see
+`PageSurface::answered` and the loading state in `draw_page` - so the wait
+reads as a page opening rather than as a launcher that has stopped
+responding.
