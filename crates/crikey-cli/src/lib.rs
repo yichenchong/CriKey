@@ -1332,13 +1332,17 @@ fn open_plugin_page(
     // the user to wait after the page has opened and closed again.
     let _ = view_model.set_selected_status(String::new());
     // Empty until the plugin answers: the host draws the sheet, so an unfilled
-    // page is a blank panel rather than a hole, and `stale` says why.
+    // page is a blank panel rather than a hole. `stale` says the host is
+    // waiting, and `answered` says nothing has ever been drawn here, which is
+    // what earns the loading state on the sheet rather than only in the
+    // footer.
     let shown = view_model.open_page(PageSurface {
         plugin: plugin.clone(),
         page_id: page_id.to_owned(),
         plugin_name: plugin.0.clone(),
         frame: Arc::new(crikey_core::PageFrame::default()),
         stale: true,
+        answered: false,
     });
     if !shown {
         // The launcher was dismissed while the action ran, so the model has no
