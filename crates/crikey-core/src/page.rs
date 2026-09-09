@@ -376,6 +376,25 @@ pub enum PageError {
     },
     /// The frame's rasters together exceed [`MAX_PAGE_IMAGE_TOTAL_BYTES`].
     ImageTotalTooLarge { bytes: usize },
+    /// A frame carried both a display list and a web surface. A page is one
+    /// or the other: the host either draws the plugin's nodes or lends the
+    /// page to an engine, and a frame asking for both does not describe a
+    /// screen anyone can render.
+    WebSurfaceWithNodes { nodes: usize },
+    /// A web surface's URL exceeds [`MAX_NODE_TEXT_BYTES`].
+    WebSurfaceUrlTooLong { bytes: usize },
+    /// A web surface named a scheme the host will not open. Only `http` and
+    /// `https` are opened: `file:` would hand a plugin the user's disk
+    /// through a surface the plugin cannot otherwise read, and `data:` and
+    /// `javascript:` are script injection wearing a URL.
+    WebSurfaceSchemeRefused { scheme: String },
+    /// A web surface frame named a focus node. Focus inside a web surface
+    /// belongs to the document, and the id would name a node that does not
+    /// exist.
+    WebSurfaceWithFocusNode { node_id: u32 },
+    /// A web surface frame asked for a timed redraw. The engine drives its
+    /// own repaints, so honouring this would wake the plugin for nothing.
+    WebSurfaceWithRedraw { redraw_after_ms: u32 },
 }
 
 impl std::fmt::Display for PageError {
@@ -425,11 +444,61 @@ impl std::fmt::Display for PageError {
                 out,
                 "the frame carried {bytes} bytes of raster, more than the {MAX_PAGE_IMAGE_TOTAL_BYTES} one frame may draw"
             ),
+            Self::WebSurfaceWithNodes { nodes } => write!(
+                out,
+                "the frame carried a web surface and {nodes} drawn nodes; a page is one or the other"
+            ),
+            Self::WebSurfaceUrlTooLong { bytes } => write!(
+                out,
+                "the web surface's address is {bytes} bytes, more than the {MAX_NODE_TEXT_BYTES} a page may carry"
+            ),
+            Self::WebSurfaceSchemeRefused { scheme } => write!(
+                out,
+                "the web surface asked for a `{scheme}` address; only `http` and `https` are opened"
+            ),
+            Self::WebSurfaceWithFocusNode { node_id } => write!(
+                out,
+                "the web surface frame named focus node {node_id}, but focus inside a web surface belongs to the document"
+            ),
+            Self::WebSurfaceWithRedraw { redraw_after_ms } => write!(
+                out,
+                "the web surface frame asked for a redraw in {redraw_after_ms} ms, but the engine drives its own repaints"
+            ),
         }
     }
 }
 
 impl std::error::Error for PageError {}
+
+/// Where a web surface's cookies and local storage live between openings.
+///
+/// Declared by the owning plugin, because only the plugin knows whether its
+/// page is a signed-in view worth remembering or a throwaway. Persistence is
+/// not free to the user: it is a plugin holding a session on their machine,
+/// so it is permission-gated and reported rather than assumed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WebStorage {
+    /// Nothing survives the page closing. The default, because a page that
+    /// does not need a session should not leave one behind.
+    #[default]
+    Ephemeral,
+    /// Cookies and local storage persist, isolated to the owning plugin.
+    Persistent,
+}
+
+/// A page the host lends to a web engine instead of drawing itself.
+///
+/// The plugin never sees the pixels or the document: it names an address and
+/// the host owns everything after that, which is what keeps a web surface
+/// from becoming a way for a plugin to read the user's screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageWebSurface {
+    /// Where to navigate. Empty on a later frame means "stay where you are",
+    /// so a plugin that re-sends its surface does not reload the page under
+    /// the user.
+    pub url: String,
+    pub storage: WebStorage,
+}
 
 /// One frame of a plugin-drawn page.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -453,12 +522,57 @@ pub struct PageFrame {
     /// The plugin asking the host to close the page, which is how a page
     /// finishes its own job without the user pressing Escape.
     pub close: bool,
+    /// Set when this page is a web surface rather than a display list. The
+    /// two are exclusive: [`PageFrame::validate`] refuses a frame carrying
+    /// both, because the host either draws the plugin's nodes or hands the
+    /// page to an engine and there is no coherent screen in between.
+    pub web: Option<PageWebSurface>,
 }
 
 impl PageFrame {
     /// Rejects a frame no host should draw. Called on every frame that
     /// arrives from a plugin, before any of it reaches the renderer.
     pub fn validate(&self) -> Result<(), PageError> {
+        // First, because the rest of this function checks a display list and
+        // a web surface frame has none to check. A frame carrying both is
+        // refused rather than resolved in the host's favour: the plugin and
+        // the host disagree about what the page is, and guessing would draw
+        // one of them a screen it never asked for.
+        if let Some(web) = &self.web {
+            if !self.nodes.is_empty() {
+                return Err(PageError::WebSurfaceWithNodes {
+                    nodes: self.nodes.len(),
+                });
+            }
+            if self.focus_node != 0 {
+                return Err(PageError::WebSurfaceWithFocusNode {
+                    node_id: self.focus_node,
+                });
+            }
+            if self.redraw_after_ms != 0 {
+                return Err(PageError::WebSurfaceWithRedraw {
+                    redraw_after_ms: self.redraw_after_ms,
+                });
+            }
+            if web.url.len() > MAX_NODE_TEXT_BYTES {
+                return Err(PageError::WebSurfaceUrlTooLong { bytes: web.url.len() });
+            }
+            // An empty address is "stay where you are", so only a stated one
+            // is checked. Matched on the scheme rather than parsed: this
+            // crate takes no URL dependency, and the question here is only
+            // which schemes the host will hand to an engine.
+            if !web.url.is_empty() {
+                let scheme = web
+                    .url
+                    .split_once(':')
+                    .map(|(scheme, _)| scheme.to_ascii_lowercase())
+                    .unwrap_or_default();
+                if scheme != "http" && scheme != "https" {
+                    return Err(PageError::WebSurfaceSchemeRefused { scheme });
+                }
+            }
+            return Ok(());
+        }
         if self.nodes.len() > MAX_PAGE_NODES {
             return Err(PageError::TooManyNodes {
                 nodes: self.nodes.len(),
@@ -965,5 +1079,89 @@ mod tests {
         };
         assert_eq!(frame.validate(), Ok(()));
         assert_eq!(frame.unlabelled_interactive(), vec![5]);
+    }
+
+    /// The exclusivity the whole design rests on. A frame carrying both is a
+    /// plugin and a host disagreeing about what the page is, and the host
+    /// cannot draw an answer to that.
+    #[test]
+    fn a_frame_cannot_be_a_display_list_and_a_web_surface_at_once() {
+        let frame = PageFrame {
+            nodes: vec![node(1, NodeRole::Button)],
+            web: Some(PageWebSurface {
+                url: "https://example.invalid/".to_owned(),
+                storage: WebStorage::Ephemeral,
+            }),
+            ..PageFrame::default()
+        };
+        assert_eq!(frame.validate(), Err(PageError::WebSurfaceWithNodes { nodes: 1 }));
+    }
+
+    /// `file:` would hand a plugin the user's disk through a surface it
+    /// cannot otherwise read, and `javascript:` is script injection wearing
+    /// a URL. Both are refused by scheme rather than by inspection.
+    #[test]
+    fn a_web_surface_opens_only_http_and_https() {
+        for (url, refused) in [
+            ("https://example.invalid/", None),
+            ("http://example.invalid/", None),
+            ("HTTPS://example.invalid/", None),
+            ("file:///etc/passwd", Some("file")),
+            ("data:text/html,<b>hi", Some("data")),
+            ("javascript:alert(1)", Some("javascript")),
+        ] {
+            let frame = PageFrame {
+                web: Some(PageWebSurface {
+                    url: url.to_owned(),
+                    ..PageWebSurface::default()
+                }),
+                ..PageFrame::default()
+            };
+            let expected = match refused {
+                None => Ok(()),
+                Some(scheme) => Err(PageError::WebSurfaceSchemeRefused {
+                    scheme: scheme.to_owned(),
+                }),
+            };
+            assert_eq!(frame.validate(), expected, "for {url}");
+        }
+    }
+
+    /// An empty address on a later frame means "stay where you are", so a
+    /// plugin re-sending its surface does not reload the page under the user.
+    #[test]
+    fn a_web_surface_with_no_address_is_a_request_to_stay_put() {
+        let frame = PageFrame {
+            web: Some(PageWebSurface::default()),
+            ..PageFrame::default()
+        };
+        assert_eq!(frame.validate(), Ok(()));
+    }
+
+    /// Both name something a web surface does not have: focus belongs to the
+    /// document, and the engine schedules its own repaints. Silently ignoring
+    /// either would leave a plugin author waiting for a callback that never
+    /// comes.
+    #[test]
+    fn a_web_surface_refuses_display_list_scheduling_and_focus() {
+        let focused = PageFrame {
+            web: Some(PageWebSurface::default()),
+            focus_node: 7,
+            ..PageFrame::default()
+        };
+        assert_eq!(
+            focused.validate(),
+            Err(PageError::WebSurfaceWithFocusNode { node_id: 7 })
+        );
+
+        let timed = PageFrame {
+            web: Some(PageWebSurface::default()),
+            redraw_after_ms: 250,
+            ..PageFrame::default()
+        };
+        assert_eq!(
+            timed.validate(),
+            Err(PageError::WebSurfaceWithRedraw { redraw_after_ms: 250 })
+        );
     }
 }
