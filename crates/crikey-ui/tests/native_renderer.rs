@@ -1282,6 +1282,7 @@ fn page_view_at_generation(nodes: Vec<PageNode>, generation: u64) -> ViewModel {
         frame: Arc::new(frame),
         stale: false,
         answered: true,
+        web_painted: false,
     });
     view
 }
@@ -1335,6 +1336,7 @@ fn lifecycle_page_view(nodes: Vec<PageNode>, stale: bool, answered: bool) -> Vie
         frame: Arc::new(frame),
         stale,
         answered,
+        web_painted: false,
     });
     view
 }
@@ -1996,5 +1998,46 @@ fn a_page_already_showing_a_frame_is_not_covered_by_a_spinner() {
         spinner_arcs(&stale),
         1,
         "a stale page keeps the frame it has: the footer is the only thing that says so"
+    );
+}
+
+/// A web surface's plugin answers the instant it declares a URL, but the
+/// engine behind it took 276 to 533 ms to produce a first frame when
+/// measured. Judging the loading state on the plugin's answer would clear the
+/// spinner immediately and leave the user watching a blank sheet for that
+/// whole interval, which is precisely the hang the spinner exists to cover.
+#[test]
+fn a_declared_web_surface_keeps_loading_until_its_first_frame_is_painted() {
+    let context = create_launcher_context();
+
+    let mut declared = lifecycle_page_view(Vec::new(), false, true);
+    let surface = declared.page.as_mut().expect("the fixture opens a page");
+    surface.frame = Arc::new(crikey_core::PageFrame {
+        generation: 1,
+        title: "Demo Page".to_owned(),
+        web: Some(crikey_core::PageWebSurface {
+            url: "https://example.invalid/".to_owned(),
+            ..crikey_core::PageWebSurface::default()
+        }),
+        ..crikey_core::PageFrame::default()
+    });
+
+    let waiting = build_launcher_frame(&context, launcher_input(Vec::new()), &declared);
+    assert_eq!(
+        spinner_arcs(&waiting),
+        1,
+        "a web surface that has answered but never painted must still say it is loading"
+    );
+
+    declared
+        .page
+        .as_mut()
+        .expect("the fixture opens a page")
+        .web_painted = true;
+    let painted = build_launcher_frame(&context, launcher_input(Vec::new()), &declared);
+    assert_eq!(
+        spinner_arcs(&painted),
+        0,
+        "once the engine has painted a frame the sheet has content and the spinner goes"
     );
 }
