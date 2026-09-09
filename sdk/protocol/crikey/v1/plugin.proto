@@ -39,6 +39,19 @@ message Envelope {
     LifecycleAck lifecycle_ack = 30;
     PageRequest page_request = 31;
     PageFrame page_frame = 32;
+    // Host-to-host web surface traffic (spec 32.x). These never reach a
+    // plugin process: they run between the launcher and crikey-web-host,
+    // which is the only executable that links WPE.
+    OpenSurface open_surface = 33;
+    RawInput raw_input = 34;
+    ImeEvent ime_event = 35;
+    Navigate navigate = 36;
+    Resize resize = 37;
+    CloseSurface close_surface = 38;
+    WebFrame web_frame = 39;
+    CaretArea caret_area = 40;
+    LoadState load_state = 41;
+    Gone gone = 42;
   }
 }
 
@@ -385,6 +398,25 @@ message PageFrame {
   uint32 redraw_after_ms = 5;
   // The plugin closing its own page.
   bool close = 6;
+  // Set when the page is a web surface instead of a display list. The two
+  // are exclusive and a frame carrying both is refused: the host either
+  // draws the plugin's nodes or hands the page to an engine, and there is no
+  // coherent screen in between. An older host that does not know this field
+  // retains it as an unknown field and draws an empty display list, which is
+  // the same nothing it would draw for a page it cannot render.
+  PageWebSurface web = 7;
+}
+
+// A page the host lends to a web engine. The plugin names an address; it
+// never sees the pixels or the document, which is what keeps a web surface
+// from becoming a way to read the user's screen. The engine itself runs in
+// crikey-web-host, and the messages below carry the surface's traffic.
+message PageWebSurface {
+  // Empty on a later frame means "stay where you are", so a plugin that
+  // re-sends its surface does not reload the page under the user. Only http
+  // and https are opened.
+  string url = 1;
+  WebStorageMode storage = 2;
 }
 
 message PageNode {
@@ -452,4 +484,216 @@ message PageNode {
   // plugin named, for no gain when the plugin can already read its own
   // package.
   Image image = 17;
+}
+
+// ---------------------------------------------------------------------------
+// Web surface (spec 32.x)
+// ---------------------------------------------------------------------------
+//
+// A plugin page is either a display list or a web surface, never both, and at
+// most one web surface is live at a time. Every message below travels between
+// the launcher and crikey-web-host; a plugin never sends or receives one.
+//
+// surface_id is field 1 everywhere so a late frame from a surface the user
+// already closed is discarded on arrival rather than drawn over its successor.
+
+// The keyboard modifiers a RawInput carries, as a bit mask. Meta and the lock
+// keys are included because a web page observes them: Ctrl+Click is not
+// Meta+Click, and a page reading `getModifierState("CapsLock")` gets a wrong
+// answer from a mask that cannot express it.
+enum WebModifier {
+  WEB_MODIFIER_NONE = 0;
+  WEB_MODIFIER_SHIFT = 1;
+  WEB_MODIFIER_CONTROL = 2;
+  WEB_MODIFIER_ALT = 4;
+  WEB_MODIFIER_META = 8;
+  WEB_MODIFIER_CAPS_LOCK = 16;
+  WEB_MODIFIER_NUM_LOCK = 32;
+}
+
+// How long a surface's cookies, local storage and caches live. Chosen by the
+// owning plugin and permission-gated by the host, so a page with no storage
+// permission cannot ask for PERSISTENT and get it. Top-level because both
+// halves of the journey name it: the plugin declares it on PageFrame.web and
+// the launcher passes it on in OpenSurface.
+enum WebStorageMode {
+  WEB_STORAGE_MODE_UNSPECIFIED = 0;
+  // In-memory only; everything dies with the surface. Also what an
+  // unspecified mode means, so the safe answer is the one a silence gets.
+  WEB_STORAGE_MODE_EPHEMERAL = 1;
+  // A directory the host owns, keyed to the plugin.
+  WEB_STORAGE_MODE_PERSISTENT = 2;
+}
+
+message OpenSurface {
+  uint64 surface_id = 1;
+  // Device pixels of the surface, which is also the frame size the web host
+  // will send back.
+  uint32 pixel_width = 2;
+  uint32 pixel_height = 3;
+  string url = 4;
+  WebStorageMode storage_mode = 5;
+}
+
+// One input event, forwarded to the engine unfiltered except for the keys the
+// host keeps: Escape exits the page and never arrives here, while Tab does
+// arrive, because a web page owns its own focus ring.
+message RawInput {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KEY_DOWN = 1;
+    KEY_UP = 2;
+    POINTER_MOVE = 3;
+    POINTER_DOWN = 4;
+    POINTER_UP = 5;
+    SCROLL = 6;
+    FOCUS_IN = 7;
+    FOCUS_OUT = 8;
+  }
+  uint64 surface_id = 1;
+  Kind kind = 2;
+  // Milliseconds on the launcher's clock; the engine only needs monotonicity.
+  uint64 timestamp_ms = 3;
+  // Device pixels relative to the surface's top-left corner.
+  float x = 4;
+  float y = 5;
+  // An X keysym. Zero produces an empty `key` in the page, so a synthesised
+  // event must carry one.
+  uint32 keysym = 6;
+  // The raw scancode. Zero produces `Unidentified` in the page, so this is
+  // carried alongside the keysym rather than derived from it.
+  uint32 hardware_keycode = 7;
+  bool repeat = 8;
+  // A bit mask of WebModifier values.
+  uint32 modifiers = 9;
+  // The engine's own button numbering: WEB_POINTER_BUTTON_LEFT = 1, MIDDLE =
+  // 2, RIGHT = 3, 0 for an event that names no button. Carried as an integer
+  // rather than an enum because a mouse with more buttons is ordinary
+  // hardware, and an enum would turn button 8 into an unspecified 0.
+  uint32 button = 10;
+  // 1 for a single click, 2 for a double, and so on.
+  uint32 press_count = 11;
+  float delta_x = 12;
+  float delta_y = 13;
+  // A high-resolution device (touchpad, precision wheel) rather than a
+  // notched wheel, which the page uses to decide whether to animate.
+  bool precise = 14;
+  // The end of a scroll gesture: fingers lifted, no more deltas coming.
+  bool stop = 15;
+}
+
+// Input-method traffic, already normalised by the launcher.
+//
+// The launcher converts winit's UTF-8 *byte* cursor offsets to the *character*
+// offsets WebKit expects before sending, and it does not forward the empty
+// preedit winit emits immediately before a commit: bridging that clear
+// straight through produces a spurious empty compositionend ahead of the real
+// one. Correction of already-committed text (delete-surrounding) is not part
+// of version 1.
+message ImeEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    PREEDIT = 1;
+    COMMIT = 2;
+  }
+  uint64 surface_id = 1;
+  Kind kind = 2;
+  string text = 3;
+  // Character offsets into `text`, valid only when has_cursor is set. An
+  // absent cursor is winit's `None` and is not the same as a cursor at 0.
+  uint32 cursor_begin_chars = 4;
+  uint32 cursor_end_chars = 5;
+  bool has_cursor = 6;
+}
+
+message Navigate {
+  uint64 surface_id = 1;
+  string url = 2;
+}
+
+message Resize {
+  uint64 surface_id = 1;
+  uint32 pixel_width = 2;
+  uint32 pixel_height = 3;
+}
+
+message CloseSurface {
+  uint64 surface_id = 1;
+  // Recorded in the host log; not shown to the user.
+  string reason = 2;
+}
+
+// One rendered frame of the surface. Raw RGBA8 and nothing else, converted
+// from the engine's BGRA in the web host so the launcher never touches a
+// channel order it did not ask for.
+//
+// This is deliberately not a PageNode.Image: the MAX_PAGE_IMAGE_* caps are a
+// plugin-facing contract about what a display list may draw, and a web
+// surface is neither drawn by a plugin nor bounded by the same numbers. Its
+// own caps are MAX_WEB_FRAME_BYTES (2 MiB) and MAX_WEB_FRAME_EDGE (4096).
+message WebFrame {
+  uint64 surface_id = 1;
+  // Increases with every frame. The launcher drops a frame older than the one
+  // it has already presented.
+  uint64 generation = 2;
+  uint32 pixel_width = 3;
+  uint32 pixel_height = 4;
+  // Exactly pixel_width * pixel_height * 4 bytes, row-major, no padding,
+  // premultiplied alpha, at most MAX_WEB_FRAME_BYTES.
+  bytes rgba8 = 5;
+}
+
+// Where the caret is inside the surface, so the launcher can place the
+// candidate window with Window::set_ime_cursor_area. Without it the IME's
+// candidates sit at the window's bottom-left, ignoring the text being typed.
+message CaretArea {
+  uint64 surface_id = 1;
+  // Device pixels relative to the surface's top-left corner.
+  float x = 2;
+  float y = 3;
+  float width = 4;
+  float height = 5;
+}
+
+message LoadState {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STARTED = 1;
+    REDIRECTED = 2;
+    COMMITTED = 3;
+    FINISHED = 4;
+    FAILED = 5;
+  }
+  uint64 surface_id = 1;
+  State state = 2;
+  string url = 3;
+  // Populated only for FAILED.
+  string failure = 4;
+  bool can_go_back = 5;
+  bool can_go_forward = 6;
+  string title = 7;
+}
+
+// The surface is gone and no further frames are coming. The reason is
+// load-bearing: the host paints an in-place panel naming the plugin when a
+// surface was killed for exceeding its memory ceiling, and must not mention
+// memory for an ordinary crash.
+message Gone {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    // The host or the plugin asked for the close.
+    CLOSED = 1;
+    // Our own cgroup limit killed it: oom > 0 in the surface's own
+    // memory.events.local.
+    MEMORY_LIMIT = 2;
+    // The web process died without our limit firing.
+    CRASHED = 3;
+    // The surface never came up.
+    STARTUP_FAILED = 4;
+    // The web host sent something the launcher refused.
+    PROTOCOL_VIOLATION = 5;
+  }
+  uint64 surface_id = 1;
+  Reason reason = 2;
+  string detail = 3;
 }

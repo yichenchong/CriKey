@@ -908,9 +908,82 @@ fn envelope_oneof_tags_are_frozen() {
                 focus_node: 0,
                 redraw_after_ms: 0,
                 close: false,
+                web: None,
                 unknown: unknown(),
             }),
             vec![0x82, 0x02],
+        ),
+        // Web surface traffic. Each carries `surface_id`, so none of these is
+        // an empty payload that would encode to a bare key.
+        (
+            message::Payload::OpenSurface(message::OpenSurface {
+                surface_id: 1,
+                ..Default::default()
+            }),
+            vec![0x8a, 0x02],
+        ),
+        (
+            message::Payload::RawInput(message::RawInput {
+                surface_id: 1,
+                ..Default::default()
+            }),
+            vec![0x92, 0x02],
+        ),
+        (
+            message::Payload::ImeEvent(message::ImeEvent {
+                surface_id: 1,
+                ..Default::default()
+            }),
+            vec![0x9a, 0x02],
+        ),
+        (
+            message::Payload::Navigate(message::Navigate {
+                surface_id: 1,
+                ..Default::default()
+            }),
+            vec![0xa2, 0x02],
+        ),
+        (
+            message::Payload::Resize(message::Resize {
+                surface_id: 1,
+                ..Default::default()
+            }),
+            vec![0xaa, 0x02],
+        ),
+        (
+            message::Payload::CloseSurface(message::CloseSurface {
+                surface_id: 1,
+                ..Default::default()
+            }),
+            vec![0xb2, 0x02],
+        ),
+        (
+            message::Payload::WebFrame(message::WebFrame {
+                surface_id: 1,
+                ..Default::default()
+            }),
+            vec![0xba, 0x02],
+        ),
+        (
+            message::Payload::CaretArea(message::CaretArea {
+                surface_id: 1,
+                ..Default::default()
+            }),
+            vec![0xc2, 0x02],
+        ),
+        (
+            message::Payload::LoadState(message::LoadState {
+                surface_id: 1,
+                ..Default::default()
+            }),
+            vec![0xca, 0x02],
+        ),
+        (
+            message::Payload::Gone(message::Gone {
+                surface_id: 1,
+                ..Default::default()
+            }),
+            vec![0xd2, 0x02],
         ),
     ];
 
@@ -1351,6 +1424,7 @@ fn a_page_frame_round_trips_through_both_conversions() {
         focus_node: 3,
         redraw_after_ms: 250,
         close: false,
+        web: None,
     };
     let wire = crikey_native_protocol::convert::to_proto_page_frame(&frame);
     let bytes = wire.encode();
@@ -1427,6 +1501,7 @@ fn a_raster_node_round_trips_with_its_bytes_intact() {
         focus_node: 0,
         redraw_after_ms: 0,
         close: false,
+        web: None,
     };
     frame.validate().expect("a bounded raster is a valid frame");
 
@@ -1557,5 +1632,788 @@ fn an_unknown_shape_keeps_an_interactive_node_reachable_rather_than_dropping_it(
         frame.focus_ring(),
         vec![7],
         "the control stays reachable by Tab rather than leaving a hole in the ring"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Web surface (spec 32.x)
+// ---------------------------------------------------------------------------
+
+/// Every inner tag of every web message, pinned one field at a time.
+///
+/// The oneof test above pins the envelope keys; this pins what is inside them,
+/// which is where a renumbering would actually hide. Each case sets exactly
+/// one field to a non-default value, so the encoding is that field's key
+/// followed by its value and nothing else: if a tag moves, the first byte
+/// changes and the case that owns it fails by name.
+#[test]
+fn web_message_field_numbers_are_frozen() {
+    macro_rules! only_field {
+        ($label:literal, $message:expr, $expected:expr) => {{
+            let encoded = $message.encode();
+            assert_eq!(
+                encoded.first().copied(),
+                Some($expected),
+                "{} moved: {:?}",
+                $label,
+                encoded
+            );
+        }};
+    }
+
+    only_field!(
+        "OpenSurface.surface_id",
+        message::OpenSurface {
+            surface_id: 1,
+            ..Default::default()
+        },
+        0x08
+    );
+    only_field!(
+        "OpenSurface.pixel_width",
+        message::OpenSurface {
+            pixel_width: 1,
+            ..Default::default()
+        },
+        0x10
+    );
+    only_field!(
+        "OpenSurface.pixel_height",
+        message::OpenSurface {
+            pixel_height: 1,
+            ..Default::default()
+        },
+        0x18
+    );
+    only_field!(
+        "OpenSurface.url",
+        message::OpenSurface {
+            url: "x".to_owned(),
+            ..Default::default()
+        },
+        0x22
+    );
+    only_field!(
+        "OpenSurface.storage_mode",
+        message::OpenSurface {
+            storage_mode: message::WebStorageMode::Persistent,
+            ..Default::default()
+        },
+        0x28
+    );
+
+    only_field!(
+        "RawInput.surface_id",
+        message::RawInput {
+            surface_id: 1,
+            ..Default::default()
+        },
+        0x08
+    );
+    only_field!(
+        "RawInput.kind",
+        message::RawInput {
+            kind: message::WebInputCode::KeyDown,
+            ..Default::default()
+        },
+        0x10
+    );
+    only_field!(
+        "RawInput.timestamp_ms",
+        message::RawInput {
+            timestamp_ms: 1,
+            ..Default::default()
+        },
+        0x18
+    );
+    only_field!(
+        "RawInput.x",
+        message::RawInput {
+            x: 1.0,
+            ..Default::default()
+        },
+        0x25
+    );
+    only_field!(
+        "RawInput.y",
+        message::RawInput {
+            y: 1.0,
+            ..Default::default()
+        },
+        0x2d
+    );
+    only_field!(
+        "RawInput.keysym",
+        message::RawInput {
+            keysym: 1,
+            ..Default::default()
+        },
+        0x30
+    );
+    only_field!(
+        "RawInput.hardware_keycode",
+        message::RawInput {
+            hardware_keycode: 1,
+            ..Default::default()
+        },
+        0x38
+    );
+    only_field!(
+        "RawInput.repeat",
+        message::RawInput {
+            repeat: true,
+            ..Default::default()
+        },
+        0x40
+    );
+    only_field!(
+        "RawInput.modifiers",
+        message::RawInput {
+            modifiers: message::WEB_MODIFIER_META,
+            ..Default::default()
+        },
+        0x48
+    );
+    only_field!(
+        "RawInput.button",
+        message::RawInput {
+            button: message::WEB_POINTER_BUTTON_RIGHT,
+            ..Default::default()
+        },
+        0x50
+    );
+    only_field!(
+        "RawInput.press_count",
+        message::RawInput {
+            press_count: 2,
+            ..Default::default()
+        },
+        0x58
+    );
+    only_field!(
+        "RawInput.delta_x",
+        message::RawInput {
+            delta_x: 1.0,
+            ..Default::default()
+        },
+        0x65
+    );
+    only_field!(
+        "RawInput.delta_y",
+        message::RawInput {
+            delta_y: 1.0,
+            ..Default::default()
+        },
+        0x6d
+    );
+    only_field!(
+        "RawInput.precise",
+        message::RawInput {
+            precise: true,
+            ..Default::default()
+        },
+        0x70
+    );
+    only_field!(
+        "RawInput.stop",
+        message::RawInput {
+            stop: true,
+            ..Default::default()
+        },
+        0x78
+    );
+
+    only_field!(
+        "ImeEvent.surface_id",
+        message::ImeEvent {
+            surface_id: 1,
+            ..Default::default()
+        },
+        0x08
+    );
+    only_field!(
+        "ImeEvent.kind",
+        message::ImeEvent {
+            kind: message::WebImeCode::Commit,
+            ..Default::default()
+        },
+        0x10
+    );
+    only_field!(
+        "ImeEvent.text",
+        message::ImeEvent {
+            text: "x".to_owned(),
+            ..Default::default()
+        },
+        0x1a
+    );
+    only_field!(
+        "ImeEvent.cursor_begin_chars",
+        message::ImeEvent {
+            cursor_begin_chars: 1,
+            ..Default::default()
+        },
+        0x20
+    );
+    only_field!(
+        "ImeEvent.cursor_end_chars",
+        message::ImeEvent {
+            cursor_end_chars: 1,
+            ..Default::default()
+        },
+        0x28
+    );
+    only_field!(
+        "ImeEvent.has_cursor",
+        message::ImeEvent {
+            has_cursor: true,
+            ..Default::default()
+        },
+        0x30
+    );
+
+    only_field!(
+        "Navigate.surface_id",
+        message::Navigate {
+            surface_id: 1,
+            ..Default::default()
+        },
+        0x08
+    );
+    only_field!(
+        "Navigate.url",
+        message::Navigate {
+            url: "x".to_owned(),
+            ..Default::default()
+        },
+        0x12
+    );
+
+    only_field!(
+        "Resize.surface_id",
+        message::Resize {
+            surface_id: 1,
+            ..Default::default()
+        },
+        0x08
+    );
+    only_field!(
+        "Resize.pixel_width",
+        message::Resize {
+            pixel_width: 1,
+            ..Default::default()
+        },
+        0x10
+    );
+    only_field!(
+        "Resize.pixel_height",
+        message::Resize {
+            pixel_height: 1,
+            ..Default::default()
+        },
+        0x18
+    );
+
+    only_field!(
+        "CloseSurface.surface_id",
+        message::CloseSurface {
+            surface_id: 1,
+            ..Default::default()
+        },
+        0x08
+    );
+    only_field!(
+        "CloseSurface.reason",
+        message::CloseSurface {
+            reason: "x".to_owned(),
+            ..Default::default()
+        },
+        0x12
+    );
+
+    only_field!(
+        "WebFrame.surface_id",
+        message::WebFrame {
+            surface_id: 1,
+            ..Default::default()
+        },
+        0x08
+    );
+    only_field!(
+        "WebFrame.generation",
+        message::WebFrame {
+            generation: 1,
+            ..Default::default()
+        },
+        0x10
+    );
+    only_field!(
+        "WebFrame.pixel_width",
+        message::WebFrame {
+            pixel_width: 1,
+            ..Default::default()
+        },
+        0x18
+    );
+    only_field!(
+        "WebFrame.pixel_height",
+        message::WebFrame {
+            pixel_height: 1,
+            ..Default::default()
+        },
+        0x20
+    );
+    only_field!(
+        "WebFrame.rgba8",
+        message::WebFrame {
+            rgba8: vec![1, 2, 3, 4],
+            ..Default::default()
+        },
+        0x2a
+    );
+
+    only_field!(
+        "CaretArea.surface_id",
+        message::CaretArea {
+            surface_id: 1,
+            ..Default::default()
+        },
+        0x08
+    );
+    only_field!(
+        "CaretArea.x",
+        message::CaretArea {
+            x: 1.0,
+            ..Default::default()
+        },
+        0x15
+    );
+    only_field!(
+        "CaretArea.y",
+        message::CaretArea {
+            y: 1.0,
+            ..Default::default()
+        },
+        0x1d
+    );
+    only_field!(
+        "CaretArea.width",
+        message::CaretArea {
+            width: 1.0,
+            ..Default::default()
+        },
+        0x25
+    );
+    only_field!(
+        "CaretArea.height",
+        message::CaretArea {
+            height: 1.0,
+            ..Default::default()
+        },
+        0x2d
+    );
+
+    only_field!(
+        "LoadState.surface_id",
+        message::LoadState {
+            surface_id: 1,
+            ..Default::default()
+        },
+        0x08
+    );
+    only_field!(
+        "LoadState.state",
+        message::LoadState {
+            state: message::WebLoadCode::Finished,
+            ..Default::default()
+        },
+        0x10
+    );
+    only_field!(
+        "LoadState.url",
+        message::LoadState {
+            url: "x".to_owned(),
+            ..Default::default()
+        },
+        0x1a
+    );
+    only_field!(
+        "LoadState.failure",
+        message::LoadState {
+            failure: "x".to_owned(),
+            ..Default::default()
+        },
+        0x22
+    );
+    only_field!(
+        "LoadState.can_go_back",
+        message::LoadState {
+            can_go_back: true,
+            ..Default::default()
+        },
+        0x28
+    );
+    only_field!(
+        "LoadState.can_go_forward",
+        message::LoadState {
+            can_go_forward: true,
+            ..Default::default()
+        },
+        0x30
+    );
+    only_field!(
+        "LoadState.title",
+        message::LoadState {
+            title: "x".to_owned(),
+            ..Default::default()
+        },
+        0x3a
+    );
+
+    only_field!(
+        "Gone.surface_id",
+        message::Gone {
+            surface_id: 1,
+            ..Default::default()
+        },
+        0x08
+    );
+    only_field!(
+        "Gone.reason",
+        message::Gone {
+            reason: message::WebGoneCode::MemoryLimit,
+            ..Default::default()
+        },
+        0x10
+    );
+    only_field!(
+        "Gone.detail",
+        message::Gone {
+            detail: "x".to_owned(),
+            ..Default::default()
+        },
+        0x1a
+    );
+
+    // The plugin-facing half, which rides on PageFrame rather than on its own
+    // envelope key.
+    only_field!(
+        "PageWebSurface.url",
+        message::PageWebSurface {
+            url: "x".to_owned(),
+            ..Default::default()
+        },
+        0x0a
+    );
+    only_field!(
+        "PageWebSurface.storage",
+        message::PageWebSurface {
+            storage: message::WebStorageMode::Persistent,
+            ..Default::default()
+        },
+        0x10
+    );
+    only_field!(
+        "PageFrame.web",
+        message::PageFrame {
+            web: Some(message::PageWebSurface::default()),
+            ..Default::default()
+        },
+        0x3a
+    );
+}
+
+#[test]
+fn every_web_message_round_trips_all_non_default_fields() {
+    assert_round_trip(message::OpenSurface {
+        surface_id: 9,
+        pixel_width: 696,
+        pixel_height: 410,
+        url: "https://example.invalid/page".to_owned(),
+        storage_mode: message::WebStorageMode::Persistent,
+        unknown: unknown(),
+    });
+    assert_round_trip(message::RawInput {
+        surface_id: 9,
+        kind: message::WebInputCode::Scroll,
+        timestamp_ms: 1_234_567,
+        x: 12.5,
+        y: -3.25,
+        keysym: 0xff09,
+        hardware_keycode: 23,
+        repeat: true,
+        modifiers: message::WEB_MODIFIER_SHIFT
+            | message::WEB_MODIFIER_CONTROL
+            | message::WEB_MODIFIER_ALT
+            | message::WEB_MODIFIER_META
+            | message::WEB_MODIFIER_CAPS_LOCK
+            | message::WEB_MODIFIER_NUM_LOCK,
+        button: message::WEB_POINTER_BUTTON_MIDDLE,
+        press_count: 2,
+        delta_x: -0.5,
+        delta_y: 120.0,
+        precise: true,
+        stop: true,
+        unknown: unknown(),
+    });
+    assert_round_trip(message::ImeEvent {
+        surface_id: 9,
+        kind: message::WebImeCode::Preedit,
+        text: "你好".to_owned(),
+        cursor_begin_chars: 2,
+        cursor_end_chars: 2,
+        has_cursor: true,
+        unknown: unknown(),
+    });
+    assert_round_trip(message::Navigate {
+        surface_id: 9,
+        url: "https://example.invalid/next".to_owned(),
+        unknown: unknown(),
+    });
+    assert_round_trip(message::Resize {
+        surface_id: 9,
+        pixel_width: 800,
+        pixel_height: 600,
+        unknown: unknown(),
+    });
+    assert_round_trip(message::CloseSurface {
+        surface_id: 9,
+        reason: "page closed".to_owned(),
+        unknown: unknown(),
+    });
+    assert_round_trip(message::CaretArea {
+        surface_id: 9,
+        x: 40.0,
+        y: 96.5,
+        width: 2.0,
+        height: 18.0,
+        unknown: unknown(),
+    });
+    assert_round_trip(message::LoadState {
+        surface_id: 9,
+        state: message::WebLoadCode::Failed,
+        url: "https://example.invalid/page".to_owned(),
+        failure: "name not resolved".to_owned(),
+        can_go_back: true,
+        can_go_forward: true,
+        title: "Example".to_owned(),
+        unknown: unknown(),
+    });
+    assert_round_trip(message::Gone {
+        surface_id: 9,
+        reason: message::WebGoneCode::MemoryLimit,
+        detail: "dev.example.web exceeded its ceiling".to_owned(),
+        unknown: unknown(),
+    });
+}
+
+/// The IME cursor is in characters, and an absent cursor is not a cursor at
+/// zero. Both halves matter: winit reports UTF-8 *byte* offsets, so a bridge
+/// that forwards them unconverted puts WebKit's caret inside a codepoint the
+/// moment anyone types the very thing an input method is for.
+#[test]
+fn an_absent_ime_cursor_is_distinct_from_a_cursor_at_the_start() {
+    let absent = message::ImeEvent {
+        text: "你好".to_owned(),
+        ..Default::default()
+    };
+    let at_zero = message::ImeEvent {
+        text: "你好".to_owned(),
+        has_cursor: true,
+        ..Default::default()
+    };
+    assert_ne!(absent.encode(), at_zero.encode());
+
+    let decoded = message::ImeEvent::decode(&at_zero.encode()).expect("a stated cursor decodes");
+    assert!(decoded.has_cursor);
+    assert_eq!((decoded.cursor_begin_chars, decoded.cursor_end_chars), (0, 0));
+
+    let decoded = message::ImeEvent::decode(&absent.encode()).expect("an absent cursor decodes");
+    assert!(!decoded.has_cursor);
+}
+
+fn web_frame(pixel_width: u32, pixel_height: u32, bytes: usize) -> message::WebFrame {
+    message::WebFrame {
+        surface_id: 4,
+        generation: 11,
+        pixel_width,
+        pixel_height,
+        rgba8: (0..bytes).map(|byte| byte as u8).collect(),
+        unknown: unknown(),
+    }
+}
+
+/// A frame filled exactly to the cap must survive the whole path: it is the
+/// one size where an off-by-one in either the cap or the wire budget turns a
+/// legal frame into a disconnected surface.
+#[test]
+fn a_maximum_size_web_frame_round_trips_and_validates() {
+    let pixels = message::MAX_WEB_FRAME_BYTES / 4;
+    let frame = web_frame(1024, 512, message::MAX_WEB_FRAME_BYTES);
+    assert_eq!(1024 * 512, pixels);
+    assert_eq!(frame.validate(), Ok(()));
+
+    let envelope = message::Envelope {
+        payload: Some(message::Payload::WebFrame(frame.clone())),
+        ..Default::default()
+    };
+    let encoded = envelope.encode();
+    assert!(
+        encoded.len() < crikey_native_protocol::MAX_FRAME_BYTES,
+        "a frame at the web cap must still fit the wire budget with room to spare"
+    );
+    let decoded = message::Envelope::decode(&encoded).expect("a capped frame must decode");
+    let Some(message::Payload::WebFrame(round_tripped)) = decoded.payload else {
+        panic!("the payload must survive as a web frame");
+    };
+    assert_eq!(
+        round_tripped.rgba8, frame.rgba8,
+        "the pixels must be byte-identical"
+    );
+    assert_eq!(round_tripped, frame);
+}
+
+#[test]
+fn an_oversized_web_frame_is_refused_on_its_byte_count() {
+    // One row past the cap, with a buffer that honestly matches the geometry:
+    // the size refusal must not depend on the frame also being malformed.
+    let bytes = 1024 * 513 * 4;
+    let frame = web_frame(1024, 513, bytes);
+    assert!(bytes > message::MAX_WEB_FRAME_BYTES);
+    assert_eq!(frame.validate(), Err(message::WebFrameError::TooLarge { bytes }));
+}
+
+/// A strip is exactly the shape a byte cap cannot catch: 1x524288 is a legal
+/// two megabytes and an impossible texture.
+#[test]
+fn a_web_frame_is_refused_on_its_shape_before_its_size() {
+    let frame = web_frame(1, 524_288, message::MAX_WEB_FRAME_BYTES);
+    assert_eq!(
+        frame.validate(),
+        Err(message::WebFrameError::EdgeOutOfRange {
+            pixel_width: 1,
+            pixel_height: 524_288,
+        })
+    );
+
+    for (pixel_width, pixel_height) in [(0, 16), (16, 0), (message::MAX_WEB_FRAME_EDGE + 1, 1)] {
+        let frame = web_frame(pixel_width, pixel_height, 0);
+        assert_eq!(
+            frame.validate(),
+            Err(message::WebFrameError::EdgeOutOfRange {
+                pixel_width,
+                pixel_height,
+            })
+        );
+    }
+}
+
+/// Declared geometry disagreeing with the buffer is the defect that draws
+/// rather than fails: shifted rows look like a rendering bug, not like a
+/// truncated frame, so it is named here instead of being uploaded.
+#[test]
+fn a_web_frame_whose_geometry_disagrees_with_its_bytes_is_refused() {
+    let short = web_frame(4, 4, 3);
+    assert_eq!(
+        short.validate(),
+        Err(message::WebFrameError::ByteCountMismatch {
+            expected: 64,
+            actual: 3,
+        })
+    );
+
+    let long = web_frame(4, 4, 65);
+    assert_eq!(
+        long.validate(),
+        Err(message::WebFrameError::ByteCountMismatch {
+            expected: 64,
+            actual: 65,
+        })
+    );
+
+    // The decoder itself stays total: the bytes materialise and the refusal
+    // comes from `validate`, so the diagnostic can name the real defect.
+    let decoded = message::WebFrame::decode(&short.encode()).expect("a wrong frame still decodes");
+    assert_eq!(decoded, short);
+}
+
+/// A newer web host may add a field this launcher has never heard of, and the
+/// launcher must hand it back unchanged rather than quietly dropping it.
+#[test]
+fn an_unknown_web_frame_field_survives_a_round_trip() {
+    let known = web_frame(2, 2, 16).encode();
+    // Field 99, length-delimited: a tag no version of this schema defines.
+    let unknown_bytes = [0x9a, 0x06, 0x02, 0xde, 0xad];
+    let mut input = unknown_bytes.to_vec();
+    input.extend_from_slice(&known);
+
+    let decoded = message::WebFrame::decode(&input).expect("an unknown field is not a refusal");
+    assert_eq!(decoded.unknown.as_bytes(), &unknown_bytes[..]);
+    assert_eq!(decoded.pixel_width, 2);
+    assert_eq!(decoded.validate(), Ok(()));
+
+    let mut expected = known;
+    expected.extend_from_slice(&unknown_bytes);
+    assert_eq!(decoded.encode(), expected, "the unknown field must be re-emitted");
+
+    // And the same promise one level up: an unknown field inside a web
+    // payload survives being carried in an envelope.
+    let envelope = message::Envelope {
+        payload: Some(message::Payload::WebFrame(decoded)),
+        ..Default::default()
+    };
+    let bytes = envelope.encode();
+    assert_eq!(
+        message::Envelope::decode(&bytes)
+            .expect("the envelope decodes")
+            .encode(),
+        bytes
+    );
+}
+
+/// A plugin declares a web surface on its page frame; the host reads it back
+/// as the same thing. The storage mode is the part worth pinning: an
+/// unspecified mode must resolve to ephemeral, because the alternative leaves
+/// a session on the user's disk that nobody asked for.
+#[test]
+fn a_web_surface_page_frame_round_trips_through_both_conversions() {
+    let frame = crikey_core::PageFrame {
+        generation: 3,
+        title: "Docs".to_owned(),
+        nodes: Vec::new(),
+        focus_node: 0,
+        redraw_after_ms: 0,
+        close: false,
+        web: Some(crikey_core::PageWebSurface {
+            url: "https://example.invalid/docs".to_owned(),
+            storage: crikey_core::WebStorage::Persistent,
+        }),
+    };
+    frame.validate().expect("a web surface page is a valid frame");
+
+    let wire = crikey_native_protocol::convert::to_proto_page_frame(&frame);
+    assert_eq!(
+        wire.web.as_ref().expect("the surface crosses").storage,
+        message::WebStorageMode::Persistent,
+        "the mode must be stated on the wire, never left to a silence"
+    );
+    let bytes = wire.encode();
+    let decoded = message::PageFrame::decode(&bytes).expect("a web surface frame decodes");
+    assert_eq!(decoded.encode(), bytes);
+    assert_eq!(
+        crikey_native_protocol::convert::from_proto_page_frame(&decoded),
+        frame
+    );
+
+    // A peer that leaves the mode at its proto3 default gets the safe answer,
+    // not an inherited session.
+    let silent = message::PageFrame {
+        web: Some(message::PageWebSurface::default()),
+        ..Default::default()
+    };
+    let core = crikey_native_protocol::convert::from_proto_page_frame(&silent);
+    assert_eq!(
+        core.web.expect("the surface survives").storage,
+        crikey_core::WebStorage::Ephemeral
     );
 }

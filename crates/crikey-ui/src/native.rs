@@ -2810,7 +2810,17 @@ fn draw_page(ui: &mut egui::Ui, page: &PageSurface, commands: &mut Vec<UiCommand
     // timer is stale between every frame, and blinking a spinner over the
     // picture it is already showing is the flicker the sheet exists to
     // prevent.
-    if page.stale && !page.answered {
+    //
+    // A web surface is judged on its first painted frame instead, because its
+    // plugin answers the instant it declares a URL while the engine behind it
+    // takes hundreds of milliseconds to produce anything. Judging it on
+    // `answered` would clear the spinner immediately and leave a blank sheet
+    // for exactly the interval this exists to cover.
+    let loading = match &page.frame.web {
+        Some(_) => !page.web_painted,
+        None => page.stale && !page.answered,
+    };
+    if loading {
         let size = theme::ICON_SIZE;
         let centre = egui::Rect::from_center_size(rect.center(), vec2(size, size));
         page_ui.put(centre, egui::Spinner::new().size(size).color(colors.text_muted));
@@ -4629,6 +4639,7 @@ mod window_geometry_tests {
             frame: Arc::new(crikey_core::PageFrame::default()),
             stale: false,
             answered: true,
+            web_painted: false,
         });
         assert_eq!(
             desired_window_height(&page, expanded),

@@ -1,0 +1,46 @@
+[package]
+name = "crikey-web-host"
+description = "Out-of-process host for a WPE WebKit web surface behind a plugin page."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[features]
+# OFF by default, and the reason is CI rather than taste. `.github/workflows`
+# runs `cargo clippy --workspace` and `cargo test --workspace` on runners that
+# have no WPE, and a default-on engine feature makes `build.rs` panic there --
+# so the whole workspace would go red on every machine that is not a packaging
+# box. Default-off inverts that: the engine-free half of this crate, which is
+# where the correctness arguments live, is checked and tested everywhere, and
+# only a build that means to link an engine asks for one.
+#
+# The packaging driver turns it on explicitly (`--features engine`), and the
+# executable below cannot be built without it.
+default = []
+engine = []
+
+[dependencies]
+crikey-native-protocol.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+# Both are crate-local rather than workspace dependencies on purpose: this is
+# the only crate in the tree that compiles C or links a system library, and
+# that ought to stay auditable from one manifest. Neither adds anything to
+# `Cargo.lock` -- both are already there, pulled in by existing build scripts.
+cc = "1"
+pkg-config = "0.3"
+
+# The executable is deliberately not declared yet. What exists so far is the
+# engine-free half of this crate -- frame conversion, the IME ordering rules
+# and their tests -- plus the C shim they will drive. Declaring a `[[bin]]`
+# whose `src/main.rs` does not exist breaks `cargo fmt` for the whole
+# workspace, and writing a stub that starts and answers nothing would be
+# worse: it would look like a host. The binary arrives with the host loop.

@@ -166,6 +166,19 @@ pub struct PageSurface {
     /// puts up the instant it opens one, before the plugin has drawn
     /// anything, which is the only case that should read as loading.
     pub answered: bool,
+    /// Whether a web surface has produced its first frame.
+    ///
+    /// Separate from [`PageSurface::answered`], and the separation is the
+    /// whole point: a plugin declaring a web surface answers immediately,
+    /// because the declaration is a URL and a rectangle, while the engine
+    /// behind it took 276 to 533 ms to produce a first frame when measured.
+    /// Keying the loading state on `answered` alone would therefore clear the
+    /// spinner instantly and leave the user watching a blank sheet for half a
+    /// second -- exactly the hang the loading state exists to prevent.
+    ///
+    /// Meaningless for a display list, where the plugin's frame *is* the
+    /// content.
+    pub web_painted: bool,
 }
 
 /// Everything the renderer needs for one frame.

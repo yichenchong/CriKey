@@ -2,7 +2,8 @@
 
 use crikey_core::{
     Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, NodeRole,
-    NodeShape, PageColor, PageFrame, PageImage, PageInput, PageInputKind, PageNode, PluginId,
+    NodeShape, PageColor, PageFrame, PageImage, PageInput, PageInputKind, PageNode, PageWebSurface, PluginId,
+    WebStorage,
 };
 
 use crate::message;
@@ -160,6 +161,26 @@ pub fn from_proto_page_frame(frame: &message::PageFrame) -> PageFrame {
         focus_node: frame.focus_node,
         redraw_after_ms: frame.redraw_after_ms,
         close: frame.close,
+        web: frame.web.as_ref().map(from_proto_web_surface),
+    }
+}
+
+/// Converts a plugin's web surface declaration to the host's model.
+///
+/// An unspecified storage mode becomes [`WebStorage::Ephemeral`], which is
+/// also the core default. That is the one direction a silence may be resolved
+/// in: forgetting to ask for persistence costs a plugin a session, while
+/// reading a silence as persistence would leave cookies on the user's disk
+/// that nobody asked for.
+fn from_proto_web_surface(web: &message::PageWebSurface) -> PageWebSurface {
+    PageWebSurface {
+        url: web.url.clone(),
+        storage: match web.storage {
+            message::WebStorageMode::Persistent => WebStorage::Persistent,
+            message::WebStorageMode::Ephemeral | message::WebStorageMode::ModeUnspecified => {
+                WebStorage::Ephemeral
+            }
+        },
     }
 }
 
@@ -288,6 +309,23 @@ pub fn to_proto_page_frame(frame: &PageFrame) -> message::PageFrame {
         focus_node: frame.focus_node,
         redraw_after_ms: frame.redraw_after_ms,
         close: frame.close,
+        web: frame.web.as_ref().map(to_proto_web_surface),
+        unknown: UnknownFields::default(),
+    }
+}
+
+/// Converts a host-side web surface declaration to the wire form.
+///
+/// The storage mode is always stated, never left at the unspecified zero: the
+/// plugin made a choice, and a receiver that has to infer it from a silence
+/// is a receiver that can infer it differently from the sender.
+fn to_proto_web_surface(web: &PageWebSurface) -> message::PageWebSurface {
+    message::PageWebSurface {
+        url: web.url.clone(),
+        storage: match web.storage {
+            WebStorage::Ephemeral => message::WebStorageMode::Ephemeral,
+            WebStorage::Persistent => message::WebStorageMode::Persistent,
+        },
         unknown: UnknownFields::default(),
     }
 }
