@@ -1488,6 +1488,17 @@ fn centred_origin(screen: PhysicalSize<u32>, window_width: u32, expanded_height_
     (x, y)
 }
 
+/// Device limits for a renderer whose swapchain follows the physical window.
+///
+/// The downlevel baseline keeps the shaders portable, but its 2D texture limit
+/// is only 2048 pixels. A normal high-DPI window can exceed that before the
+/// launcher draws its first frame, and wgpu validates the surface extent
+/// against the limits requested for the device. Resolution limits therefore
+/// come from the compatible adapter; all unrelated limits stay downlevel.
+fn required_device_limits(adapter_limits: wgpu::Limits) -> wgpu::Limits {
+    wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits)
+}
+
 /// Picks the surface compositing mode that matches the shape the window is
 /// allowed to have.
 ///
@@ -1662,7 +1673,7 @@ impl GraphicsState {
                 &wgpu::DeviceDescriptor {
                     label: Some("crikey launcher device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
+                    required_limits: required_device_limits(adapter.limits()),
                     memory_hints: wgpu::MemoryHints::MemoryUsage,
                 },
                 None,
@@ -4166,6 +4177,23 @@ mod surface_tests {
         );
         assert!(desktop.contains("desktop"), "got {desktop:?}");
         assert!(surface.contains("surface"), "got {surface:?}");
+    }
+
+    /// A 1440-logical-pixel launcher at 150% scaling configures a 2160-pixel
+    /// surface. The downlevel 2048 limit used to make that startup panic even
+    /// when the adapter supported the monitor's physical extent.
+    #[test]
+    fn device_limits_cover_a_high_dpi_surface() {
+        let downlevel = wgpu::Limits::downlevel_defaults();
+        let adapter = wgpu::Limits {
+            max_texture_dimension_2d: 8192,
+            ..downlevel.clone()
+        };
+
+        let requested = required_device_limits(adapter);
+
+        assert!(requested.max_texture_dimension_2d >= 2160);
+        assert_eq!(requested.max_bind_groups, downlevel.max_bind_groups);
     }
 }
 
