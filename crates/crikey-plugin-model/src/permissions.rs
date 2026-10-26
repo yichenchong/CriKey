@@ -101,6 +101,17 @@ pub struct Permissions {
     pub environment: bool,
     #[serde(default)]
     pub native_library_loading: bool,
+    /// Lets a web surface keep cookies and local storage between openings.
+    ///
+    /// Separate from [`Permissions::network`], which only says the plugin may
+    /// reach the network at all. This one says a page may hold a *session* on
+    /// the user's machine after it closes -- a signed-in mailbox, a tracker
+    /// with the user's credentials in it -- which outlives the interaction
+    /// that created it and is not something a manifest should get by
+    /// mentioning a URL. Default false: a surface that does not ask keeps
+    /// nothing.
+    #[serde(default)]
+    pub web_storage: bool,
     #[serde(default)]
     pub background_execution: bool,
 }
@@ -156,5 +167,107 @@ impl Permissions {
             }],
             ..Self::default()
         }
+    }
+}
+
+/// Why the host refused to open a plugin's web surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebSurfaceRefusal {
+    /// The surface named an address but the manifest does not grant network
+    /// access.
+    NetworkNotGranted,
+    /// The surface asked for persistent storage without
+    /// [`Permissions::web_storage`].
+    StorageNotGranted,
+}
+
+impl std::fmt::Display for WebSurfaceRefusal {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NetworkNotGranted => write!(
+                out,
+                "the plugin's web surface names an address, but its manifest does not declare `permissions.network`"
+            ),
+            Self::StorageNotGranted => write!(
+                out,
+                "the plugin's web surface asks to keep cookies between openings, but its manifest does not declare `permissions.web-storage`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WebSurfaceRefusal {}
+
+/// Decides whether a plugin may open the web surface it asked for.
+///
+/// Called at the boundary where a page is opened, because that is the only
+/// place both halves are known: the frame says what the plugin wants, and the
+/// manifest says what it was granted. [`crikey_core::PageFrame::validate`]
+/// cannot answer this -- it sees a frame with no idea whose it is -- so a
+/// comment there saying persistence is "permission-gated" would be a wish
+/// rather than a gate.
+///
+/// `wants_navigation` is whether the frame carries an address at all: an empty
+/// one means "stay where you are", which needs no fresh grant because whatever
+/// is already loaded was admitted by this same check.
+pub fn admit_web_surface(
+    permissions: &Permissions,
+    wants_navigation: bool,
+    wants_persistent_storage: bool,
+) -> Result<(), WebSurfaceRefusal> {
+    if wants_navigation && !permissions.network {
+        return Err(WebSurfaceRefusal::NetworkNotGranted);
+    }
+    if wants_persistent_storage && !permissions.web_storage {
+        return Err(WebSurfaceRefusal::StorageNotGranted);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_surface_that_navigates_needs_the_network_grant() {
+        let ungranted = Permissions::default();
+        assert_eq!(
+            admit_web_surface(&ungranted, true, false),
+            Err(WebSurfaceRefusal::NetworkNotGranted)
+        );
+        let granted = Permissions {
+            network: true,
+            ..Permissions::default()
+        };
+        assert_eq!(admit_web_surface(&granted, true, false), Ok(()));
+    }
+
+    /// Persistence is a separate grant from reaching the network, because it
+    /// is a separate thing to consent to: one is a page fetching bytes, the
+    /// other is a plugin holding the user's session after the page is gone.
+    #[test]
+    fn persistent_storage_is_not_implied_by_network_access() {
+        let networked = Permissions {
+            network: true,
+            ..Permissions::default()
+        };
+        assert_eq!(
+            admit_web_surface(&networked, true, true),
+            Err(WebSurfaceRefusal::StorageNotGranted)
+        );
+        let both = Permissions {
+            network: true,
+            web_storage: true,
+            ..Permissions::default()
+        };
+        assert_eq!(admit_web_surface(&both, true, true), Ok(()));
+    }
+
+    /// A later frame that re-sends the surface without an address is asking to
+    /// stay put, and re-checking the grant there would refuse a page that is
+    /// already open and already admitted.
+    #[test]
+    fn staying_on_the_current_page_needs_no_fresh_grant() {
+        assert_eq!(admit_web_surface(&Permissions::default(), false, false), Ok(()));
     }
 }

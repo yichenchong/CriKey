@@ -2332,24 +2332,26 @@ The first public compatibility release shall satisfy the following:
 
 ### 32.1 Purpose and scope
 
-A page is a plugin-drawn surface the launcher presents in place of the result
+A page is a plugin-owned surface the launcher presents in place of the result
 list.
 
-A page shall be expressed as a display list: a flat, retained frame of drawing
-nodes that the host draws with its own renderer.
+A page shall use exactly one of two forms:
 
-Executable code shall never cross the plugin boundary for a page. The plugin
-sends drawing commands and semantics; the host performs all rasterization of
-those commands (ADR-0020).
+- A flat, retained display-list frame of drawing nodes that the host draws
+  with its own renderer.
+- A web-surface declaration that the host renders through the separately
+  supervised engine of 32.11.
 
-Pixels shall cross only as a bounded raster attached to a single node, under
-the limits of 32.5. The distinction is the whole of it: a plugin may hand over
-a picture that occupies one node's rectangle, and may not hand over the page.
-A surface-sized framebuffer per frame is what ADR-0020 rejected. The caps of
-32.5 bound what one frame may cost rather than making that shape unreachable —
-tiled rasters can still sum to a full surface — and what distinguishes a page
-from a canvas is that the rest of the frame remains a display list carrying
-roles, labels and a focus order.
+Executable code shall never cross the plugin boundary for a display-list
+page. The plugin sends drawing commands and semantics; the host performs all
+rasterization of those commands (ADR-0020).
+
+Pixels in a display list shall cross only as a bounded raster attached to a
+single node, under the limits of 32.5. A plugin may hand over a picture that
+occupies one node's rectangle, and may not hand over a display-list page as a
+surface-sized framebuffer. The web form is distinct: the plugin declares the
+surface but never sends or receives its pixels or DOM; pixels travel only
+between the host and its supervised web engine under 32.11.
 
 A page shall not learn its position on screen, and shall not draw outside the
 area the host gave it. The host clips.
@@ -2418,7 +2420,7 @@ for a different surface.
 
 ### 32.5 Node vocabulary
 
-A page frame shall consist of:
+A display-list page frame shall consist of:
 
 - A generation.
 - A title.
@@ -2497,7 +2499,7 @@ stack, or otherwise reposition nodes.
 
 ### 32.6 Bounds
 
-A page frame shall be bounded:
+A display-list page frame shall be bounded:
 
 - At most `MAX_PAGE_NODES` (4,096) nodes per frame.
 - At most `MAX_NODE_TEXT_BYTES` (8,192) bytes of text per node.
@@ -2508,12 +2510,13 @@ These bounds exist so that one keypress cannot become an unbounded host layout
 or text-shaping pass, and so that the host's per-frame cost stays predictable
 under §25.1.
 
-A page frame shall additionally remain within the protocol's 8 MiB
+Every plugin page frame shall additionally remain within the protocol's 8 MiB
 `MAX_FRAME_BYTES` cap like any other message (ADR-0004).
 
-A self-scheduled redraw shall be clamped to `MIN_PAGE_REDRAW_MS` (16 ms). A
-page requests its next frame with a delay, and the per-frame caps above bound
-one frame without bounding a rate: at a one millisecond period a page carrying
+A display-list frame's self-scheduled redraw shall be clamped to
+`MIN_PAGE_REDRAW_MS` (16 ms). A page requests its next frame with a delay, and
+the per-frame caps above bound one frame without bounding a rate: at a one
+millisecond period a page carrying
 rasters would demand gigabytes a second of encode, transport and decode. The
 value is one frame at the 60 Hz baseline these budgets are written against,
 and is a floor on the page's own timer rather than a statement about any
@@ -2525,7 +2528,7 @@ a frame answering user input shall not be delayed by this clamp.
 Every page frame arriving from a plugin shall be validated before any other
 component observes it.
 
-A frame shall be refused when:
+A display-list frame shall be refused when:
 
 - It carries more than `MAX_PAGE_NODES` nodes.
 - Any node's text exceeds `MAX_NODE_TEXT_BYTES`.
@@ -2564,12 +2567,13 @@ plugin health under §24.3.
 
 ### 32.8 Semantics and accessibility
 
-A drawn glyph shall not be treated as an accessible name. Roles, labels, and
-focus order shall be carried by the protocol beside the drawing.
+For a display-list page, a drawn glyph shall not be treated as an accessible
+name. Roles, labels, and focus order shall be carried by the protocol beside
+the drawing.
 
-The focus ring shall be derived from the frame: a node joins it when its role
-is interactive and its node identifier is non-zero, ordered by focus-order
-position and then by list order.
+The display-list focus ring shall be derived from the frame: a node joins it
+when its role is interactive and its node identifier is non-zero, ordered by
+focus-order position and then by list order.
 
 A node's accessible name shall be its label, or its text when the label is
 empty. A node whose role is none shall have no accessible name and shall be
@@ -2579,29 +2583,30 @@ An interactive node with no accessible name shall be reported as a defect of
 that page rather than silently drawn, so that the omission reaches the plugin
 author through `crikey plugin doctor` and developer mode.
 
-Carrying these semantics shall not be described as screen-reader support. The
-semantics are a prerequisite for delivering a page to a platform accessibility
-tree; delivering them is separate work (ADR-0002, ADR-0020).
+Carrying display-list semantics shall not be described as screen-reader
+support. The semantics are a prerequisite for delivering a page to a platform
+accessibility tree; delivering them is separate work (ADR-0002, ADR-0020).
 
 ### 32.9 Keyboard ownership and input
 
 While a page is open the page shall own the keyboard, as the settings surface
 does. Keystrokes shall not be interpreted as launcher query text.
 
-The host shall hit-test pointer events against the frame and shall name the
-node an event landed on, or zero for none. A plugin shall not perform its own
-hit-testing against coordinates the host already resolved.
+For a display-list page, the host shall hit-test pointer events against the
+frame and shall name the node an event landed on, or zero for none. A plugin
+shall not perform its own hit-testing against coordinates the host already
+resolved.
 
-Input events shall be delivered in the order they occurred, batched into the
-next page request, and shall distinguish at least: page opened, pointer moved,
-pointer pressed, pointer released, key pressed, committed text input,
-activation, focus changed, and page closed.
+Display-list input events shall be delivered in the order they occurred,
+batched into the next page request, and shall distinguish at least: page
+opened, pointer moved, pointer pressed, pointer released, key pressed,
+committed text input, activation, focus changed, and page closed.
 
-Committed text only shall be delivered as text input. The host shall resolve
-input-method composition before delivery.
+For display-list text input, committed text only shall be delivered. The host
+shall resolve input-method composition before delivery.
 
-Key names shall be host spellings — for example `Enter`, `ArrowDown`, `A` — so
-that meaning survives version skew between host and SDK.
+Display-list key names shall be host spellings — for example `Enter`,
+`ArrowDown`, `A` — so that meaning survives version skew between host and SDK.
 
 Escape shall be reserved by the host. Escape shall close the page and shall
 never be forwarded to the plugin. A plugin therefore cannot capture the user's
@@ -2629,3 +2634,50 @@ result list with the query state it had before the page opened.
 
 No further page request shall be sent for a closed page, and a frame arriving
 for a closed page shall be discarded.
+
+### 32.11 Web surfaces
+
+A page may carry either the display list of 32.5 or one web-surface
+declaration, never both. The host shall refuse a frame that carries both, a
+web frame that names a display-list focus node, or a web frame that requests a
+plugin-timed redraw. Focus and repaint scheduling inside a web surface belong
+to the engine.
+
+At most one web surface shall be live. This follows the page invariant in
+32.2: before a new page opens, the prior page and its supervised web-host
+process tree shall be closed and released. Frames from a closed surface shall
+be discarded by surface identifier.
+
+A web surface may navigate only to `http` and `https` addresses and requires
+the plugin's `permissions.network` grant. Persistent cookies and local storage
+require the independent `permissions.web-storage` grant; network permission
+does not imply persistence. Ephemeral storage shall be discarded when the
+page closes.
+
+The engine shall start only after the user opens the page. Nothing shall be
+spawned for web surfaces at launcher startup, plugin discovery, activation or
+catalog build. While waiting for the first engine frame, the page shall show
+its in-page loading state; receiving the plugin's web-surface declaration
+shall not count as the engine having painted.
+
+For a web surface, hit-testing, DOM focus and accessibility semantics belong
+to the engine rather than the plugin display-list protocol. The launcher shall
+forward raw pointer, keyboard and IME events to its supervised web host in
+arrival order, preserving hardware keycode, logical keysym, modifiers,
+repeat state and composition boundaries. Escape remains the launcher's key
+under 32.9 and shall never reach the engine.
+
+On Linux the supervised web-host process tree should receive a memory ceiling
+equal to the lesser of 768 MiB and one eighth of physical RAM. An effective
+ceiling below 256 MiB shall refuse a web surface rather than start an engine
+expected to exceed it. If CriKey was started outside a delegated systemd user
+session and cannot establish the cgroup-v2 tree limit, diagnostics shall
+report memory enforcement as unavailable; the host shall not claim that the
+ceiling is active.
+
+Composition, committed text and candidate-window positioning shall be
+supported on the Linux WPE route. IME correction of already-committed text is
+not supported in v1 because neither the launcher input API nor the packaged
+WPE route provides a correct delete-surrounding operation. This limitation
+shall be visible in the plugin-author guide and in `crikey plugin doctor` for
+a manifest that declares persistent web storage.

@@ -1343,6 +1343,9 @@ fn open_plugin_page(
         frame: Arc::new(crikey_core::PageFrame::default()),
         stale: true,
         answered: false,
+        // A web surface is not painted until its engine produces a frame,
+        // which is hundreds of milliseconds after the plugin declares it.
+        web_painted: false,
     });
     if !shown {
         // The launcher was dismissed while the action ran, so the model has no

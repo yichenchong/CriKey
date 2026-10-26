@@ -680,6 +680,9 @@ impl PageBuilder {
             focus_node: self.focus_node,
             redraw_after_ms: self.redraw_after_ms,
             close: self.close,
+            // A display list and a web surface are exclusive, and this
+            // builder is the display-list one.
+            web: None,
         }
     }
 }

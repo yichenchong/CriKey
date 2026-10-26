@@ -58,8 +58,12 @@ fn encode_enum(field: u32, value: i32, out: &mut Vec<u8>) {
 }
 macro_rules! proto_enum {
     ($name:ident, $default:ident, $( $variant:ident = $value:expr ),+ $(,)?) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        // `Default` is the proto3 zero value, which is also the variant an
+        // unrecognised code decodes to: a defaulted enum and one this build
+        // has never heard of are the same thing, and both mean "unspecified".
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
         pub enum $name {
+            #[default]
             $default,
             $( $variant ),+
         }
@@ -176,6 +180,126 @@ proto_enum!(
     Unsupported = 6
 );
 
+// --- web surface (spec 32.x) ---------------------------------------------
+//
+// These codes belong to the launcher/`crikey-web-host` conversation and never
+// reach a plugin. They follow the same rule as every other enum here: a value
+// this build does not know decodes to the unspecified variant rather than
+// failing the frame.
+proto_enum!(WebStorageMode, ModeUnspecified, Ephemeral = 1, Persistent = 2);
+proto_enum!(
+    WebInputCode,
+    KindUnspecified,
+    KeyDown = 1,
+    KeyUp = 2,
+    PointerMove = 3,
+    PointerDown = 4,
+    PointerUp = 5,
+    Scroll = 6,
+    FocusIn = 7,
+    FocusOut = 8
+);
+proto_enum!(WebImeCode, KindUnspecified, Preedit = 1, Commit = 2);
+proto_enum!(
+    WebLoadCode,
+    StateUnspecified,
+    Started = 1,
+    Redirected = 2,
+    Committed = 3,
+    Finished = 4,
+    Failed = 5
+);
+proto_enum!(
+    WebGoneCode,
+    ReasonUnspecified,
+    Closed = 1,
+    MemoryLimit = 2,
+    Crashed = 3,
+    StartupFailed = 4,
+    ProtocolViolation = 5
+);
+
+/// Keyboard modifier bits carried by [`RawInput::modifiers`].
+///
+/// A mask rather than a set of bools because the engine takes a mask, and
+/// because a page reads `getModifierState` for keys the launcher has no
+/// dedicated field for. Meta and the locks are present for the same reason:
+/// Ctrl+Click is not Meta+Click to a web page, and Caps Lock changes what a
+/// keystroke means.
+pub const WEB_MODIFIER_SHIFT: u32 = 1 << 0;
+pub const WEB_MODIFIER_CONTROL: u32 = 1 << 1;
+pub const WEB_MODIFIER_ALT: u32 = 1 << 2;
+pub const WEB_MODIFIER_META: u32 = 1 << 3;
+pub const WEB_MODIFIER_CAPS_LOCK: u32 = 1 << 4;
+pub const WEB_MODIFIER_NUM_LOCK: u32 = 1 << 5;
+
+/// Pointer buttons, in the engine's own numbering.
+///
+/// Not an enum: a mouse with a thumb button is ordinary hardware, and an enum
+/// would decode button 8 to an unspecified 0 and silently drop the press.
+pub const WEB_POINTER_BUTTON_LEFT: u32 = 1;
+pub const WEB_POINTER_BUTTON_MIDDLE: u32 = 2;
+pub const WEB_POINTER_BUTTON_RIGHT: u32 = 3;
+
+/// The most raster one [`WebFrame`] may carry, in bytes.
+///
+/// Deliberately *not* [`crikey_core::MAX_PAGE_IMAGE_BYTES`] and deliberately
+/// not derived from it. Those caps are a plugin-facing contract about what a
+/// display list may draw; a web surface is drawn by an engine the host itself
+/// launched, at the size the host itself asked for, and it needs a whole
+/// surface per frame where a page node needs a thumbnail. Two megabytes is
+/// comfortably above the 696x410 real viewport (1,141,440 bytes) with room
+/// for a larger window, and comfortably below the 8 MiB wire and decode
+/// budget, so a legal frame never encodes into a refusal.
+pub const MAX_WEB_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+/// The longest side of a web frame, in pixels.
+///
+/// Bounds the texture the launcher uploads independently of the byte count,
+/// so a 1x524288 strip is refused on its shape rather than sneaking under
+/// [`MAX_WEB_FRAME_BYTES`].
+pub const MAX_WEB_FRAME_EDGE: u32 = 4096;
+
+/// Why a [`WebFrame`] was refused.
+///
+/// Decoding stays total, as everywhere else in this crate: the bytes are
+/// materialised and *then* judged, so a diagnostic can name the real defect
+/// instead of reporting generic malformedness. A refused frame is not drawn
+/// in whole or in part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebFrameError {
+    /// A dimension is zero or exceeds [`MAX_WEB_FRAME_EDGE`].
+    EdgeOutOfRange { pixel_width: u32, pixel_height: u32 },
+    /// The raster is not exactly `pixel_width * pixel_height * 4` bytes.
+    ByteCountMismatch { expected: usize, actual: usize },
+    /// The raster exceeds [`MAX_WEB_FRAME_BYTES`].
+    TooLarge { bytes: usize },
+}
+
+impl std::fmt::Display for WebFrameError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EdgeOutOfRange {
+                pixel_width,
+                pixel_height,
+            } => write!(
+                out,
+                "the web surface sent a {pixel_width}x{pixel_height} frame, outside the 1 to {MAX_WEB_FRAME_EDGE} pixels a side the host will upload"
+            ),
+            Self::ByteCountMismatch { expected, actual } => write!(
+                out,
+                "the web surface declared a frame of {expected} bytes and sent {actual}"
+            ),
+            Self::TooLarge { bytes } => write!(
+                out,
+                "the web surface sent a {bytes} byte frame, more than the {MAX_WEB_FRAME_BYTES} one frame may carry"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WebFrameError {}
+
 fn unknown(
     input: &[u8],
     start: usize,
@@ -255,7 +379,10 @@ fn finish(mut out: Vec<u8>, unknown: &UnknownFields) -> Vec<u8> {
 // `Eq` stops here: an envelope can now carry page geometry, and IEEE-754
 // equality is not reflexive over NaN. `PartialEq` is what the tests and the
 // round-trip checks actually use.
-#[derive(Debug, Clone, PartialEq)]
+// `Default` is the proto3 zero envelope, matching what every message in this
+// module gets from `impl_simple!`: a producer setting one field should not
+// have to spell out the zeros of the rest.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Envelope {
     pub connection_id: u64,
     pub request_id: u64,
@@ -290,6 +417,17 @@ pub enum Payload {
     LifecycleAck(LifecycleAck),
     PageRequest(PageRequest),
     PageFrame(PageFrame),
+    // Host-to-host web surface traffic. Never sent to or by a plugin.
+    OpenSurface(OpenSurface),
+    RawInput(RawInput),
+    ImeEvent(ImeEvent),
+    Navigate(Navigate),
+    Resize(Resize),
+    CloseSurface(CloseSurface),
+    WebFrame(WebFrame),
+    CaretArea(CaretArea),
+    LoadState(LoadState),
+    Gone(Gone),
 }
 
 impl Payload {
@@ -318,6 +456,16 @@ impl Payload {
             Self::LifecycleAck(_) => "lifecycle_ack",
             Self::PageRequest(_) => "page_request",
             Self::PageFrame(_) => "page_frame",
+            Self::OpenSurface(_) => "open_surface",
+            Self::RawInput(_) => "raw_input",
+            Self::ImeEvent(_) => "ime_event",
+            Self::Navigate(_) => "navigate",
+            Self::Resize(_) => "resize",
+            Self::CloseSurface(_) => "close_surface",
+            Self::WebFrame(_) => "web_frame",
+            Self::CaretArea(_) => "caret_area",
+            Self::LoadState(_) => "load_state",
+            Self::Gone(_) => "gone",
         }
     }
 }
@@ -362,6 +510,16 @@ impl Message for Envelope {
                 Payload::LifecycleAck(value) => put_message(30, value, &mut out),
                 Payload::PageRequest(value) => put_message(31, value, &mut out),
                 Payload::PageFrame(value) => put_message(32, value, &mut out),
+                Payload::OpenSurface(value) => put_message(33, value, &mut out),
+                Payload::RawInput(value) => put_message(34, value, &mut out),
+                Payload::ImeEvent(value) => put_message(35, value, &mut out),
+                Payload::Navigate(value) => put_message(36, value, &mut out),
+                Payload::Resize(value) => put_message(37, value, &mut out),
+                Payload::CloseSurface(value) => put_message(38, value, &mut out),
+                Payload::WebFrame(value) => put_message(39, value, &mut out),
+                Payload::CaretArea(value) => put_message(40, value, &mut out),
+                Payload::LoadState(value) => put_message(41, value, &mut out),
+                Payload::Gone(value) => put_message(42, value, &mut out),
             }
         }
         finish(out, &self.unknown)
@@ -446,6 +604,16 @@ impl DecodeWithBudget for Envelope {
                 30 => value.payload = Some(Payload::LifecycleAck(nested(field, budget)?)),
                 31 => value.payload = Some(Payload::PageRequest(nested(field, budget)?)),
                 32 => value.payload = Some(Payload::PageFrame(nested(field, budget)?)),
+                33 => value.payload = Some(Payload::OpenSurface(nested(field, budget)?)),
+                34 => value.payload = Some(Payload::RawInput(nested(field, budget)?)),
+                35 => value.payload = Some(Payload::ImeEvent(nested(field, budget)?)),
+                36 => value.payload = Some(Payload::Navigate(nested(field, budget)?)),
+                37 => value.payload = Some(Payload::Resize(nested(field, budget)?)),
+                38 => value.payload = Some(Payload::CloseSurface(nested(field, budget)?)),
+                39 => value.payload = Some(Payload::WebFrame(nested(field, budget)?)),
+                40 => value.payload = Some(Payload::CaretArea(nested(field, budget)?)),
+                41 => value.payload = Some(Payload::LoadState(nested(field, budget)?)),
+                42 => value.payload = Some(Payload::Gone(nested(field, budget)?)),
                 _ => unknown(bytes, start, field.end, &mut value.unknown, budget)?,
             }
         }
@@ -476,6 +644,16 @@ macro_rules! impl_simple_impl {
     ($($debug:ident)?; $($eq:ident)?; $type:ident { $( $field_name:ident : $fty:ty = $default:expr ),* $(,)? } repeated $repeated:tt encode($this:ident, $out:ident) { $( $enc:tt )* } decode($value:ident, $field:ident, $budget:ident) { $( $number:literal => $body:expr, )* }) => {
         #[derive($($debug,)? Clone, PartialEq $(, $eq)?)]
         pub struct $type { $( pub $field_name: $fty, )* pub unknown: UnknownFields }
+        // The proto3 zero message: every field at its default and no unknown
+        // bytes. This is what `decode(&[])` produces, so `Default` and an
+        // empty frame agree by construction rather than by convention, and a
+        // producer can fill one field of a wide message without spelling out
+        // the defaults of the rest.
+        impl Default for $type {
+            fn default() -> Self {
+                Self { $( $field_name: $default, )* unknown: UnknownFields::default() }
+            }
+        }
         impl Message for $type {
             fn encode(&self) -> Vec<u8> {
                 let $this = self;
@@ -1032,7 +1210,8 @@ impl_simple!(inexact; PageFrame {
     nodes: Vec<PageNode> = Vec::new(),
     focus_node: u32 = 0,
     redraw_after_ms: u32 = 0,
-    close: bool = false
+    close: bool = false,
+    web: Option<PageWebSurface> = None
 } repeated [3] encode(this, out) {
     if this.generation != 0 { put_varint(1, this.generation, &mut out); }
     if !this.title.is_empty() { put_string(2, &this.title, &mut out); }
@@ -1040,6 +1219,7 @@ impl_simple!(inexact; PageFrame {
     if this.focus_node != 0 { put_varint(4, u64::from(this.focus_node), &mut out); }
     if this.redraw_after_ms != 0 { put_varint(5, u64::from(this.redraw_after_ms), &mut out); }
     if this.close { put_varint(6, 1, &mut out); }
+    if let Some(web) = &this.web { put_message(7, web, &mut out); }
 } decode(value, field, budget) {
     1 => value.generation = decode_field_varint(field)?,
     2 => value.title = decode_string(field, budget)?,
@@ -1047,6 +1227,288 @@ impl_simple!(inexact; PageFrame {
     4 => value.focus_node = decode_u32(field)?,
     5 => value.redraw_after_ms = decode_u32(field)?,
     6 => value.close = decode_field_varint(field)? != 0,
+    7 => value.web = Some(nested(field, budget)?),
+});
+
+// The plugin-facing half of a web surface: an address and a storage choice,
+// and nothing else. Everything the engine actually does crosses between the
+// launcher and `crikey-web-host` in the messages below, where the plugin
+// cannot reach it.
+impl_simple!(PageWebSurface {
+    url: String = String::new(),
+    storage: WebStorageMode = WebStorageMode::ModeUnspecified
+} repeated [] encode(this, out) {
+    if !this.url.is_empty() { put_string(1, &this.url, &mut out); }
+    if this.storage.as_i32() != 0 { encode_enum(2, this.storage.as_i32(), &mut out); }
+} decode(value, field, budget) {
+    1 => value.url = decode_string(field, budget)?,
+    2 => value.storage = WebStorageMode::from_i32(decode_i32(field)?),
+});
+
+// --- web surface messages -------------------------------------------------
+//
+// `surface_id` is field 1 on every one of them. A surface the user has
+// already closed can still have a frame in flight, and routing by id is what
+// lets the launcher drop it instead of painting it over the successor.
+
+impl_simple!(OpenSurface {
+    surface_id: u64 = 0,
+    pixel_width: u32 = 0,
+    pixel_height: u32 = 0,
+    url: String = String::new(),
+    storage_mode: WebStorageMode = WebStorageMode::ModeUnspecified
+} repeated [] encode(this, out) {
+    if this.surface_id != 0 { put_varint(1, this.surface_id, &mut out); }
+    if this.pixel_width != 0 { put_varint(2, u64::from(this.pixel_width), &mut out); }
+    if this.pixel_height != 0 { put_varint(3, u64::from(this.pixel_height), &mut out); }
+    if !this.url.is_empty() { put_string(4, &this.url, &mut out); }
+    if this.storage_mode.as_i32() != 0 { encode_enum(5, this.storage_mode.as_i32(), &mut out); }
+} decode(value, field, budget) {
+    1 => value.surface_id = decode_field_varint(field)?,
+    2 => value.pixel_width = decode_u32(field)?,
+    3 => value.pixel_height = decode_u32(field)?,
+    4 => value.url = decode_string(field, budget)?,
+    5 => value.storage_mode = WebStorageMode::from_i32(decode_i32(field)?),
+});
+
+impl_simple!(inexact; RawInput {
+    surface_id: u64 = 0,
+    kind: WebInputCode = WebInputCode::KindUnspecified,
+    timestamp_ms: u64 = 0,
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+    keysym: u32 = 0,
+    hardware_keycode: u32 = 0,
+    repeat: bool = false,
+    modifiers: u32 = 0,
+    button: u32 = 0,
+    press_count: u32 = 0,
+    delta_x: f32 = 0.0,
+    delta_y: f32 = 0.0,
+    precise: bool = false,
+    stop: bool = false
+} repeated [] encode(this, out) {
+    if this.surface_id != 0 { put_varint(1, this.surface_id, &mut out); }
+    if this.kind.as_i32() != 0 { encode_enum(2, this.kind.as_i32(), &mut out); }
+    if this.timestamp_ms != 0 { put_varint(3, this.timestamp_ms, &mut out); }
+    if this.x != 0.0 { put_f32(4, this.x, &mut out); }
+    if this.y != 0.0 { put_f32(5, this.y, &mut out); }
+    if this.keysym != 0 { put_varint(6, u64::from(this.keysym), &mut out); }
+    if this.hardware_keycode != 0 { put_varint(7, u64::from(this.hardware_keycode), &mut out); }
+    if this.repeat { put_varint(8, 1, &mut out); }
+    if this.modifiers != 0 { put_varint(9, u64::from(this.modifiers), &mut out); }
+    if this.button != 0 { put_varint(10, u64::from(this.button), &mut out); }
+    if this.press_count != 0 { put_varint(11, u64::from(this.press_count), &mut out); }
+    if this.delta_x != 0.0 { put_f32(12, this.delta_x, &mut out); }
+    if this.delta_y != 0.0 { put_f32(13, this.delta_y, &mut out); }
+    if this.precise { put_varint(14, 1, &mut out); }
+    if this.stop { put_varint(15, 1, &mut out); }
+} decode(value, field, budget) {
+    1 => value.surface_id = decode_field_varint(field)?,
+    2 => value.kind = WebInputCode::from_i32(decode_i32(field)?),
+    3 => value.timestamp_ms = decode_field_varint(field)?,
+    4 => value.x = decode_f32(field)?,
+    5 => value.y = decode_f32(field)?,
+    6 => value.keysym = decode_u32(field)?,
+    7 => value.hardware_keycode = decode_u32(field)?,
+    8 => value.repeat = decode_field_varint(field)? != 0,
+    9 => value.modifiers = decode_u32(field)?,
+    10 => value.button = decode_u32(field)?,
+    11 => value.press_count = decode_u32(field)?,
+    12 => value.delta_x = decode_f32(field)?,
+    13 => value.delta_y = decode_f32(field)?,
+    14 => value.precise = decode_field_varint(field)? != 0,
+    15 => value.stop = decode_field_varint(field)? != 0,
+});
+
+// The cursor range is in *characters*, already converted from the UTF-8 byte
+// offsets winit reports. The conversion happens once, launcher-side, before
+// the event is put on the wire: WebKit counts characters, and handing it a
+// byte offset places the caret inside a multi-byte codepoint the moment
+// anyone types anything outside ASCII — which is precisely when an input
+// method is involved.
+impl_simple!(ImeEvent {
+    surface_id: u64 = 0,
+    kind: WebImeCode = WebImeCode::KindUnspecified,
+    text: String = String::new(),
+    cursor_begin_chars: u32 = 0,
+    cursor_end_chars: u32 = 0,
+    has_cursor: bool = false
+} repeated [] encode(this, out) {
+    if this.surface_id != 0 { put_varint(1, this.surface_id, &mut out); }
+    if this.kind.as_i32() != 0 { encode_enum(2, this.kind.as_i32(), &mut out); }
+    if !this.text.is_empty() { put_string(3, &this.text, &mut out); }
+    if this.cursor_begin_chars != 0 { put_varint(4, u64::from(this.cursor_begin_chars), &mut out); }
+    if this.cursor_end_chars != 0 { put_varint(5, u64::from(this.cursor_end_chars), &mut out); }
+    if this.has_cursor { put_varint(6, 1, &mut out); }
+} decode(value, field, budget) {
+    1 => value.surface_id = decode_field_varint(field)?,
+    2 => value.kind = WebImeCode::from_i32(decode_i32(field)?),
+    3 => value.text = decode_string(field, budget)?,
+    4 => value.cursor_begin_chars = decode_u32(field)?,
+    5 => value.cursor_end_chars = decode_u32(field)?,
+    6 => value.has_cursor = decode_field_varint(field)? != 0,
+});
+
+impl_simple!(Navigate {
+    surface_id: u64 = 0,
+    url: String = String::new()
+} repeated [] encode(this, out) {
+    if this.surface_id != 0 { put_varint(1, this.surface_id, &mut out); }
+    if !this.url.is_empty() { put_string(2, &this.url, &mut out); }
+} decode(value, field, budget) {
+    1 => value.surface_id = decode_field_varint(field)?,
+    2 => value.url = decode_string(field, budget)?,
+});
+
+impl_simple!(Resize {
+    surface_id: u64 = 0,
+    pixel_width: u32 = 0,
+    pixel_height: u32 = 0
+} repeated [] encode(this, out) {
+    if this.surface_id != 0 { put_varint(1, this.surface_id, &mut out); }
+    if this.pixel_width != 0 { put_varint(2, u64::from(this.pixel_width), &mut out); }
+    if this.pixel_height != 0 { put_varint(3, u64::from(this.pixel_height), &mut out); }
+} decode(value, field, budget) {
+    1 => value.surface_id = decode_field_varint(field)?,
+    2 => value.pixel_width = decode_u32(field)?,
+    3 => value.pixel_height = decode_u32(field)?,
+});
+
+impl_simple!(CloseSurface {
+    surface_id: u64 = 0,
+    reason: String = String::new()
+} repeated [] encode(this, out) {
+    if this.surface_id != 0 { put_varint(1, this.surface_id, &mut out); }
+    if !this.reason.is_empty() { put_string(2, &this.reason, &mut out); }
+} decode(value, field, budget) {
+    1 => value.surface_id = decode_field_varint(field)?,
+    2 => value.reason = decode_string(field, budget)?,
+});
+
+impl_simple!(WebFrame {
+    surface_id: u64 = 0,
+    generation: u64 = 0,
+    pixel_width: u32 = 0,
+    pixel_height: u32 = 0,
+    rgba8: Vec<u8> = Vec::new()
+} repeated [] encode(this, out) {
+    if this.surface_id != 0 { put_varint(1, this.surface_id, &mut out); }
+    if this.generation != 0 { put_varint(2, this.generation, &mut out); }
+    if this.pixel_width != 0 { put_varint(3, u64::from(this.pixel_width), &mut out); }
+    if this.pixel_height != 0 { put_varint(4, u64::from(this.pixel_height), &mut out); }
+    if !this.rgba8.is_empty() { put_bytes(5, &this.rgba8, &mut out); }
+} decode(value, field, budget) {
+    1 => value.surface_id = decode_field_varint(field)?,
+    2 => value.generation = decode_field_varint(field)?,
+    3 => value.pixel_width = decode_u32(field)?,
+    4 => value.pixel_height = decode_u32(field)?,
+    // Charged against the allocation budget before anything is reserved, so a
+    // frame claiming megapixels cannot outspend the decoder on the way to
+    // `validate`.
+    5 => value.rgba8 = decode_bytes(field, budget)?,
+});
+
+impl WebFrame {
+    /// Refuses a frame whose geometry and bytes do not agree, or that is
+    /// larger than the host will upload.
+    ///
+    /// Checked in this order on purpose. The edge bound comes first because a
+    /// degenerate shape is the one defect the byte count cannot express: a
+    /// 1x524288 strip is exactly `MAX_WEB_FRAME_BYTES` of legal-looking
+    /// pixels. The byte-count agreement comes next, so a truncated frame is
+    /// named as truncated rather than drawn as shifted rows of garbage. The
+    /// size cap comes last, over the *declared* geometry, which is already
+    /// known to match the buffer.
+    pub fn validate(&self) -> Result<(), WebFrameError> {
+        if self.pixel_width == 0
+            || self.pixel_height == 0
+            || self.pixel_width > MAX_WEB_FRAME_EDGE
+            || self.pixel_height > MAX_WEB_FRAME_EDGE
+        {
+            return Err(WebFrameError::EdgeOutOfRange {
+                pixel_width: self.pixel_width,
+                pixel_height: self.pixel_height,
+            });
+        }
+        // Both edges are at most `MAX_WEB_FRAME_EDGE`, so the product and its
+        // quadrupling are far inside `usize` on every platform this builds
+        // for; the widening is what makes that true rather than assumed.
+        let expected = (self.pixel_width as usize) * (self.pixel_height as usize) * 4;
+        if expected != self.rgba8.len() {
+            return Err(WebFrameError::ByteCountMismatch {
+                expected,
+                actual: self.rgba8.len(),
+            });
+        }
+        if expected > MAX_WEB_FRAME_BYTES {
+            return Err(WebFrameError::TooLarge { bytes: expected });
+        }
+        Ok(())
+    }
+}
+
+impl_simple!(inexact; CaretArea {
+    surface_id: u64 = 0,
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+    width: f32 = 0.0,
+    height: f32 = 0.0
+} repeated [] encode(this, out) {
+    if this.surface_id != 0 { put_varint(1, this.surface_id, &mut out); }
+    if this.x != 0.0 { put_f32(2, this.x, &mut out); }
+    if this.y != 0.0 { put_f32(3, this.y, &mut out); }
+    if this.width != 0.0 { put_f32(4, this.width, &mut out); }
+    if this.height != 0.0 { put_f32(5, this.height, &mut out); }
+} decode(value, field, budget) {
+    1 => value.surface_id = decode_field_varint(field)?,
+    2 => value.x = decode_f32(field)?,
+    3 => value.y = decode_f32(field)?,
+    4 => value.width = decode_f32(field)?,
+    5 => value.height = decode_f32(field)?,
+});
+
+impl_simple!(LoadState {
+    surface_id: u64 = 0,
+    state: WebLoadCode = WebLoadCode::StateUnspecified,
+    url: String = String::new(),
+    failure: String = String::new(),
+    can_go_back: bool = false,
+    can_go_forward: bool = false,
+    title: String = String::new()
+} repeated [] encode(this, out) {
+    if this.surface_id != 0 { put_varint(1, this.surface_id, &mut out); }
+    if this.state.as_i32() != 0 { encode_enum(2, this.state.as_i32(), &mut out); }
+    if !this.url.is_empty() { put_string(3, &this.url, &mut out); }
+    if !this.failure.is_empty() { put_string(4, &this.failure, &mut out); }
+    if this.can_go_back { put_varint(5, 1, &mut out); }
+    if this.can_go_forward { put_varint(6, 1, &mut out); }
+    if !this.title.is_empty() { put_string(7, &this.title, &mut out); }
+} decode(value, field, budget) {
+    1 => value.surface_id = decode_field_varint(field)?,
+    2 => value.state = WebLoadCode::from_i32(decode_i32(field)?),
+    3 => value.url = decode_string(field, budget)?,
+    4 => value.failure = decode_string(field, budget)?,
+    5 => value.can_go_back = decode_field_varint(field)? != 0,
+    6 => value.can_go_forward = decode_field_varint(field)? != 0,
+    7 => value.title = decode_string(field, budget)?,
+});
+
+// `reason` is load-bearing rather than decorative: the host paints a panel
+// naming the plugin when its surface was killed for exceeding the memory
+// ceiling, and must not mention memory for an ordinary crash.
+impl_simple!(Gone {
+    surface_id: u64 = 0,
+    reason: WebGoneCode = WebGoneCode::ReasonUnspecified,
+    detail: String = String::new()
+} repeated [] encode(this, out) {
+    if this.surface_id != 0 { put_varint(1, this.surface_id, &mut out); }
+    if this.reason.as_i32() != 0 { encode_enum(2, this.reason.as_i32(), &mut out); }
+    if !this.detail.is_empty() { put_string(3, &this.detail, &mut out); }
+} decode(value, field, budget) {
+    1 => value.surface_id = decode_field_varint(field)?,
+    2 => value.reason = WebGoneCode::from_i32(decode_i32(field)?),
+    3 => value.detail = decode_string(field, budget)?,
 });
 
 impl_simple!(no_debug; ConfigurationChange {

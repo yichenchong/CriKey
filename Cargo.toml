@@ -15,6 +15,7 @@ members = [
     "crates/crikey-native-protocol",
     "crates/crikey-native-host",
     "crates/crikey-python-host",
+    "crates/crikey-web-host",
     # Out-of-process hosts for the two runtimes that must never be loaded into
     # the launcher: a `.wasm` module and a restricted C-ABI shared library each
     # run inside their own supervised executable, which speaks the native
