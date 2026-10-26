@@ -2567,12 +2567,13 @@ plugin health under §24.3.
 
 ### 32.8 Semantics and accessibility
 
-A drawn glyph shall not be treated as an accessible name. Roles, labels, and
-focus order shall be carried by the protocol beside the drawing.
+For a display-list page, a drawn glyph shall not be treated as an accessible
+name. Roles, labels, and focus order shall be carried by the protocol beside
+the drawing.
 
-The focus ring shall be derived from the frame: a node joins it when its role
-is interactive and its node identifier is non-zero, ordered by focus-order
-position and then by list order.
+The display-list focus ring shall be derived from the frame: a node joins it
+when its role is interactive and its node identifier is non-zero, ordered by
+focus-order position and then by list order.
 
 A node's accessible name shall be its label, or its text when the label is
 empty. A node whose role is none shall have no accessible name and shall be
@@ -2582,29 +2583,30 @@ An interactive node with no accessible name shall be reported as a defect of
 that page rather than silently drawn, so that the omission reaches the plugin
 author through `crikey plugin doctor` and developer mode.
 
-Carrying these semantics shall not be described as screen-reader support. The
-semantics are a prerequisite for delivering a page to a platform accessibility
-tree; delivering them is separate work (ADR-0002, ADR-0020).
+Carrying display-list semantics shall not be described as screen-reader
+support. The semantics are a prerequisite for delivering a page to a platform
+accessibility tree; delivering them is separate work (ADR-0002, ADR-0020).
 
 ### 32.9 Keyboard ownership and input
 
 While a page is open the page shall own the keyboard, as the settings surface
 does. Keystrokes shall not be interpreted as launcher query text.
 
-The host shall hit-test pointer events against the frame and shall name the
-node an event landed on, or zero for none. A plugin shall not perform its own
-hit-testing against coordinates the host already resolved.
+For a display-list page, the host shall hit-test pointer events against the
+frame and shall name the node an event landed on, or zero for none. A plugin
+shall not perform its own hit-testing against coordinates the host already
+resolved.
 
-Input events shall be delivered in the order they occurred, batched into the
-next page request, and shall distinguish at least: page opened, pointer moved,
-pointer pressed, pointer released, key pressed, committed text input,
-activation, focus changed, and page closed.
+Display-list input events shall be delivered in the order they occurred,
+batched into the next page request, and shall distinguish at least: page
+opened, pointer moved, pointer pressed, pointer released, key pressed,
+committed text input, activation, focus changed, and page closed.
 
-Committed text only shall be delivered as text input. The host shall resolve
-input-method composition before delivery.
+For display-list text input, committed text only shall be delivered. The host
+shall resolve input-method composition before delivery.
 
-Key names shall be host spellings — for example `Enter`, `ArrowDown`, `A` — so
-that meaning survives version skew between host and SDK.
+Display-list key names shall be host spellings — for example `Enter`,
+`ArrowDown`, `A` — so that meaning survives version skew between host and SDK.
 
 Escape shall be reserved by the host. Escape shall close the page and shall
 never be forwarded to the plugin. A plugin therefore cannot capture the user's
@@ -2657,6 +2659,13 @@ spawned for web surfaces at launcher startup, plugin discovery, activation or
 catalog build. While waiting for the first engine frame, the page shall show
 its in-page loading state; receiving the plugin's web-surface declaration
 shall not count as the engine having painted.
+
+For a web surface, hit-testing, DOM focus and accessibility semantics belong
+to the engine rather than the plugin display-list protocol. The launcher shall
+forward raw pointer, keyboard and IME events to its supervised web host in
+arrival order, preserving hardware keycode, logical keysym, modifiers,
+repeat state and composition boundaries. Escape remains the launcher's key
+under 32.9 and shall never reach the engine.
 
 On Linux the supervised web-host process tree should receive a memory ceiling
 equal to the lesser of 768 MiB and one eighth of physical RAM. An effective
