@@ -76,10 +76,12 @@
 
 use std::sync::Arc;
 
-use crikey_core::{Action, ActionId, Category, ExecutionPolicy, Generation, GenerationTracker, ItemId};
+use crikey_core::{
+    Action, ActionId, Category, ExecutionPolicy, Generation, GenerationTracker, ItemId, PageFrame, PluginId,
+};
 use crikey_ui::{
-    LauncherViewModel, LauncherWindow, ResultRow, SettingControl, SettingRow, UiCommand, UiEffect, ViewModel,
-    PAGE_SIZE,
+    LauncherViewModel, LauncherWindow, PageSurface, ResultRow, SettingControl, SettingRow, UiCommand,
+    UiEffect, ViewModel, PAGE_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -1981,4 +1983,34 @@ fn dismissal_closes_the_settings_surface_but_keeps_the_settings() {
         1,
         "the rows describe the host's configuration, not this session"
     );
+}
+
+/// Spec 32.2 and the web wire contract both say one live surface. The view
+/// model owns a single slot rather than a collection, and opening another page
+/// must replace the old owner before any renderer can observe both.
+#[test]
+fn opening_a_page_replaces_the_only_live_surface() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let _ = model.frame();
+
+    let surface = |plugin: &str, page_id: &str| PageSurface {
+        plugin: PluginId(plugin.to_owned()),
+        page_id: page_id.to_owned(),
+        plugin_name: plugin.to_owned(),
+        frame: Arc::new(PageFrame::default()),
+        stale: true,
+        answered: false,
+        web_painted: false,
+    };
+
+    assert!(model.open_page(surface("modern.first", "first")));
+    assert_eq!(
+        model.page().expect("first page is open").plugin,
+        PluginId("modern.first".to_owned())
+    );
+    assert!(model.open_page(surface("modern.second", "second")));
+    let open = model.page().expect("replacement page is open");
+    assert_eq!(open.plugin, PluginId("modern.second".to_owned()));
+    assert_eq!(open.page_id, "second");
 }

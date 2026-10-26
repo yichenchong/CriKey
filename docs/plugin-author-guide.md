@@ -267,6 +267,26 @@ and if the host closed it instead you get one last request carrying
 `PageInputKind::Closed`, whose frame is discarded, so your state machine always
 has a defined end.
 
+### Web surfaces and text input
+
+A page may use a host-owned web surface instead of a display list; it cannot
+mix the two in one frame. At most one page, and therefore one web surface, is
+live at once. Opening another page closes the previous one first. Web engines
+are created only after the user opens the page and are released on close, so
+do not depend on state surviving an ephemeral surface.
+
+Navigation requires `permissions.network`. Persistent cookies and local
+storage additionally require `permissions.web-storage = true`; network access
+does not grant persistence. `crikey plugin doctor` reports platform
+limitations for a manifest carrying that declaration.
+
+On Linux, WPE surfaces support preedit, committed CJK text, and candidate
+window positioning. They do **not** support IME correction of text that has
+already been committed: the v1 route has no correct delete-surrounding
+operation. Ordinary insertion, composition and backspace within the active
+composition work; reconversion and IME-directed deletion outside it do not.
+Do not make those operations necessary to complete a form.
+
 ### A worked page
 
 A note editor with a heading, a save button, a checkbox, a text field and a
