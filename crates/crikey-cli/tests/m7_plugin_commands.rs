@@ -1014,6 +1014,42 @@ fn doctor_probes_every_work_kind_and_reports_the_resolved_limit_and_refusals() {
     );
 }
 
+/// A persistent web-surface declaration is the one thing `doctor` can see
+/// without running a plugin. The IME limitation must therefore be visible
+/// here, but it is a platform limitation rather than a malformed plugin and
+/// must not turn a healthy manifest red.
+#[test]
+fn doctor_reports_the_web_ime_delete_surrounding_limitation() {
+    let host = Host::new("doctor-web-ime");
+    let modern_root = host.subdir("modern");
+    modern_plugin(
+        &modern_root,
+        "web",
+        "\n[permissions]\nnetwork = true\nweb-storage = true\n",
+    );
+
+    let run = host.run_with(
+        &["plugin", "doctor", "modern.web"],
+        &[("CRIKEY_MODERN_PLUGIN_ROOTS", &modern_root)],
+    );
+    assert_completed(&run, EX_OK);
+    let parsed = parse(&run);
+    let warning = records(&run, &parsed, "warning")
+        .into_iter()
+        .find(|record| record.get("code") == Some("web-ime-delete-surrounding-unavailable"))
+        .unwrap_or_else(|| panic!("the web IME limitation was not reported; {run}"));
+    assert_eq!(warning.field("severity", &run), "warning", "{run}");
+    assert!(
+        warning.field("message", &run).contains("already-committed text"),
+        "{run}"
+    );
+    assert_eq!(
+        field(&summary(&run, &parsed), "verdict", &run),
+        "healthy",
+        "{run}"
+    );
+}
+
 /// A declared zero is the author switching a surface off, not a defect.
 ///
 /// Spec 19.1 keeps "the author said nothing" distinct from "the author wrote 0"

@@ -2629,3 +2629,43 @@ result list with the query state it had before the page opened.
 
 No further page request shall be sent for a closed page, and a frame arriving
 for a closed page shall be discarded.
+
+### 32.11 Web surfaces
+
+A page may carry either the display list of 32.5 or one web-surface
+declaration, never both. The host shall refuse a frame that carries both, a
+web frame that names a display-list focus node, or a web frame that requests a
+plugin-timed redraw. Focus and repaint scheduling inside a web surface belong
+to the engine.
+
+At most one web surface shall be live. This follows the page invariant in
+32.2: before a new page opens, the prior page and its supervised web-host
+process tree shall be closed and released. Frames from a closed surface shall
+be discarded by surface identifier.
+
+A web surface may navigate only to `http` and `https` addresses and requires
+the plugin's `permissions.network` grant. Persistent cookies and local storage
+require the independent `permissions.web-storage` grant; network permission
+does not imply persistence. Ephemeral storage shall be discarded when the
+page closes.
+
+The engine shall start only after the user opens the page. Nothing shall be
+spawned for web surfaces at launcher startup, plugin discovery, activation or
+catalog build. While waiting for the first engine frame, the page shall show
+its in-page loading state; receiving the plugin's web-surface declaration
+shall not count as the engine having painted.
+
+On Linux the supervised web-host process tree should receive a memory ceiling
+equal to the lesser of 768 MiB and one eighth of physical RAM. An effective
+ceiling below 256 MiB shall refuse a web surface rather than start an engine
+expected to exceed it. If CriKey was started outside a delegated systemd user
+session and cannot establish the cgroup-v2 tree limit, diagnostics shall
+report memory enforcement as unavailable; the host shall not claim that the
+ceiling is active.
+
+Composition, committed text and candidate-window positioning shall be
+supported on the Linux WPE route. IME correction of already-committed text is
+not supported in v1 because neither the launcher input API nor the packaged
+WPE route provides a correct delete-surrounding operation. This limitation
+shall be visible in the plugin-author guide and in `crikey plugin doctor` for
+a manifest that declares persistent web storage.

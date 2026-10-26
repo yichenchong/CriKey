@@ -310,21 +310,48 @@ measured throughput - together about 4% of a 16 ms frame. The cost is process
 spawn and per-process memory, and on this generation there is no
 multi-surface-per-process option to trade against it.
 
-What it leaves open is a product question, not a measurement: whether a
-deliberately opened page may cost a few hundred milliseconds and ~100 MiB
-while it is open, given the attribution rule above.
+The measured cost is accepted for a deliberately opened page, subject to a
+host-enforced ceiling. The web host receives the lesser of 768 MiB and one
+eighth of physical RAM. An effective ceiling below 256 MiB is not enough for
+the measured ordinary page, so the host refuses to open a web surface rather
+than start an engine that its own policy is expected to kill.
+
+On Linux this is a cgroup-v2 tree limit, not `RLIMIT_AS`: WebKit is a
+multi-process tree and maps far more virtual address space than it keeps
+resident. Delegation is available when CriKey runs in its normal desktop
+systemd user session. If CriKey was started outside a delegated user session,
+the launcher reports that memory enforcement is unavailable and does not
+pretend the per-surface ceiling is active. It does not refuse the page solely
+for that environmental limitation.
+
+At most one page is open at once (§32.2), therefore at most one web surface is
+live. A new page closes and releases the old one before its surface is opened;
+this is an existing page-lifecycle invariant, not an additional product limit.
 
 Pre-warming is not the answer to the latency half, and is rejected. One
-long-lived surface would convert the spawn cost into a startup cost and cap
-memory at a single process, but only for one page: a launcher cannot pre-warm
-every web surface every installed plugin might declare, and choosing which one
-to warm means guessing which page the user will open. Paying a few hundred
-milliseconds and ~100 MiB at startup for a page nobody opens is worse than
-paying it on open, and it reintroduces exactly the idle cost the attribution
-rule above exists to avoid.
+long-lived surface would convert the spawn cost into a startup cost, but it
+would pay a few hundred milliseconds and the engine's idle memory for a page
+nobody opened. The host starts the web engine when the user opens the page and
+releases the whole supervised process tree on close.
 
-The latency is therefore disclosed rather than hidden. A page that has not yet
-been answered says so on its own sheet, not only in the status line - see
-`PageSurface::answered` and the loading state in `draw_page` - so the wait
-reads as a page opening rather than as a launcher that has stopped
-responding.
+The latency is disclosed rather than hidden. A web page keeps the in-page
+loading indicator until its first engine frame is painted. The plugin's
+`PageFrame.web` declaration is only an answer that says what to open; treating
+it as painted content would clear the indicator and leave a blank sheet for
+the measured 276-533 ms startup interval. See `PageSurface::web_painted` and
+the loading state in `draw_page`.
+
+The accepted Linux IME route supports preedit, commit and candidate-window
+positioning. It deliberately does not claim correction of already-committed
+text: winit exposes no delete-surrounding event and the packaged WPE API did
+not provide a correct substitute. This limitation is documented for authors
+and `crikey plugin doctor` reports it for a manifest whose persistent web
+storage declaration proves that it intends to use a web surface.
+
+Linux distribution builds keep the web host explicit. While the host loop is
+not yet an executable, `build.sh --web-host-binary` is a supplied-host staging
+hook and places that executable beside the other supervised hosts. It does not
+offer a Cargo build mode that could only produce a library and then fail at a
+missing executable. The host-loop change will add the real
+`cargo build -p crikey-web-host --features engine` path. A package without the
+staged host does not claim to contain web-surface support.

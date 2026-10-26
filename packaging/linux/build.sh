@@ -46,7 +46,11 @@
 #   --cabi-host-binary P  The matching `crikey-cabi-host` worker. It must sit
 #                         beside the launcher because the C-ABI provider never
 #                         searches PATH.
-#   --prefix PATH         Install prefix the artefacts are built for.
+#   --web-host-binary P   Package this already-built `crikey-web-host` and
+#                         stage it beside the other supervised hosts. Until the
+#                         real host loop lands, this is deliberately a
+#                         supplied-host staging hook rather than a Cargo mode
+#                         that could only fail to produce an executable.
 #   --python-archive PATH A python-build-standalone archive to bundle as the
 #                         plugin runtime, handed to
 #                         `packaging/stage-python-runtime.sh`. Defaults to
@@ -58,10 +62,8 @@
 #   -h, --help            Print this section and exit.
 #
 # REQUIRED TOOLS, PER TARGET
-#   stage     `cargo`, unless all four executable paths are given.
+#   stage     `cargo`, unless all required executable paths are given.
 #             `desktop-file-validate` (package desktop-file-utils) is used when present and skipped
-#             with a warning when not: it checks the entry, it does not produce
-#             it, so its absence cannot corrupt an artefact.
 #   tarball   `tar` and `gzip`.
 #   deb       `dpkg-deb` (package dpkg). `dpkg-shlibdeps` (package dpkg-dev) is
 #             used when present to compute shared-library dependencies from
@@ -133,6 +135,8 @@ binary=""
 launcher_binary=""
 wasm_host_binary=""
 cabi_host_binary=""
+web_host_binary=""
+with_web_surface="no"
 prefix="/usr"
 python_archive="${CRIKEY_PYTHON_STANDALONE_ARCHIVE:-}"
 output=""
@@ -182,6 +186,17 @@ while (($#)); do
 		;;
 	--launcher-binary=*)
 		launcher_binary="${1#*=}"
+		shift
+		;;
+	--web-host-binary)
+		[[ $# -ge 2 ]] || fail "--web-host-binary needs a value"
+		web_host_binary="$2"
+		with_web_surface="yes"
+		shift 2
+		;;
+	--web-host-binary=*)
+		web_host_binary="${1#*=}"
+		with_web_surface="yes"
 		shift
 		;;
 	--prefix)
@@ -284,9 +299,11 @@ wanted() {
 	[[ ",$targets," == *",all,"* || ",$targets," == *",$target,"* ]]
 }
 
-# The launcher and its three supervised worker executables must share one
-# directory. The WASM and C-ABI providers intentionally do not search PATH:
-# an installed package must carry the exact hosts it is going to supervise.
+# The launcher and its supervised worker executables share one directory. The
+# WASM, C-ABI and web providers intentionally do not search PATH: an installed
+# package must carry the exact hosts it is going to supervise. The web host is
+# optional and, until its real executable exists, can only be supplied as an
+# already-built path.
 resolve_binaries() {
 	local given=0
 	for name in binary launcher_binary wasm_host_binary cabi_host_binary; do
@@ -294,6 +311,12 @@ resolve_binaries() {
 	done
 	if [[ $given -ne 0 && $given -ne 4 ]]; then
 		fail "--binary, --launcher-binary, --wasm-host-binary and --cabi-host-binary must be given together, or omitted so Cargo builds all four"
+	fi
+	if [[ $given -eq 4 && $with_web_surface == yes && -z $web_host_binary ]]; then
+		fail "--web-host-binary is required to stage web-surface support"
+	fi
+	if [[ $given -eq 0 && -n $web_host_binary ]]; then
+		fail "--web-host-binary requires --binary, --launcher-binary, --wasm-host-binary and --cabi-host-binary"
 	fi
 	if [[ $given -eq 0 ]]; then
 		require_tool cargo "Rust toolchain" stage
@@ -319,7 +342,14 @@ resolve_binaries() {
 		[[ -x $path ]] || fail "not executable: $path"
 		printf -v "$name" '%s' "$(cd "$(dirname "$path")" && pwd)/$(basename "$path")"
 	done
-	note "packaging $binary, $launcher_binary, $wasm_host_binary and $cabi_host_binary"
+	if [[ $with_web_surface == yes ]]; then
+		[[ -f $web_host_binary ]] || fail "no such executable: $web_host_binary"
+		[[ -x $web_host_binary ]] || fail "not executable: $web_host_binary"
+		web_host_binary="$(cd "$(dirname "$web_host_binary")" && pwd)/$(basename "$web_host_binary")"
+		note "packaging $binary, $launcher_binary, $wasm_host_binary, $cabi_host_binary and $web_host_binary"
+	else
+		note "packaging $binary, $launcher_binary, $wasm_host_binary and $cabi_host_binary"
+	fi
 }
 
 # The interpreter is a hard runtime requirement, not a nicety: `crikey run`
@@ -401,6 +431,9 @@ stage() {
 	install -Dm644 "$repository_root/LICENSE" "$stage_directory/share/doc/crikey/LICENSE"
 	install -Dm755 "$wasm_host_binary" "$stage_directory/lib/crikey/crikey-wasm-host"
 	install -Dm755 "$cabi_host_binary" "$stage_directory/lib/crikey/crikey-cabi-host"
+	if [[ $with_web_surface == yes ]]; then
+		install -Dm755 "$web_host_binary" "$stage_directory/lib/crikey/crikey-web-host"
+	fi
 	install -Dm644 "$repository_root/NOTICE.md" "$stage_directory/share/doc/crikey/NOTICE.md"
 
 	stage_python_runtime
