@@ -2332,24 +2332,26 @@ The first public compatibility release shall satisfy the following:
 
 ### 32.1 Purpose and scope
 
-A page is a plugin-drawn surface the launcher presents in place of the result
+A page is a plugin-owned surface the launcher presents in place of the result
 list.
 
-A page shall be expressed as a display list: a flat, retained frame of drawing
-nodes that the host draws with its own renderer.
+A page shall use exactly one of two forms:
 
-Executable code shall never cross the plugin boundary for a page. The plugin
-sends drawing commands and semantics; the host performs all rasterization of
-those commands (ADR-0020).
+- A flat, retained display-list frame of drawing nodes that the host draws
+  with its own renderer.
+- A web-surface declaration that the host renders through the separately
+  supervised engine of 32.11.
 
-Pixels shall cross only as a bounded raster attached to a single node, under
-the limits of 32.5. The distinction is the whole of it: a plugin may hand over
-a picture that occupies one node's rectangle, and may not hand over the page.
-A surface-sized framebuffer per frame is what ADR-0020 rejected. The caps of
-32.5 bound what one frame may cost rather than making that shape unreachable —
-tiled rasters can still sum to a full surface — and what distinguishes a page
-from a canvas is that the rest of the frame remains a display list carrying
-roles, labels and a focus order.
+Executable code shall never cross the plugin boundary for a display-list
+page. The plugin sends drawing commands and semantics; the host performs all
+rasterization of those commands (ADR-0020).
+
+Pixels in a display list shall cross only as a bounded raster attached to a
+single node, under the limits of 32.5. A plugin may hand over a picture that
+occupies one node's rectangle, and may not hand over a display-list page as a
+surface-sized framebuffer. The web form is distinct: the plugin declares the
+surface but never sends or receives its pixels or DOM; pixels travel only
+between the host and its supervised web engine under 32.11.
 
 A page shall not learn its position on screen, and shall not draw outside the
 area the host gave it. The host clips.
@@ -2418,7 +2420,7 @@ for a different surface.
 
 ### 32.5 Node vocabulary
 
-A page frame shall consist of:
+A display-list page frame shall consist of:
 
 - A generation.
 - A title.
@@ -2497,7 +2499,7 @@ stack, or otherwise reposition nodes.
 
 ### 32.6 Bounds
 
-A page frame shall be bounded:
+A display-list page frame shall be bounded:
 
 - At most `MAX_PAGE_NODES` (4,096) nodes per frame.
 - At most `MAX_NODE_TEXT_BYTES` (8,192) bytes of text per node.
@@ -2508,12 +2510,13 @@ These bounds exist so that one keypress cannot become an unbounded host layout
 or text-shaping pass, and so that the host's per-frame cost stays predictable
 under §25.1.
 
-A page frame shall additionally remain within the protocol's 8 MiB
+Every plugin page frame shall additionally remain within the protocol's 8 MiB
 `MAX_FRAME_BYTES` cap like any other message (ADR-0004).
 
-A self-scheduled redraw shall be clamped to `MIN_PAGE_REDRAW_MS` (16 ms). A
-page requests its next frame with a delay, and the per-frame caps above bound
-one frame without bounding a rate: at a one millisecond period a page carrying
+A display-list frame's self-scheduled redraw shall be clamped to
+`MIN_PAGE_REDRAW_MS` (16 ms). A page requests its next frame with a delay, and
+the per-frame caps above bound one frame without bounding a rate: at a one
+millisecond period a page carrying
 rasters would demand gigabytes a second of encode, transport and decode. The
 value is one frame at the 60 Hz baseline these budgets are written against,
 and is a floor on the page's own timer rather than a statement about any
@@ -2525,7 +2528,7 @@ a frame answering user input shall not be delayed by this clamp.
 Every page frame arriving from a plugin shall be validated before any other
 component observes it.
 
-A frame shall be refused when:
+A display-list frame shall be refused when:
 
 - It carries more than `MAX_PAGE_NODES` nodes.
 - Any node's text exceeds `MAX_NODE_TEXT_BYTES`.
