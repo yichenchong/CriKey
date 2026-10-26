@@ -1329,6 +1329,33 @@ fn doctor(args: &[String]) -> ExitCode {
                 encode(unhonoured.reason),
             );
         }
+        // Persistent web storage is the one manifest declaration that proves a
+        // plugin intends to open a web surface. The current Linux route
+        // supports composition and ordinary committed text, but neither winit
+        // nor the packaged WPE API gives the host a correct
+        // delete-surrounding bridge. Name the limitation here rather than let
+        // an author discover it as silently wrong reconversion/backspace
+        // behaviour. It is a warning, not a broken manifest.
+        if entry
+            .manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.permissions.web_storage)
+        {
+            println!(
+                "warning={warning_line} plugin={} code=web-ime-delete-surrounding-unavailable \
+                 severity=warning message={} suggestion={}",
+                encode(&entry.plugin.0),
+                encode(
+                    "web surfaces accept composition and committed CJK text, but IME correction \
+                     of already-committed text is unavailable"
+                ),
+                encode(
+                    "do not depend on IME reconversion or delete-surrounding until the host \
+                     reports that capability"
+                ),
+            );
+            warning_line += 1;
+        }
         // A legacy package ships no manifest, so the loop above has nothing to
         // report for it — and "nothing reported" would read as "nothing
         // granted", which is the opposite of the truth. Keypirinha plugins

@@ -53,12 +53,14 @@ contains() {
 	grep -qF -- "$1" <<<"$2"
 }
 
-# The four executables are staged beside each other in a real package. Stand-ins
-# keep this test about layout and packaging without a Cargo build.
+# The five executables are staged beside each other in a web-enabled package.
+# Stand-ins keep this test about layout and packaging without a Cargo or WPE
+# build.
 stand_in="/usr/bin/true"
 launcher_stand_in="/usr/bin/false"
 wasm_host_stand_in="/usr/bin/true"
 cabi_host_stand_in="/usr/bin/false"
+web_host_stand_in="/usr/bin/true"
 
 staging_build() {
 	"$build" \
@@ -66,6 +68,7 @@ staging_build() {
 		--launcher-binary "$launcher_stand_in" \
 		--wasm-host-binary "$wasm_host_stand_in" \
 		--cabi-host-binary "$cabi_host_stand_in" \
+		--web-host-binary "$web_host_stand_in" \
 		"$@"
 }
 
@@ -105,6 +108,8 @@ check "the staged WASM host sits beside the launcher" \
 	test -x "$staged/lib/crikey/crikey-wasm-host"
 check "the staged C-ABI host sits beside the launcher" \
 	test -x "$staged/lib/crikey/crikey-cabi-host"
+check "a web-enabled package stages its supervised web host" \
+	test -x "$staged/lib/crikey/crikey-web-host"
 check "the modern SDK worker sits beside the real executable" \
 	test -f "$staged/lib/crikey/modern-sdk/_crikey_modern_worker.py"
 check "the legacy shim worker sits beside the real executable" \
@@ -245,6 +250,13 @@ refuses "a missing launcher executable is refused rather than shipped without" \
 	--targets stage "$workspace/refused"
 refuses "runtime hosts are required with custom release binaries" \
 	"$build" --binary "$stand_in" --launcher-binary "$launcher_stand_in" \
+	--targets stage "$workspace/refused"
+refuses "a missing supplied web host is refused rather than silently omitted" \
+	"$build" --binary "$stand_in" --launcher-binary "$launcher_stand_in" \
+	--wasm-host-binary "$wasm_host_stand_in" --cabi-host-binary "$cabi_host_stand_in" \
+	--web-host-binary "$workspace/absent" --targets stage "$workspace/refused"
+refuses "a web host cannot be mixed with Cargo-built launcher binaries" \
+	"$build" --web-host-binary "$web_host_stand_in" \
 	--targets stage "$workspace/refused"
 
 mixed_flatpak_preflight() {
