@@ -2863,6 +2863,33 @@ fn resume_primary_thread(process_id: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// The three fields Windows needs for a tree-wide memory ceiling.
+///
+/// Kept as a small value rather than folded into the FFI call because
+/// `JOB_OBJECT_LIMIT_PROCESS_MEMORY` looks plausible while limiting each
+/// process separately. WebKit and any other forking host could then multiply
+/// the declared budget by its child count. The contract is the aggregate
+/// `JOB_OBJECT_LIMIT_JOB_MEMORY` flag and `JobMemoryLimit`, with
+/// `ProcessMemoryLimit` left zero.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+struct WindowsJobMemoryLimit {
+    flag: u32,
+    process_bytes: usize,
+    job_bytes: usize,
+}
+
+#[cfg(any(windows, test))]
+fn windows_job_memory_limit(bytes: u64) -> Result<WindowsJobMemoryLimit, String> {
+    const LIMIT_JOB_MEMORY: u32 = 0x0200;
+    let job_bytes = usize::try_from(bytes).map_err(|_| "memory limit does not fit this target".to_owned())?;
+    Ok(WindowsJobMemoryLimit {
+        flag: LIMIT_JOB_MEMORY,
+        process_bytes: 0,
+        job_bytes,
+    })
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn create_job_for_child(child: &Child, limits: &crate::launch::ResourceLimits) -> Result<OwnedJob, String> {
@@ -2907,7 +2934,7 @@ fn create_job_for_child(child: &Child, limits: &crate::launch::ResourceLimits) -
     const EXTENDED_LIMITS_CLASS: u32 = 9;
     const LIMIT_JOB_TIME: u32 = 0x0004;
     const LIMIT_ACTIVE_PROCESS: u32 = 0x0008;
-    const LIMIT_PROCESS_MEMORY: u32 = 0x0100;
+    const LIMIT_JOB_MEMORY: u32 = 0x0200;
     const LIMIT_KILL_ON_CLOSE: u32 = 0x2000;
     let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
     if job.is_null() {
@@ -2939,14 +2966,17 @@ fn create_job_for_child(child: &Child, limits: &crate::launch::ResourceLimits) -
         peak_job_memory: 0,
     };
     if let Some(bytes) = limits.max_memory_bytes {
-        info.basic.limit_flags |= LIMIT_PROCESS_MEMORY;
-        info.process_memory_limit = match usize::try_from(bytes) {
-            Ok(value) => value,
-            Err(_) => {
+        let memory = match windows_job_memory_limit(bytes) {
+            Ok(memory) => memory,
+            Err(error) => {
                 unsafe { CloseHandle(job) };
-                return Err("memory limit does not fit this target".to_owned());
+                return Err(error);
             }
         };
+        debug_assert_eq!(memory.flag, LIMIT_JOB_MEMORY);
+        info.basic.limit_flags |= memory.flag;
+        info.process_memory_limit = memory.process_bytes;
+        info.job_memory_limit = memory.job_bytes;
     }
     if let Some(processes) = limits.max_processes {
         info.basic.limit_flags |= LIMIT_ACTIVE_PROCESS;
@@ -3107,6 +3137,22 @@ impl ExitKind {
 /// is invisible from an integration test because the fixture plugin is
 /// well-behaved by construction: which execute outcome opens a page, which
 /// page frame the reader will accept at all, and which one is drawable.
+#[cfg(test)]
+mod windows_job_limits {
+    use super::*;
+
+    /// A job-wide ceiling is one budget for the whole process tree. Setting
+    /// the per-process field instead would let a three-process host consume
+    /// three times the declared amount while every process remained legal.
+    #[test]
+    fn memory_limit_is_charged_to_the_job_not_each_process() {
+        let limit = windows_job_memory_limit(768 * 1024 * 1024).expect("the limit fits");
+        assert_eq!(limit.flag, 0x0200, "JOB_OBJECT_LIMIT_JOB_MEMORY");
+        assert_eq!(limit.process_bytes, 0);
+        assert_eq!(limit.job_bytes, 768 * 1024 * 1024);
+    }
+}
+
 #[cfg(test)]
 mod page_protocol {
     use crikey_core::{PageFrame, PageNode};
