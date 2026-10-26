@@ -72,11 +72,29 @@ staging_build() {
 		"$@"
 }
 
+# Release CI normally supplies the four long-standing binaries without a web
+# host. Keep that path successful and prove it does not accidentally inherit a
+# host from a previous web-enabled stage.
+staging_build_without_web() {
+	"$build" \
+		--binary "$stand_in" \
+		--launcher-binary "$launcher_stand_in" \
+		--wasm-host-binary "$wasm_host_stand_in" \
+		--cabi-host-binary "$cabi_host_stand_in" \
+		"$@"
+}
+
 out="$workspace/out"
 build_log="$workspace/build.log"
 staging_build --targets stage,tarball,deb "$out" >"$build_log" 2>&1
 
 staged="$out/stage"
+
+no_web_out="$workspace/no-web-out"
+staging_build_without_web --targets stage "$no_web_out" >"$workspace/no-web-build.log" 2>&1
+check "the normal four-binary release stage still succeeds without a web host" \
+	test -x "$no_web_out/stage/lib/crikey/crikey" \
+	-a ! -e "$no_web_out/stage/lib/crikey/crikey-web-host"
 
 check "the staged tree carries the licence and the attribution notice" \
 	test -f "$staged/share/doc/crikey/LICENSE" -a -f "$staged/share/doc/crikey/NOTICE.md"
