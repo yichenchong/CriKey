@@ -2393,9 +2393,10 @@ A plugin shall never publish a page frame that no request asked for. The host
 shall reject an unsolicited page frame as a protocol violation, as it does any
 other unsolicited response.
 
-A frame may request another frame after a stated delay, in milliseconds, so
-that an animating or polling page does not require user input to advance. A
-delay of zero shall mean the page is static until further input arrives.
+A display-list frame may request another frame after a stated delay, in
+milliseconds, so that an animating or polling page does not require user input
+to advance. A delay of zero shall mean the page is static until further input
+arrives. Web surfaces use engine-driven repaints under 32.11 instead.
 
 The host shall carry the host palette into the request rather than requiring a
 plugin to choose colours, so a theme change does not strand a page's
@@ -2648,11 +2649,24 @@ on a later declaration shall mean “stay on the document's current navigation�
 it shall not reload the page. Other schemes shall be refused during frame
 validation.
 
+This scheme restriction also applies to engine-driven document navigation,
+including redirects and links; it is not a general subresource/network sandbox.
+Repeating the last requested nonempty address is idempotent: it shall not
+reload a live document that has navigated internally.
+
+The Linux host shall block auxiliary browser windows/popups and cancel
+downloads. The web-surface protocol does not authorize download destinations;
+ephemeral website storage alone shall not be described as preventing download
+writes.
+
 At most one web surface shall be live. This follows the page invariant in
-32.2: before a new page opens, the prior page and its supervised web-host
-process tree shall be closed and released. Frames from a closed surface, a
-different surface identifier, or an older surface generation shall be
-discarded.
+32.2: before a new page opens, the prior page shall close and teardown of its
+supervised host shall finish. A dedicated delegated cgroup shall cover the
+whole host process tree, including detached and reparented descendants after
+a host crash. Web startup without that supervision shall be refused rather
+than falling back to process-group signals or procfs discovery. Frames from a
+closed surface, a different surface identifier, or an older surface generation
+shall be discarded.
 
 A web surface with a stated address requires the plugin's
 `permissions.network` grant. Persistent cookies and local storage require the
@@ -2660,6 +2674,11 @@ independent `permissions.web-storage` grant; network permission does not imply
 persistence. Ephemeral storage shall be discarded when the page closes.
 Permission and platform checks shall complete before any engine process is
 spawned.
+
+The current declaration API is exposed by the native/Rust SDK, not the Python
+SDK. Plugin page declarations and the private web-host transport remain
+separate protocols: engine frames, raw web input and IME operations shall not
+be sent through a plugin worker connection.
 
 The Linux implementation shall listen on a private native-protocol endpoint,
 spawn one engine-enabled `crikey-web-host`, and accept that host's connection.
@@ -2681,17 +2700,24 @@ spawned for web surfaces at launcher startup, plugin discovery, activation or
 catalog build. While waiting for the first accepted engine frame, the page
 shall show its in-page loading state; receiving the plugin's web-surface
 declaration or a load-state message shall not count as a painted frame.
-Permission denial, unsupported platform, missing host, spawn/connect/protocol
-failure, engine load failure and unexpected host exit shall close the page with
-a specific diagnostic while leaving the launcher running. Normal replacement
-or dismissal shall release the host without reporting a failure.
+Permission denial, unsupported platform, missing host, unavailable required
+cgroup supervision, spawn/connect/protocol failure, engine load failure and
+unexpected host exit shall close the page with a specific `Page closed: …`
+diagnostic while leaving the launcher running. Normal replacement or dismissal
+shall release the host without reporting a failure.
 
 For a web surface, hit-testing, DOM focus and accessibility semantics belong
 to the engine rather than the plugin display-list protocol. The launcher shall
 forward raw pointer, direct key press and release, focus, resize, IME preedit
-and IME commit events to its supervised web host in arrival order. Keyboard
-events shall preserve the hardware keycode, logical keysym, modifiers and
-repeat state. Tab shall reach the engine; Escape remains the launcher's key
+and IME commit events to its supervised web host in arrival order. The native
+Linux keyboard route shall preserve logical keysyms, available modifier state
+and repeat state, and encode hardware keys as XKB keycodes (evdev code + 8).
+The egui-only fallback shall forward available named keys and actual text/IME,
+not invent unavailable hardware codes or physical key identity.
+The current winit/egui UI exposes Shift, Control, Alt
+and Super but not active Caps Lock or Num Lock modifier state; forwarding
+their logical key events and keyboard-resolved text does not imply lock-state
+preservation. Tab shall reach the engine; Escape remains the launcher's key
 under 32.9 and shall never reach it.
 
 The Linux route shall carry the engine's caret rectangle for candidate-window
@@ -2701,15 +2727,43 @@ is unmeasured, and v1 has no surrounding-text or delete-surrounding operation
 for correction of already-committed text. Both limitations shall be visible in
 the plugin-author guide.
 
-On Linux the launcher shall compute a web-host process-tree memory target equal
-to the lesser of 768 MiB and one eighth of physical RAM, reduced further by an
-inherited finite cgroup limit. An effective value below 256 MiB shall refuse a
-web surface rather than start an engine expected to exceed it. The launcher
-shall attempt enforcement with a delegated cgroup-v2 tree rather than
-`RLIMIT_AS`. When the value cannot be determined or the delegated cgroup cannot
-be created and written, it shall report a warning and continue without the new
-ceiling; documentation and diagnostics shall not describe the limit as
-universally available.
+On Linux the launcher shall compute a web-host process-tree memory ceiling
+equal to the lesser of 768 MiB and one eighth of physical RAM, reduced further
+by the launcher's inherited finite cgroup limits. Those inherited caps shall
+remain binding even when the web host uses a different cgroup parent. An
+effective value below 256 MiB shall refuse a web surface rather than start an
+engine expected to exceed it.
+
+Before executing the web host, the launcher shall search existing eligible
+proper ancestors within its writable delegated cgroup-v2 hierarchy, without leaving
+the discovered cgroup-v2 mount, for a suitable parent whose
+`cgroup.subtree_control` already enables `memory` for children. The parent's
+`cgroup.procs` shall be writable to satisfy the kernel's common-ancestor
+migration permission check. The launcher's own cgroup shall never be selected.
+A candidate parent shall contain no processes unless it is the visible mount
+root; that exception shall not waive the enabled memory controller or any
+private leaf control requirement.
+It shall create a private web-host leaf there, separate from the leaf containing
+the launcher. A writable populated launcher leaf alone shall not be considered
+sufficient, because the kernel's no-internal-process rule prevents enabling the
+memory controller for its children. The launcher shall not move itself or
+unrelated processes, change subtree controller settings, or cross unavailable
+delegation boundaries.
+
+The launcher shall prepare the private leaf's memory controls and `cgroup.kill`,
+and attach the child before host code runs. It shall use that cgroup rather
+than `RLIMIT_AS` to enforce the ceiling and terminate the process tree.
+Preparation shall verify that `memory.max`, `cgroup.procs` and `cgroup.kill` are
+writable, successfully set the memory ceiling, and successfully write
+`cgroup.kill` on the empty private cgroup before execution.
+
+If no suitable writable delegated parent with `memory` already enabled for
+children exists, the ceiling cannot be determined, or the required cgroup
+controls cannot be prepared, web startup shall fail with a specific page-closed
+diagnostic; it shall not warn and continue without supervision. This deliberately
+trades web availability on systems without suitable delegation for enforced
+memory and process-tree controls. Ordinary launcher use and display-list pages
+shall remain usable without web cgroup support.
 
 Linux packages shall make web support explicit. An engine-enabled build shall
 stage `crikey-web-host` beside the other supervised hosts and declare or derive

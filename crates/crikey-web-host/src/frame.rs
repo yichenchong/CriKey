@@ -32,6 +32,10 @@ pub enum FrameError {
     },
     #[error("converted frame is {bytes} bytes, past the {MAX_WEB_FRAME_BYTES} byte frame limit")]
     TooManyBytes { bytes: usize },
+    #[error("exported buffer mapping size overflows for {height} rows of stride {stride}")]
+    MappingSizeOverflow { height: u32, stride: u32 },
+    #[error("the surface has exhausted its frame generation counter")]
+    GenerationExhausted,
 }
 
 /// A reusable conversion buffer and the surface's frame counter.
@@ -68,8 +72,12 @@ impl FrameConverter {
         height: u32,
         stride: u32,
     ) -> Result<WebFrame, FrameError> {
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(FrameError::GenerationExhausted)?;
         self.swap_into(bgra, width, height, stride)?;
-        self.generation += 1;
+        self.generation = generation;
         Ok(WebFrame {
             surface_id,
             generation: self.generation,
@@ -85,9 +93,8 @@ impl FrameConverter {
     /// The protocol takes the pixels by value, so without this the vector is
     /// freed and reallocated on every frame. Callers hand the buffer back
     /// after encoding; a caller that forgets loses only the reuse.
-    pub fn recycle(&mut self, mut rgba: Vec<u8>) {
+    pub fn recycle(&mut self, rgba: Vec<u8>) {
         if rgba.capacity() > self.rgba.capacity() {
-            rgba.clear();
             self.rgba = rgba;
         }
     }
@@ -114,7 +121,10 @@ impl FrameConverter {
         }
         // The last row is only required to hold its pixels, not a whole
         // stride: a mapping sized exactly to the image is legal and common.
-        let required = (height as usize - 1) * stride as usize + row_bytes;
+        let required = (height as usize - 1)
+            .checked_mul(stride as usize)
+            .and_then(|prefix| prefix.checked_add(row_bytes))
+            .ok_or(FrameError::MappingSizeOverflow { height, stride })?;
         if bgra.len() < required {
             return Err(FrameError::Truncated {
                 available: bgra.len(),
@@ -124,7 +134,6 @@ impl FrameConverter {
             });
         }
 
-        self.rgba.clear();
         self.rgba.resize(bytes, 0);
         for (row, destination) in self.rgba.chunks_exact_mut(row_bytes).enumerate() {
             let start = row * stride as usize;
@@ -334,5 +343,57 @@ mod tests {
         converter.recycle(frame.rgba8);
         let next = converter.convert(1, &source, 64, 64, 256).expect("converts");
         assert_eq!(next.rgba8.as_ptr(), address, "the buffer was not reused");
+    }
+
+    #[test]
+    fn recycled_pixels_are_overwritten_without_zeroing_the_allocation() {
+        let mut converter = FrameConverter::new();
+        let frame = converter.convert(1, &[1; 16], 2, 2, 8).unwrap();
+        let address = frame.rgba8.as_ptr();
+        converter.recycle(frame.rgba8);
+        assert_eq!(converter.rgba.len(), 16, "retain initialized pixels for reuse");
+        let next = converter.convert(1, &[2, 3, 4, 5], 1, 1, 4).unwrap();
+        assert_eq!(next.rgba8, [4, 3, 2, 5]);
+        assert_eq!(next.rgba8.as_ptr(), address);
+    }
+
+    #[test]
+    fn maximal_stride_never_wraps_the_required_mapping_size() {
+        let mut converter = FrameConverter::new();
+        let result = converter.convert(1, &[], 1, 3, u32::MAX);
+        if usize::BITS == 32 {
+            assert_eq!(
+                result,
+                Err(FrameError::MappingSizeOverflow {
+                    height: 3,
+                    stride: u32::MAX
+                })
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(FrameError::Truncated {
+                    available: 0,
+                    required: usize::try_from(u64::from(u32::MAX) * 2 + 4).unwrap(),
+                    height: 3,
+                    stride: u32::MAX,
+                })
+            );
+        }
+        assert_eq!(converter.generation(), 0);
+    }
+
+    #[test]
+    fn exhausted_generations_are_rejected_without_wrapping_or_consuming_pixels() {
+        let mut converter = FrameConverter {
+            rgba: vec![7; 4],
+            generation: u64::MAX,
+        };
+        assert_eq!(
+            converter.convert(1, &[1, 2, 3, 4], 1, 1, 4),
+            Err(FrameError::GenerationExhausted)
+        );
+        assert_eq!(converter.generation(), u64::MAX);
+        assert_eq!(converter.rgba, [7; 4]);
     }
 }

@@ -13,8 +13,7 @@
  * loop's attention, and it does so by waking it, never by touching a surface.
  *
  * The numeric codes below deliberately mirror the protocol enums in
- * `crikey_native_protocol::message` so no translation table is needed on the
- * Rust side; `src/engine.rs` asserts the correspondence.
+ * `crikey_native_protocol::message`; keep both declarations in sync.
  */
 #ifndef CK_WEB_SHIM_H
 #define CK_WEB_SHIM_H
@@ -51,8 +50,8 @@ typedef struct ck_web_surface ck_web_surface;
 #define CK_WEB_INIT_NO_SHM     (-2)
 
 /*
- * Callbacks are invoked on the loop thread, never re-entered, and every
- * pointer they receive is borrowed for the duration of the call only.
+ * Callbacks are invoked on the loop thread and may run synchronously inside
+ * any surface entry point. Every pointer is borrowed only for that callback.
  *
  * `frame` in particular is called between `wl_shm_buffer_begin_access` and
  * `wl_shm_buffer_end_access`: the pixels are valid until it returns and
@@ -94,8 +93,6 @@ ck_web_surface *ck_web_surface_new(uint32_t width, uint32_t height, int32_t stor
                                    const char *storage_dir, const ck_web_callbacks *callbacks);
 
 void ck_web_surface_load_uri(ck_web_surface *surface, const char *uri);
-/* Test and diagnostic entry point: loads literal markup with no origin. */
-void ck_web_surface_load_html(ck_web_surface *surface, const char *html);
 void ck_web_surface_resize(ck_web_surface *surface, uint32_t width, uint32_t height);
 
 /* `modifiers`, `button` and `state` are already in libwpe's own encoding;
@@ -109,7 +106,7 @@ void ck_web_surface_pointer_button(ck_web_surface *surface, uint32_t time_ms, in
                                    int32_t y, uint32_t button, uint32_t state,
                                    uint32_t modifiers);
 void ck_web_surface_axis(ck_web_surface *surface, uint32_t time_ms, int32_t x, int32_t y,
-                         double delta_x, double delta_y, uint32_t modifiers);
+                         double delta_x, double delta_y, int32_t precise, uint32_t modifiers);
 void ck_web_surface_focus(ck_web_surface *surface, int32_t focused);
 
 /*
@@ -139,8 +136,8 @@ void ck_web_watch_fd(int32_t fd, void (*ready)(void *user), void *user);
  */
 void ck_web_watch_termination(void (*ready)(void *user), void *user);
 
-/* Runs the loop until `ck_web_quit`; both are called on the loop thread only,
- * except `ck_web_quit`, which is safe from any thread. */
+/* Runs the loop until `ck_web_quit`; both are called on the loop thread only.
+ * A quit requested before run is retained until cleanup/init. */
 void ck_web_run(void);
 void ck_web_quit(void);
 

@@ -30,8 +30,8 @@
 # OPTIONS
 #   --targets LIST        Comma-separated artefacts to produce. One or more of
 #                         `stage`, `tarball`, `deb`, `rpm`, `flatpak`, or
-#                         `all`. Default: `stage,tarball`. Staging always runs
-#                         first, because every other target consumes it.
+#                         `all`. Default: `stage,tarball`. Non-Flatpak targets
+#                         consume a staged tree; Flatpak builds from source.
 #   --binary PATH         Package this already-built `crikey` executable
 #                         instead of invoking Cargo. Use it in CI, where the
 #                         binaries were built and tested in an earlier job.
@@ -50,9 +50,13 @@
 #                         `crikey-web-host`. This requires pkg-config plus WPE
 #                         WebKit, libwpe, WPEBackend-fdo, Wayland and GLib
 #                         development packages. Web support is off by default.
+#                         At runtime web startup also requires writable
+#                         delegated cgroup-v2 memory controls and cgroup.kill;
+#                         without them web pages are refused, not the launcher.
 #   --web-host-binary P   Stage this already-built `crikey-web-host` instead.
 #                         Implies --with-web-surface and must accompany the
 #                         other four supplied executable options.
+#   --prefix PATH         Install prefix the artefacts are built for.
 #   --python-archive PATH A python-build-standalone archive to bundle as the
 #                         plugin runtime, handed to
 #                         `packaging/stage-python-runtime.sh`. Defaults to
@@ -64,9 +68,11 @@
 #   -h, --help            Print this section and exit.
 #
 # REQUIRED TOOLS, PER TARGET
-#   stage     `cargo`, unless all required executable paths are given;
-#             engine builds also require `pkg-config`. `desktop-file-validate`
-#             (package desktop-file-utils) is used when present and skipped
+#   stage     `cargo` and `jq`, unless all required executable paths are given;
+#             engine builds also require `pkg-config` and the WPE development
+#             stack. Web hosts require `ldd` to check runtime libraries.
+#             `desktop-file-validate` (package desktop-file-utils) is used when
+#             present and skipped with a warning otherwise.
 #   tarball   `tar` and `gzip`.
 #   deb       `dpkg-deb` (package dpkg). `dpkg-shlibdeps` (package dpkg-dev) is
 #             used when present to compute shared-library dependencies from
@@ -197,12 +203,13 @@ while (($#)); do
 		shift
 		;;
 	--web-host-binary)
-		[[ $# -ge 2 ]] || fail "--web-host-binary needs a value"
+		[[ $# -ge 2 && -n $2 ]] || fail "--web-host-binary needs a nonempty value"
 		web_host_binary="$2"
 		with_web_surface="yes"
 		shift 2
 		;;
 	--web-host-binary=*)
+		[[ -n ${1#*=} ]] || fail "--web-host-binary needs a nonempty value"
 		web_host_binary="${1#*=}"
 		with_web_surface="yes"
 		shift
@@ -248,6 +255,7 @@ done
 if [[ $targets == ,* || $targets == *, || $targets == *,,* ]]; then
 	fail "--targets contains an empty target; expected a comma-separated list without empty elements"
 fi
+[[ $targets != *$'\n'* ]] || fail "--targets must be a single comma-separated list"
 IFS=',' read -r -a requested_targets <<<"$targets"
 for requested in "${requested_targets[@]}"; do
 	case "$requested" in
@@ -317,9 +325,9 @@ wanted() {
 	return 1
 }
 
-# The launcher and its supervised worker executables share one directory. The
-# WASM, C-ABI and web providers intentionally do not search PATH: an installed
-# package must carry the exact hosts it is going to supervise.
+# The launcher and its supervised worker executables share one directory.
+# WASM and C-ABI providers do not search PATH. Web-host discovery can also use
+# PATH or an override, but a web-enabled package must carry its own host.
 resolve_binaries() {
 	local given=0
 	for name in binary launcher_binary wasm_host_binary cabi_host_binary; do
@@ -339,14 +347,15 @@ resolve_binaries() {
 		local cargo_metadata target_directory
 		if ! cargo_metadata="$(
 			cd "$repository_root" &&
-				cargo metadata --format-version 1 --no-deps
+				cargo metadata --locked --format-version 1 --no-deps
 		)"; then
 			fail "Cargo metadata failed; could not resolve the configured target directory"
 		fi
-		target_directory="$(
-			printf '%s\n' "$cargo_metadata" |
-				sed -n 's/.*"target_directory"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
-		)"
+		if ! target_directory="$(
+			jq -er '.target_directory | select(type == "string" and length > 0)' <<<"$cargo_metadata"
+		)"; then
+			fail "Cargo metadata did not report a valid target_directory"
+		fi
 		[[ -n $target_directory ]] ||
 			fail "Cargo metadata did not report a target_directory"
 		[[ $target_directory == /* ]] ||
@@ -365,7 +374,7 @@ resolve_binaries() {
 		wasm_host_binary="$target_directory/release/crikey-wasm-host"
 		cabi_host_binary="$target_directory/release/crikey-cabi-host"
 		if [[ $with_web_surface == yes ]]; then
-			require_tool pkg-config "pkg-config" stage
+			# The development stack was checked before building any binaries.
 			note "building the engine-enabled crikey-web-host"
 			(
 				cd "$repository_root" &&
@@ -747,6 +756,20 @@ flatpak() {
 # build takes minutes, and discovering afterwards that `rpmbuild` is not
 # installed wastes all of them.
 preflight() {
+	if wanted stage || wanted tarball || wanted deb || wanted rpm; then
+		if [[ -z $binary && -z $launcher_binary && -z $wasm_host_binary && -z $cabi_host_binary ]]; then
+			require_tool cargo "Rust toolchain" stage
+			require_tool jq jq stage
+			if [[ $with_web_surface == yes && -z $web_host_binary ]]; then
+				require_tool pkg-config "pkg-config" stage
+				local dependency
+				for dependency in wpe-webkit-2.0 wpebackend-fdo-1.0 wpe-1.0 wayland-server glib-2.0; do
+					pkg-config --exists "$dependency" ||
+						fail "web-surface build requires the $dependency development package (pkg-config could not find it)"
+				done
+			fi
+		fi
+	fi
 	if wanted tarball; then
 		require_tool tar tar tarball
 		require_tool gzip gzip tarball

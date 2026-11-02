@@ -19,10 +19,10 @@ use egui_wgpu::{wgpu, Renderer, ScreenDescriptor};
 use thiserror::Error;
 use winit::{
     application::ApplicationHandler,
-    dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    keyboard::{Key, ModifiersState, NamedKey},
+    keyboard::{Key, KeyLocation, ModifiersState, NamedKey, NativeKey, NativeKeyCode, PhysicalKey},
     platform::scancode::PhysicalKeyExtScancode,
     window::{Window, WindowId, WindowLevel},
 };
@@ -259,6 +259,9 @@ pub fn create_launcher_context() -> egui::Context {
 /// Text editing and pointer actions are returned as existing [`UiCommand`]
 /// values. This function does not retain a query, selection, or action state;
 /// the supplied [`ViewModel`] remains the sole frame state.
+///
+/// Ordered input and widget effects come from the first egui pass. Extra
+/// layout passes may refine the reported page size, but never replay input.
 pub fn build_launcher_frame(context: &egui::Context, input: RawInput, model: &ViewModel) -> NativeUiFrame {
     build_launcher_frame_with_transparency(context, input, model, false)
 }
@@ -270,12 +273,36 @@ fn build_launcher_frame_with_transparency(
     transparent: bool,
 ) -> NativeUiFrame {
     let mut commands = Vec::new();
+    let mut pass_commands = Vec::new();
+    let mut first_pass = true;
     let output = context.run(input, |context| {
-        // `Context::run` may repeat a pass after a discard request. Preserve
-        // input work from every pass, then collapse identical repeats.
-        draw_launcher(context, model, &mut commands, transparent);
+        pass_commands.clear();
+        draw_launcher(context, model, &mut pass_commands, transparent);
+        if first_pass {
+            // egui 0.29 drains RawInput events into the first pass only.
+            // Preserve that pass's ordered effects, including equal events and
+            // consumed shortcuts, query edits, settings commits and focus.
+            std::mem::swap(&mut commands, &mut pass_commands);
+            first_pass = false;
+        } else {
+            // Further passes refine layout, not user intent. Only the latest
+            // viewport measurement supersedes first-pass work. Keep its slot
+            // before page input, and retain a first-pass-only measurement when
+            // report_page_size's cache suppresses an unchanged later one.
+            for command in pass_commands.drain(..) {
+                if matches!(command, UiCommand::ResizePage { .. }) {
+                    if let Some(resize) = commands
+                        .iter_mut()
+                        .find(|command| matches!(command, UiCommand::ResizePage { .. }))
+                    {
+                        *resize = command;
+                    } else {
+                        commands.push(command);
+                    }
+                }
+            }
+        }
     });
-    commands.dedup();
     NativeUiFrame { output, commands }
 }
 
@@ -895,6 +922,30 @@ impl NativeLauncher {
     }
 }
 
+#[derive(Debug, Default)]
+struct NativeImeState {
+    surface_id: Option<u64>,
+    composing: bool,
+}
+
+impl NativeImeState {
+    fn set_surface(&mut self, surface_id: Option<u64>) -> bool {
+        if self.surface_id == surface_id {
+            return false;
+        }
+        self.surface_id = surface_id;
+        self.composing = false;
+        true
+    }
+
+    fn update(&mut self, ime: &Ime) {
+        self.composing = match ime {
+            Ime::Preedit(text, _) => !text.is_empty(),
+            Ime::Enabled | Ime::Commit(_) | Ime::Disabled => false,
+        };
+    }
+}
+
 struct NativeApplication<F> {
     config: NativeLauncherConfig,
     proxy: Arc<EventProxy>,
@@ -907,12 +958,12 @@ struct NativeApplication<F> {
     modifiers: ModifiersState,
     /// Monotonic origin for engine event timestamps.
     input_started: Instant,
-    /// Last cursor position in egui logical points. Button and wheel events do
-    /// not repeat it, so raw web delivery must retain the preceding move.
-    cursor_position: Option<egui::Pos2>,
-    /// True while an input method is building a character out of several key
-    /// presses. Those presses belong to the composition, not to the launcher.
-    composing: bool,
+    /// Retain physical coordinates so a scale change without another cursor
+    /// move cannot leave button and wheel events in the outgoing coordinate space.
+    cursor_position: Option<PhysicalPosition<f64>>,
+    web_pointer: WebPointerState,
+    /// Composition is scoped to its document, not to the retained window.
+    ime: NativeImeState,
     /// True once the compositor has told us this window holds the keyboard.
     ///
     /// Dismissal on focus loss is gated on this having been observed first: a
@@ -945,7 +996,8 @@ where
             modifiers: ModifiersState::default(),
             input_started: Instant::now(),
             cursor_position: None,
-            composing: false,
+            web_pointer: WebPointerState::default(),
+            ime: NativeImeState::default(),
             focused: false,
             next_repaint: None,
             consecutive_surface_retries: 0,
@@ -981,6 +1033,18 @@ where
             return false;
         };
         self.frame = Some(frame);
+        let surface_id = self.web_surface_id();
+        if self.ime.set_surface(surface_id) {
+            // Composition and pointer ownership cannot survive document
+            // replacement, or an Escape that closes the page. Reset the
+            // platform IME too; the next layout enables the new owner's IME.
+            self.web_pointer.set_surface(surface_id);
+            if let Some(graphics) = self.graphics.as_mut() {
+                graphics.window.set_ime_allowed(false);
+                graphics.egui_state.set_allow_ime(false);
+                clear_web_page_geometry(&graphics.egui_context);
+            }
+        }
         true
     }
 
@@ -1004,8 +1068,9 @@ where
         self.pending_activation = None;
         // Hiding disables the input method, so a half-built character does not
         // survive into the next activation.
-        self.composing = false;
+        self.ime = NativeImeState::default();
         self.cursor_position = None;
+        self.web_pointer.set_surface(None);
         // Unmapping the window makes the compositor hand the keyboard back to
         // whatever had it before, so a `Focused(false)` follows every hide.
         // Forgetting the focus here is what stops that event from being read as
@@ -1101,33 +1166,45 @@ where
             .unwrap_or(u64::MAX)
     }
 
-    fn web_pointer_position(&self) -> Option<(u64, f32, f32)> {
-        let surface_id = self.web_surface_id()?;
-        let position = self.cursor_position?;
-        let rect = web_page_geometry(&self.graphics.as_ref()?.egui_context)?.rect;
-        rect.contains(position)
-            .then_some((surface_id, position.x - rect.min.x, position.y - rect.min.y))
+    fn web_page_rect(&self, surface_id: u64) -> Option<egui::Rect> {
+        let geometry = web_page_geometry(&self.graphics.as_ref()?.egui_context)?;
+        (geometry.surface_id == Some(surface_id)).then_some(geometry.rect)
+    }
+
+    fn web_pixels_per_point(&self) -> f64 {
+        self.graphics
+            .as_ref()
+            .map_or(1.0, |graphics| {
+                graphics.window.scale_factor() * f64::from(graphics.egui_context.zoom_factor())
+            })
+            .max(f64::MIN_POSITIVE)
     }
 
     /// Translates a native event the web document owns and reports whether it
-    /// must be withheld from egui. Pointer events outside the measured page
-    /// remain launcher chrome input.
+    /// must be withheld from egui. A drag that begins inside the document keeps
+    /// its motion and release, even after crossing into launcher chrome.
     fn web_command(&mut self, event: &WindowEvent) -> (Option<UiCommand>, bool) {
         if let WindowEvent::CursorMoved { position, .. } = event {
-            let scale = self
-                .graphics
-                .as_ref()
-                .map_or(1.0, |graphics| graphics.window.scale_factor())
-                .max(f64::MIN_POSITIVE);
-            self.cursor_position = Some(egui::pos2(
-                (position.x / scale) as f32,
-                (position.y / scale) as f32,
-            ));
+            self.cursor_position = Some(*position);
         }
+        if matches!(event, WindowEvent::CursorLeft { .. }) {
+            self.cursor_position = None;
+        }
+        let surface_id = self.web_surface_id();
+        self.web_pointer.set_surface(surface_id);
 
-        let Some(surface_id) = self.web_surface_id() else {
+        let Some(surface_id) = surface_id else {
             return (None, false);
         };
+        if matches!(
+            event,
+            WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
+        ) {
+            let scale = self.web_pixels_per_point();
+            self.web_pointer.position = self
+                .cursor_position
+                .map(|position| web_logical_position(position, scale));
+        }
         let timestamp_ms = self.input_timestamp_ms();
         match event {
             WindowEvent::KeyboardInput {
@@ -1149,8 +1226,12 @@ where
                     true,
                 )
             }
+            WindowEvent::KeyboardInput { .. } => (None, true),
             WindowEvent::CursorMoved { .. } => {
-                let Some((surface_id, x, y)) = self.web_pointer_position() else {
+                let Some(rect) = self.web_page_rect(surface_id) else {
+                    return (None, false);
+                };
+                let Some((x, y)) = self.web_pointer.motion(rect) else {
                     return (None, false);
                 };
                 (
@@ -1161,11 +1242,32 @@ where
                         y,
                         modifiers: native_web_modifiers(self.modifiers),
                     })),
-                    true,
+                    self.web_pointer.captured()
+                        || self
+                            .web_pointer
+                            .position
+                            .is_some_and(|position| rect.contains(position)),
                 )
             }
+            WindowEvent::CursorLeft { .. } => (
+                self.web_pointer.departure().map(|(x, y)| {
+                    UiCommand::WebInput(WebSurfaceInput::PointerMove {
+                        surface_id,
+                        timestamp_ms,
+                        x,
+                        y,
+                        modifiers: native_web_modifiers(self.modifiers),
+                    })
+                }),
+                true,
+            ),
             WindowEvent::MouseInput { state, button, .. } => {
-                let Some((surface_id, x, y)) = self.web_pointer_position() else {
+                let button = native_web_button(*button);
+                let pressed = *state == ElementState::Pressed;
+                let Some((x, y)) = self
+                    .web_page_rect(surface_id)
+                    .and_then(|rect| self.web_pointer.button(rect, button, pressed))
+                else {
                     return (None, false);
                 };
                 (
@@ -1174,8 +1276,8 @@ where
                         timestamp_ms,
                         x,
                         y,
-                        button: native_web_button(*button),
-                        pressed: *state == ElementState::Pressed,
+                        button,
+                        pressed,
                         press_count: 1,
                         modifiers: native_web_modifiers(self.modifiers),
                     })),
@@ -1183,18 +1285,17 @@ where
                 )
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
-                let Some((surface_id, x, y)) = self.web_pointer_position() else {
+                let Some((x, y)) = self
+                    .web_page_rect(surface_id)
+                    .and_then(|rect| self.web_pointer.scroll_position(rect, *phase))
+                else {
                     return (None, false);
                 };
                 let (delta_x, delta_y, precise) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (*x, *y, false),
                     MouseScrollDelta::PixelDelta(delta) => {
-                        let scale = self
-                            .graphics
-                            .as_ref()
-                            .map_or(1.0, |graphics| graphics.window.scale_factor())
-                            .max(f64::MIN_POSITIVE);
-                        ((delta.x / scale) as f32, (delta.y / scale) as f32, true)
+                        let delta = web_logical_position(*delta, self.web_pixels_per_point());
+                        (delta.x, delta.y, true)
                     }
                 };
                 (
@@ -1380,7 +1481,7 @@ where
                     event,
                     is_synthetic: false,
                     ..
-                } if self.active_session.is_some() && !self.composing => {
+                } if self.active_session.is_some() && !self.ime.composing => {
                     translate_keyboard(event, self.modifiers, self.frame.as_ref())
                 }
                 _ => None,
@@ -1390,10 +1491,25 @@ where
             let Some(graphics) = self.graphics.as_mut() else {
                 return;
             };
-            if command.is_none() && !web_consumed {
+            let pointer_position_changed = matches!(
+                &event,
+                WindowEvent::CursorMoved { .. } | WindowEvent::CursorLeft { .. }
+            );
+            if (command.is_none() && !web_consumed) || pointer_position_changed {
+                let previous_events = graphics.egui_state.egui_input_mut().events.len();
                 let response = graphics
                     .egui_state
                     .on_window_event(graphics.window.as_ref(), &event);
+                if web_consumed {
+                    // Keep egui-winit's cursor bookkeeping current so the next
+                    // chrome click has its real position, but do not replay a
+                    // document-owned motion or departure through the fallback.
+                    graphics
+                        .egui_state
+                        .egui_input_mut()
+                        .events
+                        .truncate(previous_events);
+                }
                 if response.repaint && self.active_session.is_some() {
                     graphics.window.request_redraw();
                 }
@@ -1452,12 +1568,7 @@ where
             // Enter commits a composition and Escape abandons one, so while an
             // input method owns the keyboard those keys are its own and must
             // not also run the selected result or close the launcher.
-            WindowEvent::Ime(ime) => {
-                self.composing = match ime {
-                    Ime::Preedit(text, _) => !text.is_empty(),
-                    Ime::Enabled | Ime::Commit(_) | Ime::Disabled => false,
-                };
-            }
+            WindowEvent::Ime(ime) => self.ime.update(&ime),
             WindowEvent::KeyboardInput { .. }
             | WindowEvent::CursorMoved { .. }
             | WindowEvent::MouseInput { .. }
@@ -2125,23 +2236,8 @@ impl GraphicsState {
             .map_or(Duration::MAX, |output| output.repaint_delay);
         self.egui_state
             .handle_platform_output(self.window.as_ref(), platform_output);
-        // egui positions the candidate window for its own text edits through
-        // `platform_output`. A web document owns composition while it is
-        // standing, so its engine-reported caret must win afterwards. Until
-        // the first caret arrives, anchor at the document origin rather than
-        // leaving a stale rectangle from the query field or a prior surface.
-        if let Some(geometry) = web_page_geometry(&self.egui_context) {
-            let caret = geometry
-                .caret
-                .unwrap_or_else(|| egui::Rect::from_min_size(geometry.rect.min, egui::vec2(1.0, 1.0)));
-            self.window.set_ime_cursor_area(
-                LogicalPosition::new(f64::from(caret.min.x), f64::from(caret.min.y)),
-                LogicalSize::new(
-                    f64::from(caret.width().max(1.0)),
-                    f64::from(caret.height().max(1.0)),
-                ),
-            );
-        }
+        // Web pages publish their own IME output during layout, so the same
+        // egui-winit path enables composition and scales their caret geometry.
 
         for (texture_id, image_delta) in &textures_delta.set {
             self.renderer
@@ -2260,6 +2356,8 @@ fn should_dismiss_on_focus_change(focused: bool, active: bool, had_focus: bool) 
     !focused && active && had_focus
 }
 fn native_web_modifiers(modifiers: ModifiersState) -> u32 {
+    // Winit exposes no active CapsLock/NumLock state. Do not guess it by
+    // toggling on keypresses: locks can change while this window is unfocused.
     (u32::from(modifiers.shift_key()) * WEB_MODIFIER_SHIFT)
         | (u32::from(modifiers.control_key()) * WEB_MODIFIER_CONTROL)
         | (u32::from(modifiers.alt_key()) * WEB_MODIFIER_ALT)
@@ -2277,6 +2375,13 @@ fn native_web_button(button: MouseButton) -> u32 {
     }
 }
 
+fn web_logical_position(position: PhysicalPosition<f64>, pixels_per_point: f64) -> egui::Pos2 {
+    egui::pos2(
+        (position.x / pixels_per_point) as f32,
+        (position.y / pixels_per_point) as f32,
+    )
+}
+
 fn web_key_input(
     surface_id: u64,
     timestamp_ms: u64,
@@ -2287,11 +2392,26 @@ fn web_key_input(
         surface_id,
         timestamp_ms,
         pressed: event.state == ElementState::Pressed,
-        keysym: x_keysym(event.logical_key.as_ref()),
-        hardware_keycode: event.physical_key.to_scancode().unwrap_or(0),
+        keysym: x_keysym(event.logical_key.as_ref(), event.location),
+        hardware_keycode: web_hardware_keycode(event.physical_key),
         repeat: event.repeat,
         modifiers: native_web_modifiers(modifiers),
     }
+}
+
+fn web_hardware_keycode(physical_key: PhysicalKey) -> u32 {
+    if matches!(
+        physical_key,
+        PhysicalKey::Unidentified(NativeKeyCode::Unidentified)
+    ) {
+        return 0;
+    }
+    let scancode = physical_key.to_scancode();
+    // Winit subtracts eight from X11/Wayland keycodes; libwpe/WebKit requires
+    // the XKB keycode, not the evdev code (for example KeyA is 38, not 30).
+    #[cfg(target_os = "linux")]
+    let scancode = scancode.and_then(|code| code.checked_add(8));
+    scancode.unwrap_or(0)
 }
 
 fn unicode_keysym(character: char) -> u32 {
@@ -2305,10 +2425,47 @@ fn unicode_keysym(character: char) -> u32 {
 
 /// Best X keysym exposed by winit's logical key.
 ///
-/// Winit intentionally abstracts away the XKB state, so unidentified and
-/// multi-character logical keys have no honest keysym and remain zero. Textual
-/// keys and the named desktop vocabulary WPE consumes are lossless.
-fn x_keysym(key: Key<&str>) -> u32 {
+/// Native XKB keysyms are retained when available. Other backends expose only
+/// logical keys and their location; an unrepresentable key remains zero rather
+/// than fabricating printable text (in particular for dead keys).
+fn x_keysym(key: Key<&str>, location: KeyLocation) -> u32 {
+    if location == KeyLocation::Numpad {
+        match key {
+            Key::Character("0") => return 0xffb0,
+            Key::Character("1") => return 0xffb1,
+            Key::Character("2") => return 0xffb2,
+            Key::Character("3") => return 0xffb3,
+            Key::Character("4") => return 0xffb4,
+            Key::Character("5") => return 0xffb5,
+            Key::Character("6") => return 0xffb6,
+            Key::Character("7") => return 0xffb7,
+            Key::Character("8") => return 0xffb8,
+            Key::Character("9") => return 0xffb9,
+            Key::Character("*") => return 0xffaa,
+            Key::Character("+") => return 0xffab,
+            Key::Character(",") => return 0xffac,
+            Key::Character("-") => return 0xffad,
+            Key::Character(".") => return 0xffae,
+            Key::Character("/") => return 0xffaf,
+            Key::Character("=") => return 0xffbd,
+            Key::Named(NamedKey::Enter) => return 0xff8d,
+            Key::Named(NamedKey::Space) => return 0xff80,
+            Key::Named(NamedKey::Tab) => return 0xff89,
+            Key::Named(NamedKey::Home) => return 0xff95,
+            Key::Named(NamedKey::ArrowLeft) => return 0xff96,
+            Key::Named(NamedKey::ArrowUp) => return 0xff97,
+            Key::Named(NamedKey::ArrowRight) => return 0xff98,
+            Key::Named(NamedKey::ArrowDown) => return 0xff99,
+            Key::Named(NamedKey::PageUp) => return 0xff9a,
+            Key::Named(NamedKey::PageDown) => return 0xff9b,
+            Key::Named(NamedKey::End) => return 0xff9c,
+            Key::Named(NamedKey::Clear) => return 0xff9d,
+            Key::Named(NamedKey::Insert) => return 0xff9e,
+            Key::Named(NamedKey::Delete) => return 0xff9f,
+            _ => {}
+        }
+    }
+    let right = location == KeyLocation::Right;
     match key {
         Key::Character(text) => {
             let mut characters = text.chars();
@@ -2318,14 +2475,24 @@ fn x_keysym(key: Key<&str>) -> u32 {
                 _ => 0,
             }
         }
-        Key::Dead(Some(character)) => unicode_keysym(character),
+        Key::Unidentified(NativeKey::Xkb(keysym)) => keysym,
         Key::Named(named) => match named {
             NamedKey::Backspace => 0xff08,
             NamedKey::Tab => 0xff09,
+            NamedKey::Clear => 0xff0b,
             NamedKey::Enter => 0xff0d,
             NamedKey::Pause => 0xff13,
             NamedKey::ScrollLock => 0xff14,
             NamedKey::Escape => 0xff1b,
+            NamedKey::PrintScreen => 0xff61,
+            NamedKey::ContextMenu => 0xff67,
+            NamedKey::Help => 0xff6a,
+            NamedKey::Cancel => 0xff69,
+            NamedKey::Select => 0xff60,
+            NamedKey::Execute => 0xff62,
+            NamedKey::Find => 0xff68,
+            NamedKey::Undo => 0xff65,
+            NamedKey::Redo => 0xff66,
             NamedKey::Home => 0xff50,
             NamedKey::ArrowLeft => 0xff51,
             NamedKey::ArrowUp => 0xff52,
@@ -2360,16 +2527,59 @@ fn x_keysym(key: Key<&str>) -> u32 {
             NamedKey::F22 => 0xffd3,
             NamedKey::F23 => 0xffd4,
             NamedKey::F24 => 0xffd5,
-            NamedKey::Shift => 0xffe1,
-            NamedKey::Control => 0xffe3,
+            NamedKey::F25 => 0xffd6,
+            NamedKey::F26 => 0xffd7,
+            NamedKey::F27 => 0xffd8,
+            NamedKey::F28 => 0xffd9,
+            NamedKey::F29 => 0xffda,
+            NamedKey::F30 => 0xffdb,
+            NamedKey::F31 => 0xffdc,
+            NamedKey::F32 => 0xffdd,
+            NamedKey::F33 => 0xffde,
+            NamedKey::F34 => 0xffdf,
+            NamedKey::F35 => 0xffe0,
+            NamedKey::Shift => {
+                if right {
+                    0xffe2
+                } else {
+                    0xffe1
+                }
+            }
+            NamedKey::Control => {
+                if right {
+                    0xffe4
+                } else {
+                    0xffe3
+                }
+            }
             NamedKey::CapsLock => 0xffe5,
-            NamedKey::Meta | NamedKey::Super => 0xffeb,
-            NamedKey::Alt => 0xffe9,
+            NamedKey::Meta => {
+                if right {
+                    0xffe8
+                } else {
+                    0xffe7
+                }
+            }
+            NamedKey::Super => {
+                if right {
+                    0xffec
+                } else {
+                    0xffeb
+                }
+            }
+            NamedKey::Alt => {
+                if right {
+                    0xffea
+                } else {
+                    0xffe9
+                }
+            }
+            NamedKey::AltGraph => 0xfe03,
             NamedKey::Delete => 0xffff,
             NamedKey::Space => 0x20,
             _ => 0,
         },
-        Key::Dead(None) | Key::Unidentified(_) => 0,
+        Key::Dead(_) | Key::Unidentified(_) => 0,
     }
 }
 
@@ -2473,7 +2683,9 @@ fn draw_launcher(
     // from the egui frame rather than translated out of the raw key event so
     // that the headless frame builder answers to the shortcut exactly as the
     // window does, and so the query field never also receives the comma.
-    if context.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+    if model.page.as_ref().is_none_or(|page| page.frame.web.is_none())
+        && context.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma))
+    {
         commands.push(UiCommand::OpenSettings);
     }
     // Page rasters and an engine frame belong only to the page that supplied
@@ -2562,6 +2774,7 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
                     .desired_width(f32::INFINITY)
                     .margin(Margin::symmetric(theme::SPACE_3, theme::SPACE_1))
                     .frame(false)
+                    .interactive(model.page.is_none())
                     .lock_focus(true),
             );
             // The query field takes the keyboard back on every frame, which is
@@ -3097,23 +3310,29 @@ pub fn initial_page_viewport(window_width: u32, window_height: u32) -> (u32, u32
 
 /// Tells the host how big the page area actually came out.
 ///
-/// The size is remembered per page in egui's temporary store and reported only
-/// when it changes. Sending it every frame would turn a page that redraws on a
-/// timer into a stream of resize requests, and sending it never would leave
-/// the plugin laying out against whatever the host guessed when it opened the
-/// surface -- which is right only until the first window resize.
+/// Display-list sizes are remembered per page. A web size is remembered for
+/// the admitted engine identity as well: a replacement engine must receive the
+/// measured viewport even when the page id and rectangle have not changed.
+/// Identical repaints do not generate another resize.
 fn report_page_size(ui: &egui::Ui, page: &PageSurface, rect: egui::Rect, commands: &mut Vec<UiCommand>) {
     let width = rect.width().max(0.0).round() as u32;
     let height = rect.height().max(0.0).round() as u32;
     if width == 0 || height == 0 {
         return;
     }
-    let id = egui::Id::new(("crikey-page-size", page.page_id.as_str()));
-    let previous: Option<(u32, u32)> = ui.data(|data| data.get_temp(id));
-    if previous == Some((width, height)) {
+    let web = page.frame.web.is_some();
+    let id = if web {
+        egui::Id::new("crikey-web-page-size")
+    } else {
+        egui::Id::new(("crikey-page-size", page.page_id.as_str()))
+    };
+    let identity = if web { page.web_surface_id } else { None };
+    let measured = (identity, width, height);
+    let previous: Option<(Option<u64>, u32, u32)> = ui.data(|data| data.get_temp(id));
+    if previous == Some(measured) {
         return;
     }
-    ui.data_mut(|data| data.insert_temp(id, (width, height)));
+    ui.data_mut(|data| data.insert_temp(id, measured));
     commands.push(UiCommand::ResizePage { width, height });
 }
 
@@ -3179,7 +3398,23 @@ fn draw_page(ui: &mut egui::Ui, page: &PageSurface, commands: &mut Vec<UiCommand
     // headless builder or a synthetic event. Consuming it here makes those
     // routes close the page too, and the two can never both fire for one
     // keystroke because the native window loop withholds Escape from egui.
-    if page_ui.input_mut(|state| state.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+    if page_ui.input_mut(|state| {
+        let mut close = false;
+        state.events.retain(|event| {
+            if let egui::Event::Key {
+                key: egui::Key::Escape,
+                pressed,
+                ..
+            } = event
+            {
+                close |= *pressed;
+                false
+            } else {
+                true
+            }
+        });
+        close
+    }) {
         commands.push(UiCommand::ClosePage);
     }
 
@@ -3195,6 +3430,22 @@ fn draw_page(ui: &mut egui::Ui, page: &PageSurface, commands: &mut Vec<UiCommand
         // semantics, or node event code below may run.
         page_textures(page_ui.ctx(), &[]);
         remember_web_page_geometry(page_ui.ctx(), page, rect);
+        if page.web_surface_id.is_some_and(|surface_id| surface_id != 0) {
+            if let Some(geometry) = web_page_geometry(page_ui.ctx()) {
+                let caret = geometry
+                    .caret
+                    .unwrap_or_else(|| egui::Rect::from_min_size(rect.min, egui::vec2(1.0, 1.0)));
+                page_ui.ctx().output_mut(|output| {
+                    // egui-winit 0.29 anchors the candidate window at `rect`.
+                    // Publishing only a native cursor rectangle would leave
+                    // IME disabled once the query field surrenders focus.
+                    output.ime = Some(egui::output::IMEOutput {
+                        rect: caret,
+                        cursor_rect: caret,
+                    });
+                });
+            }
+        }
         let frame = page
             .web_frame
             .as_deref()
@@ -3317,7 +3568,12 @@ fn web_texture_id() -> egui::Id {
 /// reuses the handle. A new generation or surface replaces it atomically, so
 /// the old handle drops as soon as no frame can sample it.
 fn web_texture(context: &egui::Context, frame: Option<&WebSurfaceFrame>) -> Option<egui::TextureId> {
-    let Some(frame) = frame.filter(|frame| frame.is_valid()) else {
+    let max_side = context.input(|input| input.max_texture_side);
+    let Some(frame) = frame.filter(|frame| {
+        frame.is_valid()
+            && (frame.pixel_width as usize) <= max_side
+            && (frame.pixel_height as usize) <= max_side
+    }) else {
         release_web_texture(context);
         return None;
     };
@@ -3358,6 +3614,7 @@ fn release_web_texture(context: &egui::Context) {
 
 #[derive(Debug, Clone, Copy)]
 struct WebPageGeometry {
+    surface_id: Option<u64>,
     rect: egui::Rect,
     caret: Option<egui::Rect>,
 }
@@ -3367,11 +3624,19 @@ fn web_page_geometry_id() -> egui::Id {
 }
 
 fn remember_web_page_geometry(context: &egui::Context, page: &PageSurface, rect: egui::Rect) {
-    let caret = page.web_caret_area.map(|(x, y, width, height)| {
-        egui::Rect::from_min_size(rect.min + vec2(x, y), vec2(width.max(0.0), height.max(0.0)))
+    let caret = page.web_caret_area.and_then(|(x, y, width, height)| {
+        let caret = egui::Rect::from_min_size(rect.min + vec2(x, y), vec2(width.max(1.0), height.max(1.0)));
+        (caret.is_finite() && width >= 0.0 && height >= 0.0).then_some(caret)
     });
     context.data_mut(|data| {
-        data.insert_temp(web_page_geometry_id(), WebPageGeometry { rect, caret });
+        data.insert_temp(
+            web_page_geometry_id(),
+            WebPageGeometry {
+                surface_id: page.web_surface_id,
+                rect,
+                caret,
+            },
+        );
     });
 }
 
@@ -3382,10 +3647,12 @@ fn web_page_geometry(context: &egui::Context) -> Option<WebPageGeometry> {
 fn clear_web_page_geometry(context: &egui::Context) {
     context.data_mut(|data| {
         data.remove::<WebPageGeometry>(web_page_geometry_id());
+        data.remove::<Arc<Mutex<WebPointerState>>>(egui::Id::new("crikey-web-pointer"));
     });
 }
 
 fn web_modifiers(modifiers: egui::Modifiers) -> u32 {
+    // Egui, like winit, has no active lock-state information.
     (u32::from(modifiers.shift) * WEB_MODIFIER_SHIFT)
         | (u32::from(modifiers.ctrl) * WEB_MODIFIER_CONTROL)
         | (u32::from(modifiers.alt) * WEB_MODIFIER_ALT)
@@ -3402,87 +3669,262 @@ fn egui_web_button(button: egui::PointerButton) -> u32 {
     }
 }
 
+/// Pointer ownership is shared by the native and egui input routes. Tracking
+/// only hover would lose a document's release when a drag crosses its edge.
+#[derive(Debug, Default)]
+struct WebPointerState {
+    surface_id: Option<u64>,
+    position: Option<egui::Pos2>,
+    hovered: bool,
+    /// Until a real motion re-enters, button/scroll events may carry stale
+    /// inside coordinates. Captured endpoints must remain outside instead.
+    departed: bool,
+    pressed_buttons: Vec<u32>,
+    scrolling: bool,
+}
+
+impl WebPointerState {
+    fn set_surface(&mut self, surface_id: Option<u64>) {
+        if self.surface_id != surface_id {
+            self.surface_id = surface_id;
+            self.pressed_buttons.clear();
+            self.hovered = false;
+            self.scrolling = false;
+        }
+    }
+
+    fn captured(&self) -> bool {
+        !self.pressed_buttons.is_empty()
+    }
+
+    fn local_position(&self, rect: egui::Rect) -> Option<(f32, f32)> {
+        if self.departed {
+            return self.captured().then_some((-1.0, -1.0));
+        }
+        let position = self.position.filter(|position| position.is_finite())?;
+        (rect.contains(position) || self.captured())
+            .then_some((position.x - rect.min.x, position.y - rect.min.y))
+    }
+
+    fn scroll_position(&mut self, rect: egui::Rect, phase: TouchPhase) -> Option<(f32, f32)> {
+        if phase == TouchPhase::Started {
+            self.scrolling = false;
+        }
+        let position = self.local_position(rect).or_else(|| {
+            if self.departed {
+                self.scrolling.then_some((-1.0, -1.0))
+            } else {
+                self.position
+                    .filter(|position| self.scrolling && position.is_finite())
+                    .map(|position| (position.x - rect.min.x, position.y - rect.min.y))
+            }
+        });
+        self.scrolling = match phase {
+            TouchPhase::Started => position.is_some(),
+            TouchPhase::Ended | TouchPhase::Cancelled => false,
+            TouchPhase::Moved => self.scrolling,
+        };
+        position
+    }
+
+    fn motion(&mut self, rect: egui::Rect) -> Option<(f32, f32)> {
+        let position = self.position.filter(|position| position.is_finite())?;
+        self.departed = false;
+        let hovered = rect.contains(position);
+        let deliver = hovered || self.hovered || self.captured();
+        self.hovered = hovered;
+        deliver.then_some((position.x - rect.min.x, position.y - rect.min.y))
+    }
+
+    fn departure(&mut self) -> Option<(f32, f32)> {
+        // There is no leave variant in the engine protocol. Clear hover with
+        // an outside endpoint while retaining button/scroll ownership. The
+        // following release/scroll stop must use that endpoint too, not the
+        // last inside position (which could falsely activate a control).
+        let notify = !self.departed && (self.hovered || self.captured() || self.scrolling);
+        self.departed = true;
+        self.hovered = false;
+        self.position = None;
+        notify.then_some((-1.0, -1.0))
+    }
+
+    fn button(&mut self, rect: egui::Rect, button: u32, pressed: bool) -> Option<(f32, f32)> {
+        if button == 0 {
+            return None;
+        }
+        let position = self.local_position(rect)?;
+        if pressed {
+            if !self.pressed_buttons.contains(&button) {
+                self.pressed_buttons.push(button);
+            }
+        } else {
+            let index = self.pressed_buttons.iter().position(|held| *held == button)?;
+            self.pressed_buttons.swap_remove(index);
+        }
+        Some(position)
+    }
+}
+
 /// Headless-frame input route for web pages.
 ///
 /// The native window path consumes richer winit events before egui sees them,
 /// preserving hardware keycodes, repeat, wheel phase and IME ranges. This
-/// route intentionally covers only the pointer/scroll/IME information a
-/// caller can put in `egui::RawInput`; it keeps the frame builder useful for
-/// deterministic renderer tests without inventing missing raw key metadata.
+/// route preserves the pointer/scroll/IME and named navigation keys available
+/// in `egui::RawInput`; missing hardware metadata remains zero. Printable text
+/// arrives as text, never as a keysym guessed from egui's layout-neutral keys.
 fn web_frame_input(ui: &egui::Ui, page: &PageSurface, rect: egui::Rect, commands: &mut Vec<UiCommand>) {
-    let Some(surface_id) = page.web_surface_id else {
+    let Some(surface_id) = page.web_surface_id.filter(|surface_id| *surface_id != 0) else {
         return;
     };
-    let (events, pointer, modifiers) =
-        ui.input(|state| (state.events.clone(), state.pointer.hover_pos(), state.modifiers));
-    for event in events {
-        match event {
-            egui::Event::PointerMoved(position) if rect.contains(position) => {
-                commands.push(UiCommand::WebInput(WebSurfaceInput::PointerMove {
-                    surface_id,
-                    timestamp_ms: 0,
-                    x: position.x - rect.min.x,
-                    y: position.y - rect.min.y,
-                    modifiers: web_modifiers(modifiers),
-                }));
-            }
-            egui::Event::PointerButton {
-                pos,
-                button,
-                pressed,
-                modifiers,
-            } if rect.contains(pos) => {
-                commands.push(UiCommand::WebInput(WebSurfaceInput::PointerButton {
-                    surface_id,
-                    timestamp_ms: 0,
-                    x: pos.x - rect.min.x,
-                    y: pos.y - rect.min.y,
-                    button: egui_web_button(button),
-                    pressed,
-                    press_count: 1,
-                    modifiers: web_modifiers(modifiers),
-                }));
-            }
-            egui::Event::MouseWheel {
-                unit,
-                delta,
-                modifiers,
-            } => {
-                let Some(position) = pointer.filter(|position| rect.contains(*position)) else {
-                    continue;
-                };
-                commands.push(UiCommand::WebInput(WebSurfaceInput::Scroll {
-                    surface_id,
-                    timestamp_ms: 0,
-                    x: position.x - rect.min.x,
-                    y: position.y - rect.min.y,
-                    delta_x: delta.x,
-                    delta_y: delta.y,
-                    precise: unit == egui::MouseWheelUnit::Point,
-                    modifiers: web_modifiers(modifiers),
-                    stop: false,
-                }));
-            }
-            egui::Event::Ime(egui::ImeEvent::Preedit(text)) => {
-                commands.push(UiCommand::WebIme(WebImeEvent::Preedit {
-                    surface_id,
-                    text,
-                    cursor: None,
-                }));
-            }
-            egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
-                commands.push(UiCommand::WebIme(WebImeEvent::Commit { surface_id, text }));
-            }
-            egui::Event::Ime(egui::ImeEvent::Disabled) => {
-                commands.push(UiCommand::WebIme(WebImeEvent::Preedit {
-                    surface_id,
-                    text: String::new(),
-                    cursor: None,
-                }));
-            }
-            _ => {}
+    let retained: Arc<Mutex<WebPointerState>> = ui.ctx().data_mut(|data| {
+        Arc::clone(
+            data.get_temp_mut_or_default::<Arc<Mutex<WebPointerState>>>(egui::Id::new("crikey-web-pointer")),
+        )
+    });
+    let mut pointer = lock_recover(&retained);
+    pointer.set_surface(Some(surface_id));
+    ui.input(|state| {
+        if pointer.position.is_none() {
+            pointer.position = state.pointer.hover_pos();
         }
-    }
+        let timestamp_ms = (state.time.max(0.0) * 1000.0) as u64;
+        for event in &state.events {
+            match event {
+                egui::Event::PointerMoved(position) => {
+                    pointer.position = Some(*position);
+                    if let Some((x, y)) = pointer.motion(rect) {
+                        commands.push(UiCommand::WebInput(WebSurfaceInput::PointerMove {
+                            surface_id,
+                            timestamp_ms,
+                            x,
+                            y,
+                            modifiers: web_modifiers(state.modifiers),
+                        }));
+                    }
+                }
+                egui::Event::PointerGone => {
+                    if let Some((x, y)) = pointer.departure() {
+                        commands.push(UiCommand::WebInput(WebSurfaceInput::PointerMove {
+                            surface_id,
+                            timestamp_ms,
+                            x,
+                            y,
+                            modifiers: web_modifiers(state.modifiers),
+                        }));
+                    }
+                }
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers,
+                } => {
+                    pointer.position = Some(*pos);
+                    let button = egui_web_button(*button);
+                    if let Some((x, y)) = pointer.button(rect, button, *pressed) {
+                        commands.push(UiCommand::WebInput(WebSurfaceInput::PointerButton {
+                            surface_id,
+                            timestamp_ms,
+                            x,
+                            y,
+                            button,
+                            pressed: *pressed,
+                            press_count: 1,
+                            modifiers: web_modifiers(*modifiers),
+                        }));
+                    }
+                }
+                egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                } => {
+                    let Some((x, y)) = pointer.local_position(rect) else {
+                        continue;
+                    };
+                    let (delta, precise) = match unit {
+                        egui::MouseWheelUnit::Point => (*delta, true),
+                        egui::MouseWheelUnit::Line => (*delta, false),
+                        egui::MouseWheelUnit::Page => (*delta * rect.size(), true),
+                    };
+                    commands.push(UiCommand::WebInput(WebSurfaceInput::Scroll {
+                        surface_id,
+                        timestamp_ms,
+                        x,
+                        y,
+                        delta_x: delta.x,
+                        delta_y: delta.y,
+                        precise,
+                        modifiers: web_modifiers(*modifiers),
+                        stop: false,
+                    }));
+                }
+                egui::Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                    ..
+                } => {
+                    if let Some(keysym) = egui_web_keysym(*key) {
+                        commands.push(UiCommand::WebInput(WebSurfaceInput::Key {
+                            surface_id,
+                            timestamp_ms,
+                            pressed: *pressed,
+                            keysym,
+                            hardware_keycode: 0,
+                            repeat: *repeat,
+                            modifiers: web_modifiers(*modifiers),
+                        }));
+                    }
+                }
+                egui::Event::Text(text) | egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                    commands.push(UiCommand::WebIme(WebImeEvent::Commit {
+                        surface_id,
+                        text: text.clone(),
+                    }));
+                }
+                egui::Event::Ime(egui::ImeEvent::Preedit(text)) => {
+                    commands.push(UiCommand::WebIme(WebImeEvent::Preedit {
+                        surface_id,
+                        text: text.clone(),
+                        cursor: None,
+                    }));
+                }
+                egui::Event::Ime(egui::ImeEvent::Disabled) => {
+                    commands.push(UiCommand::WebIme(WebImeEvent::Preedit {
+                        surface_id,
+                        text: String::new(),
+                        cursor: None,
+                    }));
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+fn egui_web_keysym(key: egui::Key) -> Option<u32> {
+    let named = match key {
+        egui::Key::ArrowDown => NamedKey::ArrowDown,
+        egui::Key::ArrowLeft => NamedKey::ArrowLeft,
+        egui::Key::ArrowRight => NamedKey::ArrowRight,
+        egui::Key::ArrowUp => NamedKey::ArrowUp,
+        egui::Key::Tab => NamedKey::Tab,
+        egui::Key::Backspace => NamedKey::Backspace,
+        egui::Key::Enter => NamedKey::Enter,
+        egui::Key::Insert => NamedKey::Insert,
+        egui::Key::Delete => NamedKey::Delete,
+        egui::Key::Home => NamedKey::Home,
+        egui::Key::End => NamedKey::End,
+        egui::Key::PageUp => NamedKey::PageUp,
+        egui::Key::PageDown => NamedKey::PageDown,
+        _ => {
+            let function = key.name().strip_prefix('F')?.parse::<u32>().ok()?;
+            return (1..=35).contains(&function).then_some(0xffbd + function);
+        }
+    };
+    Some(x_keysym(Key::Named(named), KeyLocation::Standard))
 }
 
 /// The font size a node's text is drawn at.
@@ -5838,5 +6280,206 @@ mod window_geometry_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod web_input_tests {
+    use super::*;
+
+    #[test]
+    fn native_keysyms_preserve_layout_locations_locks_and_raw_xkb_values() {
+        assert_eq!(x_keysym(Key::Character("A"), KeyLocation::Standard), 0x41);
+        assert_eq!(x_keysym(Key::Character("é"), KeyLocation::Standard), 0xe9);
+        assert_eq!(x_keysym(Key::Character("λ"), KeyLocation::Standard), 0x0100_03bb);
+        assert_eq!(
+            x_keysym(Key::Named(NamedKey::CapsLock), KeyLocation::Standard),
+            0xffe5
+        );
+        assert_eq!(
+            x_keysym(Key::Named(NamedKey::NumLock), KeyLocation::Standard),
+            0xff7f
+        );
+        assert_eq!(x_keysym(Key::Named(NamedKey::Shift), KeyLocation::Right), 0xffe2);
+        assert_eq!(
+            x_keysym(Key::Named(NamedKey::Control), KeyLocation::Right),
+            0xffe4
+        );
+        assert_eq!(
+            x_keysym(Key::Named(NamedKey::AltGraph), KeyLocation::Right),
+            0xfe03
+        );
+        assert_eq!(x_keysym(Key::Named(NamedKey::Meta), KeyLocation::Left), 0xffe7);
+        assert_eq!(x_keysym(Key::Named(NamedKey::Super), KeyLocation::Right), 0xffec);
+        assert_eq!(x_keysym(Key::Named(NamedKey::Enter), KeyLocation::Numpad), 0xff8d);
+        assert_eq!(x_keysym(Key::Character("1"), KeyLocation::Numpad), 0xffb1);
+        assert_eq!(x_keysym(Key::Named(NamedKey::End), KeyLocation::Numpad), 0xff9c);
+        assert_eq!(
+            x_keysym(Key::Named(NamedKey::ContextMenu), KeyLocation::Standard),
+            0xff67
+        );
+        assert_eq!(
+            x_keysym(Key::Named(NamedKey::Clear), KeyLocation::Standard),
+            0xff0b
+        );
+        assert_eq!(x_keysym(Key::Named(NamedKey::F35), KeyLocation::Standard), 0xffe0);
+        assert_eq!(
+            x_keysym(
+                Key::Unidentified(NativeKey::Xkb(0x1008_ff12)),
+                KeyLocation::Standard
+            ),
+            0x1008_ff12
+        );
+    }
+
+    #[test]
+    fn dead_keys_do_not_insert_their_spacing_accent_before_an_ime_commit() {
+        assert_eq!(x_keysym(Key::Dead(Some('´')), KeyLocation::Standard), 0);
+        assert_eq!(byte_offset_to_char_index("éλ日", 2), 1);
+        assert_eq!(byte_offset_to_char_index("éλ日", 4), 2);
+        assert_eq!(byte_offset_to_char_index("éλ日", 7), 3);
+    }
+
+    #[test]
+    fn retained_native_coordinates_are_reinterpreted_at_the_current_scale() {
+        let physical = PhysicalPosition::new(240.0, 180.0);
+        assert_eq!(web_logical_position(physical, 1.0), egui::pos2(240.0, 180.0));
+        assert_eq!(web_logical_position(physical, 2.0), egui::pos2(120.0, 90.0));
+        assert_eq!(web_logical_position(physical, 2.5), egui::pos2(96.0, 72.0));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod web_hardware_keycode_tests {
+    use super::*;
+    use winit::keyboard::KeyCode;
+
+    #[test]
+    fn linux_hardware_keycodes_use_wpe_xkb_numbers_not_evdev_scancodes() {
+        assert_eq!(web_hardware_keycode(PhysicalKey::Code(KeyCode::KeyA)), 38);
+        assert_eq!(web_hardware_keycode(PhysicalKey::Code(KeyCode::Escape)), 9);
+        assert_eq!(web_hardware_keycode(PhysicalKey::Code(KeyCode::ShiftRight)), 62);
+        assert_eq!(
+            web_hardware_keycode(PhysicalKey::Unidentified(NativeKeyCode::Xkb(300))),
+            308
+        );
+        assert_eq!(
+            web_hardware_keycode(PhysicalKey::Unidentified(NativeKeyCode::Unidentified)),
+            0
+        );
+        assert_eq!(
+            web_hardware_keycode(PhysicalKey::Unidentified(NativeKeyCode::Xkb(u32::MAX))),
+            0
+        );
+    }
+}
+
+#[cfg(test)]
+mod web_ime_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn replacing_or_closing_a_web_document_retires_its_uncommitted_composition() {
+        let mut ime = NativeImeState::default();
+        assert!(ime.set_surface(Some(41)));
+        ime.update(&Ime::Preedit("é".to_owned(), Some((2, 2))));
+        assert!(ime.composing);
+        assert!(!ime.set_surface(Some(41)));
+        assert!(
+            ime.composing,
+            "a repaint of the same document must retain composition"
+        );
+        assert!(ime.set_surface(Some(42)));
+        assert!(
+            !ime.composing,
+            "the next document must not inherit a marked character"
+        );
+        ime.update(&Ime::Preedit("λ".to_owned(), Some((2, 2))));
+        assert!(ime.set_surface(None));
+        assert!(
+            !ime.composing,
+            "after host Escape, launcher Enter must not remain suppressed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod web_scroll_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn native_cursor_left_clears_hover_but_keeps_release_and_scroll_stop_outside() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 80.0));
+        let mut pointer = WebPointerState::default();
+        pointer.set_surface(Some(41));
+        pointer.position = Some(rect.center());
+        assert!(pointer.motion(rect).is_some());
+        assert_eq!(pointer.departure(), Some((-1.0, -1.0)));
+        assert_eq!(pointer.position, None);
+        assert!(!pointer.hovered);
+        assert_eq!(pointer.departure(), None);
+
+        // Native CursorMoved(inside) -> MouseInput(press) -> CursorLeft ->
+        // MouseInput(release), with no intermediate outside CursorMoved.
+        pointer.position = Some(rect.center());
+        assert!(pointer.motion(rect).is_some());
+        assert!(pointer.button(rect, 1, true).is_some());
+        assert_eq!(pointer.departure(), Some((-1.0, -1.0)));
+        assert_eq!(pointer.position, None);
+        assert!(pointer.captured(), "CursorLeft must not release the held button");
+        assert_eq!(pointer.departure(), None);
+        pointer.position = Some(rect.center());
+        assert_eq!(
+            pointer.button(rect, 1, false),
+            Some((-1.0, -1.0)),
+            "the release cannot activate the control at the old inside endpoint"
+        );
+        assert!(!pointer.captured());
+
+        pointer.position = Some(rect.center());
+        assert!(pointer.motion(rect).is_some());
+        assert!(pointer.scroll_position(rect, TouchPhase::Started).is_some());
+        assert_eq!(pointer.departure(), Some((-1.0, -1.0)));
+        assert_eq!(pointer.position, None);
+        assert!(pointer.scrolling);
+        pointer.position = Some(rect.center());
+        assert_eq!(
+            pointer.scroll_position(rect, TouchPhase::Ended),
+            Some((-1.0, -1.0))
+        );
+        assert!(!pointer.scrolling);
+    }
+
+    #[test]
+    fn a_document_scroll_keeps_its_final_stop_after_the_pointer_leaves() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 80.0));
+        let mut pointer = WebPointerState::default();
+        pointer.set_surface(Some(41));
+        pointer.position = Some(egui::pos2(30.0, 40.0));
+        assert_eq!(
+            pointer.scroll_position(rect, TouchPhase::Started),
+            Some((20.0, 20.0))
+        );
+        pointer.position = Some(egui::pos2(120.0, 110.0));
+        assert_eq!(
+            pointer.scroll_position(rect, TouchPhase::Moved),
+            Some((110.0, 90.0))
+        );
+        assert_eq!(
+            pointer.scroll_position(rect, TouchPhase::Ended),
+            Some((110.0, 90.0))
+        );
+        assert!(
+            pointer.scroll_position(rect, TouchPhase::Moved).is_none(),
+            "a later chrome scroll is not captured"
+        );
+        pointer.position = Some(rect.center());
+        assert!(pointer.scroll_position(rect, TouchPhase::Started).is_some());
+        pointer.set_surface(Some(42));
+        pointer.position = Some(egui::pos2(120.0, 110.0));
+        assert!(
+            pointer.scroll_position(rect, TouchPhase::Cancelled).is_none(),
+            "a replacement cannot inherit the old gesture"
+        );
     }
 }

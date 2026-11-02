@@ -111,6 +111,19 @@ impl ImeBridge {
         }
     }
 
+    /// Ends any live composition before its focused element or document is lost.
+    ///
+    /// Unlike [`Self::flush`], cancellation does not wait for an empty preedit:
+    /// focus loss and navigation can arrive while the input method still has
+    /// nonempty text. It never commits that text into the next focused element.
+    pub fn cancel(&mut self) -> Vec<ImeOp> {
+        if self.composing {
+            self.end_composition()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn end_composition(&mut self) -> Vec<ImeOp> {
         self.composing = false;
         self.clear_deferred = false;
@@ -412,5 +425,35 @@ mod tests {
         assert_eq!(text.len(), 8);
         assert_eq!(char_offset_from_utf8_byte(text, 8), 2);
         assert_eq!(char_offset_from_utf8_byte(text, 4), 1);
+    }
+
+    #[test]
+    fn cancellation_ends_a_nonempty_composition_without_committing() {
+        let mut bridge = ImeBridge::new();
+        bridge.preedit("ni".to_owned(), Some((2, 2)));
+        assert_eq!(
+            bridge.cancel(),
+            vec![set("", 0), ImeOp::PreeditChanged, ImeOp::PreeditFinished]
+        );
+        assert!(!bridge.composing());
+        assert!(bridge.cancel().is_empty());
+        assert!(bridge.flush().is_empty());
+        assert_eq!(
+            bridge.preedit("hao".to_owned(), None),
+            vec![set("hao", 3), ImeOp::PreeditStarted, ImeOp::PreeditChanged]
+        );
+    }
+
+    #[test]
+    fn cancellation_discards_a_deferred_clear_exactly_once() {
+        let mut bridge = ImeBridge::new();
+        bridge.preedit("ni".to_owned(), None);
+        bridge.preedit(String::new(), None);
+        assert_eq!(
+            bridge.cancel(),
+            vec![set("", 0), ImeOp::PreeditChanged, ImeOp::PreeditFinished]
+        );
+        assert!(bridge.flush().is_empty());
+        assert_eq!(bridge.commit("x".to_owned()), vec![ImeOp::Commit("x".to_owned())]);
     }
 }

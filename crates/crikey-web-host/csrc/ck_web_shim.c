@@ -4,8 +4,7 @@
  * Transcribed from harnesses that were run against WPE WebKit 2.52.6 +
  * libwpe 1.16.3 + WPEBackend-fdo 1.16.1 and observed working: the headless SHM
  * export path, the `WebKitInputMethodContext` subclass, and raw input
- * dispatch. Where this file departs from those harnesses it is only to replace
- * a hard-coded test action with a callback into Rust.
+ * dispatch. Lifecycle handling and navigation policy are the host's own.
  */
 #define _GNU_SOURCE
 
@@ -142,6 +141,7 @@ struct ck_web_surface {
     CkIm *im;
     ck_web_callbacks callbacks;
     bool gone_reported;
+    bool load_failed;
 };
 
 static void report_gone(ck_web_surface *surface, int32_t reason, const char *detail)
@@ -163,7 +163,8 @@ static void on_export_shm(void *data, struct wpe_fdo_shm_exported_buffer *buffer
         int width = wl_shm_buffer_get_width(shm);
         int height = wl_shm_buffer_get_height(shm);
         int stride = wl_shm_buffer_get_stride(shm);
-        if (width > 0 && height > 0 && stride >= width * 4) {
+        if (width > 0 && height > 0 && stride > 0 &&
+            (uint64_t)stride >= (uint64_t)width * 4) {
             wl_shm_buffer_begin_access(shm);
             const uint8_t *pixels = wl_shm_buffer_get_data(shm);
             if (pixels)
@@ -172,11 +173,9 @@ static void on_export_shm(void *data, struct wpe_fdo_shm_exported_buffer *buffer
             wl_shm_buffer_end_access(shm);
         }
     }
-    /* Release before frame-complete, and only after the callback has returned:
-     * the borrowed mapping is gone from here on. Frame-complete last is what
-     * paces the engine -- it renders the next frame only once the callback
-     * (which writes the frame to the launcher) has finished, so a slow
-     * launcher throttles rendering instead of accumulating buffers. */
+    /* The borrowed mapping is released only after Rust has copied the pixels.
+     * Frame completion paces rendering; Rust's bounded output queue coalesces
+     * frames independently when the launcher cannot keep up. */
     wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer(surface->exportable,
                                                                         buffer);
     wpe_view_backend_exportable_fdo_dispatch_frame_complete(surface->exportable);
@@ -191,6 +190,10 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
     ck_web_surface *surface = data;
     if (!surface->callbacks.load_state)
         return;
+    if (event == WEBKIT_LOAD_STARTED)
+        surface->load_failed = false;
+    else if (event == WEBKIT_LOAD_FINISHED && surface->load_failed)
+        return; /* WebKit finishes failed loads too; preserve the failure. */
     int32_t state;
     switch (event) {
     case WEBKIT_LOAD_STARTED:    state = CK_WEB_LOAD_STARTED;    break;
@@ -212,6 +215,14 @@ static gboolean on_load_failed(WebKitWebView *view, WebKitLoadEvent event, gchar
 {
     ck_web_surface *surface = data;
     (void)event;
+    /* A replacement navigation cancels the previous one. Reporting that as a
+     * page failure makes an ordinary Navigate kill the surface in the launcher. */
+    if (error &&
+        (g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED) ||
+         g_error_matches(error, WEBKIT_POLICY_ERROR,
+                         WEBKIT_POLICY_ERROR_FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE)))
+        return TRUE;
+    surface->load_failed = true;
     if (surface->callbacks.load_state)
         surface->callbacks.load_state(surface->callbacks.user, CK_WEB_LOAD_FAILED,
                                       uri ? uri : "",
@@ -248,6 +259,49 @@ static void on_close(WebKitWebView *view, gpointer data)
     report_gone((ck_web_surface *)data, CK_WEB_GONE_CLOSED, "page closed itself");
 }
 
+static gboolean on_decide_policy(WebKitWebView *view, WebKitPolicyDecision *decision,
+                                  WebKitPolicyDecisionType type, gpointer data)
+{
+    (void)view;
+    (void)data;
+    if (type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION) {
+        /* One protocol surface owns one view, never an untracked popup. */
+        webkit_policy_decision_ignore(decision);
+        return TRUE;
+    }
+    if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION)
+        return FALSE;
+
+    WebKitNavigationAction *action = webkit_navigation_policy_decision_get_navigation_action(
+        WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+    WebKitURIRequest *request = webkit_navigation_action_get_request(action);
+    const char *uri = webkit_uri_request_get_uri(request);
+    GUri *parsed = uri ? g_uri_parse(uri, G_URI_FLAGS_NONE, NULL) : NULL;
+    const char *scheme = parsed ? g_uri_get_scheme(parsed) : NULL;
+    const char *host = parsed ? g_uri_get_host(parsed) : NULL;
+    bool allowed = scheme && host && *host &&
+        (!g_ascii_strcasecmp(scheme, "http") || !g_ascii_strcasecmp(scheme, "https"));
+    if (parsed)
+        g_uri_unref(parsed);
+    /* Check engine-initiated navigations and redirects as well as protocol
+     * commands. Initial URL validation alone does not protect the user's disk. */
+    if (allowed)
+        webkit_policy_decision_use(decision);
+    else
+        webkit_policy_decision_ignore(decision);
+    return TRUE;
+}
+
+static void on_download_started(WebKitNetworkSession *session, WebKitDownload *download,
+                                 gpointer data)
+{
+    (void)session;
+    (void)data;
+    /* No protocol operation can authorize a file destination. Without this
+     * handler WebKit silently writes attachments to the user's Downloads. */
+    webkit_download_cancel(download);
+}
+
 ck_web_surface *ck_web_surface_new(uint32_t width, uint32_t height, int32_t storage_mode,
                                   const char *storage_dir, const ck_web_callbacks *callbacks)
 {
@@ -279,6 +333,7 @@ ck_web_surface *ck_web_surface_new(uint32_t width, uint32_t height, int32_t stor
     } else {
         surface->session = webkit_network_session_new_ephemeral();
     }
+    g_signal_connect(surface->session, "download-started", G_CALLBACK(on_download_started), NULL);
 
     WebKitWebViewBackend *view_backend =
         webkit_web_view_backend_new(surface->backend,
@@ -299,6 +354,7 @@ ck_web_surface *ck_web_surface_new(uint32_t width, uint32_t height, int32_t stor
     g_signal_connect(surface->view, "web-process-terminated",
                      G_CALLBACK(on_web_process_terminated), surface);
     g_signal_connect(surface->view, "close", G_CALLBACK(on_close), surface);
+    g_signal_connect(surface->view, "decide-policy", G_CALLBACK(on_decide_policy), surface);
 
     /* Without all three the engine treats the view as offscreen and stops
      * producing frames, and an unfocused view routes no key event. */
@@ -315,11 +371,6 @@ void ck_web_surface_load_uri(ck_web_surface *surface, const char *uri)
         webkit_web_view_load_uri(surface->view, uri);
 }
 
-void ck_web_surface_load_html(ck_web_surface *surface, const char *html)
-{
-    if (surface && html)
-        webkit_web_view_load_html(surface->view, html, NULL);
-}
 
 void ck_web_surface_resize(ck_web_surface *surface, uint32_t width, uint32_t height)
 {
@@ -382,10 +433,32 @@ void ck_web_surface_pointer_button(ck_web_surface *surface, uint32_t time_ms, in
 }
 
 void ck_web_surface_axis(ck_web_surface *surface, uint32_t time_ms, int32_t x, int32_t y,
-                         double delta_x, double delta_y, uint32_t modifiers)
+                         double delta_x, double delta_y, int32_t precise, uint32_t modifiers)
 {
     if (!surface)
         return;
+    if (!precise) {
+        /* The legacy 2D discrete path turns a zero orthogonal delta into a
+         * phantom notch. Separate nonzero axes preserve true line-wheel input. */
+        struct wpe_input_axis_event event = {
+            .type = wpe_input_axis_event_type_motion,
+            .time = time_ms,
+            .x = x,
+            .y = y,
+            .modifiers = modifiers,
+        };
+        if (delta_x != 0) {
+            event.axis = 1;
+            event.value = delta_x > 0 ? 1 : -1;
+            wpe_view_backend_dispatch_axis_event(surface->backend, &event);
+        }
+        if (delta_y != 0) {
+            event.axis = 0;
+            event.value = delta_y > 0 ? 1 : -1;
+            wpe_view_backend_dispatch_axis_event(surface->backend, &event);
+        }
+        return;
+    }
     /* The 2D smooth variant, not the discrete one: a touchpad or a
      * high-resolution wheel delivers fractional deltas on both axes at once,
      * and quantising them into discrete clicks here would be information
@@ -487,6 +560,7 @@ void ck_web_surface_destroy(ck_web_surface *surface)
 static GMainLoop *s_loop;
 static guint s_fd_source;
 static guint s_signal_sources[3];
+static bool s_quit_requested;
 
 static void clear_source(guint *source)
 {
@@ -506,6 +580,7 @@ void ck_web_cleanup(void)
         g_main_loop_unref(s_loop);
         s_loop = NULL;
     }
+    s_quit_requested = false;
 }
 
 int32_t ck_web_init(void)
@@ -585,6 +660,9 @@ void ck_web_watch_termination(void (*ready)(void *user), void *user)
 
 void ck_web_run(void)
 {
+    /* g_main_loop_quit before g_main_loop_run is otherwise lost. */
+    if (s_quit_requested)
+        return;
     if (!s_loop)
         s_loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(s_loop);
@@ -592,6 +670,7 @@ void ck_web_run(void)
 
 void ck_web_quit(void)
 {
+    s_quit_requested = true;
     if (s_loop)
         g_main_loop_quit(s_loop);
 }

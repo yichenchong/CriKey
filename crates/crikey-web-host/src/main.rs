@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use crikey_native_protocol::Endpoint;
 #[cfg(target_os = "linux")]
 use crikey_web_host::engine;
+#[cfg(target_os = "linux")]
+use crikey_web_host::state::validate_storage_dir;
 
 #[cfg(not(target_os = "linux"))]
 fn main() -> ExitCode {
@@ -73,8 +75,12 @@ impl Options {
                     let value = value
                         .to_str()
                         .ok_or_else(|| "--endpoint must be valid UTF-8".to_owned())?;
-                    endpoint =
-                        Some(Endpoint::parse(value).map_err(|error| format!("invalid --endpoint: {error}"))?);
+                    let parsed =
+                        Endpoint::parse(value).map_err(|error| format!("invalid --endpoint: {error}"))?;
+                    if !matches!(&parsed, Endpoint::UnixSocket(path) if path.is_absolute()) {
+                        return Err("--endpoint must be an absolute Unix socket path".to_owned());
+                    }
+                    endpoint = Some(parsed);
                 }
                 Some("--storage-dir") => {
                     if storage_dir.is_some() {
@@ -86,7 +92,9 @@ impl Options {
                     if value.is_empty() {
                         return Err("--storage-dir may not be empty".to_owned());
                     }
-                    storage_dir = Some(PathBuf::from(value));
+                    let path = PathBuf::from(value);
+                    validate_storage_dir(&path).map_err(|error| error.to_string())?;
+                    storage_dir = Some(path);
                 }
                 Some("-h") | Some("--help") => {
                     if endpoint.is_some() || storage_dir.is_some() || arguments.next().is_some() {
@@ -114,4 +122,76 @@ fn print_usage() {
          \n\
          Private WPE web-surface worker. It is normally started by the CriKey launcher."
     );
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::PathBuf;
+
+    use crikey_native_protocol::Endpoint;
+
+    use super::{Options, ParseResult};
+
+    fn parse(arguments: &[&str]) -> Result<ParseResult, String> {
+        Options::parse(arguments.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn only_a_private_absolute_unix_endpoint_is_accepted() {
+        for endpoint in ["stdio", "pipe:host", "unix:relative"] {
+            assert!(parse(&["host", "--endpoint", endpoint]).is_err());
+        }
+        let ParseResult::Run(options) = parse(&["host", "--endpoint", "unix:/tmp/host.sock"]).unwrap() else {
+            panic!("expected run options");
+        };
+        assert_eq!(
+            options.endpoint,
+            Endpoint::UnixSocket(PathBuf::from("/tmp/host.sock"))
+        );
+    }
+
+    #[test]
+    fn malformed_and_ambiguous_options_are_usage_errors() {
+        for arguments in [
+            vec!["host"],
+            vec!["host", "--endpoint"],
+            vec!["host", "--endpoint", "unix:/tmp/a", "--endpoint", "unix:/tmp/b"],
+            vec!["host", "--endpoint", "unix:/tmp/a", "--storage-dir"],
+            vec!["host", "--endpoint", "unix:/tmp/a", "--storage-dir", "relative"],
+            vec!["host", "--endpoint", "unix:/tmp/a", "--storage-dir", ""],
+            vec!["host", "--help", "--endpoint", "unix:/tmp/a"],
+            vec!["host", "--endpoint", "unix:/tmp/a", "--help"],
+        ] {
+            assert!(parse(&arguments).is_err(), "{arguments:?}");
+        }
+        assert!(matches!(parse(&["host", "--help"]), Ok(ParseResult::Help)));
+    }
+
+    #[test]
+    fn storage_directory_preserves_non_utf8_paths_but_rejects_nul() {
+        let mut path = b"/tmp/storage-".to_vec();
+        path.push(0xff);
+        let path = OsString::from_vec(path);
+        let ParseResult::Run(options) = Options::parse([
+            OsString::from("host"),
+            OsString::from("--endpoint"),
+            OsString::from("unix:/tmp/a"),
+            OsString::from("--storage-dir"),
+            path.clone(),
+        ])
+        .unwrap() else {
+            panic!("expected run options");
+        };
+        assert_eq!(options.storage_dir, Some(PathBuf::from(path)));
+        assert!(Options::parse([
+            OsString::from("host"),
+            OsString::from("--endpoint"),
+            OsString::from("unix:/tmp/a"),
+            OsString::from("--storage-dir"),
+            OsString::from_vec(b"/tmp/nul\0path".to_vec()),
+        ])
+        .is_err());
+    }
 }

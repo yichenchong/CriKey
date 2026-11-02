@@ -703,36 +703,6 @@ impl PageBuilder {
     }
 }
 
-fn validate_web_url(url: &str) -> crikey_core::Result<()> {
-    if url.is_empty() {
-        return Ok(());
-    }
-    if url.chars().any(char::is_control) {
-        return Err(CoreError::Invalid(
-            "web surface URL must not contain control characters".to_owned(),
-        ));
-    }
-    let Some((scheme, remainder)) = url.split_once(':') else {
-        return Err(CoreError::Invalid(
-            "web surface URL must be an absolute HTTP(S) URL".to_owned(),
-        ));
-    };
-    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-        || !remainder.starts_with("//")
-    {
-        return Err(CoreError::Invalid(
-            "web surface URL must be an absolute HTTP(S) URL".to_owned(),
-        ));
-    }
-    let authority = remainder[2..].split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.is_empty() || authority.chars().any(char::is_whitespace) {
-        return Err(CoreError::Invalid(
-            "web surface URL must have a non-empty authority without whitespace".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 impl WebSurfaceBuilder {
     /// Starts a web frame that navigates to an HTTP(S) address.
     ///
@@ -790,9 +760,6 @@ impl WebSurfaceBuilder {
         frame
             .validate()
             .map_err(|error| CoreError::Invalid(error.to_string()))?;
-        if let Some(web) = &frame.web {
-            validate_web_url(&web.url)?;
-        }
         Ok(frame)
     }
 }

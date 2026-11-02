@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use crikey_core::{
     Generation, ItemId, NodeRole, NodeShape, PageColor, PageFrame, PageImage, PageInput, PageInputKind,
@@ -8,7 +14,8 @@ use crikey_platform::IconImage;
 use crikey_ui::{
     build_launcher_frame, create_launcher_context, egui, ActivationLatencyTracker, NativeLauncher,
     NativeLauncherConfig, NativeLauncherHandle, PageSurface, RendererError, ResultRow, SettingControl,
-    SettingRow, UiCommand, ViewModel, WebSurfaceFrame, ACTIVATION_SAMPLE_CAPACITY,
+    SettingRow, UiCommand, ViewModel, WebImeEvent, WebSurfaceFrame, WebSurfaceInput,
+    ACTIVATION_SAMPLE_CAPACITY, WEB_MODIFIER_SHIFT,
 };
 
 fn model(query: &str) -> ViewModel {
@@ -394,6 +401,52 @@ fn launcher_input(events: Vec<egui::Event>) -> egui::RawInput {
     }
 }
 
+fn force_three_layout_passes(context: &egui::Context, change_geometry: bool) {
+    context.options_mut(|options| options.max_passes = 3.try_into().expect("three passes are nonzero"));
+    let passes = AtomicUsize::new(0);
+    context.on_begin_pass(
+        "native-renderer multipass regression",
+        Arc::new(move |context| {
+            let pass = passes.fetch_add(1, Ordering::Relaxed);
+            if change_geometry && (1..=2).contains(&pass) {
+                egui::TopBottomPanel::top("regression-layout")
+                    .exact_height(30.0 * pass as f32)
+                    .show(context, |ui| {
+                        ui.label("Layout refined");
+                    });
+            }
+        }),
+    );
+    let completed = AtomicUsize::new(0);
+    context.on_end_pass(
+        "native-renderer discard regression",
+        Arc::new(move |context| {
+            if completed.fetch_add(1, Ordering::Relaxed) < 2 {
+                context.request_discard("exercise first-pass input and final-pass geometry");
+            }
+        }),
+    );
+}
+
+#[test]
+fn query_edits_survive_layout_passes_without_being_replayed() {
+    let context = create_launcher_context();
+    let view = model("");
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    force_three_layout_passes(&context, false);
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            egui::Event::Text("a".to_owned()),
+            egui::Event::Text("a".to_owned()),
+        ]),
+        &view,
+    );
+    assert_eq!(frame.output.platform_output.num_completed_passes, 3);
+    assert_eq!(frame.commands, vec![UiCommand::SetQuery("aa".to_owned())]);
+}
+
 fn painted(frame: &crikey_ui::NativeUiFrame, needle: &str) -> bool {
     frame
         .output
@@ -615,9 +668,11 @@ fn ctrl_comma_asks_for_the_settings_surface() {
         modifiers: egui::Modifiers::COMMAND,
     }];
 
+    force_three_layout_passes(&context, false);
     let frame = build_launcher_frame(&context, launcher_input(shortcut), &model(""));
 
-    assert!(frame.commands.contains(&UiCommand::OpenSettings));
+    assert_eq!(frame.output.platform_output.num_completed_passes, 3);
+    assert_eq!(frame.commands, vec![UiCommand::OpenSettings]);
 }
 
 #[test]
@@ -776,7 +831,18 @@ fn the_settings_surface_lists_the_activation_hotkey_and_commits_an_edit() {
             modifiers: egui::Modifiers::NONE,
         },
     ];
+    force_three_layout_passes(&context, false);
     let committed = build_launcher_frame(&context, launcher_input(typed), &view);
+    assert_eq!(committed.output.platform_output.num_completed_passes, 3);
+    assert_eq!(
+        committed
+            .commands
+            .iter()
+            .filter(|command| matches!(command, UiCommand::SetSetting { .. }))
+            .count(),
+        1,
+        "a first-pass settings commit is neither lost nor repeated"
+    );
 
     let edit = committed
         .commands
@@ -1684,6 +1750,41 @@ fn typed_text_reaches_a_page_text_field_and_is_swallowed_by_a_button() {
     );
 }
 
+#[test]
+fn display_list_input_and_initial_focus_survive_layout_passes_exactly_once() {
+    let context = create_launcher_context();
+    let view = page_view(vec![page_control(NodeRole::TextField, 1, 0.0, 0.0, 120.0, 24.0)]);
+    force_three_layout_passes(&context, true);
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            egui::Event::Text("a".to_owned()),
+            egui::Event::Text("a".to_owned()),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+        ]),
+        &view,
+    );
+    assert_eq!(frame.output.platform_output.num_completed_passes, 3);
+    let focus = events_of_kind(&frame, PageInputKind::FocusChanged);
+    assert_eq!(focus.len(), 1, "first-pass focus must reach the plugin once");
+    assert_eq!(focus[0].node_id, 1);
+    let text = events_of_kind(&frame, PageInputKind::TextInput);
+    assert_eq!(text.len(), 2);
+    assert!(text.iter().all(|event| event.node_id == 1 && event.text == "a"));
+    assert_eq!(events_of_kind(&frame, PageInputKind::KeyPressed).len(), 3);
+    assert_eq!(
+        frame
+            .commands
+            .iter()
+            .filter(|command| matches!(command, UiCommand::ResizePage { .. }))
+            .count(),
+        1,
+        "only the final measured display-list viewport is published"
+    );
+}
+
 /// The three key spellings the protocol documents by example.
 ///
 /// The host's spelling is what a plugin matches on, so it is part of the wire
@@ -2180,4 +2281,616 @@ fn web_textures_are_reused_per_generation_and_evicted_on_replacement_and_close()
         closed.output.textures_delta.free.contains(&second_id),
         "closing the web page frees its final GPU texture"
     );
+}
+
+fn web_document_rect(frame: &crikey_ui::NativeUiFrame) -> egui::Rect {
+    rect_shapes(frame)
+        .into_iter()
+        .find(|(shape, _)| shape.fill_texture_id != egui::TextureId::default())
+        .expect("the fixture paints its web texture")
+        .0
+        .rect
+}
+
+fn web_inputs(frame: &crikey_ui::NativeUiFrame) -> Vec<WebSurfaceInput> {
+    frame
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            UiCommand::WebInput(input) => Some(input.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn equal_web_events_remain_ordered_and_are_not_replayed_by_layout_passes() {
+    for change_geometry in [false, true] {
+        let context = create_launcher_context();
+        let view = painted_web_view(41, 1, &[10; 8]);
+        force_three_layout_passes(&context, change_geometry);
+        // egui marks subsequent presses of a held key as repeats. The last two
+        // presses must remain equal without collapsing into one command.
+        let press = key_press(egui::Key::ArrowDown, egui::Modifiers::NONE);
+        let mut input = launcher_input(vec![
+            egui::Event::Text("a".to_owned()),
+            egui::Event::Text("a".to_owned()),
+            press.clone(),
+            press.clone(),
+            press,
+            egui::Event::Ime(egui::ImeEvent::Commit("b".to_owned())),
+        ]);
+        input.time = Some(12.0);
+        let frame = build_launcher_frame(&context, input, &view);
+        assert_eq!(frame.output.platform_output.num_completed_passes, 3);
+        let rect = web_document_rect(&frame);
+        let resize = UiCommand::ResizePage {
+            width: rect.width().round() as u32,
+            height: rect.height().round() as u32,
+        };
+        let commit = UiCommand::WebIme(WebImeEvent::Commit {
+            surface_id: 41,
+            text: "a".to_owned(),
+        });
+        let key = UiCommand::WebInput(WebSurfaceInput::Key {
+            surface_id: 41,
+            timestamp_ms: 12_000,
+            pressed: true,
+            keysym: 0xff54,
+            hardware_keycode: 0,
+            repeat: false,
+            modifiers: 0,
+        });
+        let mut repeated_key = key.clone();
+        if let UiCommand::WebInput(WebSurfaceInput::Key { repeat, .. }) = &mut repeated_key {
+            *repeat = true;
+        }
+        assert_eq!(
+            frame.commands,
+            vec![
+                resize,
+                commit.clone(),
+                commit,
+                key,
+                repeated_key.clone(),
+                repeated_key,
+                UiCommand::WebIme(WebImeEvent::Commit {
+                    surface_id: 41,
+                    text: "b".to_owned(),
+                }),
+            ],
+            "only the final viewport replaces first-pass work; equal real input stays intact"
+        );
+        let repaint = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        assert!(web_inputs(&repaint).is_empty());
+        assert!(!repaint
+            .commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::WebIme(_))));
+    }
+}
+
+#[test]
+fn leaving_the_window_clears_document_hover_without_an_intermediate_outside_motion() {
+    let context = create_launcher_context();
+    let view = painted_web_view(41, 1, &[10; 8]);
+    let first = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let inside = web_document_rect(&first).center();
+    let moved = build_launcher_frame(
+        &context,
+        launcher_input(vec![egui::Event::PointerMoved(inside)]),
+        &view,
+    );
+    assert_eq!(web_inputs(&moved).len(), 1);
+    force_three_layout_passes(&context, false);
+    let departed = build_launcher_frame(&context, launcher_input(vec![egui::Event::PointerGone]), &view);
+    assert_eq!(departed.output.platform_output.num_completed_passes, 3);
+    assert!(matches!(
+        web_inputs(&departed).as_slice(),
+        [WebSurfaceInput::PointerMove { surface_id: 41, x, y, .. }] if *x < 0.0 && *y < 0.0
+    ));
+    let repeated = build_launcher_frame(&context, launcher_input(vec![egui::Event::PointerGone]), &view);
+    assert!(web_inputs(&repeated).is_empty(), "departure is reported once");
+}
+
+#[test]
+fn a_window_departure_keeps_the_captured_release_outside_without_an_outside_motion() {
+    for one_frame in [false, true] {
+        let context = create_launcher_context();
+        let view = painted_web_view(41, 1, &[10; 8]);
+        let first = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        let inside = web_document_rect(&first).center();
+        let mut events = vec![
+            egui::Event::PointerMoved(inside),
+            egui::Event::PointerButton {
+                pos: inside,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        if !one_frame {
+            let pressed = build_launcher_frame(&context, launcher_input(events), &view);
+            assert!(matches!(
+                web_inputs(&pressed).last(),
+                Some(WebSurfaceInput::PointerButton { pressed: true, .. })
+            ));
+            events = Vec::new();
+        }
+        events.extend([
+            egui::Event::PointerGone,
+            egui::Event::PointerButton {
+                // A release with no new motion can still carry the old inside
+                // coordinate. It cannot turn the departed drag into a click.
+                pos: inside,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let released = build_launcher_frame(&context, launcher_input(events), &view);
+        let inputs = web_inputs(&released);
+        assert_eq!(inputs.len(), if one_frame { 4 } else { 2 });
+        assert!(
+            matches!(
+                &inputs[inputs.len() - 2..],
+                [
+                    WebSurfaceInput::PointerMove { surface_id: 41, x: move_x, y: move_y, .. },
+                    WebSurfaceInput::PointerButton {
+                        surface_id: 41,
+                        button: 1,
+                        pressed: false,
+                        x: release_x,
+                        y: release_y,
+                        ..
+                    },
+                ] if *move_x == -1.0 && *move_y == -1.0
+                    && *release_x == -1.0 && *release_y == -1.0
+            ),
+            "departure and release must both be outside the original control"
+        );
+        let after = build_launcher_frame(
+            &context,
+            launcher_input(vec![
+                egui::Event::PointerButton {
+                    pos: inside,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 1.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            &view,
+        );
+        assert!(
+            web_inputs(&after).is_empty(),
+            "release ends capture despite stale inside coordinates"
+        );
+        let reentered = build_launcher_frame(
+            &context,
+            launcher_input(vec![egui::Event::PointerMoved(inside)]),
+            &view,
+        );
+        assert!(
+            matches!(
+                web_inputs(&reentered).as_slice(),
+                [WebSurfaceInput::PointerMove { x, y, .. }] if *x >= 0.0 && *y >= 0.0
+            ),
+            "real motion restores document hover after re-entry"
+        );
+    }
+}
+
+#[test]
+fn web_composition_enables_ime_at_the_page_caret_without_editing_the_old_query() {
+    let context = create_launcher_context();
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &model("unchanged"));
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &model("unchanged"));
+    let mut view = painted_web_view(41, 1, &[10; 8]);
+    view.page.as_mut().expect("web page").web_caret_area = Some((4.0, 5.0, 2.0, 12.0));
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("éλ".to_owned())),
+            egui::Event::Ime(egui::ImeEvent::Commit("é".to_owned())),
+        ]),
+        &view,
+    );
+    let rect = web_document_rect(&frame);
+    let caret = egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 5.0), egui::vec2(2.0, 12.0));
+    let ime = frame
+        .output
+        .platform_output
+        .ime
+        .expect("the document keeps the native IME enabled");
+    assert_eq!(ime.rect, caret);
+    assert_eq!(ime.cursor_rect, caret);
+    let ime_commands: Vec<_> = frame
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            UiCommand::WebIme(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ime_commands,
+        vec![
+            &WebImeEvent::Preedit {
+                surface_id: 41,
+                text: "éλ".to_owned(),
+                cursor: None
+            },
+            &WebImeEvent::Commit {
+                surface_id: 41,
+                text: "é".to_owned()
+            },
+        ]
+    );
+    assert!(!frame
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetQuery(_))));
+    let display_list = build_launcher_frame(&context, launcher_input(Vec::new()), &page_view(Vec::new()));
+    assert!(
+        display_list.output.platform_output.ime.is_none(),
+        "the previous engine's caret is retired"
+    );
+}
+
+#[test]
+fn web_scrolls_use_event_order_page_units_and_page_local_coordinates() {
+    let context = create_launcher_context();
+    let view = painted_web_view(41, 1, &[10; 8]);
+    let first = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let rect = web_document_rect(&first);
+    let inside = rect.min + egui::vec2(11.0, 12.0);
+    let outside = rect.max + egui::vec2(5.0, 5.0);
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            egui::Event::PointerMoved(inside),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(2.0, 3.0),
+                modifiers: egui::Modifiers::SHIFT,
+            },
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Page,
+                delta: egui::vec2(1.0, -1.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerMoved(outside),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]),
+        &view,
+    );
+    let inputs = web_inputs(&frame);
+    let scrolls: Vec<_> = inputs
+        .iter()
+        .filter(|input| matches!(input, WebSurfaceInput::Scroll { .. }))
+        .collect();
+    assert_eq!(
+        scrolls.len(),
+        2,
+        "the later wheel event aimed at chrome is not document input"
+    );
+    assert!(matches!(
+        scrolls[0],
+        WebSurfaceInput::Scroll {
+            x: 11.0,
+            y: 12.0,
+            delta_x: 2.0,
+            delta_y: 3.0,
+            precise: true,
+            modifiers: WEB_MODIFIER_SHIFT,
+            ..
+        }
+    ));
+    assert!(
+        matches!(scrolls[1], WebSurfaceInput::Scroll { x: 11.0, y: 12.0, delta_x, delta_y, precise: true, .. } if *delta_x == rect.width() && *delta_y == -rect.height())
+    );
+    assert!(inputs.iter().any(|input| matches!(input, WebSurfaceInput::PointerMove { x, y, .. } if *x > rect.width() && *y > rect.height())), "leaving the document clears engine hover");
+}
+
+#[test]
+fn a_web_drag_keeps_chorded_buttons_and_releases_outside_the_document() {
+    let context = create_launcher_context();
+    let view = painted_web_view(41, 1, &[10; 8]);
+    let first = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let rect = web_document_rect(&first);
+    let inside = rect.min + egui::vec2(11.0, 12.0);
+    let outside = rect.max + egui::vec2(5.0, 6.0);
+    let press = build_launcher_frame(
+        &context,
+        launcher_input(vec![egui::Event::PointerButton {
+            pos: inside,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]),
+        &view,
+    );
+    assert!(web_inputs(&press).iter().any(|input| matches!(
+        input,
+        WebSurfaceInput::PointerButton {
+            button: 1,
+            pressed: true,
+            ..
+        }
+    )));
+    let release = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            egui::Event::PointerGone,
+            egui::Event::PointerMoved(outside),
+            egui::Event::PointerButton {
+                pos: outside,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: outside,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: outside,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]),
+        &view,
+    );
+    let inputs = web_inputs(&release);
+    let buttons: Vec<_> = inputs
+        .iter()
+        .filter_map(|input| match input {
+            WebSurfaceInput::PointerButton {
+                button,
+                pressed,
+                x,
+                y,
+                ..
+            } => Some((*button, *pressed, *x, *y)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        buttons,
+        vec![
+            (3, true, rect.width() + 5.0, rect.height() + 6.0),
+            (1, false, rect.width() + 5.0, rect.height() + 6.0),
+            (3, false, rect.width() + 5.0, rect.height() + 6.0),
+        ]
+    );
+    assert!(
+        !inputs
+            .iter()
+            .any(|input| matches!(input, WebSurfaceInput::Scroll { .. })),
+        "capture ends after every held button is released"
+    );
+}
+
+#[test]
+fn replacing_a_web_surface_retires_pointer_capture_and_the_previous_texture() {
+    let context = create_launcher_context();
+    let first_view = painted_web_view(41, 1, &[10; 8]);
+    let first = build_launcher_frame(&context, launcher_input(Vec::new()), &first_view);
+    let rect = web_document_rect(&first);
+    let old_texture = rect_shapes(&first)
+        .into_iter()
+        .find(|(shape, _)| shape.rect == rect && shape.fill_texture_id != egui::TextureId::default())
+        .expect("web texture")
+        .0
+        .fill_texture_id;
+    let _ = build_launcher_frame(
+        &context,
+        launcher_input(vec![egui::Event::PointerButton {
+            pos: rect.center(),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]),
+        &first_view,
+    );
+    let replacement = build_launcher_frame(
+        &context,
+        launcher_input(vec![egui::Event::PointerButton {
+            pos: rect.max + egui::vec2(5.0, 5.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]),
+        &painted_web_view(42, 1, &[20; 8]),
+    );
+    assert!(
+        web_inputs(&replacement).is_empty(),
+        "the new document cannot receive the old document's drag release"
+    );
+    assert!(replacement.output.textures_delta.free.contains(&old_texture));
+    assert!(
+        replacement
+            .output
+            .textures_delta
+            .set
+            .iter()
+            .any(|(_, delta)| delta.image.size() == [2, 1]),
+        "surface identity, not generation alone, decides texture reuse"
+    );
+}
+
+#[test]
+fn web_named_keys_and_text_reach_the_engine_but_escape_and_chrome_shortcuts_do_not_leak() {
+    let context = create_launcher_context();
+    let view = painted_web_view(41, 1, &[10; 8]);
+    let mut tab_release = key_press(egui::Key::Tab, egui::Modifiers::SHIFT);
+    if let egui::Event::Key { pressed, .. } = &mut tab_release {
+        *pressed = false;
+    }
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            key_press(egui::Key::Tab, egui::Modifiers::SHIFT),
+            tab_release,
+            egui::Event::Text("É".to_owned()),
+            key_press(egui::Key::Escape, egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+            key_press(egui::Key::Comma, egui::Modifiers::COMMAND),
+        ]),
+        &view,
+    );
+    let keys: Vec<_> = web_inputs(&frame)
+        .into_iter()
+        .filter_map(|input| match input {
+            WebSurfaceInput::Key {
+                keysym,
+                pressed,
+                modifiers,
+                ..
+            } => Some((keysym, pressed, modifiers)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            (0xff09, true, WEB_MODIFIER_SHIFT),
+            (0xff09, false, WEB_MODIFIER_SHIFT)
+        ]
+    );
+    assert_eq!(
+        frame
+            .commands
+            .iter()
+            .filter(|command| matches!(command, UiCommand::ClosePage))
+            .count(),
+        1
+    );
+    assert!(frame.commands.iter().any(
+        |command| matches!(command, UiCommand::WebIme(WebImeEvent::Commit { text, .. }) if text == "É")
+    ));
+    assert!(!frame.commands.iter().any(|command| matches!(
+        command,
+        UiCommand::OpenSettings | UiCommand::PageInput(_) | UiCommand::SetQuery(_)
+    )));
+}
+
+#[test]
+fn oversized_web_textures_are_dropped_before_upload_and_release_the_old_texture() {
+    let context = create_launcher_context();
+    let mut view = painted_web_view(41, 1, &[10; 8]);
+    let first = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let rect = web_document_rect(&first);
+    let old_texture = rect_shapes(&first)
+        .into_iter()
+        .find(|(shape, _)| shape.rect == rect && shape.fill_texture_id != egui::TextureId::default())
+        .expect("web texture")
+        .0
+        .fill_texture_id;
+    view.page.as_mut().expect("web page").web_frame = Some(Arc::new(WebSurfaceFrame {
+        surface_id: 41,
+        generation: 2,
+        pixel_width: 2049,
+        pixel_height: 1,
+        rgba8: vec![255; 2049 * 4].into(),
+    }));
+    let mut input = launcher_input(Vec::new());
+    input.max_texture_side = Some(2048);
+    let frame = build_launcher_frame(&context, input, &view);
+    assert!(frame.output.textures_delta.free.contains(&old_texture));
+    assert!(!frame
+        .output
+        .textures_delta
+        .set
+        .iter()
+        .any(|(_, delta)| delta.image.size() == [2049, 1]));
+    assert!(!rect_shapes(&frame)
+        .iter()
+        .any(|(shape, _)| shape.fill_texture_id == old_texture));
+}
+
+#[test]
+fn every_replacement_web_engine_receives_the_measured_viewport_once() {
+    let context = create_launcher_context();
+    let first_view = painted_web_view(41, 1, &[10; 8]);
+    let first = build_launcher_frame(&context, launcher_input(Vec::new()), &first_view);
+    let expected: Vec<_> = first
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            UiCommand::ResizePage { width, height } => Some((*width, *height)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(expected.len(), 1);
+    let repeated = build_launcher_frame(&context, launcher_input(Vec::new()), &first_view);
+    assert!(!repeated
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::ResizePage { .. })));
+    let replacement_view = painted_web_view(42, 1, &[20; 8]);
+    let replacement = build_launcher_frame(&context, launcher_input(Vec::new()), &replacement_view);
+    let replacement_sizes: Vec<_> = replacement
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            UiCommand::ResizePage { width, height } => Some((*width, *height)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replacement_sizes, expected,
+        "the new host must not remain at its initial guessed viewport"
+    );
+    let mut resized_input = launcher_input(Vec::new());
+    resized_input.screen_rect = resized_input
+        .screen_rect
+        .map(|rect| egui::Rect::from_min_size(rect.min, rect.size() + egui::vec2(100.0, 60.0)));
+    let resized = build_launcher_frame(&context, resized_input, &replacement_view);
+    assert!(resized.commands.iter().any(|command| matches!(command, UiCommand::ResizePage { width, height } if *width > expected[0].0 && *height > expected[0].1)));
+}
+
+#[test]
+fn returning_from_web_to_a_display_list_releases_only_the_engine_texture() {
+    let context = create_launcher_context();
+    let web = build_launcher_frame(
+        &context,
+        launcher_input(Vec::new()),
+        &painted_web_view(41, 1, &[10; 8]),
+    );
+    let web_texture = rect_shapes(&web)
+        .into_iter()
+        .find(|(shape, _)| shape.fill_texture_id != egui::TextureId::default())
+        .expect("web texture")
+        .0
+        .fill_texture_id;
+    let view = page_view(vec![image_node(0.0, 8.0, 30.0, 20.0, [10, 200, 90, 255])]);
+    let display_list = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(display_list.output.textures_delta.free.contains(&web_texture));
+    assert_eq!(raster_uploads(&display_list), 1);
+    let raster = raster_texture(&display_list);
+    assert!(rect_shapes(&display_list)
+        .iter()
+        .any(|(shape, _)| shape.fill_texture_id == raster));
+    assert!(!display_list
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::WebInput(_) | UiCommand::WebIme(_))));
 }

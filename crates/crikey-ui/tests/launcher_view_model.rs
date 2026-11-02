@@ -2168,3 +2168,20 @@ fn web_input_and_ime_commands_remain_transport_independent_host_effects() {
         Some(UiEffect::WebIme(ime))
     );
 }
+
+#[test]
+fn a_web_caret_rejects_overflowing_endpoints_without_losing_the_valid_anchor() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let _ = model.frame();
+    assert!(model.open_page(web_page_surface()));
+    assert!(model.declare_web_surface(7));
+    assert!(model.update_web_caret_area(7, 4.0, 5.0, 2.0, 12.0));
+    assert!(!model.update_web_caret_area(7, f32::MAX, 5.0, f32::MAX, 12.0));
+    assert!(!model.update_web_caret_area(7, 4.0, f32::MAX, 2.0, f32::MAX));
+    assert!(!model.update_web_caret_area(7, 4.0, 5.0, -1.0, 12.0));
+    assert_eq!(
+        model.page().expect("web page").web_caret_area,
+        Some((4.0, 5.0, 2.0, 12.0))
+    );
+}

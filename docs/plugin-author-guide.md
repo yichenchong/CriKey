@@ -205,27 +205,28 @@ needs separately compiled platform and architecture binaries, and the ABI
 grants it the full authority of the host process -- it is a compatibility
 interface, not a sandbox.
 
-## Pages: drawing your own surface
+## Pages: display lists and web surfaces
 
 When a result list cannot express what your plugin does — a form, a checklist,
 a converter with a live answer — an action may open a *page*: a surface the
-launcher presents in place of the result list and that you draw yourself.
+launcher presents in place of the result list.
 
-What crosses the boundary is a display list and never code. Pixels cross only
-as a bounded raster on a single node, described under rasters below. You
-return a flat list of nodes — rectangles, text, lines, circles, each with
-geometry, colours and a semantic role — and the host draws them with the
-launcher's own renderer. A page of geometry costs kilobytes a frame rather
-than the 1.10 MiB a 720×400 pixel canvas would; add rasters and you pay for
-them on every frame you answer, which is why they are capped and why you
-should reach for shapes first. Your code never runs on the launcher's UI
-thread, so a page cannot crash it or block it. The host's own work of drawing
-your frame does run there, including uploading your rasters, which is the
-other reason those caps exist: the cost is bounded, not absent. The reasoning, including why there is no
-embedded webview, is [ADR-0020](adr/0020-plugin-pages.md); the normative rules
-are [spec §32](spec/crikey-spec-v1.md#32-plugin-pages).
+The portable form is a display list. You return flat nodes — rectangles, text,
+lines, circles and bounded rasters, each with geometry, colours and a semantic
+role — and the host draws them with the launcher's renderer. Your plugin code
+never runs on the launcher's UI thread. The host's work of drawing the frame,
+including uploading rasters, does run there: its cost is bounded, not absent.
+A page of geometry costs kilobytes per frame rather than the 1.10 MiB of a
+720×400 pixel canvas; rasters are re-sent on every answered frame.
 
-Be clear about what that means for you before you start:
+Alternatively, the native/Rust page API can declare a Linux-only web surface,
+described below. The Python SDK does not currently expose that declaration.
+The separate engine host sends its own bounded frames to the launcher; these
+are not plugin-authored raster nodes. The rationale and limits are in
+[ADR-0020](adr/0020-plugin-pages.md), and the normative rules are in
+[spec §32](spec/crikey-spec-v1.md#32-plugin-pages).
+
+For a display-list page, be clear about what that means before you start:
 
 - **You position every node**, in logical pixels relative to your page's
   top-left corner. There is no DOM, no CSS, no flexbox, no reflow and no text
@@ -284,8 +285,14 @@ independently supply one beside the launcher, on `PATH`, or through the
 stages the engine host and is explicitly no-web. Windows and macOS do not have
 a web-surface host in v1.
 
-Only HTTP and HTTPS navigation is accepted. A stated address requires network
-permission; persistent cookies and local storage need a separate grant:
+Only HTTP and HTTPS document navigation is accepted, including redirects and
+links. This is not a general subresource or network sandbox. Auxiliary browser
+windows/popups are unsupported and blocked. Downloads are canceled: the page
+protocol has no operation for authorizing a download destination. Do not rely
+on an ephemeral storage profile alone to prevent download writes.
+
+A stated address requires network permission; persistent cookies and local
+storage need a separate grant:
 
 ```toml
 [permissions]
@@ -301,9 +308,13 @@ denied declaration cannot briefly start WebKit. Do not use `file:`, `data:` or
 `javascript:` URLs; `WebSurfaceBuilder::build` rejects them before serving the
 frame.
 
-The first frame navigates. Later frames normally use
-`WebSurfaceBuilder::stay`, whose empty URL means “keep the document and its
-current navigation” rather than reload it:
+The first frame must name an address. Later frames may use
+`WebSurfaceBuilder::stay`, whose empty URL preserves the document's current
+navigation. Do not infer that the host accepted your first frame just because
+you returned it: a resize can make that generation stale. For a fixed entry
+document, repeat its URL as below; the host suppresses navigation to the same
+last-requested URL, preserving navigation within the live document. Use a
+different URL to request a new navigation.
 
 ```rust
 use crikey_core::Result;
@@ -312,9 +323,7 @@ use crikey_plugin_sdk::{
     WebStorage, WebSurfaceBuilder,
 };
 
-struct Dashboard {
-    web_opened: bool,
-}
+struct Dashboard;
 
 impl Dashboard {
     fn execute_page(
@@ -323,7 +332,6 @@ impl Dashboard {
         _context: &dyn PluginContext,
     ) -> Result<ExecuteOutcome> {
         if request.item.0 == "dashboard" {
-            self.web_opened = false;
             return Ok(ExecuteOutcome::show_page("dashboard"));
         }
         Ok(ExecuteOutcome::Completed)
@@ -334,15 +342,10 @@ impl Dashboard {
         request: PageRequest,
         _context: &dyn PluginContext,
     ) -> Result<PageFrame> {
-        let frame = if self.web_opened {
-            WebSurfaceBuilder::stay(request.generation)
-        } else {
-            self.web_opened = true;
-            WebSurfaceBuilder::navigate(
-                request.generation,
-                "https://dashboard.example/plugin",
-            )
-        };
+        let frame = WebSurfaceBuilder::navigate(
+            request.generation,
+            "https://dashboard.example/plugin",
+        );
 
         frame
             .title("Service dashboard")
@@ -358,27 +361,63 @@ explicitly for that reason. Keep the same storage choice on stay frames.
 
 The launcher keeps its in-page loading indicator until the first accepted RGBA
 frame arrives; the declaration itself is not painted content. Permission
-denial, an unavailable platform or host, a spawn/connect/protocol failure, a
-host crash, or an engine load failure closes the page with a specific
-`Web page closed: …` diagnostic while leaving the launcher running.
+denial, an unavailable platform or host, missing required cgroup supervision,
+a spawn/connect/protocol failure, a host crash, or an engine load failure
+closes the page with a specific `Page closed: …` diagnostic while leaving the
+launcher running.
 
-On Linux the launcher attempts to put the web-host process tree in a delegated
-cgroup-v2 memory ceiling. The policy target is the lesser of 768 MiB and one
-eighth of physical RAM, reduced further by an inherited finite cgroup limit. It
-refuses to start the engine when that effective value is below 256 MiB.
-Enforcement is not universally available: if the limit cannot be determined or
-a writable delegated cgroup cannot be created, CriKey reports a warning and
-continues without the new ceiling. A plugin must not treat the limit as an
-allocation guarantee or assume it is active on a particular installation.
+On Linux web startup requires a writable delegated cgroup-v2 hierarchy with a
+suitable existing ancestor whose `cgroup.subtree_control` already enables
+`memory` for children and whose `cgroup.procs` is writable for the kernel's
+common-ancestor migration permission check. The launcher searches only proper
+ancestors within the delegation's cgroup-v2 mount, never its own cgroup.
+Candidate parents must contain no processes, except at the visible mount root;
+that exception still requires the enabled memory controller and every private
+leaf control. CriKey creates a private web-host leaf there, separate from the
+leaf containing the launcher. A writable populated launcher leaf alone is not enough:
+Linux's no-internal-process rule prevents enabling the memory controller for
+its children. CriKey does not move the launcher or unrelated processes, change
+subtree controller settings, or cross unavailable delegation boundaries.
+The private leaf must provide writable memory controls and `cgroup.kill`; the
+launcher prepares and verifies these controls and attaches the child before
+web-host code runs.
+
+The memory ceiling is the lesser of 768 MiB and one eighth of physical RAM,
+reduced further by the launcher's inherited finite cgroup limits, even when the
+web-host leaf has a different parent. An effective value below 256 MiB refuses
+web startup; this ceiling is not an allocation guarantee.
+
+If the ceiling cannot be determined or the required cgroup controls cannot be
+prepared, the page closes instead of starting an unsupervised engine. The
+diagnostic begins with
+`Page closed: web surface refused: required cgroup-v2 supervision is unavailable:`
+and ends with the specific failure, such as no suitable writable delegated
+parent with `memory` already enabled for children or an unwritable control.
+A ceiling below the floor uses the same prefix followed by
+`its effective memory ceiling is … MiB, below the 256 MiB minimum`.
+There is no warning-only fallback. This deliberately makes web pages
+unavailable on Linux installations without the required delegation, even if an
+engine-enabled host is installed; ordinary launcher use and display-list pages
+still work.
+
+The required cgroup covers detached and reparented descendants as well as the
+host, so teardown after a host crash does not depend on a procfs snapshot or
+the original process group.
 
 The implemented input route forwards pointer, direct key press and release,
 focus, resize, IME preedit and IME commit events to the Linux host; Tab is a web
 key and Escape remains reserved by the launcher. It also carries the
-engine-reported caret rectangle used to position a candidate window. This
-wiring is not a claim of complete IME support: interoperability across real
-ibus/fcitx input methods has not been measured, and v1 has no surrounding-text
-or delete-surrounding operation for correction of already-committed text. Do
-not require CJK reconversion or IME-directed deletion to complete a form.
+engine-reported caret rectangle used to position a candidate window.
+The native Linux route uses XKB hardware keycodes (evdev code + 8). The
+egui-only fallback forwards available named keys and actual text/IME, without
+guessing hardware codes or physical key identity. The UI
+forwards Shift, Control, Alt and Super state; the current winit/egui input
+source does not expose active Caps Lock or Num Lock modifier state, although
+their key events and keyboard-resolved text are forwarded. This wiring is not
+a claim of complete IME support: interoperability across real ibus/fcitx input
+methods has not been measured, and v1 has no surrounding-text or
+delete-surrounding operation for correction of already-committed text. Do not
+require CJK reconversion or IME-directed deletion to complete a form.
 
 ### A worked page
 
