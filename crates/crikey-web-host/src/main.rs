@@ -1,17 +1,20 @@
-#[cfg(not(target_os = "linux"))]
-compile_error!("crikey-web-host's engine feature requires Linux");
+use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
 use std::ffi::OsString;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
-#[cfg(target_os = "linux")]
-use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
 use crikey_native_protocol::Endpoint;
 #[cfg(target_os = "linux")]
 use crikey_web_host::engine;
+
+#[cfg(not(target_os = "linux"))]
+fn main() -> ExitCode {
+    eprintln!("crikey-web-host: web surfaces are only supported on Linux");
+    ExitCode::FAILURE
+}
 
 #[cfg(target_os = "linux")]
 fn main() -> ExitCode {

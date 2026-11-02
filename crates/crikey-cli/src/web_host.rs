@@ -5,8 +5,12 @@
 //! I/O, and teardown all stay on the manager thread below.
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::ExitStatus;
+#[cfg(target_os = "linux")]
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -18,18 +22,28 @@ use crikey_native_protocol::message::{
     CaretArea, CloseSurface, Envelope, Gone, ImeEvent, LoadState, Navigate, OpenSurface, Payload, RawInput,
     Resize, WebFrame, WebGoneCode, WebImeCode, WebInputCode, WebLoadCode, WebStorageMode,
 };
-use crikey_native_protocol::transport::{Listener, Transport};
-use crikey_native_protocol::{Endpoint, ProtocolError};
+#[cfg(target_os = "linux")]
+use crikey_native_protocol::transport::Listener;
+use crikey_native_protocol::transport::Transport;
+#[cfg(target_os = "linux")]
+use crikey_native_protocol::Endpoint;
+use crikey_native_protocol::ProtocolError;
 use crikey_ui::{WebImeEvent, WebSurfaceFrame, WebSurfaceInput};
 
+#[cfg(target_os = "linux")]
 pub(crate) const ENV_WEB_HOST_OVERRIDE: &str = "CRIKEY_WEB_HOST";
+#[cfg(target_os = "linux")]
 const WEB_HOST_BINARY: &str = "crikey-web-host";
 const COMMAND_QUEUE_CAPACITY: usize = 64;
 const NOTICE_QUEUE_CAPACITY: usize = 8;
+#[cfg(target_os = "linux")]
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
 const READ_POLL: Duration = Duration::from_millis(12);
 const MANAGER_IDLE_POLL: Duration = Duration::from_millis(25);
+#[cfg(target_os = "linux")]
 const MIN_WEB_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_WEB_MEMORY_BYTES: u64 = 768 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const PROCESS_TERMINATION_PASSES: usize = 20;
@@ -58,11 +72,13 @@ pub(crate) enum WebHostNotice {
 #[derive(Debug)]
 struct OpenRequest {
     surface_id: u64,
+    #[cfg(target_os = "linux")]
     plugin: PluginId,
     pixel_width: u32,
     pixel_height: u32,
     url: String,
     storage: WebStorage,
+    #[cfg(target_os = "linux")]
     storage_root: PathBuf,
 }
 
@@ -137,17 +153,20 @@ pub(crate) struct WebHostSupervisor {
     desired_surface: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     next_surface_id: u64,
+    #[cfg(target_os = "linux")]
     storage_root: PathBuf,
     manager: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for WebHostSupervisor {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        out.debug_struct("WebHostSupervisor")
+        let mut debug = out.debug_struct("WebHostSupervisor");
+        debug
             .field("desired_surface", &self.desired_surface.load(Ordering::Acquire))
-            .field("next_surface_id", &self.next_surface_id)
-            .field("storage_root", &self.storage_root)
-            .finish()
+            .field("next_surface_id", &self.next_surface_id);
+        #[cfg(target_os = "linux")]
+        debug.field("storage_root", &self.storage_root);
+        debug.finish()
     }
 }
 
@@ -157,6 +176,8 @@ impl WebHostSupervisor {
     }
 
     fn with_spawner(storage_root: PathBuf, wake: WebWake, spawner: Arc<dyn HostSpawner>) -> Self {
+        #[cfg(not(target_os = "linux"))]
+        let _ = storage_root;
         let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
         let mailbox = Arc::new(Mutex::new(Mailbox::default()));
         let desired_surface = Arc::new(AtomicU64::new(0));
@@ -183,6 +204,7 @@ impl WebHostSupervisor {
             desired_surface,
             shutdown,
             next_surface_id: 1,
+            #[cfg(target_os = "linux")]
             storage_root,
             manager: Some(manager),
         }
@@ -208,13 +230,17 @@ impl WebHostSupervisor {
         if surface_id == 0 {
             return Err("the web surface id space is exhausted".to_owned());
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = plugin;
         let request = OpenRequest {
             surface_id,
+            #[cfg(target_os = "linux")]
             plugin,
             pixel_width,
             pixel_height,
             url,
             storage,
+            #[cfg(target_os = "linux")]
             storage_root: self.storage_root.clone(),
         };
         self.desired_surface.store(surface_id, Ordering::Release);
@@ -1086,10 +1112,12 @@ fn spawn_production(_request: &OpenRequest) -> Result<RunningHost, String> {
         .to_owned())
 }
 
+#[cfg(target_os = "linux")]
 fn host_file_name() -> String {
     format!("{WEB_HOST_BINARY}{}", std::env::consts::EXE_SUFFIX)
 }
 
+#[cfg(target_os = "linux")]
 fn web_host_executable() -> Result<PathBuf, String> {
     if let Some(configured) = std::env::var_os(ENV_WEB_HOST_OVERRIDE) {
         if configured.is_empty() {
@@ -1525,19 +1553,6 @@ fn descendant_pids_from(roots: &[u32]) -> Vec<u32> {
         }
     }
     output
-}
-
-#[cfg(not(target_os = "linux"))]
-#[derive(Debug)]
-struct UnsupportedProcess;
-
-#[cfg(not(target_os = "linux"))]
-impl ManagedProcess for UnsupportedProcess {
-    fn try_wait(&mut self) -> Result<Option<ExitStatus>, String> {
-        Ok(None)
-    }
-
-    fn terminate(&mut self) {}
 }
 
 #[cfg(test)]
