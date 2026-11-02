@@ -18,6 +18,7 @@ mod native_commands;
 mod package_commands;
 mod plugin_commands;
 mod settings;
+#[cfg(target_os = "linux")]
 mod web_host;
 
 use calculator::Calculator;
@@ -36,7 +37,9 @@ use crikey_config::{
     administrator_policy_path, ConfigSourceWatch, ConfigStore, ConfigurationPublisher, KEY_COALESCE_MS,
     KEY_MAXIMUM_WAIT_MS, KEY_MAX_RESULTS, KEY_RELOAD_INTERVAL_MS,
 };
-use crikey_core::{Generation, Item, PageWebSurface, PluginId, WebStorage};
+#[cfg(target_os = "linux")]
+use crikey_core::WebStorage;
+use crikey_core::{Generation, Item, PageWebSurface, PluginId};
 use crikey_input_scheduler::{
     ActivationPolicy, DebouncePolicy, PluginPolicy, QueuePolicy, SchedulingProfile,
 };
@@ -53,6 +56,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "linux")]
 use web_host::{WebHostNotice, WebHostSupervisor, WebWake};
 
 const USAGE: &str = "\
@@ -788,17 +792,23 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     // the calculator renders its row and explains itself instead of pretending
     // a copy happened.
     let mut calculator = Calculator::new(search.clipboard());
-    // The manager thread and WPE process are both lazy: a launcher that never
-    // opens an admitted web page pays no process or thread startup cost.
-    let web_wake_handle = render_handle.clone();
-    let web_wake: WebWake = Arc::new(move || {
-        let _ = web_wake_handle.request_provider_answer();
-    });
-    let mut web_page = WebPageRuntime::new(
-        directories.data_dir().join("web-storage"),
-        web_wake,
-        initial_page_viewport(page_window.0, page_window.1),
-    );
+    #[cfg(target_os = "linux")]
+    let mut web_page = {
+        // The manager thread and WPE process are both lazy: a launcher that
+        // never opens an admitted web page pays no process or thread startup
+        // cost.
+        let web_wake_handle = render_handle.clone();
+        let web_wake: WebWake = Arc::new(move || {
+            let _ = web_wake_handle.request_provider_answer();
+        });
+        WebPageRuntime::new(
+            directories.data_dir().join("web-storage"),
+            web_wake,
+            initial_page_viewport(page_window.0, page_window.1),
+        )
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut web_page = WebPageRuntime::new();
     let mut retained = RetainedRows::default();
     // Per-plugin refusal totals already reported, so a growing counter is
     // announced once per increase rather than on every turn of the loop.
@@ -946,32 +956,35 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     }
                 }
             }
-            let mut web_failure = None;
-            for notice in web_page.poll() {
-                match notice {
-                    WebHostNotice::Frame(frame) => {
-                        view_model.update_web_frame(frame);
-                    }
-                    WebHostNotice::Caret {
-                        surface_id,
-                        x,
-                        y,
-                        width,
-                        height,
-                    } => {
-                        view_model.update_web_caret_area(surface_id, x, y, width, height);
-                    }
-                    WebHostNotice::Warning(message) => {
-                        eprintln!("crikey: {message}");
-                    }
-                    WebHostNotice::Fatal { surface_id, message } => {
-                        view_model.clear_web_frame(surface_id);
-                        web_failure = Some(message);
+            #[cfg(target_os = "linux")]
+            {
+                let mut web_failure = None;
+                for notice in web_page.poll() {
+                    match notice {
+                        WebHostNotice::Frame(frame) => {
+                            view_model.update_web_frame(frame);
+                        }
+                        WebHostNotice::Caret {
+                            surface_id,
+                            x,
+                            y,
+                            width,
+                            height,
+                        } => {
+                            view_model.update_web_caret_area(surface_id, x, y, width, height);
+                        }
+                        WebHostNotice::Warning(message) => {
+                            eprintln!("crikey: {message}");
+                        }
+                        WebHostNotice::Fatal { surface_id, message } => {
+                            view_model.clear_web_frame(surface_id);
+                            web_failure = Some(message);
+                        }
                     }
                 }
-            }
-            if let Some(message) = web_failure {
-                close_failed_web_page(&mut web_page, &mut search, &mut view_model, message);
+                if let Some(message) = web_failure {
+                    close_failed_web_page(&mut web_page, &mut search, &mut view_model, message);
+                }
             }
             // into the retained view model, so a later navigation keystroke
             // keeps them. `publish` refuses a superseded or retired generation,
@@ -1272,18 +1285,25 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         close_failed_web_page(&mut web_page, &mut search, &mut view_model, error.to_string());
                     }
                 }
+                #[cfg(target_os = "linux")]
                 Some(UiEffect::WebInput(input)) => {
                     if let Err(error) = web_page.send_input(input) {
                         close_failed_web_page(&mut web_page, &mut search, &mut view_model, error);
                     }
                 }
+                #[cfg(not(target_os = "linux"))]
+                Some(UiEffect::WebInput(_)) => {}
+                #[cfg(target_os = "linux")]
                 Some(UiEffect::WebIme(event)) => {
                     if let Err(error) = web_page.send_ime(event) {
                         close_failed_web_page(&mut web_page, &mut search, &mut view_model, error);
                     }
                 }
+                #[cfg(not(target_os = "linux"))]
+                Some(UiEffect::WebIme(_)) => {}
                 Some(UiEffect::ResizePage { width, height }) => {
                     search.resize_page(width, height);
+                    #[cfg(target_os = "linux")]
                     if let Err(error) = web_page.resize(width, height) {
                         close_failed_web_page(&mut web_page, &mut search, &mut view_model, error);
                     }
@@ -1389,6 +1409,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     }
     outcome
 }
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct ActiveWebSurface {
     surface_id: u64,
@@ -1397,14 +1418,20 @@ struct ActiveWebSurface {
 }
 
 struct WebPageRuntime {
+    #[cfg(target_os = "linux")]
     supervisor: Option<WebHostSupervisor>,
+    #[cfg(target_os = "linux")]
     storage_root: std::path::PathBuf,
+    #[cfg(target_os = "linux")]
     wake: WebWake,
+    #[cfg(target_os = "linux")]
     active: Option<ActiveWebSurface>,
+    #[cfg(target_os = "linux")]
     viewport: (u32, u32),
 }
 
 impl WebPageRuntime {
+    #[cfg(target_os = "linux")]
     fn new(storage_root: std::path::PathBuf, wake: WebWake, viewport: (u32, u32)) -> Self {
         Self {
             supervisor: None,
@@ -1415,11 +1442,21 @@ impl WebPageRuntime {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn new() -> Self {
+        Self {}
+    }
+
+    #[cfg(target_os = "linux")]
     fn begin_page(&mut self, viewport: (u32, u32)) {
         self.close("page was replaced");
         self.viewport = viewport;
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn begin_page(&mut self, _viewport: (u32, u32)) {}
+
+    #[cfg(target_os = "linux")]
     fn declare(
         &mut self,
         search: &SearchService,
@@ -1427,12 +1464,6 @@ impl WebPageRuntime {
         plugin: &PluginId,
         declaration: &PageWebSurface,
     ) -> Result<(), String> {
-        if !cfg!(target_os = "linux") {
-            return Err(
-                "web surfaces require Linux and an installed WPE web host; this launcher remains available without them"
-                    .to_owned(),
-            );
-        }
         search
             .admit_web_surface(
                 plugin,
@@ -1486,6 +1517,21 @@ impl WebPageRuntime {
         Ok(())
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn declare(
+        &mut self,
+        _search: &SearchService,
+        _view_model: &mut LauncherViewModel,
+        _plugin: &PluginId,
+        _declaration: &PageWebSurface,
+    ) -> Result<(), String> {
+        Err(
+            "web surfaces require Linux and an installed WPE web host; this launcher remains available without them"
+                .to_owned(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
     fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
         self.viewport = (width, height);
         let Some(active) = self.active.as_ref() else {
@@ -1497,6 +1543,7 @@ impl WebPageRuntime {
             .resize(active.surface_id, width, height)
     }
 
+    #[cfg(target_os = "linux")]
     fn send_input(&self, input: crikey_ui::WebSurfaceInput) -> Result<(), String> {
         self.supervisor
             .as_ref()
@@ -1504,6 +1551,7 @@ impl WebPageRuntime {
             .send_input(input)
     }
 
+    #[cfg(target_os = "linux")]
     fn send_ime(&self, event: crikey_ui::WebImeEvent) -> Result<(), String> {
         self.supervisor
             .as_ref()
@@ -1511,18 +1559,23 @@ impl WebPageRuntime {
             .send_ime(event)
     }
 
+    #[cfg(target_os = "linux")]
     fn poll(&self) -> Vec<WebHostNotice> {
         self.supervisor
             .as_ref()
             .map_or_else(Vec::new, WebHostSupervisor::poll)
     }
 
+    #[cfg(target_os = "linux")]
     fn close(&mut self, reason: &str) {
         self.active = None;
         if let Some(supervisor) = self.supervisor.as_ref() {
             supervisor.close(reason);
         }
     }
+
+    #[cfg(not(target_os = "linux"))]
+    fn close(&mut self, _reason: &str) {}
 }
 
 fn close_failed_web_page(
@@ -3002,7 +3055,14 @@ mod tests {
         service
     }
     fn web_page_runtime() -> WebPageRuntime {
-        WebPageRuntime::new(std::path::PathBuf::from("/unused"), Arc::new(|| {}), (1, 1))
+        #[cfg(target_os = "linux")]
+        {
+            WebPageRuntime::new(std::path::PathBuf::from("/unused"), Arc::new(|| {}), (1, 1))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            WebPageRuntime::new()
+        }
     }
 
     /// An action can finish after the user has dismissed the launcher, and the

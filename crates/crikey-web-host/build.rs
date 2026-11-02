@@ -25,6 +25,10 @@ const REQUIRED: &[(&str, &str)] = &[
 ];
 
 fn main() {
+    if !matches!(std::env::var("CARGO_CFG_TARGET_OS").as_deref(), Ok("linux")) {
+        return;
+    }
+
     println!("cargo:rerun-if-changed=csrc/ck_web_shim.c");
     println!("cargo:rerun-if-changed=csrc/ck_web_shim.h");
 
