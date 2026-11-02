@@ -381,9 +381,12 @@ long-lived surface would convert the spawn cost into a startup cost, but it
 would pay a few hundred milliseconds and the engine's idle memory for a page
 nobody opened. The host starts the web engine when the user opens the page and
 tears it down on close. The required cgroup covers the whole process tree,
-including detached or reparented descendants after a host crash; teardown does
-not depend on discovering descendants through procfs or on their remaining in
-the original process group.
+including detached or reparented descendants after a host crash.
+`cgroup.kill` is the authoritative process-tree escalation; remembered numeric
+PIDs and procfs ancestry scans are not a fallback. A graceful process-group
+SIGTERM is allowed only while the original root remains unreaped. After
+observing and reaping its exit, teardown never signals that numeric PID or
+process group again, because the kernel may reuse the identifier.
 
 The latency is disclosed rather than hidden. A web page keeps the in-page
 loading indicator until its first accepted engine frame is painted. The

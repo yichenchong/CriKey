@@ -401,8 +401,11 @@ engine-enabled host is installed; ordinary launcher use and display-list pages
 still work.
 
 The required cgroup covers detached and reparented descendants as well as the
-host, so teardown after a host crash does not depend on a procfs snapshot or
-the original process group.
+host. Its `cgroup.kill` control is the authoritative process-tree escalation;
+there is no fallback that scans procfs or kills remembered descendant PIDs.
+Graceful process-group SIGTERM is limited to the original root's unreaped
+lifetime. After the root is reaped, cleanup uses the cgroup rather than its
+potentially reused numeric PID or process group.
 
 The implemented input route forwards pointer, direct key press and release,
 focus, resize, IME preedit and IME commit events to the Linux host; Tab is a web

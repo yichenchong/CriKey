@@ -8,6 +8,8 @@ The audit was split into six separately owned sections: engine and C interface; 
 
 Every tracked item has an identifier unique to this round. Items include runtime bugs, latent boundary failures, performance waste, missing regression coverage, and documentation errors. They are **not all independent production crashes**. Some IDs describe separate fixes at different boundaries of the same feature; those relationships are stated below. Coverage-only and documentation-only changes are labeled accordingly. Hypothetical or impractical boundaries are not presented as observed user failures.
 
+**Completion:** The report contains 80 uniquely labeled entries, including runtime fixes, latent-boundary fixes, coverage/documentation improvements, and four inherited issues intentionally left unchanged. Final coordinator verification includes the PR8B-L14 cleanup correction, not just the earlier audit commit.
+
 ## Important behavior change chosen by the user
 
 **Web hosting now requires delegated cgroup-v2 supervision.** The user explicitly selected refusal over the previous warning-only fallback. Before executing a web host, CriKey must establish a private cgroup with an enforceable memory limit, process attachment, and process-tree killing. Without those facilities, opening a web page fails with a diagnostic; the ordinary launcher and display-list pages remain available.
@@ -15,6 +17,8 @@ Every tracked item has an identifier unique to this round. Items include runtime
 A suitable parent must already have the memory controller enabled for children. CriKey searches eligible ancestors within the discovered cgroup mount, excluding the launcher's populated leaf and other populated non-root candidates. It does not move existing processes or enable unrelated controllers. The host is attached before its executable can run. Its memory ceiling remains the minimum of 768 MiB, one eighth of physical memory, and the launcher's inherited memory limits; a result below 256 MiB is refused.
 
 This is an availability tradeoff, not just a wording change. Some Linux sessions that previously attempted unsupervised web hosting will now refuse it. The reason is that process-group cleanup alone cannot reliably identify a descendant that detaches and is reparented before its host crashes.
+
+The cgroup's `cgroup.kill` control is the authoritative process-tree escalation. Raw descendant-PID scans are retired, not a second cleanup guarantee. Graceful process-group SIGTERM is allowed only while the original root remains unreaped; once its exit has been observed and reaped, teardown never signals its numeric PID or process group again. PR8B-L14 explains the PID-reuse safety correction.
 
 ## Engine, C interface, and real-engine tests
 
@@ -368,7 +372,7 @@ This is an availability tradeoff, not just a wording change. Some Linux sessions
 
 **Problem and context:** Process groups plus a later ancestry scan cannot reliably find a process that detached and was reparented before its root exited. The previous unavailable-cgroup path still executed the host with only a warning, despite this cleanup limitation.
 
-**Fix and decision:** The user chose mandatory cgroup supervision. Missing/unusable memory, attachment, or kill controls now cause a named startup refusal before host execution. The owned cgroup lease is mandatory and its kill operation is used even after root exit. Warning-only startup plumbing and its consumer were removed. The ordinary launcher remains available.
+**Fix and decision:** The user chose mandatory cgroup supervision. Missing/unusable memory, attachment, or kill controls now cause a named startup refusal before host execution. The owned cgroup lease is mandatory and its kill operation is used even after root exit. Warning-only startup plumbing and its consumer were removed. The ordinary launcher remains available. PR8B-L14 removes the obsolete raw-PID fallback that initially remained alongside this cgroup cleanup.
 
 **Verification:** Deterministic tests cover unavailable delegation, absent/failed controls, invalid and below-floor inherited limits, refusal cleanup, no execution after failed attachment, and root-exited cleanup. An opt-in test also ran successfully against actual delegated cgroups and killed a detached child. PR8B-L13 makes the hierarchy selection workable; PR8B-P15 documents the availability tradeoff.
 
@@ -411,6 +415,20 @@ This is an availability tradeoff, not just a wording change. Some Linux sessions
 **Fix:** Discover the actual cgroup2 mount and search eligible proper ancestors. Require an already-enabled memory subtree, an empty non-root parent, writable migration permissions, and a private child with functioning memory/attachment/kill controls. Exclude the launcher leaf, enforce mount boundaries, and reject traversal or symlink escape. Do not move existing processes or enable unrelated controllers. Preserve the original launcher's inherited memory ceiling even when choosing a sibling location. Failed candidate setup removes its directory.
 
 **Verification:** Fake hierarchies cover valid topology, populated/ineligible parents, controller and permission refusal, candidate cleanup/retry, inherited caps, mount boundaries, and no execution on refusal. The ignored real-delegation regression was explicitly run in the WPE container and passed. See [Linux's no-internal-process constraint](https://docs.kernel.org/admin-guide/cgroup-v2.html#no-internal-process-constraint).
+
+### PR8B-L14 — Remembered process IDs could kill an unrelated process after reuse
+
+**Where:** `web_host.rs::terminate_child_tree` and its obsolete procfs descendant helpers; companion cleanup wording in ADR-0020, the author guide, and the specification.
+
+**Problem and context:** Teardown remembered descendant PIDs, then used `Child::try_wait` to observe and reap the root. It continued signaling numeric PIDs and the original process group, and reused remembered PIDs as ancestry-scan roots. Once a process is reaped, Linux may assign its PID to an unrelated process. A later scan or signal could therefore reach outside the supervised host tree. This is a confirmed unsafe cleanup path, not a claim that an unrelated process was observed being killed.
+
+**Fix:** Use the already-required dedicated cgroup's `cgroup.kill` as the authoritative process-tree escalation. Remove the raw descendant-PID collection, repeated procfs ancestry scans, and numeric descendant-kill fallback rather than adding a pidfd abstraction. Allow graceful process-group SIGTERM only while the original root is still unreaped; after `try_wait` observes and reaps its exit, never signal its numeric PID or group again. Replace the final unbounded wait with bounded reaping polls and an error diagnostic if the kernel cannot complete exit promptly. Cgroup cleanup still runs after root exit and covers detached or reparented descendants. The companion documentation explicitly states this contract.
+
+**Coverage added or retained:** `already_reaped_root_bypasses_numeric_signaling_and_still_kills_cgroup` starts with an explicitly reaped root, installs a group-signal callback that panics if called, and checks that the cgroup kill control is still written. It tests the no-later-signal boundary without touching an unrelated process or forcing real PID reuse. `graceful_root_close_runs_before_cgroup_escalation` checks the SIGTERM-handler marker, successful reaping, and mandatory cgroup kill after graceful exit. The obsolete procfs/fake-control descendant tests are replaced by opt-in real-delegation tests `exited_root_still_cleans_up_its_detached_cgroup_child` and `cgroup_cleanup_contains_a_late_detached_descendant`. The retained `real_delegated_cgroup_contains_and_kills_a_detached_child` also gains an explicit root-reaping assertion. All three real-delegation tests passed when explicitly executed in the delegated container.
+
+**Integration fixture correction:** The first late-detached real-cgroup run exposed a test-shell mistake: the SIGTERM trap called `close_host` without forwarding its positional argument, leaving the function's `$1` empty. The coordinator corrected the trap to `trap 'close_host "$1"' TERM` without weakening assertions. This is part of PR8B-L14's regression integration, not another original-code finding. The subsequent three-test real-cgroup run passed.
+
+**Verification status:** Fresh coordinator formatting, workspace check/clippy, 32 focused supervision tests, full workspace tests, documentation tests, and all three opt-in real-delegation cases passed after the correction.
 
 ## UI rendering, input, composition, and viewport ownership
 
@@ -798,30 +816,31 @@ The renderer requests ordinary downlevel device limits while native surface conf
 
 ## Final local verification record
 
-These commands completed successfully against the settled source after the final captured-departure correction:
+The final formatting, workspace check/clippy, workspace tests, documentation tests, and delegated cleanup tests were rerun after PR8B-L14. Earlier successful engine, packaging, Python, external-consumer, and cross-target checks remain applicable: their source did not change in that final cleanup correction.
 
 | Gate | Result |
 | --- | --- |
 | `cargo fmt --all --check` | Passed |
 | `cargo check --workspace --all-targets` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace --all-targets` | 2,527 passed; 2 ignored; 28 filtered |
+| `cargo test --workspace --all-targets` | 2,526 passed; 4 ignored; 28 filtered |
 | `cargo test --workspace --doc` | 1 passed |
 | `bash -n packaging/linux/build.sh packaging/linux/tests/build.test.sh` | Passed |
 | `bash packaging/linux/tests/build.test.sh` | 83 passed |
 | Repository virtual-environment Python `-m compileall -q sdk/python crates/crikey-legacy-compat/python compatibility/test-plugins` | Passed |
 | WPE container: `RUSTFLAGS="-D warnings" cargo test -p crikey-web-host --features engine` | 72 library tests, 3 CLI tests, and 6 real-engine tests passed |
-| Delegated container: `cargo test -p crikey-cli real_delegated_cgroup_contains_and_kills_a_detached_child -- --ignored --nocapture` | Explicitly selected real-cgroup test passed |
+| Delegated container: `cargo test -p crikey-cli --lib web_host::tests -- --ignored --nocapture` | All 3 selected real-cgroup tests passed |
 | `cargo check -p crikey-web-host --all-targets --all-features --target aarch64-apple-darwin` | Passed without installed WPE dependencies |
 | `cargo check -p crikey-web-host --all-targets --all-features --target x86_64-pc-windows-gnu` | Passed without installed WPE dependencies |
 | `cargo check --locked --manifest-path compatibility/native-conformance/Cargo.toml --all-targets` | External SDK consumer passed |
+| `cargo test -p crikey-cli --lib web_host::tests -- --nocapture` | 32 passed; 3 delegation-dependent tests ignored in the ordinary environment |
 
-The normally ignored real-cgroup test was run separately because ordinary CI runners need not provide writable delegation. Its code and the cgroup implementation did not change after that successful run. The later source correction was limited to UI pointer handling; the final workspace gate includes that correction. Hosted cross-platform CI results are recorded on the pull request after publication, not inferred from these local gates.
+The normally ignored cgroup tests were run separately because ordinary CI runners need not provide writable delegation. They exercise a detached child, an already-exited root with a surviving detached child, and a descendant created during graceful termination. Hosted cross-platform CI results are recorded on the pull request after publication, not inferred from these local gates.
 
 ## Verification limits
 
 - Real WPE tests run with WPE WebKit 2.52.6, WPEBackend-fdo 1.16.1, and libwpe 1.16.3. The headless container emits expected software-GPU/accessibility-bus diagnostics; passing tests require actual exported document pixels, not absence of those messages.
-- Real delegated cgroup containment was exercised, including a detached child and cleanup. The normal deterministic suite also covers root-exited cleanup; the opt-in real test does not combine every possible crash timing in one scenario.
+- Real delegated cgroup containment and killing were exercised for all three scenarios above. This does not claim exhaustive coverage of every kernel scheduling, process-crash, or uninterruptible-I/O timing.
 - No Miri, address/thread sanitizer, native screen-reader bridge, mixed-DPI hardware transition, or real ibus/fcitx interoperability run is claimed.
 - The maximal-stride regression includes a 32-bit branch, but the runtime verification here is 64-bit.
 - Linux is the supported WPE engine platform. Cross-platform CI verifies that ordinary macOS/Windows builds remain usable without WPE; it does not establish a web engine on those systems.
