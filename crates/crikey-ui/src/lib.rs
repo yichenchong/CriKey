@@ -163,6 +163,8 @@ pub enum WebSurfaceInput {
         timestamp_ms: u64,
         pressed: bool,
         keysym: u32,
+        /// XKB keycode on the Linux WPE path (evdev scancode plus eight).
+        /// Zero when the input source has no hardware-key identity.
         hardware_keycode: u32,
         repeat: bool,
         modifiers: u32,
@@ -1162,8 +1164,8 @@ impl LauncherViewModel {
 
     /// Updates the web engine's page-local caret rectangle.
     ///
-    /// Non-finite and negative extents are refused rather than passed to the
-    /// window system. A duplicate report costs no repaint.
+    /// Non-finite coordinates, overflowing endpoints, and negative extents are
+    /// refused rather than passed to the window system. A duplicate costs no repaint.
     pub fn update_web_caret_area(
         &mut self,
         surface_id: u64,
@@ -1178,6 +1180,8 @@ impl LauncherViewModel {
         let area = (x, y, width, height);
         if page.web_surface_id != Some(surface_id)
             || ![x, y, width, height].iter().all(|value| value.is_finite())
+            || !(x + width).is_finite()
+            || !(y + height).is_finite()
             || width < 0.0
             || height < 0.0
             || page.web_caret_area == Some(area)

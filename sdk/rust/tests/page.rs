@@ -516,10 +516,32 @@ fn the_web_surface_builder_sets_safe_defaults_and_validates_absolute_urls() {
         "https:///missing-authority",
         "https://white space.invalid/",
         "https://example.invalid/\nnext",
+        "https://example.invalid/\0next",
     ] {
         assert!(
             WebSurfaceBuilder::navigate(6, invalid).build().is_err(),
             "{invalid:?} must be refused before it crosses the plugin boundary"
         );
     }
+}
+
+#[test]
+fn web_surface_builder_enforces_the_core_byte_limit() {
+    let prefix = "https://example.invalid/";
+    let url = format!(
+        "{prefix}{}",
+        "a".repeat(crikey_core::MAX_NODE_TEXT_BYTES - prefix.len())
+    );
+    WebSurfaceBuilder::navigate(1, &url)
+        .build()
+        .expect("the exact byte limit is admitted");
+    let error = WebSurfaceBuilder::navigate(2, format!("{url}é"))
+        .build()
+        .expect_err("a multi-byte character exceeds the byte limit");
+    assert!(
+        error
+            .to_string()
+            .contains(&(crikey_core::MAX_NODE_TEXT_BYTES + 2).to_string()),
+        "the SDK reports the actual byte count: {error}"
+    );
 }

@@ -7,7 +7,8 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::cell::{Cell, RefCell};
+use std::ffi::{c_char, c_void, CString};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd;
@@ -15,10 +16,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crikey_native_protocol::message::{
     CaretArea, Envelope, Gone, LoadState, Payload, WebGoneCode, WebImeCode, WebLoadCode, WebStorageMode,
@@ -37,6 +39,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const SHUTDOWN_FORCE_TIMEOUT: Duration = Duration::from_secs(2);
 const COMMAND_CAPACITY: usize = 64;
 const COMMANDS_PER_DISPATCH: usize = 32;
+// Page-controlled informational strings must not turn a bounded output queue
+// into unbounded allocations or exceed the transport's frame limit.
+const MAX_ENGINE_TEXT_BYTES: usize = 8_192;
 const CK_WEB_INIT_OK: i32 = 0;
 const CK_WEB_STORAGE_EPHEMERAL: i32 = 1;
 const CK_WEB_STORAGE_PERSISTENT: i32 = 2;
@@ -88,9 +93,39 @@ impl SocketTransport {
     }
 
     fn recv(&mut self) -> Result<Envelope, ProtocolError> {
+        self.recv_from(None)
+    }
+
+    fn recv_until(&mut self, deadline: Instant) -> Result<Envelope, ProtocolError> {
+        self.recv_from(Some(deadline))
+    }
+
+    fn recv_from(&mut self, deadline: Option<Instant>) -> Result<Envelope, ProtocolError> {
         let mut bytes = Vec::new();
-        self.reader.read_frame(&mut self.stream, &mut bytes)?;
+        let mut reader = DeadlineReader {
+            stream: &mut self.stream,
+            deadline,
+        };
+        self.reader.read_frame(&mut reader, &mut bytes)?;
         Envelope::decode(&bytes)
+    }
+}
+
+struct DeadlineReader<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Option<Instant>,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "OpenSurface deadline expired"))?;
+            self.stream.set_read_timeout(Some(remaining))?;
+        }
+        self.stream.read(bytes)
     }
 }
 
@@ -128,9 +163,9 @@ pub fn run(endpoint: Endpoint, storage_dir: Option<PathBuf>) -> Result<(), RunEr
     let stream = UnixStream::connect(path)?;
     let control = stream.try_clone()?;
     let mut writer = SocketTransport::new(stream);
-    writer.set_read_timeout(Some(FIRST_COMMAND_TIMEOUT))?;
+    writer.stream.set_write_timeout(Some(SHUTDOWN_GRACE))?;
 
-    let first = match writer.recv() {
+    let first = match writer.recv_until(Instant::now() + FIRST_COMMAND_TIMEOUT) {
         Ok(first) => first,
         Err(error) => {
             let _ = send_direct_gone(
@@ -143,7 +178,18 @@ pub fn run(endpoint: Endpoint, storage_dir: Option<PathBuf>) -> Result<(), RunEr
         }
     };
     let hinted_surface_id = payload_surface_id(first.payload.as_ref());
-    let mut state = HostState::new(storage_dir)?;
+    let mut state = match HostState::new(storage_dir) {
+        Ok(state) => state,
+        Err(error) => {
+            let _ = send_direct_gone(
+                &mut writer,
+                hinted_surface_id,
+                WebGoneCode::StartupFailed,
+                error.to_string(),
+            );
+            return Err(RunError::State(error));
+        }
+    };
     let open = match state.receive(first) {
         Ok(HostAction::Open(open)) => open,
         Ok(_) => unreachable!("HostState only accepts OpenSurface first"),
@@ -182,6 +228,7 @@ pub fn run(endpoint: Endpoint, storage_dir: Option<PathBuf>) -> Result<(), RunEr
     }
 
     writer.set_read_timeout(None)?;
+    writer.stream.set_write_timeout(None)?;
     let reader = writer.try_clone()?;
     let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
     let (terminal_tx, terminal_rx) = mpsc::channel();
@@ -220,8 +267,13 @@ pub fn run(endpoint: Endpoint, storage_dir: Option<PathBuf>) -> Result<(), RunEr
     let user = (&mut *runtime as *mut Runtime).cast::<c_void>();
     unsafe {
         ck_web_watch_fd(runtime.wake_read.as_raw_fd(), Some(on_commands_ready), user);
-        ck_web_watch_termination(Some(on_termination), user);
-        ck_web_run();
+        ck_web_watch_termination(
+            Some(on_termination),
+            Rc::as_ptr(&runtime.callbacks).cast_mut().cast(),
+        );
+        if !runtime.callbacks.terminating.get() {
+            ck_web_run();
+        }
     }
 
     runtime.shutdown_engine();
@@ -311,10 +363,9 @@ fn write_wake_byte(mut write: impl FnMut() -> io::Result<usize>) -> io::Result<(
 fn signal_loop(wake: &mut UnixStream) {
     if write_wake_byte(|| wake.write(&[1])).is_err() {
         // Closing the shared socket endpoint leaves a persistent HUP for GLib,
-        // including when this failure races loop startup. Quitting also wakes
-        // and stops an already-running loop immediately.
+        // including when this failure races loop startup. Only the loop thread
+        // may access the C loop: cleanup can otherwise race a worker's quit.
         let _ = wake.shutdown(Shutdown::Both);
-        unsafe { ck_web_quit() };
     }
 }
 
@@ -446,13 +497,9 @@ struct Runtime {
     commands: Receiver<Envelope>,
     terminal: Receiver<TerminalEvent>,
     wake_read: UnixStream,
-    recycle: Receiver<Vec<u8>>,
-    output: Arc<OutputBuffer>,
-    frame_converter: FrameConverter,
+    callbacks: Rc<CallbackState>,
     ime: ImeBridge,
     engine: EngineLoop,
-    gone_sent: bool,
-    terminating: bool,
 }
 
 impl Runtime {
@@ -465,19 +512,16 @@ impl Runtime {
         output: Arc<OutputBuffer>,
         engine: EngineLoop,
     ) -> Self {
+        let surface_id = state.surface_id().unwrap_or(0);
         Self {
             state,
             surface: None,
             commands,
             terminal,
             wake_read,
-            recycle,
-            output,
-            frame_converter: FrameConverter::new(),
+            callbacks: Rc::new(CallbackState::new(surface_id, recycle, output)),
             ime: ImeBridge::new(),
             engine,
-            gone_sent: false,
-            terminating: false,
         }
     }
 
@@ -493,12 +537,10 @@ impl Runtime {
         let storage_mode = match open.storage_mode {
             WebStorageMode::Ephemeral => CK_WEB_STORAGE_EPHEMERAL,
             WebStorageMode::Persistent => CK_WEB_STORAGE_PERSISTENT,
-            WebStorageMode::ModeUnspecified => {
-                return Err(RunError::State(StateError::UnspecifiedStorageMode));
-            }
+            WebStorageMode::ModeUnspecified => CK_WEB_STORAGE_EPHEMERAL,
         };
         let callbacks = CkWebCallbacks {
-            user: (self as *mut Runtime).cast::<c_void>(),
+            user: Rc::as_ptr(&self.callbacks).cast_mut().cast::<c_void>(),
             frame: Some(on_frame),
             caret: Some(on_caret),
             load_state: Some(on_load_state),
@@ -522,11 +564,17 @@ impl Runtime {
     }
 
     fn process_commands(&mut self) {
-        if self.terminating {
+        if self.callbacks.terminating.get() {
             return;
         }
         let mut bytes = [0_u8; COMMANDS_PER_DISPATCH];
-        let count = match self.wake_read.read(&mut bytes) {
+        let ready = loop {
+            match self.wake_read.read(&mut bytes) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result,
+            }
+        };
+        let count = match ready {
             Ok(0) => {
                 self.disconnect("transport wakeup closed".to_owned());
                 return;
@@ -561,19 +609,26 @@ impl Runtime {
                     break;
                 }
             }
-            if self.terminating {
+            if self.callbacks.terminating.get() {
                 break;
             }
         }
     }
 
     fn apply(&mut self, action: HostAction) {
-        if self.terminating {
+        if self.callbacks.terminating.get() {
             return;
         }
-        if !matches!(action, HostAction::Ime(_)) {
-            let ops = self.ime.flush();
-            self.apply_ime_ops(ops);
+        let ops = match &action {
+            HostAction::Navigate(_)
+            | HostAction::Close { .. }
+            | HostAction::Input(EngineInput::Focus(false)) => self.ime.cancel(),
+            HostAction::Ime(_) => Vec::new(),
+            _ => self.ime.flush(),
+        };
+        self.apply_ime_ops(ops);
+        if self.callbacks.terminating.get() {
+            return;
         }
         let Some(surface) = self.surface else {
             self.protocol_fault("command arrived without a live surface".to_owned());
@@ -667,8 +722,18 @@ impl Runtime {
                     y,
                     delta_x,
                     delta_y,
+                    precise,
                     modifiers,
-                } => ck_web_surface_axis(surface.as_ptr(), time_ms, x, y, delta_x, delta_y, modifiers),
+                } => ck_web_surface_axis(
+                    surface.as_ptr(),
+                    time_ms,
+                    x,
+                    y,
+                    delta_x,
+                    delta_y,
+                    i32::from(precise),
+                    modifiers,
+                ),
                 EngineInput::Focus(focused) => {
                     ck_web_surface_focus(surface.as_ptr(), i32::from(focused));
                 }
@@ -681,6 +746,9 @@ impl Runtime {
             return;
         };
         for op in ops {
+            if self.callbacks.terminating.get() {
+                break;
+            }
             unsafe {
                 match op {
                     ImeOp::SetPreedit { text, cursor_chars } => {
@@ -707,23 +775,8 @@ impl Runtime {
         }
     }
 
-    fn push(&mut self, payload: Payload) {
-        if let Some(rgba) = self.output.push(envelope(payload)) {
-            self.frame_converter.recycle(rgba);
-        }
-    }
-
-    fn emit_gone(&mut self, reason: WebGoneCode, detail: String) {
-        if self.gone_sent {
-            return;
-        }
-        self.gone_sent = true;
-        self.push(Payload::Gone(Gone {
-            surface_id: self.state.surface_id().unwrap_or(0),
-            reason,
-            detail,
-            ..Default::default()
-        }));
+    fn emit_gone(&self, reason: WebGoneCode, detail: String) {
+        self.callbacks.emit_gone(reason, detail);
     }
 
     fn protocol_fault(&mut self, detail: String) {
@@ -736,11 +789,8 @@ impl Runtime {
         self.quit();
     }
 
-    fn quit(&mut self) {
-        if !self.terminating {
-            self.terminating = true;
-            unsafe { ck_web_quit() };
-        }
+    fn quit(&self) {
+        self.callbacks.quit();
     }
 
     fn destroy_surface(&mut self) {
@@ -750,19 +800,77 @@ impl Runtime {
     }
 
     fn shutdown_engine(&mut self) {
-        self.terminating = true;
+        self.callbacks.terminating.set(true);
+        let _ = self.ime.cancel();
         self.destroy_surface();
         self.engine.cleanup();
     }
+}
 
-    fn take_recycled_frame(&mut self) {
-        while let Ok(rgba) = self.recycle.try_recv() {
-            self.frame_converter.recycle(rgba);
+// Surface callbacks may be emitted synchronously by any WPE call. They must
+// never reconstruct a second &mut Runtime while a command is borrowing it.
+// Rc gives the C userdata a stable shared allocation independent of Runtime's
+// exclusive command borrow; only the frame converter needs interior mutation.
+#[derive(Debug)]
+struct CallbackState {
+    surface_id: u64,
+    recycle: Receiver<Vec<u8>>,
+    output: Arc<OutputBuffer>,
+    frame_converter: RefCell<FrameConverter>,
+    gone_sent: Cell<bool>,
+    terminating: Cell<bool>,
+}
+
+impl CallbackState {
+    fn new(surface_id: u64, recycle: Receiver<Vec<u8>>, output: Arc<OutputBuffer>) -> Self {
+        Self {
+            surface_id,
+            recycle,
+            output,
+            frame_converter: RefCell::new(FrameConverter::new()),
+            gone_sent: Cell::new(false),
+            terminating: Cell::new(false),
         }
     }
 
-    fn receive_frame(&mut self, bgra: *const u8, width: u32, height: u32, stride: u32) {
-        if self.terminating || bgra.is_null() {
+    fn push(&self, payload: Payload) {
+        if let Some(rgba) = self.output.push(envelope(payload)) {
+            self.frame_converter.borrow_mut().recycle(rgba);
+        }
+    }
+
+    fn emit_gone(&self, reason: WebGoneCode, mut detail: String) {
+        if self.gone_sent.replace(true) {
+            return;
+        }
+        truncate_text(&mut detail);
+        self.push(Payload::Gone(Gone {
+            surface_id: self.surface_id,
+            reason,
+            detail,
+            ..Default::default()
+        }));
+    }
+
+    fn protocol_fault(&self, detail: String) {
+        self.emit_gone(WebGoneCode::ProtocolViolation, detail);
+        self.quit();
+    }
+
+    fn quit(&self) {
+        if !self.terminating.replace(true) {
+            unsafe { ck_web_quit() };
+        }
+    }
+
+    fn take_recycled_frame(&self) {
+        while let Ok(rgba) = self.recycle.try_recv() {
+            self.frame_converter.borrow_mut().recycle(rgba);
+        }
+    }
+
+    fn receive_frame(&self, bgra: *const u8, width: u32, height: u32, stride: u32) {
+        if self.terminating.get() || bgra.is_null() {
             return;
         }
         self.take_recycled_frame();
@@ -785,6 +893,10 @@ impl Runtime {
                 return;
             }
         };
+        if (stride as usize) < row_bytes || required > isize::MAX as usize {
+            self.engine_frame_fault("exported frame stride or mapping size is invalid");
+            return;
+        }
         // Refuse impossible geometry before forming a slice from the borrowed
         // mapping. The C shim has already verified stride and owns the mapping
         // for this callback's duration.
@@ -803,17 +915,17 @@ impl Runtime {
             }
             _ => unsafe { std::slice::from_raw_parts(bgra, required) },
         };
-        let surface_id = self.state.surface_id().unwrap_or(0);
-        match self
-            .frame_converter
-            .convert(surface_id, pixels, width, height, stride)
-        {
+        let converted =
+            self.frame_converter
+                .borrow_mut()
+                .convert(self.surface_id, pixels, width, height, stride);
+        match converted {
             Ok(frame) => self.push(Payload::WebFrame(frame)),
             Err(error) => self.engine_frame_fault(&error.to_string()),
         }
     }
 
-    fn engine_frame_fault(&mut self, detail: &str) {
+    fn engine_frame_fault(&self, detail: &str) {
         self.emit_gone(WebGoneCode::Crashed, detail.to_owned());
         self.quit();
     }
@@ -832,8 +944,8 @@ unsafe extern "C" fn on_commands_ready(user: *mut c_void) {
 }
 
 unsafe extern "C" fn on_termination(user: *mut c_void) {
-    if let Some(runtime) = (user as *mut Runtime).as_mut() {
-        if runtime.terminating {
+    if let Some(runtime) = (user as *const CallbackState).as_ref() {
+        if runtime.terminating.get() {
             return;
         }
         runtime.emit_gone(WebGoneCode::Closed, "web host terminated".to_owned());
@@ -842,18 +954,18 @@ unsafe extern "C" fn on_termination(user: *mut c_void) {
 }
 
 unsafe extern "C" fn on_frame(user: *mut c_void, bgra: *const u8, width: u32, height: u32, stride: u32) {
-    if let Some(runtime) = (user as *mut Runtime).as_mut() {
+    if let Some(runtime) = (user as *const CallbackState).as_ref() {
         runtime.receive_frame(bgra, width, height, stride);
     }
 }
 
 unsafe extern "C" fn on_caret(user: *mut c_void, x: i32, y: i32, width: i32, height: i32) {
-    if let Some(runtime) = (user as *mut Runtime).as_mut() {
-        if runtime.terminating {
+    if let Some(runtime) = (user as *const CallbackState).as_ref() {
+        if runtime.terminating.get() {
             return;
         }
         runtime.push(Payload::CaretArea(CaretArea {
-            surface_id: runtime.state.surface_id().unwrap_or(0),
+            surface_id: runtime.surface_id,
             x: x as f32,
             y: y as f32,
             width: width.max(0) as f32,
@@ -872,8 +984,8 @@ unsafe extern "C" fn on_load_state(
     can_go_forward: i32,
     title: *const c_char,
 ) {
-    if let Some(runtime) = (user as *mut Runtime).as_mut() {
-        if runtime.terminating {
+    if let Some(runtime) = (user as *const CallbackState).as_ref() {
+        if runtime.terminating.get() {
             return;
         }
         let state = WebLoadCode::from_i32(state);
@@ -882,7 +994,7 @@ unsafe extern "C" fn on_load_state(
             return;
         }
         runtime.push(Payload::LoadState(LoadState {
-            surface_id: runtime.state.surface_id().unwrap_or(0),
+            surface_id: runtime.surface_id,
             state,
             url: borrowed_c_string(url),
             failure: borrowed_c_string(failure),
@@ -895,8 +1007,8 @@ unsafe extern "C" fn on_load_state(
 }
 
 unsafe extern "C" fn on_gone(user: *mut c_void, reason: i32, detail: *const c_char) {
-    if let Some(runtime) = (user as *mut Runtime).as_mut() {
-        if runtime.terminating {
+    if let Some(runtime) = (user as *const CallbackState).as_ref() {
+        if runtime.terminating.get() {
             return;
         }
         let reason = WebGoneCode::from_i32(reason);
@@ -912,10 +1024,24 @@ unsafe extern "C" fn on_gone(user: *mut c_void, reason: i32, detail: *const c_ch
 
 unsafe fn borrowed_c_string(value: *const c_char) -> String {
     if value.is_null() {
-        String::new()
-    } else {
-        CStr::from_ptr(value).to_string_lossy().into_owned()
+        return String::new();
     }
+    let mut length = 0;
+    while length < MAX_ENGINE_TEXT_BYTES && *value.add(length) != 0 {
+        length += 1;
+    }
+    let bytes = std::slice::from_raw_parts(value.cast::<u8>(), length);
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    truncate_text(&mut text);
+    text
+}
+
+fn truncate_text(text: &mut String) {
+    let mut end = text.len().min(MAX_ENGINE_TEXT_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
 
 #[repr(C)]
@@ -977,6 +1103,7 @@ extern "C" {
         y: i32,
         delta_x: f64,
         delta_y: f64,
+        precise: i32,
         modifiers: u32,
     );
     fn ck_web_surface_focus(surface: *mut CkWebSurface, focused: i32);
@@ -994,9 +1121,23 @@ extern "C" {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::ffi::CString;
+    use std::io::{self, Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::ptr;
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    use super::write_wake_byte;
+    use crikey_native_protocol::message::{Payload, WebGoneCode, WebLoadCode};
+    use crikey_native_protocol::ProtocolError;
+
+    use crate::output::OutputBuffer;
+
+    use super::{
+        borrowed_c_string, on_load_state, write_wake_byte, CallbackState, DeadlineReader, SocketTransport,
+        MAX_ENGINE_TEXT_BYTES,
+    };
 
     #[test]
     fn wake_write_retries_interruption_until_the_byte_is_written() {
@@ -1038,5 +1179,86 @@ mod tests {
         let result = write_wake_byte(|| Ok(0));
 
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[test]
+    fn startup_deadline_is_not_extended_by_a_drip_fed_partial_frame() {
+        let (mut peer, stream) = UnixStream::pair().unwrap();
+        peer.write_all(&[0, 0, 0, 20]).unwrap();
+        let drip = thread::spawn(move || {
+            for _ in 0..20 {
+                thread::sleep(Duration::from_millis(5));
+                if peer.write_all(&[0]).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut transport = SocketTransport::new(stream);
+        assert!(matches!(
+            transport.recv_until(Instant::now() + Duration::from_millis(20)),
+            Err(ProtocolError::Timeout)
+        ));
+        drop(transport);
+        drip.join().unwrap();
+    }
+
+    #[test]
+    fn expired_startup_deadline_does_not_consume_already_available_bytes() {
+        let (mut peer, mut stream) = UnixStream::pair().unwrap();
+        peer.write_all(b"ab").unwrap();
+        let mut reader = DeadlineReader {
+            stream: &mut stream,
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
+        };
+        let mut byte = [0];
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        stream.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [b'a']);
+    }
+
+    #[test]
+    fn callback_metadata_is_bounded_before_copying_and_preserves_utf8() {
+        let (_, recycle) = mpsc::channel();
+        let output = Arc::new(OutputBuffer::new());
+        let callbacks = CallbackState::new(7, recycle, Arc::clone(&output));
+        let title = CString::new("é".repeat(MAX_ENGINE_TEXT_BYTES)).unwrap();
+        unsafe {
+            on_load_state(
+                ptr::from_ref(&callbacks).cast_mut().cast(),
+                WebLoadCode::Finished as i32,
+                title.as_ptr(),
+                title.as_ptr(),
+                0,
+                0,
+                title.as_ptr(),
+            );
+        }
+        let Some(Payload::LoadState(state)) = output.pop().unwrap().payload else {
+            panic!("expected load state");
+        };
+        assert_eq!(state.surface_id, 7);
+        for value in [state.title, state.url, state.failure] {
+            assert!(value.len() <= MAX_ENGINE_TEXT_BYTES);
+            assert!(value.chars().all(|character| character == 'é'));
+        }
+        assert!(unsafe { borrowed_c_string(ptr::null()) }.is_empty());
+    }
+
+    #[test]
+    fn terminal_detail_is_bounded_and_callbacks_cannot_replace_it() {
+        let (_, recycle) = mpsc::channel();
+        let output = Arc::new(OutputBuffer::new());
+        let callbacks = CallbackState::new(7, recycle, Arc::clone(&output));
+        callbacks.emit_gone(WebGoneCode::Closed, "界".repeat(MAX_ENGINE_TEXT_BYTES));
+        callbacks.emit_gone(WebGoneCode::Crashed, "second cause".to_owned());
+        let Some(Payload::Gone(gone)) = output.pop().unwrap().payload else {
+            panic!("expected terminal Gone");
+        };
+        assert_eq!(gone.reason, WebGoneCode::Closed);
+        assert!(gone.detail.len() <= MAX_ENGINE_TEXT_BYTES);
+        assert!(gone.detail.chars().all(|character| character == '界'));
     }
 }

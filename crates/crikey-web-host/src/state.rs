@@ -4,6 +4,8 @@
 //! actions produced here. All untrusted wire fields are validated before an
 //! engine call can observe them.
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crikey_native_protocol::message::{
@@ -55,8 +57,6 @@ pub enum StateError {
     InvalidUrl,
     #[error("web URL contains a control character")]
     UrlControlCharacter,
-    #[error("storage mode is unspecified")]
-    UnspecifiedStorageMode,
     #[error("persistent storage was requested without a storage directory")]
     MissingStorageDirectory,
     #[error("storage directory must be an absolute path without NUL bytes")]
@@ -147,14 +147,16 @@ impl HostState {
         }
         validate_dimensions(open.pixel_width, open.pixel_height)?;
         validate_url(&open.url)?;
-        let storage_dir = match open.storage_mode {
-            WebStorageMode::Ephemeral => None,
-            WebStorageMode::Persistent => Some(
-                self.storage_dir
-                    .clone()
-                    .ok_or(StateError::MissingStorageDirectory)?,
+        let (storage_mode, storage_dir) = match open.storage_mode {
+            WebStorageMode::Ephemeral | WebStorageMode::ModeUnspecified => (WebStorageMode::Ephemeral, None),
+            WebStorageMode::Persistent => (
+                WebStorageMode::Persistent,
+                Some(
+                    self.storage_dir
+                        .clone()
+                        .ok_or(StateError::MissingStorageDirectory)?,
+                ),
             ),
-            WebStorageMode::ModeUnspecified => return Err(StateError::UnspecifiedStorageMode),
         };
         self.surface_id = Some(open.surface_id);
         Ok(HostAction::Open(OpenSpec {
@@ -162,7 +164,7 @@ impl HostState {
             pixel_width: open.pixel_width,
             pixel_height: open.pixel_height,
             url: open.url,
-            storage_mode: open.storage_mode,
+            storage_mode,
             storage_dir,
         }))
     }
@@ -187,7 +189,6 @@ pub fn validate_storage_dir(path: &Path) -> Result<(), StateError> {
 
 #[cfg(unix)]
 fn path_has_nul(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
     path.as_os_str().as_bytes().contains(&0)
 }
 
@@ -406,5 +407,138 @@ mod tests {
             })
         );
         assert_eq!(state.receive(open(9)), Err(StateError::AlreadyClosed));
+    }
+
+    #[test]
+    fn unspecified_storage_is_ephemeral_even_with_a_persistent_directory() {
+        let directory = std::env::temp_dir().join("crikey-web-host-storage");
+        for configured in [None, Some(directory)] {
+            let mut state = HostState::new(configured).unwrap();
+            let Payload::OpenSurface(mut request) = open(7).payload.unwrap() else {
+                unreachable!()
+            };
+            request.storage_mode = WebStorageMode::ModeUnspecified;
+            let HostAction::Open(spec) = state.receive(envelope(Payload::OpenSurface(request))).unwrap()
+            else {
+                unreachable!()
+            };
+            assert_eq!(spec.storage_mode, WebStorageMode::Ephemeral);
+            assert_eq!(spec.storage_dir, None);
+        }
+    }
+
+    #[test]
+    fn persistent_storage_uses_only_the_configured_absolute_directory() {
+        assert!(matches!(
+            HostState::new(Some(PathBuf::from("relative/storage"))),
+            Err(StateError::InvalidStorageDirectory)
+        ));
+        let directory = std::env::temp_dir().join("crikey-web-host-storage");
+        let mut state = HostState::new(Some(directory.clone())).unwrap();
+        let Payload::OpenSurface(mut request) = open(7).payload.unwrap() else {
+            unreachable!()
+        };
+        request.storage_mode = WebStorageMode::Persistent;
+        let HostAction::Open(spec) = state.receive(envelope(Payload::OpenSurface(request))).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(spec.storage_mode, WebStorageMode::Persistent);
+        assert_eq!(spec.storage_dir, Some(directory));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_directory_rejects_embedded_nul_before_ffi() {
+        let directory = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/storage\0other"));
+        assert_eq!(
+            validate_storage_dir(directory),
+            Err(StateError::InvalidStorageDirectory)
+        );
+    }
+
+    #[test]
+    fn rejected_open_does_not_claim_a_surface_and_valid_open_can_follow() {
+        let mut state = HostState::new(None).unwrap();
+        let Payload::OpenSurface(mut request) = open(7).payload.unwrap() else {
+            unreachable!()
+        };
+        request.url = "https:///missing-host".to_owned();
+        assert_eq!(
+            state.receive(envelope(Payload::OpenSurface(request))),
+            Err(StateError::InvalidUrl)
+        );
+        assert_eq!(state.surface_id(), None);
+        assert!(matches!(state.receive(open(8)), Ok(HostAction::Open(_))));
+        assert_eq!(state.surface_id(), Some(8));
+    }
+
+    #[test]
+    fn dimensions_accept_the_exact_byte_limit_but_not_the_next_row() {
+        assert_eq!(validate_dimensions(1024, 512), Ok(()));
+        assert_eq!(
+            validate_dimensions(1024, 513),
+            Err(StateError::InvalidDimensions {
+                width: 1024,
+                height: 513
+            })
+        );
+        assert!(validate_dimensions(u32::MAX, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn ime_cursor_validation_counts_characters_not_utf8_bytes() {
+        let mut event = ImeEvent {
+            kind: WebImeCode::Preedit,
+            text: "\u{4f60}\u{20bb7}".to_owned(),
+            has_cursor: true,
+            cursor_begin_chars: 1,
+            cursor_end_chars: 2,
+            ..Default::default()
+        };
+        assert_eq!(validate_ime(&event), Ok(()));
+        event.cursor_end_chars = 3;
+        assert_eq!(validate_ime(&event), Err(StateError::InvalidImeCursor));
+        event.cursor_begin_chars = 2;
+        event.cursor_end_chars = 1;
+        assert_eq!(validate_ime(&event), Err(StateError::InvalidImeCursor));
+        event.has_cursor = false;
+        assert_eq!(validate_ime(&event), Err(StateError::InvalidImeCursor));
+        event.cursor_begin_chars = 0;
+        event.cursor_end_chars = 0;
+        event.kind = WebImeCode::Commit;
+        assert_eq!(validate_ime(&event), Ok(()));
+        event.has_cursor = true;
+        assert_eq!(validate_ime(&event), Err(StateError::InvalidImeCursor));
+        event.has_cursor = false;
+        event.text.push('\0');
+        assert_eq!(validate_ime(&event), Err(StateError::ImeNul));
+    }
+
+    #[test]
+    fn navigation_uses_the_same_absolute_http_url_boundary_as_open() {
+        let mut state = HostState::new(None).unwrap();
+        state.receive(open(7)).unwrap();
+        for url in [
+            "",
+            "https:relative",
+            "https:///path",
+            "https://bad host/",
+            "file:///tmp/page",
+        ] {
+            assert_eq!(
+                state.receive(envelope(Payload::Navigate(Navigate {
+                    surface_id: 7,
+                    url: url.to_owned(),
+                    ..Default::default()
+                }))),
+                Err(StateError::InvalidUrl),
+                "{url:?}"
+            );
+        }
+        assert_eq!(
+            validate_url("https://example.test/\n"),
+            Err(StateError::UrlControlCharacter)
+        );
+        assert_eq!(validate_url("HTTPS://example.test/path?q=1#fragment"), Ok(()));
     }
 }

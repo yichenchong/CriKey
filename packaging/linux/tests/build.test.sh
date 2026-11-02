@@ -304,6 +304,8 @@ refuses "an empty target element is refused" \
 	"$build" --targets stage,,tarball "$workspace/refused"
 refuses "a trailing empty target element is refused" \
 	"$build" --targets stage, "$workspace/refused"
+refuses "a newline cannot silently discard later targets" \
+	staging_build_without_web --targets $'stage\nnonsense' "$workspace/refused"
 refuses "an unknown option is refused" \
 	"$build" --nonsense "$workspace/refused"
 refuses "the deb target refuses a prefix Debian policy forbids" \
@@ -380,7 +382,7 @@ recording_tools="$workspace/recording-tools"
 mkdir -p "$recording_tools"
 cat >"$recording_tools/pkg-config" <<'EOF'
 #!/usr/bin/env bash
-exit 0
+[[ ${CRIKEY_TEST_MISSING_WPE:-} != 1 || ${2:-} != wpe-webkit-2.0 ]]
 EOF
 cat >"$recording_tools/cargo" <<'EOF'
 #!/usr/bin/env bash
@@ -392,7 +394,9 @@ if [[ $target != /* ]]; then
 	target="$PWD/$target"
 fi
 if [[ ${1:-} == metadata ]]; then
-	printf '{"target_directory":"%s"}\n' "$target"
+	escaped_target="${target//\\/\\\\}"
+	escaped_target="${escaped_target//\"/\\\"}"
+	printf '{"target_directory":"%s"}\n' "$escaped_target"
 	exit 0
 fi
 destination="$target/release"
@@ -416,6 +420,71 @@ check "engine mode asks Cargo for the real web-host binary with its engine featu
 		grep -q -- "--features engine" "$1"' _ "$cargo_log"
 check "engine mode stages the web host from Cargo's reported target directory" \
 	cmp -s "$web_host_stand_in" "$cargo_mode_out/stage/lib/crikey/crikey-web-host"
+check "Cargo metadata cannot rewrite the release lockfile" \
+	grep -q -- "metadata --locked --format-version 1 --no-deps" "$cargo_log"
+
+missing_wpe_preflight() {
+	local log="$workspace/missing-wpe-cargo.log" status=0
+	env PATH="$recording_tools:$PATH" \
+		CRIKEY_TEST_MISSING_WPE=1 \
+		CRIKEY_TEST_CARGO_LOG="$log" \
+		"$build" --with-web-surface --targets stage \
+		"$workspace/missing-wpe" >"$workspace/missing-wpe.log" 2>&1 || status=$?
+	[[ $status -ne 0 && ! -e "$log" ]] &&
+		grep -q 'wpe-webkit-2.0 development package' "$workspace/missing-wpe.log"
+}
+check "missing WPE dependencies fail before Cargo builds the launcher" missing_wpe_preflight
+
+empty_web_host_preflight() {
+	local form="$1" log="$workspace/empty-web-host-$1-cargo.log" status=0
+	local -a option=(--web-host-binary "")
+	if [[ $form == equals ]]; then option=(--web-host-binary=); fi
+	env PATH="$recording_tools:$PATH" \
+		CARGO_TARGET_DIR="$workspace/empty-web-host-target" \
+		CRIKEY_TEST_CARGO_LOG="$log" \
+		CRIKEY_TEST_FIXTURE_BIN="$fixture_bin" \
+		CRIKEY_PACKAGING_TEST_ALLOW_SCRIPT_WEB_HOST=1 \
+		"$build" "${option[@]}" --targets stage \
+		"$workspace/empty-web-host" >"$workspace/empty-web-host-$form.log" 2>&1 || status=$?
+	[[ $status -ne 0 && ! -e "$log" ]] &&
+		grep -q -- '--web-host-binary needs a nonempty value' "$workspace/empty-web-host-$form.log"
+}
+check "an empty supplied web-host path fails before selecting Cargo" empty_web_host_preflight separate
+check "an empty equals-form web-host path fails before selecting Cargo" empty_web_host_preflight equals
+
+escaped_target_out="$workspace/escaped-target-out"
+env PATH="$recording_tools:$PATH" \
+	CARGO_TARGET_DIR="$workspace/cargo \"quoted\" \\target" \
+	CRIKEY_TEST_CARGO_LOG="$workspace/escaped-target-cargo.log" \
+	CRIKEY_TEST_FIXTURE_BIN="$fixture_bin" \
+	"$build" --targets stage "$escaped_target_out" >/dev/null
+check "JSON-escaped Cargo target paths stage the actual binaries" \
+	cmp -s "$stand_in" "$escaped_target_out/stage/lib/crikey/crikey"
+
+# The initial shell hosts force the real scanner down its fallback path.
+# Separately exercise successful scanning, recording which installed files
+# were inspected rather than asserting source text in build.sh.
+cat >"$recording_tools/dpkg-shlibdeps" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"${CRIKEY_TEST_SHLIBDEPS_LOG:?}"
+printf 'shlibs:Depends=libc6, libwpewebkit-2.0-1 (>= 2.48), libwpe-1.0-1, libwpebackend-fdo-1.0-1, libwayland-server0, libglib2.0-0\n'
+EOF
+chmod +x "$recording_tools/dpkg-shlibdeps"
+scanned_out="$workspace/scanned-out"
+scan_log="$workspace/shlibdeps.log"
+env PATH="$recording_tools:$PATH" \
+	CRIKEY_TEST_SHLIBDEPS_LOG="$scan_log" \
+	CRIKEY_PACKAGING_TEST_ALLOW_SCRIPT_WEB_HOST=1 \
+	"$build" --binary "$stand_in" --launcher-binary "$launcher_stand_in" \
+	--wasm-host-binary "$wasm_host_stand_in" --cabi-host-binary "$cabi_host_stand_in" \
+	--web-host-binary "$web_host_stand_in" --targets deb "$scanned_out" >/dev/null
+scanned_deb="$(find "$scanned_out" -maxdepth 1 -name 'crikey_*.deb' -print -quit)"
+for executable in crikey crikey-launcher crikey-wasm-host crikey-cabi-host crikey-web-host; do
+	check "Debian dependency scanning inspects the installed $executable" \
+		grep -qxF "$scanned_out/deb/crikey_$(workspace_version)_$(dpkg-deb --field "$scanned_deb" Architecture)/usr/lib/crikey/$executable" "$scan_log"
+done
+check "computed engine dependency versions reach the Debian control record" \
+	contains "libwpewebkit-2.0-1 (>= 2.48)" "$(dpkg-deb --field "$scanned_deb" Depends)"
 
 relative_target="${in_tree_workspace#"$repository_root/"/}/relative-cargo-target"
 relative_target_out="$workspace/relative-target-out"

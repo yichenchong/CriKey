@@ -39,7 +39,7 @@ fn main() {
     let mut include_paths: Vec<PathBuf> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
     for (package, human) in REQUIRED {
-        match pkg_config::Config::new().cargo_metadata(true).probe(package) {
+        match pkg_config::Config::new().cargo_metadata(false).probe(package) {
             Ok(library) => include_paths.extend(library.include_paths),
             Err(error) => missing.push(format!("  {package} ({human}): {error}")),
         }
@@ -53,7 +53,8 @@ fn main() {
             "crikey-web-host needs the WPE WebKit development packages, and pkg-config \
              could not find:\n{}\n\nOn Debian and Ubuntu these come from \
              libwpewebkit-2.0-dev, libwpebackend-fdo-1.0-dev, libwpe-1.0-dev and \
-             libwayland-dev. CriKey's own tarball builds them from source. To build \
+             libwayland-dev. CriKey's Linux host links system WPE libraries; install \
+             their development packages before building it. To build \
              only the engine-independent half of this crate -- frame conversion, input \
              translation, the IME ordering state machine and message handling, all of \
              which are unit-tested without an engine -- use \
@@ -68,4 +69,14 @@ fn main() {
         build.include(path);
     }
     build.compile("ck_web_shim");
+
+    // Emit system linkage after the static shim: with --as-needed, emitting
+    // GLib/WPE first can discard them before the shim introduces references.
+    // Re-probe rather than manually replaying a subset of pkg-config's flags.
+    for (package, human) in REQUIRED {
+        pkg_config::Config::new()
+            .cargo_metadata(true)
+            .probe(package)
+            .unwrap_or_else(|error| panic!("could not emit linkage for {package} ({human}): {error}"));
+    }
 }

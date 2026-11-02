@@ -973,9 +973,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         } => {
                             view_model.update_web_caret_area(surface_id, x, y, width, height);
                         }
-                        WebHostNotice::Warning(message) => {
-                            eprintln!("crikey: {message}");
-                        }
                         WebHostNotice::Fatal { surface_id, message } => {
                             view_model.clear_web_frame(surface_id);
                             web_failure = Some(message);
@@ -3001,6 +2998,8 @@ fn measurement_failure(config: &BenchmarkConfig, report: &BenchmarkReport) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crikey_plugin_model::Permissions;
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|arg| (*arg).to_owned()).collect()
@@ -3043,10 +3042,20 @@ mod tests {
     }
 
     fn page_service(runtime: &Arc<PageRuntime>) -> SearchService {
+        page_service_with_permissions(
+            runtime,
+            crikey_plugin_model::Permissions::legacy_compatibility_baseline(),
+        )
+    }
+
+    fn page_service_with_permissions(
+        runtime: &Arc<PageRuntime>,
+        permissions: crikey_plugin_model::Permissions,
+    ) -> SearchService {
         let mut router = PluginActionRouter::default();
         router
-            .register(
-                [PluginId("test.page".to_owned())],
+            .register_with_permissions(
+                [(PluginId("test.page".to_owned()), permissions)],
                 Arc::clone(runtime) as Arc<dyn crikey_app::PluginActionExecutor>,
             )
             .expect("the stub registers once");
@@ -3063,6 +3072,121 @@ mod tests {
         {
             WebPageRuntime::new()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn denied_web_declarations_never_construct_a_supervisor() {
+        for (permissions, declaration, owner, reason) in [
+            (
+                Permissions::default(),
+                PageWebSurface {
+                    url: "https://example.test".to_owned(),
+                    storage: WebStorage::Ephemeral,
+                },
+                PluginId("test.page".to_owned()),
+                "network",
+            ),
+            (
+                Permissions {
+                    network: true,
+                    ..Permissions::default()
+                },
+                PageWebSurface {
+                    url: "https://example.test".to_owned(),
+                    storage: WebStorage::Persistent,
+                },
+                PluginId("test.page".to_owned()),
+                "web-storage",
+            ),
+            (
+                Permissions {
+                    network: true,
+                    web_storage: true,
+                    ..Permissions::default()
+                },
+                PageWebSurface {
+                    url: "https://example.test".to_owned(),
+                    storage: WebStorage::Persistent,
+                },
+                PluginId("native.test.page".to_owned()),
+                "no registered permissions",
+            ),
+        ] {
+            let plugin_runtime = Arc::new(PageRuntime::default());
+            let mut search = page_service_with_permissions(&plugin_runtime, permissions);
+            let mut view_model = LauncherViewModel::default();
+            let mut web_page = web_page_runtime();
+            view_model.activate();
+            open_plugin_page(
+                &mut search,
+                &mut view_model,
+                &mut web_page,
+                &PluginId("test.page".to_owned()),
+                "page",
+                (800, 600),
+            )
+            .expect("page opens");
+            assert!(view_model.update_page(
+                Arc::new(crikey_core::PageFrame {
+                    generation: 1,
+                    web: Some(declaration.clone()),
+                    ..crikey_core::PageFrame::default()
+                }),
+                false
+            ));
+            let error = web_page
+                .declare(&search, &mut view_model, &owner, &declaration)
+                .expect_err("exact owner's manifest refuses the request");
+            assert!(error.contains(reason), "{error}");
+            assert!(
+                web_page.supervisor.is_none(),
+                "denial precedes manager construction"
+            );
+            assert!(web_page.active.is_none(), "no denied surface becomes active");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stay_without_a_document_never_constructs_a_supervisor() {
+        let plugin_runtime = Arc::new(PageRuntime::default());
+        let mut search = page_service_with_permissions(&plugin_runtime, Permissions::default());
+        let mut view_model = LauncherViewModel::default();
+        let mut web_page = web_page_runtime();
+        view_model.activate();
+        open_plugin_page(
+            &mut search,
+            &mut view_model,
+            &mut web_page,
+            &PluginId("test.page".to_owned()),
+            "page",
+            (800, 600),
+        )
+        .expect("page opens");
+        let declaration = PageWebSurface {
+            url: String::new(),
+            storage: WebStorage::Ephemeral,
+        };
+        assert!(view_model.update_page(
+            Arc::new(crikey_core::PageFrame {
+                generation: 1,
+                web: Some(declaration.clone()),
+                ..crikey_core::PageFrame::default()
+            }),
+            false
+        ));
+        let error = web_page
+            .declare(
+                &search,
+                &mut view_model,
+                &PluginId("test.page".to_owned()),
+                &declaration,
+            )
+            .expect_err("stay cannot create a document");
+        assert!(error.contains("first web-surface declaration"));
+        assert!(web_page.supervisor.is_none());
+        assert!(web_page.active.is_none());
     }
 
     /// An action can finish after the user has dismissed the launcher, and the

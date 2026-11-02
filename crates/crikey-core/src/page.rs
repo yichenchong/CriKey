@@ -388,6 +388,9 @@ pub enum PageError {
     /// through a surface the plugin cannot otherwise read, and `data:` and
     /// `javascript:` are script injection wearing a URL.
     WebSurfaceSchemeRefused { scheme: String },
+    /// A stated HTTP(S) address is not absolute, has no authority, or
+    /// contains control characters or whitespace in its authority.
+    WebSurfaceInvalidUrl,
     /// A web surface frame named a focus node. Focus inside a web surface
     /// belongs to the document, and the id would name a node that does not
     /// exist.
@@ -456,6 +459,10 @@ impl std::fmt::Display for PageError {
                 out,
                 "the web surface asked for a `{scheme}` address; only `http` and `https` are opened"
             ),
+            Self::WebSurfaceInvalidUrl => write!(
+                out,
+                "the web surface must name an absolute HTTP(S) address with a non-empty authority without whitespace or control characters"
+            ),
             Self::WebSurfaceWithFocusNode { node_id } => write!(
                 out,
                 "the web surface frame named focus node {node_id}, but focus inside a web surface belongs to the document"
@@ -493,11 +500,49 @@ pub enum WebStorage {
 /// from becoming a way for a plugin to read the user's screen.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PageWebSurface {
-    /// Where to navigate. Empty on a later frame means "stay where you are",
-    /// so a plugin that re-sends its surface does not reload the page under
-    /// the user.
+    /// An absolute HTTP(S) address. Empty on a later frame means "stay where
+    /// you are", so re-sending the surface does not reload the document.
+    /// [`PageWebSurface::validate`] checks the same contract for SDK-built
+    /// frames and declarations received from a plugin.
     pub url: String,
     pub storage: WebStorage,
+}
+
+impl PageWebSurface {
+    /// Checks a declaration before the host hands it to a web engine.
+    ///
+    /// An empty address is the later-frame "stay" operation; the host must
+    /// additionally require an already-open document for that operation.
+    pub fn validate(&self) -> Result<(), PageError> {
+        if self.url.len() > MAX_NODE_TEXT_BYTES {
+            return Err(PageError::WebSurfaceUrlTooLong {
+                bytes: self.url.len(),
+            });
+        }
+        if self.url.is_empty() {
+            return Ok(());
+        }
+        let (scheme, remainder) = self.url.split_once(':').unwrap_or(("", ""));
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+            return Err(PageError::WebSurfaceSchemeRefused {
+                scheme: scheme.to_ascii_lowercase(),
+            });
+        }
+        if self.url.chars().any(char::is_control) {
+            return Err(PageError::WebSurfaceInvalidUrl);
+        }
+        let Some(authority_and_path) = remainder.strip_prefix("//") else {
+            return Err(PageError::WebSurfaceInvalidUrl);
+        };
+        let authority = authority_and_path
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        if authority.is_empty() || authority.chars().any(char::is_whitespace) {
+            return Err(PageError::WebSurfaceInvalidUrl);
+        }
+        Ok(())
+    }
 }
 
 /// One frame of a plugin-drawn page.
@@ -554,24 +599,7 @@ impl PageFrame {
                     redraw_after_ms: self.redraw_after_ms,
                 });
             }
-            if web.url.len() > MAX_NODE_TEXT_BYTES {
-                return Err(PageError::WebSurfaceUrlTooLong { bytes: web.url.len() });
-            }
-            // An empty address is "stay where you are", so only a stated one
-            // is checked. Matched on the scheme rather than parsed: this
-            // crate takes no URL dependency, and the question here is only
-            // which schemes the host will hand to an engine.
-            if !web.url.is_empty() {
-                let scheme = web
-                    .url
-                    .split_once(':')
-                    .map(|(scheme, _)| scheme.to_ascii_lowercase())
-                    .unwrap_or_default();
-                if scheme != "http" && scheme != "https" {
-                    return Err(PageError::WebSurfaceSchemeRefused { scheme });
-                }
-            }
-            return Ok(());
+            return web.validate();
         }
         if self.nodes.len() > MAX_PAGE_NODES {
             return Err(PageError::TooManyNodes {
@@ -1136,6 +1164,50 @@ mod tests {
             ..PageFrame::default()
         };
         assert_eq!(frame.validate(), Ok(()));
+    }
+
+    #[test]
+    fn malformed_web_addresses_are_refused_even_without_the_sdk_builder() {
+        for url in [
+            "https:relative",
+            "https:///missing-authority",
+            "https://?query",
+            "https://white space.invalid/",
+            "https://example.invalid/\nnext",
+            "https://example.invalid/\0next",
+        ] {
+            let web = PageWebSurface {
+                url: url.to_owned(),
+                ..PageWebSurface::default()
+            };
+            assert_eq!(web.validate(), Err(PageError::WebSurfaceInvalidUrl), "{url:?}");
+            let frame = PageFrame {
+                web: Some(web),
+                ..PageFrame::default()
+            };
+            assert_eq!(frame.validate(), Err(PageError::WebSurfaceInvalidUrl), "{url:?}");
+        }
+    }
+
+    #[test]
+    fn web_address_limit_counts_utf8_bytes_and_accepts_the_boundary() {
+        let prefix = "https://example.invalid/";
+        let mut url = prefix.to_owned();
+        url.extend(std::iter::repeat_n('a', MAX_NODE_TEXT_BYTES - prefix.len() - 2));
+        url.push('é');
+        let mut web = PageWebSurface {
+            url,
+            ..PageWebSurface::default()
+        };
+        assert_eq!(web.url.len(), MAX_NODE_TEXT_BYTES);
+        assert_eq!(web.validate(), Ok(()));
+        web.url.push('a');
+        assert_eq!(
+            web.validate(),
+            Err(PageError::WebSurfaceUrlTooLong {
+                bytes: MAX_NODE_TEXT_BYTES + 1,
+            })
+        );
     }
 
     /// Both name something a web surface does not have: focus belongs to the

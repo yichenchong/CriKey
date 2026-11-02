@@ -81,6 +81,56 @@ fn stdio_survives_read_timeout_request() {
         .expect("clearing an unsupported timeout must remain harmless");
 }
 
+#[test]
+fn unsupported_write_deadlines_are_not_reported_as_enforced() {
+    let (mut pair, _peer) = transport::pair();
+    let mut stdio = transport::stdio();
+    for connection in [&mut pair, &mut stdio] {
+        assert!(matches!(
+            connection.set_write_timeout(Some(Duration::from_millis(20))),
+            Err(ProtocolError::Io(_))
+        ));
+        connection
+            .set_write_timeout(None)
+            .expect("clearing an unsupported write deadline is harmless");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_unix_write_deadline_releases_a_sender_when_the_peer_stops_reading() {
+    let endpoint = native_endpoint();
+    let listener = transport::Listener::bind(&endpoint).expect("bind");
+    let mut peer = transport::connect(&endpoint, Some(Duration::from_secs(1))).expect("connect");
+    let mut sender = listener.accept(Some(Duration::from_secs(1))).expect("accept");
+    sender
+        .set_write_timeout(Some(Duration::from_millis(50)))
+        .expect("Unix sockets enforce write deadlines");
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let payload = message::Envelope {
+            payload: Some(message::Payload::WebFrame(message::WebFrame {
+                rgba8: vec![0; 4 * 1024 * 1024],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let result = sender.send(&payload);
+        sender.close();
+        result_tx.send(result).expect("deliver send result");
+    });
+    let result = result_rx.recv_timeout(Duration::from_secs(3));
+    // Closing the stalled reader also releases a broken implementation, so
+    // this regression reports its failure without leaving a blocked thread.
+    peer.close();
+    worker.join().expect("sender exits after the peer closes");
+    assert!(
+        matches!(result, Ok(Err(ProtocolError::Timeout))),
+        "a connected peer that reads nothing must time out: {result:?}"
+    );
+    remove_endpoint(&endpoint);
+}
+
 /// A unique endpoint of whatever kind this platform actually uses for native
 /// plugins, so the test below drives the real listener rather than a portable
 /// stand-in for it.

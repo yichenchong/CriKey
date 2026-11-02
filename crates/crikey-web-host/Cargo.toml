@@ -36,9 +36,8 @@ crikey-native-protocol.workspace = true
 thiserror.workspace = true
 
 [build-dependencies]
-# Both are crate-local rather than workspace dependencies on purpose: this is
-# the only crate in the tree that compiles C or links a system library, and
-# that ought to stay auditable from one manifest. Neither adds anything to
-# `Cargo.lock` -- both are already there, pulled in by existing build scripts.
+# Keep the C compiler and WPE package discovery local to the one crate that
+# links the browser engine. Other workspace crates can link platform libraries;
+# neither WPE probing nor its link directives belong in those crates.
 cc = "1"
 pkg-config = "0.3"

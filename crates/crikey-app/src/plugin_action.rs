@@ -591,6 +591,52 @@ mod tests {
             &[PluginId("modern.alpha".to_owned())]
         );
     }
+
+    #[test]
+    fn web_permissions_follow_exact_manifest_owners_not_the_shared_executor() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let denied = PluginId("modern.page".to_owned());
+        let networked = PluginId("native.page".to_owned());
+        let persistent = PluginId("native.persistent".to_owned());
+        let mut router = PluginActionRouter::default();
+        router
+            .register_with_permissions(
+                [
+                    (denied.clone(), Permissions::default()),
+                    (
+                        networked.clone(),
+                        Permissions {
+                            network: true,
+                            ..Permissions::default()
+                        },
+                    ),
+                    (
+                        persistent.clone(),
+                        Permissions {
+                            network: true,
+                            web_storage: true,
+                            ..Permissions::default()
+                        },
+                    ),
+                ],
+                executor,
+            )
+            .expect("owners share one endpoint");
+        assert!(router.admit_web_surface(&denied, true, false).is_err());
+        assert!(router.admit_web_surface(&networked, true, false).is_ok());
+        let refusal = router
+            .admit_web_surface(&networked, true, true)
+            .expect_err("network alone does not authorize durable cookies");
+        assert!(refusal.to_string().contains("native.page"));
+        assert!(refusal.to_string().contains("permissions.web-storage"));
+        assert!(router.admit_web_surface(&persistent, true, true).is_ok());
+        assert!(router
+            .admit_web_surface(&PluginId("page".to_owned()), true, true)
+            .is_err());
+        assert!(router
+            .admit_web_surface(&PluginId("legacy.page".to_owned()), false, false)
+            .is_err());
+    }
     #[test]
     fn host_process_permission_is_enforced_per_manifest_owner() {
         let executor = Arc::new(RecordingExecutor::default());

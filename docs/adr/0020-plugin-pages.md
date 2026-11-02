@@ -170,18 +170,22 @@ a platform accessibility tree is the remaining work, and it is the same tracked
 follow-up ADR-0002 recorded. Nothing here should be described as
 screen-reader support until that wiring exists and is measured.
 
+The web route uses the engine's DOM semantics, but does not bridge the engine's
+accessibility tree into the launcher's platform tree. It is not a claim of
+screen-reader support either.
+
 ## Consequences
 
-- The plugin implements its own layout. Every node is positioned in absolute
-  logical pixels relative to the page's top-left corner. There is no DOM, no
-  CSS, no reflow, no flexbox, and no automatic wrapping between nodes.
-- The plugin implements its own text editing. A text field is a rectangle, a
-  string and a role; caret movement, selection, insertion and deletion are the
-  plugin's state machine, driven by `PageInputKind::KeyPressed` and
-  `TextInput`.
-- The plugin implements its own state machine and its own focus order, and
-  rebuilds the whole display list on every frame. The host retains the last
-  frame for redraw but never diffs or merges frames.
+- The display-list plugin implements its own layout. Every node is positioned
+  in absolute logical pixels relative to the page's top-left corner. There is
+  no DOM, no CSS, no reflow, no flexbox, and no automatic wrapping between nodes.
+- The display-list plugin implements its own text editing. A text field is a
+  rectangle, a string and a role; caret movement, selection, insertion and
+  deletion are the plugin's state machine, driven by `PageInputKind::KeyPressed`
+  and `TextInput`.
+- The display-list plugin implements its own state machine and its own focus
+  order, and rebuilds the whole display list on every frame. The host retains
+  the last frame for redraw but never diffs or merges frames.
 - This remains a real ergonomic cost to display-list authors. A web surface is
   available when an HTTP(S) application is the honest fit, but it opts into a
   separately packaged engine, network policy and higher per-open cost rather
@@ -338,17 +342,35 @@ multi-surface-per-process option to trade against it.
 
 The measured cost is accepted for a deliberately opened page. The launcher
 computes a policy target equal to the lesser of 768 MiB and one eighth of
-physical RAM, reduced further by an inherited finite cgroup limit. It refuses
-to open a surface when that effective value is below 256 MiB rather than start
-an engine expected to exceed it.
+physical RAM, reduced further by the launcher's inherited finite cgroup limits.
+Those inherited caps remain binding even when the web host is placed under a
+different cgroup parent. It refuses to open a surface when that effective value
+is below 256 MiB rather than start an engine expected to exceed it.
 
-On Linux it attempts to enforce the value with a delegated cgroup-v2 tree
-covering the web-host process tree. `RLIMIT_AS` is deliberately not used:
-WebKit maps far more virtual address space than it keeps resident. If the value
-cannot be determined or a writable delegated cgroup cannot be created, the
-launcher warns and the page continues without the new memory ceiling. The host
-loop and degradation path are implemented; the protection must still be
-described as conditional, never as present on every installation.
+On Linux this ceiling and process-tree supervision are required, not
+best-effort. Before executing the web host, the launcher must find an existing
+suitable writable parent within its delegated cgroup-v2 hierarchy with `memory`
+already enabled in `cgroup.subtree_control` and a writable `cgroup.procs` for
+the kernel's common-ancestor migration permission check. It searches only proper
+ancestors within the delegation's cgroup-v2 mount, never the launcher's own
+cgroup. Candidate parents must contain no processes, except at the visible mount
+root; that exception still requires the enabled memory controller and every
+private leaf control. It creates a private web-host leaf separate from the leaf
+containing the launcher.
+A writable populated launcher leaf alone does not suffice: the kernel's
+no-internal-process rule prevents enabling memory for its children. CriKey does
+not move the launcher or unrelated processes, change subtree controller
+settings, or cross unavailable delegation boundaries.
+
+The private leaf must have working memory controls and `cgroup.kill`; the
+launcher prepares and verifies them and attaches the child before host code
+runs. `RLIMIT_AS` is deliberately not used: WebKit maps far more virtual address
+space than it keeps resident. If no suitable parent exists, the ceiling cannot
+be determined, or the required cgroup controls cannot be prepared, web startup
+is refused; there is no warning-only, unsupervised fallback. This deliberately
+trades web-page availability on systems without suitable delegation for bounded
+memory and reliable process-tree cleanup. Ordinary launcher use and display-list
+pages remain available.
 
 At most one page is open at once (§32.2), therefore at most one web surface is
 live. A new page closes and releases the old one before its surface is opened;
@@ -358,7 +380,10 @@ Pre-warming is not the answer to the latency half, and is rejected. One
 long-lived surface would convert the spawn cost into a startup cost, but it
 would pay a few hundred milliseconds and the engine's idle memory for a page
 nobody opened. The host starts the web engine when the user opens the page and
-releases the whole supervised process tree on close.
+tears it down on close. The required cgroup covers the whole process tree,
+including detached or reparented descendants after a host crash; teardown does
+not depend on discovering descendants through procfs or on their remaining in
+the original process group.
 
 The latency is disclosed rather than hidden. A web page keeps the in-page
 loading indicator until its first accepted engine frame is painted. The
@@ -378,8 +403,10 @@ Linux distribution builds keep the web host explicit. The default remains a
 no-web package. `build.sh --with-web-surface` performs the real
 `cargo build -p crikey-web-host --features engine` build after checking the WPE
 development stack; `--web-host-binary` retains release-CI and distributor
-support for staging an already-built host, and verifies its CLI and dynamic
-libraries. Debian and RPM artifacts derive or declare the corresponding
+support for staging an already-built host, and verifies that it is a native ELF
+with resolvable dynamic libraries. This does not establish host protocol
+compatibility or prove that an arbitrary supplied ELF is an engine-enabled
+CriKey host. Debian and RPM artifacts derive or declare the corresponding
 runtime requirements. A package without the staged host does not claim to
 contain web-surface support. The current Flatpak recipe is intentionally
 no-web: it neither builds the engine-enabled host nor provides pinned WPE

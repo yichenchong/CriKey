@@ -32,6 +32,22 @@ pub trait Transport: std::fmt::Debug + Send {
         false
     }
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), ProtocolError>;
+    /// Bounds individual blocking writes when the transport supports it.
+    ///
+    /// Unix sockets enforce this in the operating system. Other transports
+    /// reject a requested deadline rather than pretending a blocking send is
+    /// bounded; clearing an unsupported deadline is harmless.
+    ///
+    /// A timed-out send may have written a partial frame. The caller must
+    /// close the connection instead of retrying the envelope.
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> Result<(), ProtocolError> {
+        if timeout.is_some() {
+            return Err(ProtocolError::Io(
+                "this transport does not support write timeouts".to_owned(),
+            ));
+        }
+        Ok(())
+    }
     fn close(&mut self);
 }
 
@@ -172,6 +188,18 @@ impl Transport for IoTransport {
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), ProtocolError> {
         self.set_timeout(timeout)
+    }
+
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> Result<(), ProtocolError> {
+        match &self.stream {
+            #[cfg(unix)]
+            IoStream::Unix(stream) => stream.set_write_timeout(timeout).map_err(map_io),
+            IoStream::Closed => Err(ProtocolError::Closed),
+            _ if timeout.is_none() => Ok(()),
+            _ => Err(ProtocolError::Io(
+                "this transport does not support write timeouts".to_owned(),
+            )),
+        }
     }
 
     fn close(&mut self) {

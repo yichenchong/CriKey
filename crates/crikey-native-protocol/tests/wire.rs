@@ -2417,3 +2417,130 @@ fn a_web_surface_page_frame_round_trips_through_both_conversions() {
         crikey_core::WebStorage::Ephemeral
     );
 }
+
+#[test]
+fn fragmented_web_declarations_merge_before_core_validation() {
+    // A generated protobuf writer may split a singular message field across
+    // occurrences. The last fragment explicitly resets storage to zero;
+    // the omitted URL and each fragment's unknown fields must survive.
+    let bytes = b"\x3a\x11\x0a\x0ahttps://a/\x10\x02\x98\x06\x07\
+                  \x3a\x05\x10\x00\xa0\x06\x08\x3a\x00";
+    let frame = message::PageFrame::decode(bytes).expect("valid message fragments");
+    let web = frame.web.as_ref().expect("web declaration");
+    assert_eq!(web.url, "https://a/");
+    assert_eq!(web.storage, message::WebStorageMode::ModeUnspecified);
+    assert_eq!(web.unknown.as_bytes(), b"\x98\x06\x07\xa0\x06\x08");
+    let core = crikey_native_protocol::convert::from_proto_page_frame(&frame);
+    assert_eq!(core.validate(), Ok(()));
+    assert_eq!(
+        core.web.expect("web declaration").storage,
+        crikey_core::WebStorage::Ephemeral
+    );
+}
+
+#[test]
+fn every_new_web_oneof_member_merges_same_member_fragments() {
+    // Frozen envelope tags 33..42. These raw fixtures do not use the encoder
+    // under test to manufacture the fragments. Every message has surface_id
+    // at field 1, including an explicitly stated default in fragment two.
+    for key in [0x8a, 0x92, 0x9a, 0xa2, 0xaa, 0xb2, 0xba, 0xc2, 0xca, 0xd2] {
+        let bytes = [
+            key, 0x02, 0x05, 0x08, 0x09, 0x98, 0x06, 0x07, key, 0x02, 0x05, 0x08, 0x00, 0xa0, 0x06, 0x08,
+            key, 0x02, 0x00,
+        ];
+        let envelope = message::Envelope::decode(&bytes).expect("valid message fragments");
+        let (surface_id, unknown) = match envelope.payload.as_ref().expect("payload") {
+            message::Payload::OpenSurface(value) => (value.surface_id, &value.unknown),
+            message::Payload::RawInput(value) => (value.surface_id, &value.unknown),
+            message::Payload::ImeEvent(value) => (value.surface_id, &value.unknown),
+            message::Payload::Navigate(value) => (value.surface_id, &value.unknown),
+            message::Payload::Resize(value) => (value.surface_id, &value.unknown),
+            message::Payload::CloseSurface(value) => (value.surface_id, &value.unknown),
+            message::Payload::WebFrame(value) => (value.surface_id, &value.unknown),
+            message::Payload::CaretArea(value) => (value.surface_id, &value.unknown),
+            message::Payload::LoadState(value) => (value.surface_id, &value.unknown),
+            message::Payload::Gone(value) => (value.surface_id, &value.unknown),
+            other => panic!("unexpected payload: {other:?}"),
+        };
+        assert_eq!(surface_id, 0, "explicit default must overwrite: {key:#x}");
+        assert_eq!(
+            unknown.as_bytes(),
+            b"\x98\x06\x07\xa0\x06\x08",
+            "unknown fields from both fragments must survive: {key:#x}"
+        );
+    }
+}
+
+#[test]
+fn fragmented_open_preserves_omitted_geometry_but_a_new_oneof_discards_it() {
+    let envelope = message::Envelope::decode(b"\x8a\x02\x04\x08\x09\x10\x40\x8a\x02\x02\x18\x20")
+        .expect("fragmented OpenSurface");
+    let Some(message::Payload::OpenSurface(open)) = envelope.payload else {
+        panic!("expected OpenSurface");
+    };
+    assert_eq!(
+        (open.surface_id, open.pixel_width, open.pixel_height),
+        (9, 64, 32)
+    );
+
+    let envelope = message::Envelope::decode(
+        b"\xaa\x02\x04\x08\x09\x10\x40\
+          \xa2\x02\x02\x08\x08\
+          \xaa\x02\x02\x18\x20",
+    )
+    .expect("changing a oneof member is valid");
+    let Some(message::Payload::Resize(resize)) = envelope.payload else {
+        panic!("expected Resize");
+    };
+    assert_eq!(
+        (resize.surface_id, resize.pixel_width, resize.pixel_height),
+        (0, 0, 32),
+        "returning to Resize must not revive fields from before Navigate"
+    );
+}
+
+#[test]
+fn decoded_web_urls_cannot_bypass_the_sdk_validation_contract() {
+    // PageFrame.web.url is an absolute address containing a NUL. Protobuf
+    // accepts it as UTF-8; core must refuse it before a C-string engine API.
+    let frame =
+        message::PageFrame::decode(b"\x3a\x0d\x0a\x0bhttps://a/\0").expect("NUL is valid protobuf text");
+    let core = crikey_native_protocol::convert::from_proto_page_frame(&frame);
+    assert_eq!(core.validate(), Err(crikey_core::PageError::WebSurfaceInvalidUrl));
+}
+
+#[test]
+fn an_unknown_storage_code_cannot_enable_persistence() {
+    let web = message::PageWebSurface::decode(b"\x10\xff\xff\xff\xff\x07")
+        .expect("an unknown enum is forward-compatible");
+    let core = crikey_native_protocol::convert::from_proto_page_frame(&message::PageFrame {
+        web: Some(web),
+        ..Default::default()
+    });
+    assert_eq!(
+        core.web.expect("web declaration").storage,
+        crikey_core::WebStorage::Ephemeral
+    );
+}
+
+#[test]
+fn malformed_web_merge_fragments_are_refused_without_losing_wire_checks() {
+    for bytes in [
+        // An initial valid OpenSurface followed by a varint where a message
+        // fragment belongs, then a truncated nested scalar in another case.
+        b"\x8a\x02\x02\x08\x09\x88\x02\x01".as_slice(),
+        b"\x8a\x02\x02\x08\x09\x8a\x02\x01\x08".as_slice(),
+        // The same safeguards apply to PageFrame.web below.
+    ] {
+        assert!(matches!(
+            message::Envelope::decode(bytes),
+            Err(ProtocolError::Malformed(_))
+        ));
+    }
+    for bytes in [b"\x3a\x00\x38\x01".as_slice(), b"\x3a\x00\x3a\x01\x10".as_slice()] {
+        assert!(matches!(
+            message::PageFrame::decode(bytes),
+            Err(ProtocolError::Malformed(_))
+        ));
+    }
+}

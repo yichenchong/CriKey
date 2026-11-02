@@ -15,6 +15,11 @@ use crate::{Message, ProtocolError, MAX_FRAME_BYTES};
 
 trait DecodeWithBudget: Sized {
     fn decode_with_budget(bytes: &[u8], budget: &mut DecodeBudget) -> Result<Self, ProtocolError>;
+
+    fn merge_with_budget(&mut self, bytes: &[u8], budget: &mut DecodeBudget) -> Result<(), ProtocolError> {
+        *self = Self::decode_with_budget(bytes, budget)?;
+        Ok(())
+    }
 }
 
 fn ensure_message_size(bytes: &[u8]) -> Result<(), ProtocolError> {
@@ -25,9 +30,9 @@ fn ensure_message_size(bytes: &[u8]) -> Result<(), ProtocolError> {
 }
 
 fn mark_singular(_seen: &mut u64, _field_number: u32) -> Result<(), ProtocolError> {
-    // Proto3 permits a singular field to occur more than once.  Scalar and
-    // enum fields use the last value, while a message field is replaced by
-    // the last occurrence.  The caller already performs that assignment.
+    // Proto3 permits duplicate singular fields. Scalars/enums use the last
+    // stated value; message-valued fields decide how to merge at their decode
+    // site so omitted fields are not mistaken for explicitly stated defaults.
     Ok(())
 }
 
@@ -233,7 +238,7 @@ pub const WEB_MODIFIER_META: u32 = 1 << 3;
 pub const WEB_MODIFIER_CAPS_LOCK: u32 = 1 << 4;
 pub const WEB_MODIFIER_NUM_LOCK: u32 = 1 << 5;
 
-/// Pointer buttons, in the engine's own numbering.
+/// Pointer buttons in normalized launcher numbering, translated by the web host.
 ///
 /// Not an enum: a mouse with a thumb button is ordinary hardware, and an enum
 /// would decode button 8 to an unspecified 0 and silently drop the press.
@@ -319,6 +324,29 @@ fn nested<M: DecodeWithBudget>(
     let result = M::decode_with_budget(field.value, budget);
     budget.leave_nested();
     result
+}
+
+fn merge_nested<M: DecodeWithBudget>(
+    value: &mut M,
+    field: crate::wire::Field<'_>,
+    budget: &mut DecodeBudget,
+) -> Result<(), ProtocolError> {
+    expect_wire(field, WireType::Length)?;
+    budget.enter_nested()?;
+    let result = value.merge_with_budget(field.value, budget);
+    budget.leave_nested();
+    result
+}
+
+// A repeated occurrence of the same message-valued oneof member merges its
+// fields; changing to a different member discards the previous message.
+macro_rules! merge_web_payload {
+    ($payload:expr, $variant:ident, $field:expr, $budget:expr) => {
+        match $payload {
+            Some(Payload::$variant(message)) => merge_nested(message, $field, $budget)?,
+            payload => *payload = Some(Payload::$variant(nested($field, $budget)?)),
+        }
+    };
 }
 
 fn map_entry(
@@ -604,16 +632,16 @@ impl DecodeWithBudget for Envelope {
                 30 => value.payload = Some(Payload::LifecycleAck(nested(field, budget)?)),
                 31 => value.payload = Some(Payload::PageRequest(nested(field, budget)?)),
                 32 => value.payload = Some(Payload::PageFrame(nested(field, budget)?)),
-                33 => value.payload = Some(Payload::OpenSurface(nested(field, budget)?)),
-                34 => value.payload = Some(Payload::RawInput(nested(field, budget)?)),
-                35 => value.payload = Some(Payload::ImeEvent(nested(field, budget)?)),
-                36 => value.payload = Some(Payload::Navigate(nested(field, budget)?)),
-                37 => value.payload = Some(Payload::Resize(nested(field, budget)?)),
-                38 => value.payload = Some(Payload::CloseSurface(nested(field, budget)?)),
-                39 => value.payload = Some(Payload::WebFrame(nested(field, budget)?)),
-                40 => value.payload = Some(Payload::CaretArea(nested(field, budget)?)),
-                41 => value.payload = Some(Payload::LoadState(nested(field, budget)?)),
-                42 => value.payload = Some(Payload::Gone(nested(field, budget)?)),
+                33 => merge_web_payload!(&mut value.payload, OpenSurface, field, budget),
+                34 => merge_web_payload!(&mut value.payload, RawInput, field, budget),
+                35 => merge_web_payload!(&mut value.payload, ImeEvent, field, budget),
+                36 => merge_web_payload!(&mut value.payload, Navigate, field, budget),
+                37 => merge_web_payload!(&mut value.payload, Resize, field, budget),
+                38 => merge_web_payload!(&mut value.payload, CloseSurface, field, budget),
+                39 => merge_web_payload!(&mut value.payload, WebFrame, field, budget),
+                40 => merge_web_payload!(&mut value.payload, CaretArea, field, budget),
+                41 => merge_web_payload!(&mut value.payload, LoadState, field, budget),
+                42 => merge_web_payload!(&mut value.payload, Gone, field, budget),
                 _ => unknown(bytes, start, field.end, &mut value.unknown, budget)?,
             }
         }
@@ -672,7 +700,17 @@ macro_rules! impl_simple_impl {
                 bytes: &[u8],
                 $budget: &mut DecodeBudget,
             ) -> Result<Self, ProtocolError> {
-                let mut $value = Self { $( $field_name: $default, )* unknown: UnknownFields::default() };
+                let mut value = Self { $( $field_name: $default, )* unknown: UnknownFields::default() };
+                value.merge_with_budget(bytes, $budget)?;
+                Ok(value)
+            }
+
+            fn merge_with_budget(
+                &mut self,
+                bytes: &[u8],
+                $budget: &mut DecodeBudget,
+            ) -> Result<(), ProtocolError> {
+                let $value = self;
                 let mut cursor = 0;
                 let mut seen = 0_u64;
                 while cursor < bytes.len() {
@@ -688,7 +726,7 @@ macro_rules! impl_simple_impl {
                         _ => unknown(bytes, start, $field.end, &mut $value.unknown, $budget)?,
                     }
                 }
-                Ok($value)
+                Ok(())
             }
         }
     };
@@ -1227,7 +1265,10 @@ impl_simple!(inexact; PageFrame {
     4 => value.focus_node = decode_u32(field)?,
     5 => value.redraw_after_ms = decode_u32(field)?,
     6 => value.close = decode_field_varint(field)? != 0,
-    7 => value.web = Some(nested(field, budget)?),
+    7 => match &mut value.web {
+        Some(web) => merge_nested(web, field, budget)?,
+        web => *web = Some(nested(field, budget)?),
+    },
 });
 
 // The plugin-facing half of a web surface: an address and a storage choice,

@@ -31,12 +31,14 @@ impl OutputBuffer {
         }
     }
 
-    /// Keeps only the newest pending frame and never exceeds the fixed bound.
+    /// Keeps only the newest pending frame and each surface's latest state.
     ///
-    /// A control message evicts a stale frame first and otherwise the oldest
-    /// control update. A frame never displaces control traffic. Gone is an
-    /// exactly-once terminal fence: it takes priority over all pending output,
-    /// can never be evicted, and rejects every later callback.
+    /// Caret and load updates replace older snapshots of the same kind, so a
+    /// burst of redirects cannot evict the only pending caret or frame. A control
+    /// message evicts a stale frame first and otherwise the oldest control
+    /// update. A frame never displaces control traffic. Gone is an exactly-once
+    /// terminal fence: it takes priority over all pending output, can never be
+    /// evicted, and rejects every later callback.
     pub(crate) fn push(&self, envelope: Envelope) -> Option<Vec<u8>> {
         let is_frame = matches!(envelope.payload.as_ref(), Some(Payload::WebFrame(_)));
         let is_terminal = matches!(envelope.payload.as_ref(), Some(Payload::Gone(_)));
@@ -51,7 +53,7 @@ impl OutputBuffer {
             state.queue.clear();
             state.queue.push_back(envelope);
             drop(state);
-            self.ready.notify_one();
+            self.ready.notify_all();
             return recycled;
         }
 
@@ -66,6 +68,9 @@ impl OutputBuffer {
                 recycled = frame_pixels(envelope);
             }
         } else {
+            if let Some(index) = state.queue.iter().position(|queued| replaces(&envelope, queued)) {
+                state.queue.remove(index);
+            }
             if state.queue.len() == OUTPUT_CAPACITY {
                 let index = frame_index(&state.queue).unwrap_or(0);
                 recycled = state.queue.remove(index).and_then(frame_pixels);
@@ -84,7 +89,7 @@ impl OutputBuffer {
             if let Some(envelope) = state.queue.pop_front() {
                 return Some(envelope);
             }
-            if state.closed {
+            if state.closed || state.terminal {
                 return None;
             }
             state = match self.ready.wait(state) {
@@ -104,6 +109,14 @@ fn frame_index(queue: &VecDeque<Envelope>) -> Option<usize> {
     queue
         .iter()
         .position(|queued| matches!(queued.payload.as_ref(), Some(Payload::WebFrame(_))))
+}
+
+fn replaces(new: &Envelope, queued: &Envelope) -> bool {
+    match (new.payload.as_ref(), queued.payload.as_ref()) {
+        (Some(Payload::CaretArea(new)), Some(Payload::CaretArea(old))) => new.surface_id == old.surface_id,
+        (Some(Payload::LoadState(new)), Some(Payload::LoadState(old))) => new.surface_id == old.surface_id,
+        _ => false,
+    }
 }
 
 fn frame_pixels(mut envelope: Envelope) -> Option<Vec<u8>> {
@@ -126,7 +139,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use crikey_native_protocol::message::{CaretArea, Gone, WebFrame, WebGoneCode};
+    use crikey_native_protocol::message::{CaretArea, Gone, LoadState, WebFrame, WebGoneCode, WebLoadCode};
 
     use super::*;
 
@@ -214,6 +227,7 @@ mod tests {
             }))
         ));
         assert!(lock_unpoisoned(&output.state).queue.is_empty());
+        assert_eq!(output.pop(), None, "a drained terminal fence ends the stream");
     }
 
     #[test]
@@ -227,5 +241,66 @@ mod tests {
         ));
         assert_eq!(output.pop(), None);
         assert_eq!(output.push(frame(1, 3)), Some(vec![3; 4]));
+    }
+
+    #[test]
+    fn load_flood_preserves_the_latest_caret_and_pending_frame() {
+        let output = OutputBuffer::new();
+        output.push(envelope(Payload::CaretArea(CaretArea {
+            surface_id: 1,
+            x: 11.0,
+            ..Default::default()
+        })));
+        output.push(frame(1, 7));
+        for generation in 0..OUTPUT_CAPACITY * 2 {
+            output.push(envelope(Payload::LoadState(LoadState {
+                surface_id: 1,
+                state: WebLoadCode::Redirected,
+                url: format!("https://example.test/redirect/{generation}"),
+                ..Default::default()
+            })));
+        }
+        assert_eq!(lock_unpoisoned(&output.state).queue.len(), 3);
+        assert!(matches!(
+            output.pop().unwrap().payload,
+            Some(Payload::CaretArea(caret)) if caret.x == 11.0
+        ));
+        assert!(matches!(
+            output.pop().unwrap().payload,
+            Some(Payload::WebFrame(_))
+        ));
+        let Some(Payload::LoadState(load)) = output.pop().unwrap().payload else {
+            panic!("latest load snapshot");
+        };
+        assert_eq!(
+            load.url,
+            format!("https://example.test/redirect/{}", OUTPUT_CAPACITY * 2 - 1)
+        );
+    }
+
+    #[test]
+    fn replacement_state_moves_after_intervening_updates_and_is_surface_specific() {
+        let output = OutputBuffer::new();
+        output.push(caret(1));
+        output.push(caret(2));
+        output.push(frame(1, 7));
+        output.push(envelope(Payload::CaretArea(CaretArea {
+            surface_id: 1,
+            x: 23.0,
+            ..Default::default()
+        })));
+        assert_eq!(lock_unpoisoned(&output.state).queue.len(), 3);
+        assert!(matches!(
+            output.pop().unwrap().payload,
+            Some(Payload::CaretArea(CaretArea { surface_id: 2, .. }))
+        ));
+        assert!(matches!(
+            output.pop().unwrap().payload,
+            Some(Payload::WebFrame(_))
+        ));
+        assert!(matches!(
+            output.pop().unwrap().payload,
+            Some(Payload::CaretArea(caret)) if caret.surface_id == 1 && caret.x == 23.0
+        ));
     }
 }
