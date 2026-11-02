@@ -18,11 +18,18 @@
 # sandbox spawns inside the sandbox. Making that work needs the application to
 # route launches through `flatpak-spawn --host`, which it does not yet do.
 #
+# This recipe is intentionally a no-web build: it neither builds
+# `crikey-web-host` nor supplies pinned WPE modules and runtime dependencies for
+# that executable. Staging a host without defining that complete runtime
+# contract would defer failure until a user opened a page. Native Linux
+# packages can opt in with `build.sh --with-web-surface`; this recipe must gain
+# the engine host and its pinned dependencies before it may do the same.
+#
 # The permissions below are therefore the set that lets CriKey run honestly,
-# not the set that would make it *look* complete. In particular `--filesystem=host-os`
-# is deliberately absent: granting it would fill the results list with host
-# applications that CriKey would then fail to start, which is worse than
-# showing nothing.
+# not the set that would make it *look* complete. In particular
+# `--filesystem=host-os` is deliberately absent: granting it would fill the
+# results list with host applications that CriKey would then fail to start,
+# which is worse than showing nothing.
 app-id: org.crikey.CriKey
 runtime: org.freedesktop.Platform
 runtime-version: '24.08'

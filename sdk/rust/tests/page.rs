@@ -5,7 +5,7 @@ use crikey_core::{NodeRole, NodeShape, PageColor, PageError, PageFrame, PageInpu
 use crikey_native_protocol::{Capabilities, Endpoint};
 use crikey_plugin_sdk::{
     harness::TestHarness, CatalogSink, ExecuteOutcome, ExecuteRequest, PageBuilder, PagePalette, PageRect,
-    PageRequest, Plugin, PluginContext, Query, ServeConfig, SuggestionSink,
+    PageRequest, Plugin, PluginContext, Query, ServeConfig, SuggestionSink, WebStorage, WebSurfaceBuilder,
 };
 
 const PAGE_ID: &str = "counter";
@@ -169,6 +169,51 @@ impl Plugin for DefaultPagePlugin {
     }
 }
 
+/// A native plugin serving one persistent web surface across page generations.
+struct WebPagePlugin {
+    opened: bool,
+}
+
+impl Plugin for WebPagePlugin {
+    fn start(&mut self, _context: &dyn PluginContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn build_catalog(&mut self, _context: &dyn PluginContext, sink: &mut dyn CatalogSink) -> Result<()> {
+        sink.finish()
+    }
+
+    fn suggest(
+        &mut self,
+        _query: Query,
+        _context: &dyn PluginContext,
+        sink: &mut dyn SuggestionSink,
+    ) -> Result<()> {
+        sink.finish()
+    }
+
+    fn execute(&mut self, _request: ExecuteRequest, _context: &dyn PluginContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn page(&mut self, request: PageRequest, _context: &dyn PluginContext) -> Result<PageFrame> {
+        let builder = if self.opened {
+            WebSurfaceBuilder::stay(request.generation)
+        } else {
+            self.opened = true;
+            WebSurfaceBuilder::navigate(request.generation, "https://example.invalid/app")
+        };
+        builder
+            .title("Web application")
+            .storage(WebStorage::Persistent)
+            .build()
+    }
+
+    fn stop(&mut self, _context: &dyn PluginContext) -> Result<()> {
+        Ok(())
+    }
+}
+
 fn opened() -> Vec<PageInput> {
     vec![PageInput::new(PageInputKind::Opened)]
 }
@@ -214,6 +259,33 @@ fn page_request_is_answered_with_a_frame_echoing_the_generation() {
         .page(PAGE_ID, 8, Vec::new(), true)
         .expect("second page frame");
     assert_eq!(next.generation, 8);
+    harness.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_native_plugin_serves_a_web_declaration_then_stays_on_the_loaded_url() {
+    let mut harness = TestHarness::start(WebPagePlugin { opened: false }, config()).expect("harness");
+
+    let initial = harness
+        .page("web", 11, opened(), true)
+        .expect("initial web frame");
+    assert_eq!(initial.generation, 11);
+    assert!(
+        initial.nodes.is_empty(),
+        "a web frame must not carry display-list nodes"
+    );
+    let initial_web = initial.web.expect("the first frame declares a web surface");
+    assert_eq!(initial_web.url, "https://example.invalid/app");
+    assert_eq!(initial_web.storage, WebStorage::Persistent);
+
+    let next = harness.page("web", 12, Vec::new(), true).expect("stay frame");
+    assert_eq!(next.generation, 12);
+    let next_web = next.web.as_ref().expect("the later frame keeps the web surface");
+    assert_eq!(next_web.url, "", "an empty URL means stay on the loaded document");
+    assert_eq!(next_web.storage, WebStorage::Persistent);
+    next.validate()
+        .expect("the stay operation remains a valid web frame");
+
     harness.shutdown().expect("shutdown");
 }
 
@@ -407,4 +479,47 @@ fn an_impossible_raster_is_refused_at_construction() {
             bytes: 1024 * 1024 * 4
         })
     );
+}
+
+#[test]
+fn the_web_surface_builder_refuses_non_network_schemes_before_serving() {
+    let error = WebSurfaceBuilder::navigate(1, "file:///etc/passwd")
+        .build()
+        .expect_err("file URLs must never reach the host");
+    assert!(
+        error.to_string().contains("only `http` and `https` are opened"),
+        "the SDK should preserve the core validation reason: {error}"
+    );
+}
+
+#[test]
+fn the_web_surface_builder_sets_safe_defaults_and_validates_absolute_urls() {
+    let frame = WebSurfaceBuilder::navigate(4, "HTTPS://example.invalid/path")
+        .title("Account")
+        .build()
+        .expect("absolute HTTPS URL");
+    assert_eq!(frame.generation, 4);
+    assert_eq!(frame.title, "Account");
+    assert!(frame.nodes.is_empty());
+    assert_eq!(frame.focus_node, 0);
+    assert_eq!(frame.redraw_after_ms, 0);
+    assert!(!frame.close);
+    let web = frame.web.expect("web declaration");
+    assert_eq!(web.url, "HTTPS://example.invalid/path");
+    assert_eq!(web.storage, WebStorage::Ephemeral);
+
+    let stay = WebSurfaceBuilder::stay(5).build().expect("stay operation");
+    assert_eq!(stay.web.expect("web declaration").url, "");
+
+    for invalid in [
+        "https:relative",
+        "https:///missing-authority",
+        "https://white space.invalid/",
+        "https://example.invalid/\nnext",
+    ] {
+        assert!(
+            WebSurfaceBuilder::navigate(6, invalid).build().is_err(),
+            "{invalid:?} must be refused before it crosses the plugin boundary"
+        );
+    }
 }

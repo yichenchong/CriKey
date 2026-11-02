@@ -70,10 +70,17 @@ typedef struct {
 
 /*
  * Loads the FDO backend and selects its headless SHM path. Must be called
- * exactly once, before any surface is created. Returns CK_WEB_INIT_OK or one
- * of the CK_WEB_INIT_* failures.
+ * before any surface is created. Returns CK_WEB_INIT_OK or one of the
+ * CK_WEB_INIT_* failures. A successful call must be paired with
+ * `ck_web_cleanup` after all surfaces have been destroyed.
  */
 int32_t ck_web_init(void);
+
+/*
+ * Removes every fd and signal source, unreferences the process loop and clears
+ * their callback pointers. Safe to call repeatedly.
+ */
+void ck_web_cleanup(void);
 
 /*
  * Creates one web surface of the requested pixel size.
@@ -94,7 +101,8 @@ void ck_web_surface_resize(ck_web_surface *surface, uint32_t width, uint32_t hei
 /* `modifiers`, `button` and `state` are already in libwpe's own encoding;
  * `src/input.rs` performs the translation from the protocol's encoding. */
 void ck_web_surface_key(ck_web_surface *surface, uint32_t time_ms, uint32_t keysym,
-                        uint32_t hardware_keycode, int32_t pressed, uint32_t modifiers);
+                        uint32_t hardware_keycode, int32_t pressed, int32_t repeat,
+                        uint32_t modifiers);
 void ck_web_surface_pointer_motion(ck_web_surface *surface, uint32_t time_ms, int32_t x,
                                    int32_t y, uint32_t modifiers);
 void ck_web_surface_pointer_button(ck_web_surface *surface, uint32_t time_ms, int32_t x,
@@ -123,6 +131,13 @@ void ck_web_surface_destroy(ck_web_surface *surface);
  * This is how the protocol reader thread hands work to the loop thread.
  */
 void ck_web_watch_fd(int32_t fd, void (*ready)(void *user), void *user);
+
+/*
+ * Runs `ready` on the loop thread for SIGTERM, SIGINT or SIGHUP. Installing
+ * this before `ck_web_run` gives supervised termination the same exactly-once
+ * surface teardown path as CloseSurface.
+ */
+void ck_web_watch_termination(void (*ready)(void *user), void *user);
 
 /* Runs the loop until `ck_web_quit`; both are called on the loop thread only,
  * except `ck_web_quit`, which is safe from any thread. */

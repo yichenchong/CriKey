@@ -19,15 +19,18 @@ use egui_wgpu::{wgpu, Renderer, ScreenDescriptor};
 use thiserror::Error;
 use winit::{
     application::ApplicationHandler,
-    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
-    event::{ElementState, Ime, KeyEvent, WindowEvent},
+    dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
+    event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
+    platform::scancode::PhysicalKeyExtScancode,
     window::{Window, WindowId, WindowLevel},
 };
 
 use crate::{
     theme, LauncherWindow, PageSurface, ResultRow, SettingControl, SettingRow, UiCommand, ViewModel,
+    WebImeEvent, WebSurfaceFrame, WebSurfaceInput, WEB_MODIFIER_ALT, WEB_MODIFIER_CONTROL, WEB_MODIFIER_META,
+    WEB_MODIFIER_SHIFT, WEB_POINTER_BUTTON_LEFT, WEB_POINTER_BUTTON_MIDDLE, WEB_POINTER_BUTTON_RIGHT,
 };
 
 /// Maximum number of activation-to-present observations retained in memory.
@@ -902,6 +905,11 @@ struct NativeApplication<F> {
     active_session: Option<u64>,
     pending_activation: Option<Instant>,
     modifiers: ModifiersState,
+    /// Monotonic origin for engine event timestamps.
+    input_started: Instant,
+    /// Last cursor position in egui logical points. Button and wheel events do
+    /// not repeat it, so raw web delivery must retain the preceding move.
+    cursor_position: Option<egui::Pos2>,
     /// True while an input method is building a character out of several key
     /// presses. Those presses belong to the composition, not to the launcher.
     composing: bool,
@@ -935,6 +943,8 @@ where
             active_session: None,
             pending_activation: None,
             modifiers: ModifiersState::default(),
+            input_started: Instant::now(),
+            cursor_position: None,
             composing: false,
             focused: false,
             next_repaint: None,
@@ -995,6 +1005,7 @@ where
         // Hiding disables the input method, so a half-built character does not
         // survive into the next activation.
         self.composing = false;
+        self.cursor_position = None;
         // Unmapping the window makes the compositor hand the keyboard back to
         // whatever had it before, so a `Focused(false)` follows every hide.
         // Forgetting the focus here is what stops that event from being read as
@@ -1073,6 +1084,164 @@ where
         }
         for command in draw.commands {
             self.dispatch_command(event_loop, command);
+        }
+    }
+
+    fn web_surface_id(&self) -> Option<u64> {
+        let page = self.frame.as_ref()?.page.as_ref()?;
+        page.frame.web.as_ref()?;
+        page.web_surface_id.filter(|surface_id| *surface_id != 0)
+    }
+
+    fn input_timestamp_ms(&self) -> u64 {
+        self.input_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
+    fn web_pointer_position(&self) -> Option<(u64, f32, f32)> {
+        let surface_id = self.web_surface_id()?;
+        let position = self.cursor_position?;
+        let rect = web_page_geometry(&self.graphics.as_ref()?.egui_context)?.rect;
+        rect.contains(position)
+            .then_some((surface_id, position.x - rect.min.x, position.y - rect.min.y))
+    }
+
+    /// Translates a native event the web document owns and reports whether it
+    /// must be withheld from egui. Pointer events outside the measured page
+    /// remain launcher chrome input.
+    fn web_command(&mut self, event: &WindowEvent) -> (Option<UiCommand>, bool) {
+        if let WindowEvent::CursorMoved { position, .. } = event {
+            let scale = self
+                .graphics
+                .as_ref()
+                .map_or(1.0, |graphics| graphics.window.scale_factor())
+                .max(f64::MIN_POSITIVE);
+            self.cursor_position = Some(egui::pos2(
+                (position.x / scale) as f32,
+                (position.y / scale) as f32,
+            ));
+        }
+
+        let Some(surface_id) = self.web_surface_id() else {
+            return (None, false);
+        };
+        let timestamp_ms = self.input_timestamp_ms();
+        match event {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } => {
+                if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+                    let command = (event.state == ElementState::Pressed).then_some(UiCommand::ClosePage);
+                    return (command, true);
+                }
+                (
+                    Some(UiCommand::WebInput(web_key_input(
+                        surface_id,
+                        timestamp_ms,
+                        event,
+                        self.modifiers,
+                    ))),
+                    true,
+                )
+            }
+            WindowEvent::CursorMoved { .. } => {
+                let Some((surface_id, x, y)) = self.web_pointer_position() else {
+                    return (None, false);
+                };
+                (
+                    Some(UiCommand::WebInput(WebSurfaceInput::PointerMove {
+                        surface_id,
+                        timestamp_ms,
+                        x,
+                        y,
+                        modifiers: native_web_modifiers(self.modifiers),
+                    })),
+                    true,
+                )
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let Some((surface_id, x, y)) = self.web_pointer_position() else {
+                    return (None, false);
+                };
+                (
+                    Some(UiCommand::WebInput(WebSurfaceInput::PointerButton {
+                        surface_id,
+                        timestamp_ms,
+                        x,
+                        y,
+                        button: native_web_button(*button),
+                        pressed: *state == ElementState::Pressed,
+                        press_count: 1,
+                        modifiers: native_web_modifiers(self.modifiers),
+                    })),
+                    true,
+                )
+            }
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                let Some((surface_id, x, y)) = self.web_pointer_position() else {
+                    return (None, false);
+                };
+                let (delta_x, delta_y, precise) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (*x, *y, false),
+                    MouseScrollDelta::PixelDelta(delta) => {
+                        let scale = self
+                            .graphics
+                            .as_ref()
+                            .map_or(1.0, |graphics| graphics.window.scale_factor())
+                            .max(f64::MIN_POSITIVE);
+                        ((delta.x / scale) as f32, (delta.y / scale) as f32, true)
+                    }
+                };
+                (
+                    Some(UiCommand::WebInput(WebSurfaceInput::Scroll {
+                        surface_id,
+                        timestamp_ms,
+                        x,
+                        y,
+                        delta_x,
+                        delta_y,
+                        precise,
+                        modifiers: native_web_modifiers(self.modifiers),
+                        stop: matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled),
+                    })),
+                    true,
+                )
+            }
+            WindowEvent::Ime(Ime::Preedit(text, cursor)) => (
+                Some(UiCommand::WebIme(WebImeEvent::Preedit {
+                    surface_id,
+                    text: text.clone(),
+                    cursor: cursor.map(|(begin, end)| {
+                        (
+                            byte_offset_to_char_index(text, begin),
+                            byte_offset_to_char_index(text, end),
+                        )
+                    }),
+                })),
+                true,
+            ),
+            WindowEvent::Ime(Ime::Commit(text)) => (
+                Some(UiCommand::WebIme(WebImeEvent::Commit {
+                    surface_id,
+                    text: text.clone(),
+                })),
+                true,
+            ),
+            WindowEvent::Ime(Ime::Disabled) => (
+                Some(UiCommand::WebIme(WebImeEvent::Preedit {
+                    surface_id,
+                    text: String::new(),
+                    cursor: None,
+                })),
+                true,
+            ),
+            WindowEvent::Ime(Ime::Enabled) => (None, true),
+            _ => (None, false),
         }
     }
 }
@@ -1200,21 +1369,28 @@ where
             return;
         }
 
-        let command = match &event {
-            WindowEvent::KeyboardInput {
-                event,
-                is_synthetic: false,
-                ..
-            } if self.active_session.is_some() && !self.composing => {
-                translate_keyboard(event, self.modifiers, self.frame.as_ref())
-            }
-            _ => None,
+        let (mut command, web_consumed) = if self.active_session.is_some() {
+            self.web_command(&event)
+        } else {
+            (None, false)
         };
+        if command.is_none() && !web_consumed {
+            command = match &event {
+                WindowEvent::KeyboardInput {
+                    event,
+                    is_synthetic: false,
+                    ..
+                } if self.active_session.is_some() && !self.composing => {
+                    translate_keyboard(event, self.modifiers, self.frame.as_ref())
+                }
+                _ => None,
+            };
+        }
         {
             let Some(graphics) = self.graphics.as_mut() else {
                 return;
             };
-            if command.is_none() {
+            if command.is_none() && !web_consumed {
                 let response = graphics
                     .egui_state
                     .on_window_event(graphics.window.as_ref(), &event);
@@ -1248,10 +1424,12 @@ where
             // A Linux composition is therefore invisible until it commits,
             // which is a display limitation, not a lost keystroke.
             #[cfg(target_os = "linux")]
-            if let WindowEvent::Ime(Ime::Commit(text)) = &event {
-                let events = &mut graphics.egui_state.egui_input_mut().events;
-                events.push(egui::Event::Ime(egui::ImeEvent::Enabled));
-                events.push(egui::Event::Ime(egui::ImeEvent::Commit(text.clone())));
+            if !web_consumed {
+                if let WindowEvent::Ime(Ime::Commit(text)) = &event {
+                    let events = &mut graphics.egui_state.egui_input_mut().events;
+                    events.push(egui::Event::Ime(egui::ImeEvent::Enabled));
+                    events.push(egui::Event::Ime(egui::ImeEvent::Commit(text.clone())));
+                }
             }
             match &event {
                 WindowEvent::Resized(size) => graphics.resize(size.width, size.height),
@@ -1261,6 +1439,10 @@ where
                 }
                 _ => {}
             }
+        }
+
+        if let Some(command) = command {
+            self.dispatch_command(event_loop, command);
         }
 
         match event {
@@ -1276,11 +1458,10 @@ where
                     Ime::Enabled | Ime::Commit(_) | Ime::Disabled => false,
                 };
             }
-            WindowEvent::KeyboardInput { .. } => {
-                if let Some(command) = command {
-                    self.dispatch_command(event_loop, command);
-                }
-            }
+            WindowEvent::KeyboardInput { .. }
+            | WindowEvent::CursorMoved { .. }
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::MouseWheel { .. } => {}
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             WindowEvent::CloseRequested => self.dispatch_command(event_loop, UiCommand::Dismiss),
             // A launcher is dismissed by being clicked away from, the way
@@ -1291,7 +1472,14 @@ where
             WindowEvent::Focused(focused) => {
                 let dismiss =
                     should_dismiss_on_focus_change(focused, self.active_session.is_some(), self.focused);
+                let web_surface_id = self.web_surface_id();
                 self.focused = focused;
+                if let Some(surface_id) = web_surface_id {
+                    self.dispatch_command(
+                        event_loop,
+                        UiCommand::WebInput(WebSurfaceInput::Focus { surface_id, focused }),
+                    );
+                }
                 if dismiss {
                     self.dispatch_command(event_loop, UiCommand::Dismiss);
                 }
@@ -1937,6 +2125,23 @@ impl GraphicsState {
             .map_or(Duration::MAX, |output| output.repaint_delay);
         self.egui_state
             .handle_platform_output(self.window.as_ref(), platform_output);
+        // egui positions the candidate window for its own text edits through
+        // `platform_output`. A web document owns composition while it is
+        // standing, so its engine-reported caret must win afterwards. Until
+        // the first caret arrives, anchor at the document origin rather than
+        // leaving a stale rectangle from the query field or a prior surface.
+        if let Some(geometry) = web_page_geometry(&self.egui_context) {
+            let caret = geometry
+                .caret
+                .unwrap_or_else(|| egui::Rect::from_min_size(geometry.rect.min, egui::vec2(1.0, 1.0)));
+            self.window.set_ime_cursor_area(
+                LogicalPosition::new(f64::from(caret.min.x), f64::from(caret.min.y)),
+                LogicalSize::new(
+                    f64::from(caret.width().max(1.0)),
+                    f64::from(caret.height().max(1.0)),
+                ),
+            );
+        }
 
         for (texture_id, image_delta) in &textures_delta.set {
             self.renderer
@@ -2054,6 +2259,136 @@ struct DrawResult {
 fn should_dismiss_on_focus_change(focused: bool, active: bool, had_focus: bool) -> bool {
     !focused && active && had_focus
 }
+fn native_web_modifiers(modifiers: ModifiersState) -> u32 {
+    (u32::from(modifiers.shift_key()) * WEB_MODIFIER_SHIFT)
+        | (u32::from(modifiers.control_key()) * WEB_MODIFIER_CONTROL)
+        | (u32::from(modifiers.alt_key()) * WEB_MODIFIER_ALT)
+        | (u32::from(modifiers.super_key()) * WEB_MODIFIER_META)
+}
+
+fn native_web_button(button: MouseButton) -> u32 {
+    match button {
+        MouseButton::Left => WEB_POINTER_BUTTON_LEFT,
+        MouseButton::Middle => WEB_POINTER_BUTTON_MIDDLE,
+        MouseButton::Right => WEB_POINTER_BUTTON_RIGHT,
+        MouseButton::Back => 8,
+        MouseButton::Forward => 9,
+        MouseButton::Other(button) => u32::from(button),
+    }
+}
+
+fn web_key_input(
+    surface_id: u64,
+    timestamp_ms: u64,
+    event: &KeyEvent,
+    modifiers: ModifiersState,
+) -> WebSurfaceInput {
+    WebSurfaceInput::Key {
+        surface_id,
+        timestamp_ms,
+        pressed: event.state == ElementState::Pressed,
+        keysym: x_keysym(event.logical_key.as_ref()),
+        hardware_keycode: event.physical_key.to_scancode().unwrap_or(0),
+        repeat: event.repeat,
+        modifiers: native_web_modifiers(modifiers),
+    }
+}
+
+fn unicode_keysym(character: char) -> u32 {
+    let codepoint = character as u32;
+    if (0x20..=0x7e).contains(&codepoint) || (0xa0..=0xff).contains(&codepoint) {
+        codepoint
+    } else {
+        0x0100_0000 | codepoint
+    }
+}
+
+/// Best X keysym exposed by winit's logical key.
+///
+/// Winit intentionally abstracts away the XKB state, so unidentified and
+/// multi-character logical keys have no honest keysym and remain zero. Textual
+/// keys and the named desktop vocabulary WPE consumes are lossless.
+fn x_keysym(key: Key<&str>) -> u32 {
+    match key {
+        Key::Character(text) => {
+            let mut characters = text.chars();
+            let first = characters.next();
+            match (first, characters.next()) {
+                (Some(character), None) => unicode_keysym(character),
+                _ => 0,
+            }
+        }
+        Key::Dead(Some(character)) => unicode_keysym(character),
+        Key::Named(named) => match named {
+            NamedKey::Backspace => 0xff08,
+            NamedKey::Tab => 0xff09,
+            NamedKey::Enter => 0xff0d,
+            NamedKey::Pause => 0xff13,
+            NamedKey::ScrollLock => 0xff14,
+            NamedKey::Escape => 0xff1b,
+            NamedKey::Home => 0xff50,
+            NamedKey::ArrowLeft => 0xff51,
+            NamedKey::ArrowUp => 0xff52,
+            NamedKey::ArrowRight => 0xff53,
+            NamedKey::ArrowDown => 0xff54,
+            NamedKey::PageUp => 0xff55,
+            NamedKey::PageDown => 0xff56,
+            NamedKey::End => 0xff57,
+            NamedKey::Insert => 0xff63,
+            NamedKey::NumLock => 0xff7f,
+            NamedKey::F1 => 0xffbe,
+            NamedKey::F2 => 0xffbf,
+            NamedKey::F3 => 0xffc0,
+            NamedKey::F4 => 0xffc1,
+            NamedKey::F5 => 0xffc2,
+            NamedKey::F6 => 0xffc3,
+            NamedKey::F7 => 0xffc4,
+            NamedKey::F8 => 0xffc5,
+            NamedKey::F9 => 0xffc6,
+            NamedKey::F10 => 0xffc7,
+            NamedKey::F11 => 0xffc8,
+            NamedKey::F12 => 0xffc9,
+            NamedKey::F13 => 0xffca,
+            NamedKey::F14 => 0xffcb,
+            NamedKey::F15 => 0xffcc,
+            NamedKey::F16 => 0xffcd,
+            NamedKey::F17 => 0xffce,
+            NamedKey::F18 => 0xffcf,
+            NamedKey::F19 => 0xffd0,
+            NamedKey::F20 => 0xffd1,
+            NamedKey::F21 => 0xffd2,
+            NamedKey::F22 => 0xffd3,
+            NamedKey::F23 => 0xffd4,
+            NamedKey::F24 => 0xffd5,
+            NamedKey::Shift => 0xffe1,
+            NamedKey::Control => 0xffe3,
+            NamedKey::CapsLock => 0xffe5,
+            NamedKey::Meta | NamedKey::Super => 0xffeb,
+            NamedKey::Alt => 0xffe9,
+            NamedKey::Delete => 0xffff,
+            NamedKey::Space => 0x20,
+            _ => 0,
+        },
+        Key::Dead(None) | Key::Unidentified(_) => 0,
+    }
+}
+
+fn byte_offset_to_char_index(text: &str, byte: usize) -> u32 {
+    if byte >= text.len() {
+        return text.chars().count().try_into().unwrap_or(u32::MAX);
+    }
+    let mut offset = 0u32;
+    for (at, _) in text.char_indices() {
+        if at == byte {
+            return offset;
+        }
+        if at > byte {
+            return offset.saturating_sub(1);
+        }
+        offset = offset.saturating_add(1);
+    }
+    offset
+}
 
 fn translate_keyboard(
     event: &KeyEvent,
@@ -2141,13 +2476,13 @@ fn draw_launcher(
     if context.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
         commands.push(UiCommand::OpenSettings);
     }
-    // A page's rasters are the page's, and nothing else in the launcher draws
-    // them: keeping them past the close would hold up to `MAX_PAGE_IMAGE_TOTAL_BYTES`
-    // of GPU memory for every page the user ever opened. `page_textures` drops
-    // whatever a live page stopped drawing; a closed page has no draw call to
-    // do it in, which is what this branch is for.
+    // Page rasters and an engine frame belong only to the page that supplied
+    // them. A closed page has no draw call in which the live-frame caches can
+    // evict their old handles, so release both caches here.
     if model.page.is_none() {
         release_page_textures(context);
+        release_web_texture(context);
+        clear_web_page_geometry(context);
     }
     egui::CentralPanel::default()
         .frame(
@@ -2822,13 +3157,14 @@ fn draw_page(ui: &mut egui::Ui, page: &PageSurface, commands: &mut Vec<UiCommand
     // picture it is already showing is the flicker the sheet exists to
     // prevent.
     //
-    // A web surface is judged on its first painted frame instead, because its
-    // plugin answers the instant it declares a URL while the engine behind it
-    // takes hundreds of milliseconds to produce anything. Judging it on
-    // `answered` would clear the spinner immediately and leave a blank sheet
-    // for exactly the interval this exists to cover.
+    // A web surface is judged on whether it has ever accepted an engine
+    // generation, because its plugin answers the instant it declares a URL
+    // while the engine behind it takes hundreds of milliseconds to produce
+    // anything. The generation floor survives texture eviction after a
+    // `Gone`, so a surface that did paint does not regress to its first-frame
+    // spinner.
     let loading = match &page.frame.web {
-        Some(_) => !page.web_painted,
+        Some(_) => page.web_generation == 0,
         None => page.stale && !page.answered,
     };
     if loading {
@@ -2837,24 +3173,49 @@ fn draw_page(ui: &mut egui::Ui, page: &PageSurface, commands: &mut Vec<UiCommand
         page_ui.put(centre, egui::Spinner::new().size(size).color(colors.text_muted));
     }
 
-    // Escape is the host's key. `translate_keyboard` already answers it on the
+    // Escape is the host's key. `web_command` already answers it on the native
     // window path and, by answering, keeps it out of egui entirely; this is the
     // same decision for every other way input can reach a frame -- the
-    // headless builder, a synthetic event, a key that arrived while an input
-    // method was composing. Consuming it here is what makes those routes close
-    // the page too, and the two can never both fire for one keystroke because
-    // the window loop hands an event to egui only when `translate_keyboard`
-    // declined it.
+    // headless builder or a synthetic event. Consuming it here makes those
+    // routes close the page too, and the two can never both fire for one
+    // keystroke because the native window loop withholds Escape from egui.
     if page_ui.input_mut(|state| state.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
         commands.push(UiCommand::ClosePage);
     }
 
     // The host opened this page with a guess at its size; only the renderer
     // knows what the layout actually left it. Reporting the measurement is
-    // what lets a plugin lay out against the surface it really has, and it is
-    // sent only when the number changes so a static page still costs one
-    // request per interaction rather than one per repaint.
+    // what lets a plugin or engine lay out against the surface it really has,
+    // and it is sent only when the number changes.
     report_page_size(&page_ui, page, rect, commands);
+
+    if page.frame.web.is_some() {
+        // A web surface is a single engine-painted raster. Its document owns
+        // hit-testing and focus, so none of the display-list focus ring,
+        // semantics, or node event code below may run.
+        page_textures(page_ui.ctx(), &[]);
+        remember_web_page_geometry(page_ui.ctx(), page, rect);
+        let frame = page
+            .web_frame
+            .as_deref()
+            .filter(|frame| Some(frame.surface_id) == page.web_surface_id);
+        if let Some(texture) = web_texture(page_ui.ctx(), frame) {
+            page_ui.painter().add(egui::epaint::RectShape {
+                rect,
+                rounding: Rounding::same(theme::RADIUS_MEDIUM),
+                fill: egui::Color32::WHITE,
+                stroke: Stroke::NONE,
+                blur_width: 0.0,
+                fill_texture_id: texture,
+                uv: RASTER_UV,
+            });
+        }
+        web_frame_input(&page_ui, page, rect, commands);
+        return;
+    }
+
+    release_web_texture(page_ui.ctx());
+    clear_web_page_geometry(page_ui.ctx());
 
     let ring = page.frame.focus_ring();
     // The pointer is read before the focus is resolved, because a press on a
@@ -2928,6 +3289,200 @@ fn node_rounding(node: &PageNode, rect: egui::Rect) -> f32 {
 /// draws.
 fn node_color(color: PageColor) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a)
+}
+
+struct WebTexture {
+    surface_id: u64,
+    generation: u64,
+    handle: TextureHandle,
+}
+
+impl fmt::Debug for WebTexture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebTexture")
+            .field("surface_id", &self.surface_id)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+fn web_texture_id() -> egui::Id {
+    egui::Id::new("crikey-web-texture")
+}
+
+/// Uploads at most one texture for the currently painted engine generation.
+///
+/// A repaint, pointer event, or size report that leaves the frame standing
+/// reuses the handle. A new generation or surface replaces it atomically, so
+/// the old handle drops as soon as no frame can sample it.
+fn web_texture(context: &egui::Context, frame: Option<&WebSurfaceFrame>) -> Option<egui::TextureId> {
+    let Some(frame) = frame.filter(|frame| frame.is_valid()) else {
+        release_web_texture(context);
+        return None;
+    };
+    let retained: Arc<Mutex<Option<WebTexture>>> = context.data_mut(|data| {
+        Arc::clone(data.get_temp_mut_or_default::<Arc<Mutex<Option<WebTexture>>>>(web_texture_id()))
+    });
+    let mut retained = retained.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(texture) = retained
+        .as_ref()
+        .filter(|texture| texture.surface_id == frame.surface_id && texture.generation == frame.generation)
+    {
+        return Some(texture.handle.id());
+    }
+
+    // WPE exports premultiplied pixels. Treating them as straight alpha would
+    // multiply RGB a second time and visibly darken translucent content.
+    let pixels = ColorImage::from_rgba_premultiplied(
+        [frame.pixel_width as usize, frame.pixel_height as usize],
+        &frame.rgba8,
+    );
+    let handle = context.load_texture(
+        format!("crikey-web-surface-{}-{}", frame.surface_id, frame.generation),
+        pixels,
+        TextureOptions::LINEAR,
+    );
+    let id = handle.id();
+    *retained = Some(WebTexture {
+        surface_id: frame.surface_id,
+        generation: frame.generation,
+        handle,
+    });
+    Some(id)
+}
+
+fn release_web_texture(context: &egui::Context) {
+    context.data_mut(|data| data.remove::<Arc<Mutex<Option<WebTexture>>>>(web_texture_id()));
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WebPageGeometry {
+    rect: egui::Rect,
+    caret: Option<egui::Rect>,
+}
+
+fn web_page_geometry_id() -> egui::Id {
+    egui::Id::new("crikey-web-page-geometry")
+}
+
+fn remember_web_page_geometry(context: &egui::Context, page: &PageSurface, rect: egui::Rect) {
+    let caret = page.web_caret_area.map(|(x, y, width, height)| {
+        egui::Rect::from_min_size(rect.min + vec2(x, y), vec2(width.max(0.0), height.max(0.0)))
+    });
+    context.data_mut(|data| {
+        data.insert_temp(web_page_geometry_id(), WebPageGeometry { rect, caret });
+    });
+}
+
+fn web_page_geometry(context: &egui::Context) -> Option<WebPageGeometry> {
+    context.data(|data| data.get_temp(web_page_geometry_id()))
+}
+
+fn clear_web_page_geometry(context: &egui::Context) {
+    context.data_mut(|data| {
+        data.remove::<WebPageGeometry>(web_page_geometry_id());
+    });
+}
+
+fn web_modifiers(modifiers: egui::Modifiers) -> u32 {
+    (u32::from(modifiers.shift) * WEB_MODIFIER_SHIFT)
+        | (u32::from(modifiers.ctrl) * WEB_MODIFIER_CONTROL)
+        | (u32::from(modifiers.alt) * WEB_MODIFIER_ALT)
+        | (u32::from(modifiers.mac_cmd) * WEB_MODIFIER_META)
+}
+
+fn egui_web_button(button: egui::PointerButton) -> u32 {
+    match button {
+        egui::PointerButton::Primary => WEB_POINTER_BUTTON_LEFT,
+        egui::PointerButton::Middle => WEB_POINTER_BUTTON_MIDDLE,
+        egui::PointerButton::Secondary => WEB_POINTER_BUTTON_RIGHT,
+        egui::PointerButton::Extra1 => 8,
+        egui::PointerButton::Extra2 => 9,
+    }
+}
+
+/// Headless-frame input route for web pages.
+///
+/// The native window path consumes richer winit events before egui sees them,
+/// preserving hardware keycodes, repeat, wheel phase and IME ranges. This
+/// route intentionally covers only the pointer/scroll/IME information a
+/// caller can put in `egui::RawInput`; it keeps the frame builder useful for
+/// deterministic renderer tests without inventing missing raw key metadata.
+fn web_frame_input(ui: &egui::Ui, page: &PageSurface, rect: egui::Rect, commands: &mut Vec<UiCommand>) {
+    let Some(surface_id) = page.web_surface_id else {
+        return;
+    };
+    let (events, pointer, modifiers) =
+        ui.input(|state| (state.events.clone(), state.pointer.hover_pos(), state.modifiers));
+    for event in events {
+        match event {
+            egui::Event::PointerMoved(position) if rect.contains(position) => {
+                commands.push(UiCommand::WebInput(WebSurfaceInput::PointerMove {
+                    surface_id,
+                    timestamp_ms: 0,
+                    x: position.x - rect.min.x,
+                    y: position.y - rect.min.y,
+                    modifiers: web_modifiers(modifiers),
+                }));
+            }
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers,
+            } if rect.contains(pos) => {
+                commands.push(UiCommand::WebInput(WebSurfaceInput::PointerButton {
+                    surface_id,
+                    timestamp_ms: 0,
+                    x: pos.x - rect.min.x,
+                    y: pos.y - rect.min.y,
+                    button: egui_web_button(button),
+                    pressed,
+                    press_count: 1,
+                    modifiers: web_modifiers(modifiers),
+                }));
+            }
+            egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+            } => {
+                let Some(position) = pointer.filter(|position| rect.contains(*position)) else {
+                    continue;
+                };
+                commands.push(UiCommand::WebInput(WebSurfaceInput::Scroll {
+                    surface_id,
+                    timestamp_ms: 0,
+                    x: position.x - rect.min.x,
+                    y: position.y - rect.min.y,
+                    delta_x: delta.x,
+                    delta_y: delta.y,
+                    precise: unit == egui::MouseWheelUnit::Point,
+                    modifiers: web_modifiers(modifiers),
+                    stop: false,
+                }));
+            }
+            egui::Event::Ime(egui::ImeEvent::Preedit(text)) => {
+                commands.push(UiCommand::WebIme(WebImeEvent::Preedit {
+                    surface_id,
+                    text,
+                    cursor: None,
+                }));
+            }
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                commands.push(UiCommand::WebIme(WebImeEvent::Commit { surface_id, text }));
+            }
+            egui::Event::Ime(egui::ImeEvent::Disabled) => {
+                commands.push(UiCommand::WebIme(WebImeEvent::Preedit {
+                    surface_id,
+                    text: String::new(),
+                    cursor: None,
+                }));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The font size a node's text is drawn at.
@@ -4667,7 +5222,10 @@ mod window_geometry_tests {
             frame: Arc::new(crikey_core::PageFrame::default()),
             stale: false,
             answered: true,
-            web_painted: false,
+            web_surface_id: None,
+            web_frame: None,
+            web_generation: 0,
+            web_caret_area: None,
         });
         assert_eq!(
             desired_window_height(&page, expanded),

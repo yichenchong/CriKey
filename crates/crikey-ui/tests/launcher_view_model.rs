@@ -81,7 +81,7 @@ use crikey_core::{
 };
 use crikey_ui::{
     LauncherViewModel, LauncherWindow, PageSurface, ResultRow, SettingControl, SettingRow, UiCommand,
-    UiEffect, ViewModel, PAGE_SIZE,
+    UiEffect, ViewModel, WebImeEvent, WebSurfaceFrame, WebSurfaceInput, PAGE_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -2001,7 +2001,10 @@ fn opening_a_page_replaces_the_only_live_surface() {
         frame: Arc::new(PageFrame::default()),
         stale: true,
         answered: false,
-        web_painted: false,
+        web_surface_id: None,
+        web_frame: None,
+        web_generation: 0,
+        web_caret_area: None,
     };
 
     assert!(model.open_page(surface("modern.first", "first")));
@@ -2013,4 +2016,155 @@ fn opening_a_page_replaces_the_only_live_surface() {
     let open = model.page().expect("replacement page is open");
     assert_eq!(open.plugin, PluginId("modern.second".to_owned()));
     assert_eq!(open.page_id, "second");
+}
+
+fn web_page_surface() -> PageSurface {
+    PageSurface {
+        plugin: PluginId("modern.web".to_owned()),
+        page_id: "browser".to_owned(),
+        plugin_name: "Web Plugin".to_owned(),
+        frame: Arc::new(PageFrame {
+            generation: 1,
+            web: Some(crikey_core::PageWebSurface {
+                url: "https://example.invalid/".to_owned(),
+                ..crikey_core::PageWebSurface::default()
+            }),
+            ..PageFrame::default()
+        }),
+        stale: false,
+        answered: true,
+        web_surface_id: None,
+        web_frame: None,
+        web_generation: 0,
+        web_caret_area: None,
+    }
+}
+
+fn engine_frame(surface_id: u64, generation: u64, bytes: &[u8]) -> Arc<WebSurfaceFrame> {
+    Arc::new(WebSurfaceFrame {
+        surface_id,
+        generation,
+        pixel_width: 2,
+        pixel_height: 1,
+        rgba8: Arc::from(bytes),
+    })
+}
+
+#[test]
+fn web_frames_are_admitted_only_for_the_live_surface_and_a_new_generation() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let _ = model.frame();
+    assert!(model.open_page(web_page_surface()));
+    assert!(!model.declare_web_surface(0), "zero is not a surface identity");
+    assert!(model.declare_web_surface(7));
+    assert!(
+        !model.declare_web_surface(7),
+        "reattaching the same engine is a no-op"
+    );
+
+    assert!(
+        !model.update_web_frame(engine_frame(8, 1, &[1; 8])),
+        "a frame from a replaced or unrelated engine must be dropped"
+    );
+    assert!(
+        !model.update_web_frame(engine_frame(7, 1, &[1; 7])),
+        "an incomplete RGBA raster must be dropped before upload"
+    );
+    assert!(model.update_web_frame(engine_frame(7, 2, &[1; 8])));
+    assert!(
+        !model.update_web_frame(engine_frame(7, 2, &[2; 8])),
+        "a duplicate generation cannot replace pixels already accepted"
+    );
+    assert!(
+        !model.update_web_frame(engine_frame(7, 1, &[3; 8])),
+        "an older generation cannot walk the page backwards"
+    );
+
+    let page = model.page().expect("the web page remains open");
+    assert_eq!(page.web_generation, 2);
+    assert_eq!(
+        page.web_frame
+            .as_ref()
+            .expect("the accepted pixels stand")
+            .rgba8
+            .as_ref(),
+        &[1; 8]
+    );
+}
+
+#[test]
+fn replacing_or_changing_a_web_surface_retires_its_pixels_and_caret() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let _ = model.frame();
+    assert!(model.open_page(web_page_surface()));
+    assert!(model.declare_web_surface(7));
+    assert!(model.update_web_frame(engine_frame(7, 2, &[1; 8])));
+    assert!(model.update_web_caret_area(7, 4.0, 5.0, 2.0, 12.0));
+    assert!(
+        !model.update_web_caret_area(8, 1.0, 2.0, 3.0, 4.0),
+        "caret reports are scoped to the live surface"
+    );
+    assert!(
+        !model.update_web_caret_area(7, f32::NAN, 2.0, 3.0, 4.0),
+        "non-finite geometry never reaches the window system"
+    );
+
+    assert!(model.clear_web_frame(7));
+    let cleared = model.page().expect("clearing pixels does not close the page");
+    assert!(cleared.web_frame.is_none());
+    assert!(cleared.web_caret_area.is_none());
+    assert_eq!(
+        cleared.web_generation, 2,
+        "eviction retains the generation floor and the fact that a first frame arrived"
+    );
+    assert!(!model.update_web_frame(engine_frame(7, 2, &[2; 8])));
+    assert!(model.update_web_frame(engine_frame(7, 3, &[3; 8])));
+
+    assert!(model.declare_web_surface(9));
+    let replacement = model.page().expect("the replacement is attached");
+    assert_eq!(replacement.web_surface_id, Some(9));
+    assert_eq!(replacement.web_generation, 0);
+    assert!(replacement.web_frame.is_none());
+    assert!(replacement.web_caret_area.is_none());
+    assert!(!model.update_web_frame(engine_frame(7, 4, &[4; 8])));
+
+    assert!(model.update_page(
+        Arc::new(PageFrame {
+            generation: 2,
+            title: "Display list now".to_owned(),
+            ..PageFrame::default()
+        }),
+        false,
+    ));
+    let display_list = model.page().expect("the page changed rendering model");
+    assert!(display_list.web_surface_id.is_none());
+    assert_eq!(display_list.web_generation, 0);
+    assert!(display_list.web_frame.is_none());
+    assert!(display_list.web_caret_area.is_none());
+    assert!(!model.update_web_frame(engine_frame(9, 1, &[5; 8])));
+}
+
+#[test]
+fn web_input_and_ime_commands_remain_transport_independent_host_effects() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let _ = model.frame();
+    let input = WebSurfaceInput::Focus {
+        surface_id: 7,
+        focused: true,
+    };
+    assert_eq!(
+        model.apply(UiCommand::WebInput(input.clone())),
+        Some(UiEffect::WebInput(input))
+    );
+    let ime = WebImeEvent::Commit {
+        surface_id: 7,
+        text: "é".to_owned(),
+    };
+    assert_eq!(
+        model.apply(UiCommand::WebIme(ime.clone())),
+        Some(UiEffect::WebIme(ime))
+    );
 }

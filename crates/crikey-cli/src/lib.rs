@@ -18,6 +18,7 @@ mod native_commands;
 mod package_commands;
 mod plugin_commands;
 mod settings;
+mod web_host;
 
 use calculator::Calculator;
 use crikey_app::{
@@ -35,7 +36,7 @@ use crikey_config::{
     administrator_policy_path, ConfigSourceWatch, ConfigStore, ConfigurationPublisher, KEY_COALESCE_MS,
     KEY_MAXIMUM_WAIT_MS, KEY_MAX_RESULTS, KEY_RELOAD_INTERVAL_MS,
 };
-use crikey_core::{Generation, Item, PluginId};
+use crikey_core::{Generation, Item, PageWebSurface, PluginId, WebStorage};
 use crikey_input_scheduler::{
     ActivationPolicy, DebouncePolicy, PluginPolicy, QueuePolicy, SchedulingProfile,
 };
@@ -52,6 +53,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use web_host::{WebHostNotice, WebHostSupervisor, WebWake};
 
 const USAGE: &str = "\
 crikey - a fast, keyboard-driven application launcher
@@ -786,6 +788,17 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     // the calculator renders its row and explains itself instead of pretending
     // a copy happened.
     let mut calculator = Calculator::new(search.clipboard());
+    // The manager thread and WPE process are both lazy: a launcher that never
+    // opens an admitted web page pays no process or thread startup cost.
+    let web_wake_handle = render_handle.clone();
+    let web_wake: WebWake = Arc::new(move || {
+        let _ = web_wake_handle.request_provider_answer();
+    });
+    let mut web_page = WebPageRuntime::new(
+        directories.data_dir().join("web-storage"),
+        web_wake,
+        initial_page_viewport(page_window.0, page_window.1),
+    );
     let mut retained = RetainedRows::default();
     // Per-plugin refusal totals already reported, so a growing counter is
     // announced once per increase rather than on every turn of the loop.
@@ -880,6 +893,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         match open_plugin_page(
                             &mut search,
                             &mut view_model,
+                            &mut web_page,
                             &completion.plugin,
                             &page_id,
                             page_window,
@@ -902,10 +916,62 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             // that caused them. `poll_page` yields at most one update a turn.
             if let Some(update) = search.poll_page() {
                 if update.closed {
+                    web_page.close("plugin page closed");
                     view_model.close_page();
                 } else {
-                    view_model.update_page(Arc::new(update.frame), false);
+                    let owner = search.page_owner().map(|(plugin, _)| plugin);
+                    let frame = Arc::new(update.frame);
+                    let declaration = frame.web.clone();
+                    if view_model.update_page(frame, false) {
+                        match (owner, declaration) {
+                            (Some(plugin), Some(declaration)) => {
+                                if let Err(error) =
+                                    web_page.declare(&search, &mut view_model, &plugin, &declaration)
+                                {
+                                    close_failed_web_page(&mut web_page, &mut search, &mut view_model, error);
+                                }
+                            }
+                            (Some(_), None) => {
+                                web_page.close("page switched to a display list");
+                            }
+                            (None, _) => {
+                                close_failed_web_page(
+                                    &mut web_page,
+                                    &mut search,
+                                    &mut view_model,
+                                    "the page owner disappeared before its frame was admitted".to_owned(),
+                                );
+                            }
+                        }
+                    }
                 }
+            }
+            let mut web_failure = None;
+            for notice in web_page.poll() {
+                match notice {
+                    WebHostNotice::Frame(frame) => {
+                        view_model.update_web_frame(frame);
+                    }
+                    WebHostNotice::Caret {
+                        surface_id,
+                        x,
+                        y,
+                        width,
+                        height,
+                    } => {
+                        view_model.update_web_caret_area(surface_id, x, y, width, height);
+                    }
+                    WebHostNotice::Warning(message) => {
+                        eprintln!("crikey: {message}");
+                    }
+                    WebHostNotice::Fatal { surface_id, message } => {
+                        view_model.clear_web_frame(surface_id);
+                        web_failure = Some(message);
+                    }
+                }
+            }
+            if let Some(message) = web_failure {
+                close_failed_web_page(&mut web_page, &mut search, &mut view_model, message);
             }
             // into the retained view model, so a later navigation keystroke
             // keeps them. `publish` refuses a superseded or retired generation,
@@ -1160,10 +1226,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     // this the plugin keeps a page session alive for a screen
                     // nobody is looking at, and goes on being asked to draw it
                     // (spec 32.10). `close_page` is inert when none is open.
+                    web_page.close("launcher was dismissed");
                     search.close_page();
                     view_model.close_page();
                 }
-                Some(UiEffect::Quit) => {}
+                Some(UiEffect::Quit) => {
+                    web_page.close("launcher is quitting");
+                }
                 Some(UiEffect::SetSetting { key, value }) => {
                     let report = {
                         let mut registrar = settings::PlatformHotkeys {
@@ -1200,18 +1269,30 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     // the input that discovered it, rather than leaving the
                     // user pressing keys at a surface nobody owns.
                     if let Err(error) = search.send_page_input(input) {
-                        search.close_page();
-                        view_model.close_page();
-                        report_status(&mut view_model, format!("Page closed: {error}"));
+                        close_failed_web_page(&mut web_page, &mut search, &mut view_model, error.to_string());
+                    }
+                }
+                Some(UiEffect::WebInput(input)) => {
+                    if let Err(error) = web_page.send_input(input) {
+                        close_failed_web_page(&mut web_page, &mut search, &mut view_model, error);
+                    }
+                }
+                Some(UiEffect::WebIme(event)) => {
+                    if let Err(error) = web_page.send_ime(event) {
+                        close_failed_web_page(&mut web_page, &mut search, &mut view_model, error);
                     }
                 }
                 Some(UiEffect::ResizePage { width, height }) => {
                     search.resize_page(width, height);
+                    if let Err(error) = web_page.resize(width, height) {
+                        close_failed_web_page(&mut web_page, &mut search, &mut view_model, error);
+                    }
                 }
                 Some(UiEffect::ClosePage) => {
                     // The model has already forgotten the page; this is what
                     // tells the plugin, and it runs even when the model had
                     // nothing open so a session can never outlive its surface.
+                    web_page.close("page was closed");
                     search.close_page();
                     view_model.close_page();
                 }
@@ -1308,6 +1389,153 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     }
     outcome
 }
+#[derive(Debug)]
+struct ActiveWebSurface {
+    surface_id: u64,
+    plugin: PluginId,
+    storage: WebStorage,
+}
+
+struct WebPageRuntime {
+    supervisor: Option<WebHostSupervisor>,
+    storage_root: std::path::PathBuf,
+    wake: WebWake,
+    active: Option<ActiveWebSurface>,
+    viewport: (u32, u32),
+}
+
+impl WebPageRuntime {
+    fn new(storage_root: std::path::PathBuf, wake: WebWake, viewport: (u32, u32)) -> Self {
+        Self {
+            supervisor: None,
+            storage_root,
+            wake,
+            active: None,
+            viewport,
+        }
+    }
+
+    fn begin_page(&mut self, viewport: (u32, u32)) {
+        self.close("page was replaced");
+        self.viewport = viewport;
+    }
+
+    fn declare(
+        &mut self,
+        search: &SearchService,
+        view_model: &mut LauncherViewModel,
+        plugin: &PluginId,
+        declaration: &PageWebSurface,
+    ) -> Result<(), String> {
+        if !cfg!(target_os = "linux") {
+            return Err(
+                "web surfaces require Linux and an installed WPE web host; this launcher remains available without them"
+                    .to_owned(),
+            );
+        }
+        search
+            .admit_web_surface(
+                plugin,
+                !declaration.url.is_empty(),
+                declaration.storage == WebStorage::Persistent,
+            )
+            .map_err(|error| error.to_string())?;
+
+        if let Some(active) = self.active.as_ref() {
+            if active.plugin != *plugin {
+                return Err(format!(
+                    "web surface {} belongs to `{}`, not `{}`",
+                    active.surface_id, active.plugin.0, plugin.0
+                ));
+            }
+            if active.storage != declaration.storage {
+                return Err("a web surface cannot change its storage mode while it is open".to_owned());
+            }
+            if declaration.url.is_empty() {
+                return Ok(());
+            }
+            return self
+                .supervisor
+                .as_ref()
+                .ok_or_else(|| "the web-host supervisor is unavailable".to_owned())?
+                .navigate(active.surface_id, declaration.url.clone());
+        }
+
+        if declaration.url.is_empty() {
+            return Err("the first web-surface declaration must name an http or https address".to_owned());
+        }
+        let supervisor = self
+            .supervisor
+            .get_or_insert_with(|| WebHostSupervisor::new(self.storage_root.clone(), Arc::clone(&self.wake)));
+        let surface_id = supervisor.open(
+            plugin.clone(),
+            self.viewport.0,
+            self.viewport.1,
+            declaration.url.clone(),
+            declaration.storage,
+        )?;
+        if !view_model.declare_web_surface(surface_id) {
+            supervisor.close("the page no longer accepts the admitted web surface");
+            return Err("the page no longer accepts its admitted web surface".to_owned());
+        }
+        self.active = Some(ActiveWebSurface {
+            surface_id,
+            plugin: plugin.clone(),
+            storage: declaration.storage,
+        });
+        Ok(())
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+        self.viewport = (width, height);
+        let Some(active) = self.active.as_ref() else {
+            return Ok(());
+        };
+        self.supervisor
+            .as_ref()
+            .ok_or_else(|| "the web-host supervisor is unavailable".to_owned())?
+            .resize(active.surface_id, width, height)
+    }
+
+    fn send_input(&self, input: crikey_ui::WebSurfaceInput) -> Result<(), String> {
+        self.supervisor
+            .as_ref()
+            .ok_or_else(|| "the web-host supervisor is unavailable".to_owned())?
+            .send_input(input)
+    }
+
+    fn send_ime(&self, event: crikey_ui::WebImeEvent) -> Result<(), String> {
+        self.supervisor
+            .as_ref()
+            .ok_or_else(|| "the web-host supervisor is unavailable".to_owned())?
+            .send_ime(event)
+    }
+
+    fn poll(&self) -> Vec<WebHostNotice> {
+        self.supervisor
+            .as_ref()
+            .map_or_else(Vec::new, WebHostSupervisor::poll)
+    }
+
+    fn close(&mut self, reason: &str) {
+        self.active = None;
+        if let Some(supervisor) = self.supervisor.as_ref() {
+            supervisor.close(reason);
+        }
+    }
+}
+
+fn close_failed_web_page(
+    runtime: &mut WebPageRuntime,
+    search: &mut SearchService,
+    view_model: &mut LauncherViewModel,
+    message: String,
+) {
+    runtime.close("web surface failed");
+    search.close_page();
+    view_model.close_page();
+    report_status(view_model, format!("Page closed: {message}"));
+}
 
 /// Opens a plugin-drawn page and puts it on screen.
 ///
@@ -1319,14 +1547,17 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
 fn open_plugin_page(
     search: &mut SearchService,
     view_model: &mut LauncherViewModel,
+    web_page: &mut WebPageRuntime,
     plugin: &PluginId,
     page_id: &str,
     window: (u32, u32),
 ) -> Result<(), String> {
     let (width, height) = initial_page_viewport(window.0, window.1);
-    search
-        .open_page(plugin, page_id, width, height, page_palette())
-        .map_err(|error| error.to_string())?;
+    web_page.begin_page((width, height));
+    if let Err(error) = search.open_page(plugin, page_id, width, height, page_palette()) {
+        view_model.close_page();
+        return Err(error.to_string());
+    }
     // The submission left "Action pending" on the row. The action did not stay
     // pending, it became a page; leaving the message there would go on telling
     // the user to wait after the page has opened and closed again.
@@ -1343,9 +1574,10 @@ fn open_plugin_page(
         frame: Arc::new(crikey_core::PageFrame::default()),
         stale: true,
         answered: false,
-        // A web surface is not painted until its engine produces a frame,
-        // which is hundreds of milliseconds after the plugin declares it.
-        web_painted: false,
+        web_surface_id: None,
+        web_frame: None,
+        web_generation: 0,
+        web_caret_area: None,
     });
     if !shown {
         // The launcher was dismissed while the action ran, so the model has no
@@ -2769,6 +3001,9 @@ mod tests {
         service.set_plugin_action_router(Arc::new(router));
         service
     }
+    fn web_page_runtime() -> WebPageRuntime {
+        WebPageRuntime::new(std::path::PathBuf::from("/unused"), Arc::new(|| {}), (1, 1))
+    }
 
     /// An action can finish after the user has dismissed the launcher, and the
     /// hidden model refuses the surface. The session started a moment earlier
@@ -2779,12 +3014,14 @@ mod tests {
         let runtime = Arc::new(PageRuntime::default());
         let mut search = page_service(&runtime);
         let mut view_model = LauncherViewModel::default();
+        let mut web_page = web_page_runtime();
         view_model.dismiss();
         assert!(!view_model.is_visible(), "the launcher starts dismissed");
 
         open_plugin_page(
             &mut search,
             &mut view_model,
+            &mut web_page,
             &PluginId("test.page".to_owned()),
             "page",
             (800, 600),
@@ -2810,11 +3047,13 @@ mod tests {
         let runtime = Arc::new(PageRuntime::default());
         let mut search = page_service(&runtime);
         let mut view_model = LauncherViewModel::default();
+        let mut web_page = web_page_runtime();
         view_model.activate();
 
         open_plugin_page(
             &mut search,
             &mut view_model,
+            &mut web_page,
             &PluginId("test.page".to_owned()),
             "page",
             (800, 600),

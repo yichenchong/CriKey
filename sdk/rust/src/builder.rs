@@ -3,9 +3,9 @@
 use std::collections::BTreeMap;
 
 use crikey_core::{
-    Action, ActionId, ArgumentPolicy, Category, ExecutionPolicy, HitPolicy, Item, ItemId, NodeRole,
-    NodeShape, PageColor, PageError, PageFrame, PageImage, PageNode, PluginId, MAX_PAGE_IMAGE_BYTES,
-    MAX_PAGE_IMAGE_EDGE,
+    Action, ActionId, ArgumentPolicy, Category, CoreError, ExecutionPolicy, HitPolicy, Item, ItemId,
+    NodeRole, NodeShape, PageColor, PageError, PageFrame, PageImage, PageNode, PageWebSurface, PluginId,
+    WebStorage, MAX_PAGE_IMAGE_BYTES, MAX_PAGE_IMAGE_EDGE,
 };
 
 use crate::PagePalette;
@@ -241,6 +241,22 @@ pub struct PageBuilder {
     redraw_after_ms: u32,
     close: bool,
     palette: PagePalette,
+}
+
+/// Builds a page backed by the host's supervised web engine (spec 32.11).
+///
+/// This is intentionally separate from [`PageBuilder`]: a frame may contain a
+/// display list or a web surface, never both. [`WebSurfaceBuilder::build`]
+/// validates the finished declaration before returning it, so a refused or
+/// malformed URL is reported at the author's call site rather than after the
+/// frame crosses the protocol boundary.
+#[must_use = "call WebSurfaceBuilder::build to create the frame"]
+#[derive(Debug, Clone)]
+pub struct WebSurfaceBuilder {
+    generation: u64,
+    title: String,
+    url: String,
+    storage: WebStorage,
 }
 
 /// Where a control sits, in the page's own logical pixels.
@@ -684,5 +700,99 @@ impl PageBuilder {
             // builder is the display-list one.
             web: None,
         }
+    }
+}
+
+fn validate_web_url(url: &str) -> crikey_core::Result<()> {
+    if url.is_empty() {
+        return Ok(());
+    }
+    if url.chars().any(char::is_control) {
+        return Err(CoreError::Invalid(
+            "web surface URL must not contain control characters".to_owned(),
+        ));
+    }
+    let Some((scheme, remainder)) = url.split_once(':') else {
+        return Err(CoreError::Invalid(
+            "web surface URL must be an absolute HTTP(S) URL".to_owned(),
+        ));
+    };
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        || !remainder.starts_with("//")
+    {
+        return Err(CoreError::Invalid(
+            "web surface URL must be an absolute HTTP(S) URL".to_owned(),
+        ));
+    }
+    let authority = remainder[2..].split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.chars().any(char::is_whitespace) {
+        return Err(CoreError::Invalid(
+            "web surface URL must have a non-empty authority without whitespace".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+impl WebSurfaceBuilder {
+    /// Starts a web frame that navigates to an HTTP(S) address.
+    ///
+    /// The address is checked by [`WebSurfaceBuilder::build`]. Navigation also
+    /// requires the plugin manifest's `permissions.network` grant; that policy
+    /// is enforced by the host because a builder cannot see the manifest.
+    pub fn navigate(generation: u64, url: impl Into<String>) -> Self {
+        Self {
+            generation,
+            title: String::new(),
+            url: url.into(),
+            storage: WebStorage::Ephemeral,
+        }
+    }
+
+    /// Starts a later frame that leaves the current document at its URL.
+    ///
+    /// An empty URL is a protocol operation, not an empty first navigation:
+    /// it lets a plugin answer another page generation without reloading the
+    /// document under the user.
+    pub fn stay(generation: u64) -> Self {
+        Self::navigate(generation, String::new())
+    }
+
+    /// Sets the title the launcher shows beside the page.
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
+        self
+    }
+
+    /// Chooses whether the engine may retain cookies and local storage.
+    ///
+    /// Persistence requires the independent `permissions.web-storage` grant.
+    /// Ephemeral storage is the default.
+    pub fn storage(mut self, storage: WebStorage) -> Self {
+        self.storage = storage;
+        self
+    }
+
+    /// Validates and returns the web-surface frame.
+    ///
+    /// A stated URL must be an absolute HTTP(S) URL with a non-empty authority.
+    /// An empty URL is accepted only as the [`WebSurfaceBuilder::stay`]
+    /// operation; the launcher refuses it when no document is already open.
+    pub fn build(self) -> crikey_core::Result<PageFrame> {
+        let frame = PageFrame {
+            generation: self.generation,
+            title: self.title,
+            web: Some(PageWebSurface {
+                url: self.url,
+                storage: self.storage,
+            }),
+            ..PageFrame::default()
+        };
+        frame
+            .validate()
+            .map_err(|error| CoreError::Invalid(error.to_string()))?;
+        if let Some(web) = &frame.web {
+            validate_web_url(&web.url)?;
+        }
+        Ok(frame)
     }
 }

@@ -17,9 +17,10 @@ pub mod bench;
 pub mod harness;
 pub mod packaging;
 
-pub use builder::{ActionBuilder, ItemBuilder, PageBuilder, PageCanvas, PageRect};
+pub use builder::{ActionBuilder, ItemBuilder, PageBuilder, PageCanvas, PageRect, WebSurfaceBuilder};
 pub use crikey_core::{
     NodeRole, NodeShape, PageColor, PageError, PageFrame, PageImage, PageInput, PageInputKind, PageNode,
+    PageWebSurface, WebStorage,
 };
 pub use crikey_native_protocol as protocol;
 pub use serve::{serve, serve_on, HandshakeInfo, ServeConfig};

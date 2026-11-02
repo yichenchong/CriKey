@@ -679,6 +679,7 @@ dependencies = [
  "crikey-python-host",
  "crikey-sandbox",
  "crikey-ui",
+ "libc",
  "sha2",
  "windows 0.61.3",
 ]

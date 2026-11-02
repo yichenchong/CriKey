@@ -119,6 +119,118 @@ pub enum SettingControl {
     Toggle { on: bool },
 }
 
+/// One complete engine-painted web surface frame.
+///
+/// Pixels are premultiplied RGBA8, row-major from the top left. The native
+/// protocol validates its own message before the launcher constructs this
+/// transport-independent value; the view model nevertheless checks the
+/// dimensions against the byte count before allowing a renderer to upload it.
+///
+/// Shared because the same bounded raster crosses the host/view-model boundary
+/// and then the view-model/renderer boundary. Neither handoff copies it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSurfaceFrame {
+    pub surface_id: u64,
+    pub generation: u64,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub rgba8: Arc<[u8]>,
+}
+
+impl WebSurfaceFrame {
+    /// Whether this value is a non-empty, complete RGBA surface.
+    pub fn is_valid(&self) -> bool {
+        self.surface_id != 0
+            && self.generation != 0
+            && self.pixel_width != 0
+            && self.pixel_height != 0
+            && (self.pixel_width as usize)
+                .checked_mul(self.pixel_height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                == Some(self.rgba8.len())
+    }
+}
+
+/// Raw input for the supervised web engine.
+///
+/// This is deliberately not `crikey-native-protocol::RawInput`: the UI knows
+/// nothing about a transport or its numeric discriminants. The composition
+/// root translates these semantic variants at its own boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WebSurfaceInput {
+    Key {
+        surface_id: u64,
+        timestamp_ms: u64,
+        pressed: bool,
+        keysym: u32,
+        hardware_keycode: u32,
+        repeat: bool,
+        modifiers: u32,
+    },
+    PointerMove {
+        surface_id: u64,
+        timestamp_ms: u64,
+        x: f32,
+        y: f32,
+        modifiers: u32,
+    },
+    PointerButton {
+        surface_id: u64,
+        timestamp_ms: u64,
+        x: f32,
+        y: f32,
+        button: u32,
+        pressed: bool,
+        press_count: u32,
+        modifiers: u32,
+    },
+    Scroll {
+        surface_id: u64,
+        timestamp_ms: u64,
+        x: f32,
+        y: f32,
+        delta_x: f32,
+        delta_y: f32,
+        precise: bool,
+        modifiers: u32,
+        stop: bool,
+    },
+    Focus {
+        surface_id: u64,
+        focused: bool,
+    },
+}
+
+/// Input-method composition for the supervised web engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebImeEvent {
+    /// The current marked text. The optional range is measured in Unicode
+    /// scalar values, not UTF-8 bytes.
+    Preedit {
+        surface_id: u64,
+        text: String,
+        cursor: Option<(u32, u32)>,
+    },
+    Commit {
+        surface_id: u64,
+        text: String,
+    },
+}
+
+/// Modifier bits used by [`WebSurfaceInput`].
+///
+/// These are engine semantics rather than protocol discriminants. They remain
+/// stable when the host transport changes.
+pub const WEB_MODIFIER_SHIFT: u32 = 1 << 0;
+pub const WEB_MODIFIER_CONTROL: u32 = 1 << 1;
+pub const WEB_MODIFIER_ALT: u32 = 1 << 2;
+pub const WEB_MODIFIER_META: u32 = 1 << 3;
+
+/// Engine pointer-button numbering used by [`WebSurfaceInput`].
+pub const WEB_POINTER_BUTTON_LEFT: u32 = 1;
+pub const WEB_POINTER_BUTTON_MIDDLE: u32 = 2;
+pub const WEB_POINTER_BUTTON_RIGHT: u32 = 3;
+
 /// The plugin-drawn surface the launcher is showing, if any (spec 6.3, 32).
 ///
 /// A page is a display list the plugin returns and the *host* draws: the
@@ -166,19 +278,21 @@ pub struct PageSurface {
     /// puts up the instant it opens one, before the plugin has drawn
     /// anything, which is the only case that should read as loading.
     pub answered: bool,
-    /// Whether a web surface has produced its first frame.
-    ///
-    /// Separate from [`PageSurface::answered`], and the separation is the
-    /// whole point: a plugin declaring a web surface answers immediately,
-    /// because the declaration is a URL and a rectangle, while the engine
-    /// behind it took 276 to 533 ms to produce a first frame when measured.
-    /// Keying the loading state on `answered` alone would therefore clear the
-    /// spinner instantly and leave the user watching a blank sheet for half a
-    /// second -- exactly the hang the loading state exists to prevent.
-    ///
-    /// Meaningless for a display list, where the plugin's frame *is* the
-    /// content.
-    pub web_painted: bool,
+    /// Launcher-generated identity of the supervised engine surface, once the
+    /// declaration has passed permission checks. `None` for display-list pages
+    /// and for a declaration that has not been admitted yet.
+    pub web_surface_id: Option<u64>,
+    /// The newest accepted engine frame. It belongs to `web_surface_id`; a
+    /// frame for a closed or replaced id never enters this slot.
+    pub web_frame: Option<Arc<WebSurfaceFrame>>,
+    /// Highest engine generation accepted for this surface. Kept even when
+    /// `web_frame` is cleared, so an older frame already in flight cannot
+    /// repaint the sheet afterwards.
+    pub web_generation: u64,
+    /// Engine-reported caret rectangle in page-local logical pixels. The
+    /// native renderer offsets it by the measured page origin before asking
+    /// the window system to position an IME candidate window.
+    pub web_caret_area: Option<(f32, f32, f32, f32)>,
 }
 
 /// Everything the renderer needs for one frame.
@@ -266,6 +380,10 @@ pub enum UiCommand {
     /// (spec 32). The renderer has already hit-tested it and translated its
     /// coordinates into the page's own space.
     PageInput(PageInput),
+    /// Raw input for the supervised engine behind an admitted web page.
+    WebInput(WebSurfaceInput),
+    /// Input-method composition for the supervised engine.
+    WebIme(WebImeEvent),
     /// Closes the open page. Reserved by the host -- Escape produces this and
     /// is never forwarded -- so a plugin can never trap the user inside its
     /// own surface.
@@ -326,6 +444,10 @@ pub enum UiEffect {
     /// Deliver `PageInput` to the plugin that owns the open page (spec 32.9).
     /// The model holds no transport, so the round trip is the host's.
     PageInput(PageInput),
+    /// Deliver raw input to the supervised engine behind the open web page.
+    WebInput(WebSurfaceInput),
+    /// Deliver input-method composition to the supervised web engine.
+    WebIme(WebImeEvent),
     /// Tear the page session down with the plugin that owns it.
     ///
     /// Produced even when the model had no page open, and even while the
@@ -664,6 +786,8 @@ impl LauncherViewModel {
             // The page's own input is the host's to deliver: the model holds no
             // transport and the plugin is the only thing that can answer.
             UiCommand::PageInput(input) => Some(UiEffect::PageInput(input)),
+            UiCommand::WebInput(input) => Some(UiEffect::WebInput(input)),
+            UiCommand::WebIme(event) => Some(UiEffect::WebIme(event)),
             // Pure measurement: nothing in the model changes, and the frame
             // already on screen stays exactly as it is.
             UiCommand::ResizePage { width, height } => {
@@ -941,11 +1065,127 @@ impl LauncherViewModel {
             return false;
         }
 
+        let changed_rendering_model = page.frame.web.is_some() != frame.web.is_some();
         page.frame = frame;
         page.stale = stale;
         // The plugin has now drawn something, whatever it drew. An empty
         // display list still counts: the page answered.
         page.answered = true;
+        // A display list and an engine surface are mutually exclusive. A
+        // frame that crosses that boundary retires the old engine identity as
+        // well as its pixels, generation floor, and caret; otherwise a late
+        // frame from the page's previous rendering model could be admitted if
+        // the plugin later crossed back.
+        if changed_rendering_model {
+            page.web_surface_id = None;
+            page.web_frame = None;
+            page.web_generation = 0;
+            page.web_caret_area = None;
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Attaches an admitted, launcher-generated engine surface to the current
+    /// web declaration.
+    ///
+    /// Permission checks and process creation stay in the composition root.
+    /// The UI accepts only a nonzero identity and only after a validated
+    /// `PageFrame.web` declaration is standing. Replacing the identity drops
+    /// every pixel and caret belonging to its predecessor.
+    pub fn declare_web_surface(&mut self, surface_id: u64) -> bool {
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        if surface_id == 0 || page.frame.web.is_none() {
+            return false;
+        }
+        if page.web_surface_id == Some(surface_id) {
+            return false;
+        }
+
+        page.web_surface_id = Some(surface_id);
+        page.web_frame = None;
+        page.web_generation = 0;
+        page.web_caret_area = None;
+        self.dirty = true;
+        true
+    }
+
+    /// Accepts the next complete engine frame for the current web surface.
+    ///
+    /// Surface identity drops pixels still in flight from a closed engine.
+    /// Generations increase strictly, so a duplicate or stale delivery cannot
+    /// walk the page backwards. Geometry is checked before the renderer sees
+    /// it even though the transport already validated the same invariant.
+    pub fn update_web_frame(&mut self, frame: Arc<WebSurfaceFrame>) -> bool {
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        if !frame.is_valid()
+            || page.frame.web.is_none()
+            || page.web_surface_id != Some(frame.surface_id)
+            || frame.generation <= page.web_generation
+        {
+            return false;
+        }
+
+        page.web_generation = frame.generation;
+        page.web_frame = Some(frame);
+        self.dirty = true;
+        true
+    }
+
+    /// Clears the pixels and caret for a live web surface without retiring its
+    /// generation floor.
+    ///
+    /// This is the `Gone`/load-failure path. Keeping the floor means a frame
+    /// queued before the failure cannot restore pixels after the host reported
+    /// them gone. The accepted generation also records that the surface did
+    /// produce a first frame, so clearing it does not put the page back into
+    /// its initial loading state.
+    pub fn clear_web_frame(&mut self, surface_id: u64) -> bool {
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        if page.web_surface_id != Some(surface_id) {
+            return false;
+        }
+        let changed = page.web_frame.take().is_some() | page.web_caret_area.take().is_some();
+        if !changed {
+            return false;
+        }
+
+        self.dirty = true;
+        true
+    }
+
+    /// Updates the web engine's page-local caret rectangle.
+    ///
+    /// Non-finite and negative extents are refused rather than passed to the
+    /// window system. A duplicate report costs no repaint.
+    pub fn update_web_caret_area(
+        &mut self,
+        surface_id: u64,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> bool {
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        let area = (x, y, width, height);
+        if page.web_surface_id != Some(surface_id)
+            || ![x, y, width, height].iter().all(|value| value.is_finite())
+            || width < 0.0
+            || height < 0.0
+            || page.web_caret_area == Some(area)
+        {
+            return false;
+        }
+
+        page.web_caret_area = Some(area);
         self.dirty = true;
         true
     }
