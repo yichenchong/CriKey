@@ -38,6 +38,12 @@ URL:            https://github.com/crikey-launcher/crikey
 # correctly disappears.
 %{?crikey_python_requires:Requires:       %{crikey_python_requires}}
 
+# When crikey-web-host is present, RPM's ELF dependency generator reads that
+# executable along with the other payload files and emits its WPE WebKit,
+# libwpe, WPEBackend-fdo, Wayland and GLib soname requirements. Keeping this
+# automatic avoids hard-coding distribution-specific package names while
+# still making a web-enabled RPM uninstallable without its engine runtime.
+
 %description
 CriKey finds and runs applications, files and plugin commands from a single
 keyboard-driven prompt. Plugins run as supervised subprocesses, so a slow or

@@ -8,7 +8,7 @@ use crikey_platform::IconImage;
 use crikey_ui::{
     build_launcher_frame, create_launcher_context, egui, ActivationLatencyTracker, NativeLauncher,
     NativeLauncherConfig, NativeLauncherHandle, PageSurface, RendererError, ResultRow, SettingControl,
-    SettingRow, UiCommand, ViewModel, ACTIVATION_SAMPLE_CAPACITY,
+    SettingRow, UiCommand, ViewModel, WebSurfaceFrame, ACTIVATION_SAMPLE_CAPACITY,
 };
 
 fn model(query: &str) -> ViewModel {
@@ -1282,7 +1282,10 @@ fn page_view_at_generation(nodes: Vec<PageNode>, generation: u64) -> ViewModel {
         frame: Arc::new(frame),
         stale: false,
         answered: true,
-        web_painted: false,
+        web_surface_id: None,
+        web_frame: None,
+        web_generation: 0,
+        web_caret_area: None,
     });
     view
 }
@@ -1336,7 +1339,10 @@ fn lifecycle_page_view(nodes: Vec<PageNode>, stale: bool, answered: bool) -> Vie
         frame: Arc::new(frame),
         stale,
         answered,
-        web_painted: false,
+        web_surface_id: None,
+        web_frame: None,
+        web_generation: 0,
+        web_caret_area: None,
     });
     view
 }
@@ -2029,15 +2035,149 @@ fn a_declared_web_surface_keeps_loading_until_its_first_frame_is_painted() {
         "a web surface that has answered but never painted must still say it is loading"
     );
 
-    declared
-        .page
-        .as_mut()
-        .expect("the fixture opens a page")
-        .web_painted = true;
+    let surface = declared.page.as_mut().expect("the fixture opens a page");
+    surface.web_surface_id = Some(41);
+    surface.web_generation = 1;
+    surface.web_frame = Some(Arc::new(WebSurfaceFrame {
+        surface_id: 41,
+        generation: 1,
+        pixel_width: 2,
+        pixel_height: 1,
+        rgba8: Arc::from([20, 40, 60, 255, 80, 100, 120, 255]),
+    }));
     let painted = build_launcher_frame(&context, launcher_input(Vec::new()), &declared);
     assert_eq!(
         spinner_arcs(&painted),
         0,
         "once the engine has painted a frame the sheet has content and the spinner goes"
+    );
+
+    let surface = declared.page.as_mut().expect("the fixture opens a page");
+    surface.web_frame = None;
+    let evicted = build_launcher_frame(&context, launcher_input(Vec::new()), &declared);
+    assert_eq!(
+        spinner_arcs(&evicted),
+        0,
+        "evicting pixels after a painted generation must not regress to first-frame loading"
+    );
+}
+
+fn painted_web_view(surface_id: u64, generation: u64, rgba8: &[u8]) -> ViewModel {
+    let mut view = lifecycle_page_view(Vec::new(), false, true);
+    let page = view.page.as_mut().expect("the fixture opens a page");
+    page.frame = Arc::new(crikey_core::PageFrame {
+        generation: 1,
+        title: "Web Page".to_owned(),
+        web: Some(crikey_core::PageWebSurface {
+            url: "https://example.invalid/".to_owned(),
+            ..crikey_core::PageWebSurface::default()
+        }),
+        ..crikey_core::PageFrame::default()
+    });
+    page.web_surface_id = Some(surface_id);
+    page.web_generation = generation;
+    page.web_frame = Some(Arc::new(WebSurfaceFrame {
+        surface_id,
+        generation,
+        pixel_width: 2,
+        pixel_height: 1,
+        rgba8: Arc::from(rgba8),
+    }));
+    view
+}
+
+#[test]
+fn a_web_generation_uploads_exact_premultiplied_rgba_and_paints_it_untinted() {
+    let context = create_launcher_context();
+    let bytes = [10, 20, 30, 40, 90, 100, 110, 120];
+    let view = painted_web_view(41, 1, &bytes);
+
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let (texture, delta) = frame
+        .output
+        .textures_delta
+        .set
+        .iter()
+        .find(|(_, delta)| delta.image.size() == [2, 1])
+        .expect("the complete web raster must be uploaded at its exact extent");
+    match &delta.image {
+        egui::ImageData::Color(image) => assert_eq!(
+            image.pixels.as_slice(),
+            &[
+                egui::Color32::from_rgba_premultiplied(10, 20, 30, 40),
+                egui::Color32::from_rgba_premultiplied(90, 100, 110, 120),
+            ],
+            "premultiplied engine bytes must reach the texture without another alpha multiplication"
+        ),
+        egui::ImageData::Font(_) => panic!("a web frame uploads colour data, not font coverage"),
+    }
+
+    let (shape, clip) = rect_shapes(&frame)
+        .into_iter()
+        .find(|(shape, _)| shape.fill_texture_id == *texture)
+        .expect("the uploaded web texture must be painted in the same frame");
+    assert!(shape.rect.width() > 0.0 && shape.rect.height() > 0.0);
+    assert!(
+        clip.contains_rect(shape.rect),
+        "the document is clipped to its page"
+    );
+    assert_eq!(
+        shape.fill,
+        egui::Color32::WHITE,
+        "the engine already composed the frame, so the launcher must not tint it"
+    );
+}
+
+#[test]
+fn web_textures_are_reused_per_generation_and_evicted_on_replacement_and_close() {
+    let context = create_launcher_context();
+    let first_view = painted_web_view(41, 1, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    let first = build_launcher_frame(&context, launcher_input(Vec::new()), &first_view);
+    let first_id = first
+        .output
+        .textures_delta
+        .set
+        .iter()
+        .find(|(_, delta)| delta.image.size() == [2, 1])
+        .map(|(id, _)| *id)
+        .expect("the first generation uploads");
+
+    let repeated = build_launcher_frame(&context, launcher_input(Vec::new()), &first_view);
+    assert!(
+        repeated
+            .output
+            .textures_delta
+            .set
+            .iter()
+            .all(|(_, delta)| delta.image.size() != [2, 1]),
+        "a repaint of one generation must reuse its texture"
+    );
+    assert!(
+        rect_shapes(&repeated)
+            .iter()
+            .any(|(shape, _)| shape.fill_texture_id == first_id),
+        "the reused texture remains the one painted"
+    );
+
+    let second_view = painted_web_view(41, 2, &[8, 7, 6, 5, 4, 3, 2, 1]);
+    let second = build_launcher_frame(&context, launcher_input(Vec::new()), &second_view);
+    let second_id = second
+        .output
+        .textures_delta
+        .set
+        .iter()
+        .find(|(_, delta)| delta.image.size() == [2, 1])
+        .map(|(id, _)| *id)
+        .expect("a new generation uploads its replacement");
+    assert_ne!(second_id, first_id);
+    assert!(
+        second.output.textures_delta.free.contains(&first_id),
+        "replacing a generation frees its previous GPU texture"
+    );
+
+    let closed = build_launcher_frame(&context, launcher_input(Vec::new()), &model(""));
+    assert!(
+        closed.output.textures_delta.free.contains(&second_id),
+        "closing the web page frees its final GPU texture"
     );
 }

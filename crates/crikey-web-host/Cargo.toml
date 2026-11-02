@@ -9,6 +9,11 @@ repository.workspace = true
 authors.workspace = true
 build = "build.rs"
 
+[[bin]]
+name = "crikey-web-host"
+path = "src/main.rs"
+required-features = ["engine"]
+
 [lints]
 workspace = true
 
@@ -37,10 +42,3 @@ thiserror.workspace = true
 # `Cargo.lock` -- both are already there, pulled in by existing build scripts.
 cc = "1"
 pkg-config = "0.3"
-
-# The executable is deliberately not declared yet. What exists so far is the
-# engine-free half of this crate -- frame conversion, the IME ordering rules
-# and their tests -- plus the C shim they will drive. Declaring a `[[bin]]`
-# whose `src/main.rs` does not exist breaks `cargo fmt` for the whole
-# workspace, and writing a stub that starts and answers nothing would be
-# worse: it would look like a host. The binary arrives with the host loop.

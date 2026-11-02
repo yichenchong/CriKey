@@ -2643,41 +2643,76 @@ web frame that names a display-list focus node, or a web frame that requests a
 plugin-timed redraw. Focus and repaint scheduling inside a web surface belong
 to the engine.
 
+The first declaration shall name an `http` or `https` address. An empty address
+on a later declaration shall mean “stay on the document's current navigation”;
+it shall not reload the page. Other schemes shall be refused during frame
+validation.
+
 At most one web surface shall be live. This follows the page invariant in
 32.2: before a new page opens, the prior page and its supervised web-host
-process tree shall be closed and released. Frames from a closed surface shall
-be discarded by surface identifier.
+process tree shall be closed and released. Frames from a closed surface, a
+different surface identifier, or an older surface generation shall be
+discarded.
 
-A web surface may navigate only to `http` and `https` addresses and requires
-the plugin's `permissions.network` grant. Persistent cookies and local storage
-require the independent `permissions.web-storage` grant; network permission
-does not imply persistence. Ephemeral storage shall be discarded when the
-page closes.
+A web surface with a stated address requires the plugin's
+`permissions.network` grant. Persistent cookies and local storage require the
+independent `permissions.web-storage` grant; network permission does not imply
+persistence. Ephemeral storage shall be discarded when the page closes.
+Permission and platform checks shall complete before any engine process is
+spawned.
+
+The Linux implementation shall listen on a private native-protocol endpoint,
+spawn one engine-enabled `crikey-web-host`, and accept that host's connection.
+The first launcher command shall be `OpenSurface` carrying a launcher-generated
+non-zero surface identifier, viewport, URL and storage mode. The launcher and
+UI shall not link WPE directly, and the host shall not create or overlay a
+child window. Windows and macOS shall refuse web declarations until an
+equivalent supervised offscreen host is implemented for those platforms.
+
+The web host shall convert an exported engine buffer to tightly packed RGBA8.
+A frame shall carry exactly `pixel_width * pixel_height * 4` bytes, shall not
+exceed `MAX_WEB_FRAME_EDGE` (4,096) on either side, and shall not exceed
+`MAX_WEB_FRAME_BYTES` (2 MiB). A malformed frame shall close the surface rather
+than reaching GPU upload. Host-to-launcher queues shall be bounded and stale
+surface or generation frames shall be discarded.
 
 The engine shall start only after the user opens the page. Nothing shall be
 spawned for web surfaces at launcher startup, plugin discovery, activation or
-catalog build. While waiting for the first engine frame, the page shall show
-its in-page loading state; receiving the plugin's web-surface declaration
-shall not count as the engine having painted.
+catalog build. While waiting for the first accepted engine frame, the page
+shall show its in-page loading state; receiving the plugin's web-surface
+declaration or a load-state message shall not count as a painted frame.
+Permission denial, unsupported platform, missing host, spawn/connect/protocol
+failure, engine load failure and unexpected host exit shall close the page with
+a specific diagnostic while leaving the launcher running. Normal replacement
+or dismissal shall release the host without reporting a failure.
 
 For a web surface, hit-testing, DOM focus and accessibility semantics belong
 to the engine rather than the plugin display-list protocol. The launcher shall
-forward raw pointer, keyboard and IME events to its supervised web host in
-arrival order, preserving hardware keycode, logical keysym, modifiers,
-repeat state and composition boundaries. Escape remains the launcher's key
-under 32.9 and shall never reach the engine.
+forward raw pointer, direct key press and release, focus, resize, IME preedit
+and IME commit events to its supervised web host in arrival order. Keyboard
+events shall preserve the hardware keycode, logical keysym, modifiers and
+repeat state. Tab shall reach the engine; Escape remains the launcher's key
+under 32.9 and shall never reach it.
 
-On Linux the supervised web-host process tree should receive a memory ceiling
-equal to the lesser of 768 MiB and one eighth of physical RAM. An effective
-ceiling below 256 MiB shall refuse a web surface rather than start an engine
-expected to exceed it. If CriKey was started outside a delegated systemd user
-session and cannot establish the cgroup-v2 tree limit, diagnostics shall
-report memory enforcement as unavailable; the host shall not claim that the
-ceiling is active.
+The Linux route shall carry the engine's caret rectangle for candidate-window
+positioning. These implemented transport operations shall not be described as
+complete IME support: compatibility across real ibus and fcitx input methods
+is unmeasured, and v1 has no surrounding-text or delete-surrounding operation
+for correction of already-committed text. Both limitations shall be visible in
+the plugin-author guide.
 
-Composition, committed text and candidate-window positioning shall be
-supported on the Linux WPE route. IME correction of already-committed text is
-not supported in v1 because neither the launcher input API nor the packaged
-WPE route provides a correct delete-surrounding operation. This limitation
-shall be visible in the plugin-author guide and in `crikey plugin doctor` for
-a manifest that declares persistent web storage.
+On Linux the launcher shall compute a web-host process-tree memory target equal
+to the lesser of 768 MiB and one eighth of physical RAM, reduced further by an
+inherited finite cgroup limit. An effective value below 256 MiB shall refuse a
+web surface rather than start an engine expected to exceed it. The launcher
+shall attempt enforcement with a delegated cgroup-v2 tree rather than
+`RLIMIT_AS`. When the value cannot be determined or the delegated cgroup cannot
+be created and written, it shall report a warning and continue without the new
+ceiling; documentation and diagnostics shall not describe the limit as
+universally available.
+
+Linux packages shall make web support explicit. An engine-enabled build shall
+stage `crikey-web-host` beside the other supervised hosts and declare or derive
+its WPE WebKit, libwpe, WPEBackend-fdo, Wayland and GLib runtime dependencies.
+A no-web package shall remain functional and shall not claim web-surface
+availability.

@@ -271,21 +271,114 @@ has a defined end.
 
 A page may use a host-owned web surface instead of a display list; it cannot
 mix the two in one frame. At most one page, and therefore one web surface, is
-live at once. Opening another page closes the previous one first. Web engines
-are created only after the user opens the page and are released on close, so
-do not depend on state surviving an ephemeral surface.
+live at once. Opening another page closes the previous one first. The engine
+starts only after the user opens the page and the launcher releases the
+supervised host when the page closes.
 
-Navigation requires `permissions.network`. Persistent cookies and local
-storage additionally require `permissions.web-storage = true`; network access
-does not grant persistence. `crikey plugin doctor` reports platform
-limitations for a manifest carrying that declaration.
+Web surfaces are currently available only on Linux with an engine-enabled
+`crikey-web-host`. `packaging/linux/build.sh --with-web-surface` builds one;
+`--web-host-binary` stages a supplied host that passes the packaging checks.
+The normal no-web package does not provide that host, although an operator may
+independently supply one beside the launcher, on `PATH`, or through the
+`CRIKEY_WEB_HOST` override. The current Flatpak recipe neither builds nor
+stages the engine host and is explicitly no-web. Windows and macOS do not have
+a web-surface host in v1.
 
-On Linux, WPE surfaces support preedit, committed CJK text, and candidate
-window positioning. They do **not** support IME correction of text that has
-already been committed: the v1 route has no correct delete-surrounding
-operation. Ordinary insertion, composition and backspace within the active
-composition work; reconversion and IME-directed deletion outside it do not.
-Do not make those operations necessary to complete a form.
+Only HTTP and HTTPS navigation is accepted. A stated address requires network
+permission; persistent cookies and local storage need a separate grant:
+
+```toml
+[permissions]
+network = true
+web-storage = true
+```
+
+The default `WebStorage::Ephemeral` profile is destroyed when the page closes
+and does not require `web-storage`. `WebStorage::Persistent` survives later
+openings in storage isolated to that plugin; `network = true` does not imply
+it. Permission and platform checks happen before the engine is spawned, so a
+denied declaration cannot briefly start WebKit. Do not use `file:`, `data:` or
+`javascript:` URLs; `WebSurfaceBuilder::build` rejects them before serving the
+frame.
+
+The first frame navigates. Later frames normally use
+`WebSurfaceBuilder::stay`, whose empty URL means “keep the document and its
+current navigation” rather than reload it:
+
+```rust
+use crikey_core::Result;
+use crikey_plugin_sdk::{
+    ExecuteOutcome, ExecuteRequest, PageFrame, PageRequest, PluginContext,
+    WebStorage, WebSurfaceBuilder,
+};
+
+struct Dashboard {
+    web_opened: bool,
+}
+
+impl Dashboard {
+    fn execute_page(
+        &mut self,
+        request: ExecuteRequest,
+        _context: &dyn PluginContext,
+    ) -> Result<ExecuteOutcome> {
+        if request.item.0 == "dashboard" {
+            self.web_opened = false;
+            return Ok(ExecuteOutcome::show_page("dashboard"));
+        }
+        Ok(ExecuteOutcome::Completed)
+    }
+
+    fn page_frame(
+        &mut self,
+        request: PageRequest,
+        _context: &dyn PluginContext,
+    ) -> Result<PageFrame> {
+        let frame = if self.web_opened {
+            WebSurfaceBuilder::stay(request.generation)
+        } else {
+            self.web_opened = true;
+            WebSurfaceBuilder::navigate(
+                request.generation,
+                "https://dashboard.example/plugin",
+            )
+        };
+
+        frame
+            .title("Service dashboard")
+            .storage(WebStorage::Persistent)
+            .build()
+    }
+}
+```
+
+Use those method bodies from `Plugin::execute_outcome` and `Plugin::page`.
+Returning the request's generation is still mandatory; the builder takes it
+explicitly for that reason. Keep the same storage choice on stay frames.
+
+The launcher keeps its in-page loading indicator until the first accepted RGBA
+frame arrives; the declaration itself is not painted content. Permission
+denial, an unavailable platform or host, a spawn/connect/protocol failure, a
+host crash, or an engine load failure closes the page with a specific
+`Web page closed: …` diagnostic while leaving the launcher running.
+
+On Linux the launcher attempts to put the web-host process tree in a delegated
+cgroup-v2 memory ceiling. The policy target is the lesser of 768 MiB and one
+eighth of physical RAM, reduced further by an inherited finite cgroup limit. It
+refuses to start the engine when that effective value is below 256 MiB.
+Enforcement is not universally available: if the limit cannot be determined or
+a writable delegated cgroup cannot be created, CriKey reports a warning and
+continues without the new ceiling. A plugin must not treat the limit as an
+allocation guarantee or assume it is active on a particular installation.
+
+The implemented input route forwards pointer, direct key press and release,
+focus, resize, IME preedit and IME commit events to the Linux host; Tab is a web
+key and Escape remains reserved by the launcher. It also carries the
+engine-reported caret rectangle used to position a candidate window. This
+wiring is not a claim of complete IME support: interoperability across real
+ibus/fcitx input methods has not been measured, and v1 has no surrounding-text
+or delete-surrounding operation for correction of already-committed text. Do
+not require CJK reconversion or IME-directed deletion to complete a form.
 
 ### A worked page
 
@@ -602,13 +695,16 @@ cause host-side matching or sorting of suggestion batches.
 
 ## Permissions, security, and troubleshooting
 
-Manifests may request filesystem read/write, network client/listener, clipboard,
-process, window, notification, secret-storage, environment, native-library,
-and persistent-background capabilities. Five of those reach a real host gate
-and one is refused at parse time; the rest record a request, and
-`crikey plugin doctor` names every declaration the host does not honour, with
-the reason. Independently of the manifest, Linux confines every supervised
-plugin process with Landlock: your plugin may write only beneath the
+Manifests may request filesystem read/write, network client/listener,
+web-storage, clipboard, process, window, notification, secret-storage,
+environment, native-library, and persistent-background capabilities. Some are
+enforced gates, one is refused at parse time, and declarations the current host
+does not honour are reported by `crikey plugin doctor` with the reason. A web
+surface's network and persistent-storage grants are enforced before its host
+spawns.
+
+Independently of the manifest, Linux confines every supervised plugin process
+with Landlock: your plugin may write only beneath the
 directories the host gave it — its scratch space, and for a legacy package the
 `package_cache_path()` directory — and if you did not request `network`,
 TCP `bind` and `connect` fail with `EACCES`. Its own package directory is

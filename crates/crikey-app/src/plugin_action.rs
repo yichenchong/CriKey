@@ -10,7 +10,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crikey_core::{ActionId, CoreError, Item, ItemId, PageInput, PluginId, Result as CoreResult};
-use crikey_plugin_model::{FilesystemScope, Permissions};
+use crikey_plugin_model::{permissions::admit_web_surface, FilesystemScope, Permissions};
 
 use crate::plugin_page::PageUpdate;
 
@@ -344,6 +344,33 @@ impl PluginActionRouter {
             capability.permission(),
             capability.operation()
         )))
+    }
+
+    /// Decides whether the exact owner may create the web surface its page
+    /// declared.
+    ///
+    /// The page frame carries what the surface wants, while this registry
+    /// carries the owning manifest's grants. Keeping the decision here makes
+    /// an absent or unattributable owner a refusal rather than a route around
+    /// [`admit_web_surface`].
+    pub fn admit_web_surface(
+        &self,
+        plugin: &PluginId,
+        wants_navigation: bool,
+        wants_persistent_storage: bool,
+    ) -> CoreResult<()> {
+        let permissions = self.host_permissions.get(plugin).ok_or_else(|| {
+            CoreError::Invalid(format!(
+                "plugin `{}` has no registered permissions for a web surface",
+                plugin.0
+            ))
+        })?;
+        admit_web_surface(permissions, wants_navigation, wants_persistent_storage).map_err(|error| {
+            CoreError::Invalid(format!(
+                "plugin `{}` cannot open its web surface: {error}",
+                plugin.0
+            ))
+        })
     }
 
     /// Admits an action only to the endpoint registered for `plugin`.

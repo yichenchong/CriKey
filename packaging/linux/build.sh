@@ -46,11 +46,13 @@
 #   --cabi-host-binary P  The matching `crikey-cabi-host` worker. It must sit
 #                         beside the launcher because the C-ABI provider never
 #                         searches PATH.
-#   --web-host-binary P   Package this already-built `crikey-web-host` and
-#                         stage it beside the other supervised hosts. Until the
-#                         real host loop lands, this is deliberately a
-#                         supplied-host staging hook rather than a Cargo mode
-#                         that could only fail to produce an executable.
+#   --with-web-surface    Build and stage the engine-enabled
+#                         `crikey-web-host`. This requires pkg-config plus WPE
+#                         WebKit, libwpe, WPEBackend-fdo, Wayland and GLib
+#                         development packages. Web support is off by default.
+#   --web-host-binary P   Stage this already-built `crikey-web-host` instead.
+#                         Implies --with-web-surface and must accompany the
+#                         other four supplied executable options.
 #   --python-archive PATH A python-build-standalone archive to bundle as the
 #                         plugin runtime, handed to
 #                         `packaging/stage-python-runtime.sh`. Defaults to
@@ -62,8 +64,9 @@
 #   -h, --help            Print this section and exit.
 #
 # REQUIRED TOOLS, PER TARGET
-#   stage     `cargo`, unless all required executable paths are given.
-#             `desktop-file-validate` (package desktop-file-utils) is used when present and skipped
+#   stage     `cargo`, unless all required executable paths are given;
+#             engine builds also require `pkg-config`. `desktop-file-validate`
+#             (package desktop-file-utils) is used when present and skipped
 #   tarball   `tar` and `gzip`.
 #   deb       `dpkg-deb` (package dpkg). `dpkg-shlibdeps` (package dpkg-dev) is
 #             used when present to compute shared-library dependencies from
@@ -131,6 +134,7 @@ substitute() {
 	' "$6"
 }
 targets="stage,tarball"
+declare -a requested_targets=()
 binary=""
 launcher_binary=""
 wasm_host_binary=""
@@ -188,6 +192,10 @@ while (($#)); do
 		launcher_binary="${1#*=}"
 		shift
 		;;
+	--with-web-surface)
+		with_web_surface="yes"
+		shift
+		;;
 	--web-host-binary)
 		[[ $# -ge 2 ]] || fail "--web-host-binary needs a value"
 		web_host_binary="$2"
@@ -236,7 +244,12 @@ done
 
 [[ $prefix == /* ]] || fail "--prefix must be absolute (got \`$prefix\`)"
 
-for requested in ${targets//,/ }; do
+[[ -n $targets ]] || fail "--targets must name at least one target"
+if [[ $targets == ,* || $targets == *, || $targets == *,,* ]]; then
+	fail "--targets contains an empty target; expected a comma-separated list without empty elements"
+fi
+IFS=',' read -r -a requested_targets <<<"$targets"
+for requested in "${requested_targets[@]}"; do
 	case "$requested" in
 	stage | tarball | deb | rpm | flatpak | all) ;;
 	*) fail "unknown target \`$requested\`; expected stage, tarball, deb, rpm, flatpak or all" ;;
@@ -295,15 +308,18 @@ flatpak_archive_name=""
 flatpak_archive_sha256=""
 
 wanted() {
-	local target="$1"
-	[[ ",$targets," == *",all,"* || ",$targets," == *",$target,"* ]]
+	local wanted_target="$1" requested
+	for requested in "${requested_targets[@]}"; do
+		if [[ $requested == all || $requested == "$wanted_target" ]]; then
+			return 0
+		fi
+	done
+	return 1
 }
 
 # The launcher and its supervised worker executables share one directory. The
 # WASM, C-ABI and web providers intentionally do not search PATH: an installed
-# package must carry the exact hosts it is going to supervise. The web host is
-# optional and, until its real executable exists, can only be supplied as an
-# already-built path.
+# package must carry the exact hosts it is going to supervise.
 resolve_binaries() {
 	local given=0
 	for name in binary launcher_binary wasm_host_binary cabi_host_binary; do
@@ -313,26 +329,52 @@ resolve_binaries() {
 		fail "--binary, --launcher-binary, --wasm-host-binary and --cabi-host-binary must be given together, or omitted so Cargo builds all four"
 	fi
 	if [[ $given -eq 4 && $with_web_surface == yes && -z $web_host_binary ]]; then
-		fail "--web-host-binary is required to stage web-surface support"
+		fail "--with-web-surface needs --web-host-binary when the other release binaries are supplied"
 	fi
 	if [[ $given -eq 0 && -n $web_host_binary ]]; then
 		fail "--web-host-binary requires --binary, --launcher-binary, --wasm-host-binary and --cabi-host-binary"
 	fi
 	if [[ $given -eq 0 ]]; then
 		require_tool cargo "Rust toolchain" stage
+		local cargo_metadata target_directory
+		if ! cargo_metadata="$(
+			cd "$repository_root" &&
+				cargo metadata --format-version 1 --no-deps
+		)"; then
+			fail "Cargo metadata failed; could not resolve the configured target directory"
+		fi
+		target_directory="$(
+			printf '%s\n' "$cargo_metadata" |
+				sed -n 's/.*"target_directory"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+		)"
+		[[ -n $target_directory ]] ||
+			fail "Cargo metadata did not report a target_directory"
+		[[ $target_directory == /* ]] ||
+			fail "Cargo metadata reported a non-absolute target_directory: $target_directory"
+
 		note "building crikey and runtime hosts $version in release mode"
 		(
 			cd "$repository_root" &&
-			cargo build --release --locked \
-				--package crikey-cli \
-				--package crikey-wasm-host \
-				--package crikey-cabi-host
+				cargo build --release --locked \
+					--package crikey-cli \
+					--package crikey-wasm-host \
+					--package crikey-cabi-host
 		)
-		local target_directory="${CARGO_TARGET_DIR:-$repository_root/target}"
 		binary="$target_directory/release/crikey"
 		launcher_binary="$target_directory/release/crikey-launcher"
 		wasm_host_binary="$target_directory/release/crikey-wasm-host"
 		cabi_host_binary="$target_directory/release/crikey-cabi-host"
+		if [[ $with_web_surface == yes ]]; then
+			require_tool pkg-config "pkg-config" stage
+			note "building the engine-enabled crikey-web-host"
+			(
+				cd "$repository_root" &&
+					cargo build --release --locked \
+						--package crikey-web-host \
+						--features engine
+			)
+			web_host_binary="$target_directory/release/crikey-web-host"
+		fi
 	fi
 
 	local name path
@@ -346,9 +388,33 @@ resolve_binaries() {
 		[[ -f $web_host_binary ]] || fail "no such executable: $web_host_binary"
 		[[ -x $web_host_binary ]] || fail "not executable: $web_host_binary"
 		web_host_binary="$(cd "$(dirname "$web_host_binary")" && pwd)/$(basename "$web_host_binary")"
+
+		# No released host CLI exposes a machine-readable protocol contract yet.
+		# Do not infer compatibility from human-oriented --help text. Production
+		# inputs are validated only for what can be established structurally:
+		# they are ELF executables whose dynamic dependencies all resolve.
+		#
+		# The shell fixtures used by this file's contract tests are admitted by
+		# an intentionally test-only switch. They are never accepted by a normal
+		# packaging invocation.
+		local magic=""
+		IFS= read -r -N 4 magic <"$web_host_binary" || true
+		if [[ $magic == $'\x7fELF' ]]; then
+			require_tool ldd "libc-bin or glibc-common" stage
+			local linked
+			if ! linked="$(LC_ALL=C ldd "$web_host_binary" 2>&1)"; then
+				fail "could not inspect runtime libraries for $web_host_binary: $linked"
+			fi
+			[[ $linked != *"not found"* ]] ||
+				fail "$web_host_binary has unresolved runtime libraries: $linked"
+		elif [[ $magic == '#!'* && ${CRIKEY_PACKAGING_TEST_ALLOW_SCRIPT_WEB_HOST:-} == 1 ]]; then
+			note "accepting a script web host under the test-only fixture switch"
+		else
+			fail "$web_host_binary is not an ELF executable; supplied production web hosts must be native binaries"
+		fi
 		note "packaging $binary, $launcher_binary, $wasm_host_binary, $cabi_host_binary and $web_host_binary"
 	else
-		note "packaging $binary, $launcher_binary, $wasm_host_binary and $cabi_host_binary"
+		note "packaging $binary, $launcher_binary, $wasm_host_binary and $cabi_host_binary (web surfaces disabled)"
 	fi
 }
 
@@ -485,11 +551,20 @@ debian_shared_library_depends() {
 	local work="$1"
 	command -v dpkg-shlibdeps >/dev/null 2>&1 || return 1
 	local scratch computed=""
+	local -a executables=(
+		"$work/usr/lib/crikey/crikey"
+		"$work/usr/lib/crikey/crikey-launcher"
+		"$work/usr/lib/crikey/crikey-wasm-host"
+		"$work/usr/lib/crikey/crikey-cabi-host"
+	)
+	if [[ -x "$work/usr/lib/crikey/crikey-web-host" ]]; then
+		executables+=("$work/usr/lib/crikey/crikey-web-host")
+	fi
 	scratch="$(mktemp -d)"
 	mkdir -p "$scratch/debian"
 	printf 'Source: crikey\n\nPackage: crikey\nArchitecture: any\n' >"$scratch/debian/control"
 	if ! computed="$(cd "$scratch" && dpkg-shlibdeps -O --ignore-missing-info \
-		"$work/usr/bin/crikey" 2>/dev/null)"; then
+		"${executables[@]}" 2>/dev/null)"; then
 		computed=""
 	fi
 	rm -rf "$scratch"
@@ -507,10 +582,13 @@ deb() {
 
 	local depends
 	if depends="$(debian_shared_library_depends "$work")"; then
-		note "shared-library dependencies computed from the ELF: $depends"
+		note "shared-library dependencies computed from every staged ELF: $depends"
 	else
 		depends="libc6, libgcc-s1"
-		note "dpkg-shlibdeps unavailable or unable to read the ELF; falling back to \`$depends\`"
+		if [[ $with_web_surface == yes ]]; then
+			depends="$depends, libwpewebkit-2.0-1, libwpe-1.0-1, libwpebackend-fdo-1.0-1, libwayland-server0, libglib2.0-0"
+		fi
+		note "dpkg-shlibdeps unavailable or unable to read the ELF files; falling back to \`$depends\`"
 	fi
 	if [[ $bundles_python == "no" ]]; then
 		# Not a Recommends: with no interpreter every Python plugin fails to
@@ -684,6 +762,9 @@ preflight() {
 			fail "the \`rpm\` target requires --prefix /usr; got \`$prefix\`"
 	fi
 	if wanted flatpak; then
+		if [[ $with_web_surface == yes ]]; then
+			fail "the Flatpak recipe is explicitly no-web; it does not build crikey-web-host or provide pinned WPE modules and runtime dependencies"
+		fi
 		require_tool flatpak-builder flatpak-builder flatpak
 		require_tool tar tar flatpak
 		require_tool sha256sum coreutils flatpak

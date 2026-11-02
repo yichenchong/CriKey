@@ -10,8 +10,8 @@
 # file. Nothing about a successful build reveals that one of those stopped
 # being true, so each is asserted here against a real artefact.
 #
-# No Cargo build happens: `--binary` packages a stand-in executable, because
-# every contract under test is about the packaging, not about the program.
+# Cargo is replaced by a recording fixture for the engine-build path; supplied
+# executable fixtures cover the staging path without requiring WPE on CI.
 #
 # USAGE
 #   packaging/linux/tests/build.test.sh
@@ -53,17 +53,53 @@ contains() {
 	grep -qF -- "$1" <<<"$2"
 }
 
-# The five executables are staged beside each other in a web-enabled package.
-# Stand-ins keep this test about layout and packaging without a Cargo or WPE
-# build.
-stand_in="/usr/bin/true"
-launcher_stand_in="/usr/bin/false"
-wasm_host_stand_in="/usr/bin/true"
-cabi_host_stand_in="/usr/bin/false"
-web_host_stand_in="/usr/bin/true"
+# Executable fixtures cover staging without requiring a Rust toolchain or WPE.
+# The web host script is admitted only through build.sh's explicit test-fixture
+# switch; production packaging requires an ELF and validates its dependencies.
+fixture_bin="$workspace/executables"
+mkdir -p "$fixture_bin"
 
+cat >"$fixture_bin/crikey" <<'EOF'
+#!/usr/bin/env bash
+printf 'crikey fixture\n'
+EOF
+cat >"$fixture_bin/crikey-launcher" <<'EOF'
+#!/usr/bin/env bash
+printf 'launcher fixture\n'
+EOF
+cat >"$fixture_bin/crikey-wasm-host" <<'EOF'
+#!/usr/bin/env bash
+printf 'wasm host fixture\n'
+EOF
+cat >"$fixture_bin/crikey-cabi-host" <<'EOF'
+#!/usr/bin/env bash
+printf 'c-abi host fixture\n'
+EOF
+cat >"$fixture_bin/crikey-web-host" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+--help)
+	printf 'Usage: crikey-web-host --endpoint <unix:/absolute/socket> [--storage-dir <absolute/path>]\n'
+	;;
+--endpoint)
+	[[ $# -eq 2 && $2 == unix:/* ]]
+	;;
+*)
+	printf 'crikey-web-host: --endpoint is required\n' >&2
+	exit 2
+	;;
+esac
+EOF
+chmod +x "$fixture_bin"/*
+
+stand_in="$fixture_bin/crikey"
+launcher_stand_in="$fixture_bin/crikey-launcher"
+wasm_host_stand_in="$fixture_bin/crikey-wasm-host"
+cabi_host_stand_in="$fixture_bin/crikey-cabi-host"
+web_host_stand_in="$fixture_bin/crikey-web-host"
 staging_build() {
-	"$build" \
+	CRIKEY_PACKAGING_TEST_ALLOW_SCRIPT_WEB_HOST=1 "$build" \
 		--binary "$stand_in" \
 		--launcher-binary "$launcher_stand_in" \
 		--wasm-host-binary "$wasm_host_stand_in" \
@@ -91,8 +127,12 @@ staging_build --targets stage,tarball,deb "$out" >"$build_log" 2>&1
 staged="$out/stage"
 
 no_web_out="$workspace/no-web-out"
+# First leave a web host in this exact output tree, then rebuild it in normal
+# no-web mode. `stage` promises replacement rather than merging; a stale host
+# would make a package claim support the operator did not request.
+staging_build --targets stage "$no_web_out" >"$workspace/prior-web-build.log" 2>&1
 staging_build_without_web --targets stage "$no_web_out" >"$workspace/no-web-build.log" 2>&1
-check "the normal four-binary release stage still succeeds without a web host" \
+check "a normal four-binary rebuild removes a previously staged web host" \
 	test -x "$no_web_out/stage/lib/crikey/crikey" \
 	-a ! -e "$no_web_out/stage/lib/crikey/crikey-web-host"
 
@@ -128,6 +168,8 @@ check "the staged C-ABI host sits beside the launcher" \
 	test -x "$staged/lib/crikey/crikey-cabi-host"
 check "a web-enabled package stages its supervised web host" \
 	test -x "$staged/lib/crikey/crikey-web-host"
+check "the staged web host is the supplied executable" \
+	cmp -s "$web_host_stand_in" "$staged/lib/crikey/crikey-web-host"
 check "the modern SDK worker sits beside the real executable" \
 	test -f "$staged/lib/crikey/modern-sdk/_crikey_modern_worker.py"
 check "the legacy shim worker sits beside the real executable" \
@@ -212,6 +254,10 @@ if command -v dpkg-deb >/dev/null 2>&1; then
 		bash -c 'printf "%s" "$1" | grep -q "/usr/lib/crikey/crikey-wasm-host" &&
 			printf "%s" "$1" | grep -q "/usr/lib/crikey/crikey-cabi-host"' \
 		_ "$contents"
+	check "a web-enabled Debian package declares the WPE runtime when ELF scanning is unavailable" \
+		bash -c 'for dependency in libwpewebkit-2.0-1 libwpe-1.0-1 libwpebackend-fdo-1.0-1 libwayland-server0 libglib2.0-0; do
+			printf "%s" "$1" | grep -q "$dependency" || exit 1
+		done' _ "$control"
 	# Working-copy mtimes vary between checkouts, so the deb target clamps
 	# them; without that clamp this is the check that fails.
 	staging_build --targets deb "$second" >/dev/null 2>&1
@@ -252,6 +298,12 @@ refuses "Flatpak without a bundled interpreter is refused" \
 
 refuses "an unknown target is refused" \
 	"$build" --targets nonsense "$workspace/refused"
+refuses "an empty target list is refused" \
+	"$build" --targets "" "$workspace/refused"
+refuses "an empty target element is refused" \
+	"$build" --targets stage,,tarball "$workspace/refused"
+refuses "a trailing empty target element is refused" \
+	"$build" --targets stage, "$workspace/refused"
 refuses "an unknown option is refused" \
 	"$build" --nonsense "$workspace/refused"
 refuses "the deb target refuses a prefix Debian policy forbids" \
@@ -276,6 +328,114 @@ refuses "a missing supplied web host is refused rather than silently omitted" \
 refuses "a web host cannot be mixed with Cargo-built launcher binaries" \
 	"$build" --web-host-binary "$web_host_stand_in" \
 	--targets stage "$workspace/refused"
+
+invalid_web_host="$fixture_bin/not-a-web-host"
+cat >"$invalid_web_host" <<'EOF'
+#!/usr/bin/env bash
+# This deliberately mimics the old human-readable checks. It is still not a
+# production host: scripts cannot establish a native host's structural contract.
+if [[ ${1:-} == --help ]]; then
+	printf 'Usage: crikey-web-host --endpoint SOCKET --storage-dir DIRECTORY\n'
+	exit 0
+fi
+exit 2
+EOF
+chmod +x "$invalid_web_host"
+refuses "a help-mimicking script is refused as a structurally incompatible supplied web host" \
+	"$build" --binary "$stand_in" --launcher-binary "$launcher_stand_in" \
+	--wasm-host-binary "$wasm_host_stand_in" --cabi-host-binary "$cabi_host_stand_in" \
+	--web-host-binary "$invalid_web_host" --targets stage "$workspace/refused"
+
+localized_ldd_tools="$workspace/localized-ldd-tools"
+mkdir -p "$localized_ldd_tools"
+cat >"$localized_ldd_tools/ldd" <<'EOF'
+#!/usr/bin/env bash
+if [[ ${LC_ALL:-} == C ]]; then
+	printf 'libmissing-for-test.so => not found\n'
+else
+	printf 'libmissing-for-test.so => nicht gefunden\n'
+fi
+EOF
+chmod +x "$localized_ldd_tools/ldd"
+elf_web_host="$workspace/crikey-web-host-elf"
+cp /bin/true "$elf_web_host"
+refuses "missing ELF libraries are refused under a forced C locale" \
+	env PATH="$localized_ldd_tools:$PATH" "$build" \
+	--binary "$stand_in" --launcher-binary "$launcher_stand_in" \
+	--wasm-host-binary "$wasm_host_stand_in" --cabi-host-binary "$cabi_host_stand_in" \
+	--web-host-binary "$elf_web_host" --targets stage "$workspace/refused"
+refuses "engine mode with supplied release binaries also requires a supplied web host" \
+	"$build" --binary "$stand_in" --launcher-binary "$launcher_stand_in" \
+	--wasm-host-binary "$wasm_host_stand_in" --cabi-host-binary "$cabi_host_stand_in" \
+	--with-web-surface --targets stage "$workspace/refused"
+refuses "Flatpak refuses web mode because its recipe has no engine host or pinned WPE dependencies" \
+	env PATH="$flatpak_stub_dir:$PATH" "$build" --with-web-surface \
+	--targets flatpak --python-archive "$workspace/absent.tar" "$workspace/refused"
+
+# Exercise the genuine Cargo mode without requiring WPE on the test machine.
+# The recording tool supplies the exact executables Cargo would have produced;
+# the assertions below prove that build.sh selects the engine feature and uses
+# the target directory reported by Cargo metadata.
+recording_tools="$workspace/recording-tools"
+mkdir -p "$recording_tools"
+cat >"$recording_tools/pkg-config" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >"$recording_tools/cargo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${CRIKEY_TEST_CARGO_LOG:?}"
+target="${CRIKEY_TEST_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+[[ -n $target ]]
+if [[ $target != /* ]]; then
+	target="$PWD/$target"
+fi
+if [[ ${1:-} == metadata ]]; then
+	printf '{"target_directory":"%s"}\n' "$target"
+	exit 0
+fi
+destination="$target/release"
+mkdir -p "$destination"
+for executable in crikey crikey-launcher crikey-wasm-host crikey-cabi-host crikey-web-host; do
+	cp "${CRIKEY_TEST_FIXTURE_BIN:?}/$executable" "$destination/$executable"
+done
+EOF
+chmod +x "$recording_tools"/*
+
+cargo_mode_out="$workspace/cargo-mode"
+cargo_log="$workspace/cargo.log"
+env PATH="$recording_tools:$PATH" \
+	CARGO_TARGET_DIR="$workspace/cargo-target" \
+	CRIKEY_TEST_CARGO_LOG="$cargo_log" \
+	CRIKEY_TEST_FIXTURE_BIN="$fixture_bin" \
+	CRIKEY_PACKAGING_TEST_ALLOW_SCRIPT_WEB_HOST=1 \
+	"$build" --with-web-surface --targets stage "$cargo_mode_out" >/dev/null
+check "engine mode asks Cargo for the real web-host binary with its engine feature" \
+	bash -c 'grep -q -- "--package crikey-web-host" "$1" &&
+		grep -q -- "--features engine" "$1"' _ "$cargo_log"
+check "engine mode stages the web host from Cargo's reported target directory" \
+	cmp -s "$web_host_stand_in" "$cargo_mode_out/stage/lib/crikey/crikey-web-host"
+
+relative_target="${in_tree_workspace#"$repository_root/"/}/relative-cargo-target"
+relative_target_out="$workspace/relative-target-out"
+env PATH="$recording_tools:$PATH" \
+	CARGO_TARGET_DIR="$relative_target" \
+	CRIKEY_TEST_CARGO_LOG="$workspace/relative-cargo.log" \
+	CRIKEY_TEST_FIXTURE_BIN="$fixture_bin" \
+	"$build" --targets stage "$relative_target_out" >/dev/null
+check "a relative Cargo target directory is resolved from the repository root" \
+	cmp -s "$stand_in" "$relative_target_out/stage/lib/crikey/crikey"
+
+configured_target="$workspace/configured-cargo-target"
+configured_target_out="$workspace/configured-target-out"
+env -u CARGO_TARGET_DIR PATH="$recording_tools:$PATH" \
+	CRIKEY_TEST_CARGO_TARGET_DIR="$configured_target" \
+	CRIKEY_TEST_CARGO_LOG="$workspace/configured-cargo.log" \
+	CRIKEY_TEST_FIXTURE_BIN="$fixture_bin" \
+	"$build" --targets stage "$configured_target_out" >/dev/null
+check "Cargo's configured target directory is taken from metadata" \
+	cmp -s "$stand_in" "$configured_target_out/stage/lib/crikey/crikey"
 
 mixed_flatpak_preflight() {
 	local out="$workspace/mixed-flatpak" status=0

@@ -19,6 +19,7 @@
 
 #include <glib.h>
 #include <glib-unix.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -280,7 +281,9 @@ ck_web_surface *ck_web_surface_new(uint32_t width, uint32_t height, int32_t stor
     }
 
     WebKitWebViewBackend *view_backend =
-        webkit_web_view_backend_new(surface->backend, NULL, NULL);
+        webkit_web_view_backend_new(surface->backend,
+                                    (GDestroyNotify)wpe_view_backend_exportable_fdo_destroy,
+                                    surface->exportable);
     surface->view = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
                                                  "backend", view_backend,
                                                  "network-session", surface->session,
@@ -325,10 +328,14 @@ void ck_web_surface_resize(ck_web_surface *surface, uint32_t width, uint32_t hei
 }
 
 void ck_web_surface_key(ck_web_surface *surface, uint32_t time_ms, uint32_t keysym,
-                        uint32_t hardware_keycode, int32_t pressed, uint32_t modifiers)
+                        uint32_t hardware_keycode, int32_t pressed, int32_t repeat,
+                        uint32_t modifiers)
 {
     if (!surface)
         return;
+    /* libwpe 1.x has no repeat flag. A repeated key-down is represented by
+     * dispatching the subsequent pressed event, which is exactly this call. */
+    (void)repeat;
     struct wpe_input_keyboard_event event = {
         .time = time_ms,
         .key_code = keysym,
@@ -463,10 +470,13 @@ void ck_web_surface_destroy(ck_web_surface *surface)
     if (surface->im)
         surface->im->callbacks = surface->callbacks;
     g_clear_object(&surface->view);
+    /* The WebKitWebViewBackend destroy notifier above owns the exportable and
+     * its wpe_view_backend. Clearing the view has released both; destroying the
+     * exportable here as well would double-free the backend during shutdown. */
+    surface->exportable = NULL;
+    surface->backend = NULL;
     g_clear_object(&surface->im);
     g_clear_object(&surface->session);
-    if (surface->exportable)
-        wpe_view_backend_exportable_fdo_destroy(surface->exportable);
     g_free(surface);
 }
 
@@ -475,17 +485,38 @@ void ck_web_surface_destroy(ck_web_surface *surface)
  * ------------------------------------------------------------------ */
 
 static GMainLoop *s_loop;
+static guint s_fd_source;
+static guint s_signal_sources[3];
+
+static void clear_source(guint *source)
+{
+    if (!*source)
+        return;
+    guint id = *source;
+    *source = 0;
+    g_source_remove(id);
+}
+
+void ck_web_cleanup(void)
+{
+    clear_source(&s_fd_source);
+    for (size_t index = 0; index < G_N_ELEMENTS(s_signal_sources); index++)
+        clear_source(&s_signal_sources[index]);
+    if (s_loop) {
+        g_main_loop_unref(s_loop);
+        s_loop = NULL;
+    }
+}
 
 int32_t ck_web_init(void)
 {
+    ck_web_cleanup();
     if (!wpe_loader_init("libWPEBackend-fdo-1.0.so.1"))
         return CK_WEB_INIT_NO_LOADER;
     /* SHM, not EGL: this host renders with no GPU and no display server, and
      * the SHM path is the one that was measured working in that configuration. */
     if (!wpe_fdo_initialize_shm())
         return CK_WEB_INIT_NO_SHM;
-    /* Built here rather than in `ck_web_run` so `ck_web_quit` from the reader
-     * thread can never race a loop that does not exist yet. */
     s_loop = g_main_loop_new(NULL, FALSE);
     return CK_WEB_INIT_OK;
 }
@@ -493,6 +524,7 @@ int32_t ck_web_init(void)
 typedef struct {
     void (*ready)(void *user);
     void *user;
+    guint *source;
 } FdWatch;
 
 static gboolean on_fd_ready(gint fd, GIOCondition condition, gpointer data)
@@ -500,6 +532,7 @@ static gboolean on_fd_ready(gint fd, GIOCondition condition, gpointer data)
     FdWatch *watch = data;
     (void)fd;
     if (condition & (G_IO_HUP | G_IO_ERR)) {
+        *watch->source = 0;
         watch->ready(watch->user);
         return G_SOURCE_REMOVE;
     }
@@ -509,13 +542,45 @@ static gboolean on_fd_ready(gint fd, GIOCondition condition, gpointer data)
 
 void ck_web_watch_fd(int32_t fd, void (*ready)(void *user), void *user)
 {
+    clear_source(&s_fd_source);
     if (!ready)
         return;
     FdWatch *watch = g_new0(FdWatch, 1);
     watch->ready = ready;
     watch->user = user;
-    g_unix_fd_add_full(G_PRIORITY_DEFAULT, fd, G_IO_IN | G_IO_HUP | G_IO_ERR, on_fd_ready,
-                       watch, g_free);
+    watch->source = &s_fd_source;
+    s_fd_source = g_unix_fd_add_full(G_PRIORITY_DEFAULT, fd,
+                                     G_IO_IN | G_IO_HUP | G_IO_ERR, on_fd_ready,
+                                     watch, g_free);
+}
+
+static gboolean on_termination(gpointer data)
+{
+    FdWatch *watch = data;
+    *watch->source = 0;
+    watch->ready(watch->user);
+    return G_SOURCE_REMOVE;
+}
+
+static void watch_signal(size_t index, int signum, void (*ready)(void *user), void *user)
+{
+    FdWatch *watch = g_new0(FdWatch, 1);
+    watch->ready = ready;
+    watch->user = user;
+    watch->source = &s_signal_sources[index];
+    s_signal_sources[index] =
+        g_unix_signal_add_full(G_PRIORITY_HIGH, signum, on_termination, watch, g_free);
+}
+
+void ck_web_watch_termination(void (*ready)(void *user), void *user)
+{
+    for (size_t index = 0; index < G_N_ELEMENTS(s_signal_sources); index++)
+        clear_source(&s_signal_sources[index]);
+    if (!ready)
+        return;
+    watch_signal(0, SIGTERM, ready, user);
+    watch_signal(1, SIGINT, ready, user);
+    watch_signal(2, SIGHUP, ready, user);
 }
 
 void ck_web_run(void)

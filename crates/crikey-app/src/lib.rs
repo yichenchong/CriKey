@@ -1832,6 +1832,24 @@ impl SearchService {
         Ok(())
     }
 
+    /// Checks a page's web-surface declaration against its exact owning
+    /// plugin's manifest grants.
+    ///
+    /// This call deliberately does not start an engine. The launcher invokes
+    /// it before handing an open request to the lazy web-host supervisor, so a
+    /// denied navigation or persistent store cannot transiently spawn one.
+    pub fn admit_web_surface(
+        &self,
+        plugin: &PluginId,
+        wants_navigation: bool,
+        wants_persistent_storage: bool,
+    ) -> CoreResult<()> {
+        self.plugin_actions
+            .as_ref()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("plugin page runtime is unavailable".to_owned()))?
+            .admit_web_surface(plugin, wants_navigation, wants_persistent_storage)
+    }
+
     /// Hands one host-hit-tested event to the open page's plugin.
     pub fn send_page_input(&mut self, input: crikey_core::PageInput) -> CoreResult<()> {
         let (plugin, _) = self

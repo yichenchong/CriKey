@@ -478,6 +478,8 @@ pub(crate) fn residency(effect: &UiEffect) -> Option<Residency> {
         | UiEffect::Execute { .. }
         | UiEffect::SetSetting { .. }
         | UiEffect::PageInput(_)
+        | UiEffect::WebInput(_)
+        | UiEffect::WebIme(_)
         | UiEffect::ResizePage { .. }
         | UiEffect::ClosePage => None,
     }

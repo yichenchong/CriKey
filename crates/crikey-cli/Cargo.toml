@@ -59,6 +59,11 @@ crikey-plugin-supervisor.workspace = true
 crikey-sandbox.workspace = true
 crikey-ui.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The web-host supervisor creates a dedicated process group, requests a
+# parent-death signal, and escalates teardown over the whole tree.
+libc = "0.2"
+
 # `crikey-launcher` is GUI-subsystem on Windows, so a fatal startup failure has
 # no console to be printed to. `MessageBoxW` is the one channel a process with
 # no window of its own has to say why it is about to exit. Only the Windows

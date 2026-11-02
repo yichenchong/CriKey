@@ -1,6 +1,6 @@
-# ADR-0020: Plugin pages are a display list, not pixels and not a webview
+# ADR-0020: Plugin pages use bounded display lists or supervised web surfaces
 
-Status: Accepted — webview revisit trigger stated below
+Status: Accepted — Linux web-surface route accepted after measurement
 Spec: §32, §25.1, §16.2–16.5, §6.3
 
 ## Context
@@ -20,24 +20,37 @@ commands.
 
 ## Decision
 
-A plugin sends a *display list*. `crikey_core::page` defines a flat frame of
-nodes — rectangle, text, line, circle, image, each with geometry, colours, and
-a semantic role — and the host draws it with its own `egui` renderer. Drawing
-commands and semantics cross the boundary, and code never does.
+A plugin page chooses one of two exclusive declarations.
 
-Pixels cross in exactly one bounded form: an `Image` node carries raw RGBA8 for
-its own rectangle, capped at 1 MiB per node and 4 MiB per frame, 1,024 px a
-side. That is a deliberate narrowing of this ADR's original "pixels never
-cross", not an abandonment of it, and the narrowing is bounded rather than
-absolute. Because a page is full request/response, a raster is re-sent in
-every frame the plugin answers, not only when its pixels change; the host's
-texture cache spares the GPU upload, never the wire. And two tiles under the
-per-node cap reconstruct a 720x400 framebuffer inside the per-frame one, so
-the caps do not make a surface canvas unreachable. What they and
-`MIN_PAGE_REDRAW_MS` establish is a bounded worst case — 4 MiB per frame, one
-self-scheduled frame per 16 ms — against the unbounded rate the rejected
-design implies, while the rest of the display list keeps the roles, labels and
-focus ring a framebuffer cannot carry.
+The portable/default form is a *display list*. `crikey_core::page` defines a
+flat frame of nodes — rectangle, text, line, circle, image, each with geometry,
+colours, and a semantic role — and the host draws it with its own `egui`
+renderer. Drawing commands and semantics cross the boundary, and plugin code
+never does.
+
+On Linux, a plugin may instead name one HTTP(S) document. The launcher spawns a
+separate `crikey-web-host` only after the user opens that page. WPE WebKit
+renders offscreen in the supervised host process tree; bounded RGBA frames
+cross a private native-protocol connection and are uploaded into the same
+shaped `egui`/`wgpu` surface as the rest of the launcher. There is no child
+window, no direct WPE linkage in the launcher or UI crates, and no web engine
+in no-web builds. The display list and web declaration are mutually exclusive
+and every plugin-originated `PageFrame` still passes `PageFrame::validate`.
+
+Pixels from a plugin cross in exactly one bounded form: an `Image` node carries
+raw RGBA8 for its own rectangle, capped at 1 MiB per node and 4 MiB per frame,
+1,024 px a side. That is a deliberate narrowing of this ADR's original
+“pixels never cross”, not an abandonment of it. A web host's engine frames use
+their own bounded, one-surface transport; they are not plugin-authored image
+nodes and cannot be pushed through the plugin protocol. Because a display-list
+page is full request/response, its raster is re-sent in every frame the plugin
+answers, not only when its pixels change; the host's texture cache spares the
+GPU upload, never the wire. And two tiles under the per-node cap reconstruct a
+720x400 framebuffer inside the per-frame one, so the caps do not make a surface
+canvas unreachable. What they and `MIN_PAGE_REDRAW_MS` establish is a bounded
+worst case — 4 MiB per frame, one self-scheduled frame per 16 ms — against the
+unbounded rate the rejected design implies, while the rest of the display list
+keeps the roles, labels and focus ring a framebuffer cannot carry.
 
 The cycle is host-driven request/response, exactly like `suggest`: the host
 sends a `PageRequest` carrying the surface size, the events since the previous
@@ -76,7 +89,7 @@ smaller than one pixel frame — and even a maximal 4,096-node frame is under
 250 KiB of geometry. Kilobytes per frame need no shared region. Megabytes per
 frame would demand one.
 
-### Why not a webview
+### Why not an in-process or child-window webview
 
 One decisive reason, and two that are weaker than they are usually stated. All
 three are recorded precisely, because two of them were previously written here
@@ -118,20 +131,27 @@ argument genuinely applies; that reasoning does not transfer to a surface
 opened on demand, and it should not be borrowed as though it did.
 
 The decisive objection is compositing, and it is the one lazy loading and
-out-of-process rendering do nothing about. Putting a webview inside the
-launcher's `wgpu` surface means either an overlaid child window — which breaks
-the shaped rounded window, because a child window is rectangular and does not
-participate in our rounding or clipping — or offscreen rendering, which means
-shared textures between the engine's renderer and our surface: exactly the
-shared-memory machinery ADR-0017 declined to build. Note that this cost is
-*caused* by keeping content out of process, so it cannot be traded against the
+out-of-process rendering do nothing about. Putting a conventional webview
+inside the launcher's `wgpu` surface means either an overlaid child window —
+which breaks the shaped rounded window, because a child window is rectangular
+and does not participate in our rounding or clipping — or offscreen rendering
+with an explicit frame path into the launcher's surface. Note that this cost is
+caused by keeping content out of process, so it cannot be traded against the
 invariant; the two objections do not cancel.
 
-Three engines compound it. WebView2, WKWebView and WebKitGTK differ in
-embedding model, in what they will render offscreen, and in whether they are
-present at all — WebView2 is a runtime the user may not have installed. A
-display list has one implementation; an embedded engine has three, each with
-its own failure when absent.
+The accepted Linux route pays that cost explicitly rather than hiding it: WPE
+exports a bounded software frame from `crikey-web-host`, the launcher receives
+it over private IPC, and the UI uploads it as a texture clipped by the existing
+shaped surface. The launcher does not link WPE and does not overlay a child
+window. Other platforms remain unsupported until they have an equivalent
+out-of-process, offscreen route.
+
+Three engines still compound a cross-platform implementation. WebView2,
+WKWebView and WebKitGTK differ in embedding model, in what they will render
+offscreen, and in whether they are present at all — WebView2 is a runtime the
+user may not have installed. A display list has one implementation; an embedded
+engine has three, each with its own failure when absent. This ADR accepts only
+the measured and implemented Linux WPE route.
 
 ### Accessibility is a protocol requirement, not a side effect
 
@@ -162,10 +182,10 @@ screen-reader support until that wiring exists and is measured.
 - The plugin implements its own state machine and its own focus order, and
   rebuilds the whole display list on every frame. The host retains the last
   frame for redraw but never diffs or merges frames.
-- This is a real ergonomic cost to plugin authors, and it is the price of not
-  shipping a browser engine. Documenting it honestly
-  (`docs/plugin-author-guide.md`) matters more than pretending the protocol is
-  a UI framework.
+- This remains a real ergonomic cost to display-list authors. A web surface is
+  available when an HTTP(S) application is the honest fit, but it opts into a
+  separately packaged engine, network policy and higher per-open cost rather
+  than turning the display-list protocol into a UI framework.
 - The host stays in control of the parts that are its business: it hit-tests,
   it owns the palette, it clips, and it reserves Escape. A page never learns
   where it sits on screen.
@@ -196,9 +216,9 @@ screen-reader support until that wiring exists and is measured.
   node buys over a surface canvas is that the rest of the display list keeps
   its roles, labels and focus ring. The rejection stands on semantics and a
   bounded rate, not on the framebuffer being impossible to rebuild.
-- **Embedded webview per surface.** Rejected on compositing, not on process
-  placement: the mainstream engines already run content out of process, so the
-  standing requirement is that any embedding keep it there and prove it. What
+- **In-process or child-window webview per surface.** Rejected on launcher
+  integration, not merely process placement: mainstream engines already run
+  content out of process, so any embedding must keep it there and prove it. What
   is unresolved is that the surface must be either a rectangular child window,
   which breaks the shaped rounded window, or an offscreen render sharing
   textures with our `wgpu` surface — a cost created by out-of-process
@@ -216,18 +236,22 @@ screen-reader support until that wiring exists and is measured.
   in-process code by another name, and it puts a plugin panic inside the UI
   event loop.
 
-## Revisit trigger
+## Webview revisit criteria
 
-Reopen the webview decision when all of the following can be measured on the
-ADR-0017 reference system (Intel N150, 2 cores, Linux 7.0) and recorded here:
-an engine created on demand that composites into the existing `wgpu` surface
-without a child window; content execution demonstrably out of process,
-asserted by a test rather than inherited from an engine default, since a
-future engine or configuration that moves it in-process is what
-`docs/architecture.md:37` forbids; a surface whose process is spawned only
-when the page opens and is proven released when it closes; and a page-open
-latency that is disclosed to the user by a loading state rather than a frozen
-panel.
+The original decision required all of the following to be measured on the
+ADR-0017 reference system (Intel N150, 2 cores, Linux 7.0): an engine created
+on demand that composites into the existing `wgpu` surface without a child
+window; content execution out of the launcher process; a surface spawned only
+when its page opens and released when it closes; and page-open latency disclosed
+by a loading state rather than a frozen panel.
+
+The Linux implementation now satisfies the architectural parts: a supervised
+host connects over private IPC, sends bounded RGBA frames for composition in
+the shaped surface, and exists only for the open page. The first-frame loading
+state makes cold start visible. Runtime assertion that the engine's content
+process remains a descendant of the web host is still a desirable regression
+test; separation of the web host executable from the launcher is implemented,
+but is not by itself that ancestry proof.
 
 Two more borrowed criteria are gone alongside the pair below. This trigger used
 to require "under 20 MiB resident per live surface" and a 50 ms cold start.
@@ -276,32 +300,34 @@ and should be treated as unverified. Using it appears to need a custom WebKit
 build. It was not measured, and neither was any differently configured
 WebKit. Nothing below rules those out.
 
-- **Offscreen export: demonstrated. Compositing and process ancestry: still
-  unverified.** SHM export works with no EGL or GPU - the first exported
-  buffer was 696x410, stride 2784, ARGB8888 - and each view was observed to
-  spawn its own `WPEWebProcess`, with no child window involved. That is not
-  the trigger's condition met. The harness exported buffers in a container; it
-  never imported one into CriKey's `wgpu` surface, so compositing into the
-  shaped window is unmeasured. And observing that a web process exists is not
-  the test the trigger asks for, which must assert at runtime that content
-  executes in a descendant of the host rather than inheriting the claim from
-  an engine default. Both remain open.
+- **Offscreen export: demonstrated; shaped-window composition: implemented;
+  content-process ancestry assertion: still open.** SHM export works with no
+  EGL or GPU — the first measured buffer was 696x410, stride 2784, ARGB8888 —
+  and each measured view spawned its own `WPEWebProcess`, with no child window.
+  The 2026-09 harness did not import that buffer into CriKey and therefore did
+  not measure end-to-end composition. The delivered route now converts the
+  host frame to bounded RGBA, transports it over private IPC and uploads it
+  into the launcher's existing `wgpu` surface. That establishes the
+  compositing architecture, not its performance on the original harness.
+  Observing a web process still is not the requested runtime assertion that
+  content executes in a descendant of the host; that regression proof remains
+  open.
 - **Per-surface memory: ~248 MiB RSS, 98-107 MiB marginal PSS.** Measured at
   1, 2 and 4 concurrent surfaces; RSS is flat per surface because each view
   gets a dedicated web process. The embedder process itself carries 111-118
   MiB simply for linking WebKit.
 - **Page open: 276-533 ms** to the first exported frame (533 ms cold, median
   307 ms warm over five runs), dominated by process spawn.
-- **Compose input is broken on this route, and fixable off it.** Injected
-  `dead_acute` + `a` yields a bare `a` - the accent is *silently* dropped -
-  and `Multi_key ' e` yields two characters rather than one `e-acute`. No
-  composition events fire and no IM context is installed, since the WPE port
-  ships only the abstract `WebKitInputMethodContext` while the GTK port ships
-  a concrete one. A standalone harness demonstrated the remedy outside CriKey:
-  running `xkb_compose_state` before dispatch produced exactly one correct
-  character for five sequences. That is a proof of concept in a test program,
-  not an integrated fix, and a real CJK IME needs more - a
-  `WebKitInputMethodContext` subclass bridged to ibus or fcitx.
+- **Compose input was broken in the measured harness; the delivered route is
+  wired but not fully measured.** In the original harness, injected
+  `dead_acute` + `a` yielded a bare `a`, and `Multi_key ' e` yielded two
+  characters rather than one `e-acute`; no composition events fired because
+  the WPE port supplied only the abstract `WebKitInputMethodContext`. The host
+  now installs its IM-context shim and carries preedit, commit and caret-area
+  events between launcher and engine. End-to-end interoperability across real
+  ibus/fcitx input methods, especially CJK reconversion, has not been measured,
+  and the route has no correct delete-surrounding operation. Wiring must not be
+  reported as complete IME support.
 
 What this settles: the transport and pixel path are not the obstacle. The
 host-side cost of a 696x410 frame is 0.149 ms to convert BGRA-premultiplied to
@@ -310,19 +336,19 @@ measured throughput - together about 4% of a 16 ms frame. The cost is process
 spawn and per-process memory, and on this generation there is no
 multi-surface-per-process option to trade against it.
 
-The measured cost is accepted for a deliberately opened page, subject to a
-host-enforced ceiling. The web host receives the lesser of 768 MiB and one
-eighth of physical RAM. An effective ceiling below 256 MiB is not enough for
-the measured ordinary page, so the host refuses to open a web surface rather
-than start an engine that its own policy is expected to kill.
+The measured cost is accepted for a deliberately opened page. The launcher
+computes a policy target equal to the lesser of 768 MiB and one eighth of
+physical RAM, reduced further by an inherited finite cgroup limit. It refuses
+to open a surface when that effective value is below 256 MiB rather than start
+an engine expected to exceed it.
 
-On Linux this is a cgroup-v2 tree limit, not `RLIMIT_AS`: WebKit is a
-multi-process tree and maps far more virtual address space than it keeps
-resident. Delegation is available when CriKey runs in its normal desktop
-systemd user session. If CriKey was started outside a delegated user session,
-the launcher reports that memory enforcement is unavailable and does not
-pretend the per-surface ceiling is active. It does not refuse the page solely
-for that environmental limitation.
+On Linux it attempts to enforce the value with a delegated cgroup-v2 tree
+covering the web-host process tree. `RLIMIT_AS` is deliberately not used:
+WebKit maps far more virtual address space than it keeps resident. If the value
+cannot be determined or a writable delegated cgroup cannot be created, the
+launcher warns and the page continues without the new memory ceiling. The host
+loop and degradation path are implemented; the protection must still be
+described as conditional, never as present on every installation.
 
 At most one page is open at once (§32.2), therefore at most one web surface is
 live. A new page closes and releases the old one before its surface is opened;
@@ -335,23 +361,26 @@ nobody opened. The host starts the web engine when the user opens the page and
 releases the whole supervised process tree on close.
 
 The latency is disclosed rather than hidden. A web page keeps the in-page
-loading indicator until its first engine frame is painted. The plugin's
-`PageFrame.web` declaration is only an answer that says what to open; treating
-it as painted content would clear the indicator and leave a blank sheet for
-the measured 276-533 ms startup interval. See `PageSurface::web_painted` and
-the loading state in `draw_page`.
+loading indicator until its first accepted engine frame is painted. The
+plugin's `PageFrame.web` declaration is only an answer that says what to open;
+treating it as painted content would clear the indicator and leave a blank
+sheet for the measured 276-533 ms startup interval. Host unavailability,
+protocol failure, crash or engine load failure closes the page with a specific
+diagnostic and leaves the launcher running.
 
-The accepted Linux IME route supports preedit, commit and candidate-window
-positioning. It deliberately does not claim correction of already-committed
-text: winit exposes no delete-surrounding event and the packaged WPE API did
-not provide a correct substitute. This limitation is documented for authors
-and `crikey plugin doctor` reports it for a manifest whose persistent web
-storage declaration proves that it intends to use a web surface.
+The Linux input route forwards preedit, commit and candidate-window position,
+but it deliberately does not claim full IME support. End-to-end ibus/fcitx
+coverage is unmeasured, and correction of already-committed text has no correct
+delete-surrounding operation in v1. Both limitations are documented for
+authors.
 
-Linux distribution builds keep the web host explicit. While the host loop is
-not yet an executable, `build.sh --web-host-binary` is a supplied-host staging
-hook and places that executable beside the other supervised hosts. It does not
-offer a Cargo build mode that could only produce a library and then fail at a
-missing executable. The host-loop change will add the real
-`cargo build -p crikey-web-host --features engine` path. A package without the
-staged host does not claim to contain web-surface support.
+Linux distribution builds keep the web host explicit. The default remains a
+no-web package. `build.sh --with-web-surface` performs the real
+`cargo build -p crikey-web-host --features engine` build after checking the WPE
+development stack; `--web-host-binary` retains release-CI and distributor
+support for staging an already-built host, and verifies its CLI and dynamic
+libraries. Debian and RPM artifacts derive or declare the corresponding
+runtime requirements. A package without the staged host does not claim to
+contain web-surface support. The current Flatpak recipe is intentionally
+no-web: it neither builds the engine-enabled host nor provides pinned WPE
+modules and runtime dependencies for one.

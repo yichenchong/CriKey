@@ -26,8 +26,16 @@
 //! given and emits what the engine reports; every decision about *what* to
 //! dispatch, and in what order, is made above it by [`ime`] and [`frame`].
 
+#[cfg(all(feature = "engine", target_os = "linux"))]
+pub mod engine;
 pub mod frame;
 pub mod ime;
+pub mod input;
+#[cfg(any(all(feature = "engine", target_os = "linux"), test))]
+mod output;
+pub mod state;
 
 pub use frame::{FrameConverter, FrameError};
 pub use ime::{char_offset_from_utf8_byte, ImeBridge, ImeOp};
+pub use input::{EngineInput, InputError, InputTranslator};
+pub use state::{HostAction, HostState, OpenSpec, StateError};
