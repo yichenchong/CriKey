@@ -1719,134 +1719,55 @@ impl Drop for ProductionProcess {
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn terminate_child_tree(child: &mut Child, cgroup: &mut CgroupLease) {
-    let root = child.id();
-    let mut observed = descendant_pids(root);
-    // SAFETY: negative pid addresses the session/process group created in
-    // `pre_exec`; SIGTERM is the host's graceful engine-destroy path.
-    unsafe {
-        libc::kill(-(root as i32), libc::SIGTERM);
-    }
-    for _ in 0..PROCESS_TERMINATION_PASSES {
-        remember_descendants(root, &mut observed);
-        let root_exited = child.try_wait().ok().flatten().is_some();
-        if root_exited && !process_group_exists(root) && !observed.iter().copied().any(process_is_running) {
-            break;
-        }
-        std::thread::sleep(PROCESS_TERMINATION_POLL);
-    }
-
-    // Descendants can fork and create a new session while the root is handling
-    // SIGTERM. Re-scan from every process observed so far before each bounded
-    // escalation pass; that retains ancestry even after the root exits.
-    for _ in 0..PROCESS_TERMINATION_PASSES {
-        let descendants = remember_descendants(root, &mut observed);
-        // This remains mandatory even when the root and its process group
-        // have already exited: detached descendants are still in the cgroup.
-        cgroup.kill_tree();
-        // SAFETY: every positive pid was discovered through procfs as part of
-        // this dedicated host tree. Negative root addresses its process group.
-        // ESRCH is expected when a process exits between discovery and signal.
+    terminate_child_tree_with(child, cgroup, |root| {
+        // SAFETY: the caller has just observed this owned child still running
+        // and has not reaped it. Even if it exits now, its PID cannot be reused
+        // before the next try_wait. SIGTERM gives the host a graceful close.
         unsafe {
-            for pid in observed.iter().rev() {
-                libc::kill(*pid as i32, libc::SIGKILL);
-            }
-            libc::kill(-(root as i32), libc::SIGKILL);
+            libc::kill(-(root as i32), libc::SIGTERM);
         }
-        let _ = child.kill();
-        let _ = child.try_wait();
-        if descendants.is_empty()
-            && !process_group_exists(root)
-            && !observed.iter().copied().any(process_is_running)
-        {
-            break;
-        }
-        std::thread::sleep(PROCESS_TERMINATION_POLL);
-    }
-    let _ = child.wait();
+    });
 }
 
 #[cfg(target_os = "linux")]
-fn remember_descendants(root: u32, observed: &mut Vec<u32>) -> Vec<u32> {
-    let mut roots = Vec::with_capacity(observed.len() + 1);
-    roots.push(root);
-    roots.extend(observed.iter().copied());
-    let descendants = descendant_pids_from(&roots);
-    for pid in descendants.iter().copied() {
-        if !observed.contains(&pid) {
-            observed.push(pid);
-        }
-    }
-    descendants
-}
-
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn process_group_exists(root: u32) -> bool {
-    // SAFETY: signal 0 only checks whether the dedicated process group exists.
-    unsafe {
-        libc::kill(-(root as i32), 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn process_is_running(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    stat.rsplit_once(") ")
-        .and_then(|(_, fields)| fields.split_whitespace().next())
-        .is_some_and(|state| state != "Z" && state != "X")
-}
-
-#[cfg(target_os = "linux")]
-fn descendant_pids(root: u32) -> Vec<u32> {
-    descendant_pids_from(&[root])
-}
-
-#[cfg(target_os = "linux")]
-fn descendant_pids_from(roots: &[u32]) -> Vec<u32> {
-    let mut parents = std::collections::BTreeMap::<u32, Vec<u32>>::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        let Some(after_name) = stat.rsplit_once(") ").map(|(_, fields)| fields) else {
-            continue;
-        };
-        let Some(parent) = after_name
-            .split_whitespace()
-            .nth(1)
-            .and_then(|value| value.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        parents.entry(parent).or_default().push(pid);
-    }
-    let mut output = Vec::new();
-    let mut pending = VecDeque::from(roots.to_vec());
-    let mut visited = roots.iter().copied().collect::<std::collections::BTreeSet<_>>();
-    while let Some(parent) = pending.pop_front() {
-        if let Some(children) = parents.remove(&parent) {
-            for child in children {
-                if visited.insert(child) {
-                    output.push(child);
-                    pending.push_back(child);
+fn terminate_child_tree_with(child: &mut Child, cgroup: &mut CgroupLease, signal_group: impl FnOnce(u32)) {
+    // Only Ok(None) establishes that we still own the unreaped root identity.
+    // An already-cached exit status or a wait error must bypass numeric signals.
+    let mut root_exited = false;
+    match child.try_wait() {
+        Ok(None) => {
+            signal_group(child.id());
+            for _ in 0..PROCESS_TERMINATION_PASSES {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        root_exited = true;
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(PROCESS_TERMINATION_POLL),
+                    Err(_) => break,
                 }
             }
         }
+        Ok(Some(_)) => root_exited = true,
+        Err(_) => {}
     }
-    output
+
+    // The held dedicated controller, not remembered PIDs or process groups,
+    // owns escalation. This is mandatory even after the root has been reaped:
+    // detached descendants remain contained, including forks during SIGTERM.
+    cgroup.kill_tree();
+    if root_exited {
+        return;
+    }
+    for _ in 0..PROCESS_TERMINATION_PASSES {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(PROCESS_TERMINATION_POLL);
+    }
+    // Never turn bounded manager teardown into an unbounded Child::wait when
+    // the kernel cannot complete exit promptly (for example, uninterruptible I/O).
+    eprintln!("supervised web-host root did not exit within the bounded teardown deadline");
 }
 
 #[cfg(test)]
@@ -2559,7 +2480,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires a writable cgroup-v2 delegation with memory already enabled for children"]
-    #[allow(unsafe_code)]
     fn real_delegated_cgroup_contains_and_kills_a_detached_child() {
         let launcher_membership = std::fs::read_to_string("/proc/self/cgroup").expect("launcher membership");
         let policy = MemoryPolicy::detect().expect("delegated memory policy");
@@ -2571,17 +2491,8 @@ mod tests {
                 .trim(),
             policy.bytes.to_string()
         );
-        let attachment = cgroup.attachment.as_raw_fd();
-        let launcher_pid = std::process::id() as libc::pid_t;
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", "setsid sh -c 'echo $$; exec sleep 30' & wait"])
-            .stdout(Stdio::piped());
-        // SAFETY: this is the production async-signal-safe pre-exec helper;
-        // no host command executes before attachment to the private cgroup.
-        unsafe {
-            command.pre_exec(move || prepare_host_process(launcher_pid, attachment));
-        }
+        let mut command = contained_shell("setsid sh -c 'echo $$; exec sleep 30' & wait", &cgroup);
+        command.stdout(Stdio::piped());
         let mut child = command.spawn().expect("contained controlled child");
         let stdout = child.stdout.take().expect("detached pid output");
         let mut process = ProductionProcess {
@@ -2611,6 +2522,7 @@ mod tests {
         process.cgroup.kill_tree();
         assert_process_stopped(detached);
         assert_process_stopped(process.child.id());
+        assert!(process.child.try_wait().expect("root is reaped").is_some());
         drop(process);
         assert!(!path.exists(), "private real cgroup is removed after teardown");
     }
@@ -2987,6 +2899,31 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn contained_shell(script: &str, cgroup: &CgroupLease) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        let attachment = cgroup.attachment.as_raw_fd();
+        let launcher_pid = std::process::id() as libc::pid_t;
+        // SAFETY: use the production async-signal-safe pre-exec helper so no
+        // test descendant executes before entering the dedicated cgroup.
+        unsafe {
+            command.pre_exec(move || prepare_host_process(launcher_pid, attachment));
+        }
+        command
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_running(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit_once(") ")
+            .and_then(|(_, fields)| fields.split_whitespace().next())
+            .is_some_and(|state| state != "Z" && state != "X")
+    }
+
+    #[cfg(target_os = "linux")]
     fn assert_process_stopped(pid: u32) {
         for _ in 0..100 {
             if !process_is_running(pid) {
@@ -2999,15 +2936,16 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn exited_root_still_cleans_up_its_surviving_process_group() {
-        let directory = TestDirectory::new();
-        let mut command = session_shell("sleep 30 & printf '%s\n' \"$!\"");
+    #[ignore = "requires a writable cgroup-v2 delegation with memory already enabled for children"]
+    fn exited_root_still_cleans_up_its_detached_cgroup_child() {
+        let cgroup = CgroupLease::prepare().expect("usable delegated ancestor");
+        let mut command = contained_shell("setsid sh -c 'echo $$; exec sleep 30' &", &cgroup);
         command.stdout(Stdio::piped());
-        let mut child = command.spawn().expect("fake root starts");
-        let stdout = child.stdout.take().expect("fake root stdout is piped");
+        let mut child = command.spawn().expect("contained root starts");
+        let stdout = child.stdout.take().expect("root stdout is piped");
         let mut process = ProductionProcess {
             child,
-            cgroup: directory.cgroup(),
+            cgroup,
             terminated: false,
         };
         let mut survivor = String::new();
@@ -3024,7 +2962,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(status.is_some(), "fake root must exit before teardown");
+        assert!(status.is_some(), "contained root must exit before teardown");
         assert!(!process.terminated, "observing root exit is not cleanup");
         assert!(process_is_running(survivor), "surviving child must outlive root");
 
@@ -3032,39 +2970,33 @@ mod tests {
 
         assert!(process.terminated);
         assert_process_stopped(survivor);
-        assert!(
-            std::fs::read(directory.0.join("cgroup/cgroup.kill"))
-                .expect("kill control")
-                .len()
-                > 1,
-            "root exit must not bypass the dedicated cgroup.kill",
-        );
+        assert!(process.child.try_wait().expect("root remains reaped").is_some());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn tree_cleanup_discovers_a_late_detached_descendant() {
+    #[ignore = "requires a writable cgroup-v2 delegation with memory already enabled for children"]
+    fn cgroup_cleanup_contains_a_late_detached_descendant() {
         let directory = TestDirectory::new();
-        static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
-        let late_pid_file = std::env::temp_dir().join(format!(
-            "crikey-web-host-late-{}-{}",
-            std::process::id(),
-            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_file(&late_pid_file);
+        let late_pid_file = directory.0.join("late-detached.pid");
+        let cgroup = CgroupLease::prepare().expect("usable delegated ancestor");
         let script = concat!(
-            "trap 'setsid sleep 30 >/dev/null 2>&1 & echo $! > \"$1\"; ",
-            "sleep 0.15' TERM\n",
+            "close_host() {\n",
+            "  setsid sh -c 'echo $$ > \"$1\"; exec sleep 30' sh \"$1\" >/dev/null 2>&1 &\n",
+            "  sleep 0.05\n",
+            "  exit 0\n",
+            "}\n",
+            "trap 'close_host \"$1\"' TERM\n",
             "printf 'ready\\n'\n",
-            "while :; do sleep 1; done"
+            "while :; do :; done"
         );
-        let mut command = session_shell(script);
+        let mut command = contained_shell(script, &cgroup);
         command.arg("sh").arg(&late_pid_file).stdout(Stdio::piped());
         let mut child = command.spawn().expect("late-forking root starts");
         let stdout = child.stdout.take().expect("fake root stdout is piped");
         let mut process = ProductionProcess {
             child,
-            cgroup: directory.cgroup(),
+            cgroup,
             terminated: false,
         };
         let mut ready = String::new();
@@ -3080,25 +3012,73 @@ mod tests {
             .trim()
             .parse::<u32>()
             .expect("detached descendant pid");
-        let _ = std::fs::remove_file(&late_pid_file);
         assert_process_stopped(late_pid);
+        assert!(process.child.try_wait().expect("root is reaped").is_some());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[allow(unsafe_code)]
-    fn proc_descendant_walk_finds_a_real_grandchild_for_tree_cleanup() {
+    fn graceful_root_close_runs_before_cgroup_escalation() {
+        let directory = TestDirectory::new();
+        let closed_file = directory.0.join("closed");
+        let mut command = session_shell(concat!(
+            "trap 'printf closed > \"$1\"; exit 0' TERM\n",
+            "printf 'ready\\n'\n",
+            "while :; do :; done"
+        ));
+        command.arg("sh").arg(&closed_file).stdout(Stdio::piped());
+        let mut child = command.spawn().expect("graceful root starts");
+        let stdout = child.stdout.take().expect("root stdout is piped");
+        let mut process = ProductionProcess {
+            child,
+            cgroup: directory.cgroup(),
+            terminated: false,
+        };
+        let mut ready = String::new();
+        BufReader::new(stdout)
+            .read_line(&mut ready)
+            .expect("root reports installed SIGTERM handler");
+        assert_eq!(ready.trim(), "ready");
+
+        process.terminate();
+
+        assert_eq!(
+            std::fs::read(&closed_file).expect("graceful close marker"),
+            b"closed"
+        );
+        assert!(process
+            .child
+            .try_wait()
+            .expect("root is reaped")
+            .expect("root exited")
+            .success());
+        assert_eq!(
+            std::fs::read(directory.0.join("cgroup/cgroup.kill")).expect("kill control"),
+            b"11",
+            "graceful root exit still escalates over the dedicated cgroup"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn already_reaped_root_bypasses_numeric_signaling_and_still_kills_cgroup() {
         let directory = TestDirectory::new();
         let mut cgroup = directory.cgroup();
-        let mut child = session_shell("sh -c 'sleep 30 & wait' & wait")
-            .spawn()
-            .expect("fake tree starts");
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(
-            descendant_pids(child.id()).len() >= 2,
-            "the fake executable must have a child and grandchild"
+        let mut child = session_shell("exit 0").spawn().expect("short-lived root starts");
+        let status = child.wait().expect("root is reaped before teardown");
+        assert!(status.success());
+
+        // This seam substitutes every raw process/group operation in cleanup.
+        // It never sends a real signal to a potentially reused/unrelated PID.
+        terminate_child_tree_with(&mut child, &mut cgroup, |_| {
+            panic!("an already-reaped root must never trigger numeric signaling");
+        });
+
+        assert_eq!(child.try_wait().expect("cached root status"), Some(status));
+        assert_eq!(
+            std::fs::read(directory.0.join("cgroup/cgroup.kill")).expect("kill control"),
+            b"11",
+            "already-reaped root must still kill detached cgroup members"
         );
-        terminate_child_tree(&mut child, &mut cgroup);
-        assert!(child.try_wait().expect("wait succeeds").is_some());
     }
 }

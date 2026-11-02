@@ -2664,9 +2664,14 @@ At most one web surface shall be live. This follows the page invariant in
 supervised host shall finish. A dedicated delegated cgroup shall cover the
 whole host process tree, including detached and reparented descendants after
 a host crash. Web startup without that supervision shall be refused rather
-than falling back to process-group signals or procfs discovery. Frames from a
-closed surface, a different surface identifier, or an older surface generation
-shall be discarded.
+than falling back to process-group signals or procfs discovery.
+`cgroup.kill` shall be the authoritative process-tree escalation; teardown shall
+not signal remembered descendant PIDs or use them as ancestry roots. Graceful
+process-group SIGTERM shall be allowed only while the original root remains
+unreaped. Once its exit has been observed and reaped, teardown shall never
+signal its numeric PID or process group again. Teardown shall remain bounded
+and reap the root. Frames from a closed surface, a different surface identifier,
+or an older surface generation shall be discarded.
 
 A web surface with a stated address requires the plugin's
 `permissions.network` grant. Persistent cookies and local storage require the
