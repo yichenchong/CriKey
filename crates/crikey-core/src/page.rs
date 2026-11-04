@@ -388,8 +388,8 @@ pub enum PageError {
     /// through a surface the plugin cannot otherwise read, and `data:` and
     /// `javascript:` are script injection wearing a URL.
     WebSurfaceSchemeRefused { scheme: String },
-    /// A stated HTTP(S) address is not absolute, has no authority, or
-    /// contains control characters or whitespace in its authority.
+    /// A stated HTTP(S) address is not absolute, has no host, or contains
+    /// control characters or whitespace in its authority.
     WebSurfaceInvalidUrl,
     /// A web surface frame named a focus node. Focus inside a web surface
     /// belongs to the document, and the id would name a node that does not
@@ -461,7 +461,7 @@ impl std::fmt::Display for PageError {
             ),
             Self::WebSurfaceInvalidUrl => write!(
                 out,
-                "the web surface must name an absolute HTTP(S) address with a non-empty authority without whitespace or control characters"
+                "the web surface must name an absolute HTTP(S) address with a non-empty host and an authority without whitespace or control characters"
             ),
             Self::WebSurfaceWithFocusNode { node_id } => write!(
                 out,
@@ -514,35 +514,56 @@ impl PageWebSurface {
     /// An empty address is the later-frame "stay" operation; the host must
     /// additionally require an already-open document for that operation.
     pub fn validate(&self) -> Result<(), PageError> {
-        if self.url.len() > MAX_NODE_TEXT_BYTES {
-            return Err(PageError::WebSurfaceUrlTooLong {
-                bytes: self.url.len(),
-            });
-        }
         if self.url.is_empty() {
             return Ok(());
         }
-        let (scheme, remainder) = self.url.split_once(':').unwrap_or(("", ""));
-        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-            return Err(PageError::WebSurfaceSchemeRefused {
-                scheme: scheme.to_ascii_lowercase(),
-            });
-        }
-        if self.url.chars().any(char::is_control) {
-            return Err(PageError::WebSurfaceInvalidUrl);
-        }
-        let Some(authority_and_path) = remainder.strip_prefix("//") else {
-            return Err(PageError::WebSurfaceInvalidUrl);
-        };
-        let authority = authority_and_path
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or_default();
-        if authority.is_empty() || authority.chars().any(char::is_whitespace) {
-            return Err(PageError::WebSurfaceInvalidUrl);
-        }
-        Ok(())
+        validate_web_surface_url(&self.url)
     }
+}
+
+/// Checks a non-empty navigation address at the SDK and web-host boundaries.
+///
+/// This is a bounded HTTP(S) admission check, not a browser URL parser. It
+/// requires an authority with a host, without imposing HTTP request-target
+/// syntax on browser URLs (which may contain user information or Unicode).
+/// An empty later-frame stay declaration is handled by [`PageWebSurface`],
+/// not by the engine's navigation operation.
+pub fn validate_web_surface_url(url: &str) -> Result<(), PageError> {
+    if url.len() > MAX_NODE_TEXT_BYTES {
+        return Err(PageError::WebSurfaceUrlTooLong { bytes: url.len() });
+    }
+    let (scheme, remainder) = url.split_once(':').unwrap_or(("", ""));
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(PageError::WebSurfaceSchemeRefused {
+            scheme: scheme.to_ascii_lowercase(),
+        });
+    }
+    if url.chars().any(char::is_control) {
+        return Err(PageError::WebSurfaceInvalidUrl);
+    }
+    let Some(authority_and_path) = remainder.strip_prefix("//") else {
+        return Err(PageError::WebSurfaceInvalidUrl);
+    };
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.chars().any(char::is_whitespace) {
+        return Err(PageError::WebSurfaceInvalidUrl);
+    }
+    // User information and a port are not a host. Checking the complete
+    // authority for emptiness would admit `https://user@:443/`, then hand the
+    // engine a navigation that cannot name a document.
+    let host_and_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        bracketed.split_once(']').map(|(host, _)| host)
+    } else {
+        Some(host_and_port.split(':').next().unwrap_or_default())
+    };
+    if host.is_none_or(str::is_empty) {
+        return Err(PageError::WebSurfaceInvalidUrl);
+    }
+    Ok(())
 }
 
 /// One frame of a plugin-drawn page.
@@ -1186,6 +1207,38 @@ mod tests {
                 ..PageFrame::default()
             };
             assert_eq!(frame.validate(), Err(PageError::WebSurfaceInvalidUrl), "{url:?}");
+        }
+    }
+
+    #[test]
+    fn a_web_authority_requires_a_host_not_just_user_information_or_a_port() {
+        for url in [
+            "https://@/",
+            "https://user@/",
+            "https://:443/",
+            "https://user@:443/",
+            "https://[]/",
+            "https://[]:443/",
+        ] {
+            let frame = PageFrame {
+                web: Some(PageWebSurface {
+                    url: url.to_owned(),
+                    ..PageWebSurface::default()
+                }),
+                ..PageFrame::default()
+            };
+            assert_eq!(frame.validate(), Err(PageError::WebSurfaceInvalidUrl), "{url:?}");
+        }
+        for url in [
+            "https://user:password@example.invalid:443/path",
+            "https://[::1]:443/",
+            "https://例え.invalid/文書",
+        ] {
+            let web = PageWebSurface {
+                url: url.to_owned(),
+                ..PageWebSurface::default()
+            };
+            assert_eq!(web.validate(), Ok(()), "{url:?}");
         }
     }
 

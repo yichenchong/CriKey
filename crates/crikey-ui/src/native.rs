@@ -263,7 +263,7 @@ pub fn create_launcher_context() -> egui::Context {
 /// Ordered input and widget effects come from the first egui pass. Extra
 /// layout passes may refine the reported page size, but never replay input.
 pub fn build_launcher_frame(context: &egui::Context, input: RawInput, model: &ViewModel) -> NativeUiFrame {
-    build_launcher_frame_with_transparency(context, input, model, false)
+    build_launcher_frame_with_transparency(context, input, model, false, false)
 }
 
 fn build_launcher_frame_with_transparency(
@@ -271,13 +271,29 @@ fn build_launcher_frame_with_transparency(
     input: RawInput,
     model: &ViewModel,
     transparent: bool,
+    native_web_input: bool,
 ) -> NativeUiFrame {
+    if !native_web_input
+        && model.page.as_ref().is_some_and(|page| {
+            page.frame.web.is_some() && page.web_surface_id.is_some_and(|surface_id| surface_id != 0)
+        })
+    {
+        // Seed from the preceding frame, before egui folds this batch into
+        // its final pointer position. A wheel before the batch's first motion
+        // must not be delivered at the position of a later motion.
+        let previous_position = context.input(|state| state.pointer.hover_pos());
+        let retained = web_frame_pointer(context);
+        let mut pointer = lock_recover(&retained);
+        if pointer.position.is_none() && !pointer.departed {
+            pointer.position = previous_position;
+        }
+    }
     let mut commands = Vec::new();
     let mut pass_commands = Vec::new();
     let mut first_pass = true;
     let output = context.run(input, |context| {
         pass_commands.clear();
-        draw_launcher(context, model, &mut pass_commands, transparent);
+        draw_launcher(context, model, &mut pass_commands, transparent, native_web_input);
         if first_pass {
             // egui 0.29 drains RawInput events into the first pass only.
             // Preserve that pass's ordered effects, including equal events and
@@ -1180,9 +1196,9 @@ where
             .max(f64::MIN_POSITIVE)
     }
 
-    /// Translates a native event the web document owns and reports whether it
-    /// must be withheld from egui. A drag that begins inside the document keeps
-    /// its motion and release, even after crossing into launcher chrome.
+    /// Translates a native event and reports whether the web document owns it.
+    /// Position tracking still reaches egui for launcher chrome, without
+    /// replaying document input. A drag retains motion and release outside.
     fn web_command(&mut self, event: &WindowEvent) -> (Option<UiCommand>, bool) {
         if let WindowEvent::CursorMoved { position, .. } = event {
             self.cursor_position = Some(*position);
@@ -1496,20 +1512,9 @@ where
                 WindowEvent::CursorMoved { .. } | WindowEvent::CursorLeft { .. }
             );
             if (command.is_none() && !web_consumed) || pointer_position_changed {
-                let previous_events = graphics.egui_state.egui_input_mut().events.len();
                 let response = graphics
                     .egui_state
                     .on_window_event(graphics.window.as_ref(), &event);
-                if web_consumed {
-                    // Keep egui-winit's cursor bookkeeping current so the next
-                    // chrome click has its real position, but do not replay a
-                    // document-owned motion or departure through the fallback.
-                    graphics
-                        .egui_state
-                        .egui_input_mut()
-                        .events
-                        .truncate(previous_events);
-                }
                 if response.repaint && self.active_session.is_some() {
                     graphics.window.request_redraw();
                 }
@@ -2223,7 +2228,7 @@ impl GraphicsState {
         // that decides it can be changed while the launcher is running.
         self.apply_window_rounding(model.rounded_corners);
         let NativeUiFrame { output, commands } =
-            build_launcher_frame_with_transparency(&self.egui_context, input, model, self.transparent);
+            build_launcher_frame_with_transparency(&self.egui_context, input, model, self.transparent, true);
         let egui::FullOutput {
             platform_output,
             textures_delta,
@@ -2677,6 +2682,7 @@ fn draw_launcher(
     model: &ViewModel,
     commands: &mut Vec<UiCommand>,
     transparent: bool,
+    native_web_input: bool,
 ) {
     let colors = theme::palette();
     // Ctrl+, is what every desktop means by "open preferences". It is consumed
@@ -2725,7 +2731,7 @@ fn draw_launcher(
                 // keeps the two mutually exclusive, so this is a branch rather
                 // than a stack.
                 ui.add_space(theme::SPACE_3);
-                draw_page(ui, page, commands, colors);
+                draw_page(ui, page, commands, colors, native_web_input);
             } else if model.settings_open {
                 // The settings surface takes the result area rather than
                 // floating over it: the launcher is one column, and a list the
@@ -3336,7 +3342,13 @@ fn report_page_size(ui: &egui::Ui, page: &PageSurface, rect: egui::Rect, command
     commands.push(UiCommand::ResizePage { width, height });
 }
 
-fn draw_page(ui: &mut egui::Ui, page: &PageSurface, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
+fn draw_page(
+    ui: &mut egui::Ui,
+    page: &PageSurface,
+    commands: &mut Vec<UiCommand>,
+    colors: theme::Palette,
+    native_web_input: bool,
+) {
     // What the page may occupy is what is left after the footer and the gap
     // above it, measured the way `draw_results` measures the list's room. The
     // central panel's bottom inner margin is already outside
@@ -3393,28 +3405,29 @@ fn draw_page(ui: &mut egui::Ui, page: &PageSurface, commands: &mut Vec<UiCommand
     }
 
     // Escape is the host's key. `web_command` already answers it on the native
-    // window path and, by answering, keeps it out of egui entirely; this is the
-    // same decision for every other way input can reach a frame -- the
-    // headless builder or a synthetic event. Consuming it here makes those
-    // routes close the page too, and the two can never both fire for one
-    // keystroke because the native window loop withholds Escape from egui.
-    if page_ui.input_mut(|state| {
-        let mut close = false;
-        state.events.retain(|event| {
-            if let egui::Event::Key {
-                key: egui::Key::Escape,
-                pressed,
-                ..
-            } = event
-            {
-                close |= *pressed;
-                false
-            } else {
-                true
-            }
-        });
-        close
-    }) {
+    // window path and, by answering, keeps it out of egui entirely. Display
+    // lists retain their existing shortcut route; web_frame_input handles
+    // Escape in event order so earlier document input precedes the close and
+    // later input cannot target a retired document.
+    if page.frame.web.is_none()
+        && page_ui.input_mut(|state| {
+            let mut close = false;
+            state.events.retain(|event| {
+                if let egui::Event::Key {
+                    key: egui::Key::Escape,
+                    pressed,
+                    ..
+                } = event
+                {
+                    close |= *pressed;
+                    false
+                } else {
+                    true
+                }
+            });
+            close
+        })
+    {
         commands.push(UiCommand::ClosePage);
     }
 
@@ -3461,7 +3474,10 @@ fn draw_page(ui: &mut egui::Ui, page: &PageSurface, commands: &mut Vec<UiCommand
                 uv: RASTER_UV,
             });
         }
-        web_frame_input(&page_ui, page, rect, commands);
+        // Native mouse positions still update chrome, but must not replay
+        // document input. Touch has no immediate native route: translate its
+        // original Touch events, never egui-winit's synthesized mouse copies.
+        web_frame_input(&page_ui, page, rect, commands, native_web_input);
         return;
     }
 
@@ -3681,6 +3697,7 @@ struct WebPointerState {
     departed: bool,
     pressed_buttons: Vec<u32>,
     scrolling: bool,
+    touch_id: Option<(egui::TouchDeviceId, egui::TouchId)>,
 }
 
 impl WebPointerState {
@@ -3690,6 +3707,7 @@ impl WebPointerState {
             self.pressed_buttons.clear();
             self.hovered = false;
             self.scrolling = false;
+            self.touch_id = None;
         }
     }
 
@@ -3763,32 +3781,158 @@ impl WebPointerState {
         }
         Some(position)
     }
+
+    fn touch_input(
+        &mut self,
+        rect: egui::Rect,
+        event: &egui::Event,
+        timestamp_ms: u64,
+        modifiers: u32,
+    ) -> [Option<WebSurfaceInput>; 2] {
+        let mut inputs = [None, None];
+        let Some(surface_id) = self.surface_id else {
+            return inputs;
+        };
+        let egui::Event::Touch {
+            device_id,
+            id,
+            phase,
+            pos,
+            ..
+        } = event
+        else {
+            return inputs;
+        };
+        let identity = (*device_id, *id);
+        if *phase == egui::TouchPhase::Start {
+            if self.touch_id.is_some() {
+                return inputs;
+            }
+            self.touch_id = Some(identity);
+        } else if self.touch_id != Some(identity) {
+            return inputs;
+        }
+        self.position = Some(*pos);
+        let motion = |(x, y)| WebSurfaceInput::PointerMove {
+            surface_id,
+            timestamp_ms,
+            x,
+            y,
+            modifiers,
+        };
+        let button = |(x, y), pressed| WebSurfaceInput::PointerButton {
+            surface_id,
+            timestamp_ms,
+            x,
+            y,
+            button: WEB_POINTER_BUTTON_LEFT,
+            pressed,
+            press_count: 1,
+            modifiers,
+        };
+        match phase {
+            egui::TouchPhase::Start => {
+                inputs[0] = self.motion(rect).map(motion);
+                inputs[1] = self
+                    .button(rect, WEB_POINTER_BUTTON_LEFT, true)
+                    .map(|position| button(position, true));
+            }
+            egui::TouchPhase::Move => inputs[0] = self.motion(rect).map(motion),
+            egui::TouchPhase::End => {
+                inputs[0] = self
+                    .button(rect, WEB_POINTER_BUTTON_LEFT, false)
+                    .map(|position| button(position, false));
+                inputs[1] = self.departure().map(motion);
+                self.touch_id = None;
+            }
+            egui::TouchPhase::Cancel => {
+                // Cancellation cannot activate the control under the last
+                // contact position, but must release its captured button.
+                inputs[0] = self.departure().map(motion);
+                inputs[1] = self
+                    .button(rect, WEB_POINTER_BUTTON_LEFT, false)
+                    .map(|position| button(position, false));
+                self.touch_id = None;
+            }
+        }
+        inputs
+    }
+}
+
+fn web_frame_pointer(context: &egui::Context) -> Arc<Mutex<WebPointerState>> {
+    context.data_mut(|data| {
+        Arc::clone(
+            data.get_temp_mut_or_default::<Arc<Mutex<WebPointerState>>>(egui::Id::new("crikey-web-pointer")),
+        )
+    })
 }
 
 /// Headless-frame input route for web pages.
 ///
-/// The native window path consumes richer winit events before egui sees them,
-/// preserving hardware keycodes, repeat, wheel phase and IME ranges. This
-/// route preserves the pointer/scroll/IME and named navigation keys available
-/// in `egui::RawInput`; missing hardware metadata remains zero. Printable text
-/// arrives as text, never as a keysym guessed from egui's layout-neutral keys.
-fn web_frame_input(ui: &egui::Ui, page: &PageSurface, rect: egui::Rect, commands: &mut Vec<UiCommand>) {
+/// The native window path translates richer winit events before constructing
+/// a frame, preserving hardware keycodes, repeat, wheel phase and IME ranges.
+/// Its mouse positions inform chrome without fallback replay. Original touch
+/// events are the exception: they have no immediate native translation and
+/// are handled here without replaying egui-winit's synthesized mouse events.
+/// Standalone frames preserve pointer/scroll/IME and named navigation keys;
+/// missing hardware metadata remains zero. Printable text arrives as text.
+fn web_frame_input(
+    ui: &egui::Ui,
+    page: &PageSurface,
+    rect: egui::Rect,
+    commands: &mut Vec<UiCommand>,
+    native_web_input: bool,
+) {
+    if native_web_input
+        && !ui.input(|state| {
+            state
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Touch { .. }))
+        })
+    {
+        return;
+    }
     let Some(surface_id) = page.web_surface_id.filter(|surface_id| *surface_id != 0) else {
+        // Pending declarations own no document pointer state. In particular,
+        // motion during admission must not leave a predecessor's coordinates
+        // or touch capture frozen until the new surface becomes live.
+        ui.ctx().data_mut(|data| {
+            data.remove::<Arc<Mutex<WebPointerState>>>(egui::Id::new("crikey-web-pointer"));
+        });
+        // Escape remains host-owned while admission/startup is pending too.
+        if ui.input(|state| {
+            state.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+        }) {
+            commands.push(UiCommand::ClosePage);
+        }
         return;
     };
-    let retained: Arc<Mutex<WebPointerState>> = ui.ctx().data_mut(|data| {
-        Arc::clone(
-            data.get_temp_mut_or_default::<Arc<Mutex<WebPointerState>>>(egui::Id::new("crikey-web-pointer")),
-        )
-    });
+    let retained = web_frame_pointer(ui.ctx());
     let mut pointer = lock_recover(&retained);
     pointer.set_surface(Some(surface_id));
     ui.input(|state| {
-        if pointer.position.is_none() {
-            pointer.position = state.pointer.hover_pos();
-        }
         let timestamp_ms = (state.time.max(0.0) * 1000.0) as u64;
         for event in &state.events {
+            if native_web_input {
+                commands.extend(
+                    pointer
+                        .touch_input(rect, event, timestamp_ms, web_modifiers(state.modifiers))
+                        .into_iter()
+                        .flatten()
+                        .map(UiCommand::WebInput),
+                );
+                continue;
+            }
             match event {
                 egui::Event::PointerMoved(position) => {
                     pointer.position = Some(*position);
@@ -3858,6 +4002,18 @@ fn web_frame_input(ui: &egui::Ui, page: &PageSurface, rect: egui::Rect, commands
                         modifiers: web_modifiers(*modifiers),
                         stop: false,
                     }));
+                }
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    pressed,
+                    ..
+                } => {
+                    if *pressed {
+                        // Preserve earlier input, then stop at the session
+                        // boundary. Later events cannot target this document.
+                        commands.push(UiCommand::ClosePage);
+                        break;
+                    }
                 }
                 egui::Event::Key {
                     key,
@@ -4926,10 +5082,15 @@ mod transparency_tests {
             ..Default::default()
         };
 
-        let opaque =
-            build_launcher_frame_with_transparency(&create_launcher_context(), input.clone(), &model, false);
+        let opaque = build_launcher_frame_with_transparency(
+            &create_launcher_context(),
+            input.clone(),
+            &model,
+            false,
+            false,
+        );
         let transparent =
-            build_launcher_frame_with_transparency(&create_launcher_context(), input, &model, true);
+            build_launcher_frame_with_transparency(&create_launcher_context(), input, &model, true, false);
         let colors = theme::palette();
 
         assert!(opaque
@@ -6286,6 +6447,170 @@ mod window_geometry_tests {
 #[cfg(test)]
 mod web_input_tests {
     use super::*;
+
+    fn native_web_view() -> ViewModel {
+        let mut launcher = crate::LauncherViewModel::new();
+        launcher.activate();
+        let mut view = launcher.frame().expect("visible launcher");
+        view.page = Some(PageSurface {
+            plugin: crikey_core::PluginId("demo".to_owned()),
+            page_id: "web".to_owned(),
+            plugin_name: "Demo".to_owned(),
+            frame: Arc::new(PageFrame {
+                web: Some(crikey_core::PageWebSurface {
+                    url: "https://example.invalid/".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            stale: false,
+            answered: true,
+            web_surface_id: Some(41),
+            web_frame: None,
+            web_generation: 0,
+            web_caret_area: None,
+        });
+        view
+    }
+
+    #[test]
+    fn native_document_motion_updates_chrome_hover_without_replaying_web_input() {
+        let context = create_launcher_context();
+        let view = native_web_view();
+        let input = |events| RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(720.0, 420.0),
+            )),
+            focused: true,
+            events,
+            ..Default::default()
+        };
+        let _ = build_launcher_frame_with_transparency(&context, input(Vec::new()), &view, false, true);
+        let inside = web_page_geometry(&context).expect("measured page").rect.center();
+        for events in [
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
+            vec![egui::Event::PointerMoved(inside)],
+            vec![egui::Event::PointerGone],
+        ] {
+            let expected = events.iter().find_map(|event| match event {
+                egui::Event::PointerMoved(position) => Some(*position),
+                _ => None,
+            });
+            let frame = build_launcher_frame_with_transparency(&context, input(events), &view, false, true);
+            assert_eq!(context.input(|state| state.pointer.hover_pos()), expected);
+            assert!(
+                !frame
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, UiCommand::WebInput(_) | UiCommand::WebIme(_))),
+                "native-owned input must not be replayed through the egui fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn native_touch_preserves_capture_and_ignores_its_synthesized_mouse_copies() {
+        for terminal in [egui::TouchPhase::End, egui::TouchPhase::Cancel] {
+            let context = create_launcher_context();
+            let view = native_web_view();
+            let input = |events| RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(720.0, 420.0),
+                )),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            let _ = build_launcher_frame_with_transparency(&context, input(Vec::new()), &view, false, true);
+            let rect = web_page_geometry(&context).expect("measured page").rect;
+            let inside = rect.center();
+            let outside = rect.max + egui::vec2(5.0, 6.0);
+            let touch = |id, phase, pos| egui::Event::Touch {
+                device_id: egui::TouchDeviceId(5),
+                id: egui::TouchId(id),
+                phase,
+                pos,
+                force: None,
+            };
+            let mouse = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let frame = build_launcher_frame_with_transparency(
+                &context,
+                input(vec![
+                    touch(7, egui::TouchPhase::Start, inside),
+                    egui::Event::PointerMoved(inside),
+                    mouse(inside, true),
+                    touch(8, egui::TouchPhase::Start, inside),
+                    touch(7, egui::TouchPhase::Move, outside),
+                    egui::Event::PointerMoved(outside),
+                    touch(8, egui::TouchPhase::End, inside),
+                    touch(7, terminal, outside),
+                    mouse(outside, false),
+                    egui::Event::PointerGone,
+                ]),
+                &view,
+                false,
+                true,
+            );
+            let buttons: Vec<_> = frame
+                .commands
+                .iter()
+                .filter_map(|command| match command {
+                    UiCommand::WebInput(WebSurfaceInput::PointerButton { pressed, x, y, .. }) => {
+                        Some((*pressed, *x, *y))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let release = if terminal == egui::TouchPhase::Cancel {
+                (false, -1.0, -1.0)
+            } else {
+                (false, rect.width() + 5.0, rect.height() + 6.0)
+            };
+            assert_eq!(
+                buttons,
+                vec![(true, inside.x - rect.min.x, inside.y - rect.min.y), release],
+                "the primary contact owns exactly one press/release, including capture outside"
+            );
+            let motions = frame
+                .commands
+                .iter()
+                .filter(|command| matches!(command, UiCommand::WebInput(WebSurfaceInput::PointerMove { .. })))
+                .count();
+            let expected_motions = if terminal == egui::TouchPhase::Cancel {
+                3
+            } else {
+                2
+            };
+            assert_eq!(motions, expected_motions,
+                "start and drag (plus cancellation's outside endpoint) must not replay synthesized mouse input");
+            let restarted = build_launcher_frame_with_transparency(
+                &context,
+                input(vec![touch(9, egui::TouchPhase::Start, inside)]),
+                &view,
+                false,
+                true,
+            );
+            assert_eq!(
+                restarted
+                    .commands
+                    .iter()
+                    .filter(|command| matches!(
+                        command,
+                        UiCommand::WebInput(WebSurfaceInput::PointerButton { pressed: true, .. })
+                    ))
+                    .count(),
+                1,
+                "end/cancel must release contact ownership for the next touch"
+            );
+        }
+    }
 
     #[test]
     fn native_keysyms_preserve_layout_locations_locks_and_raw_xkb_values() {

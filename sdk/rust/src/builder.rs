@@ -744,7 +744,7 @@ impl WebSurfaceBuilder {
 
     /// Validates and returns the web-surface frame.
     ///
-    /// A stated URL must be an absolute HTTP(S) URL with a non-empty authority.
+    /// A stated URL must be an absolute HTTP(S) URL with a non-empty host.
     /// An empty URL is accepted only as the [`WebSurfaceBuilder::stay`]
     /// operation; the launcher refuses it when no document is already open.
     pub fn build(self) -> crikey_core::Result<PageFrame> {

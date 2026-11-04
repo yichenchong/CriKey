@@ -2544,3 +2544,100 @@ fn malformed_web_merge_fragments_are_refused_without_losing_wire_checks() {
         ));
     }
 }
+
+#[test]
+fn enveloped_web_declaration_fragments_merge_through_to_the_core_consumer() {
+    // Envelope.page_frame (tag 32) is itself a singular message. Splitting
+    // the new declaration across that boundary must not erase its initial
+    // URL when the following fragment supplies storage.
+    let bytes = b"\x82\x02\x13\x08\x07\x3a\x0f\x0a\x0ahttps://a/\x98\x06\x07\
+                  \x82\x02\x0a\x3a\x05\x10\x02\xa0\x06\x08\x12\x01T";
+    let envelope = message::Envelope::decode(bytes).expect("valid envelope fragments");
+    let Some(message::Payload::PageFrame(frame)) = envelope.payload else {
+        panic!("expected PageFrame");
+    };
+    assert_eq!(frame.generation, 7);
+    assert_eq!(frame.title, "T");
+    let web = frame.web.as_ref().expect("web declaration");
+    assert_eq!(web.unknown.as_bytes(), b"\x98\x06\x07\xa0\x06\x08");
+    let core = crikey_native_protocol::convert::from_proto_page_frame(&frame);
+    assert_eq!(core.validate(), Ok(()));
+    let web = core.web.expect("web declaration reaches the page consumer");
+    assert_eq!(web.url, "https://a/");
+    assert_eq!(web.storage, crikey_core::WebStorage::Persistent);
+
+    // An explicit scalar default overrides the earlier value, while an
+    // empty fragment preserves the web declaration and its storage.
+    let mut reset = bytes.to_vec();
+    reset.extend_from_slice(b"\x82\x02\x04\x08\x00\x12\x00\x82\x02\x00");
+    let envelope = message::Envelope::decode(&reset).expect("default-reset fragments");
+    let Some(message::Payload::PageFrame(frame)) = envelope.payload else {
+        panic!("expected PageFrame");
+    };
+    assert_eq!(frame.generation, 0);
+    assert!(frame.title.is_empty());
+    assert_eq!(
+        frame.web.expect("empty fragment must not erase web").url,
+        "https://a/"
+    );
+}
+
+#[test]
+fn envelope_fragments_cannot_hide_a_mixed_display_list_and_web_frame() {
+    // A default display-list node in one fragment followed by a web
+    // declaration in the next is still one contradictory PageFrame.
+    let bytes = b"\x82\x02\x02\x1a\x00\x82\x02\x02\x3a\x00";
+    let envelope = message::Envelope::decode(bytes).expect("valid mixed frame wire");
+    let Some(message::Payload::PageFrame(frame)) = envelope.payload else {
+        panic!("expected PageFrame");
+    };
+    let core = crikey_native_protocol::convert::from_proto_page_frame(&frame);
+    assert_eq!(
+        core.validate(),
+        Err(crikey_core::PageError::WebSurfaceWithNodes { nodes: 1 })
+    );
+}
+
+#[test]
+fn fragmented_web_page_envelopes_keep_oneof_replacement_and_wire_checks() {
+    let bytes = b"\x82\x02\x04\x08\x07\x3a\x00\
+                  \xa2\x02\x02\x08\x09\
+                  \x82\x02\x03\x12\x01T";
+    let envelope = message::Envelope::decode(bytes).expect("valid oneof switches");
+    let Some(message::Payload::PageFrame(frame)) = envelope.payload else {
+        panic!("expected PageFrame");
+    };
+    assert_eq!(frame.generation, 0, "the replaced PageFrame must not revive");
+    assert_eq!(frame.title, "T");
+    assert!(frame.web.is_none());
+
+    for malformed in [
+        b"\x82\x02\x02\x3a\x00\x80\x02\x01".as_slice(),
+        b"\x82\x02\x02\x3a\x00\x82\x02\x01\x3a".as_slice(),
+    ] {
+        assert!(matches!(
+            message::Envelope::decode(malformed),
+            Err(ProtocolError::Malformed(_))
+        ));
+    }
+}
+
+#[test]
+fn decoded_web_authorities_without_hosts_are_refused_before_opening() {
+    for url in ["https://@/", "https://:443/", "https://user@:443/", "https://[]/"] {
+        let frame = message::PageFrame {
+            web: Some(message::PageWebSurface {
+                url: url.to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let decoded = message::PageFrame::decode(&frame.encode()).expect("valid protobuf text");
+        let core = crikey_native_protocol::convert::from_proto_page_frame(&decoded);
+        assert_eq!(
+            core.validate(),
+            Err(crikey_core::PageError::WebSurfaceInvalidUrl),
+            "{url}"
+        );
+    }
+}

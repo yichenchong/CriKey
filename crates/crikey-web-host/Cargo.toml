@@ -32,6 +32,7 @@ default = []
 engine = []
 
 [dependencies]
+crikey-core.workspace = true
 crikey-native-protocol.workspace = true
 thiserror.workspace = true
 

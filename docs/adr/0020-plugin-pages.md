@@ -351,9 +351,12 @@ On Linux this ceiling and process-tree supervision are required, not
 best-effort. Before executing the web host, the launcher must find an existing
 suitable writable parent within its delegated cgroup-v2 hierarchy with `memory`
 already enabled in `cgroup.subtree_control` and a writable `cgroup.procs` for
-the kernel's common-ancestor migration permission check. It searches only proper
-ancestors within the delegation's cgroup-v2 mount, never the launcher's own
-cgroup. Candidate parents must contain no processes, except at the visible mount
+the kernel's common-ancestor migration permission check. It considers safely
+resolved cgroup-v2 mount views, including writable delegated bind mounts, and
+searches only proper ancestors within each view, never the launcher's own
+cgroup. Inherited memory limits visible through any safe view remain binding
+when another view supplies the writable parent. Candidate parents must contain
+no processes, except at the visible mount
 root; that exception still requires the enabled memory controller and every
 private leaf control. It creates a private web-host leaf separate from the leaf
 containing the launcher.
@@ -388,6 +391,12 @@ SIGTERM is allowed only while the original root remains unreaped. After
 observing and reaping its exit, teardown never signals that numeric PID or
 process group again, because the kernel may reuse the identifier.
 
+That cleanup guarantee assumes the launcher supervisor remains alive to write
+`cgroup.kill`. An abrupt launcher crash or SIGKILL only delivers the configured
+parent-death signal to the web-host root; detached descendants are not covered
+by that signal. The cgroup memory ceiling remains active, but v1 does not
+provide an independent reaper for whole-tree cleanup after launcher death.
+
 The latency is disclosed rather than hidden. A web page keeps the in-page
 loading indicator until its first accepted engine frame is painted. The
 plugin's `PageFrame.web` declaration is only an answer that says what to open;
@@ -410,7 +419,13 @@ support for staging an already-built host, and verifies that it is a native ELF
 with resolvable dynamic libraries. This does not establish host protocol
 compatibility or prove that an arbitrary supplied ELF is an engine-enabled
 CriKey host. Debian and RPM artifacts derive or declare the corresponding
-runtime requirements. A package without the staged host does not claim to
-contain web-surface support. The current Flatpak recipe is intentionally
-no-web: it neither builds the engine-enabled host nor provides pinned WPE
-modules and runtime dependencies for one.
+runtime requirements. For web-enabled Debian packages, missing metadata for
+versioned public libraries makes dependency scanning fail into the explicit WPE
+runtime fallback instead of ignoring that error. This is not a completeness
+check for arbitrary supplied hosts: `dpkg-shlibdeps` retains its own exceptions
+for unversioned, no-SONAME and private libraries, while the conservative
+fallback lists the known WPE stack without inferring versions or custom-library
+packages. A package without the staged host does not claim to contain
+web-surface support. The current Flatpak recipe is intentionally no-web: it
+neither builds the engine-enabled host nor provides pinned WPE modules and
+runtime dependencies for one.

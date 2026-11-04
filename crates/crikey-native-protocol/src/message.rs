@@ -631,7 +631,9 @@ impl DecodeWithBudget for Envelope {
                 29 => value.payload = Some(Payload::Lifecycle(nested(field, budget)?)),
                 30 => value.payload = Some(Payload::LifecycleAck(nested(field, budget)?)),
                 31 => value.payload = Some(Payload::PageRequest(nested(field, budget)?)),
-                32 => value.payload = Some(Payload::PageFrame(nested(field, budget)?)),
+                // PageFrame carries the plugin's web declaration, so merge
+                // both its envelope occurrences and its nested `web` fields.
+                32 => merge_web_payload!(&mut value.payload, PageFrame, field, budget),
                 33 => merge_web_payload!(&mut value.payload, OpenSurface, field, budget),
                 34 => merge_web_payload!(&mut value.payload, RawInput, field, budget),
                 35 => merge_web_payload!(&mut value.payload, ImeEvent, field, budget),

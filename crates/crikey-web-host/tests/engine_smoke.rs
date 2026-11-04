@@ -1,9 +1,11 @@
 #![cfg(all(feature = "engine", target_os = "linux"))]
 
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -11,8 +13,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crikey_native_protocol::message::{
-    CloseSurface, Envelope, Gone, Navigate, OpenSurface, Payload, RawInput, Resize, WebFrame, WebGoneCode,
-    WebInputCode, WebLoadCode, WebStorageMode,
+    CloseSurface, Envelope, Gone, ImeEvent, Navigate, OpenSurface, Payload, RawInput, Resize, WebFrame,
+    WebGoneCode, WebImeCode, WebInputCode, WebLoadCode, WebStorageMode,
 };
 use crikey_native_protocol::{frame, Endpoint, Message, ProtocolError};
 
@@ -66,6 +68,10 @@ struct Host {
 
 impl Host {
     fn start() -> Self {
+        Self::start_with_storage(None)
+    }
+
+    fn start_with_storage(storage_dir: Option<&Path>) -> Self {
         let socket = PathBuf::from(format!(
             "/tmp/crikey-web-smoke-{}-{}.sock",
             std::process::id(),
@@ -86,6 +92,8 @@ impl Host {
                 Command::new(env!("CARGO_BIN_EXE_crikey-web-host"))
                     .arg("--endpoint")
                     .arg(Endpoint::UnixSocket(socket.clone()).to_spec())
+                    .arg("--storage-dir")
+                    .arg(storage_dir.map_or_else(|| private_dir.join("profile"), Path::to_path_buf))
                     .stdin(Stdio::null())
                     .env("XDG_CONFIG_HOME", &private_dir)
                     .env("HOME", &private_dir)
@@ -128,12 +136,16 @@ impl Host {
     }
 
     fn open(&mut self, url: String) {
+        self.open_with_storage(url, WebStorageMode::Ephemeral);
+    }
+
+    fn open_with_storage(&mut self, url: String, storage_mode: WebStorageMode) {
         self.send(Payload::OpenSurface(OpenSurface {
             surface_id: SURFACE_ID,
             pixel_width: 320,
             pixel_height: 200,
             url,
-            storage_mode: WebStorageMode::Ephemeral,
+            storage_mode,
             ..OpenSurface::default()
         }));
     }
@@ -284,12 +296,16 @@ impl HttpFixture {
                 // center pixel observes script-driven state changes.
                 let body = match path.as_str() {
                     "/second" => "<!doctype html><style>html,body{margin:0;background:#654321}</style><title>Second</title>",
+                    // Let Content-Disposition start the download only after
+                    // the server has received /download. A `download` attribute
+                    // lets WebKit cancel before any HTTP request is dispatched.
                     "/download-test" => concat!(
                         "<!doctype html><style>html,body{margin:0;min-height:100vh;background:#111111}</style>",
-                        "<a id=d href='/download' download>download</a><script>d.click();",
+                        "<a id=d href='/download'>download</a><script>d.click();",
                         "setTimeout(()=>document.body.style.background='#123456',1000)</script>"
                     ),
                     "/download" => "attachment contents",
+                    "/unsupported" => "not a supported document",
                     "/wheel" => concat!(
                         "<!doctype html><style>html,body{margin:0;min-height:100vh;background:#111111}</style>",
                         "<script>let n=0;addEventListener('wheel',e=>{n++;",
@@ -303,6 +319,32 @@ impl HttpFixture {
                         "setTimeout(()=>document.body.style.background=escaped?'#ff0000':'#123456',1000)</script>",
                         "<iframe hidden src=\"data:text/html,<script>parent.postMessage('escaped','*')</script>\"></iframe>"
                     ),
+                    "/storage/set" => concat!(
+                        "<!doctype html><style>html,body{margin:0;min-height:100vh;background:#111111}</style>",
+                        "<script>localStorage.setItem('persisted','yes');",
+                        "setTimeout(()=>{let ok=document.cookie.includes('persisted=yes')",
+                        "&&document.cookie.includes('session_only=yes');",
+                        "document.body.style.background=ok?'#123456':'#ff0000'},1000)</script>"
+                    ),
+                    "/storage/read" => concat!(
+                        "<!doctype html><style>html,body{margin:0;min-height:100vh;background:#111111}</style>",
+                        "<script>addEventListener('load',()=>{let ok=document.cookie.includes('persisted=yes')",
+                        "&&!document.cookie.includes('session_only=')&&localStorage.getItem('persisted')==='yes';",
+                        "document.body.style.background=ok?'#123456':'#ff0000'})</script>"
+                    ),
+                    "/storage/empty" => concat!(
+                        "<!doctype html><style>html,body{margin:0;min-height:100vh;background:#111111}</style>",
+                        "<script>addEventListener('load',()=>document.body.style.background=",
+                        "document.cookie===''&&localStorage.length===0?'#123456':'#ff0000')</script>"
+                    ),
+                    "/ime" => concat!(
+                        "<!doctype html><meta charset=utf-8>",
+                        "<style>html,body{margin:0;min-height:100vh;background:#222222}</style><input id=i>",
+                        "<script>i.addEventListener('input',()=>requestAnimationFrame(()=>{",
+                        "if(i.value==='😀中')document.body.style.background=i.selectionStart===3?'#123456':'#ff0000';",
+                        "else if(i.value==='確定')document.body.style.background='#654321'}));",
+                        "i.focus();requestAnimationFrame(()=>document.body.style.background='#111111')</script>"
+                    ),
                     _ => "<!doctype html><style>html,body{margin:0;background:#123456}</style><title>CriKey smoke</title>",
                 };
                 let disposition = if path == "/download" {
@@ -310,12 +352,24 @@ impl HttpFixture {
                 } else {
                     ""
                 };
+                let cookies = if path == "/storage/set" {
+                    "Set-Cookie: persisted=yes; Max-Age=86400; Path=/\r\n\
+                     Set-Cookie: session_only=yes; Path=/\r\n"
+                } else {
+                    ""
+                };
+                let content_type = if path == "/unsupported" {
+                    "application/x-crikey-unsupported"
+                } else {
+                    "text/html; charset=utf-8"
+                };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{disposition}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(), body
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{disposition}{cookies}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
                 );
                 // Cancellation is an expected action in the navigation test.
                 let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
             }
         });
         Self {
@@ -461,5 +515,182 @@ fn line_wheel_and_precise_pixel_scroll_reach_the_engine_distinctly() {
         }));
         host.painted((320, 200), expected);
     }
+    host.close();
+}
+
+#[test]
+fn persistent_cookies_and_local_storage_survive_reopen_but_not_profile_boundaries() {
+    let fixture = HttpFixture::start();
+    let mut original = Host::start();
+    let profile = original.private_dir.join("profile");
+    original.open_with_storage(format!("{}/storage/set", fixture.url), WebStorageMode::Persistent);
+    original.painted((320, 200), [0x12, 0x34, 0x56, 0xff]);
+    original.close();
+
+    let mut reopened = Host::start_with_storage(Some(&profile));
+    reopened.open_with_storage(
+        format!("{}/storage/read", fixture.url),
+        WebStorageMode::Persistent,
+    );
+    reopened.painted((320, 200), [0x12, 0x34, 0x56, 0xff]);
+    reopened.close();
+
+    // The same configured directory must be ignored for an ephemeral request.
+    let mut ephemeral = Host::start_with_storage(Some(&profile));
+    ephemeral.open(format!("{}/storage/empty", fixture.url));
+    ephemeral.painted((320, 200), [0x12, 0x34, 0x56, 0xff]);
+    ephemeral.close();
+
+    // A different plugin profile on the same origin must not inherit the data.
+    let mut isolated = Host::start();
+    isolated.open_with_storage(
+        format!("{}/storage/empty", fixture.url),
+        WebStorageMode::Persistent,
+    );
+    isolated.painted((320, 200), [0x12, 0x34, 0x56, 0xff]);
+    isolated.close();
+}
+
+#[test]
+fn ephemeral_cookie_and_local_storage_state_is_discarded_on_close() {
+    let fixture = HttpFixture::start();
+    let mut original = Host::start();
+    let profile = original.private_dir.join("profile");
+    original.open(format!("{}/storage/set", fixture.url));
+    original.painted((320, 200), [0x12, 0x34, 0x56, 0xff]);
+    original.close();
+    assert!(
+        !profile.exists(),
+        "an ephemeral surface must not create its configured profile"
+    );
+
+    let mut reopened = Host::start_with_storage(Some(&profile));
+    reopened.open(format!("{}/storage/empty", fixture.url));
+    reopened.painted((320, 200), [0x12, 0x34, 0x56, 0xff]);
+    reopened.close();
+}
+
+#[test]
+fn supplementary_preedit_uses_utf16_engine_offsets_and_commits_expected_text() {
+    let fixture = HttpFixture::start();
+    let mut host = Host::start();
+    host.open(format!("{}/ime", fixture.url));
+    host.painted((320, 200), [0x11, 0x11, 0x11, 0xff]);
+    host.send(Payload::ImeEvent(ImeEvent {
+        surface_id: SURFACE_ID,
+        kind: WebImeCode::Preedit,
+        text: "😀中".to_owned(),
+        has_cursor: true,
+        cursor_begin_chars: 2,
+        cursor_end_chars: 2,
+        ..ImeEvent::default()
+    }));
+    host.painted((320, 200), [0x12, 0x34, 0x56, 0xff]);
+    host.send(Payload::ImeEvent(ImeEvent {
+        surface_id: SURFACE_ID,
+        kind: WebImeCode::Commit,
+        text: "確定".to_owned(),
+        ..ImeEvent::default()
+    }));
+    host.painted((320, 200), [0x65, 0x43, 0x21, 0xff]);
+    host.close();
+}
+
+#[test]
+fn malformed_open_urls_are_protocol_failures_before_engine_startup() {
+    for url in [
+        "https://user@/".to_owned(),
+        "https://:443/".to_owned(),
+        "https://[]/".to_owned(),
+        format!("https://example.test/{}", "a".repeat(8192)),
+    ] {
+        let mut host = Host::start();
+        host.open(url);
+        assert_eq!(host.terminal().reason, WebGoneCode::ProtocolViolation);
+        assert!(!host.child.wait_bounded(Duration::from_secs(5)).success());
+        assert!(matches!(
+            host.reader.read_frame(&mut host.stream, &mut Vec::new()),
+            Err(ProtocolError::Closed)
+        ));
+    }
+}
+
+#[test]
+fn non_utf8_profile_is_refused_for_persistence_but_unused_for_ephemeral_storage() {
+    let fixture = HttpFixture::start();
+    let mut bytes = format!(
+        "/tmp/crikey-web-encoding-{}-{}-",
+        std::process::id(),
+        NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+    )
+    .into_bytes();
+    bytes.push(0xff);
+    let profile = PathBuf::from(OsString::from_vec(bytes));
+    let mut ephemeral = Host::start_with_storage(Some(&profile));
+    ephemeral.open(format!("{}/", fixture.url));
+    ephemeral.painted((320, 200), [0x12, 0x34, 0x56, 0xff]);
+    ephemeral.close();
+
+    let mut persistent = Host::start_with_storage(Some(&profile));
+    persistent.open_with_storage(format!("{}/", fixture.url), WebStorageMode::Persistent);
+    let gone = persistent.terminal();
+    assert_eq!(gone.reason, WebGoneCode::StartupFailed);
+    assert!(gone.detail.contains("UTF-8"), "{}", gone.detail);
+    assert!(!persistent.child.wait_bounded(Duration::from_secs(5)).success());
+    assert!(
+        !profile.exists(),
+        "an unusable persistent profile must not be created"
+    );
+    assert!(matches!(
+        persistent
+            .reader
+            .read_frame(&mut persistent.stream, &mut Vec::new()),
+        Err(ProtocolError::Closed)
+    ));
+}
+
+#[test]
+fn unsupported_document_response_preserves_surface_for_next_navigation() {
+    let fixture = HttpFixture::start();
+    let mut host = Host::start();
+    host.open(format!("{}/unsupported", fixture.url));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut finished = false;
+    let mut last_load = None;
+    let mut last_frame = None;
+    let mut load_states = Vec::new();
+    while !finished {
+        match host.receive(deadline).unwrap_or_else(|| {
+            panic!(
+                "unsupported document deadline: finished={finished}, \
+                 load sequence={load_states:?}, last load={last_load:?}, \
+                 last frame={last_frame:?}, requests={:?}",
+                fixture.requests.try_iter().collect::<Vec<_>>()
+            )
+        }) {
+            Payload::LoadState(state) => {
+                assert_ne!(state.state, WebLoadCode::Failed, "{}", state.failure);
+                // An ignored MIME response need not commit its pending URI.
+                // Wait for its native completion, then prove the view is usable
+                // by navigating to and painting an actual supported document.
+                finished |= state.state == WebLoadCode::Finished;
+                load_states.push(state.state);
+                last_load = Some(state);
+            }
+            Payload::WebFrame(frame) => {
+                frame.validate().unwrap();
+                last_frame = Some((frame.pixel_width, frame.pixel_height, frame.generation));
+            }
+            Payload::Gone(gone) => panic!("unsupported response closed its surface: {}", gone.detail),
+            _ => {}
+        }
+    }
+    fixture.requested("/unsupported");
+    host.send(Payload::Navigate(Navigate {
+        surface_id: SURFACE_ID,
+        url: format!("{}/second", fixture.url),
+        ..Navigate::default()
+    }));
+    host.painted((320, 200), [0x65, 0x43, 0x21, 0xff]);
     host.close();
 }

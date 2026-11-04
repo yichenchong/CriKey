@@ -42,7 +42,8 @@ G_DECLARE_FINAL_TYPE(CkIm, ck_im, CK, IM, WebKitInputMethodContext)
 struct _CkIm {
     WebKitInputMethodContext parent;
     char *preedit;         /* owned, never NULL after construction */
-    guint cursor_chars;    /* CHARACTER offset into `preedit`, already clamped */
+    guint cursor_utf16;    /* WebKit EditingRange uses UTF-16 code units */
+    guint length_utf16;
     ck_web_callbacks callbacks;
 };
 G_DEFINE_TYPE(CkIm, ck_im, WEBKIT_TYPE_INPUT_METHOD_CONTEXT)
@@ -58,10 +59,10 @@ static void ck_im_get_preedit(WebKitInputMethodContext *context, gchar **text,
         *underlines = NULL;
         if (*preedit)
             *underlines = g_list_prepend(NULL,
-                webkit_input_method_underline_new(0, g_utf8_strlen(preedit, -1)));
+                webkit_input_method_underline_new(0, self->length_utf16));
     }
     if (cursor_offset)
-        *cursor_offset = self->cursor_chars;
+        *cursor_offset = self->cursor_utf16;
 }
 
 static void ck_im_notify_cursor_area(WebKitInputMethodContext *context, int x, int y,
@@ -103,7 +104,8 @@ static void ck_im_reset(WebKitInputMethodContext *context)
     CkIm *self = CK_IM(context);
     g_free(self->preedit);
     self->preedit = g_strdup("");
-    self->cursor_chars = 0;
+    self->cursor_utf16 = 0;
+    self->length_utf16 = 0;
 }
 
 static void ck_im_finalize(GObject *object)
@@ -126,7 +128,8 @@ static void ck_im_class_init(CkImClass *klass)
 static void ck_im_init(CkIm *self)
 {
     self->preedit = g_strdup("");
-    self->cursor_chars = 0;
+    self->cursor_utf16 = 0;
+    self->length_utf16 = 0;
 }
 
 /* ------------------------------------------------------------------ *
@@ -210,15 +213,20 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
                                   title ? title : "");
 }
 
-static gboolean on_load_failed(WebKitWebView *view, WebKitLoadEvent event, gchar *uri,
+/* Link-visible for native-boundary tests of the actual signal callback. This
+ * is not an additional entry point in the public embedding header. */
+gboolean ck_web_on_load_failed(WebKitWebView *view, WebKitLoadEvent event, gchar *uri,
                                GError *error, gpointer data)
 {
     ck_web_surface *surface = data;
     (void)event;
+    (void)view;
     /* A replacement navigation cancels the previous one. Reporting that as a
      * page failure makes an ordinary Navigate kill the surface in the launcher. */
     if (error &&
         (g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED) ||
+         /* Media documents intentionally replace their preliminary load. */
+         g_error_matches(error, WEBKIT_MEDIA_ERROR, WEBKIT_MEDIA_ERROR_WILL_HANDLE_LOAD) ||
          g_error_matches(error, WEBKIT_POLICY_ERROR,
                          WEBKIT_POLICY_ERROR_FRAME_LOAD_INTERRUPTED_BY_POLICY_CHANGE)))
         return TRUE;
@@ -227,8 +235,8 @@ static gboolean on_load_failed(WebKitWebView *view, WebKitLoadEvent event, gchar
         surface->callbacks.load_state(surface->callbacks.user, CK_WEB_LOAD_FAILED,
                                       uri ? uri : "",
                                       (error && error->message) ? error->message : "load failed",
-                                      webkit_web_view_can_go_back(view) ? 1 : 0,
-                                      webkit_web_view_can_go_forward(view) ? 1 : 0, "");
+                                      webkit_web_view_can_go_back(surface->view) ? 1 : 0,
+                                      webkit_web_view_can_go_forward(surface->view) ? 1 : 0, "");
     /* TRUE: the failure has been reported to the launcher, which owns the
      * in-place error panel. Letting the engine load its own error page would
      * paint a second, unstyled one underneath. */
@@ -328,6 +336,14 @@ ck_web_surface *ck_web_surface_new(uint32_t width, uint32_t height, int32_t stor
         char *cache = g_build_filename(storage_dir, "cache", NULL);
         char *data = g_build_filename(storage_dir, "data", NULL);
         surface->session = webkit_network_session_new(data, cache);
+        /* A persistent website-data manager does not persist cookies by
+         * default. Keep only non-session cookies, inside this plugin's
+         * explicitly approved profile, never WebKit's shared default path. */
+        char *cookies = g_build_filename(storage_dir, "cookies.sqlite", NULL);
+        webkit_cookie_manager_set_persistent_storage(
+            webkit_network_session_get_cookie_manager(surface->session), cookies,
+            WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+        g_free(cookies);
         g_free(cache);
         g_free(data);
     } else {
@@ -350,7 +366,7 @@ ck_web_surface *ck_web_surface_new(uint32_t width, uint32_t height, int32_t stor
                                              WEBKIT_INPUT_METHOD_CONTEXT(surface->im));
 
     g_signal_connect(surface->view, "load-changed", G_CALLBACK(on_load_changed), surface);
-    g_signal_connect(surface->view, "load-failed", G_CALLBACK(on_load_failed), surface);
+    g_signal_connect(surface->view, "load-failed", G_CALLBACK(ck_web_on_load_failed), surface);
     g_signal_connect(surface->view, "web-process-terminated",
                      G_CALLBACK(on_web_process_terminated), surface);
     g_signal_connect(surface->view, "close", G_CALLBACK(on_close), surface);
@@ -497,12 +513,19 @@ void ck_web_surface_set_preedit(ck_web_surface *surface, const char *text, uint3
     const char *value = text ? text : "";
     g_free(surface->im->preedit);
     surface->im->preedit = g_strdup(value);
-    /* Clamp here as well as in Rust. `get_preedit` handing WebKit a cursor
-     * past the end of the string is a defect in the engine's arithmetic, not
-     * an error it reports, so the last line of defence belongs next to the
-     * field being read. */
-    glong length = g_utf8_strlen(value, -1);
-    surface->im->cursor_chars = cursor_chars > (guint)length ? (guint)length : cursor_chars;
+    /* The wire cursor counts Unicode scalar values. WebKit's GLib filter
+     * passes get_preedit offsets straight to UTF-16 EditingRange and
+     * CompositionUnderline, so supplementary characters occupy two units.
+     * Compute both offsets once without allocating a second text buffer. */
+    guint characters = 0;
+    surface->im->cursor_utf16 = 0;
+    surface->im->length_utf16 = 0;
+    for (const char *at = value; *at; at = g_utf8_next_char(at)) {
+        guint units = g_utf8_get_char(at) > 0xffff ? 2 : 1;
+        surface->im->length_utf16 += units;
+        if (characters++ < cursor_chars)
+            surface->im->cursor_utf16 += units;
+    }
 }
 
 void ck_web_surface_preedit_started(ck_web_surface *surface)

@@ -2673,12 +2673,25 @@ signal its numeric PID or process group again. Teardown shall remain bounded
 and reap the root. Frames from a closed surface, a different surface identifier,
 or an older surface generation shall be discarded.
 
+These teardown guarantees require the launcher supervisor to remain alive.
+They shall not be described as whole-tree cleanup after an abrupt launcher
+crash or SIGKILL: the root's parent-death signal does not cover detached
+descendants. The cgroup memory ceiling remains enforced, but v1 has no
+independent reaper for this launcher-death case.
+
 A web surface with a stated address requires the plugin's
 `permissions.network` grant. Persistent cookies and local storage require the
 independent `permissions.web-storage` grant; network permission does not imply
 persistence. Ephemeral storage shall be discarded when the page closes.
 Permission and platform checks shall complete before any engine process is
 spawned.
+
+On Linux the persistent profile directory shall be representable as UTF-8,
+as required by WPE's storage APIs. A persistent opening with a non-UTF-8
+directory shall fail before engine initialization rather than substitute
+another profile path. Native-byte CLI path parsing shall not be described as
+support for non-UTF-8 persistent WPE profiles; an ephemeral opening shall not
+be rejected merely because an unused configured storage directory is non-UTF-8.
 
 The current declaration API is exposed by the native/Rust SDK, not the Python
 SDK. Plugin page declarations and the private web-host transport remain
@@ -2739,10 +2752,12 @@ remain binding even when the web host uses a different cgroup parent. An
 effective value below 256 MiB shall refuse a web surface rather than start an
 engine expected to exceed it.
 
-Before executing the web host, the launcher shall search existing eligible
-proper ancestors within its writable delegated cgroup-v2 hierarchy, without leaving
-the discovered cgroup-v2 mount, for a suitable parent whose
-`cgroup.subtree_control` already enables `memory` for children. The parent's
+Before executing the web host, the launcher shall consider safely resolved
+cgroup-v2 mount views, including writable delegated bind mounts. It shall
+search existing eligible proper ancestors within each view, never leaving that
+mount, for a suitable parent whose `cgroup.subtree_control` already enables
+`memory` for children. Inherited memory limits visible through any safe view
+shall remain binding even when another view supplies the writable parent. The parent's
 `cgroup.procs` shall be writable to satisfy the kernel's common-ancestor
 migration permission check. The launcher's own cgroup shall never be selected.
 A candidate parent shall contain no processes unless it is the visible mount

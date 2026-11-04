@@ -2738,6 +2738,116 @@ fn replacing_a_web_surface_retires_pointer_capture_and_the_previous_texture() {
 }
 
 #[test]
+fn web_escape_preserves_earlier_input_and_retires_the_rest_of_the_batch() {
+    for multiple_passes in [false, true] {
+        let context = create_launcher_context();
+        if multiple_passes {
+            force_three_layout_passes(&context, false);
+        }
+        let view = painted_web_view(41, 1, &[10; 8]);
+        let frame = build_launcher_frame(
+            &context,
+            launcher_input(vec![
+                egui::Event::Text("before".to_owned()),
+                key_press(egui::Key::Escape, egui::Modifiers::CTRL),
+                egui::Event::Text("after".to_owned()),
+                key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            ]),
+            &view,
+        );
+        let effects: Vec<_> = frame
+            .commands
+            .into_iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    UiCommand::WebInput(_) | UiCommand::WebIme(_) | UiCommand::ClosePage
+                )
+            })
+            .collect();
+        assert_eq!(
+            effects,
+            vec![
+                UiCommand::WebIme(WebImeEvent::Commit {
+                    surface_id: 41,
+                    text: "before".to_owned()
+                }),
+                UiCommand::ClosePage,
+            ],
+            "input order must not deliver any document work after teardown"
+        );
+    }
+}
+
+#[test]
+fn an_unadmitted_web_declaration_still_answers_host_escape() {
+    let context = create_launcher_context();
+    let mut view = painted_web_view(41, 1, &[10; 8]);
+    let page = view.page.as_mut().expect("page");
+    page.web_surface_id = None;
+    page.web_frame = None;
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![key_press(egui::Key::Escape, egui::Modifiers::NONE)]),
+        &view,
+    );
+    assert_eq!(
+        frame
+            .commands
+            .iter()
+            .filter(|command| matches!(command, UiCommand::ClosePage))
+            .count(),
+        1
+    );
+    assert!(web_inputs(&frame).is_empty());
+}
+
+#[test]
+fn the_first_web_wheel_uses_the_previous_position_not_a_later_motion() {
+    for prior_chrome_position in [false, true] {
+        let context = create_launcher_context();
+        let view = painted_web_view(41, 1, &[10; 8]);
+        // Another context measures geometry without priming this context's
+        // document pointer state.
+        let measured = build_launcher_frame(&create_launcher_context(), launcher_input(Vec::new()), &view);
+        let inside = web_document_rect(&measured).center();
+        if prior_chrome_position {
+            let _ = build_launcher_frame(
+                &context,
+                launcher_input(vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))]),
+                &model(""),
+            );
+        }
+        force_three_layout_passes(&context, false);
+        let frame = build_launcher_frame(
+            &context,
+            launcher_input(vec![
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 1.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(inside),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 2.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            &view,
+        );
+        let scrolls: Vec<_> = web_inputs(&frame)
+            .into_iter()
+            .filter(|input| matches!(input, WebSurfaceInput::Scroll { .. }))
+            .collect();
+        assert!(
+            matches!(scrolls.as_slice(), [WebSurfaceInput::Scroll { delta_y: 2.0, .. }]),
+            "the first wheel was aimed at chrome or had no known pointer position: {scrolls:?}"
+        );
+    }
+}
+
+#[test]
 fn web_named_keys_and_text_reach_the_engine_but_escape_and_chrome_shortcuts_do_not_leak() {
     let context = create_launcher_context();
     let view = painted_web_view(41, 1, &[10; 8]);
@@ -2893,4 +3003,68 @@ fn returning_from_web_to_a_display_list_releases_only_the_engine_texture() {
         .commands
         .iter()
         .any(|command| matches!(command, UiCommand::WebInput(_) | UiCommand::WebIme(_))));
+}
+
+#[test]
+fn admission_uses_pointer_motion_from_pending_frames_for_the_first_stationary_wheel() {
+    for had_previous_surface in [false, true] {
+        for enters_document in [false, true] {
+            let context = create_launcher_context();
+            let previous_view = painted_web_view(41, 1, &[10; 8]);
+            let measured = build_launcher_frame(
+                &create_launcher_context(),
+                launcher_input(Vec::new()),
+                &previous_view,
+            );
+            let inside = web_document_rect(&measured).center();
+            let chrome = egui::pos2(1.0, 1.0);
+            let (before, pending_position) = if enters_document {
+                (chrome, inside)
+            } else {
+                (inside, chrome)
+            };
+            let initial = if had_previous_surface {
+                previous_view
+            } else {
+                model("")
+            };
+            let _ = build_launcher_frame(
+                &context,
+                launcher_input(vec![egui::Event::PointerMoved(before)]),
+                &initial,
+            );
+            let mut pending = painted_web_view(42, 1, &[10; 8]);
+            let page = pending.page.as_mut().expect("pending page");
+            page.web_surface_id = None;
+            page.web_frame = None;
+            page.web_generation = 0;
+            let _ = build_launcher_frame(
+                &context,
+                launcher_input(vec![egui::Event::PointerMoved(pending_position)]),
+                &pending,
+            );
+            let admitted = build_launcher_frame(
+                &context,
+                launcher_input(vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 3.0),
+                    modifiers: egui::Modifiers::NONE,
+                }]),
+                &painted_web_view(42, 1, &[10; 8]),
+            );
+            let scrolls: Vec<_> = web_inputs(&admitted)
+                .into_iter()
+                .filter(|input| matches!(input, WebSurfaceInput::Scroll { .. }))
+                .collect();
+            assert_eq!(scrolls.len(), usize::from(enters_document),
+                "admission must use the pending frame's real final pointer, not its initial seed or predecessor state");
+            if enters_document {
+                assert!(
+                    matches!(scrolls.as_slice(), [WebSurfaceInput::Scroll { surface_id: 42, delta_y: 3.0, x, y, .. }]
+                    if (*x - (inside.x - web_document_rect(&admitted).min.x)).abs() < 0.1
+                        && (*y - (inside.y - web_document_rect(&admitted).min.y)).abs() < 0.1)
+                );
+            }
+        }
+    }
 }
