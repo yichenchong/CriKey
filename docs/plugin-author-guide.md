@@ -308,6 +308,13 @@ denied declaration cannot briefly start WebKit. Do not use `file:`, `data:` or
 `javascript:` URLs; `WebSurfaceBuilder::build` rejects them before serving the
 frame.
 
+On Linux, the host-selected persistent profile directory must be representable
+as UTF-8 because WPE's storage APIs take UTF-8 paths. A non-UTF-8 directory
+closes a persistent page with a startup diagnostic instead of substituting a
+different profile path. The host CLI preserves native path bytes, but that
+does not make such a path usable for persistent WPE storage. Ephemeral pages
+do not use that directory and are unaffected.
+
 The first frame must name an address. Later frames may use
 `WebSurfaceBuilder::stay`, whose empty URL preserves the document's current
 navigation. Do not infer that the host accepted your first frame just because
@@ -369,8 +376,11 @@ launcher running.
 On Linux web startup requires a writable delegated cgroup-v2 hierarchy with a
 suitable existing ancestor whose `cgroup.subtree_control` already enables
 `memory` for children and whose `cgroup.procs` is writable for the kernel's
-common-ancestor migration permission check. The launcher searches only proper
-ancestors within the delegation's cgroup-v2 mount, never its own cgroup.
+common-ancestor migration permission check. The launcher considers safely
+resolved cgroup-v2 mount views, including writable delegated bind mounts,
+searching only proper ancestors within each view, never its own cgroup.
+Inherited memory limits visible through any safe view remain binding when
+another view supplies the writable parent.
 Candidate parents must contain no processes, except at the visible mount root;
 that exception still requires the enabled memory controller and every private
 leaf control. CriKey creates a private web-host leaf there, separate from the
@@ -406,6 +416,12 @@ there is no fallback that scans procfs or kills remembered descendant PIDs.
 Graceful process-group SIGTERM is limited to the original root's unreaped
 lifetime. After the root is reaped, cleanup uses the cgroup rather than its
 potentially reused numeric PID or process group.
+
+Whole-tree cleanup depends on the launcher supervisor remaining alive to write
+`cgroup.kill`. After an abrupt launcher crash or SIGKILL, the parent-death
+signal targets only the web-host root; it does not guarantee termination of
+detached descendants. The cgroup memory ceiling remains enforced, but v1 has
+no independent reaper that guarantees whole-tree cleanup after launcher death.
 
 The implemented input route forwards pointer, direct key press and release,
 focus, resize, IME preedit and IME commit events to the Linux host; Tab is a web

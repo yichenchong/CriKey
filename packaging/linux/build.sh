@@ -566,13 +566,20 @@ debian_shared_library_depends() {
 		"$work/usr/lib/crikey/crikey-wasm-host"
 		"$work/usr/lib/crikey/crikey-cabi-host"
 	)
+	# Missing metadata for versioned public engine libraries must trigger
+	# deb()'s explicit WPE fallback. Keep dpkg-shlibdeps' own private-library
+	# and unversioned/absent-SONAME exceptions; this is not host validation.
+	local -a scanner_options=(-O)
+	if [[ $with_web_surface != yes ]]; then
+		scanner_options+=(--ignore-missing-info)
+	fi
 	if [[ -x "$work/usr/lib/crikey/crikey-web-host" ]]; then
 		executables+=("$work/usr/lib/crikey/crikey-web-host")
 	fi
 	scratch="$(mktemp -d)"
 	mkdir -p "$scratch/debian"
 	printf 'Source: crikey\n\nPackage: crikey\nArchitecture: any\n' >"$scratch/debian/control"
-	if ! computed="$(cd "$scratch" && dpkg-shlibdeps -O --ignore-missing-info \
+	if ! computed="$(cd "$scratch" && dpkg-shlibdeps "${scanner_options[@]}" \
 		"${executables[@]}" 2>/dev/null)"; then
 		computed=""
 	fi

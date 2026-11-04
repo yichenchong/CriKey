@@ -3,11 +3,14 @@
 //! The transport and WPE adapter are intentionally dumb consumers of the
 //! actions produced here. All untrusted wire fields are validated before an
 //! engine call can observe them.
+//! URL policy is shared with plugin page validation: direct wire commands
+//! cannot bypass its host requirement or byte limit.
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use crikey_core::validate_web_surface_url;
 use crikey_native_protocol::message::{
     Envelope, ImeEvent, OpenSurface, Payload, WebImeCode, WebStorageMode, MAX_WEB_FRAME_BYTES,
     MAX_WEB_FRAME_EDGE,
@@ -222,19 +225,14 @@ fn validate_url(url: &str) -> Result<(), StateError> {
     if url.chars().any(char::is_control) {
         return Err(StateError::UrlControlCharacter);
     }
-    let Some((scheme, remainder)) = url.split_once(':') else {
-        return Err(StateError::InvalidUrl);
-    };
-    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-        || !remainder.starts_with("//")
-    {
-        return Err(StateError::InvalidUrl);
-    }
-    let authority = remainder[2..].split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.is_empty() || authority.chars().any(char::is_whitespace) {
+    // The core diagnostic owns the refused scheme string, which this boundary
+    // would immediately discard. Reject it here without allocating.
+    if !url.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    }) {
         return Err(StateError::InvalidUrl);
     }
-    Ok(())
+    validate_web_surface_url(url).map_err(|_| StateError::InvalidUrl)
 }
 
 fn validate_ime(event: &ImeEvent) -> Result<(), StateError> {
@@ -539,6 +537,87 @@ mod tests {
             validate_url("https://example.test/\n"),
             Err(StateError::UrlControlCharacter)
         );
+        assert_eq!(
+            validate_url("file:///tmp/page\n"),
+            Err(StateError::UrlControlCharacter),
+            "control-character diagnostics take precedence even for refused schemes"
+        );
         assert_eq!(validate_url("HTTPS://example.test/path?q=1#fragment"), Ok(()));
+    }
+
+    fn assert_url_is_rejected_before_open_and_navigation(url: &str) {
+        let mut state = HostState::new(None).unwrap();
+        let Payload::OpenSurface(mut request) = open(7).payload.unwrap() else {
+            unreachable!()
+        };
+        request.url = url.to_owned();
+        assert_eq!(
+            state.receive(envelope(Payload::OpenSurface(request))),
+            Err(StateError::InvalidUrl),
+            "OpenSurface accepted {url:?}"
+        );
+        assert_eq!(state.surface_id(), None);
+        state.receive(open(7)).unwrap();
+        assert_eq!(
+            state.receive(envelope(Payload::Navigate(Navigate {
+                surface_id: 7,
+                url: url.to_owned(),
+                ..Default::default()
+            }))),
+            Err(StateError::InvalidUrl),
+            "Navigate accepted {url:?}"
+        );
+        assert_eq!(state.surface_id(), Some(7));
+    }
+
+    #[test]
+    fn hostless_http_authorities_never_become_engine_actions() {
+        for url in [
+            "https://@/",
+            "https://user:secret@/",
+            "https://:443/",
+            "https://user@:443/",
+            "https://[]/",
+            "https://[]:443/",
+        ] {
+            assert_url_is_rejected_before_open_and_navigation(url);
+        }
+    }
+
+    #[test]
+    fn wire_urls_obey_the_same_byte_limit_as_plugin_page_urls() {
+        let prefix = "https://example.test/";
+        let mut url = format!("{prefix}{}", "x".repeat(8192 - prefix.len()));
+        assert_eq!(validate_url(&url), Ok(()));
+        url.push('x');
+        assert_url_is_rejected_before_open_and_navigation(&url);
+    }
+
+    #[test]
+    fn url_validation_preserves_browser_authority_forms() {
+        for url in [
+            "https://user:secret@example.test:443/path",
+            "https://[::1]:8443/",
+            "https://例子.测试/path",
+        ] {
+            let mut state = HostState::new(None).unwrap();
+            let Payload::OpenSurface(mut request) = open(7).payload.unwrap() else {
+                unreachable!()
+            };
+            request.url = url.to_owned();
+            let HostAction::Open(spec) = state.receive(envelope(Payload::OpenSurface(request))).unwrap()
+            else {
+                panic!("valid URL must open the surface");
+            };
+            assert_eq!(spec.url, url);
+            assert_eq!(
+                state.receive(envelope(Payload::Navigate(Navigate {
+                    surface_id: 7,
+                    url: url.to_owned(),
+                    ..Default::default()
+                }))),
+                Ok(HostAction::Navigate(url.to_owned()))
+            );
+        }
     }
 }

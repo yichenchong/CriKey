@@ -467,6 +467,17 @@ check "JSON-escaped Cargo target paths stage the actual binaries" \
 cat >"$recording_tools/dpkg-shlibdeps" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >"${CRIKEY_TEST_SHLIBDEPS_LOG:?}"
+if [[ ${CRIKEY_TEST_MISSING_SHLIBS_INFO:-} == 1 ]]; then
+	# Real dpkg-shlibdeps succeeds with incomplete output under this option.
+	# Without it, missing metadata must select build.sh's explicit fallback.
+	for argument in "$@"; do
+		if [[ $argument == --ignore-missing-info ]]; then
+			printf 'shlibs:Depends=libc6\n'
+			exit 0
+		fi
+	done
+	exit 2
+fi
 printf 'shlibs:Depends=libc6, libwpewebkit-2.0-1 (>= 2.48), libwpe-1.0-1, libwpebackend-fdo-1.0-1, libwayland-server0, libglib2.0-0\n'
 EOF
 chmod +x "$recording_tools/dpkg-shlibdeps"
@@ -485,6 +496,20 @@ for executable in crikey crikey-launcher crikey-wasm-host crikey-cabi-host crike
 done
 check "computed engine dependency versions reach the Debian control record" \
 	contains "libwpewebkit-2.0-1 (>= 2.48)" "$(dpkg-deb --field "$scanned_deb" Depends)"
+
+missing_info_out="$workspace/missing-shlibs-info"
+env PATH="$recording_tools:$PATH" \
+	CRIKEY_TEST_SHLIBDEPS_LOG="$workspace/missing-shlibs-info.log" \
+	CRIKEY_TEST_MISSING_SHLIBS_INFO=1 \
+	CRIKEY_PACKAGING_TEST_ALLOW_SCRIPT_WEB_HOST=1 \
+	"$build" --binary "$stand_in" --launcher-binary "$launcher_stand_in" \
+	--wasm-host-binary "$wasm_host_stand_in" --cabi-host-binary "$cabi_host_stand_in" \
+	--web-host-binary "$web_host_stand_in" --targets deb "$missing_info_out" >/dev/null
+missing_info_deb="$(find "$missing_info_out" -maxdepth 1 -name 'crikey_*.deb' -print -quit)"
+check "incomplete Debian library metadata cannot silently omit the engine runtime" \
+	bash -c 'for dependency in libwpewebkit-2.0-1 libwpe-1.0-1 libwpebackend-fdo-1.0-1 libwayland-server0 libglib2.0-0; do
+		printf "%s" "$1" | grep -q "$dependency" || exit 1
+	done' _ "$(dpkg-deb --field "$missing_info_deb" Depends)"
 
 relative_target="${in_tree_workspace#"$repository_root/"/}/relative-cargo-target"
 relative_target_out="$workspace/relative-target-out"

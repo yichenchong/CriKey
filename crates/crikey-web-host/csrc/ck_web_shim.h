@@ -85,9 +85,9 @@ void ck_web_cleanup(void);
  * Creates one web surface of the requested pixel size.
  *
  * `storage_dir` is used only when `storage_mode` is CK_WEB_STORAGE_PERSISTENT,
- * where it names a directory this surface may keep website data in; ephemeral
- * surfaces get a session that writes nothing to disk. Returns NULL if the
- * engine refused to produce a backend.
+ * where its UTF-8 path isolates website data and non-session cookies for later
+ * openings; ephemeral surfaces write no website data to disk. Returns NULL if
+ * the engine refused to produce a backend.
  */
 ck_web_surface *ck_web_surface_new(uint32_t width, uint32_t height, int32_t storage_mode,
                                    const char *storage_dir, const ck_web_callbacks *callbacks);
@@ -114,6 +114,8 @@ void ck_web_surface_focus(ck_web_surface *surface, int32_t focused);
  * correctness argument and it lives in `src/ime.rs`, which is testable without
  * an engine; this layer only does what it is told.
  */
+/* The incoming cursor counts Unicode scalar values; the shim converts it to
+ * the UTF-16 offsets consumed by WebKit's GLib input-method filter. */
 void ck_web_surface_set_preedit(ck_web_surface *surface, const char *text,
                                 uint32_t cursor_chars);
 void ck_web_surface_preedit_started(ck_web_surface *surface);

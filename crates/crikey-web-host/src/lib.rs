@@ -21,10 +21,11 @@
 //! They are therefore reachable with `--no-default-features`.
 //!
 //! The `engine` feature adds the half that cannot be tested without an engine:
-//! the C shim in `csrc/`, and the executable that drives it. The shim
-//! deliberately holds no policy. It creates a surface, dispatches what it is
-//! given and emits what the engine reports; every decision about *what* to
-//! dispatch, and in what order, is made above it by [`ime`] and [`frame`].
+//! the C shim in `csrc/`, and the executable that drives it. Rust owns protocol
+//! validation, input translation, frame conversion, and IME operation ordering.
+//! The shim creates the surface, dispatches those operations, and reports engine
+//! callbacks. It also enforces WebKit-specific navigation, download, and storage
+//! policy at the native APIs that expose those decisions.
 
 #[cfg(all(feature = "engine", target_os = "linux"))]
 pub mod engine;

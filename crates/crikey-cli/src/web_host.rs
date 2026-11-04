@@ -18,6 +18,8 @@ use std::os::fd::{AsRawFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(target_os = "linux")]
+use std::os::unix::fs::DirBuilderExt;
+#[cfg(all(target_os = "linux", test))]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
@@ -32,6 +34,9 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+use crate::create_private_dir;
 
 use crikey_core::{PluginId, WebStorage};
 use crikey_native_protocol::message::{
@@ -626,19 +631,8 @@ fn manager_loop(
         }
 
         if let Some(host) = active.as_mut() {
-            match host.runtime.process.try_wait() {
-                Ok(Some(status)) => {
-                    let surface_id = host.surface_id;
-                    publish_fatal(
-                        &mailbox,
-                        &desired_surface,
-                        &wake,
-                        surface_id,
-                        format!("web host exited unexpectedly ({status})"),
-                    );
-                    teardown(&mut active, "host exited");
-                    continue;
-                }
+            let exit_status = match host.runtime.process.try_wait() {
+                Ok(status) => status,
                 Err(error) => {
                     let surface_id = host.surface_id;
                     publish_fatal(
@@ -651,26 +645,35 @@ fn manager_loop(
                     teardown(&mut active, "process inspection failed");
                     continue;
                 }
-                Ok(None) => {}
-            }
+            };
 
+            // The host flushes Gone/load failures before exiting. Its process
+            // can already be reaped while complete messages remain buffered on
+            // the socket. Drain one envelope per manager turn before replacing
+            // that diagnostic with a generic exit status; ownership and shutdown
+            // are still checked between envelopes.
             match host.runtime.transport.recv() {
                 Ok(envelope) => {
                     if let Some(reason) = handle_incoming(envelope, host, &mailbox, &desired_surface, &wake) {
                         teardown(&mut active, &reason);
                     }
                 }
-                Err(ProtocolError::Timeout) => {}
+                Err(ProtocolError::Timeout) if exit_status.is_none() => {}
                 Err(error) => {
                     let surface_id = host.surface_id;
-                    publish_fatal(
-                        &mailbox,
-                        &desired_surface,
-                        &wake,
-                        surface_id,
-                        format!("web host connection failed: {error}"),
+                    let message = exit_status.map_or_else(
+                        || format!("web host connection failed: {error}"),
+                        |status| format!("web host exited unexpectedly ({status})"),
                     );
-                    teardown(&mut active, "connection failed");
+                    publish_fatal(&mailbox, &desired_surface, &wake, surface_id, message);
+                    teardown(
+                        &mut active,
+                        if exit_status.is_some() {
+                            "host exited"
+                        } else {
+                            "connection failed"
+                        },
+                    );
                 }
             }
         } else if !did_work {
@@ -1248,6 +1251,7 @@ fn executable_file(path: &Path) -> Option<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn persistent_storage_dir(root: &Path, plugin: &PluginId) -> Result<PathBuf, String> {
+    create_private_dir(root)?;
     let mut encoded = String::with_capacity(plugin.0.len() * 2);
     for byte in plugin.0.as_bytes() {
         let _ = write!(&mut encoded, "{byte:02x}");
@@ -1267,18 +1271,6 @@ fn persistent_storage_dir(root: &Path, plugin: &PluginId) -> Result<PathBuf, Str
 }
 
 #[cfg(target_os = "linux")]
-fn create_private_dir(path: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(path)
-        .map_err(|error| format!("cannot create private directory `{}`: {error}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|error| {
-        format!(
-            "cannot restrict private directory `{}` to this account: {error}",
-            path.display()
-        )
-    })
-}
-
-#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct PrivateEndpoint {
     directory: PathBuf,
@@ -1293,13 +1285,17 @@ impl PrivateEndpoint {
             let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
             let directory =
                 std::env::temp_dir().join(format!("crikey-web-{}-{sequence}", std::process::id()));
-            match std::fs::create_dir(&directory) {
+            match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
                 Ok(()) => {
-                    create_private_dir(&directory)?;
-                    return Ok(Self {
+                    let private = Self {
                         endpoint: Endpoint::UnixSocket(directory.join("host.sock")),
                         directory,
-                    });
+                    };
+                    // Creation never grants other accounts access, but umask
+                    // can also remove owner search permission. Restore 0700
+                    // before binding; RAII removes the directory on failure.
+                    create_private_dir(&private.directory)?;
+                    return Ok(private);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
@@ -1332,17 +1328,27 @@ impl Drop for PrivateEndpoint {
 #[derive(Debug)]
 struct MemoryPolicy {
     bytes: u64,
-    hierarchy: CgroupHierarchy,
+    hierarchies: Vec<CgroupHierarchy>,
 }
 
 #[cfg(target_os = "linux")]
 impl MemoryPolicy {
     fn detect() -> Result<Self, String> {
-        let hierarchy = CgroupHierarchy::detect()?;
-        let physical = physical_memory_bytes()?;
-        let inherited = inherited_memory_limit(&hierarchy.launcher, &hierarchy.root)?;
+        Self::from_hierarchies(physical_memory_bytes()?, CgroupHierarchy::detect()?)
+    }
+
+    fn from_hierarchies(physical: u64, hierarchies: Vec<CgroupHierarchy>) -> Result<Self, String> {
+        let mut inherited: Option<u64> = None;
+        // Read-only mounts can expose limits hidden above a writable delegated
+        // bind mount. Keep every visible original-launcher limit even when a
+        // different mount supplies the usable host parent.
+        for hierarchy in &hierarchies {
+            if let Some(limit) = inherited_memory_limit(&hierarchy.launcher, &hierarchy.root)? {
+                inherited = Some(inherited.map_or(limit, |current| current.min(limit)));
+            }
+        }
         let bytes = web_memory_ceiling(physical, inherited)?;
-        Ok(Self { bytes, hierarchy })
+        Ok(Self { bytes, hierarchies })
     }
 }
 
@@ -1386,15 +1392,20 @@ struct CgroupHierarchy {
 
 #[cfg(target_os = "linux")]
 impl CgroupHierarchy {
-    fn detect() -> Result<Self, String> {
+    fn detect() -> Result<Vec<Self>, String> {
         let membership = std::fs::read_to_string("/proc/self/cgroup")
             .map_err(|error| format!("cannot read the launcher's cgroup: {error}"))?;
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo")
+            .map_err(|error| format!("cannot read cgroup mount information: {error}"))?;
+        Self::from_proc(&membership, &mounts)
+    }
+
+    fn from_proc(membership: &str, mounts: &str) -> Result<Vec<Self>, String> {
         let current = membership
             .lines()
             .find_map(|line| line.strip_prefix("0::"))
             .ok_or_else(|| "the launcher is not in a unified cgroup-v2 hierarchy".to_owned())?;
-        let mounts = std::fs::read_to_string("/proc/self/mountinfo")
-            .map_err(|error| format!("cannot read cgroup mount information: {error}"))?;
+        let mut hierarchies = Vec::new();
         for line in mounts.lines() {
             let Some((fields, filesystem)) = line.split_once(" - ") else {
                 continue;
@@ -1412,10 +1423,14 @@ impl CgroupHierarchy {
             let mount_root = decode_mount_path(mount_root)?;
             let mount_point = decode_mount_path(mount_point)?;
             if let Ok(hierarchy) = Self::resolve(&mount_point, &mount_root, current) {
-                return Ok(hierarchy);
+                hierarchies.push(hierarchy);
             }
         }
-        Err("no mounted cgroup-v2 hierarchy safely exposes the launcher's cgroup".to_owned())
+        if hierarchies.is_empty() {
+            Err("no mounted cgroup-v2 hierarchy safely exposes the launcher's cgroup".to_owned())
+        } else {
+            Ok(hierarchies)
+        }
     }
 
     fn resolve(mount_point: &Path, mount_root: &Path, current: &str) -> Result<Self, String> {
@@ -1519,7 +1534,21 @@ struct CgroupLease {
 impl CgroupLease {
     fn prepare() -> Result<Self, String> {
         let policy = MemoryPolicy::detect()?;
-        Self::select_parent(&policy.hierarchy, policy.bytes, Self::create_at)
+        Self::prepare_with(policy, Self::create_at)
+    }
+
+    fn prepare_with(
+        policy: MemoryPolicy,
+        mut create: impl FnMut(&Path, u64) -> Result<Self, String>,
+    ) -> Result<Self, String> {
+        let mut refusal = "no mounted hierarchy provides a delegated parent".to_owned();
+        for hierarchy in &policy.hierarchies {
+            match Self::select_parent(hierarchy, policy.bytes, &mut create) {
+                Ok(lease) => return Ok(lease),
+                Err(error) => refusal = error,
+            }
+        }
+        Err(refusal)
     }
 
     fn select_parent(
@@ -1774,6 +1803,8 @@ fn terminate_child_tree_with(child: &mut Child, cgroup: &mut CgroupLease, signal
 mod tests {
     #[cfg(target_os = "linux")]
     use std::io::{BufRead, BufReader};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::process::ExitStatusExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::Barrier;
@@ -1873,6 +1904,53 @@ mod tests {
             rgba8: vec![generation as u8; 8],
             ..WebFrame::default()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_endpoint_restores_owner_search_under_a_restrictive_umask() {
+        const CHILD: &str = "CRIKEY_WEB_ENDPOINT_UMASK_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let private = PrivateEndpoint::create().expect("private endpoint under umask 0100");
+            let directory = private.directory.clone();
+            assert_eq!(
+                std::fs::metadata(&directory)
+                    .expect("endpoint directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "umask must not leave the host unable to traverse its endpoint directory",
+            );
+            let listener = Listener::bind(private.endpoint()).expect("owner can bind the private socket");
+            drop(listener);
+            drop(private);
+            assert!(!directory.exists(), "the private endpoint directory is removed");
+            return;
+        }
+
+        // umask is process-global. Set it in a shell that execs one isolated
+        // test, never in this harness alongside concurrently running tests.
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg("umask 0100; exec \"$@\"")
+            .arg("sh")
+            .arg(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "web_host::tests::private_endpoint_restores_owner_search_under_a_restrictive_umask",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("isolated restrictive-umask test starts");
+        assert!(
+            output.status.success(),
+            "restrictive-umask subprocess failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[test]
@@ -2057,6 +2135,100 @@ mod tests {
             lock_recover(&self.0)
                 .take()
                 .ok_or_else(|| "already started".to_owned())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct ExitedProcess(FakeProcess);
+
+    #[cfg(target_os = "linux")]
+    impl ManagedProcess for ExitedProcess {
+        fn try_wait(&mut self) -> Result<Option<ExitStatus>, String> {
+            Ok(Some(ExitStatus::from_raw(0)))
+        }
+
+        fn terminate(&mut self) {
+            self.0.terminate();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exited_host_keeps_its_buffered_terminal_diagnostic() {
+        for (terminal, expected) in [
+            (
+                Some(Payload::Gone(Gone {
+                    surface_id: 1,
+                    reason: WebGoneCode::StartupFailed,
+                    detail: "controlled engine startup failure".to_owned(),
+                    ..Gone::default()
+                })),
+                "web host failed to start: controlled engine startup failure",
+            ),
+            (
+                Some(Payload::LoadState(LoadState {
+                    surface_id: 1,
+                    state: WebLoadCode::Failed,
+                    url: "https://example.test".to_owned(),
+                    failure: "controlled document failure".to_owned(),
+                    ..LoadState::default()
+                })),
+                "web page load failed for `https://example.test`: controlled document failure",
+            ),
+            (None, "web host exited unexpectedly (exit status: 0)"),
+        ] {
+            let (mut launcher, mut peer) = transport::pair();
+            launcher
+                .set_read_timeout(Some(Duration::from_millis(5)))
+                .expect("bounded empty receive");
+            peer.send(&Envelope {
+                payload: Some(Payload::LoadState(LoadState {
+                    surface_id: 1,
+                    state: WebLoadCode::Started,
+                    ..LoadState::default()
+                })),
+                ..Envelope::default()
+            })
+            .expect("nonterminal output precedes process exit");
+            if let Some(terminal) = terminal {
+                peer.send(&Envelope {
+                    payload: Some(terminal),
+                    ..Envelope::default()
+                })
+                .expect("terminal output was flushed before exit");
+                peer.send(&Envelope {
+                    payload: Some(Payload::WebFrame(frame(1, 9))),
+                    ..Envelope::default()
+                })
+                .expect("a later frame cannot revive a terminal surface");
+            }
+            let terminated = Arc::new(AtomicUsize::new(0));
+            let (wake_tx, wake_rx) = mpsc::channel();
+            let mut supervisor = WebHostSupervisor::with_spawner(
+                PathBuf::from("/unused"),
+                Arc::new(move || {
+                    let _ = wake_tx.send(());
+                }),
+                Arc::new(OneShotSpawner(Mutex::new(Some(RunningHost {
+                    transport: launcher,
+                    process: Box::new(ExitedProcess(FakeProcess {
+                        terminated: Arc::clone(&terminated),
+                    })),
+                })))),
+            );
+            assert_eq!(open(&mut supervisor), 1);
+            wake_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the completed host publishes a terminal notice");
+            let notices = supervisor.poll();
+            drop(supervisor);
+            assert_eq!(notices.len(), 1, "post-terminal frames are discarded");
+            assert!(
+                matches!(&notices[0], WebHostNotice::Fatal { surface_id: 1, message } if message == expected),
+                "the original terminal diagnostic must survive process exit: {notices:?}",
+            );
+            assert_eq!(terminated.load(Ordering::Acquire), 1);
         }
     }
 
@@ -2274,6 +2446,85 @@ mod tests {
         }
         drop(lease);
         assert!(!path.exists(), "private leaf is removed");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mounted_hierarchies_fixture(full: &TestDirectory, delegated: &TestDirectory) -> Vec<CgroupHierarchy> {
+        let original = delegated_fixture(full);
+        delegated_fixture(delegated);
+        let subtree = full.0.join("delegation");
+        std::fs::create_dir(&subtree).expect("delegated subtree");
+        std::fs::rename(&original.launcher, subtree.join("launcher")).expect("nested launcher");
+        for (name, contents) in [
+            ("memory.max", "536870912"),
+            ("cgroup.subtree_control", "memory"),
+            ("cgroup.procs", ""),
+        ] {
+            std::fs::write(subtree.join(name), contents).expect("full-view subtree controls");
+        }
+        std::fs::write(full.0.join("memory.max"), MIN_WEB_MEMORY_BYTES.to_string())
+            .expect("hidden ancestor limit");
+        std::fs::write(delegated.0.join("memory.max"), "536870912").expect("same delegated subtree limit");
+        let mounts = format!(
+            "1 0 0:1 / {} ro - cgroup2 cgroup ro\n\
+             2 0 0:1 /delegation {} rw - cgroup2 cgroup rw\n",
+            full.0.display(),
+            delegated.0.display(),
+        );
+        CgroupHierarchy::from_proc("0::/delegation/launcher\n", &mounts)
+            .expect("both mount views expose the launcher")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_later_writable_cgroup_mount_is_tried_without_losing_hidden_ancestor_limits() {
+        let full = TestDirectory::new();
+        let delegated = TestDirectory::new();
+        let hierarchies = mounted_hierarchies_fixture(&full, &delegated);
+        assert_eq!(hierarchies.len(), 2, "mount discovery retains both safe views");
+        let policy = MemoryPolicy::from_hierarchies(8 * 1024 * 1024 * 1024, hierarchies)
+            .expect("all original launcher limits are readable");
+        assert_eq!(policy.bytes, MIN_WEB_MEMORY_BYTES);
+        let mut attempted = Vec::new();
+        let lease = CgroupLease::prepare_with(policy, |parent, bytes| {
+            attempted.push(parent.to_owned());
+            if parent.starts_with(&full.0) {
+                Err("read-only cgroup mount".to_owned())
+            } else {
+                create_fixture_lease(parent, bytes)
+            }
+        })
+        .expect("read-only first mount cannot hide the usable delegation");
+        assert_eq!(
+            attempted,
+            vec![full.0.join("delegation"), full.0.clone(), delegated.0.clone()]
+        );
+        assert_eq!(lease.path.parent(), Some(delegated.0.as_path()));
+        assert_eq!(
+            std::fs::read_to_string(lease.path.join("memory.max")).expect("enforced ceiling"),
+            MIN_WEB_MEMORY_BYTES.to_string(),
+            "a hidden full-mount ancestor still caps the sibling host",
+        );
+        remove_fixture_lease(lease);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hidden_below_floor_ancestor_refuses_every_mount_before_creation() {
+        let full = TestDirectory::new();
+        let delegated = TestDirectory::new();
+        let hierarchies = mounted_hierarchies_fixture(&full, &delegated);
+        std::fs::write(full.0.join("memory.max"), (MIN_WEB_MEMORY_BYTES - 1).to_string())
+            .expect("below-floor hidden ancestor");
+        assert_startup_refused(
+            || {
+                let policy = MemoryPolicy::from_hierarchies(8 * 1024 * 1024 * 1024, hierarchies)?;
+                CgroupLease::prepare_with(policy, |_, _| {
+                    panic!("no mount can bypass the original launcher floor")
+                })
+            },
+            "below the 256 MiB minimum",
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2710,6 +2961,15 @@ mod tests {
             native_path,
         );
         let canonical_root = root.canonicalize().expect("storage root");
+        assert_eq!(
+            std::fs::metadata(&root)
+                .expect("storage-root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "owner directories cannot be replaced through a public storage root",
+        );
         for path in [native_path, modern_path] {
             assert_eq!(path.parent(), Some(canonical_root.as_path()));
             assert_eq!(
@@ -2722,6 +2982,55 @@ mod tests {
                 "durable cookies stay private to the launcher account",
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_storage_rejects_symlinked_owner_directories_without_modifying_the_target() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("web-storage");
+        let owner = PluginId("native.notes".to_owned());
+        let owned = persistent_storage_dir(&root, &owner).expect("initial owner store");
+        std::fs::remove_dir(&owned).expect("empty owner store");
+        let unrelated = directory.0.join("unrelated");
+        std::fs::create_dir(&unrelated).expect("unrelated directory");
+        std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o750))
+            .expect("unrelated permissions");
+        std::fs::write(unrelated.join("marker"), "not a web store").expect("unrelated contents");
+        std::os::unix::fs::symlink(&unrelated, &owned).expect("preexisting owner alias");
+        let error = persistent_storage_dir(&root, &owner).expect_err("aliases cannot merge stores");
+        assert!(error.contains("not a real directory"), "{error}");
+        assert_eq!(
+            std::fs::metadata(&unrelated)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750,
+            "refusal must not chmod an unrelated target",
+        );
+        assert_eq!(
+            std::fs::read_to_string(unrelated.join("marker")).expect("untouched target"),
+            "not a web store",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_storage_rejects_a_symlinked_root_before_creating_an_owner_store() {
+        let directory = TestDirectory::new();
+        let unrelated = directory.0.join("unrelated");
+        std::fs::create_dir(&unrelated).expect("unrelated root target");
+        let root = directory.0.join("web-storage");
+        std::os::unix::fs::symlink(&unrelated, &root).expect("preexisting storage-root alias");
+        let error = persistent_storage_dir(&root, &PluginId("native.notes".to_owned()))
+            .expect_err("aliased roots cannot redirect durable cookies");
+        assert!(error.contains("not a real directory"), "{error}");
+        assert_eq!(
+            std::fs::read_dir(&unrelated).expect("target entries").count(),
+            0,
+            "no plugin store is created outside the admitted root",
+        );
     }
 
     #[cfg(target_os = "linux")]

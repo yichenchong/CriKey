@@ -385,6 +385,9 @@ message PageInput {
 // One frame of a page: either a flat display list drawn by the host or a web
 // surface declaration. Plugin code never crosses this boundary. Plugin-drawn
 // pixels cross only as the bounded raster an IMAGE node carries.
+// Repeated occurrences of Envelope.page_frame merge, including their nested
+// web declarations; splitting fields across fragments does not replace the
+// earlier URL or hide a mixture of display-list nodes and a web surface.
 message PageFrame {
   uint64 generation = 1;
   string title = 2;
@@ -412,7 +415,7 @@ message PageFrame {
 // from becoming a way to read the user's screen. The engine itself runs in
 // crikey-web-host, and the messages below carry the surface's traffic.
 message PageWebSurface {
-  // A stated address must be an absolute HTTP(S) URL with a non-empty
+  // A stated address must be an absolute HTTP(S) URL with a non-empty host,
   // whitespace-free authority and no control characters, at most 8 KiB.
   // Empty on a later frame means "stay where you are"; the host refuses an
   // empty first navigation rather than opening a blank document.

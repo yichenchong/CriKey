@@ -52,6 +52,8 @@ use crikey_ui::{
 };
 use file_provider::{file_provider_policy, FileSearchDriver, FILE_SEARCH_PLUGIN};
 use std::cell::RefCell;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -2401,33 +2403,20 @@ fn show_startup_failure_dialog(_text: &str) {}
 /// world- or group-writable. Symlink leaves are rejected: following one would
 /// secure a different directory than the configured trust root.
 fn create_private_dir(dir: &std::path::Path) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|error| {
-        format!(
-            "cannot create private cache directory `{}`: {error}",
-            dir.display()
-        )
-    })?;
-    let metadata = std::fs::symlink_metadata(dir).map_err(|error| {
-        format!(
-            "cannot inspect private cache directory `{}`: {error}",
-            dir.display()
-        )
-    })?;
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("cannot create private directory `{}`: {error}", dir.display()))?;
+    let metadata = std::fs::symlink_metadata(dir)
+        .map_err(|error| format!("cannot inspect private directory `{}`: {error}", dir.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(format!(
-            "private cache path `{}` is not a real directory",
+            "private path `{}` is not a real directory",
             dir.display()
         ));
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|error| {
-            format!(
-                "cannot secure private cache directory `{}`: {error}",
-                dir.display()
-            )
-        })?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot secure private directory `{}`: {error}", dir.display()))?;
     }
     Ok(())
 }

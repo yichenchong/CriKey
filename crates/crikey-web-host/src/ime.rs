@@ -66,7 +66,8 @@ impl ImeBridge {
     /// A preedit update. `cursor` is the character range the launcher reported,
     /// or `None` for winit's absent cursor.
     pub fn preedit(&mut self, text: String, cursor: Option<(u32, u32)>) -> Vec<ImeOp> {
-        let mut ops = Vec::with_capacity(3);
+        // Empty updates are common before commits and need no operations or
+        // allocation while their clear is deferred.
         if text.is_empty() {
             // Not an end of composition. Remembered, then either overtaken by
             // the commit that is about to arrive or flushed by the next
@@ -74,9 +75,10 @@ impl ImeBridge {
             if self.composing {
                 self.clear_deferred = true;
             }
-            return ops;
+            return Vec::new();
         }
         self.clear_deferred = false;
+        let mut ops = Vec::with_capacity(3);
         let cursor_chars = clamp_cursor(&text, cursor);
         ops.push(ImeOp::SetPreedit { text, cursor_chars });
         if !self.composing {
@@ -105,7 +107,7 @@ impl ImeBridge {
     /// no commit is coming.
     pub fn flush(&mut self) -> Vec<ImeOp> {
         if self.composing && self.clear_deferred {
-            self.end_composition()
+            self.end_composition().into()
         } else {
             Vec::new()
         }
@@ -118,16 +120,16 @@ impl ImeBridge {
     /// nonempty text. It never commits that text into the next focused element.
     pub fn cancel(&mut self) -> Vec<ImeOp> {
         if self.composing {
-            self.end_composition()
+            self.end_composition().into()
         } else {
             Vec::new()
         }
     }
 
-    fn end_composition(&mut self) -> Vec<ImeOp> {
+    fn end_composition(&mut self) -> [ImeOp; 3] {
         self.composing = false;
         self.clear_deferred = false;
-        vec![
+        [
             ImeOp::SetPreedit {
                 text: String::new(),
                 cursor_chars: 0,

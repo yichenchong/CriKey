@@ -545,3 +545,20 @@ fn web_surface_builder_enforces_the_core_byte_limit() {
         "the SDK reports the actual byte count: {error}"
     );
 }
+
+#[test]
+fn the_web_surface_builder_refuses_authorities_without_a_host() {
+    for url in [
+        "https://@/",
+        "https://user@/",
+        "https://:443/",
+        "https://user@:443/",
+        "https://[]/",
+        "https://[]:443/",
+    ] {
+        assert!(
+            WebSurfaceBuilder::navigate(1, url).build().is_err(),
+            "{url:?} must not be accepted as a navigation"
+        );
+    }
+}

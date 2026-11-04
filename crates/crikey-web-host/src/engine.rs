@@ -17,6 +17,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -60,8 +61,12 @@ pub enum RunError {
     Thread(io::Error),
     #[error("WPE initialization failed ({0})")]
     EngineInit(i32),
+    #[error("WPE may be initialized only once per web-host process")]
+    EngineAlreadyStarted,
     #[error("WPE refused to create the web surface")]
     SurfaceCreate,
+    #[error("WPE persistent storage directory must be valid UTF-8")]
+    StorageEncoding,
     #[error("web-host {0} thread did not stop after transport shutdown")]
     ThreadTimeout(&'static str),
 }
@@ -135,8 +140,21 @@ struct EngineLoop {
 }
 
 impl EngineLoop {
-    fn new() -> Self {
-        Self { active: true }
+    fn new() -> Result<Self, RunError> {
+        // The shim, GLib default context and WPE loader have process-global,
+        // thread-affine state. A safe public run() must not let concurrent or
+        // later callers clean up another runtime or move WPE to a new thread.
+        // A failed initialization can also leave library-global state behind;
+        // retries require a fresh host process, just like normal page opens.
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        if STARTED.swap(true, Ordering::Relaxed) {
+            return Err(RunError::EngineAlreadyStarted);
+        }
+        let init = unsafe { ck_web_init() };
+        if init != CK_WEB_INIT_OK {
+            return Err(RunError::EngineInit(init));
+        }
+        Ok(Self { active: true })
     }
 
     fn cleanup(&mut self) {
@@ -155,6 +173,9 @@ impl Drop for EngineLoop {
 
 /// Connects to the launcher's private endpoint and owns one WPE surface until
 /// CloseSurface, transport loss, engine failure or supervised termination.
+///
+/// The process may enter WPE initialization only once. Concurrent or later
+/// calls report StartupFailed without accessing the process-global engine.
 pub fn run(endpoint: Endpoint, storage_dir: Option<PathBuf>) -> Result<(), RunError> {
     validate_endpoint(&endpoint)?;
     let Endpoint::UnixSocket(path) = &endpoint else {
@@ -203,18 +224,37 @@ pub fn run(endpoint: Endpoint, storage_dir: Option<PathBuf>) -> Result<(), RunEr
             return Err(RunError::State(error));
         }
     };
-
-    let init = unsafe { ck_web_init() };
-    if init != CK_WEB_INIT_OK {
+    // WebKit's directory and cookie APIs take UTF-8, not arbitrary Unix
+    // filename bytes. Reject an unrepresentable profile rather than allowing
+    // its path conversion to select default/shared storage. Ephemeral opens
+    // carry no storage directory and remain independent of this setting.
+    if open
+        .storage_dir
+        .as_deref()
+        .is_some_and(|path| path.to_str().is_none())
+    {
+        let error = RunError::StorageEncoding;
         let _ = send_direct_gone(
             &mut writer,
             open.surface_id,
             WebGoneCode::StartupFailed,
-            format!("WPE initialization failed ({init})"),
+            error.to_string(),
         );
-        return Err(RunError::EngineInit(init));
+        return Err(error);
     }
-    let engine = EngineLoop::new();
+
+    let engine = match EngineLoop::new() {
+        Ok(engine) => engine,
+        Err(error) => {
+            let _ = send_direct_gone(
+                &mut writer,
+                open.surface_id,
+                WebGoneCode::StartupFailed,
+                error.to_string(),
+            );
+            return Err(error);
+        }
+    };
     if let Some(path) = open.storage_dir.as_deref() {
         if let Err(error) = std::fs::create_dir_all(path) {
             let _ = send_direct_gone(
@@ -1121,23 +1161,146 @@ extern "C" {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
+    use std::ffi::{c_char, c_void, CString};
     use std::io::{self, Read, Write};
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::ptr;
     use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use crikey_native_protocol::message::{Payload, WebGoneCode, WebLoadCode};
-    use crikey_native_protocol::ProtocolError;
+    use crikey_native_protocol::message::{OpenSurface, Payload, WebGoneCode, WebLoadCode, WebStorageMode};
+    use crikey_native_protocol::{Endpoint, ProtocolError};
 
     use crate::output::OutputBuffer;
 
     use super::{
-        borrowed_c_string, on_load_state, write_wake_byte, CallbackState, DeadlineReader, SocketTransport,
-        MAX_ENGINE_TEXT_BYTES,
+        borrowed_c_string, ck_web_surface_destroy, ck_web_surface_new, envelope, on_load_state, run,
+        write_wake_byte, CallbackState, CkWebCallbacks, DeadlineReader, EngineLoop, RunError,
+        SocketTransport, CK_WEB_STORAGE_EPHEMERAL, MAX_ENGINE_TEXT_BYTES,
     };
+
+    extern "C" {
+        fn g_error_new_literal(domain: u32, code: i32, message: *const c_char) -> *mut c_void;
+        fn g_error_free(error: *mut c_void);
+        fn webkit_media_error_quark() -> u32;
+        fn webkit_network_error_quark() -> u32;
+        fn webkit_policy_error_quark() -> u32;
+        fn ck_web_on_load_failed(
+            view: *mut c_void,
+            event: i32,
+            uri: *mut c_char,
+            error: *mut c_void,
+            surface: *mut c_void,
+        ) -> i32;
+    }
+
+    fn assert_native_load_failure_callbacks() {
+        let uri = CString::new("https://example.test/native-load").unwrap();
+        let detail = CString::new("native error regression").unwrap();
+        let cases = unsafe {
+            [
+                (webkit_media_error_quark(), 204, false),
+                (webkit_media_error_quark(), 999, true),
+                (webkit_network_error_quark(), 302, false),
+                (webkit_network_error_quark(), 399, true),
+                (webkit_policy_error_quark(), 102, false),
+                (webkit_policy_error_quark(), 100, true),
+            ]
+        };
+        for (domain, code, reports_failure) in cases {
+            let (_, recycle) = mpsc::channel();
+            let output = Arc::new(OutputBuffer::new());
+            let callbacks = CallbackState::new(7, recycle, Arc::clone(&output));
+            let native_callbacks = CkWebCallbacks {
+                user: ptr::from_ref(&callbacks).cast_mut().cast(),
+                frame: None,
+                caret: None,
+                load_state: Some(on_load_state),
+                gone: None,
+            };
+            unsafe {
+                let surface =
+                    ck_web_surface_new(320, 200, CK_WEB_STORAGE_EPHEMERAL, ptr::null(), &native_callbacks);
+                assert!(!surface.is_null(), "create real WPE surface for native callback");
+                let error = g_error_new_literal(domain, code, detail.as_ptr());
+                assert!(!error.is_null());
+                assert_eq!(
+                    ck_web_on_load_failed(ptr::null_mut(), 0, uri.as_ptr().cast_mut(), error, surface.cast(),),
+                    1,
+                );
+                g_error_free(error);
+                ck_web_surface_destroy(surface);
+            }
+            output.close();
+            let update = output.pop();
+            if reports_failure {
+                let Some(Payload::LoadState(state)) = update.and_then(|update| update.payload) else {
+                    panic!("native error {domain}/{code} did not report Failed");
+                };
+                assert_eq!(state.state, WebLoadCode::Failed);
+                assert_eq!(state.url, "https://example.test/native-load");
+                assert_eq!(state.failure, "native error regression");
+            } else {
+                assert!(
+                    update.is_none(),
+                    "expected control-flow error {domain}/{code} leaked {update:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wpe_process_lifetime_and_native_load_failure_boundaries() {
+        let engine = EngineLoop::new().expect("initialize WPE for this process");
+        assert_native_load_failure_callbacks();
+        let socket =
+            std::env::temp_dir().join(format!("crikey-web-engine-reuse-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = Endpoint::UnixSocket(socket.clone());
+        let worker = thread::spawn(move || run(endpoint, None));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "second runtime connection deadline expired"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("second runtime connection failed: {error}"),
+            }
+        };
+        let mut transport = SocketTransport::new(stream);
+        transport
+            .send(&envelope(Payload::OpenSurface(OpenSurface {
+                surface_id: 7,
+                pixel_width: 320,
+                pixel_height: 200,
+                url: "http://127.0.0.1/".to_owned(),
+                storage_mode: WebStorageMode::Ephemeral,
+                ..OpenSurface::default()
+            })))
+            .unwrap();
+        let response = transport
+            .recv_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let Some(Payload::Gone(gone)) = response.payload else {
+            panic!("expected structured startup rejection");
+        };
+        assert_eq!(gone.surface_id, 7);
+        assert_eq!(gone.reason, WebGoneCode::StartupFailed);
+        assert!(gone.detail.contains("only once"), "{}", gone.detail);
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(RunError::EngineAlreadyStarted)
+        ));
+        drop(engine);
+        std::fs::remove_file(socket).unwrap();
+    }
 
     #[test]
     fn wake_write_retries_interruption_until_the_byte_is_written() {
