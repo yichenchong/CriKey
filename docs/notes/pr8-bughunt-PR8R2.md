@@ -8,7 +8,7 @@ Six implementation agents owned separate sections: browser engine/C interface; h
 
 Each item below has a label unique to this round. Labels cover different kinds of work: behavioral defects, latent safety or validation defects, a small allocation improvement, additional end-to-end coverage, and a documentation correction. They must not be read as a count of independent production crashes. Related changes at different boundaries are explicitly linked.
 
-**Completion:** This report contains 19 labeled entries. All confirmed in-scope fixes are included, including the review corrections and the download-fixture race found during final execution. Remaining inherited and unverified boundaries are stated separately.
+**Completion:** This report contains 20 labeled entries: 19 in-scope fix/coverage/documentation entries and one unchanged outside-PR CI failure. All confirmed in-scope fixes are included, including the review corrections and the download-fixture race found during final execution. Remaining inherited and unverified boundaries are stated separately.
 
 ## Browser engine and C interface
 
@@ -283,6 +283,18 @@ The section agents also reviewed the following boundaries. These are source-revi
 - Native pointer capture/chords/departure, wheel ownership, hardware-key normalization, dead keys, measured caret placement, texture validation/eviction and multipass effects. Only the specific new issues above justified edits.
 - Schema tags/types, unknown fields, byte budgets, storage defaults, core/display-list exclusivity, SDK building, transport timeout documentation and separate native/Python protocols.
 - Packaging modes, supplied-binary combinations, staging replacement, locked metadata decoding, required dependency preflight, target-list parsing, Flatpak refusal of unsupported web mode, RPM recipe and truthful accessibility/platform limitations.
+
+## Outside-PR failure observed during hosted verification
+
+### PR8R2-X-1 — An unchanged file-opening fixture could not execute its helper
+
+**Location:** `crates/crikey-platform-linux/tests/file_open.rs`, `a_path_that_is_not_valid_unicode_reaches_the_helper_unchanged`.
+
+**Observed result:** The first hosted Linux job for audit commit `b089f6f` failed while executing its recording helper with `Text file busy (os error 26)`. Eight other tests in that test binary passed. The complete local workspace run had passed this same unchanged suite.
+
+**Scope and decision:** This platform file is not changed by PR #8. No root cause was established from that single hosted failure, and this report does not label it a web regression or claim it was fixed. The failure is retained here rather than hidden or used to justify unrelated platform edits. The later report-only publication leaves the tested implementation unchanged; final hosted status belongs to the PR checks, separately from the local passes below.
+
+**Evidence:** [Initial hosted run](https://github.com/yichenchong/CriKey/actions/runs/41933530679), Linux Rust job, test failure at `file_open.rs:301`. An attempted failed-job rerun was refused because the original workflow was still running; no successful rerun is implied by that command.
 
 ## Explicit unchanged and unverified risks
 
