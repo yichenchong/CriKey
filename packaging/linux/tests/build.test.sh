@@ -387,10 +387,11 @@ cat >"$recording_tools/cargo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"${CRIKEY_TEST_CARGO_LOG:?}"
+root="$(pwd -P)"
 target="${CRIKEY_TEST_CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
 [[ -n $target ]]
 if [[ $target != /* ]]; then
-	target="$PWD/$target"
+	target="$root/$target"
 fi
 if [[ ${1:-} == metadata ]]; then
 	escaped_target="${target//\\/\\\\}"
@@ -407,7 +408,7 @@ for executable in crikey crikey-launcher crikey-wasm-host crikey-cabi-host crike
 	cp "${CRIKEY_TEST_FIXTURE_BIN:?}/$executable" "$destination/$executable"
 	package="$executable"
 	case "$executable" in crikey | crikey-launcher) package=crikey-cli ;; esac
-	manifest="$PWD/crates/$package/Cargo.toml"
+	manifest="$root/crates/$package/Cargo.toml"
 	path="$destination/$executable"
 	escaped_manifest="${manifest//\\/\\\\}"
 	escaped_manifest="${escaped_manifest//\"/\\\"}"
@@ -544,6 +545,21 @@ env PATH="$recording_tools:$PATH" \
 check "JSON-escaped Cargo target paths stage the actual binaries" \
 	cmp -s "$stand_in" "$escaped_target_out/stage/lib/crikey/crikey"
 
+# Cargo resolves its working directory physically, even when the packaging
+# script was invoked through a symlink to the checkout.
+repository_alias="$workspace/repository-alias"
+ln -s "$repository_root" "$repository_alias"
+aliased_out="$workspace/aliased-out"
+env PATH="$recording_tools:$PATH" \
+	CARGO_TARGET_DIR="$workspace/aliased-target" \
+	CRIKEY_TEST_CARGO_LOG="$workspace/aliased-cargo.log" \
+	CRIKEY_TEST_FIXTURE_BIN="$fixture_bin" \
+	"$repository_alias/packaging/linux/build.sh" --targets stage "$aliased_out" >/dev/null
+for executable in crikey crikey-launcher crikey-wasm-host crikey-cabi-host; do
+	check "a symlinked checkout invocation stages Cargo's actual $executable" \
+		cmp -s "$fixture_bin/$executable" "$aliased_out/stage/lib/crikey/$executable"
+done
+
 # The initial shell hosts force the real scanner down its fallback path.
 # Separately exercise successful scanning, recording which installed files
 # were inspected rather than asserting source text in build.sh.
@@ -676,6 +692,17 @@ EOF
 		"$in_tree_flatpak" >/dev/null
 	check "Flatpak excludes an in-tree output workspace from source staging" \
 		test -d "$in_tree_flatpak/flatpak/sources/crikey"
+
+	aliased_output_relative="${in_tree_workspace#"$repository_root"/}/aliased-output"
+	aliased_in_tree_flatpak="$repository_alias/$aliased_output_relative"
+	env PATH="$flatpak_stub_dir:$PATH" \
+		CRIKEY_TEST_FLATPAK_MANIFEST="$flatpak_capture" \
+		"$repository_alias/packaging/linux/build.sh" --targets flatpak \
+		--python-archive "$workspace/python-runtime.tar.gz" \
+		"$aliased_in_tree_flatpak" >/dev/null
+	check "Flatpak excludes an aliased in-tree workspace from staged sources" \
+		bash -c 'test -f "$1/Cargo.toml" && test ! -e "$1/$2/flatpak"' _ \
+		"$aliased_in_tree_flatpak/flatpak/sources/crikey" "$aliased_output_relative"
 
 
 	tar -cf "$workspace/python-runtime.tar" -C "$fixture" python

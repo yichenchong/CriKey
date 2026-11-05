@@ -618,6 +618,12 @@ int32_t ck_web_init(void)
      * thread-affine surface callbacks. Acquisition is reentrant, so the loop
      * can run on this thread while the lifetime reservation remains held. */
     GMainContext *context = g_main_context_default();
+    /* WebKit adopts the caller's thread-default context for its work source,
+     * while this host iterates the process default. Refuse a mismatch before
+     * acquiring a context, cleaning up global state, or initializing WPE. */
+    GMainContext *thread_context = g_main_context_get_thread_default();
+    if (thread_context && thread_context != context)
+        return CK_WEB_INIT_UNSUPPORTED_CONTEXT;
     if (!g_main_context_acquire(context))
         return CK_WEB_INIT_CONTEXT_BUSY;
     ck_web_cleanup();

@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 
 use crikey_native_protocol::message::{
     CloseSurface, Envelope, Gone, ImeEvent, Navigate, OpenSurface, Payload, RawInput, Resize, WebFrame,
-    WebGoneCode, WebImeCode, WebInputCode, WebLoadCode, WebStorageMode,
+    WebGoneCode, WebImeCode, WebInputCode, WebLoadCode, WebStorageMode, WEB_MODIFIER_CONTROL,
+    WEB_MODIFIER_SHIFT,
 };
-use crikey_native_protocol::{frame, Endpoint, Message, ProtocolError};
+use crikey_native_protocol::{frame, Message, ProtocolError};
 
 const SURFACE_ID: u64 = 7;
 static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
@@ -77,7 +78,17 @@ impl Host {
             std::process::id(),
             NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
         ));
-        let private_dir = socket.with_extension("files");
+        Self::start_at(socket, storage_dir)
+    }
+
+    fn start_at(socket: PathBuf, storage_dir: Option<&Path>) -> Self {
+        // Keep browser profile/config paths UTF-8 even when exercising a
+        // non-UTF-8 transport endpoint.
+        let private_dir = PathBuf::from(format!(
+            "/tmp/crikey-web-smoke-{}-{}.files",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir(&private_dir).unwrap();
         std::fs::create_dir(private_dir.join("Downloads")).unwrap();
         std::fs::write(
@@ -87,11 +98,13 @@ impl Host {
         .unwrap();
         let listener = UnixListener::bind(&socket).expect("bind private host endpoint");
         listener.set_nonblocking(true).unwrap();
+        let mut endpoint = OsString::from("unix:");
+        endpoint.push(socket.as_os_str());
         let mut child = ChildGuard {
             child: Some(
                 Command::new(env!("CARGO_BIN_EXE_crikey-web-host"))
                     .arg("--endpoint")
-                    .arg(Endpoint::UnixSocket(socket.clone()).to_spec())
+                    .arg(endpoint)
                     .arg("--storage-dir")
                     .arg(storage_dir.map_or_else(|| private_dir.join("profile"), Path::to_path_buf))
                     .stdin(Stdio::null())
@@ -342,6 +355,24 @@ impl HttpFixture {
                         "<script>addEventListener('load',()=>document.body.style.background=",
                         "document.cookie===''&&localStorage.length===0?'#123456':'#ff0000')</script>"
                     ),
+                    "/input" => concat!(
+                        "<!doctype html><style>html,body{margin:0;min-height:100vh;background:#111111}",
+                        "input{position:absolute;left:0;top:0;width:100px;height:40px}</style><input id=i>",
+                        "<script>let stage=0;const paint=(ok,next,color)=>{",
+                        "stage=ok?next:-1;document.body.style.background=ok?color:'#ff0000'};",
+                        "i.addEventListener('mousedown',e=>paint(stage===0&&e.button===0&&e.buttons===1",
+                        "&&e.clientX===20&&e.clientY===20&&e.ctrlKey&&e.shiftKey,1,'#123456'));",
+                        "i.addEventListener('mousemove',e=>{if(stage===1)paint(e.buttons===1",
+                        "&&e.clientX===30&&e.clientY===25&&e.ctrlKey&&e.shiftKey,2,'#234567')});",
+                        "i.addEventListener('mouseup',e=>paint(stage===2&&e.button===0&&e.buttons===0",
+                        "&&e.ctrlKey&&e.shiftKey,3,'#345678'));",
+                        "i.addEventListener('keydown',e=>{paint(stage===3&&e.key==='A'&&e.ctrlKey",
+                        "&&e.shiftKey&&!e.altKey&&!e.metaKey&&!e.repeat,4,'#456789');e.preventDefault()});",
+                        "i.addEventListener('keyup',e=>paint(stage===4&&e.key==='A'&&e.ctrlKey",
+                        "&&e.shiftKey,5,'#56789a'));",
+                        "addEventListener('blur',()=>{if(stage===5)paint(!document.hasFocus(),6,'#6789ab')});",
+                        "addEventListener('focus',()=>{if(stage===6)paint(document.hasFocus(),7,'#789abc')})</script>"
+                    ),
                     "/ime" => concat!(
                         "<!doctype html><meta charset=utf-8>",
                         "<style>html,body{margin:0;min-height:100vh;background:#222222}</style><input id=i>",
@@ -524,6 +555,79 @@ fn line_wheel_and_precise_pixel_scroll_reach_the_engine_distinctly() {
 }
 
 #[test]
+fn pointer_drag_key_modifiers_and_focus_reach_the_document() {
+    let fixture = HttpFixture::start();
+    let mut host = Host::start();
+    host.open(format!("{}/input", fixture.url));
+    host.painted((320, 200), [0x11, 0x11, 0x11, 0xff]);
+    let modifiers = WEB_MODIFIER_CONTROL | WEB_MODIFIER_SHIFT;
+    for (kind, x, y, expected) in [
+        (WebInputCode::PointerMove, 20.0, 20.0, None),
+        (
+            WebInputCode::PointerDown,
+            20.0,
+            20.0,
+            Some([0x12, 0x34, 0x56, 0xff]),
+        ),
+        (
+            WebInputCode::PointerMove,
+            30.0,
+            25.0,
+            Some([0x23, 0x45, 0x67, 0xff]),
+        ),
+        (
+            WebInputCode::PointerUp,
+            30.0,
+            25.0,
+            Some([0x34, 0x56, 0x78, 0xff]),
+        ),
+    ] {
+        host.send(Payload::RawInput(RawInput {
+            surface_id: SURFACE_ID,
+            kind,
+            timestamp_ms: 1000,
+            x,
+            y,
+            button: 1,
+            modifiers,
+            ..RawInput::default()
+        }));
+        if let Some(expected) = expected {
+            host.painted((320, 200), expected);
+        }
+    }
+    // The pointer press must focus the input: no script focuses it for us.
+    for (kind, expected) in [
+        (WebInputCode::KeyDown, [0x45, 0x67, 0x89, 0xff]),
+        (WebInputCode::KeyUp, [0x56, 0x78, 0x9a, 0xff]),
+    ] {
+        host.send(Payload::RawInput(RawInput {
+            surface_id: SURFACE_ID,
+            kind,
+            timestamp_ms: 1100,
+            keysym: u32::from(b'A'),
+            hardware_keycode: 38,
+            modifiers,
+            ..RawInput::default()
+        }));
+        host.painted((320, 200), expected);
+    }
+    for (kind, expected) in [
+        (WebInputCode::FocusOut, [0x67, 0x89, 0xab, 0xff]),
+        (WebInputCode::FocusIn, [0x78, 0x9a, 0xbc, 0xff]),
+    ] {
+        host.send(Payload::RawInput(RawInput {
+            surface_id: SURFACE_ID,
+            kind,
+            timestamp_ms: 1200,
+            ..RawInput::default()
+        }));
+        host.painted((320, 200), expected);
+    }
+    host.close();
+}
+
+#[test]
 fn persistent_cookies_and_local_storage_survive_reopen_but_not_profile_boundaries() {
     let fixture = HttpFixture::start();
     let mut original = Host::start();
@@ -618,6 +722,23 @@ fn malformed_open_urls_are_protocol_failures_before_engine_startup() {
             Err(ProtocolError::Closed)
         ));
     }
+}
+
+#[test]
+fn non_utf8_unix_endpoint_carries_real_document_frames_and_normal_close() {
+    let fixture = HttpFixture::start();
+    let mut bytes = format!(
+        "/tmp/crikey-web-endpoint-{}-{}-",
+        std::process::id(),
+        NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+    )
+    .into_bytes();
+    bytes.extend_from_slice(b"\xff.sock");
+    let socket = PathBuf::from(OsString::from_vec(bytes));
+    let mut host = Host::start_at(socket, None);
+    host.open(format!("{}/", fixture.url));
+    host.painted((320, 200), [0x12, 0x34, 0x56, 0xff]);
+    host.close();
 }
 
 #[test]

@@ -1138,7 +1138,7 @@ fn spawn_contained(request: &OpenRequest, mut cgroup: CgroupLease) -> Result<Run
     let mut command = Command::new(&executable);
     command
         .arg("--endpoint")
-        .arg(endpoint.endpoint().to_spec())
+        .arg(endpoint.argument())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1375,6 +1375,18 @@ impl PrivateEndpoint {
 
     fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    // Unlike the shared text endpoint spelling, this private argv boundary
+    // must preserve native TMPDIR bytes through the host's args_os parser.
+    fn argument(&self) -> OsString {
+        let Endpoint::UnixSocket(path) = &self.endpoint else {
+            unreachable!("the private Linux web-host endpoint is always a Unix socket");
+        };
+        let mut argument = OsString::with_capacity(b"unix:".len() + path.as_os_str().as_bytes().len());
+        argument.push("unix:");
+        argument.push(path);
+        argument
     }
 }
 
@@ -3383,6 +3395,57 @@ mod tests {
         );
         assert!(resolve_web_host_executable(Some(sibling.join(&name).into_os_string()), None, None).is_err());
         assert!(resolve_web_host_executable(Some(OsString::new()), None, None).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an installed web host and a writable cgroup-v2 delegation with memory enabled"]
+    fn real_host_connects_through_a_non_utf8_temporary_directory() {
+        const CHILD: &str = "CRIKEY_WEB_NATIVE_ENDPOINT_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let mut host = spawn_production(&OpenRequest {
+                surface_id: 1,
+                plugin: PluginId("native.endpoint-test".to_owned()),
+                pixel_width: 2,
+                pixel_height: 1,
+                url: "https://example.test".to_owned(),
+                storage: WebStorage::Ephemeral,
+                storage_root: PathBuf::from("/unused"),
+            })
+            .expect("the real host connects to the exact native socket path");
+            host.transport.close();
+            host.process.terminate();
+            return;
+        }
+
+        let directory = TestDirectory::new();
+        let temporary = directory.0.join(OsString::from_vec(b"native-\xff".to_vec()));
+        std::fs::create_dir(&temporary).expect("native temporary directory");
+        // TMPDIR is process-global. Exercise the production spawner and real
+        // host parser in an isolated harness rather than changing this process.
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "web_host::tests::real_host_connects_through_a_non_utf8_temporary_directory",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("TMPDIR", &temporary)
+            .output()
+            .expect("isolated native-path test starts");
+        assert!(
+            output.status.success(),
+            "real host native-path connection failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            std::fs::read_dir(&temporary).expect("temporary entries").count(),
+            0,
+            "the private endpoint directory is removed after connection",
+        );
     }
 
     #[cfg(target_os = "linux")]
