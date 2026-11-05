@@ -2346,12 +2346,13 @@ Executable code shall never cross the plugin boundary for a display-list
 page. The plugin sends drawing commands and semantics; the host performs all
 rasterization of those commands (ADR-0020).
 
-Pixels in a display list shall cross only as a bounded raster attached to a
-single node, under the limits of 32.5. A plugin may hand over a picture that
-occupies one node's rectangle, and may not hand over a display-list page as a
-surface-sized framebuffer. The web form is distinct: the plugin declares the
-surface but never sends or receives its pixels or DOM; pixels travel only
-between the host and its supervised web engine under 32.11.
+Pixels in a display list shall cross only as bounded rasters attached to image
+nodes, under the limits of 32.5. Each raster occupies its node's rectangle;
+multiple image nodes may tile a surface-sized framebuffer within the per-node
+and per-frame limits. There is no separate display-list framebuffer payload.
+The web form is distinct: the plugin declares the surface but never sends or
+receives its pixels or DOM; pixels travel only between the host and its
+supervised web engine under 32.11.
 
 A page shall not learn its position on screen, and shall not draw outside the
 area the host gave it. The host clips.

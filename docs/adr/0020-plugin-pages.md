@@ -225,14 +225,14 @@ screen-reader support either.
   bounded rate, not on the framebuffer being impossible to rebuild.
 - **In-process or child-window webview per surface.** Rejected on launcher
   integration, not merely process placement: mainstream engines already run
-  content out of process, so any embedding must keep it there and prove it. What
-  is unresolved is that the surface must be either a rectangular child window,
-  which breaks the shaped rounded window, or an offscreen render sharing
-  textures with our `wgpu` surface — a cost created by out-of-process
-  rendering, not avoidable by it — across three engines with three embedding
-  models, one of which is a runtime the user may not have installed. Creating
-  the engine lazily answers the startup and idle-memory objections; it does not
-  answer this one.
+  content out of process, so any embedding must keep it there and prove it.
+  A rectangular child window breaks the shaped rounded window. An offscreen
+  renderer instead needs an explicit frame path into the launcher's `wgpu`
+  surface; it does not inherently require shared textures, as the accepted
+  Linux socket-and-upload route demonstrates. Equivalent offscreen integration
+  remains platform-specific across the three engines and their embedding
+  models. Creating an engine lazily answers the startup and idle-memory
+  objections, not that integration work.
 - **Fixed widget vocabulary with no drawing at all.** A closed list of
   `Button`, `Label`, `Field`, `Row` would be easier to draw and easier to make
   accessible, and it is too rigid: it decides on the plugin's behalf what a

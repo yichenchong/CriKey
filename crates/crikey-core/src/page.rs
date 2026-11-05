@@ -1,40 +1,47 @@
-//! Plugin-drawn pages: the retained display list a plugin paints inside the
-//! launcher window, and the input the host routes back to it (spec 32).
+//! Plugin pages: a retained display list or a supervised web surface inside
+//! the launcher window (spec 32).
 //!
 //! # What crosses the boundary
 //!
-//! Drawing commands and semantics, never code. A page is a flat list of
-//! [`PageNode`]s that the host draws with its own renderer, so the plugin
-//! decides *what* appears while the host keeps the frame budget, the palette,
-//! the DPI scaling and the process boundary. A plugin that could hand over
-//! code would end the invariant that no third-party code runs in the main
-//! process.
+//! A plugin sends a declarative [`PageFrame`], never code for the launcher to
+//! execute. For a display list, the frame is a flat list of [`PageNode`]s that
+//! the host draws with its own renderer, so the plugin decides *what* appears
+//! while the host keeps the frame budget, palette, DPI scaling and process
+//! boundary.
 //!
-//! Pixels cross only as a [`PageImage`] on a single node, bounded by
-//! [`MAX_PAGE_IMAGE_BYTES`] and [`MAX_PAGE_IMAGE_TOTAL_BYTES`]. Those caps
-//! bound the worst case rather than forbid a shape: tiled nodes can still add
-//! up to a surface-sized framebuffer. What they buy is a ceiling on what one
-//! frame can cost, and what the display list buys over a bare canvas is the
-//! roles, labels and focus order a framebuffer cannot carry.
+//! Plugin-produced pixels cross only as a [`PageImage`] on a single node,
+//! bounded by [`MAX_PAGE_IMAGE_BYTES`] and [`MAX_PAGE_IMAGE_TOTAL_BYTES`].
+//! Those caps bound the worst case rather than forbid a shape: tiled nodes
+//! can still add up to a surface-sized framebuffer. What they buy is a ceiling
+//! on what one display-list frame can cost, and what the display list buys over
+//! a bare canvas is the roles, labels and focus order a framebuffer cannot carry.
 //!
-//! # What a page is not
+//! # Display lists do not provide a document model
 //!
-//! There is no document model here, and that is a real cost to plugin
-//! authors, not a detail. Nothing lays out, wraps, reflows or scrolls on the
-//! plugin's behalf: a page positions every node itself in logical pixels, runs
-//! its own edit state for anything text-like, and rebuilds the list whenever
-//! its own state changes. The vocabulary is deliberately closed - a host that
+//! Nothing lays out, wraps, reflows or scrolls display-list nodes on the
+//! plugin's behalf: the plugin positions every node itself in logical pixels,
+//! runs its own edit state for anything text-like, and rebuilds the list when
+//! its own state changes. The vocabulary is deliberately closed — a host that
 //! accepted open-ended nodes could not promise to draw them.
 //!
-//! # Accessibility is carried, not inferred
+//! # Display-list accessibility is carried, not inferred
 //!
 //! A painted glyph is not an accessible name. Assistive technology reads
 //! widget semantics, so [`PageNode::role`], [`PageNode::label`] and
-//! [`PageNode::focus_order`] travel *beside* the drawing and are the only
-//! thing the host reports upwards. A plugin that paints text and leaves the
+//! [`PageNode::focus_order`] travel *beside* the drawing and are what the host
+//! reports for display-list nodes. A plugin that paints text and leaves the
 //! role unset has drawn something no screen reader can describe, which is why
 //! [`PageFrame::unlabelled_interactive`] reports it rather than leaving the
 //! omission silent.
+//!
+//! # Web surfaces use a separate rendering path
+//!
+//! A [`PageWebSurface`] instead declares an HTTP(S) address and storage mode.
+//! The host's supervised web engine owns document layout, focus and repainting;
+//! the plugin does not receive the document or its pixels. Engine pixels and
+//! document input travel on a private host-to-host path with separate limits,
+//! not as [`PageImage`]s or display-list node events. A frame cannot mix the
+//! two page forms.
 
 use std::collections::BTreeSet;
 
@@ -47,21 +54,22 @@ pub const MAX_PAGE_NODES: usize = 4_096;
 /// short enough that the host's text shaping stays bounded per node.
 pub const MAX_NODE_TEXT_BYTES: usize = 8_192;
 
-/// The soonest a self-scheduled redraw is honoured, in milliseconds.
+/// The soonest a display list's self-scheduled redraw is honoured, in milliseconds.
 ///
-/// A page asks for its next frame with `redraw_after_ms`, and nothing else
-/// bounds how often it may ask. That is affordable for a display list of
-/// geometry and it is not affordable once a frame may carry
+/// A display-list page asks for its next frame with `redraw_after_ms`, and
+/// nothing else bounds how often it may ask. That is affordable for a display
+/// list of geometry and it is not affordable once a frame may carry
 /// [`MAX_PAGE_IMAGE_TOTAL_BYTES`] of raster: at a one millisecond period those
 /// are gigabytes a second of encode, transport and decode, which is the cost
 /// profile ADR-0017 and ADR-0020 both refused. Sixteen milliseconds is one
 /// frame at the 60 Hz baseline the launcher's own budgets are written against
-/// (spec 25.1). It is a floor on the page's own timer, not a claim about what
-/// the display can present: a page that needs to track something faster
-/// should redraw from input, which this does not clamp.
+/// (spec 25.1). It is a floor on the display-list page's own timer, not a claim
+/// about what the display can present: a display list that needs to track
+/// something faster should redraw from input, which this does not clamp.
 ///
-/// This bounds self-scheduled redraws only. A frame answering user input is
-/// not delayed: input already arrives no faster than a person generates it.
+/// This bounds display-list self-scheduled redraws only. A frame answering user
+/// input is not delayed: input already arrives no faster than a person generates it.
+/// Web declarations must set `redraw_after_ms` to zero; their engine owns repainting.
 pub const MIN_PAGE_REDRAW_MS: u32 = 16;
 
 /// The largest raster a single node may carry. Exactly a 512x512 RGBA
@@ -569,7 +577,7 @@ pub fn validate_web_surface_url(url: &str) -> Result<(), PageError> {
     Ok(())
 }
 
-/// One frame of a plugin-drawn page.
+/// One frame of a plugin page: a display list or a web-surface declaration.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PageFrame {
     /// The request this answers. The host drops a frame whose generation is
@@ -584,9 +592,10 @@ pub struct PageFrame {
     /// plugin may move focus on its own frames - that is how a page advances
     /// through a form - but only within its own nodes.
     pub focus_node: u32,
-    /// Asks for another frame after this many milliseconds even without
-    /// input. Zero means the page is static until the user does something,
-    /// which is the case that costs nothing.
+    /// Asks for another display-list frame after this many milliseconds even
+    /// without input. Zero leaves the display list static until user input.
+    /// Web declarations must set this to zero: the engine owns their repainting,
+    /// and [`PageFrame::validate`] refuses a nonzero web redraw request.
     pub redraw_after_ms: u32,
     /// The plugin asking the host to close the page, which is how a page
     /// finishes its own job without the user pressing Escape.

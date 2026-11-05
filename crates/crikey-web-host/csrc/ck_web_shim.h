@@ -12,8 +12,9 @@
  * `ck_web_run`. `ck_web_watch_fd` is the only way another thread gets the
  * loop's attention, and it does so by waking it, never by touching a surface.
  *
- * The numeric codes below deliberately mirror the protocol enums in
- * `crikey_native_protocol::message`; keep both declarations in sync.
+ * WebStorageMode, WebLoadCode and WebGoneCode deliberately mirror the enums
+ * in `crikey_native_protocol::message`; keep those declarations in sync.
+ * CK_WEB_INIT_* statuses are private initialization results, not wire codes.
  */
 #ifndef CK_WEB_SHIM_H
 #define CK_WEB_SHIM_H
@@ -48,6 +49,7 @@ typedef struct ck_web_surface ck_web_surface;
 #define CK_WEB_INIT_OK           0
 #define CK_WEB_INIT_NO_LOADER  (-1)
 #define CK_WEB_INIT_NO_SHM     (-2)
+#define CK_WEB_INIT_CONTEXT_BUSY (-3)
 
 /*
  * Callbacks are invoked on the loop thread and may run synchronously inside
@@ -68,16 +70,19 @@ typedef struct {
 } ck_web_callbacks;
 
 /*
- * Loads the FDO backend and selects its headless SHM path. Must be called
- * before any surface is created. Returns CK_WEB_INIT_OK or one of the
- * CK_WEB_INIT_* failures. A successful call must be paired with
- * `ck_web_cleanup` after all surfaces have been destroyed.
+ * Reserves the default GLib context on this thread, loads the FDO backend and
+ * selects its headless SHM path. Must be called before any surface is created.
+ * Returns CK_WEB_INIT_OK or one of the CK_WEB_INIT_* failures. A context owned
+ * by another thread is refused before modifying sources or initializing WPE.
+ * A successful call must be paired with `ck_web_cleanup` on this same thread
+ * after all surfaces have been destroyed.
  */
 int32_t ck_web_init(void);
 
 /*
- * Removes every fd and signal source, unreferences the process loop and clears
- * their callback pointers. Safe to call repeatedly.
+ * Removes every fd and signal source, unreferences the process loop, clears
+ * their callback pointers and finally releases the default GLib context.
+ * Safe to call repeatedly on the initialization thread.
  */
 void ck_web_cleanup(void);
 
