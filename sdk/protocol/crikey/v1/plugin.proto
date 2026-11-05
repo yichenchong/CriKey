@@ -392,12 +392,15 @@ message PageFrame {
   uint64 generation = 1;
   string title = 2;
   repeated PageNode nodes = 3;
-  // The node the plugin wants focused, or 0 to leave focus where it is.
+  // The display-list node the plugin wants focused, or 0 to leave focus where
+  // it is. Web frames must use 0: focus belongs to the document.
   uint32 focus_node = 4;
-  // Ask for another frame this many milliseconds from now even without
-  // input. 0 means the page is static until the user acts. The host clamps a
-  // self-scheduled redraw to MIN_PAGE_REDRAW_MS (16 ms), so a shorter period
-  // is raised rather than honoured; frames answering input are not delayed.
+  // Ask for another display-list frame this many milliseconds from now even
+  // without input. 0 leaves the display list static until the user acts.
+  // The host clamps a display list's self-scheduled redraw to
+  // MIN_PAGE_REDRAW_MS (16 ms), so a shorter period is raised rather than
+  // honoured; frames answering input are not delayed. Web frames must use 0:
+  // the engine owns their repainting, and nonzero web redraws are refused.
   uint32 redraw_after_ms = 5;
   // The plugin closing its own page.
   bool close = 6;

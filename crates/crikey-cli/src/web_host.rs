@@ -1345,10 +1345,23 @@ struct PrivateEndpoint {
 impl PrivateEndpoint {
     fn create() -> Result<Self, String> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
+        // TMPDIR may be relative, but the host requires an absolute endpoint.
+        // Preserve short symlink aliases: resolving their physical targets can
+        // exceed the Unix socket path limit even when the alias fits.
+        let temporary_root = std::env::temp_dir();
+        let temporary_root = if temporary_root.is_absolute() {
+            temporary_root
+        } else {
+            std::path::absolute(&temporary_root).map_err(|error| {
+                format!(
+                    "cannot make temporary web-host directory `{}` absolute: {error}",
+                    temporary_root.display()
+                )
+            })?
+        };
         for _ in 0..32 {
             let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
-            let directory =
-                std::env::temp_dir().join(format!("crikey-web-{}-{sequence}", std::process::id()));
+            let directory = temporary_root.join(format!("crikey-web-{}-{sequence}", std::process::id()));
             match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
                 Ok(()) => {
                     let private = Self {
@@ -2029,6 +2042,80 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relative_native_tmpdir_produces_a_cwd_independent_endpoint() {
+        const CHILD: &str = "CRIKEY_WEB_RELATIVE_ENDPOINT_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let private = PrivateEndpoint::create().expect("relative temporary directory");
+            let directory = private
+                .directory
+                .canonicalize()
+                .expect("created endpoint directory");
+            let listener = Listener::bind(private.endpoint()).expect("private listener");
+            // The host accepts only absolute Unix endpoints. Exercise that
+            // same address independently of the directory used during bind.
+            std::env::set_current_dir("/").expect("leave the temporary working directory");
+            let mut peer = transport::connect(private.endpoint(), Some(Duration::from_secs(1)))
+                .expect("the endpoint remains connectable outside the launcher's working directory");
+            let mut host = listener
+                .accept(Some(Duration::from_secs(1)))
+                .expect("private connection");
+            send_payload(&mut peer, Payload::WebFrame(frame(1, 1))).expect("peer sends a frame");
+            assert_eq!(recv(&mut host).payload, Some(Payload::WebFrame(frame(1, 1))));
+            assert!(
+                private.argument().as_bytes().starts_with(b"unix:/"),
+                "the host's native argv parser requires an absolute Unix endpoint",
+            );
+            assert!(
+                private.argument().as_bytes().contains(&0xff),
+                "native TMPDIR bytes survive"
+            );
+            drop(peer);
+            drop(host);
+            drop(listener);
+            drop(private);
+            assert!(
+                !directory.exists(),
+                "cleanup is independent of the working directory"
+            );
+            return;
+        }
+
+        // TMPDIR and the working directory are process-global; isolate both.
+        let directory = TestDirectory::new();
+        let relative = OsString::from_vec(b"tmp-\xff".to_vec());
+        std::fs::create_dir(directory.0.join(&relative)).expect("native relative TMPDIR");
+        let long = directory.0.join("long-target-".repeat(12));
+        std::fs::create_dir(&long).expect("long physical temporary directory");
+        let alias = directory.0.join(OsString::from_vec(b"alias-\xff".to_vec()));
+        std::os::unix::fs::symlink(long.canonicalize().expect("physical temporary target"), &alias)
+            .expect("short temporary alias");
+        for configured in [
+            PathBuf::from(relative),
+            std::path::absolute(alias).expect("absolute temporary alias"),
+        ] {
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "web_host::tests::relative_native_tmpdir_produces_a_cwd_independent_endpoint",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .current_dir(&directory.0)
+                .env("TMPDIR", &configured)
+                .env(CHILD, "1")
+                .output()
+                .expect("isolated relative-TMPDIR test starts");
+            assert!(
+                output.status.success(),
+                "TMPDIR {configured:?} subprocess failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 
     #[test]
@@ -3419,33 +3506,55 @@ mod tests {
         }
 
         let directory = TestDirectory::new();
-        let temporary = directory.0.join(OsString::from_vec(b"native-\xff".to_vec()));
-        std::fs::create_dir(&temporary).expect("native temporary directory");
-        // TMPDIR is process-global. Exercise the production spawner and real
-        // host parser in an isolated harness rather than changing this process.
-        let output = Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "web_host::tests::real_host_connects_through_a_non_utf8_temporary_directory",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .env("TMPDIR", &temporary)
-            .output()
-            .expect("isolated native-path test starts");
-        assert!(
-            output.status.success(),
-            "real host native-path connection failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        assert_eq!(
-            std::fs::read_dir(&temporary).expect("temporary entries").count(),
-            0,
-            "the private endpoint directory is removed after connection",
-        );
+        let long = directory.0.join("long-target-".repeat(12));
+        std::fs::create_dir(&long).expect("long physical temporary directory");
+        let alias = directory.0.join(OsString::from_vec(b"alias-\xff".to_vec()));
+        std::os::unix::fs::symlink(long.canonicalize().expect("physical temporary target"), &alias)
+            .expect("short temporary alias");
+        for (name, relative) in [
+            (b"native-\xff".as_slice(), false),
+            (b"relative-utf8".as_slice(), true),
+            (b"relative-\xff".as_slice(), true),
+            (b"alias-\xff".as_slice(), false),
+        ] {
+            let name = OsString::from_vec(name.to_vec());
+            let temporary = directory.0.join(&name);
+            if !temporary.exists() {
+                std::fs::create_dir(&temporary).expect("temporary directory");
+            }
+            let configured = if relative {
+                PathBuf::from(name)
+            } else {
+                std::path::absolute(&temporary).expect("absolute native temporary directory")
+            };
+            // TMPDIR and cwd are process-global. Keep the existing absolute
+            // native-byte case and exercise valid relative roots in isolated
+            // children of the real production spawner/installed host.
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "web_host::tests::real_host_connects_through_a_non_utf8_temporary_directory",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .current_dir(&directory.0)
+                .env(CHILD, "1")
+                .env("TMPDIR", &configured)
+                .output()
+                .expect("isolated native-path test starts");
+            assert!(
+                output.status.success(),
+                "real host connection through {configured:?} failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert_eq!(
+                std::fs::read_dir(&temporary).expect("temporary entries").count(),
+                0,
+                "the private endpoint directory is removed after connection",
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
