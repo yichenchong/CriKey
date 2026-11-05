@@ -176,11 +176,13 @@ impl Drop for EngineLoop {
 /// Connects to the launcher's private endpoint and owns one WPE surface until
 /// CloseSurface, transport loss, engine failure or supervised termination.
 ///
-/// The process may enter WPE initialization only once. Concurrent or later
-/// calls report StartupFailed without accessing the process-global engine.
-/// The caller must own GLib's default main context for the duration of this
-/// call; initialization refuses a context owned by another thread before
-/// touching WPE state.
+/// The process may attempt WPE initialization only once, including refused
+/// attempts. Concurrent or later calls report StartupFailed without accessing
+/// the process-global engine. This call reserves GLib's process-default main
+/// context on the current thread until teardown. Initialization refuses a
+/// process-default context owned by another thread or a different thread-default
+/// context before touching WPE state. An explicit process-default thread-default
+/// context is supported.
 pub fn run(endpoint: Endpoint, storage_dir: Option<PathBuf>) -> Result<(), RunError> {
     validate_endpoint(&endpoint)?;
     let Endpoint::UnixSocket(path) = &endpoint else {
@@ -1204,6 +1206,8 @@ mod tests {
 
     const CONTEXT_BUSY_PROBE_ENV: &str = "CRIKEY_WEB_CONTEXT_BUSY_PROBE";
     const CONTEXT_BUSY_CODE: i32 = -3;
+    const THREAD_DEFAULT_PROBE_ENV: &str = "CRIKEY_WEB_THREAD_DEFAULT_PROBE";
+    const UNSUPPORTED_CONTEXT_CODE: i32 = -4;
 
     use crikey_native_protocol::message::{
         CloseSurface, OpenSurface, Payload, Resize, WebGoneCode, WebLoadCode, WebStorageMode,
@@ -1233,6 +1237,10 @@ mod tests {
 
     extern "C" {
         fn g_main_context_default() -> *mut GMainContext;
+        fn g_main_context_new() -> *mut GMainContext;
+        fn g_main_context_unref(context: *mut GMainContext);
+        fn g_main_context_push_thread_default(context: *mut GMainContext);
+        fn g_main_context_pop_thread_default(context: *mut GMainContext);
         fn g_main_context_acquire(context: *mut GMainContext) -> i32;
         fn g_main_context_release(context: *mut GMainContext);
     }
@@ -1273,6 +1281,36 @@ mod tests {
         release_tx.send(()).unwrap();
         owner.join().unwrap();
         assert!(matches!(result, Err(RunError::EngineInit(CONTEXT_BUSY_CODE))));
+    }
+
+    fn assert_private_thread_default_is_rejected_without_reserving_default() {
+        let context = unsafe { g_main_context_new() };
+        assert!(!context.is_null());
+        unsafe { g_main_context_push_thread_default(context) };
+        let result = EngineLoop::new();
+        unsafe {
+            g_main_context_pop_thread_default(context);
+            g_main_context_unref(context);
+        }
+        assert!(matches!(
+            result,
+            Err(RunError::EngineInit(UNSUPPORTED_CONTEXT_CODE))
+        ));
+        thread::spawn(|| {
+            let default = unsafe { g_main_context_default() };
+            assert_eq!(unsafe { g_main_context_acquire(default) }, 1);
+            unsafe { g_main_context_release(default) };
+        })
+        .join()
+        .unwrap();
+    }
+
+    fn assert_explicit_global_thread_default_is_supported() {
+        let context = unsafe { g_main_context_default() };
+        unsafe { g_main_context_push_thread_default(context) };
+        let engine = EngineLoop::new().expect("explicit process-default context is supported");
+        drop(engine);
+        unsafe { g_main_context_pop_thread_default(context) };
     }
 
     fn assert_native_load_failure_callbacks() {
@@ -1447,6 +1485,19 @@ mod tests {
 
     #[test]
     fn wpe_process_lifetime_and_native_load_failure_boundaries() {
+        if let Some(mode) = std::env::var_os(THREAD_DEFAULT_PROBE_ENV) {
+            thread::spawn(|| {
+                thread::sleep(Duration::from_secs(10));
+                std::process::exit(124);
+            });
+            if mode == "private" {
+                assert_private_thread_default_is_rejected_without_reserving_default();
+            } else {
+                assert_eq!(mode, "global");
+                assert_explicit_global_thread_default_is_supported();
+            }
+            std::process::exit(43);
+        }
         if std::env::var_os(CONTEXT_BUSY_PROBE_ENV).is_some() {
             thread::spawn(|| {
                 thread::sleep(Duration::from_secs(10));
@@ -1469,6 +1520,22 @@ mod tests {
             "busy-context probe failed: status={} stderr={stderr}",
             child.status
         );
+        for mode in ["private", "global"] {
+            let child = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("engine::tests::wpe_process_lifetime_and_native_load_failure_boundaries")
+                .arg("--nocapture")
+                .env(THREAD_DEFAULT_PROBE_ENV, mode)
+                .output()
+                .expect("run isolated thread-default context probe");
+            let stderr = String::from_utf8_lossy(&child.stderr);
+            assert_eq!(
+                child.status.code(),
+                Some(43),
+                "{mode} thread-default probe failed: status={} stderr={stderr}",
+                child.status
+            );
+        }
         let engine = EngineLoop::new().expect("initialize WPE for this process");
         assert_native_load_failure_callbacks();
         let socket =

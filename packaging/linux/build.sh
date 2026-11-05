@@ -270,10 +270,13 @@ for requested in "${requested_targets[@]}"; do
 done
 
 packaging_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repository_root="$(cd "$packaging_root/../.." && pwd)"
+# Cargo reports physical manifest paths even through a symlinked checkout.
+# Keep both roots physical so artifact selection and Flatpak's in-checkout
+# workspace exclusion compare paths using the same directory identity.
+repository_root="$(cd "$packaging_root/../.." && pwd -P)"
 output="${output:-$repository_root/target/packaging/linux}"
 mkdir -p "$output"
-output="$(cd "$output" && pwd)"
+output="$(cd "$output" && pwd -P)"
 
 # The version lives in one place, `[workspace.package]`, and is read rather
 # than repeated here so a release bump cannot leave one artefact behind.

@@ -50,6 +50,7 @@ typedef struct ck_web_surface ck_web_surface;
 #define CK_WEB_INIT_NO_LOADER  (-1)
 #define CK_WEB_INIT_NO_SHM     (-2)
 #define CK_WEB_INIT_CONTEXT_BUSY (-3)
+#define CK_WEB_INIT_UNSUPPORTED_CONTEXT (-4)
 
 /*
  * Callbacks are invoked on the loop thread and may run synchronously inside
@@ -72,10 +73,13 @@ typedef struct {
 /*
  * Reserves the default GLib context on this thread, loads the FDO backend and
  * selects its headless SHM path. Must be called before any surface is created.
- * Returns CK_WEB_INIT_OK or one of the CK_WEB_INIT_* failures. A context owned
- * by another thread is refused before modifying sources or initializing WPE.
- * A successful call must be paired with `ck_web_cleanup` on this same thread
- * after all surfaces have been destroyed.
+ * Returns CK_WEB_INIT_OK or one of the CK_WEB_INIT_* failures. A non-default
+ * thread-default context is refused before acquiring the process default,
+ * modifying sources or initializing WPE; no thread-default or an explicit
+ * process-default thread-default is supported. A process-default context owned
+ * by another thread is also refused before modifying sources or initializing
+ * WPE. A successful call must be paired with `ck_web_cleanup` on this same
+ * thread after all surfaces have been destroyed.
  */
 int32_t ck_web_init(void);
 

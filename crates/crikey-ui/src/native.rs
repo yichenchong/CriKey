@@ -1611,6 +1611,15 @@ where
             }
         }
 
+        // Enter commits a composition and Escape abandons one, so while an
+        // input method owns the keyboard those keys must not also run a result
+        // or close the launcher. Record this event before dispatch: the host
+        // callback may close or replace its document, whose composition reset
+        // must not be overwritten by the retired owner's preedit afterwards.
+        if let WindowEvent::Ime(ime) = &event {
+            self.ime.update(ime);
+        }
+
         for command in touch_commands.into_iter().flatten() {
             self.dispatch_command(event_loop, command);
         }
@@ -1623,10 +1632,6 @@ where
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
-            // Enter commits a composition and Escape abandons one, so while an
-            // input method owns the keyboard those keys are its own and must
-            // not also run the selected result or close the launcher.
-            WindowEvent::Ime(ime) => self.ime.update(&ime),
             WindowEvent::KeyboardInput { .. }
             | WindowEvent::CursorMoved { .. }
             | WindowEvent::MouseInput { .. }
@@ -6488,6 +6493,8 @@ mod window_geometry_tests {
 mod web_input_tests {
     use super::*;
     #[cfg(target_os = "linux")]
+    use std::process::{Command, Stdio};
+    #[cfg(target_os = "linux")]
     use winit::platform::x11::EventLoopBuilderExtX11;
 
     fn native_web_view() -> ViewModel {
@@ -6758,15 +6765,18 @@ mod web_input_tests {
     }
 
     /// Uses a real native window/GPU surface and the actual application event
-    /// dispatcher, but injects synthetic winit Touch events, not hardware touch.
+    /// dispatcher with injected touch/IME and one XTEST keyboard event.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires an X11 display and a working GPU surface"]
+    #[ignore = "requires an X11 display, xdotool, and a working GPU surface"]
     fn native_touch_dispatch_precedes_ime_and_cannot_retarget_after_redraw() {
         struct Smoke {
             application: NativeApplication<Box<dyn FnMut(NativeLauncherEvent)>>,
             handle: NativeLauncherHandle,
             commands: Arc<Mutex<Vec<UiCommand>>>,
+            ime_replacement: Arc<Mutex<Option<ViewModel>>>,
+            ime_view: Option<ViewModel>,
+            input_deadline: Option<Instant>,
         }
         impl ApplicationHandler<NativeEvent> for Smoke {
             fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -6997,10 +7007,132 @@ mod web_input_tests {
                     ),
                     "reactivation must admit exactly one fresh contact"
                 );
+
+                assert!(self.application.terminal_error.is_none());
+                self.ime_view = Some(view);
+                // Capture one real XTEST keyboard event, then replay that event
+                // synchronously after each callback transition. This keeps an
+                // unrelated queued platform Ime::Disabled from masking stale
+                // composition before the next native keyboard consumer.
+                let mut injector = Command::new("xdotool")
+                    .args([
+                        "search",
+                        "--sync",
+                        "--onlyvisible",
+                        "--name",
+                        &format!("^CriKey PR8R6 UI input regression {}$", std::process::id()),
+                        "windowfocus",
+                        "--sync",
+                        "key",
+                        "Return",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .expect("xdotool must inject a real Enter key");
+                let injection_deadline = Instant::now() + Duration::from_secs(5);
+                let status = loop {
+                    if let Some(status) = injector.try_wait().expect("observe xdotool injection") {
+                        break status;
+                    }
+                    if Instant::now() >= injection_deadline {
+                        let _ = injector.kill();
+                        let _ = injector.wait();
+                        panic!("xdotool did not find and focus the test window within five seconds");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                assert!(status.success(), "xdotool Enter injection must succeed");
+                self.input_deadline = Some(Instant::now() + Duration::from_secs(5));
+            }
+
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                window_id: WindowId,
+                event: WindowEvent,
+            ) {
+                if !matches!(
+                    &event,
+                    WindowEvent::KeyboardInput { event, is_synthetic: false, .. }
+                        if event.state == ElementState::Pressed
+                            && event.logical_key == Key::Named(NamedKey::Enter)
+                ) {
+                    return;
+                }
+                let Some(view) = self.ime_view.take() else {
+                    return;
+                };
+                let session = self.application.active_session.expect("reactivated session");
+                // A failed preedit delivery can close the page in the host
+                // callback. The next native key must reach the query, not be
+                // suppressed by the retired document's composition.
+                for replacement_id in [Some(44), None, Some(45)] {
+                    self.handle.submit_frame(&view).expect("restore web owner");
+                    assert!(self.application.accept_latest_frame(session, false));
+                    self.application.window_event(
+                        event_loop,
+                        window_id,
+                        WindowEvent::Ime(Ime::Commit(String::new())),
+                    );
+                    let mut replacement = view.clone();
+                    if let Some(surface_id) = replacement_id {
+                        replacement.page.as_mut().expect("web page").web_surface_id = Some(surface_id);
+                    } else {
+                        replacement.page = None;
+                    }
+                    *lock_recover(&self.ime_replacement) = Some(replacement);
+                    lock_recover(&self.commands).clear();
+                    self.application.window_event(
+                        event_loop,
+                        window_id,
+                        WindowEvent::Ime(Ime::Preedit("retired-preedit".to_owned(), Some((15, 15)))),
+                    );
+                    self.application
+                        .window_event(event_loop, window_id, event.clone());
+                    let commands = lock_recover(&self.commands);
+                    match replacement_id {
+                        None => assert!(
+                            matches!(
+                                commands.as_slice(),
+                                [
+                                    UiCommand::WebIme(WebImeEvent::Preedit { surface_id: 44, .. }),
+                                    UiCommand::ExecuteDefault,
+                                ]
+                            ),
+                            "the query must receive Enter after the old page's preedit: {commands:?}"
+                        ),
+                        Some(expected_id) => assert!(
+                            matches!(
+                                commands.as_slice(),
+                                [
+                                    UiCommand::WebIme(WebImeEvent::Preedit { surface_id: 44, .. }),
+                                    UiCommand::WebInput(WebSurfaceInput::Key {
+                                        surface_id,
+                                        pressed: true,
+                                        keysym: 0xff0d,
+                                        ..
+                                    }),
+                                ] if *surface_id == expected_id
+                            ),
+                            "Enter must follow preedit and target the current document: {commands:?}"
+                        ),
+                    }
+                }
                 assert!(self.application.terminal_error.is_none());
                 event_loop.exit();
             }
-            fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                if self.ime_view.is_some() {
+                    let deadline = self.input_deadline.expect("keyboard delivery deadline");
+                    assert!(
+                        Instant::now() < deadline,
+                        "the native Enter event was not delivered"
+                    );
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                }
+            }
         }
         let mut builder = EventLoop::<NativeEvent>::with_user_event();
         let event_loop = builder
@@ -7014,15 +7146,35 @@ mod web_input_tests {
         };
         let commands = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&commands);
+        let ime_replacement: Arc<Mutex<Option<ViewModel>>> = Arc::new(Mutex::new(None));
+        let callback_replacement = Arc::clone(&ime_replacement);
+        let callback_handle = handle.clone();
         let callback: Box<dyn FnMut(NativeLauncherEvent)> = Box::new(move |event| {
             if let NativeLauncherEvent::Command { command, .. } = event {
+                if matches!(&command, UiCommand::WebIme(WebImeEvent::Preedit { .. })) {
+                    if let Some(replacement) = lock_recover(&callback_replacement).take() {
+                        callback_handle
+                            .submit_frame(&replacement)
+                            .expect("publish the host callback's next owner");
+                    }
+                }
                 lock_recover(&observed).push(command);
             }
         });
         let mut smoke = Smoke {
-            application: NativeApplication::new(NativeLauncherConfig::default(), handle.clone(), callback),
+            application: NativeApplication::new(
+                NativeLauncherConfig {
+                    title: format!("CriKey PR8R6 UI input regression {}", std::process::id()),
+                    ..NativeLauncherConfig::default()
+                },
+                handle.clone(),
+                callback,
+            ),
             handle,
             commands,
+            ime_replacement,
+            ime_view: None,
+            input_deadline: None,
         };
         event_loop.run_app(&mut smoke).expect("native smoke loop");
     }

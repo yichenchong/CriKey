@@ -1,9 +1,11 @@
 use std::process::ExitCode;
 
 #[cfg(target_os = "linux")]
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 #[cfg(target_os = "linux")]
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use crikey_native_protocol::Endpoint;
@@ -72,15 +74,15 @@ impl Options {
                     let value = arguments
                         .next()
                         .ok_or_else(|| "--endpoint requires a value".to_owned())?;
-                    let value = value
-                        .to_str()
-                        .ok_or_else(|| "--endpoint must be valid UTF-8".to_owned())?;
-                    let parsed =
-                        Endpoint::parse(value).map_err(|error| format!("invalid --endpoint: {error}"))?;
-                    if !matches!(&parsed, Endpoint::UnixSocket(path) if path.is_absolute()) {
-                        return Err("--endpoint must be an absolute Unix socket path".to_owned());
-                    }
-                    endpoint = Some(parsed);
+                    // This private argv boundary carries a native Unix path,
+                    // not the shared protocol's UTF-8 endpoint spelling.
+                    let path = value
+                        .as_bytes()
+                        .strip_prefix(b"unix:")
+                        .map(|bytes| Path::new(OsStr::from_bytes(bytes)))
+                        .filter(|path| path.is_absolute() && !path.as_os_str().as_bytes().contains(&0))
+                        .ok_or_else(|| "--endpoint must be an absolute Unix socket path".to_owned())?;
+                    endpoint = Some(Endpoint::UnixSocket(path.to_path_buf()));
                 }
                 Some("--storage-dir") => {
                     if storage_dir.is_some() {
@@ -167,6 +169,36 @@ mod tests {
             assert!(parse(&arguments).is_err(), "{arguments:?}");
         }
         assert!(matches!(parse(&["host", "--help"]), Ok(ParseResult::Help)));
+    }
+
+    #[test]
+    fn endpoint_preserves_native_socket_path_bytes() {
+        let path = OsString::from_vec(b"/tmp/crikey-\xff/host.sock".to_vec());
+        let mut endpoint = OsString::from("unix:");
+        endpoint.push(&path);
+        let ParseResult::Run(options) =
+            Options::parse([OsString::from("host"), OsString::from("--endpoint"), endpoint]).unwrap()
+        else {
+            panic!("expected run options");
+        };
+        assert_eq!(options.endpoint, Endpoint::UnixSocket(PathBuf::from(path)));
+    }
+
+    #[test]
+    fn endpoint_rejects_empty_relative_and_nul_native_paths() {
+        for endpoint in [
+            b"unix:".as_slice(),
+            b"unix:relative-\xff",
+            b"unix:/tmp/nul\0path",
+            b"pipe:/tmp/host.sock",
+        ] {
+            assert!(Options::parse([
+                OsString::from("host"),
+                OsString::from("--endpoint"),
+                OsString::from_vec(endpoint.to_vec()),
+            ])
+            .is_err());
+        }
     }
 
     #[test]
