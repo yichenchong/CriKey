@@ -20,7 +20,7 @@ use thiserror::Error;
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
-    event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
+    event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, KeyLocation, ModifiersState, NamedKey, NativeKey, NativeKeyCode, PhysicalKey},
     platform::scancode::PhysicalKeyExtScancode,
@@ -1196,6 +1196,28 @@ where
             .max(f64::MIN_POSITIVE)
     }
 
+    fn web_touch_commands(&mut self, event: &WindowEvent) -> [Option<UiCommand>; 2] {
+        let WindowEvent::Touch(touch) = event else {
+            return [None, None];
+        };
+        let surface_id = self.web_surface_id();
+        self.web_pointer.set_surface(surface_id);
+        let Some(rect) = surface_id.and_then(|surface_id| self.web_page_rect(surface_id)) else {
+            return [None, None];
+        };
+        let scale = self.web_pixels_per_point();
+        let timestamp_ms = self.input_timestamp_ms();
+        self.web_pointer
+            .native_touch_input(
+                rect,
+                touch,
+                scale,
+                timestamp_ms,
+                native_web_modifiers(self.modifiers),
+            )
+            .map(|input| input.map(UiCommand::WebInput))
+    }
+
     /// Translates a native event and reports whether the web document owns it.
     /// Position tracking still reaches egui for launcher chrome, without
     /// replaying document input. A drag retains motion and release outside.
@@ -1209,6 +1231,19 @@ where
         let surface_id = self.web_surface_id();
         self.web_pointer.set_surface(surface_id);
 
+        if self.web_pointer.touch_id.is_some()
+            && matches!(
+                event,
+                WindowEvent::CursorMoved { .. }
+                    | WindowEvent::CursorLeft { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+            )
+        {
+            // A contact owns the emulated pointer until end/cancel. Physical
+            // mouse events cannot move it or release its primary button.
+            return (None, true);
+        }
         let Some(surface_id) = surface_id else {
             return (None, false);
         };
@@ -1220,6 +1255,12 @@ where
             self.web_pointer.position = self
                 .cursor_position
                 .map(|position| web_logical_position(position, scale));
+            if self.cursor_position.is_some() {
+                // Touch end/cancel clears document hover, not the physical
+                // mouse's retained location. A stationary mouse can resume
+                // clicking without requiring a CursorMoved first.
+                self.web_pointer.departed = false;
+            }
         }
         let timestamp_ms = self.input_timestamp_ms();
         match event {
@@ -1486,6 +1527,14 @@ where
             return;
         }
 
+        // Touch must cross the same immediate ownership boundary as native
+        // keys and mouse input. Deferring it until redraw reorders a tap before
+        // a key and can retarget queued contacts to a replacement document.
+        let touch_commands = if self.active_session.is_some() {
+            self.web_touch_commands(&event)
+        } else {
+            [None, None]
+        };
         let (mut command, web_consumed) = if self.active_session.is_some() {
             self.web_command(&event)
         } else {
@@ -1560,6 +1609,10 @@ where
                 }
                 _ => {}
             }
+        }
+
+        for command in touch_commands.into_iter().flatten() {
+            self.dispatch_command(event_loop, command);
         }
 
         if let Some(command) = command {
@@ -3474,9 +3527,8 @@ fn draw_page(
                 uv: RASTER_UV,
             });
         }
-        // Native mouse positions still update chrome, but must not replay
-        // document input. Touch has no immediate native route: translate its
-        // original Touch events, never egui-winit's synthesized mouse copies.
+        // Native events already crossed the current surface's ownership
+        // boundary. Their egui copies only update launcher chrome.
         web_frame_input(&page_ui, page, rect, commands, native_web_input);
         return;
     }
@@ -3697,7 +3749,7 @@ struct WebPointerState {
     departed: bool,
     pressed_buttons: Vec<u32>,
     scrolling: bool,
-    touch_id: Option<(egui::TouchDeviceId, egui::TouchId)>,
+    touch_id: Option<(winit::event::DeviceId, u64)>,
 }
 
 impl WebPointerState {
@@ -3782,10 +3834,11 @@ impl WebPointerState {
         Some(position)
     }
 
-    fn touch_input(
+    fn native_touch_input(
         &mut self,
         rect: egui::Rect,
-        event: &egui::Event,
+        touch: &Touch,
+        pixels_per_point: f64,
         timestamp_ms: u64,
         modifiers: u32,
     ) -> [Option<WebSurfaceInput>; 2] {
@@ -3793,26 +3846,16 @@ impl WebPointerState {
         let Some(surface_id) = self.surface_id else {
             return inputs;
         };
-        let egui::Event::Touch {
-            device_id,
-            id,
-            phase,
-            pos,
-            ..
-        } = event
-        else {
-            return inputs;
-        };
-        let identity = (*device_id, *id);
-        if *phase == egui::TouchPhase::Start {
-            if self.touch_id.is_some() {
+        let identity = (touch.device_id, touch.id);
+        if touch.phase == TouchPhase::Started {
+            if self.touch_id.is_some() || self.captured() || self.scrolling {
                 return inputs;
             }
             self.touch_id = Some(identity);
         } else if self.touch_id != Some(identity) {
             return inputs;
         }
-        self.position = Some(*pos);
+        self.position = Some(web_logical_position(touch.location, pixels_per_point));
         let motion = |(x, y)| WebSurfaceInput::PointerMove {
             surface_id,
             timestamp_ms,
@@ -3830,22 +3873,22 @@ impl WebPointerState {
             press_count: 1,
             modifiers,
         };
-        match phase {
-            egui::TouchPhase::Start => {
+        match touch.phase {
+            TouchPhase::Started => {
                 inputs[0] = self.motion(rect).map(motion);
                 inputs[1] = self
                     .button(rect, WEB_POINTER_BUTTON_LEFT, true)
                     .map(|position| button(position, true));
             }
-            egui::TouchPhase::Move => inputs[0] = self.motion(rect).map(motion),
-            egui::TouchPhase::End => {
+            TouchPhase::Moved => inputs[0] = self.motion(rect).map(motion),
+            TouchPhase::Ended => {
                 inputs[0] = self
                     .button(rect, WEB_POINTER_BUTTON_LEFT, false)
                     .map(|position| button(position, false));
                 inputs[1] = self.departure().map(motion);
                 self.touch_id = None;
             }
-            egui::TouchPhase::Cancel => {
+            TouchPhase::Cancelled => {
                 // Cancellation cannot activate the control under the last
                 // contact position, but must release its captured button.
                 inputs[0] = self.departure().map(motion);
@@ -3871,9 +3914,8 @@ fn web_frame_pointer(context: &egui::Context) -> Arc<Mutex<WebPointerState>> {
 ///
 /// The native window path translates richer winit events before constructing
 /// a frame, preserving hardware keycodes, repeat, wheel phase and IME ranges.
-/// Its mouse positions inform chrome without fallback replay. Original touch
-/// events are the exception: they have no immediate native translation and
-/// are handled here without replaying egui-winit's synthesized mouse events.
+/// Its event copies inform chrome without fallback replay, including touch:
+/// deferred contacts must never be delivered to a later surface identity.
 /// Standalone frames preserve pointer/scroll/IME and named navigation keys;
 /// missing hardware metadata remains zero. Printable text arrives as text.
 fn web_frame_input(
@@ -3883,14 +3925,7 @@ fn web_frame_input(
     commands: &mut Vec<UiCommand>,
     native_web_input: bool,
 ) {
-    if native_web_input
-        && !ui.input(|state| {
-            state
-                .events
-                .iter()
-                .any(|event| matches!(event, egui::Event::Touch { .. }))
-        })
-    {
+    if native_web_input {
         return;
     }
     let Some(surface_id) = page.web_surface_id.filter(|surface_id| *surface_id != 0) else {
@@ -3923,16 +3958,6 @@ fn web_frame_input(
     ui.input(|state| {
         let timestamp_ms = (state.time.max(0.0) * 1000.0) as u64;
         for event in &state.events {
-            if native_web_input {
-                commands.extend(
-                    pointer
-                        .touch_input(rect, event, timestamp_ms, web_modifiers(state.modifiers))
-                        .into_iter()
-                        .flatten()
-                        .map(UiCommand::WebInput),
-                );
-                continue;
-            }
             match event {
                 egui::Event::PointerMoved(position) => {
                     pointer.position = Some(*position);
@@ -6447,6 +6472,8 @@ mod window_geometry_tests {
 #[cfg(test)]
 mod web_input_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use winit::platform::x11::EventLoopBuilderExtX11;
 
     fn native_web_view() -> ViewModel {
         let mut launcher = crate::LauncherViewModel::new();
@@ -6510,10 +6537,89 @@ mod web_input_tests {
     }
 
     #[test]
-    fn native_touch_preserves_capture_and_ignores_its_synthesized_mouse_copies() {
-        for terminal in [egui::TouchPhase::End, egui::TouchPhase::Cancel] {
+    fn native_touch_preserves_capture_and_primary_contact_ownership() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 80.0));
+        let inside = rect.center();
+        let outside = rect.max + egui::vec2(5.0, 6.0);
+        let touch = |id, phase, pos: egui::Pos2| Touch {
+            device_id: winit::event::DeviceId::dummy(),
+            id,
+            phase,
+            location: PhysicalPosition::new(f64::from(pos.x) * 2.0, f64::from(pos.y) * 2.0),
+            force: None,
+        };
+        for terminal in [TouchPhase::Ended, TouchPhase::Cancelled] {
+            let mut pointer = WebPointerState::default();
+            pointer.set_surface(Some(41));
+            let mut inputs = Vec::new();
+            for event in [
+                touch(7, TouchPhase::Started, inside),
+                touch(8, TouchPhase::Started, inside),
+                touch(7, TouchPhase::Moved, outside),
+                touch(8, TouchPhase::Ended, inside),
+                touch(7, terminal, outside),
+            ] {
+                inputs.extend(
+                    pointer
+                        .native_touch_input(rect, &event, 2.0, 10, 0)
+                        .into_iter()
+                        .flatten(),
+                );
+            }
+            let buttons: Vec<_> = inputs
+                .iter()
+                .filter_map(|input| match input {
+                    WebSurfaceInput::PointerButton { pressed, x, y, .. } => Some((*pressed, *x, *y)),
+                    _ => None,
+                })
+                .collect();
+            let release = if terminal == TouchPhase::Cancelled {
+                (false, -1.0, -1.0)
+            } else {
+                (false, rect.width() + 5.0, rect.height() + 6.0)
+            };
+            assert_eq!(
+                buttons,
+                vec![(true, inside.x - rect.min.x, inside.y - rect.min.y), release],
+                "one contact owns exactly one press/release at the current scale"
+            );
+            assert!(!pointer.captured());
+            let restarted =
+                pointer.native_touch_input(rect, &touch(9, TouchPhase::Started, inside), 2.0, 11, 0);
+            assert!(matches!(
+                restarted[1],
+                Some(WebSurfaceInput::PointerButton { pressed: true, .. })
+            ));
+
+            // An engine replacement retires the contact. Its late end cannot
+            // release a button or activate anything in the replacement.
+            pointer.set_surface(Some(42));
+            assert_eq!(
+                pointer.native_touch_input(rect, &touch(9, TouchPhase::Ended, inside), 2.0, 12, 0),
+                [None, None]
+            );
+            pointer.position = Some(inside);
+            assert!(pointer.button(rect, WEB_POINTER_BUTTON_LEFT, true).is_some());
+            assert_eq!(
+                pointer.native_touch_input(rect, &touch(10, TouchPhase::Started, inside), 2.0, 13, 0),
+                [None, None],
+                "a contact must not steal a physical mouse drag"
+            );
+            assert!(pointer.button(rect, WEB_POINTER_BUTTON_LEFT, false).is_some());
+            pointer.scrolling = true;
+            assert_eq!(
+                pointer.native_touch_input(rect, &touch(11, TouchPhase::Started, inside), 2.0, 14, 0),
+                [None, None],
+                "a contact must not steal an active physical scroll gesture"
+            );
+        }
+    }
+
+    #[test]
+    fn native_buffered_touch_never_replays_or_retargets_a_replacement_document() {
+        for surface_id in [Some(41), Some(42), None] {
             let context = create_launcher_context();
-            let view = native_web_view();
+            let mut view = native_web_view();
             let input = |events| RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -6524,92 +6630,242 @@ mod web_input_tests {
                 ..Default::default()
             };
             let _ = build_launcher_frame_with_transparency(&context, input(Vec::new()), &view, false, true);
-            let rect = web_page_geometry(&context).expect("measured page").rect;
-            let inside = rect.center();
-            let outside = rect.max + egui::vec2(5.0, 6.0);
-            let touch = |id, phase, pos| egui::Event::Touch {
-                device_id: egui::TouchDeviceId(5),
-                id: egui::TouchId(id),
-                phase,
-                pos,
-                force: None,
-            };
-            let mouse = |pos, pressed| egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed,
-                modifiers: egui::Modifiers::NONE,
-            };
-            let frame = build_launcher_frame_with_transparency(
-                &context,
-                input(vec![
-                    touch(7, egui::TouchPhase::Start, inside),
-                    egui::Event::PointerMoved(inside),
-                    mouse(inside, true),
-                    touch(8, egui::TouchPhase::Start, inside),
-                    touch(7, egui::TouchPhase::Move, outside),
-                    egui::Event::PointerMoved(outside),
-                    touch(8, egui::TouchPhase::End, inside),
-                    touch(7, terminal, outside),
-                    mouse(outside, false),
-                    egui::Event::PointerGone,
-                ]),
-                &view,
-                false,
-                true,
-            );
-            let buttons: Vec<_> = frame
-                .commands
-                .iter()
-                .filter_map(|command| match command {
-                    UiCommand::WebInput(WebSurfaceInput::PointerButton { pressed, x, y, .. }) => {
-                        Some((*pressed, *x, *y))
+            let inside = web_page_geometry(&context).expect("measured page").rect.center();
+            // These copies arrived while surface 41 was current, before the
+            // next redraw accepted a replacement or pending declaration.
+            let events = vec![
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(5),
+                    id: egui::TouchId(7),
+                    phase: egui::TouchPhase::Start,
+                    pos: inside,
+                    force: None,
+                },
+                egui::Event::PointerMoved(inside),
+                egui::Event::PointerButton {
+                    pos: inside,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            view.page.as_mut().expect("web page").web_surface_id = surface_id;
+            context.options_mut(|options| options.max_passes = 3.try_into().expect("nonzero passes"));
+            let passes = AtomicU64::new(0);
+            context.on_end_pass(
+                "native touch ownership regression",
+                Arc::new(move |context| {
+                    if passes.fetch_add(1, Ordering::Relaxed) < 2 {
+                        context.request_discard("exercise native touch copies across layout passes");
                     }
-                    _ => None,
-                })
-                .collect();
-            let release = if terminal == egui::TouchPhase::Cancel {
-                (false, -1.0, -1.0)
-            } else {
-                (false, rect.width() + 5.0, rect.height() + 6.0)
-            };
-            assert_eq!(
-                buttons,
-                vec![(true, inside.x - rect.min.x, inside.y - rect.min.y), release],
-                "the primary contact owns exactly one press/release, including capture outside"
+                }),
             );
-            let motions = frame
-                .commands
-                .iter()
-                .filter(|command| matches!(command, UiCommand::WebInput(WebSurfaceInput::PointerMove { .. })))
-                .count();
-            let expected_motions = if terminal == egui::TouchPhase::Cancel {
-                3
-            } else {
-                2
-            };
-            assert_eq!(motions, expected_motions,
-                "start and drag (plus cancellation's outside endpoint) must not replay synthesized mouse input");
-            let restarted = build_launcher_frame_with_transparency(
-                &context,
-                input(vec![touch(9, egui::TouchPhase::Start, inside)]),
-                &view,
-                false,
-                true,
-            );
-            assert_eq!(
-                restarted
+            let frame = build_launcher_frame_with_transparency(&context, input(events), &view, false, true);
+            assert!(
+                !frame
                     .commands
                     .iter()
-                    .filter(|command| matches!(
-                        command,
-                        UiCommand::WebInput(WebSurfaceInput::PointerButton { pressed: true, .. })
-                    ))
-                    .count(),
-                1,
-                "end/cancel must release contact ownership for the next touch"
+                    .any(|command| matches!(command, UiCommand::WebInput(_) | UiCommand::WebIme(_))),
+                "native copies must not dispatch again under surface {surface_id:?}"
             );
         }
+    }
+
+    /// Uses a real native window/GPU surface and the actual application event
+    /// dispatcher, but injects synthetic winit Touch events, not hardware touch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an X11 display and a working GPU surface"]
+    fn native_touch_dispatch_precedes_ime_and_cannot_retarget_after_redraw() {
+        struct Smoke {
+            application: NativeApplication<Box<dyn FnMut(NativeLauncherEvent)>>,
+            handle: NativeLauncherHandle,
+            commands: Arc<Mutex<Vec<UiCommand>>>,
+        }
+        impl ApplicationHandler<NativeEvent> for Smoke {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                self.application.resumed(event_loop);
+                assert!(self.application.terminal_error.is_none());
+                let mut view = native_web_view();
+                let page = view.page.as_mut().expect("web page");
+                page.web_generation = 1;
+                page.web_frame = Some(Arc::new(WebSurfaceFrame {
+                    surface_id: 41,
+                    generation: 1,
+                    pixel_width: 1,
+                    pixel_height: 1,
+                    rgba8: Arc::from([32, 96, 160, 255]),
+                }));
+                let session = self.handle.shared.claim_activation().expect("new activation");
+                self.handle.submit_frame(&view).expect("publish initial frame");
+                self.application.user_event(
+                    event_loop,
+                    NativeEvent::Activate {
+                        session,
+                        requested_at: Instant::now(),
+                    },
+                );
+                let draw = self
+                    .application
+                    .graphics
+                    .as_mut()
+                    .expect("graphics")
+                    .draw(&view)
+                    .expect("present initial raster");
+                assert!(draw.presented_at.is_some(), "the real surface must present");
+                lock_recover(&self.commands).clear();
+                let window_id = self.application.graphics.as_ref().expect("graphics").window.id();
+                let rect = self.application.web_page_rect(41).expect("measured web page");
+                let scale = self.application.web_pixels_per_point();
+                let touch = |id, phase| {
+                    WindowEvent::Touch(Touch {
+                        device_id: winit::event::DeviceId::dummy(),
+                        id,
+                        phase,
+                        location: PhysicalPosition::new(
+                            f64::from(rect.center().x) * scale,
+                            f64::from(rect.center().y) * scale,
+                        ),
+                        force: None,
+                    })
+                };
+                self.application.window_event(
+                    event_loop,
+                    window_id,
+                    WindowEvent::CursorMoved {
+                        device_id: winit::event::DeviceId::dummy(),
+                        position: PhysicalPosition::new(
+                            f64::from(rect.center().x) * scale,
+                            f64::from(rect.center().y) * scale,
+                        ),
+                    },
+                );
+                lock_recover(&self.commands).clear();
+                self.application
+                    .window_event(event_loop, window_id, touch(7, TouchPhase::Started));
+                self.application.window_event(
+                    event_loop,
+                    window_id,
+                    WindowEvent::Ime(Ime::Commit("after-touch".to_owned())),
+                );
+                {
+                    let commands = lock_recover(&self.commands);
+                    assert!(
+                        matches!(commands.as_slice(), [
+                        UiCommand::WebInput(WebSurfaceInput::PointerMove { surface_id: 41, .. }),
+                        UiCommand::WebInput(WebSurfaceInput::PointerButton { surface_id: 41, pressed: true, .. }),
+                        UiCommand::WebIme(WebImeEvent::Commit { surface_id: 41, text }),
+                    ] if text == "after-touch"),
+                        "native touch must dispatch before the following IME event: {commands:?}"
+                    );
+                }
+                self.application.window_event(
+                    event_loop,
+                    window_id,
+                    WindowEvent::MouseInput {
+                        device_id: winit::event::DeviceId::dummy(),
+                        state: ElementState::Released,
+                        button: MouseButton::Left,
+                    },
+                );
+                assert!(
+                    self.application.web_pointer.captured(),
+                    "a mouse release cannot release touch capture"
+                );
+                assert_eq!(lock_recover(&self.commands).len(), 3);
+                self.application
+                    .window_event(event_loop, window_id, touch(7, TouchPhase::Ended));
+                lock_recover(&self.commands).clear();
+                for state in [ElementState::Pressed, ElementState::Released] {
+                    self.application.window_event(
+                        event_loop,
+                        window_id,
+                        WindowEvent::MouseInput {
+                            device_id: winit::event::DeviceId::dummy(),
+                            state,
+                            button: MouseButton::Left,
+                        },
+                    );
+                }
+                assert!(
+                    matches!(
+                        lock_recover(&self.commands).as_slice(),
+                        [
+                            UiCommand::WebInput(WebSurfaceInput::PointerButton { pressed: true, .. }),
+                            UiCommand::WebInput(WebSurfaceInput::PointerButton { pressed: false, .. }),
+                        ]
+                    ),
+                    "stationary mouse input must resume after touch ends"
+                );
+                self.application
+                    .window_event(event_loop, window_id, touch(9, TouchPhase::Started));
+
+                let page = view.page.as_mut().expect("web page");
+                page.web_surface_id = Some(42);
+                page.web_frame = None;
+                self.handle.submit_frame(&view).expect("publish replacement");
+                assert!(self.application.accept_latest_frame(session, false));
+                lock_recover(&self.commands).clear();
+                self.application.redraw(event_loop);
+                self.application
+                    .window_event(event_loop, window_id, touch(9, TouchPhase::Ended));
+                assert!(
+                    !lock_recover(&self.commands)
+                        .iter()
+                        .any(|command| matches!(command, UiCommand::WebInput(_) | UiCommand::WebIme(_))),
+                    "queued copies and a late end must not target the replacement"
+                );
+
+                // Pending declarations own no contacts. Admission must not
+                // replay the pending start that egui buffered for chrome.
+                view.page.as_mut().expect("web page").web_surface_id = None;
+                self.handle
+                    .submit_frame(&view)
+                    .expect("publish pending declaration");
+                assert!(self.application.accept_latest_frame(session, false));
+                self.application
+                    .window_event(event_loop, window_id, touch(8, TouchPhase::Started));
+                view.page.as_mut().expect("web page").web_surface_id = Some(43);
+                self.handle.submit_frame(&view).expect("publish admitted surface");
+                assert!(self.application.accept_latest_frame(session, false));
+                lock_recover(&self.commands).clear();
+                self.application.redraw(event_loop);
+                self.application
+                    .window_event(event_loop, window_id, touch(8, TouchPhase::Ended));
+                assert!(
+                    !lock_recover(&self.commands)
+                        .iter()
+                        .any(|command| matches!(command, UiCommand::WebInput(_) | UiCommand::WebIme(_))),
+                    "admission cannot replay pending contacts"
+                );
+                assert!(self.application.terminal_error.is_none());
+                event_loop.exit();
+            }
+            fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+        }
+        let mut builder = EventLoop::<NativeEvent>::with_user_event();
+        let event_loop = builder
+            .with_x11()
+            .with_any_thread(true)
+            .build()
+            .expect("X11 event loop");
+        let handle = NativeLauncherHandle {
+            proxy: Arc::new(EventProxy::new(event_loop.create_proxy())),
+            shared: Arc::new(SharedState::default()),
+        };
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&commands);
+        let callback: Box<dyn FnMut(NativeLauncherEvent)> = Box::new(move |event| {
+            if let NativeLauncherEvent::Command { command, .. } = event {
+                lock_recover(&observed).push(command);
+            }
+        });
+        let mut smoke = Smoke {
+            application: NativeApplication::new(NativeLauncherConfig::default(), handle.clone(), callback),
+            handle,
+            commands,
+        };
+        event_loop.run_app(&mut smoke).expect("native smoke loop");
     }
 
     #[test]

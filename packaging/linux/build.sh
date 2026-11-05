@@ -409,7 +409,6 @@ resolve_binaries() {
 		local magic=""
 		IFS= read -r -N 4 magic <"$web_host_binary" || true
 		if [[ $magic == $'\x7fELF' ]]; then
-			require_tool ldd "libc-bin or glibc-common" stage
 			local linked
 			if ! linked="$(LC_ALL=C ldd "$web_host_binary" 2>&1)"; then
 				fail "could not inspect runtime libraries for $web_host_binary: $linked"
@@ -764,6 +763,9 @@ flatpak() {
 # installed wastes all of them.
 preflight() {
 	if wanted stage || wanted tarball || wanted deb || wanted rpm; then
+		if [[ $with_web_surface == yes ]]; then
+			require_tool ldd "libc-bin or glibc-common" stage
+		fi
 		if [[ -z $binary && -z $launcher_binary && -z $wasm_host_binary && -z $cabi_host_binary ]]; then
 			require_tool cargo "Rust toolchain" stage
 			require_tool jq jq stage

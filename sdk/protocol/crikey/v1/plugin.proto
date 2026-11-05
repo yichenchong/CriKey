@@ -420,6 +420,8 @@ message PageWebSurface {
   // Empty on a later frame means "stay where you are"; the host refuses an
   // empty first navigation rather than opening a blank document.
   string url = 1;
+  // Defaults to ephemeral. The choice cannot change while the surface is
+  // open; later stay/navigation frames must repeat the original mode.
   WebStorageMode storage = 2;
 }
 
@@ -590,12 +592,13 @@ message RawInput {
 
 // Input-method traffic, already normalised by the launcher.
 //
-// The launcher converts winit's UTF-8 *byte* cursor offsets to the *character*
-// offsets WebKit expects before sending, and it does not forward the empty
-// preedit winit emits immediately before a commit: bridging that clear
-// straight through produces a spurious empty compositionend ahead of the real
-// one. Correction of already-committed text (delete-surrounding) is not part
-// of version 1.
+// The launcher converts winit's UTF-8 byte cursor offsets to Unicode scalar
+// offsets before sending. The web host converts those scalar offsets to
+// WebKit's UTF-16 code units; a supplementary character counts as one on the
+// wire and two in WebKit. An empty preedit immediately before a commit must
+// not end the composition ahead of the commit; the host bridges that sequence.
+// Correction of already-committed text (delete-surrounding) is not part of
+// version 1.
 message ImeEvent {
   enum Kind {
     KIND_UNSPECIFIED = 0;
@@ -605,8 +608,8 @@ message ImeEvent {
   uint64 surface_id = 1;
   Kind kind = 2;
   string text = 3;
-  // Character offsets into `text`, valid only when has_cursor is set. An
-  // absent cursor is winit's `None` and is not the same as a cursor at 0.
+  // Unicode scalar offsets into `text`, valid only when has_cursor is set.
+  // An absent cursor is winit's `None`, not the same as a cursor at 0.
   uint32 cursor_begin_chars = 4;
   uint32 cursor_end_chars = 5;
   bool has_cursor = 6;

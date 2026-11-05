@@ -723,6 +723,10 @@ impl WebSurfaceBuilder {
     /// An empty URL is a protocol operation, not an empty first navigation:
     /// it lets a plugin answer another page generation without reloading the
     /// document under the user.
+    ///
+    /// This builder still defaults to [`WebStorage::Ephemeral`]. For an open
+    /// persistent surface, repeat `.storage(WebStorage::Persistent)` so the
+    /// host does not refuse the frame as a storage-mode change.
     pub fn stay(generation: u64) -> Self {
         Self::navigate(generation, String::new())
     }
@@ -736,7 +740,9 @@ impl WebSurfaceBuilder {
     /// Chooses whether the engine may retain cookies and local storage.
     ///
     /// Persistence requires the independent `permissions.web-storage` grant.
-    /// Ephemeral storage is the default.
+    /// Ephemeral storage is the default. The host fixes this choice for the
+    /// lifetime of the surface, so repeat it on every later navigation/stay
+    /// frame; close and reopen the surface to change it.
     pub fn storage(mut self, storage: WebStorage) -> Self {
         self.storage = storage;
         self
@@ -745,8 +751,9 @@ impl WebSurfaceBuilder {
     /// Validates and returns the web-surface frame.
     ///
     /// A stated URL must be an absolute HTTP(S) URL with a non-empty host.
-    /// An empty URL is accepted only as the [`WebSurfaceBuilder::stay`]
-    /// operation; the launcher refuses it when no document is already open.
+    /// An empty URL has the [`WebSurfaceBuilder::stay`] meaning, including
+    /// when passed to [`WebSurfaceBuilder::navigate`]; the launcher refuses
+    /// it when no document is already open.
     pub fn build(self) -> crikey_core::Result<PageFrame> {
         let frame = PageFrame {
             generation: self.generation,

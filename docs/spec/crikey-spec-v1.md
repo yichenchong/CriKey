@@ -2683,6 +2683,9 @@ A web surface with a stated address requires the plugin's
 `permissions.network` grant. Persistent cookies and local storage require the
 independent `permissions.web-storage` grant; network permission does not imply
 persistence. Ephemeral storage shall be discarded when the page closes.
+Every declaration for an open surface, including an empty-address stay
+declaration, shall retain the opening storage mode. Changing it shall close
+the page with a diagnostic rather than switch profiles in a live surface.
 Permission and platform checks shall complete before any engine process is
 spawned.
 

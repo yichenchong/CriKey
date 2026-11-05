@@ -31,8 +31,8 @@
 pub enum ImeOp {
     /// Replace the preedit the context reports from `get_preedit`.
     ///
-    /// `cursor_chars` is a CHARACTER offset into `text`, already clamped to
-    /// its length -- the engine has no way to report a nonsensical one.
+    /// `cursor_chars` is a Unicode scalar offset into `text`, already clamped
+    /// to its length. The native adapter converts it to WebKit's UTF-16 units.
     SetPreedit {
         text: String,
         cursor_chars: u32,
@@ -143,11 +143,10 @@ impl ImeBridge {
 /// Character offset of the char boundary at or before UTF-8 byte offset `byte`.
 ///
 /// The launcher's input source, winit, reports preedit cursor ranges as UTF-8
-/// *byte* offsets while the engine wants *character* offsets, so somebody has
-/// to convert, and getting it wrong puts the candidate window in the wrong
-/// place for every non-ASCII composition -- which is all of them. This is that
-/// conversion, kept here next to the ordering rules it travels with, so the
-/// two halves of the IME bridge are tested together.
+/// *byte* offsets. The launcher-to-host protocol carries Unicode scalar
+/// offsets, which this helper produces; the native adapter later converts
+/// those to WebKit's UTF-16 units. Keeping the byte-to-scalar conversion here
+/// lets it share tests with the IME ordering rules.
 ///
 /// A byte offset past the end clamps to the end. One landing inside a
 /// multi-byte sequence rounds down to the character that contains it: that
@@ -181,7 +180,7 @@ fn char_count(text: &str) -> u32 {
     u32::try_from(text.chars().count()).unwrap_or(u32::MAX)
 }
 
-/// The cursor offset the engine should report for `text`.
+/// The scalar cursor offset the native adapter receives for `text`.
 ///
 /// An absent cursor puts the caret at the end of the preedit, which is where
 /// it is while the user is still typing the composition.

@@ -435,6 +435,30 @@ missing_wpe_preflight() {
 }
 check "missing WPE dependencies fail before Cargo builds the launcher" missing_wpe_preflight
 
+# Keep every prerequisite available except ldd. Engine mode must discover its
+# runtime-library inspection tool before compiling either release binary set.
+missing_ldd_preflight() {
+	local tools="$workspace/no-ldd-tools" log="$workspace/missing-ldd-cargo.log" status=0 tool
+	local executables="$workspace/no-ldd-executables"
+	mkdir -p "$tools" "$executables"
+	cp -a "$fixture_bin/." "$executables/"
+	cp "$elf_web_host" "$executables/crikey-web-host"
+	for tool in bash basename dirname mkdir sed uname jq cp; do
+		ln -s "$(command -v "$tool")" "$tools/$tool"
+	done
+	ln -s "$recording_tools/cargo" "$tools/cargo"
+	ln -s "$recording_tools/pkg-config" "$tools/pkg-config"
+	env PATH="$tools" SOURCE_DATE_EPOCH=1 \
+		CARGO_TARGET_DIR="$workspace/missing-ldd-target" \
+		CRIKEY_TEST_CARGO_LOG="$log" \
+		CRIKEY_TEST_FIXTURE_BIN="$executables" \
+		"$build" --with-web-surface --targets stage \
+		"$workspace/missing-ldd" >"$workspace/missing-ldd.log" 2>&1 || status=$?
+	[[ $status -ne 0 && ! -e "$log" ]] &&
+		grep -q 'needs `ldd`' "$workspace/missing-ldd.log"
+}
+check "missing ldd fails before Cargo builds either release binary set" missing_ldd_preflight
+
 empty_web_host_preflight() {
 	local form="$1" log="$workspace/empty-web-host-$1-cargo.log" status=0
 	local -a option=(--web-host-binary "")
