@@ -2937,6 +2937,88 @@ fn a_web_document_keeps_the_footer_settings_route_without_leaking_chrome_clicks(
 }
 
 #[test]
+fn web_keyboard_navigation_cannot_activate_the_host_settings_control() {
+    for admitted in [false, true] {
+        for retained_settings_focus in [false, true] {
+            for key in [egui::Key::Enter, egui::Key::Space] {
+                let context = create_launcher_context();
+                let mut view = painted_web_view(41, 1, &[10; 8]);
+                if !admitted {
+                    let page = view.page.as_mut().expect("pending declaration");
+                    page.web_surface_id = None;
+                    page.web_frame = None;
+                    page.web_generation = 0;
+                }
+                // An empty display-list page has no document widgets; Tab
+                // therefore gives the host Settings control keyboard focus.
+                // Carry that real focus across a rendering-model transition.
+                let previous = if retained_settings_focus {
+                    page_view(Vec::new())
+                } else {
+                    view.clone()
+                };
+                let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &previous);
+                let tab = build_launcher_frame(
+                    &context,
+                    launcher_input(vec![key_press(egui::Key::Tab, egui::Modifiers::NONE)]),
+                    &previous,
+                );
+                if retained_settings_focus {
+                    assert!(
+                        context.memory(|memory| memory.focused()).is_some(),
+                        "the previous host control must really have keyboard focus"
+                    );
+                } else if admitted {
+                    assert!(matches!(
+                        web_inputs(&tab).as_slice(),
+                        [WebSurfaceInput::Key {
+                            keysym: 0xff09,
+                            pressed: true,
+                            ..
+                        }]
+                    ));
+                }
+                let mut events = vec![key_press(key, egui::Modifiers::NONE)];
+                if key == egui::Key::Space {
+                    events.push(egui::Event::Text(" ".to_owned()));
+                }
+                force_three_layout_passes(&context, false);
+                let entered = build_launcher_frame(&context, launcher_input(events), &view);
+                assert_eq!(entered.output.platform_output.num_completed_passes, 3);
+                if admitted && key == egui::Key::Enter {
+                    assert!(matches!(
+                        web_inputs(&entered).as_slice(),
+                        [WebSurfaceInput::Key {
+                            keysym: 0xff0d,
+                            pressed: true,
+                            ..
+                        }]
+                    ));
+                } else if admitted {
+                    assert!(entered.commands.contains(&UiCommand::WebIme(WebImeEvent::Commit {
+                        surface_id: 41,
+                        text: " ".to_owned(),
+                    })));
+                } else {
+                    assert!(web_inputs(&entered).is_empty());
+                    assert!(!entered
+                        .commands
+                        .iter()
+                        .any(|command| matches!(command, UiCommand::WebIme(_))));
+                }
+                assert!(
+                    !entered.commands.iter().any(|command| matches!(
+                        command,
+                        UiCommand::OpenSettings | UiCommand::SetQuery(_) | UiCommand::Quit
+                    )),
+                    "web-owned keys cannot activate host chrome, even before admission or after host focus"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn oversized_web_textures_are_dropped_before_upload_and_release_the_old_texture() {
     let context = create_launcher_context();
     let mut view = painted_web_view(41, 1, &[10; 8]);

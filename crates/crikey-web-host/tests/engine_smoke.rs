@@ -508,8 +508,9 @@ fn disconnected_launcher_unblocks_reader_and_writer_shutdown() {
     let fixture = HttpFixture::start();
     let mut host = Host::start();
     host.open(format!("{}/", fixture.url));
-    // One 320x200 frame exceeds a typical Unix socket buffer. Stop reading so
-    // shutdown exercises a blocked output writer, not just an idle worker.
+    // Stop reading briefly while the engine may produce frames, then disconnect.
+    // This checks bounded shutdown; the request and delay do not establish that
+    // the output writer reached a blocked socket send.
     fixture.requested("/");
     thread::sleep(Duration::from_millis(300));
     host.stream.shutdown(Shutdown::Both).unwrap();

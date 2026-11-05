@@ -4959,6 +4959,16 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
     // canvas under the hint line in every window the launcher opens.
     ui.spacing_mut().interact_size.y = theme::FOOTER_HEIGHT;
     let web_page = model.page.as_ref().is_some_and(|page| page.frame.web.is_some());
+    if web_page {
+        // The fallback frame builder also feeds keys through egui. Retire any
+        // host focus before its footer can interpret document Enter/Space as
+        // a click, including focus retained from a previous pointer click.
+        ui.memory_mut(|memory| {
+            if let Some(focused) = memory.focused() {
+                memory.surrender_focus(focused);
+            }
+        });
+    }
     ui.horizontal(|ui| {
         if let Some(page) = &model.page {
             // A surface that takes the whole result area has to say whose it
@@ -5008,9 +5018,9 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
             );
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            // The footer remains the mouse route into host settings. A web
-            // document owns Ctrl+, along with its other non-Escape keys, so do
-            // not advertise that shortcut while the document is open.
+            // The footer remains the pointer/accessibility route into host
+            // settings. A web document owns Ctrl+, Tab, Enter and Space: never
+            // advertise the shortcut or admit host keyboard focus here.
             let settings = ui
                 .add(
                     egui::Label::new(
@@ -5018,7 +5028,10 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
                             .small()
                             .color(colors.text),
                     )
-                    .sense(egui::Sense::click()),
+                    .sense(egui::Sense {
+                        focusable: !web_page,
+                        ..egui::Sense::click()
+                    }),
                 )
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             // Drawn in the same frame the hover is detected in, so the
@@ -6523,7 +6536,7 @@ mod web_input_tests {
     }
 
     #[test]
-    fn native_document_motion_updates_chrome_hover_without_replaying_web_input() {
+    fn native_document_copies_update_chrome_without_replaying_or_activating_it() {
         let context = create_launcher_context();
         let view = native_web_view();
         let input = |events| RawInput {
@@ -6554,6 +6567,25 @@ mod web_input_tests {
                     .iter()
                     .any(|command| matches!(command, UiCommand::WebInput(_) | UiCommand::WebIme(_))),
                 "native-owned input must not be replayed through the egui fallback"
+            );
+        }
+        for key in [egui::Key::Tab, egui::Key::Enter, egui::Key::Space] {
+            let frame = build_launcher_frame_with_transparency(
+                &context,
+                input(vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }]),
+                &view,
+                false,
+                true,
+            );
+            assert!(
+                frame.commands.is_empty(),
+                "native-owned key copies cannot replay document input or activate host chrome"
             );
         }
     }
