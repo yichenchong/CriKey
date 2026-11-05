@@ -52,9 +52,11 @@ worst case — 4 MiB per frame, one self-scheduled frame per 16 ms — against t
 unbounded rate the rejected design implies, while the rest of the display list
 keeps the roles, labels and focus ring a framebuffer cannot carry.
 
-The cycle is host-driven request/response, exactly like `suggest`: the host
-sends a `PageRequest` carrying the surface size, the events since the previous
-frame and the host palette, and the plugin answers one `PageFrame`. A plugin
+The declaration cycle is host-driven request/response, exactly like `suggest`:
+the host sends a `PageRequest` carrying the surface size, accumulated page
+events and the host palette, and the plugin answers one `PageFrame`. Web
+pointer, key and IME input goes directly to the engine over its private
+connection rather than through these plugin requests. A plugin
 cannot push a frame; `legal_plugin_payload` in
 `crates/crikey-native-host/src/worker.rs` rejects an unsolicited
 `Payload::PageFrame`, which keeps a page on the same generation-and-staleness
@@ -81,13 +83,13 @@ reopen clause arriving through the back door — "the codec gets fast enough tha
 transport is ~19 % of end to end" — except manufactured by us rather than
 observed.
 
-So the honest statement is this: we did **not** build a shared-memory
-transport, ADR-0017 still stands, and a display list is what keeps it standing.
-A fully populated node is about 60 bytes of scalars plus its own strings, so a
-realistic page of forty nodes with short labels is roughly 3 KiB — about 350×
-smaller than one pixel frame — and even a maximal 4,096-node frame is under
-250 KiB of geometry. Kilobytes per frame need no shared region. Megabytes per
-frame would demand one.
+No shared-memory transport is implemented. Display lists avoid the per-frame
+pixel cost for geometry: a fully populated node is about 60 bytes of scalars
+plus its own strings, so a realistic page of forty nodes with short labels is
+roughly 3 KiB — about 350× smaller than one pixel frame — and even a maximal
+4,096-node frame is under 250 KiB of geometry. The web route accepts a distinct
+cost: engine frames of up to 2 MiB cross the private socket. That route does
+not introduce the shared-memory data plane rejected by ADR-0017.
 
 ### Why not an in-process or child-window webview
 
@@ -190,9 +192,10 @@ screen-reader support either.
   available when an HTTP(S) application is the honest fit, but it opts into a
   separately packaged engine, network policy and higher per-open cost rather
   than turning the display-list protocol into a UI framework.
-- The host stays in control of the parts that are its business: it hit-tests,
-  it owns the palette, it clips, and it reserves Escape. A page never learns
-  where it sits on screen.
+- For display lists, the host hit-tests and supplies the palette; for web
+  surfaces, the engine hit-tests and the document controls its styling. Both
+  forms are clipped by the launcher, which reserves Escape. A plugin page
+  declaration never includes its position on screen.
 - Every frame is validated by `PageFrame::validate` before anything else sees
   it, so a malformed page is refused with a named reason instead of drawn
   partially. Non-finite geometry in particular would otherwise poison `egui`'s

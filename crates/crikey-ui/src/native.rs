@@ -4953,6 +4953,7 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
     // `STATUS_BLOCK_HEIGHT`, so leaving the default would put a strip of empty
     // canvas under the hint line in every window the launcher opens.
     ui.spacing_mut().interact_size.y = theme::FOOTER_HEIGHT;
+    let web_page = model.page.as_ref().is_some_and(|page| page.frame.web.is_some());
     ui.horizontal(|ui| {
         if let Some(page) = &model.page {
             // A surface that takes the whole result area has to say whose it
@@ -5002,16 +5003,17 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
             );
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            // Set in the footer's own type rather than raised into a button:
-            // this line is a legend of what the keyboard can do, and `Ctrl+,`
-            // belongs in it beside `Tab` and `Esc`. It is still the one control
-            // on screen no matter what the launcher is doing, so it keeps a
-            // click -- a first-time user with no idea the shortcut exists must
-            // still be able to reach settings with the mouse.
+            // The footer remains the mouse route into host settings. A web
+            // document owns Ctrl+, along with its other non-Escape keys, so do
+            // not advertise that shortcut while the document is open.
             let settings = ui
                 .add(
-                    egui::Label::new(RichText::new("Settings  Ctrl+,").small().color(colors.text))
-                        .sense(egui::Sense::click()),
+                    egui::Label::new(
+                        RichText::new(if web_page { "Settings" } else { "Settings  Ctrl+," })
+                            .small()
+                            .color(colors.text),
+                    )
+                    .sense(egui::Sense::click()),
                 )
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             // Drawn in the same frame the hover is detected in, so the
@@ -5038,9 +5040,13 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
             // measured against.
             if model.show_hints {
                 ui.label(
-                    RichText::new("Up/Down navigate   Tab complete   Esc cancel")
-                        .small()
-                        .color(colors.text_muted),
+                    RichText::new(if web_page {
+                        "Tab navigate page   Esc close page"
+                    } else {
+                        "Up/Down navigate   Tab complete   Esc cancel"
+                    })
+                    .small()
+                    .color(colors.text_muted),
                 );
             }
         });
@@ -6935,6 +6941,61 @@ mod web_input_tests {
                         .iter()
                         .any(|command| matches!(command, UiCommand::WebInput(_) | UiCommand::WebIme(_))),
                     "admission cannot replay pending contacts"
+                );
+
+                // Hiding retires both the native capture and the buffered
+                // egui copies, even when the retained window is immediately
+                // reactivated before its old contact finishes.
+                self.application
+                    .window_event(event_loop, window_id, touch(13, TouchPhase::Started));
+                assert!(self.handle.shared.claim_hide(session));
+                self.application
+                    .user_event(event_loop, NativeEvent::Hide { session });
+                assert!(self.application.active_session.is_none());
+                view.page.as_mut().expect("web page").web_surface_id = Some(44);
+                let reopened = self.handle.shared.claim_activation().expect("reactivation");
+                self.handle.submit_frame(&view).expect("publish reactivated page");
+                self.application.user_event(
+                    event_loop,
+                    NativeEvent::Activate {
+                        session: reopened,
+                        requested_at: Instant::now(),
+                    },
+                );
+                lock_recover(&self.commands).clear();
+                self.application.redraw(event_loop);
+                self.application
+                    .window_event(event_loop, window_id, touch(13, TouchPhase::Ended));
+                assert!(
+                    !lock_recover(&self.commands)
+                        .iter()
+                        .any(|command| matches!(command, UiCommand::WebInput(_) | UiCommand::WebIme(_))),
+                    "a hidden activation's contact cannot reach the reopened page"
+                );
+                lock_recover(&self.commands).clear();
+                for phase in [TouchPhase::Started, TouchPhase::Ended] {
+                    self.application
+                        .window_event(event_loop, window_id, touch(14, phase));
+                }
+                assert!(
+                    matches!(
+                        lock_recover(&self.commands).as_slice(),
+                        [
+                            UiCommand::WebInput(WebSurfaceInput::PointerMove { surface_id: 44, .. }),
+                            UiCommand::WebInput(WebSurfaceInput::PointerButton {
+                                surface_id: 44,
+                                pressed: true,
+                                ..
+                            }),
+                            UiCommand::WebInput(WebSurfaceInput::PointerButton {
+                                surface_id: 44,
+                                pressed: false,
+                                ..
+                            }),
+                            UiCommand::WebInput(WebSurfaceInput::PointerMove { surface_id: 44, .. }),
+                        ]
+                    ),
+                    "reactivation must admit exactly one fresh contact"
                 );
                 assert!(self.application.terminal_error.is_none());
                 event_loop.exit();

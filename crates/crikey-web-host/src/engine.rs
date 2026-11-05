@@ -277,6 +277,7 @@ pub fn run(endpoint: Endpoint, storage_dir: Option<PathBuf>) -> Result<(), RunEr
     let (wake_read, wake_write) = UnixStream::pair()?;
     wake_read.set_nonblocking(true)?;
     wake_write.set_nonblocking(true)?;
+    let runtime_wake = wake_write.try_clone()?;
 
     let output = Arc::new(OutputBuffer::new());
     let (recycle_tx, recycle_rx) = mpsc::sync_channel(2);
@@ -294,7 +295,7 @@ pub fn run(endpoint: Endpoint, storage_dir: Option<PathBuf>) -> Result<(), RunEr
         state,
         command_rx,
         terminal_rx,
-        wake_read,
+        (wake_read, runtime_wake),
         recycle_rx,
         Arc::clone(&output),
         engine,
@@ -544,6 +545,7 @@ struct Runtime {
     commands: Receiver<Envelope>,
     terminal: Receiver<TerminalEvent>,
     wake_read: UnixStream,
+    wake_write: UnixStream,
     callbacks: Rc<CallbackState>,
     ime: ImeBridge,
     engine: EngineLoop,
@@ -554,18 +556,20 @@ impl Runtime {
         state: HostState,
         commands: Receiver<Envelope>,
         terminal: Receiver<TerminalEvent>,
-        wake_read: UnixStream,
+        wake: (UnixStream, UnixStream),
         recycle: Receiver<Vec<u8>>,
         output: Arc<OutputBuffer>,
         engine: EngineLoop,
     ) -> Self {
         let surface_id = state.surface_id().unwrap_or(0);
+        let (wake_read, wake_write) = wake;
         Self {
             state,
             surface: None,
             commands,
             terminal,
             wake_read,
+            wake_write,
             callbacks: Rc::new(CallbackState::new(surface_id, recycle, output)),
             ime: ImeBridge::new(),
             engine,
@@ -621,18 +625,18 @@ impl Runtime {
                 result => break result,
             }
         };
-        let count = match ready {
+        match ready {
             Ok(0) => {
                 self.disconnect("transport wakeup closed".to_owned());
                 return;
             }
-            Ok(count) => count,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => {
                 self.disconnect(format!("transport wakeup failed: {error}"));
                 return;
             }
-        };
+        }
         match self.terminal.try_recv() {
             Ok(TerminalEvent::ProtocolFault(detail)) => {
                 self.protocol_fault(detail);
@@ -644,7 +648,11 @@ impl Runtime {
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
         }
-        for _ in 0..count {
+        // A full wake socket coalesces notifications, so its byte count is not
+        // the number of queued commands. Drain the authoritative queue within
+        // the dispatch budget and rearm it if that budget is exhausted.
+        let mut processed = 0;
+        for _ in 0..COMMANDS_PER_DISPATCH {
             match self.commands.try_recv() {
                 Ok(envelope) => match self.state.receive(envelope) {
                     Ok(action) => self.apply(action),
@@ -656,9 +664,13 @@ impl Runtime {
                     break;
                 }
             }
+            processed += 1;
             if self.callbacks.terminating.get() {
                 break;
             }
+        }
+        if processed == COMMANDS_PER_DISPATCH && !self.callbacks.terminating.get() {
+            signal_loop(&mut self.wake_write);
         }
     }
 
@@ -1179,24 +1191,37 @@ extern "C" {
 mod tests {
     use std::ffi::{c_char, c_void, CString};
     use std::io::{self, Read, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::ptr;
     use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use crikey_native_protocol::message::{OpenSurface, Payload, WebGoneCode, WebLoadCode, WebStorageMode};
+    use crikey_native_protocol::message::{
+        CloseSurface, OpenSurface, Payload, Resize, WebGoneCode, WebLoadCode, WebStorageMode,
+    };
     use crikey_native_protocol::{Endpoint, ProtocolError};
 
     use crate::output::OutputBuffer;
+    use crate::state::{HostAction, HostState};
 
     use super::{
         borrowed_c_string, ck_web_surface_destroy, ck_web_surface_new, envelope, on_load_state, run,
-        write_wake_byte, CallbackState, CkWebCallbacks, DeadlineReader, EngineLoop, RunError,
-        SocketTransport, CK_WEB_STORAGE_EPHEMERAL, MAX_ENGINE_TEXT_BYTES,
+        write_wake_byte, CallbackState, CkWebCallbacks, DeadlineReader, EngineLoop, RunError, Runtime,
+        SocketTransport, CK_WEB_STORAGE_EPHEMERAL, COMMAND_CAPACITY, MAX_ENGINE_TEXT_BYTES,
     };
 
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: u16,
+        revents: u16,
+    }
+
     extern "C" {
+        fn setsockopt(fd: i32, level: i32, option: i32, value: *const c_void, length: u32) -> i32;
+        fn g_poll(fds: *mut PollFd, count: u32, timeout_ms: i32) -> i32;
         fn g_error_new_literal(domain: u32, code: i32, message: *const c_char) -> *mut c_void;
         fn g_error_free(error: *mut c_void);
         fn webkit_media_error_quark() -> u32;
@@ -1272,6 +1297,115 @@ mod tests {
         }
     }
 
+    fn assert_coalesced_commands_are_drained(engine: EngineLoop) {
+        let mut state = HostState::new(None).unwrap();
+        let HostAction::Open(open) = state
+            .receive(envelope(Payload::OpenSurface(OpenSurface {
+                surface_id: 7,
+                pixel_width: 320,
+                pixel_height: 200,
+                url: "http://127.0.0.1/".to_owned(),
+                storage_mode: WebStorageMode::Ephemeral,
+                ..OpenSurface::default()
+            })))
+            .unwrap()
+        else {
+            panic!("expected native surface configuration");
+        };
+        let (commands, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
+        let (_terminal, terminal_rx) = mpsc::channel();
+        let (_recycle, recycle_rx) = mpsc::channel();
+        let (wake_read, mut wake_write) = UnixStream::pair().unwrap();
+        wake_read.set_nonblocking(true).unwrap();
+        wake_write.set_nonblocking(true).unwrap();
+        // Linux clamps this to its minimum send buffer, still small enough
+        // that separately written notification bytes fill it before the queue.
+        let send_buffer = 1024_i32;
+        assert_eq!(
+            unsafe {
+                setsockopt(
+                    wake_write.as_raw_fd(),
+                    1, // SOL_SOCKET
+                    7, // SO_SNDBUF
+                    ptr::from_ref(&send_buffer).cast(),
+                    std::mem::size_of_val(&send_buffer) as u32,
+                )
+            },
+            0,
+            "shrink real wake socket: {}",
+            io::Error::last_os_error()
+        );
+        let output = Arc::new(OutputBuffer::new());
+        let mut runtime = Runtime::new(
+            state,
+            command_rx,
+            terminal_rx,
+            (wake_read, wake_write.try_clone().unwrap()),
+            recycle_rx,
+            Arc::clone(&output),
+            engine,
+        );
+        runtime.create_surface(&open).unwrap();
+        let mut coalesced = 0;
+        for index in 0..COMMAND_CAPACITY {
+            let command = if index + 1 == COMMAND_CAPACITY {
+                Payload::CloseSurface(CloseSurface {
+                    surface_id: 7,
+                    reason: "coalesced close".to_owned(),
+                    ..CloseSurface::default()
+                })
+            } else {
+                Payload::Resize(Resize {
+                    surface_id: 7,
+                    pixel_width: 240,
+                    pixel_height: 160,
+                    ..Resize::default()
+                })
+            };
+            commands.try_send(envelope(command)).unwrap();
+            write_wake_byte(|| {
+                let result = wake_write.write(&[1]);
+                if matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock) {
+                    coalesced += 1;
+                }
+                result
+            })
+            .unwrap();
+        }
+        assert!(coalesced > 0, "fixture must exercise real wake coalescing");
+        // Dispatch only while the real fd is readable, as GLib does. Calling
+        // process_commands after readiness disappears would hide a lost wake.
+        let mut watch = PollFd {
+            fd: runtime.wake_read.as_raw_fd(),
+            events: 1, // G_IO_IN
+            revents: 0,
+        };
+        for _ in 0..COMMAND_CAPACITY {
+            let ready = unsafe { g_poll(&mut watch, 1, 0) };
+            assert!(
+                ready >= 0,
+                "poll real wake socket: {}",
+                io::Error::last_os_error()
+            );
+            if ready == 0 {
+                break;
+            }
+            assert_ne!(watch.revents & 1, 0);
+            runtime.process_commands();
+            if runtime.callbacks.terminating.get() {
+                break;
+            }
+        }
+        output.close();
+        let Some(Payload::Gone(gone)) = output.pop().and_then(|update| update.payload) else {
+            panic!("accepted CloseSurface was stranded after coalesced wakeups");
+        };
+        assert_eq!(gone.surface_id, 7);
+        assert_eq!(gone.reason, WebGoneCode::Closed);
+        assert_eq!(gone.detail, "coalesced close");
+        assert!(runtime.callbacks.terminating.get());
+    }
+
     #[test]
     fn wpe_process_lifetime_and_native_load_failure_boundaries() {
         let engine = EngineLoop::new().expect("initialize WPE for this process");
@@ -1320,7 +1454,7 @@ mod tests {
             worker.join().unwrap(),
             Err(RunError::EngineAlreadyStarted)
         ));
-        drop(engine);
+        assert_coalesced_commands_are_drained(engine);
         std::fs::remove_file(socket).unwrap();
     }
 

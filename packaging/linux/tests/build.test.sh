@@ -376,8 +376,7 @@ refuses "Flatpak refuses web mode because its recipe has no engine host or pinne
 
 # Exercise the genuine Cargo mode without requiring WPE on the test machine.
 # The recording tool supplies the exact executables Cargo would have produced;
-# the assertions below prove that build.sh selects the engine feature and uses
-# the target directory reported by Cargo metadata.
+# artifact records describe where they were actually written.
 recording_tools="$workspace/recording-tools"
 mkdir -p "$recording_tools"
 cat >"$recording_tools/pkg-config" <<'EOF'
@@ -399,11 +398,36 @@ if [[ ${1:-} == metadata ]]; then
 	printf '{"target_directory":"%s"}\n' "$escaped_target"
 	exit 0
 fi
+if [[ -n ${CARGO_BUILD_TARGET:-} ]]; then
+	target="$target/$CARGO_BUILD_TARGET"
+fi
 destination="$target/release"
 mkdir -p "$destination"
 for executable in crikey crikey-launcher crikey-wasm-host crikey-cabi-host crikey-web-host; do
 	cp "${CRIKEY_TEST_FIXTURE_BIN:?}/$executable" "$destination/$executable"
+	package="$executable"
+	case "$executable" in crikey | crikey-launcher) package=crikey-cli ;; esac
+	manifest="$PWD/crates/$package/Cargo.toml"
+	path="$destination/$executable"
+	escaped_manifest="${manifest//\\/\\\\}"
+	escaped_manifest="${escaped_manifest//\"/\\\"}"
+	escaped_path="${path//\\/\\\\}"
+	escaped_path="${escaped_path//\"/\\\"}"
+	# Same-name artifacts are not necessarily this package's release binary.
+	# Put decoys on both sides of it so selecting the first/last name fails.
+	printf '{"reason":"compiler-artifact","manifest_path":"/dependency/Cargo.toml","target":{"name":"%s","kind":["bin"]},"profile":{"test":false},"executable":"/bin/false"}\n' \
+		"$executable"
+	if [[ ${CRIKEY_TEST_CARGO_MISSING_ARTIFACT:-} == "$executable" ]]; then
+		continue
+	fi
+	printf '{"reason":"compiler-artifact","manifest_path":"%s","target":{"name":"%s","kind":["bin"]},"profile":{"test":false},"executable":"%s"}\n' \
+		"$escaped_manifest" "$executable" "$escaped_path"
+	printf '{"reason":"compiler-artifact","manifest_path":"%s","target":{"name":"%s","kind":["lib"]},"profile":{"test":false},"executable":"/bin/false"}\n' \
+		"$escaped_manifest" "$executable"
+	printf '{"reason":"compiler-artifact","manifest_path":"%s","target":{"name":"%s","kind":["bin"]},"profile":{"test":true},"executable":"/bin/false"}\n' \
+		"$escaped_manifest" "$executable"
 done
+if [[ ${CRIKEY_TEST_CARGO_BUILD_FAIL:-} == 1 ]]; then exit 1; fi
 EOF
 chmod +x "$recording_tools"/*
 
@@ -418,10 +442,45 @@ env PATH="$recording_tools:$PATH" \
 check "engine mode asks Cargo for the real web-host binary with its engine feature" \
 	bash -c 'grep -q -- "--package crikey-web-host" "$1" &&
 		grep -q -- "--features engine" "$1"' _ "$cargo_log"
-check "engine mode stages the web host from Cargo's reported target directory" \
+check "engine mode stages the web host from Cargo's executable artifact" \
 	cmp -s "$web_host_stand_in" "$cargo_mode_out/stage/lib/crikey/crikey-web-host"
-check "Cargo metadata cannot rewrite the release lockfile" \
-	grep -q -- "metadata --locked --format-version 1 --no-deps" "$cargo_log"
+check "Cargo release builds cannot rewrite the release lockfile" \
+	grep -q -- "build --release --locked" "$cargo_log"
+
+# An explicit native target changes Cargo's layout even without cross-compiling.
+# Leave stale binaries at the old guessed paths so this catches silent
+# mispackaging, not only a missing-file error.
+configured_build_root="$workspace/configured-build-target"
+mkdir -p "$configured_build_root/release"
+for executable in crikey crikey-launcher crikey-wasm-host crikey-cabi-host crikey-web-host; do
+	cp /bin/false "$configured_build_root/release/$executable"
+done
+configured_build_out="$workspace/configured-build-out"
+env PATH="$recording_tools:$PATH" \
+	CARGO_TARGET_DIR="$configured_build_root" \
+	CARGO_BUILD_TARGET="$(uname -m)-unknown-linux-gnu" \
+	CRIKEY_TEST_CARGO_LOG="$workspace/configured-build-cargo.log" \
+	CRIKEY_TEST_FIXTURE_BIN="$fixture_bin" \
+	CRIKEY_PACKAGING_TEST_ALLOW_SCRIPT_WEB_HOST=1 \
+	"$build" --with-web-surface --targets stage "$configured_build_out" >/dev/null
+for executable in crikey crikey-launcher crikey-wasm-host crikey-cabi-host crikey-web-host; do
+	check "a configured build target packages the fresh $executable, not a stale default-target binary" \
+		cmp -s "$fixture_bin/$executable" "$configured_build_out/stage/lib/crikey/$executable"
+done
+
+cargo_artifact_failure() {
+	local variant="$1" status=0 out="$workspace/artifact-$1"
+	env PATH="$recording_tools:$PATH" \
+		CARGO_TARGET_DIR="$workspace/artifact-failure-target" \
+		CRIKEY_TEST_CARGO_LOG="$workspace/artifact-$variant.log" \
+		CRIKEY_TEST_FIXTURE_BIN="$fixture_bin" \
+		CRIKEY_TEST_CARGO_MISSING_ARTIFACT="$([[ $variant == missing ]] && printf crikey || true)" \
+		CRIKEY_TEST_CARGO_BUILD_FAIL="$([[ $variant == failed ]] && printf 1 || true)" \
+		"$build" --targets stage "$out" >/dev/null 2>&1 || status=$?
+	[[ $status -ne 0 && ! -e "$out/stage" ]]
+}
+check "a missing release artifact cannot package an existing guessed binary" cargo_artifact_failure missing
+check "a failed Cargo build cannot package even its reported executables" cargo_artifact_failure failed
 
 missing_wpe_preflight() {
 	local log="$workspace/missing-wpe-cargo.log" status=0

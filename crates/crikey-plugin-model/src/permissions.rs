@@ -270,4 +270,22 @@ mod tests {
     fn staying_on_the_current_page_needs_no_fresh_grant() {
         assert_eq!(admit_web_surface(&Permissions::default(), false, false), Ok(()));
     }
+
+    #[test]
+    fn staying_on_a_persistent_surface_still_requires_the_storage_grant() {
+        assert_eq!(
+            admit_web_surface(&Permissions::default(), false, true),
+            Err(WebSurfaceRefusal::StorageNotGranted)
+        );
+        let storage_only = Permissions {
+            web_storage: true,
+            ..Permissions::default()
+        };
+        assert_eq!(admit_web_surface(&storage_only, false, true), Ok(()));
+        assert_eq!(
+            admit_web_surface(&storage_only, true, true),
+            Err(WebSurfaceRefusal::NetworkNotGranted),
+            "storage permission must not also authorize a fresh navigation"
+        );
+    }
 }

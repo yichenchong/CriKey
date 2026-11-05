@@ -10,21 +10,27 @@ processes and threads. For the mechanics of building and testing the tree, see
 ```mermaid
 graph TB
   subgraph main[Main process]
-    UI[UI event-loop thread: window, keyboard, presentation, page display lists]
+    UI[UI event-loop thread: window, keyboard, presentation, page composition]
     SCHED[Provider schedulers: generations, debounce, obsolete-work, cancellation]
     CORE[Core: query engine, catalog, ranking, aggregator]
     SUP[Plugin supervisors]
+    WEB[Optional web supervisor thread]
     PLAT[Platform backend]
   end
   LW[Legacy CPython worker]
   MW[Modern Python worker]
   NW[Native plugin process]
+  WH[Linux crikey-web-host: offscreen WPE engine]
+  WP[WPE content processes]
   UI --> SCHED
   SCHED --> CORE
   SCHED --> SUP
   SUP -->|bounded JSON-lines| LW
   SUP -->|bounded JSON-lines| MW
   SUP -->|bounded native v1 proto3| NW
+  UI --> WEB
+  WEB -->|bounded private native v1 proto3| WH
+  WH --> WP
   CORE --> PLAT
 ```
 
@@ -36,19 +42,19 @@ platform-dependent. Each provider driver owns a query pipeline and its own curre
 the provider generations are advanced in step with the launcher query. No
 third-party code runs inside the main process.
 
-That claim survives plugin pages, and pages are the reason to state why. A page
-is drawn by the plugin only in the sense that the plugin decides what it
-contains: what crosses the boundary is a display list of shapes, text and
-semantic roles, which the UI thread draws with the launcher's own renderer. No
-plugin code is loaded, executed or JIT-compiled in the main process — the
-alternative that would have broken the sentence above, and the reason it was
-rejected (ADR-0020).
+That claim survives both plugin-page forms. A display-list page sends shapes,
+text and semantic roles for the UI thread to draw with the launcher's own
+renderer. Plugin-rasterized pixels cross only in bounded image nodes; the host
+positions, scales and clips them. No plugin code is loaded, executed or
+JIT-compiled in the main process.
 
-Plugin-rasterized pixels do reach the surface, but only as the bounded raster
-an image node carries: the host still decides where it lands, scales it to the
-node's rectangle and clips it, and the rest of the frame remains a display
-list with roles and a focus order. A plugin handing over the whole surface as
-pixels is what ADR-0020 rejected.
+An optional Linux web page instead declares an HTTP(S) document. The launcher
+starts a separate supervised `crikey-web-host` using WPE WebKit only when the
+page opens. That host sends bounded engine-rendered RGBA frames over private
+native-protocol IPC, and the UI uploads and clips them in the existing launcher
+surface. Web content and JavaScript execute outside the main process. The
+launcher and UI do not link WPE or overlay a child window. Web input and engine
+frames do not pass through the owning plugin's connection (ADR-0020).
 
 The native worker uses the versioned proto3 protocol. The legacy and modern
 Python workers currently use separate bounded newline-delimited JSON protocols;
@@ -65,9 +71,10 @@ boundary above remains the primary isolation everywhere.
 
 | Thread | Work | Blocking rules |
 | --- | --- | --- |
-| UI event loop | winit event loop, input, immediate local catalog search, presentation, and drawing the retained page display list | Never waits for plugin I/O or a child process; small in-process Rust work may run in the event callback |
+| UI event loop | winit event loop, input, immediate local catalog search, presentation, and page display-list drawing or web-frame composition | Never waits for plugin I/O or a child process; small in-process Rust work may run in the event callback |
 | Provider supervisor threads | `LegacyDriver`, `ModernDriver`, and `NativeDriver`; each owns its `QueryPipeline`, scheduling decisions, result aggregation, worker dispatch, and the page request/response cycle | Blocking child I/O stays off the UI thread; request slots and result intake are bounded |
 | Provider dispatch threads | Modern/native catalog builds and native per-plugin calls where the provider needs parallel work | Work is cancellable or joined during shutdown; no provider thread blocks the UI event loop |
+| Web supervisor thread | Starts, communicates with and tears down the optional Linux web host; validates and publishes bounded engine frames | Blocking host I/O and process cleanup stay off the UI thread; command and output mailboxes are bounded |
 
 There is no standalone Tokio runtime or general shared CPU pool in the current
 implementation. Scheduling is a deterministic state machine driven by the
@@ -75,15 +82,20 @@ provider supervisor thread with caller-supplied millisecond timestamps; the
 driver's bounded mailbox and condition variable provide the waiting outside
 that state machine.
 
-A page uses those two threads and no others. The UI thread draws the last
-accepted frame and accumulates input; the native supervisor thread asks the
-owning plugin for the next frame, validates the answer and publishes it. The UI
-thread therefore never waits for a plugin page: a plugin that stops answering
-leaves the previous frame on screen, marked stale, at full frame rate. Pages
-borrow the query pipeline's staleness rule rather than adding one — generations
-are monotonic per open page and a frame answering an older generation is
-dropped — and the host reserves Escape, so a page cannot capture the user's way
-out of it.
+For a display-list page, the UI draws the last accepted frame and accumulates
+input while the provider supervisor asks the owning plugin for another frame,
+validates the answer and publishes it. The UI never waits for that answer:
+a plugin that stops answering leaves its previous frame on screen, marked
+stale. Plugin declarations use monotonically increasing per-page generations;
+older answers are dropped.
+
+A web page adds the launcher-side web supervisor thread and a separate host
+process. Inside that host, reader and writer threads handle private IPC while
+the engine loop owns WPE calls and callbacks; WebKit also manages its own
+content processes and threads. The plugin still answers page declarations,
+but document input and repaints use the private engine route. The UI composes
+the latest accepted engine frame rather than drawing plugin nodes. Escape
+remains reserved by the launcher for either form.
 
 ## Query pipeline
 
