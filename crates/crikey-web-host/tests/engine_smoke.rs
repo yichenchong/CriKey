@@ -291,6 +291,11 @@ impl HttpFixture {
                     held.push(stream);
                     continue;
                 }
+                if path == "/failure" {
+                    // Closing without an HTTP response is a genuine network
+                    // load failure, unlike an HTTP error status document.
+                    continue;
+                }
                 // Dynamic fixtures paint `body` over an opaque root. Give it
                 // the full viewport even when its content is empty, so the
                 // center pixel observes script-driven state changes.
@@ -693,4 +698,39 @@ fn unsupported_document_response_preserves_surface_for_next_navigation() {
     }));
     host.painted((320, 200), [0x65, 0x43, 0x21, 0xff]);
     host.close();
+}
+
+#[test]
+fn genuine_load_failure_reports_diagnostic_and_stops_without_launcher_disconnect() {
+    let fixture = HttpFixture::start();
+    let mut host = Host::start();
+    let url = format!("{}/failure", fixture.url);
+    host.open(url.clone());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match host
+            .receive(deadline)
+            .expect("native load failure deadline expired")
+        {
+            Payload::LoadState(state) if state.state == WebLoadCode::Failed => {
+                assert_eq!(state.surface_id, SURFACE_ID);
+                assert_eq!(state.url, url);
+                assert!(
+                    !state.failure.is_empty(),
+                    "native failure must retain its diagnostic"
+                );
+                break;
+            }
+            Payload::Gone(gone) => panic!("load failure lost its diagnostic: {gone:?}"),
+            _ => {}
+        }
+    }
+    fixture.requested("/failure");
+    // Keep the launcher endpoint connected: termination belongs to the fatal
+    // load boundary, not a later CloseSurface or transport-disconnect event.
+    assert!(!host.child.wait_bounded(Duration::from_secs(5)).success());
+    assert!(matches!(
+        host.reader.read_frame(&mut host.stream, &mut Vec::new()),
+        Err(ProtocolError::Closed)
+    ));
 }

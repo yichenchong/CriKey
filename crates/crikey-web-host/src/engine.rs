@@ -61,6 +61,8 @@ pub enum RunError {
     Thread(io::Error),
     #[error("WPE initialization failed ({0})")]
     EngineInit(i32),
+    #[error("WPE failed to load the web document")]
+    EngineLoad,
     #[error("WPE may be initialized only once per web-host process")]
     EngineAlreadyStarted,
     #[error("WPE refused to create the web surface")]
@@ -317,7 +319,12 @@ pub fn run(endpoint: Endpoint, storage_dir: Option<PathBuf>) -> Result<(), RunEr
     }
 
     runtime.shutdown_engine();
-    shutdown_workers(&control, &output, reader_worker, writer_worker)
+    shutdown_workers(&control, &output, reader_worker, writer_worker)?;
+    if runtime.callbacks.load_failed.get() {
+        Err(RunError::EngineLoad)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_endpoint(endpoint: &Endpoint) -> Result<(), RunError> {
@@ -858,6 +865,7 @@ struct CallbackState {
     output: Arc<OutputBuffer>,
     frame_converter: RefCell<FrameConverter>,
     gone_sent: Cell<bool>,
+    load_failed: Cell<bool>,
     terminating: Cell<bool>,
 }
 
@@ -869,6 +877,7 @@ impl CallbackState {
             output,
             frame_converter: RefCell::new(FrameConverter::new()),
             gone_sent: Cell::new(false),
+            load_failed: Cell::new(false),
             terminating: Cell::new(false),
         }
     }
@@ -1043,6 +1052,13 @@ unsafe extern "C" fn on_load_state(
             title: borrowed_c_string(title),
             ..Default::default()
         }));
+        // A genuine load failure is terminal for the launcher. Stop accepting
+        // commands and tear the engine down after preserving its diagnostic;
+        // otherwise a queued navigation can keep the failed surface alive.
+        if state == WebLoadCode::Failed {
+            runtime.load_failed.set(true);
+            runtime.quit();
+        }
     }
 }
 
@@ -1232,6 +1248,12 @@ mod tests {
                 g_error_free(error);
                 ck_web_surface_destroy(surface);
             }
+            assert_eq!(
+                callbacks.terminating.get(),
+                reports_failure,
+                "native error {domain}/{code} has the expected terminal policy"
+            );
+            assert_eq!(callbacks.load_failed.get(), reports_failure);
             output.close();
             let update = output.pop();
             if reports_failure {

@@ -254,12 +254,14 @@ were given: a frame answering an older generation is dropped, never drawn, and
 a resize advances the generation because your previous layout was for a
 different size.
 
-Return `redraw_after_ms` only if your page genuinely changes without input; `0`
-means static until the user acts, which is what a form should be. A shorter
-period than `MIN_PAGE_REDRAW_MS` (16 ms) is raised to it rather than honoured,
-because your whole display list - rasters included - is re-sent on every frame
-you answer, so a fast timer costs real bandwidth for a repaint the user is
-unlikely to perceive. Frames answering input are never delayed by that floor.
+For a display-list page, return `redraw_after_ms` only if your page genuinely
+changes without input; `0` means static until the user acts, which is what a
+form should be. A shorter period than `MIN_PAGE_REDRAW_MS` (16 ms) is raised to
+it rather than honoured, because your whole display list - rasters included -
+is re-sent on every frame you answer, so a fast timer costs real bandwidth for
+a repaint the user is unlikely to perceive. Frames answering input are never
+delayed by that floor. Web declarations must leave `redraw_after_ms` at `0`;
+the engine drives their repaints, and a nonzero plugin timer is rejected.
 
 Escape is reserved by the host. It closes your page and is never delivered to
 you, so do not plan an Escape binding. You close your own page by returning a
@@ -364,7 +366,11 @@ impl Dashboard {
 
 Use those method bodies from `Plugin::execute_outcome` and `Plugin::page`.
 Returning the request's generation is still mandatory; the builder takes it
-explicitly for that reason. Keep the same storage choice on stay frames.
+explicitly for that reason. Keep the same storage choice on stay frames:
+`WebSurfaceBuilder::stay` defaults to `WebStorage::Ephemeral`, so a persistent
+page must repeat `.storage(WebStorage::Persistent)` on every stay declaration.
+Changing storage mode while the page is open closes it with a diagnostic; use a
+new page opening to change profiles.
 
 The launcher keeps its in-page loading indicator until the first accepted RGBA
 frame arrives; the declaration itself is not painted content. Permission

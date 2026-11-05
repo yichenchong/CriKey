@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use crate::create_private_dir;
@@ -64,6 +64,9 @@ const READ_POLL: Duration = Duration::from_millis(12);
 #[cfg(target_os = "linux")]
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const MANAGER_IDLE_POLL: Duration = Duration::from_millis(25);
+// Bound diagnostic-only reads after a failed write independently of how much
+// stale output a peer buffered. Each receive retains its configured timeout.
+const MAX_FAILURE_DIAGNOSTIC_MESSAGES: usize = 64;
 #[cfg(target_os = "linux")]
 const MIN_WEB_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(target_os = "linux")]
@@ -781,12 +784,11 @@ fn handle_control(
             ) {
                 Ok(()) => host.url = url,
                 Err(error) => {
-                    host.runtime.transport.close();
-                    publish_fatal(
+                    publish_control_failure(
+                        host,
                         mailbox,
                         desired_surface,
                         wake,
-                        surface_id,
                         format!("cannot navigate the web surface: {error}"),
                     );
                     teardown(active, "navigation transport failed");
@@ -818,12 +820,11 @@ fn handle_control(
                     host.pixel_height = pixel_height;
                 }
                 Err(error) => {
-                    host.runtime.transport.close();
-                    publish_fatal(
+                    publish_control_failure(
+                        host,
                         mailbox,
                         desired_surface,
                         wake,
-                        surface_id,
                         format!("cannot resize the web surface: {error}"),
                     );
                     teardown(active, "resize transport failed");
@@ -835,12 +836,11 @@ fn handle_control(
                 return;
             };
             if let Err(error) = send_payload(&mut host.runtime.transport, event.payload) {
-                host.runtime.transport.close();
-                publish_fatal(
+                publish_control_failure(
+                    host,
                     mailbox,
                     desired_surface,
                     wake,
-                    host.surface_id,
                     format!("web host input transport failed: {error}"),
                 );
                 teardown(active, "input transport failed");
@@ -1037,6 +1037,52 @@ fn send_payload(transport: &mut Box<dyn Transport>, payload: Payload) -> Result<
         payload: Some(payload),
         ..Envelope::default()
     })
+}
+
+/// A host may flush its terminal diagnostic and exit before a queued control
+/// reaches it. Preserve that inbound reason, without retrying any failed write
+/// or allowing teardown to write into a potentially partial outbound frame.
+fn publish_control_failure(
+    host: &mut ActiveHost,
+    mailbox: &Arc<Mutex<Mailbox>>,
+    desired_surface: &AtomicU64,
+    wake: &WebWake,
+    fallback: String,
+) {
+    let deadline = Instant::now() + MANAGER_IDLE_POLL;
+    let mut terminal = false;
+    let mut completed = 0;
+    while completed < MAX_FAILURE_DIAGNOSTIC_MESSAGES {
+        if Instant::now() >= deadline || desired_surface.load(Ordering::Acquire) != host.surface_id {
+            break;
+        }
+        let envelope = match host.runtime.transport.recv() {
+            Ok(envelope) => envelope,
+            // FrameReader retains partial prefixes/bodies across timeouts.
+            // Resume that same reader within the grace deadline; only complete
+            // envelopes count toward the diagnostic-work cap.
+            Err(ProtocolError::Timeout) => continue,
+            Err(_) => break,
+        };
+        completed += 1;
+        // Unknown, stale and nonterminal output cannot replace the original
+        // control error. In particular, do not publish frames while retiring.
+        let current_terminal = match envelope.payload.as_ref() {
+            Some(Payload::LoadState(state)) => {
+                state.surface_id == host.surface_id && state.state == WebLoadCode::Failed
+            }
+            Some(Payload::Gone(gone)) => gone.surface_id == host.surface_id,
+            _ => false,
+        };
+        if current_terminal {
+            terminal = handle_incoming(envelope, host, mailbox, desired_surface, wake).is_some();
+            break;
+        }
+    }
+    host.runtime.transport.close();
+    if !terminal {
+        publish_fatal(mailbox, desired_surface, wake, host.surface_id, fallback);
+    }
 }
 
 fn teardown(active: &mut Option<ActiveHost>, reason: &str) {
@@ -1256,7 +1302,25 @@ fn persistent_storage_dir(root: &Path, plugin: &PluginId) -> Result<PathBuf, Str
     for byte in plugin.0.as_bytes() {
         let _ = write!(&mut encoded, "{byte:02x}");
     }
-    let directory = root.join(encoded);
+    // Preserve existing stores that fit one Linux filename. Longer, otherwise
+    // valid owner identities need bounded components, not truncation (which
+    // would merge owners). The non-hex names separate branch/profile roots
+    // from encoded identity components, including prefix-related owners.
+    let mut directory = root.to_owned();
+    if encoded.len() <= 254 {
+        directory.push(&encoded);
+    } else {
+        directory.push("_long");
+        create_private_dir(&directory)?;
+        let mut remaining = encoded.as_str();
+        while !remaining.is_empty() {
+            let (component, rest) = remaining.split_at(remaining.len().min(254));
+            directory.push(component);
+            create_private_dir(&directory)?;
+            remaining = rest;
+        }
+        directory.push("profile");
+    }
     create_private_dir(&directory)?;
     let absolute = directory.canonicalize().map_err(|error| {
         format!(
@@ -1811,6 +1875,8 @@ mod tests {
 
     use super::*;
     use crikey_native_protocol::transport;
+    #[cfg(target_os = "linux")]
+    use crikey_native_protocol::Message;
 
     #[derive(Debug)]
     struct FakeProcess {
@@ -2229,6 +2295,379 @@ mod tests {
                 "the original terminal diagnostic must survive process exit: {notices:?}",
             );
             assert_eq!(terminated.load(Ordering::Acquire), 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct TrackedClosedPeer {
+        inner: Box<dyn Transport>,
+        live_writes: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        closed: bool,
+        resume_after_timeout: Option<(std::os::unix::net::UnixStream, Vec<u8>)>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Transport for TrackedClosedPeer {
+        fn send(&mut self, envelope: &Envelope) -> Result<(), ProtocolError> {
+            if self.closed {
+                return Err(ProtocolError::Closed);
+            }
+            self.live_writes.fetch_add(1, Ordering::AcqRel);
+            self.inner.send(envelope)
+        }
+
+        fn recv(&mut self) -> Result<Envelope, ProtocolError> {
+            self.reads.fetch_add(1, Ordering::AcqRel);
+            let result = self.inner.recv();
+            if matches!(result, Err(ProtocolError::Timeout)) {
+                if let Some((mut peer, remainder)) = self.resume_after_timeout.take() {
+                    std::io::Write::write_all(&mut peer, &remainder).expect("complete timed-out frame");
+                }
+            }
+            result
+        }
+
+        fn try_clone_handle(&self) -> Result<Box<dyn Transport>, ProtocolError> {
+            Err(ProtocolError::Io("test transport cannot clone".to_owned()))
+        }
+
+        fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), ProtocolError> {
+            self.inner.set_read_timeout(timeout)
+        }
+
+        fn close(&mut self) {
+            self.closed = true;
+            self.inner.close();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_queued_controls_preserve_only_the_buffered_current_terminal_diagnostic() {
+        const DRAIN_LIMIT: usize = 64;
+        for operation in ["navigate", "resize", "input", "ime"] {
+            for terminal in ["failed", "gone", "none", "beyond-cap"] {
+                // The pair's bounded 64-message channel cannot synchronously
+                // preload a >64-envelope diagnostic prefix. Use real Unix
+                // buffering for that small-byte, many-envelope boundary.
+                let endpoint = PrivateEndpoint::create().expect("private buffered endpoint");
+                let listener = Listener::bind(endpoint.endpoint()).expect("buffered listener");
+                let (mut launcher, mut peer) = if terminal == "beyond-cap" {
+                    let peer = transport::connect(endpoint.endpoint(), Some(Duration::from_secs(1)))
+                        .expect("buffered Unix peer");
+                    let launcher = listener
+                        .accept(Some(Duration::from_secs(1)))
+                        .expect("buffered launcher");
+                    (launcher, peer)
+                } else {
+                    transport::pair()
+                };
+                launcher
+                    .set_read_timeout(Some(Duration::from_millis(5)))
+                    .expect("bounded receive");
+                let prefix_count = if terminal == "beyond-cap" {
+                    DRAIN_LIMIT + 1
+                } else {
+                    1
+                };
+                for _ in 0..prefix_count {
+                    send_payload(
+                        &mut peer,
+                        Payload::LoadState(LoadState {
+                            surface_id: 1,
+                            state: WebLoadCode::Started,
+                            ..LoadState::default()
+                        }),
+                    )
+                    .expect("buffered Started");
+                }
+                send_payload(
+                    &mut peer,
+                    Payload::LoadState(LoadState {
+                        surface_id: 2,
+                        state: WebLoadCode::Failed,
+                        failure: "obsolete owner must not replace the control error".to_owned(),
+                        ..LoadState::default()
+                    }),
+                )
+                .expect("buffered obsolete terminal");
+                peer.send(&Envelope {
+                    connection_id: 1,
+                    ..Envelope::default()
+                })
+                .expect("buffered unknown output");
+                if terminal != "none" {
+                    let payload = if terminal == "gone" {
+                        Payload::Gone(Gone {
+                            surface_id: 1,
+                            reason: WebGoneCode::StartupFailed,
+                            detail: "specific startup failure".to_owned(),
+                            ..Gone::default()
+                        })
+                    } else {
+                        Payload::LoadState(LoadState {
+                            surface_id: 1,
+                            state: WebLoadCode::Failed,
+                            url: "https://example.test/document".to_owned(),
+                            failure: "specific native document failure".to_owned(),
+                            ..LoadState::default()
+                        })
+                    };
+                    send_payload(&mut peer, payload).expect("buffered terminal");
+                }
+                send_payload(&mut peer, Payload::WebFrame(frame(1, 99)))
+                    .expect("post-terminal frame cannot revive the surface");
+                drop(peer);
+
+                let terminated = Arc::new(AtomicUsize::new(0));
+                let writes = Arc::new(AtomicUsize::new(0));
+                let reads = Arc::new(AtomicUsize::new(0));
+                let mut active = Some(ActiveHost {
+                    surface_id: 1,
+                    pixel_width: 2,
+                    pixel_height: 1,
+                    url: "https://example.test".to_owned(),
+                    latest_generation: 0,
+                    runtime: RunningHost {
+                        transport: Box::new(TrackedClosedPeer {
+                            inner: launcher,
+                            live_writes: Arc::clone(&writes),
+                            reads: Arc::clone(&reads),
+                            closed: false,
+                            resume_after_timeout: None,
+                        }),
+                        process: Box::new(ExitedProcess(FakeProcess {
+                            terminated: Arc::clone(&terminated),
+                        })),
+                    },
+                });
+                assert!(active
+                    .as_mut()
+                    .expect("active host")
+                    .runtime
+                    .process
+                    .try_wait()
+                    .expect("exited process")
+                    .is_some());
+                let mailbox = Arc::new(Mutex::new(Mailbox::default()));
+                let desired = AtomicU64::new(1);
+                let wake: WebWake = Arc::new(|| {});
+                publish_frame(&mailbox, &desired, &wake, frame(1, 1));
+                publish_caret(
+                    &mailbox,
+                    &desired,
+                    &wake,
+                    CaretArea {
+                        surface_id: 1,
+                        width: 1.0,
+                        height: 1.0,
+                        ..CaretArea::default()
+                    },
+                );
+                let (control, fallback_prefix) = match operation {
+                    "navigate" => (
+                        Control::Navigate {
+                            surface_id: 1,
+                            url: "https://example.test/next".to_owned(),
+                        },
+                        "cannot navigate the web surface:",
+                    ),
+                    "resize" => (
+                        Control::Resize {
+                            surface_id: 1,
+                            pixel_width: 3,
+                            pixel_height: 2,
+                        },
+                        "cannot resize the web surface:",
+                    ),
+                    "ime" => (
+                        Control::Input(Input {
+                            surface_id: 1,
+                            payload: Payload::ImeEvent(ImeEvent {
+                                surface_id: 1,
+                                kind: WebImeCode::Commit,
+                                text: "文".to_owned(),
+                                ..ImeEvent::default()
+                            }),
+                        }),
+                        "web host input transport failed:",
+                    ),
+                    _ => (
+                        Control::Input(Input {
+                            surface_id: 1,
+                            payload: Payload::RawInput(RawInput {
+                                surface_id: 1,
+                                kind: WebInputCode::FocusIn,
+                                ..RawInput::default()
+                            }),
+                        }),
+                        "web host input transport failed:",
+                    ),
+                };
+                handle_control(
+                    control,
+                    &mut active,
+                    &mailbox,
+                    &desired,
+                    &wake,
+                    &OneShotSpawner(Mutex::new(None)),
+                );
+                assert!(active.is_none());
+                assert_eq!(terminated.load(Ordering::Acquire), 1);
+                assert_eq!(
+                    writes.load(Ordering::Acquire),
+                    1,
+                    "never write after the failed control"
+                );
+                assert!(reads.load(Ordering::Acquire) <= DRAIN_LIMIT);
+                let mailbox = lock_recover(&mailbox);
+                assert!(mailbox.latest_frame.is_none());
+                assert!(mailbox.latest_caret.is_none());
+                assert_eq!(
+                    mailbox.notices.len(),
+                    1,
+                    "no generic duplicate fatal: {mailbox:?}"
+                );
+                let WebHostNotice::Fatal { surface_id, message } = &mailbox.notices[0] else {
+                    panic!("retirement must publish only its terminal failure");
+                };
+                assert_eq!(*surface_id, 1);
+                match terminal {
+                    "failed" => assert_eq!(
+                        message,
+                        "web page load failed for `https://example.test/document`: specific native document failure",
+                    ),
+                    "gone" => assert_eq!(message, "web host failed to start: specific startup failure"),
+                    _ => assert!(message.starts_with(fallback_prefix), "{message}"),
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_control_resumes_partial_terminal_frames_until_the_diagnostic_deadline() {
+        for split in [2, 6] {
+            for resume in [true, false] {
+                let endpoint = PrivateEndpoint::create().expect("partial-frame endpoint");
+                let listener = Listener::bind(endpoint.endpoint()).expect("partial-frame listener");
+                let mut peer = std::os::unix::net::UnixStream::connect(match endpoint.endpoint() {
+                    Endpoint::UnixSocket(path) => path,
+                    _ => unreachable!("Linux private endpoint is a Unix socket"),
+                })
+                .expect("raw partial-frame peer");
+                let mut launcher = listener.accept(Some(Duration::from_secs(1))).expect("launcher");
+                launcher
+                    .set_read_timeout(Some(Duration::from_millis(1)))
+                    .expect("real receive timeout");
+                let mut framed = Vec::new();
+                crikey_native_protocol::frame::write_frame(
+                    &mut framed,
+                    &Envelope {
+                        payload: Some(Payload::LoadState(LoadState {
+                            surface_id: 1,
+                            state: WebLoadCode::Failed,
+                            url: "https://example.test/partial".to_owned(),
+                            failure: "specific resumed failure".to_owned(),
+                            ..LoadState::default()
+                        })),
+                        ..Envelope::default()
+                    }
+                    .encode(),
+                )
+                .expect("framed terminal");
+                std::io::Write::write_all(&mut peer, &framed[..split]).expect("partial prefix/body");
+                peer.shutdown(std::net::Shutdown::Read)
+                    .expect("peer no longer accepts controls");
+                let (resume_after_timeout, _incomplete_peer) = if resume {
+                    (Some((peer, framed[split..].to_vec())), None)
+                } else {
+                    (None, Some(peer))
+                };
+                let writes = Arc::new(AtomicUsize::new(0));
+                let reads = Arc::new(AtomicUsize::new(0));
+                let terminated = Arc::new(AtomicUsize::new(0));
+                let mut active = Some(ActiveHost {
+                    surface_id: 1,
+                    pixel_width: 2,
+                    pixel_height: 1,
+                    url: "https://example.test".to_owned(),
+                    latest_generation: 0,
+                    runtime: RunningHost {
+                        transport: Box::new(TrackedClosedPeer {
+                            inner: launcher,
+                            live_writes: Arc::clone(&writes),
+                            reads: Arc::clone(&reads),
+                            closed: false,
+                            resume_after_timeout,
+                        }),
+                        process: Box::new(ExitedProcess(FakeProcess {
+                            terminated: Arc::clone(&terminated),
+                        })),
+                    },
+                });
+                let mailbox = Arc::new(Mutex::new(Mailbox::default()));
+                let desired = AtomicU64::new(1);
+                let wake: WebWake = Arc::new(|| {});
+                publish_frame(&mailbox, &desired, &wake, frame(1, 1));
+                publish_caret(
+                    &mailbox,
+                    &desired,
+                    &wake,
+                    CaretArea {
+                        surface_id: 1,
+                        width: 1.0,
+                        height: 1.0,
+                        ..CaretArea::default()
+                    },
+                );
+                let started = std::time::Instant::now();
+                handle_control(
+                    Control::Resize {
+                        surface_id: 1,
+                        pixel_width: 3,
+                        pixel_height: 2,
+                    },
+                    &mut active,
+                    &mailbox,
+                    &desired,
+                    &wake,
+                    &OneShotSpawner(Mutex::new(None)),
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "partial reads must not hang teardown"
+                );
+                assert!(
+                    reads.load(Ordering::Acquire) >= 2,
+                    "a timeout must not discard retained reader state"
+                );
+                assert!(active.is_none());
+                assert_eq!(terminated.load(Ordering::Acquire), 1);
+                assert_eq!(writes.load(Ordering::Acquire), 1);
+                let mailbox = lock_recover(&mailbox);
+                assert!(mailbox.latest_frame.is_none());
+                assert!(mailbox.latest_caret.is_none());
+                assert_eq!(
+                    mailbox.notices.len(),
+                    1,
+                    "never publish both generic and specific failures"
+                );
+                let WebHostNotice::Fatal { surface_id, message } = &mailbox.notices[0] else {
+                    panic!("partial-frame retirement must publish one fatal");
+                };
+                assert_eq!(*surface_id, 1);
+                if resume {
+                    assert_eq!(
+                        message,
+                        "web page load failed for `https://example.test/partial`: specific resumed failure",
+                    );
+                } else {
+                    assert!(message.starts_with("cannot resize the web surface:"), "{message}");
+                }
+            }
         }
     }
 
@@ -2981,6 +3420,104 @@ mod tests {
                 0o700,
                 "durable cookies stay private to the launcher account",
             );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_storage_supports_long_and_prefix_related_owner_identities() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("web-storage");
+        let owners = [
+            PluginId(format!("native.{}", "a".repeat(120))),
+            PluginId(format!("native.{}", "a".repeat(121))),
+            PluginId(format!("native.{}b", "a".repeat(121))),
+            PluginId(format!("native.{}c", "a".repeat(121))),
+            PluginId(format!("modern.{}", "中".repeat(80))),
+        ];
+        let mut paths = Vec::new();
+        for (index, owner) in owners.iter().enumerate() {
+            let path = persistent_storage_dir(&root, owner).expect("valid long owner storage");
+            assert!(!paths.contains(&path), "full owners must retain separate stores");
+            std::fs::write(path.join("owner"), index.to_string()).expect("owner marker");
+            paths.push(path);
+        }
+        let canonical_root = root.canonicalize().expect("storage root");
+        assert_eq!(paths[0].parent(), Some(canonical_root.as_path()));
+        for (index, owner) in owners.iter().enumerate() {
+            let path = persistent_storage_dir(&root, owner).expect("reopened long owner storage");
+            assert_eq!(path, paths[index]);
+            for component in path
+                .strip_prefix(&canonical_root)
+                .expect("contained owner path")
+                .components()
+            {
+                assert!(
+                    component.as_os_str().as_bytes().len() <= 254,
+                    "encoded components must fit Linux NAME_MAX",
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(path.join("owner")).expect("retained isolated marker"),
+                index.to_string(),
+            );
+            for ancestor in path
+                .ancestors()
+                .take_while(|ancestor| ancestor.starts_with(&canonical_root))
+            {
+                assert_eq!(
+                    std::fs::metadata(ancestor)
+                        .expect("private path metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700,
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_storage_rejects_a_symlinked_long_owner_branch() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("web-storage");
+        let owner = PluginId(format!("native.{}", "a".repeat(121)));
+        let owned = persistent_storage_dir(&root, &owner).expect("long owner storage");
+        let canonical_root = root.canonicalize().expect("storage root");
+        let branches: Vec<_> = owned
+            .ancestors()
+            .take_while(|ancestor| ancestor.starts_with(&canonical_root))
+            .map(Path::to_owned)
+            .collect();
+        let unrelated = directory.0.join("unrelated");
+        std::fs::create_dir(&unrelated).expect("unrelated directory");
+        std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o750))
+            .expect("unrelated permissions");
+        std::fs::write(unrelated.join("marker"), "unrelated").expect("unrelated marker");
+        for branch in branches {
+            persistent_storage_dir(&root, &owner).expect("restored private owner path");
+            std::fs::remove_dir_all(&branch).expect("empty private branch");
+            std::os::unix::fs::symlink(&unrelated, &branch).expect("aliased private branch");
+            let error = persistent_storage_dir(&root, &owner).expect_err("aliased branches are refused");
+            assert!(error.contains("not a real directory"), "{error}");
+            assert_eq!(
+                std::fs::read_dir(&unrelated).expect("unrelated entries").count(),
+                1
+            );
+            assert_eq!(
+                std::fs::metadata(&unrelated)
+                    .expect("unrelated metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o750,
+            );
+            assert_eq!(
+                std::fs::read_to_string(unrelated.join("marker")).expect("untouched unrelated marker"),
+                "unrelated",
+            );
+            std::fs::remove_file(&branch).expect("remove test alias before restoring path");
         }
     }
 

@@ -187,10 +187,10 @@ proto_enum!(
 
 // --- web surface (spec 32.x) ---------------------------------------------
 //
-// These codes belong to the launcher/`crikey-web-host` conversation and never
-// reach a plugin. They follow the same rule as every other enum here: a value
-// this build does not know decodes to the unspecified variant rather than
-// failing the frame.
+// Storage mode is shared by the plugin's PageWebSurface declaration and the
+// launcher's OpenSurface command. The other enums belong only to the
+// launcher/`crikey-web-host` conversation. As with every enum here, unknown
+// values decode to the unspecified variant rather than failing the frame.
 proto_enum!(WebStorageMode, ModeUnspecified, Ephemeral = 1, Persistent = 2);
 proto_enum!(
     WebInputCode,
@@ -1364,12 +1364,11 @@ impl_simple!(inexact; RawInput {
     15 => value.stop = decode_field_varint(field)? != 0,
 });
 
-// The cursor range is in *characters*, already converted from the UTF-8 byte
-// offsets winit reports. The conversion happens once, launcher-side, before
-// the event is put on the wire: WebKit counts characters, and handing it a
-// byte offset places the caret inside a multi-byte codepoint the moment
-// anyone types anything outside ASCII — which is precisely when an input
-// method is involved.
+// The cursor range counts Unicode scalar values, not UTF-8 bytes or UTF-16
+// code units. The launcher converts winit's byte offsets before encoding;
+// the web host then converts scalar offsets to the UTF-16 units WebKit uses.
+// Keeping the wire unit independent of either endpoint avoids placing the
+// caret inside a multibyte codepoint or a supplementary character.
 impl_simple!(ImeEvent {
     surface_id: u64 = 0,
     kind: WebImeCode = WebImeCode::KindUnspecified,

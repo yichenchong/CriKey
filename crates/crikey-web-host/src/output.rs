@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, MutexGuard};
 
-use crikey_native_protocol::message::{Envelope, Payload};
+use crikey_native_protocol::message::{Envelope, Payload, WebLoadCode};
 
 const OUTPUT_CAPACITY: usize = 16;
 
@@ -36,12 +36,17 @@ impl OutputBuffer {
     /// Caret and load updates replace older snapshots of the same kind, so a
     /// burst of redirects cannot evict the only pending caret or frame. A control
     /// message evicts a stale frame first and otherwise the oldest control
-    /// update. A frame never displaces control traffic. Gone is an exactly-once
-    /// terminal fence: it takes priority over all pending output, can never be
-    /// evicted, and rejects every later callback.
+    /// update. A frame never displaces control traffic. Gone and failed loads
+    /// are exactly-once terminal fences: they take priority over all pending
+    /// output, can never be evicted, and reject every later callback. The
+    /// launcher closes the page on either terminal notification.
     pub(crate) fn push(&self, envelope: Envelope) -> Option<Vec<u8>> {
         let is_frame = matches!(envelope.payload.as_ref(), Some(Payload::WebFrame(_)));
-        let is_terminal = matches!(envelope.payload.as_ref(), Some(Payload::Gone(_)));
+        let is_terminal = matches!(envelope.payload.as_ref(), Some(Payload::Gone(_)))
+            || matches!(
+                envelope.payload.as_ref(),
+                Some(Payload::LoadState(load)) if load.state == WebLoadCode::Failed
+            );
         let mut state = lock_unpoisoned(&self.state);
         if state.closed || state.terminal {
             return frame_pixels(envelope);
@@ -166,6 +171,60 @@ mod tests {
             surface_id,
             ..Default::default()
         }))
+    }
+
+    #[test]
+    fn failed_load_survives_a_replacement_navigation_and_later_callbacks() {
+        let output = OutputBuffer::new();
+        output.push(caret(1));
+        output.push(frame(1, 6));
+        let failed = envelope(Payload::LoadState(LoadState {
+            surface_id: 1,
+            state: WebLoadCode::Failed,
+            url: "https://example.test/broken".to_owned(),
+            failure: "controlled network failure".to_owned(),
+            ..Default::default()
+        }));
+        output.push(failed.clone());
+
+        // A second navigation can start on the engine thread while the writer
+        // has not yet drained the genuine failure from the preceding load.
+        for state in [WebLoadCode::Started, WebLoadCode::Finished] {
+            output.push(envelope(Payload::LoadState(LoadState {
+                surface_id: 1,
+                state,
+                url: "https://example.test/replacement".to_owned(),
+                ..Default::default()
+            })));
+        }
+        output.push(frame(2, 9));
+        output.push(caret(1));
+        output.close();
+
+        assert_eq!(output.pop(), Some(failed));
+        assert_eq!(output.pop(), None, "shutdown drains the fatal diagnostic");
+    }
+
+    #[test]
+    fn failed_load_fences_shutdown_without_losing_its_specific_diagnostic() {
+        let output = OutputBuffer::new();
+        let failed = envelope(Payload::LoadState(LoadState {
+            surface_id: 1,
+            state: WebLoadCode::Failed,
+            failure: "controlled network failure".to_owned(),
+            ..Default::default()
+        }));
+        output.push(failed.clone());
+        assert_eq!(output.push(frame(2, 9)), Some(vec![9; 4]));
+        output.push(envelope(Payload::Gone(Gone {
+            surface_id: 1,
+            reason: WebGoneCode::Closed,
+            detail: "later shutdown".to_owned(),
+            ..Default::default()
+        })));
+
+        assert_eq!(output.pop(), Some(failed));
+        assert_eq!(output.pop(), None, "the fatal diagnostic ends the stream");
     }
 
     #[test]

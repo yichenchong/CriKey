@@ -505,6 +505,9 @@ pub struct PageWebSurface {
     /// [`PageWebSurface::validate`] checks the same contract for SDK-built
     /// frames and declarations received from a plugin.
     pub url: String,
+    /// The storage mode is fixed for the lifetime of the surface. Later
+    /// declarations, including empty-URL stay frames, must repeat it; only
+    /// closing and reopening the surface permits a different choice.
     pub storage: WebStorage,
 }
 
