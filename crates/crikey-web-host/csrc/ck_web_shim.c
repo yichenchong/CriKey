@@ -580,6 +580,7 @@ void ck_web_surface_destroy(ck_web_surface *surface)
  * Process-wide loop.
  * ------------------------------------------------------------------ */
 
+static GMainContext *s_context;
 static GMainLoop *s_loop;
 static guint s_fd_source;
 static guint s_signal_sources[3];
@@ -604,18 +605,34 @@ void ck_web_cleanup(void)
         s_loop = NULL;
     }
     s_quit_requested = false;
+    if (s_context) {
+        g_main_context_release(s_context);
+        s_context = NULL;
+    }
 }
 
 int32_t ck_web_init(void)
 {
+    /* Global fd/signal sources and WPE use the default context. Reserve it
+     * before touching either: a foreign iterator must never dispatch our
+     * thread-affine surface callbacks. Acquisition is reentrant, so the loop
+     * can run on this thread while the lifetime reservation remains held. */
+    GMainContext *context = g_main_context_default();
+    if (!g_main_context_acquire(context))
+        return CK_WEB_INIT_CONTEXT_BUSY;
     ck_web_cleanup();
-    if (!wpe_loader_init("libWPEBackend-fdo-1.0.so.1"))
+    s_context = context;
+    if (!wpe_loader_init("libWPEBackend-fdo-1.0.so.1")) {
+        ck_web_cleanup();
         return CK_WEB_INIT_NO_LOADER;
+    }
     /* SHM, not EGL: this host renders with no GPU and no display server, and
      * the SHM path is the one that was measured working in that configuration. */
-    if (!wpe_fdo_initialize_shm())
+    if (!wpe_fdo_initialize_shm()) {
+        ck_web_cleanup();
         return CK_WEB_INIT_NO_SHM;
-    s_loop = g_main_loop_new(NULL, FALSE);
+    }
+    s_loop = g_main_loop_new(s_context, FALSE);
     return CK_WEB_INIT_OK;
 }
 
