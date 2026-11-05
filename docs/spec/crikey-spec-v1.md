@@ -2382,8 +2382,9 @@ For each frame the host shall send one page request containing:
 - The page identifier.
 - The requested generation.
 - The surface width and height in logical pixels.
-- The input events accumulated since the previous request, in the order they
-  occurred.
+- The page input events accumulated since the previous request, in the order
+  they occurred. Web pointer, key and IME input shall instead use the private
+  engine transport under 32.11.
 - Whether the page currently holds the keyboard.
 - The host palette: surface, text, accent, and muted colours.
 
@@ -2399,8 +2400,9 @@ to advance. A delay of zero shall mean the page is static until further input
 arrives. Web surfaces use engine-driven repaints under 32.11 instead.
 
 The host shall carry the host palette into the request rather than requiring a
-plugin to choose colours, so a theme change does not strand a page's
-appearance.
+display-list plugin to choose colours, so a theme change does not strand its
+page's appearance. Web documents control their own styling; the launcher
+palette does not automatically style them.
 
 ### 32.4 Generations and staleness
 

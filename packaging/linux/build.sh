@@ -91,6 +91,11 @@
 # commit time of HEAD, so two builds of one commit produce identical archives.
 # Running the script twice over one output directory is safe: each target
 # clears its own working tree first rather than merging into it.
+#
+# Cargo-built payloads are selected from that build's executable artifacts,
+# including a configured native build target or custom target directory.
+# Package architecture labels describe this machine; this is not a
+# cross-packaging driver.
 
 set -euo pipefail
 
@@ -325,6 +330,29 @@ wanted() {
 	return 1
 }
 
+# Cargo's target_directory is only a root: an explicit build target adds a
+# triple subdirectory. Read the successful build's artifact records instead of
+# guessing a path that might still contain binaries from an older build.
+cargo_executable() {
+	local messages="$1" package="$2" executable="$3" path
+	if ! path="$(jq -ers \
+		--arg manifest "$repository_root/crates/$package/Cargo.toml" \
+		--arg executable "$executable" '
+		[.[] | select(.reason == "compiler-artifact"
+			and .manifest_path == $manifest
+			and .target.name == $executable
+			and (.target.kind | index("bin")) != null
+			and .profile.test == false)
+			| .executable | select(type == "string" and length > 0)]
+		| if length == 1 then .[0] else empty end
+	' <<<"$messages")"; then
+		fail "Cargo did not report exactly one executable artifact for $package/$executable"
+	fi
+	[[ $path == /* ]] ||
+		fail "Cargo reported a non-absolute executable artifact for $package/$executable: $path"
+	printf '%s' "$path"
+}
+
 # The launcher and its supervised worker executables share one directory.
 # WASM and C-ABI providers do not search PATH. Web-host discovery can also use
 # PATH or an override, but a web-enabled package must carry its own host.
@@ -344,45 +372,33 @@ resolve_binaries() {
 	fi
 	if [[ $given -eq 0 ]]; then
 		require_tool cargo "Rust toolchain" stage
-		local cargo_metadata target_directory
-		if ! cargo_metadata="$(
-			cd "$repository_root" &&
-				cargo metadata --locked --format-version 1 --no-deps
-		)"; then
-			fail "Cargo metadata failed; could not resolve the configured target directory"
-		fi
-		if ! target_directory="$(
-			jq -er '.target_directory | select(type == "string" and length > 0)' <<<"$cargo_metadata"
-		)"; then
-			fail "Cargo metadata did not report a valid target_directory"
-		fi
-		[[ -n $target_directory ]] ||
-			fail "Cargo metadata did not report a target_directory"
-		[[ $target_directory == /* ]] ||
-			fail "Cargo metadata reported a non-absolute target_directory: $target_directory"
-
+		local cargo_messages
 		note "building crikey and runtime hosts $version in release mode"
-		(
+		if ! cargo_messages="$(
 			cd "$repository_root" &&
-				cargo build --release --locked \
+				cargo build --release --locked --message-format=json-render-diagnostics \
 					--package crikey-cli \
 					--package crikey-wasm-host \
 					--package crikey-cabi-host
-		)
-		binary="$target_directory/release/crikey"
-		launcher_binary="$target_directory/release/crikey-launcher"
-		wasm_host_binary="$target_directory/release/crikey-wasm-host"
-		cabi_host_binary="$target_directory/release/crikey-cabi-host"
+		)"; then
+			fail "Cargo failed to build crikey and runtime hosts"
+		fi
+		binary="$(cargo_executable "$cargo_messages" crikey-cli crikey)"
+		launcher_binary="$(cargo_executable "$cargo_messages" crikey-cli crikey-launcher)"
+		wasm_host_binary="$(cargo_executable "$cargo_messages" crikey-wasm-host crikey-wasm-host)"
+		cabi_host_binary="$(cargo_executable "$cargo_messages" crikey-cabi-host crikey-cabi-host)"
 		if [[ $with_web_surface == yes ]]; then
 			# The development stack was checked before building any binaries.
 			note "building the engine-enabled crikey-web-host"
-			(
+			if ! cargo_messages="$(
 				cd "$repository_root" &&
-					cargo build --release --locked \
+					cargo build --release --locked --message-format=json-render-diagnostics \
 						--package crikey-web-host \
 						--features engine
-			)
-			web_host_binary="$target_directory/release/crikey-web-host"
+			)"; then
+				fail "Cargo failed to build the engine-enabled crikey-web-host"
+			fi
+			web_host_binary="$(cargo_executable "$cargo_messages" crikey-web-host crikey-web-host)"
 		fi
 	fi
 

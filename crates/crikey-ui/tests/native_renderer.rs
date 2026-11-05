@@ -2903,6 +2903,40 @@ fn web_named_keys_and_text_reach_the_engine_but_escape_and_chrome_shortcuts_do_n
 }
 
 #[test]
+fn a_web_document_keeps_the_footer_settings_route_without_leaking_chrome_clicks() {
+    for show_hints in [false, true] {
+        let context = create_launcher_context();
+        let mut view = painted_web_view(41, 1, &[10; 8]);
+        view.show_hints = show_hints;
+        let located = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        let settings = position_of(&located, "Settings") + egui::vec2(4.0, 4.0);
+        let inside = web_document_rect(&located).center();
+        let _ = build_launcher_frame(
+            &context,
+            launcher_input(vec![egui::Event::PointerMoved(inside)]),
+            &view,
+        );
+        force_three_layout_passes(&context, false);
+        let clicked = build_launcher_frame(&context, launcher_input(click_at(settings)), &view);
+        assert_eq!(
+            clicked
+                .commands
+                .iter()
+                .filter(|command| matches!(command, UiCommand::OpenSettings))
+                .count(),
+            1,
+            "host settings must remain reachable with or without page hints"
+        );
+        assert!(
+            !web_inputs(&clicked)
+                .iter()
+                .any(|input| matches!(input, WebSurfaceInput::PointerButton { .. })),
+            "the footer click belongs to launcher chrome, not the document"
+        );
+    }
+}
+
+#[test]
 fn oversized_web_textures_are_dropped_before_upload_and_release_the_old_texture() {
     let context = create_launcher_context();
     let mut view = painted_web_view(41, 1, &[10; 8]);

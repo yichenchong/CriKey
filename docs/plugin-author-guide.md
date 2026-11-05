@@ -248,11 +248,12 @@ and it owns Escape.
 Pages are host-driven request/response, exactly like `suggest`. You never push
 a frame; the host asks, you answer once, and an unsolicited frame is a protocol
 violation. Each `PageRequest` carries the generation it wants answered, the
-surface size, the palette, whether you hold the keyboard, and every input event
-since your previous frame in the order it happened. Answer the generation you
-were given: a frame answering an older generation is dropped, never drawn, and
-a resize advances the generation because your previous layout was for a
-different size.
+surface size, the palette and whether you hold the keyboard. For display-list
+pages it also carries accumulated input events in arrival order. Web pointer,
+key and IME events go directly to the engine, not to your plugin. Answer the
+generation you were given: a frame answering an older generation is dropped,
+never drawn, and a resize advances the generation because your previous layout
+was for a different size.
 
 For a display-list page, return `redraw_after_ms` only if your page genuinely
 changes without input; `0` means static until the user acts, which is what a

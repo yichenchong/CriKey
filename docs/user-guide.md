@@ -54,8 +54,9 @@ crikey config layers [<key>]
 The launcher's own settings — the activation hotkey, the result ceiling, the
 selected profile, whether the footer shows its keyboard hints — also have a
 surface that does not require knowing a key name. Press `Ctrl+,` in the
-launcher, or click `Settings` in the hint line along the bottom, to edit them
-in place; the same rows are readable and writable from a terminal:
+launcher outside a web page, or click `Settings` in the hint line along the
+bottom, to edit them in place; the same rows are readable and writable from a
+terminal:
 
 ```sh
 crikey settings
@@ -66,12 +67,14 @@ Both write the user-global layer, so the panel and the command line always
 agree. A hotkey the desktop refuses leaves the previous one working and says
 so rather than leaving the launcher unreachable.
 
-The hint line along the bottom — `Up/Down navigate   Tab complete   Esc
-cancel` — is a legend for keys you have not learned yet, so once you have,
-turn it off with `launcher.show-hints = false` or the matching row in the
-panel. `Settings  Ctrl+,` stays where it is: it is the only way into the
-settings surface with the mouse, so hiding the hints must never be a choice
-you cannot take back.
+For query and result navigation, the hint line along the bottom reads
+`Up/Down navigate   Tab complete   Esc cancel`. Once you have learned those
+keys, turn the hints off with `launcher.show-hints = false` or the matching row
+in the panel. The `Settings` mouse affordance stays visible, so hiding the hints
+does not prevent you from turning them back on. It normally advertises
+`Ctrl+,`; on a web page it shows only `Settings`, because that shortcut belongs
+to the document. Web-page hints instead read `Tab navigate page   Esc close
+page`.
 
 The launcher window is drawn with rounded corners where the desktop can
 composite them smoothly: a Wayland session, an X11 session with a compositing
@@ -133,7 +136,7 @@ Each root is followed by the corresponding per-user directory used by
 
 ## Keyboard and query behavior
 
-The launcher is usable without a mouse:
+The launcher is usable without a mouse. For query and result navigation:
 
 | Key | Action |
 | --- | --- |
@@ -145,6 +148,11 @@ The launcher is usable without a mouse:
 | Ctrl+, | Open the settings surface |
 | Escape | Close the settings surface, else cancel or dismiss the launcher |
 | 1–9 (actions open) | Choose that alternate action |
+
+While a web page is open, keys other than Escape go to the document instead of
+performing launcher query/result actions. Tab navigates the document, and
+`Ctrl+,` does not open launcher settings. Click the persistent `Settings`
+affordance to open settings from a web page. Escape closes the page.
 
 An empty query shows nothing but the query field: the launcher does not list
 the catalog at rest, and the window stays compact until there is something to

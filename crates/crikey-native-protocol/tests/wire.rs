@@ -2641,3 +2641,19 @@ fn decoded_web_authorities_without_hosts_are_refused_before_opening() {
         );
     }
 }
+
+#[test]
+fn fragmented_page_frames_share_one_decode_allocation_budget() {
+    // Each occurrence contributes one empty node to the same PageFrame.
+    // The wire remains small, but the merged repeated field must not obtain
+    // a fresh allocation budget for each otherwise harmless fragment.
+    let mut bytes = Vec::with_capacity(5 * 100_000);
+    for _ in 0..100_000 {
+        bytes.extend_from_slice(b"\x82\x02\x02\x1a\x00");
+    }
+    assert!(bytes.len() < crikey_native_protocol::MAX_FRAME_BYTES);
+    assert!(matches!(
+        message::Envelope::decode(&bytes),
+        Err(ProtocolError::DecodeBudgetExceeded { .. })
+    ));
+}

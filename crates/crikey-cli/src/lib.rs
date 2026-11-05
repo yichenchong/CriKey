@@ -1094,8 +1094,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     // A rapid off/on hotkey pair may supersede the queued
                     // dismissal. Reset the old session before opening the new
                     // one so its query and rows cannot cross the boundary.
-                    view_model.dismiss();
-                    view_model.activate();
+                    activate_launcher_session(&mut search, &mut view_model, &mut web_page);
                     // A new session searches from cold. Within one burst of
                     // typing the filesystem is effectively still, but between
                     // two sessions the user has had time to create the file
@@ -1575,6 +1574,19 @@ impl WebPageRuntime {
 
     #[cfg(not(target_os = "linux"))]
     fn close(&mut self, _reason: &str) {}
+}
+
+fn activate_launcher_session(
+    search: &mut SearchService,
+    view_model: &mut LauncherViewModel,
+    web_page: &mut WebPageRuntime,
+) {
+    // Native activation can supersede a queued dismissal before the event
+    // loop receives it. Retire every old page owner, not just its model.
+    web_page.close("launcher session was replaced");
+    search.close_page();
+    view_model.dismiss();
+    view_model.activate();
 }
 
 fn close_failed_web_page(
@@ -3244,6 +3256,63 @@ mod tests {
             "the page owns the screen"
         );
         assert!(view_model.page().is_some(), "the model shows the surface");
+    }
+
+    #[test]
+    fn reactivation_closes_a_page_even_when_dismissal_was_superseded() {
+        let runtime = Arc::new(PageRuntime::default());
+        let mut search = page_service(&runtime);
+        let mut view_model = LauncherViewModel::default();
+        let mut web_page = web_page_runtime();
+        let plugin = PluginId("test.page".to_owned());
+        view_model.activate();
+        open_plugin_page(
+            &mut search,
+            &mut view_model,
+            &mut web_page,
+            &plugin,
+            "page",
+            (800, 600),
+        )
+        .expect("the old session opens a page");
+
+        activate_launcher_session(&mut search, &mut view_model, &mut web_page);
+
+        assert!(view_model.is_visible(), "the new launcher session is visible");
+        assert!(view_model.page().is_none(), "the new session has no old surface");
+        assert!(
+            search.page_owner().is_none(),
+            "the old plugin no longer owns a page"
+        );
+        assert_eq!(
+            *runtime.closes.lock().expect("runtime state"),
+            1,
+            "the plugin is told its old page closed even without a dismissal event",
+        );
+
+        activate_launcher_session(&mut search, &mut view_model, &mut web_page);
+        assert_eq!(
+            *runtime.closes.lock().expect("runtime state"),
+            1,
+            "repeated activation does not close an already retired page twice",
+        );
+
+        open_plugin_page(
+            &mut search,
+            &mut view_model,
+            &mut web_page,
+            &plugin,
+            "replacement",
+            (800, 600),
+        )
+        .expect("the replacement session can open its own page");
+        assert_eq!(
+            search.page_owner(),
+            Some((plugin, "replacement".to_owned())),
+            "only the new page owns the replacement session",
+        );
+        assert_eq!(*runtime.opens.lock().expect("runtime state"), 2);
+        assert_eq!(*runtime.closes.lock().expect("runtime state"), 1);
     }
 
     /// A report of a run that went exactly as asked, for `config()`.

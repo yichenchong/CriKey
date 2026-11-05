@@ -233,18 +233,17 @@ pub const WEB_POINTER_BUTTON_LEFT: u32 = 1;
 pub const WEB_POINTER_BUTTON_MIDDLE: u32 = 2;
 pub const WEB_POINTER_BUTTON_RIGHT: u32 = 3;
 
-/// The plugin-drawn surface the launcher is showing, if any (spec 6.3, 32).
+/// The plugin-owned page the launcher is showing, if any (spec 6.3, 32).
 ///
-/// A page is a display list the plugin returns and the *host* draws: the
-/// vocabulary crosses the boundary and code never does, so a misbehaving
-/// plugin can make the launcher draw an ugly page but cannot make it draw
-/// outside one. Pixels cross only as the bounded raster an image node carries,
-/// which the host still places and clips itself.
+/// A page either carries a display list the host draws, or declares a web
+/// document whose supervised engine supplies complete frames. The renderer
+/// places and clips both kinds inside the same host-owned page rectangle;
+/// neither can paint over launcher chrome.
 ///
-/// The frame is shared rather than owned for the same reason the result rows
-/// are: a page that redraws on a timer republishes the same node list many
-/// times over, and a repaint that changes nothing about it costs a refcount
-/// bump instead of a copy of every node and every string in it.
+/// The declaration and display list are shared rather than copied: a page
+/// that redraws on a timer republishes its frame many times, and a repaint
+/// that changes nothing about it costs a refcount bump instead of a copy of
+/// every node and string. Engine pixels are shared separately in `web_frame`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageSurface {
     /// Which plugin owns the page, so the host can route input back to the
@@ -256,10 +255,9 @@ pub struct PageSurface {
     /// The owning plugin's display name, shown in the status line: a surface
     /// that takes the whole launcher must always say whose it is.
     pub plugin_name: String,
-    /// The display list the last accepted frame carried. Already validated by
-    /// the host transport, so the renderer draws it without re-checking:
-    /// nothing that failed [`crikey_core::PageFrame::validate`] ever reaches
-    /// here.
+    /// The last accepted display list or web declaration. Already validated
+    /// by the host transport, so nothing that failed
+    /// [`crikey_core::PageFrame::validate`] reaches the renderer.
     pub frame: Arc<PageFrame>,
     /// Whether the host is still waiting for the plugin to answer the request
     /// it has already sent.
