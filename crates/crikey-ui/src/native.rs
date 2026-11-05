@@ -3847,15 +3847,24 @@ impl WebPointerState {
             return inputs;
         };
         let identity = (touch.device_id, touch.id);
+        if touch.phase != TouchPhase::Started && self.touch_id != Some(identity) {
+            return inputs;
+        }
+        let position = web_logical_position(touch.location, pixels_per_point);
         if touch.phase == TouchPhase::Started {
-            if self.touch_id.is_some() || self.captured() || self.scrolling {
+            if self.touch_id.is_some()
+                || self.captured()
+                || self.scrolling
+                || !position.is_finite()
+                || !rect.contains(position)
+            {
+                // Chrome and invalid contacts own no document state. A later
+                // move inside must not admit them or block another contact.
                 return inputs;
             }
             self.touch_id = Some(identity);
-        } else if self.touch_id != Some(identity) {
-            return inputs;
         }
-        self.position = Some(web_logical_position(touch.location, pixels_per_point));
+        self.position = Some(position);
         let motion = |(x, y)| WebSurfaceInput::PointerMove {
             surface_id,
             timestamp_ms,
@@ -6616,6 +6625,77 @@ mod web_input_tests {
     }
 
     #[test]
+    fn native_chrome_touch_cannot_claim_or_release_the_document_contact() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 80.0));
+        let inside = rect.center();
+        let touch = |id, phase, pos: egui::Pos2| Touch {
+            device_id: winit::event::DeviceId::dummy(),
+            id,
+            phase,
+            location: PhysicalPosition::new(f64::from(pos.x) * 2.0, f64::from(pos.y) * 2.0),
+            force: None,
+        };
+        for start in [
+            rect.max + egui::vec2(5.0, 6.0),
+            egui::pos2(f32::NAN, inside.y),
+            egui::pos2(inside.x, f32::INFINITY),
+        ] {
+            let mut pointer = WebPointerState::default();
+            pointer.set_surface(Some(41));
+            pointer.position = Some(inside);
+            assert!(pointer.motion(rect).is_some());
+            assert_eq!(
+                pointer.native_touch_input(rect, &touch(6, TouchPhase::Started, start), 2.0, 10, 0),
+                [None, None]
+            );
+            assert_eq!(
+                pointer.touch_id, None,
+                "an outside/invalid start cannot own the document"
+            );
+            assert_eq!(
+                pointer.position,
+                Some(inside),
+                "rejected starts cannot replace pointer position"
+            );
+            assert!(pointer.hovered, "rejected starts cannot clear document hover");
+            assert_eq!(
+                pointer.native_touch_input(rect, &touch(6, TouchPhase::Moved, inside), 2.0, 11, 0),
+                [None, None],
+                "moving a chrome-started contact inside cannot admit it"
+            );
+            let accepted =
+                pointer.native_touch_input(rect, &touch(7, TouchPhase::Started, inside), 2.0, 12, 0);
+            assert!(
+                matches!(
+                    accepted[1],
+                    Some(WebSurfaceInput::PointerButton {
+                        surface_id: 41,
+                        pressed: true,
+                        ..
+                    })
+                ),
+                "the distinct inside-started contact must remain admissible"
+            );
+            assert_eq!(
+                pointer.native_touch_input(rect, &touch(6, TouchPhase::Ended, inside), 2.0, 13, 0),
+                [None, None],
+                "the original outside contact cannot release the admitted contact"
+            );
+            assert!(pointer.captured());
+            let released = pointer.native_touch_input(rect, &touch(7, TouchPhase::Ended, inside), 2.0, 14, 0);
+            assert!(matches!(
+                released[0],
+                Some(WebSurfaceInput::PointerButton {
+                    surface_id: 41,
+                    pressed: false,
+                    ..
+                })
+            ));
+            assert!(!pointer.captured());
+        }
+    }
+
+    #[test]
     fn native_buffered_touch_never_replays_or_retargets_a_replacement_document() {
         for surface_id in [Some(41), Some(42), None] {
             let context = create_launcher_context();
@@ -6717,18 +6797,19 @@ mod web_input_tests {
                 let window_id = self.application.graphics.as_ref().expect("graphics").window.id();
                 let rect = self.application.web_page_rect(41).expect("measured web page");
                 let scale = self.application.web_pixels_per_point();
-                let touch = |id, phase| {
+                let touch_at = |id, phase, position: egui::Pos2| {
                     WindowEvent::Touch(Touch {
                         device_id: winit::event::DeviceId::dummy(),
                         id,
                         phase,
                         location: PhysicalPosition::new(
-                            f64::from(rect.center().x) * scale,
-                            f64::from(rect.center().y) * scale,
+                            f64::from(position.x) * scale,
+                            f64::from(position.y) * scale,
                         ),
                         force: None,
                     })
                 };
+                let touch = |id, phase| touch_at(id, phase, rect.center());
                 self.application.window_event(
                     event_loop,
                     window_id,
@@ -6741,8 +6822,25 @@ mod web_input_tests {
                     },
                 );
                 lock_recover(&self.commands).clear();
+                self.application.window_event(
+                    event_loop,
+                    window_id,
+                    touch_at(6, TouchPhase::Started, rect.max + egui::vec2(5.0, 6.0)),
+                );
+                self.application
+                    .window_event(event_loop, window_id, touch(6, TouchPhase::Moved));
+                assert!(
+                    lock_recover(&self.commands).is_empty(),
+                    "a chrome-started contact cannot enter the document"
+                );
                 self.application
                     .window_event(event_loop, window_id, touch(7, TouchPhase::Started));
+                self.application
+                    .window_event(event_loop, window_id, touch(6, TouchPhase::Ended));
+                assert!(
+                    self.application.web_pointer.captured(),
+                    "the chrome contact cannot release the inside contact"
+                );
                 self.application.window_event(
                     event_loop,
                     window_id,
