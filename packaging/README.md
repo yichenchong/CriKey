@@ -150,6 +150,11 @@ timestamped and verified with `signtool verify /pa` immediately after it is
 applied; there is no switch anywhere in these scripts that skips, weakens or
 disables verification.
 
+The release workflow installs the MSI, checks that both launcher entry points
+stay resident, reinstalls over the running launcher, and uninstalls. This smoke
+step has a five-minute timeout so a stuck installer cannot wait indefinitely.
+On failure, CI uploads any available `install.log` and `reinstall.log` files.
+
 ## macos/
 
 | File | What it is |
@@ -324,11 +329,13 @@ exercises actual headless document rendering, resize, input, storage and
 navigation policy. The web job uses the supported `ubuntu-22.04` runner because
 Ubuntu 24.04 restricts unprivileged user namespaces on the host; no host
 security sysctl is changed. The package build still runs inside Debian 13.
-Docker's default seccomp and AppArmor policies also block the namespaces and
-bind mounts that WPE's bubblewrap sandbox needs. Only this disposable CI
-container uses `--security-opt seccomp=unconfined --security-opt apparmor=unconfined`.
-It checks namespace creation and mounts before building. The browser still
-runs non-root with its own sandbox enabled, without a privileged container.
+Docker's default seccomp, AppArmor and masked procfs paths also prevent the
+private namespaces and mounts that WPE's bubblewrap sandbox needs. Only this
+disposable CI container uses `--security-opt seccomp=unconfined`,
+`--security-opt apparmor=unconfined` and `--security-opt systempaths=unconfined`.
+It checks namespace creation and procfs mounts before building. The browser
+still runs non-root with its own sandbox enabled, without extra capabilities
+or a privileged container.
 Do not interpret a build or `--help` invocation as a substitute for the engine smoke.
 
 No WPE engine libraries are bundled. The tarball needs compatible system WPE

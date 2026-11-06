@@ -86,10 +86,10 @@ jobs:
       contents: read
     container:
       image: debian:13
-      # Allow the namespaces and bind mounts needed by WPE's own sandbox in
-      # this disposable CI container. The browser still runs non-root with
-      # its sandbox enabled; no privileged container is used.
-      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+      # WPE's sandbox needs private namespaces, bind mounts and procfs.
+      # Relax only the outer CI container, including Docker's proc masks;
+      # the non-root browser keeps its own sandbox and no extra capabilities.
+      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined
     defaults:
       run:
         shell: bash
@@ -477,6 +477,7 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path target/packaging/windows/stage/* -DestinationPath target/packaging/windows/crikey-windows-x86_64-portable.zip
       - name: Install the MSI and prove the installed launcher actually starts
+        timeout-minutes: 5
         # The owner's first report was "it installs and the app opens once,
         # then vanishes", and nothing in this pipeline could have caught that:
         # building an MSI proves it packages, not that what it installs runs.
@@ -566,6 +567,15 @@ jobs:
           if ($unknown.ExitCode -eq 0) { throw "an unknown subcommand must not be accepted" }
           $uninstall = Start-Process msiexec -ArgumentList @('/x', "`"$msi`"", '/qn') -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "uninstall failed with $($uninstall.ExitCode)" }
+      - name: Upload installer logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-logs
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/install.log
+            ${{ runner.temp }}/reinstall.log
       - uses: actions/upload-artifact@v4
         with:
           name: windows
