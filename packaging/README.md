@@ -150,6 +150,11 @@ timestamped and verified with `signtool verify /pa` immediately after it is
 applied; there is no switch anywhere in these scripts that skips, weakens or
 disables verification.
 
+The release workflow installs the MSI, checks that both launcher entry points
+stay resident, reinstalls over the running launcher, and uninstalls. This smoke
+step has a five-minute timeout so a stuck installer cannot wait indefinitely.
+On failure, CI uploads any available `install.log` and `reinstall.log` files.
+
 ## macos/
 
 | File | What it is |
@@ -164,6 +169,18 @@ disables verification.
 uses. `LSMinimumSystemVersion` is 11.0: the build ships an arm64 slice and Big
 Sur is the first release that exists on Apple silicon, while nothing in the tree
 calls a newer API.
+
+The release workflow builds both `aarch64-apple-darwin` and
+`x86_64-apple-darwin` on the standard `macos-15-intel` runner, then combines
+each executable with `lipo`. `macos-14` has been retired; the plain `macos-15`
+label selects Apple silicon rather than preserving the Intel build host.
+The job sets `MACOSX_DEPLOYMENT_TARGET=11.0` to match the bundle metadata
+without raising the deployment floor to the runner's OS version. The
+[runner image](https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md)
+provides Xcode 16.4 and the macOS 15.5 SDK;
+[Apple's supported deployment targets](https://developer.apple.com/xcode/system-requirements/)
+include macOS 11. Building with that SDK is not evidence of runtime
+verification on macOS 11.
 
 **`CFBundleExecutable` is `crikey-launcher`**, not `crikey`. Launch Services
 starts a bundle's main executable with no arguments and has no key for
@@ -260,6 +277,114 @@ The tarball is prefix-relative, so a distro-agnostic install is:
 sudo tar --strip-components=1 -C /usr/local -xf crikey-<version>-x86_64-linux.tar.gz
 ```
 
+### Standard and optional web release packages
+
+The standard release job is pinned to `ubuntu-24.04`, so movement of
+`ubuntu-latest` does not silently raise its runtime baseline. Both Linux
+release jobs set `CRIKEY_MAINTAINER` to the existing public release identity,
+`Yi Chen Chong <yichenchong@yahoo.com>`, rather than the packager's placeholder.
+
+The release workflow keeps the standard Linux tarball, `.deb` and `.rpm`
+**without a web engine**, and builds an additional set in a **Debian 13**
+container using `--with-web-surface`. The additional downloads end in
+`-web-debian13.tar.gz`, `-web-debian13.deb` and `-web-debian13.rpm`.
+Only download names differ: package identities and installed paths are the
+same, so install one variant, not both. Windows and macOS do not include the
+Linux-only web host. The Flatpak recipe explicitly refuses web mode.
+
+The engine build requires a C toolchain, `pkg-config`, and these exact modules:
+
+| pkg-config module | Debian 13 development package |
+| --- | --- |
+| `wpe-webkit-2.0` | `libwpewebkit-2.0-dev` |
+| `wpebackend-fdo-1.0` | `libwpebackend-fdo-1.0-dev` |
+| `wpe-1.0` | `libwpe-1.0-dev` |
+| `wayland-server` | `libwayland-dev` |
+| `glib-2.0` | `libglib2.0-dev` |
+
+This is not WebKitGTK or WPE's older 1.0 API. The native shim uses
+[`WebKitNetworkSession`, available since 2.40](https://wpewebkit.org/reference/stable/wpe-webkit-2.0/class.NetworkSession.html).
+[Debian 13 supplies the required 2.0 API](https://packages.debian.org/trixie/libwpewebkit-2.0-dev).
+[Ubuntu's WPE packages](https://packages.ubuntu.com/search?keywords=wpewebkit&searchon=names&suite=all&section=all)
+only provide the older API on Ubuntu 22.04; the
+[required development package search](https://packages.ubuntu.com/search?keywords=libwpewebkit-2.0-dev&searchon=names&suite=all&section=all)
+has no result. Adding the web flag to the existing Ubuntu release build is
+therefore insufficient.
+
+For a native Debian 13 build with those packages and the normal packaging
+tools installed:
+
+```sh
+packaging/linux/build.sh --with-web-surface \
+  --targets stage,tarball,deb,rpm target/packaging/linux-web
+LIBGL_ALWAYS_SOFTWARE=1 EGL_PLATFORM=surfaceless \
+  cargo test --release --locked -p crikey-web-host \
+  --features engine --test engine_smoke -- --test-threads=1
+```
+
+Run the engine smoke as a **non-root user with a writable HOME** and keep the
+browser sandbox enabled. The workflow installs Mesa EGL/GLES and software DRI
+drivers and uses a separate non-root account for both commands. Its smoke gate
+exercises actual headless document rendering, resize, input, storage and
+navigation policy. The web job uses the supported `ubuntu-22.04` runner because
+Ubuntu 24.04 restricts unprivileged user namespaces on the host; no host
+security sysctl is changed. The package build still runs inside Debian 13.
+Docker's default seccomp, AppArmor and masked procfs paths also prevent the
+private namespaces and mounts that WPE's bubblewrap sandbox needs. Only this
+disposable CI container uses `--security-opt seccomp=unconfined`,
+`--security-opt apparmor=unconfined` and `--security-opt systempaths=unconfined`.
+It checks namespace creation and procfs mounts before building. The browser
+still runs non-root with its own sandbox enabled, without extra capabilities
+or a privileged container.
+Do not interpret a build or `--help` invocation as a substitute for the engine smoke.
+
+No WPE engine libraries are bundled. The tarball needs compatible system WPE
+WebKit 2.0, libwpe, WPEBackend-fdo, Wayland and GLib runtimes, plus the other
+libraries required by its Debian 13-built executables. The `.deb` scans every
+staged executable with `dpkg-shlibdeps`; if scanning is unavailable, the
+packager uses an explicit WPE dependency fallback. RPM generates ELF SONAME
+requirements automatically. A Debian-built RPM is **not** a claim of Fedora
+installation compatibility. Both release variants use system Python 3.
+The workflow extracts all three web formats, compares all five executables to
+the staged payload (byte comparison for tar/`.deb`, matching ELF build IDs
+for RPM, which may strip symbols), runs the extracted CLI's version command,
+checks SDK/shim/notices, resolves shared libraries and
+requires WPE dependencies in both package metadata formats before upload.
+The release-mode smoke's executable must also match the staged web host after
+the test finishes, so a different test binary cannot validate an untested host.
+
+An installed engine is not sufficient for launcher web startup. CriKey needs a
+writable delegated cgroup-v2 parent with `memory` already enabled for children
+and writable migration controls; its private leaf must supply working
+`memory.max`, `cgroup.procs` and `cgroup.kill`. The launcher's own populated leaf
+alone is insufficient. The effective ceiling must be at least 256 MiB and is
+capped at the lesser of 768 MiB, one eighth of physical RAM and inherited
+finite limits. Missing supervision refuses the web page rather than starting
+an unsupervised engine; ordinary launcher and display-list pages still work.
+Direct engine tests do not exercise that launcher gate. See the
+[full delegation and cleanup requirements](../docs/plugin-author-guide.md)
+and verify actual launcher startup, teardown and refusal under the target
+system's delegation before claiming end-to-end web availability.
+
+### Release preflight without publishing
+
+The release workflow requires an existing tag as its `tag` input for publishing.
+For `publish=false`, every job instead checks out the immutable event commit
+selected by `workflow_dispatch --ref`, even if that preparation branch moves
+while another job is queued. Preflight builds and uploads all platform
+artefacts, including the Debian 13 web set, without creating a GitHub release
+or uploading release assets. For example, from a pushed preparation branch:
+
+```sh
+gh workflow run release.yml --ref release/v0.1.19 \
+  -f tag=release/v0.1.19 -F publish=false
+```
+
+Tag pushes publish normally; manual dispatch defaults to `publish=true`.
+Do not use a preparation branch with publishing enabled. Publication waits
+for every packaging job, includes both Linux variants and checksums, and
+states the unsigned distribution and platform-runtime limitations.
+
 ### Installed layout, and why it is shaped this way
 
 ```
@@ -269,6 +394,7 @@ sudo tar --strip-components=1 -C /usr/local -xf crikey-<version>-x86_64-linux.ta
 <prefix>/lib/crikey/crikey-launcher     (no arguments; what the menu entry runs)
 <prefix>/lib/crikey/crikey-wasm-host    (supervised WASM runtime host)
 <prefix>/lib/crikey/crikey-cabi-host    (supervised C-ABI runtime host)
+<prefix>/lib/crikey/crikey-web-host    (Debian 13 web variant only; supervised WPE host)
 <prefix>/lib/crikey/modern-sdk/                              (sdk/python)
 <prefix>/lib/crikey/legacy-shim/   (crates/crikey-legacy-compat/python)
 <prefix>/lib/crikey/python-runtime/    (optional for tarball/deb/rpm; required in Flatpak)
@@ -325,14 +451,14 @@ and the path has to be the one the `.deb` and the tarball also use.
 the licence and notice reach every artefact, the worker trees land beside the
 real executable, a package with no bundled interpreter declares `python3`, the
 tarball is prefix-relative, two builds agree byte for byte, and every refusal
-path exits non-zero with a message. It packages `/usr/bin/true` and
-`/usr/bin/false` as stand-ins rather than building CriKey, so it runs in
-seconds and needs no Rust toolchain. It passes,
-37 checks, with the `.deb` checks included.
+path exits non-zero with a message. It packages supplied fixture executables
+rather than compiling CriKey. CI covers both web and no-web packaging,
+including Debian dependency records; these fixture checks do not prove browser
+rendering.
 
-The `.rpm` and Flatpak recipes are checked in but have not been executed:
-neither `rpmbuild` nor `flatpak-builder` was installed on the machine they were
-written on. Treat them as unverified until a release build runs them.
+The release workflow separately builds real tarballs, Debian packages and
+RPMs, and checks the web variant with the actual engine. Flatpak is not a
+release artefact and remains unverified as a supported distribution channel.
 
 ## What each toolchain requires
 
