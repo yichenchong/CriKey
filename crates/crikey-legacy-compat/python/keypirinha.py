@@ -52,7 +52,7 @@ _PRODUCT_NAME = "CriKey"
 
 #: Kept in step with the Cargo workspace version by hand. A tuple of ints is
 #: the documented shape; legacy plugins compare it with tuple ordering.
-_PRODUCT_VERSION = (0, 1, 0)
+_PRODUCT_VERSION = (0, 1, 19)
 
 #: Longest a cooperative wait sleeps before re-reading the host's flag. The
 #: flag is level-triggered and raised by another thread, so one long sleep

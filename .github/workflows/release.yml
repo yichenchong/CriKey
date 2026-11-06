@@ -32,19 +32,28 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to build and release
+        description: Existing tag to publish (ignored when publish=false)
         required: true
+      publish:
+        description: Publish a GitHub release after all packages pass
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
+  CRIKEY_MAINTAINER: Yi Chen Chong <yichenchong@yahoo.com>
+  # A non-publishing dispatch builds exactly its event commit, even if the
+  # preparation branch moves while other platform jobs are queued.
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && (inputs.publish == false && github.sha || format('refs/tags/{0}', inputs.tag)) || github.ref }}
 
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    # Keep the standard package baseline fixed while ubuntu-latest migrates.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ env.RELEASE_REF }}
       - uses: dtolnay/rust-toolchain@1.86.0
       - uses: Swatinem/rust-cache@v2
       - name: Install the packaging tools the script requires
@@ -68,12 +77,142 @@ jobs:
             target/packaging/linux/*.deb
             target/packaging/linux/**/*.rpm
 
+  linux-web:
+    runs-on: ubuntu-24.04
+    # Ubuntu does not package the WPE WebKit 2.0 API used by the host.
+    # This is an additional Debian 13 build, not a replacement for linux.
+    container: debian:13
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_HOME: /opt/cargo
+      RUSTUP_HOME: /opt/rustup
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      EGL_PLATFORM: surfaceless
+    steps:
+      - name: Install the WPE engine and packaging toolchains
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git cmake pkg-config jq \
+            dpkg-dev rpm rpm2cpio cpio desktop-file-utils passwd util-linux \
+            libssl-dev libwpewebkit-2.0-dev libwpebackend-fdo-1.0-dev \
+            libwpe-1.0-dev libwayland-dev libglib2.0-dev \
+            libegl1 libgles2 libgl1-mesa-dri
+          pkg-config --modversion wpe-webkit-2.0 wpebackend-fdo-1.0 \
+            wpe-1.0 wayland-server glib-2.0
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Prepare a non-root build and browser user
+        # WPE's sandbox must run normally, never through a disable-sandbox flag.
+        run: |
+          useradd --create-home --shell /bin/bash crikey
+          chown -R crikey:crikey "$GITHUB_WORKSPACE" "$CARGO_HOME" "$RUSTUP_HOME"
+      - name: Build the Debian 13 web-enabled artefacts
+        run: |
+          runuser -u crikey -- env HOME=/home/crikey PATH="$PATH" \
+            packaging/linux/build.sh --with-web-surface \
+            --targets stage,tarball,deb,rpm target/packaging/linux-web
+      - name: Exercise the real engine as a non-root user
+        # These tests check real headless pixels, resize, input, storage and
+        # policy. They do not exercise the launcher's delegated-cgroup gate.
+        run: |
+          runuser -u crikey -- env HOME=/home/crikey PATH="$PATH" \
+            cargo test --release --locked -p crikey-web-host \
+            --features engine --test engine_smoke -- --test-threads=1
+      - name: Verify each web package payload and runtime dependencies
+        run: |
+          out=target/packaging/linux-web
+          # The integration test's CARGO_BIN_EXE must be the staged release host,
+          # not an unshipped debug binary or a replacement built by the test.
+          cmp target/release/crikey-web-host "$out/stage/lib/crikey/crikey-web-host"
+          version="$(runuser -u crikey -- env HOME=/home/crikey PATH="$PATH" \
+            cargo metadata --locked --no-deps --format-version=1 \
+            | jq -r '.packages[] | select(.name == "crikey-cli") | .version')"
+          tarballs=("$out"/*.tar.gz)
+          debs=("$out"/*.deb)
+          mapfile -t rpms < <(find "$out" -type f -name '*.rpm' \
+            ! -name '*.src.rpm' ! -name '*-debuginfo-*' ! -name '*-debugsource-*')
+          test "${#tarballs[@]}" -eq 1
+          test "${#debs[@]}" -eq 1
+          test "${#rpms[@]}" -eq 1
+          mkdir -p "$out/verify"/{tar,deb,rpm}
+          tar --extract --file "${tarballs[0]}" --strip-components=1 --directory "$out/verify/tar"
+          dpkg-deb --extract "${debs[0]}" "$out/verify/deb"
+          rpm_path="$(realpath "${rpms[0]}")"
+          (cd "$out/verify/rpm" && rpm2cpio "$rpm_path" | cpio -idm --quiet --no-absolute-filenames)
+          for payload in "$out/verify/tar" "$out/verify/deb/usr" "$out/verify/rpm/usr"; do
+            version_output="$("$payload/lib/crikey/crikey" version)"
+            printf '%s\n' "$version_output"
+            [[ $version_output == "crikey $version ("* ]]
+            for executable in crikey crikey-launcher crikey-wasm-host crikey-cabi-host crikey-web-host; do
+              test -x "$payload/lib/crikey/$executable"
+              if [[ $payload == "$out/verify/rpm/usr" ]]; then
+                # RPM may strip symbols; its ELF build ID must still match.
+                expected="$(LC_ALL=C readelf -n "$out/stage/lib/crikey/$executable" | grep 'Build ID:')"
+                actual="$(LC_ALL=C readelf -n "$payload/lib/crikey/$executable" | grep 'Build ID:')"
+                test -n "$expected"
+                test "$actual" = "$expected"
+              else
+                cmp "$out/stage/lib/crikey/$executable" "$payload/lib/crikey/$executable"
+              fi
+            done
+            test -d "$payload/lib/crikey/modern-sdk"
+            test -d "$payload/lib/crikey/legacy-shim"
+            test -f "$payload/share/doc/crikey/LICENSE"
+            test -f "$payload/share/doc/crikey/NOTICE.md"
+          done
+          for executable in crikey crikey-launcher crikey-wasm-host crikey-cabi-host crikey-web-host; do
+            LC_ALL=C ldd "$out/stage/lib/crikey/$executable" | tee "$out/verify/$executable.ldd"
+            if grep -Fq 'not found' "$out/verify/$executable.ldd"; then
+              echo "Unresolved runtime dependency: $executable" >&2
+              exit 1
+            fi
+          done
+          dpkg-deb --field "${debs[0]}" Depends | tee "$out/verify/deb-depends.txt"
+          for dependency in libwpewebkit-2.0-1 libwpe-1.0-1 libwpebackend-fdo-1.0-1 libwayland-server0 libglib2.0-0 python3; do
+            grep -Fq "$dependency" "$out/verify/deb-depends.txt"
+          done
+          rpm -qp --requires "${rpms[0]}" | tee "$out/verify/rpm-requires.txt"
+          for dependency in libWPEWebKit-2.0.so.1 libwpe-1.0.so.1 libWPEBackend-fdo-1.0.so.1 libwayland-server.so.0 libglib-2.0.so.0 python3; do
+            grep -Fq "$dependency" "$out/verify/rpm-requires.txt"
+          done
+      - name: Give the additional web artefacts distinct download names
+        # Package identities stay unchanged: install either variant, not both.
+        run: |
+          out=target/packaging/linux-web
+          mkdir -p "$out/upload"
+          for archive in "$out"/*.tar.gz; do
+            name="$(basename "$archive" .tar.gz)"
+            mv "$archive" "$out/upload/$name-web-debian13.tar.gz"
+          done
+          for package in "$out"/*.deb; do
+            name="$(basename "$package" .deb)"
+            mv "$package" "$out/upload/$name-web-debian13.deb"
+          done
+          while IFS= read -r -d '' package; do
+            name="$(basename "$package" .rpm)"
+            mv "$package" "$out/upload/$name-web-debian13.rpm"
+          done < <(find "$out" -type f -name '*.rpm' ! -path "$out/upload/*" \
+            ! -name '*.src.rpm' ! -name '*-debuginfo-*' ! -name '*-debugsource-*' -print0)
+          packages=("$out/upload/"*)
+          test "${#packages[@]}" -eq 3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-web-debian13
+          if-no-files-found: error
+          path: target/packaging/linux-web/upload/*
+
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ env.RELEASE_REF }}
       - uses: dtolnay/rust-toolchain@1.86.0
       - uses: Swatinem/rust-cache@v2
       - name: Build the release executables
@@ -426,11 +565,16 @@ jobs:
             target/packaging/windows/*.zip
 
   macos:
-    runs-on: macos-14
+    # macos-14 is retired; use the standard Intel runner, not the ARM
+    # macos-15 label, while retaining the existing universal cross-build.
+    runs-on: macos-15-intel
+    env:
+      # Match Info.plist rather than inheriting the build host's OS version.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ env.RELEASE_REF }}
       - uses: dtolnay/rust-toolchain@1.86.0
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
@@ -454,6 +598,22 @@ jobs:
             --wasm-host-binary target/x86_64-apple-darwin/release/crikey-wasm-host \
             --cabi-host-binary target/aarch64-apple-darwin/release/crikey-cabi-host \
             --cabi-host-binary target/x86_64-apple-darwin/release/crikey-cabi-host
+      - name: Verify the universal executables and deployment floor
+        run: |
+          app=target/packaging/macos/CriKey.app
+          for executable in crikey crikey-launcher crikey-wasm-host crikey-cabi-host; do
+            binary="$app/Contents/MacOS/$executable"
+            lipo -verify_arch x86_64 arm64 "$binary"
+            for architecture in x86_64 arm64; do
+              build_info="$(xcrun vtool -arch "$architecture" -show-build "$binary")"
+              printf '%s\n' "$build_info"
+              grep -Eq 'minos[[:space:]]+11(\.0){1,2}$' <<< "$build_info"
+            done
+          done
+          version="$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")"
+          version_output="$("$app/Contents/MacOS/crikey" version)"
+          printf '%s\n' "$version_output"
+          [[ $version_output == "crikey $version ("* ]]
       - name: Archive the bundle
         # `ditto` rather than `zip`, because it preserves the bundle's symlinks
         # and extended attributes; a zipped .app that loses them will not launch.
@@ -465,14 +625,15 @@ jobs:
           path: target/packaging/macos/*.zip
 
   publish:
-    needs: [linux, windows, macos]
+    if: ${{ github.event_name == 'push' || inputs.publish == true }}
+    needs: [linux, linux-web, windows, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ env.RELEASE_REF }}
       - uses: actions/download-artifact@v4
         with:
           path: artefacts
@@ -497,14 +658,31 @@ jobs:
           {
             printf 'CriKey %s, built from this tag by `.github/workflows/release.yml`.\n\n' "$TAG"
             printf '| Platform | Artefact |\n| --- | --- |\n'
-            printf '| Linux | `crikey-*-linux.tar.gz`, `.deb`, `.rpm` |\n'
+            printf '| Linux standard (no web engine) | `crikey-*-linux.tar.gz`, `.deb`, `.rpm` without `-web-debian13` |\n'
+            printf '| Linux optional web (Debian 13 build) | `*-web-debian13.tar.gz`, `*-web-debian13.deb`, `*-web-debian13.rpm` |\n'
             printf '| Windows | `CriKey-*.msi` (per-user), `crikey-windows-x86_64-portable.zip` |\n'
             printf '| macOS | `crikey-macos-universal.zip` (CriKey.app, universal) |\n\n'
             printf 'Verify a download against `SHA256SUMS`.\n\n'
+            printf 'Changes since v0.1.18: raster images in plugin pages; optional Linux web\n'
+            printf 'surfaces; high-DPI sizing fixes; and aggregate Windows job memory limits.\n\n'
+            printf 'The standard Linux packages do not include `crikey-web-host`. Choose the\n'
+            printf 'additional `-web-debian13` packages for the WPE engine host. The variants\n'
+            printf 'have the same installed package identity; install one, not both.\n\n'
+            printf 'Web packages are built on Debian 13 and use system WPE WebKit 2.0 API,\n'
+            printf 'libwpe, WPEBackend-fdo, Wayland and GLib libraries, not a bundled engine.\n'
+            printf 'The tarball needs those compatible runtime libraries installed separately.\n'
+            printf 'The RPM records library SONAME requirements; a Debian-built RPM is not\n'
+            printf 'a claim of Fedora compatibility. All Linux packages use system Python 3.\n\n'
+            printf 'Web startup also requires writable delegated cgroup-v2 memory controls\n'
+            printf 'and `cgroup.kill`, with an effective ceiling of at least 256 MiB. Without\n'
+            printf 'the required delegation, web pages are refused while ordinary launcher\n'
+            printf 'use and display-list pages continue. Engine smoke tests do not prove\n'
+            printf 'launcher cgroup delegation on your system. See `packaging/README.md`\n'
+            printf 'and `docs/plugin-author-guide.md` for the full runtime requirements.\n\n'
             printf '**These artefacts are unsigned.** No code-signing certificate exists for\n'
             printf 'this project yet, so Windows SmartScreen reports an unknown publisher and\n'
             printf 'macOS Gatekeeper refuses the bundle until it is opened through the context\n'
-            printf 'menu. The Linux artefacts are unaffected.\n\n'
+            printf 'menu. Linux packages are unsigned too; no signed apt/rpm repository is supplied.\n\n'
             printf 'Platform runtime verification (M8) is still open: the Windows and macOS\n'
             printf 'backends compile and are covered by portable tests, but their native\n'
             printf 'runtime paths have not been exercised on real hardware. See\n'
