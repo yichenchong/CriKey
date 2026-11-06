@@ -81,7 +81,14 @@ jobs:
     runs-on: ubuntu-24.04
     # Ubuntu does not package the WPE WebKit 2.0 API used by the host.
     # This is an additional Debian 13 build, not a replacement for linux.
-    container: debian:13
+    permissions:
+      contents: read
+    container:
+      image: debian:13
+      # Docker's default seccomp policy blocks the namespaces WPE's own
+      # bubblewrap sandbox creates. Relax only this disposable CI container;
+      # the browser still runs non-root with its sandbox enabled.
+      options: --security-opt seccomp=unconfined
     defaults:
       run:
         shell: bash
@@ -112,6 +119,8 @@ jobs:
         run: |
           useradd --create-home --shell /bin/bash crikey
           chown -R crikey:crikey "$GITHUB_WORKSPACE" "$CARGO_HOME" "$RUSTUP_HOME"
+          runuser -u crikey -- bwrap --unshare-user --unshare-pid \
+            --ro-bind / / --proc /proc --dev /dev -- /bin/true
       - name: Build the Debian 13 web-enabled artefacts
         run: |
           runuser -u crikey -- env HOME=/home/crikey PATH="$PATH" \
@@ -603,7 +612,7 @@ jobs:
           app=target/packaging/macos/CriKey.app
           for executable in crikey crikey-launcher crikey-wasm-host crikey-cabi-host; do
             binary="$app/Contents/MacOS/$executable"
-            lipo -verify_arch x86_64 arm64 "$binary"
+            lipo "$binary" -verify_arch x86_64 arm64
             for architecture in x86_64 arm64; do
               build_info="$(xcrun vtool -arch "$architecture" -show-build "$binary")"
               printf '%s\n' "$build_info"
