@@ -444,14 +444,14 @@ and the path has to be the one the `.deb` and the tarball also use.
 the licence and notice reach every artefact, the worker trees land beside the
 real executable, a package with no bundled interpreter declares `python3`, the
 tarball is prefix-relative, two builds agree byte for byte, and every refusal
-path exits non-zero with a message. It packages `/usr/bin/true` and
-`/usr/bin/false` as stand-ins rather than building CriKey, so it runs in
-seconds and needs no Rust toolchain. It passes,
-37 checks, with the `.deb` checks included.
+path exits non-zero with a message. It packages supplied fixture executables
+rather than compiling CriKey. CI covers both web and no-web packaging,
+including Debian dependency records; these fixture checks do not prove browser
+rendering.
 
-The `.rpm` and Flatpak recipes are checked in but have not been executed:
-neither `rpmbuild` nor `flatpak-builder` was installed on the machine they were
-written on. Treat them as unverified until a release build runs them.
+The release workflow separately builds real tarballs, Debian packages and
+RPMs, and checks the web variant with the actual engine. Flatpak is not a
+release artefact and remains unverified as a supported distribution channel.
 
 ## What each toolchain requires
 
