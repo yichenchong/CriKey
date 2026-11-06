@@ -321,11 +321,15 @@ Run the engine smoke as a **non-root user with a writable HOME** and keep the
 browser sandbox enabled. The workflow installs Mesa EGL/GLES and software DRI
 drivers and uses a separate non-root account for both commands. Its smoke gate
 exercises actual headless document rendering, resize, input, storage and
-navigation policy. Docker's default seccomp policy blocks the namespaces that
-WPE's bubblewrap sandbox needs, so this disposable CI container uses
-`--security-opt seccomp=unconfined` and checks namespace creation before building.
-The browser still runs non-root with its own sandbox enabled. Do not interpret
-a build or `--help` invocation as a substitute for the engine smoke.
+navigation policy. The web job uses the supported `ubuntu-22.04` runner because
+Ubuntu 24.04 restricts unprivileged user namespaces on the host; no host
+security sysctl is changed. The package build still runs inside Debian 13.
+Docker's default seccomp and AppArmor policies also block the namespaces and
+bind mounts that WPE's bubblewrap sandbox needs. Only this disposable CI
+container uses `--security-opt seccomp=unconfined --security-opt apparmor=unconfined`.
+It checks namespace creation and mounts before building. The browser still
+runs non-root with its own sandbox enabled, without a privileged container.
+Do not interpret a build or `--help` invocation as a substitute for the engine smoke.
 
 No WPE engine libraries are bundled. The tarball needs compatible system WPE
 WebKit 2.0, libwpe, WPEBackend-fdo, Wayland and GLib runtimes, plus the other

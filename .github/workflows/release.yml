@@ -78,17 +78,18 @@ jobs:
             target/packaging/linux/**/*.rpm
 
   linux-web:
-    runs-on: ubuntu-24.04
-    # Ubuntu does not package the WPE WebKit 2.0 API used by the host.
-    # This is an additional Debian 13 build, not a replacement for linux.
+    # Ubuntu 24.04 restricts unprivileged user namespaces on the host.
+    # Use the supported 22.04 runner without changing host security sysctls;
+    # the actual package build and runtime baseline remain Debian 13.
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
     container:
       image: debian:13
-      # Docker's default seccomp policy blocks the namespaces WPE's own
-      # bubblewrap sandbox creates. Relax only this disposable CI container;
-      # the browser still runs non-root with its sandbox enabled.
-      options: --security-opt seccomp=unconfined
+      # Allow the namespaces and bind mounts needed by WPE's own sandbox in
+      # this disposable CI container. The browser still runs non-root with
+      # its sandbox enabled; no privileged container is used.
+      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
     defaults:
       run:
         shell: bash
