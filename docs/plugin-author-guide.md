@@ -121,8 +121,8 @@ compatible with the selected runtime and request native-code permission where
 applicable. Use `crikey package build --plugin DIR` to create a
 `.crikey-package`, then `inspect`, `verify`, and (with a publisher key) `sign`
 it before distribution. Index installation additionally checks the published
-digest and signer trust policy. See [ADR-0012](adr/0012-package-signing.md)
-and [ADR-0013](adr/0013-plugin-index.md).
+digest and signer trust policy. See [ADR-0012](../../notes/adr/0012-package-signing.md)
+and [ADR-0013](../../notes/adr/0013-plugin-index.md).
 
 ## Modern Python API
 
@@ -194,9 +194,9 @@ Use request IDs, query generations, cancellation, deadlines, bounded batches,
 and backpressure as protocol contracts. Keep persistent indexes and native
 libraries in the child process. Do not rely on ordinary local IPC being shared
 memory; shared-memory transport is an optimization that may be added later.
-The native wire details are in [ADR-0010](adr/0010-protobuf-codec.md),
-[ADR-0017](adr/0017-shared-memory-transport.md), and the
-[native-host architecture](architecture.md).
+The native wire details are in [ADR-0010](../../notes/adr/0010-protobuf-codec.md),
+[ADR-0017](../../notes/adr/0017-shared-memory-transport.md), and the
+[native-host architecture](../../notes/architecture.md).
 
 A C-ABI plugin is supported, but never in process: `crikey-cabi-host` loads the
 shared library and speaks the native protocol on its behalf, so a crash or a
@@ -223,8 +223,8 @@ Alternatively, the native/Rust page API can declare a Linux-only web surface,
 described below. The Python SDK does not currently expose that declaration.
 The separate engine host sends its own bounded frames to the launcher; these
 are not plugin-authored raster nodes. The rationale and limits are in
-[ADR-0020](adr/0020-plugin-pages.md), and the normative rules are in
-[spec §32](spec/crikey-spec-v1.md#32-plugin-pages).
+[ADR-0020](../../notes/adr/0020-plugin-pages.md), and the normative rules are in
+[spec §32](../../notes/spec/crikey-spec-v1.md#32-plugin-pages).
 
 For a display-list page, be clear about what that means before you start:
 
@@ -753,8 +753,8 @@ result batch.
 or event frequency) and must be explicitly selected; never assume it is the
 default. Run `crikey plugin doctor [ID]` and
 `crikey dev test-legacy-compat` while porting. The compatibility matrix and
-limitations are documented in [ADR-0006](adr/0006-legacy-scheduling.md) and
-[ADR-0005](adr/0005-python-hosting.md). Legacy dynamic suggestions are not
+limitations are documented in [ADR-0006](../../notes/adr/0006-legacy-scheduling.md) and
+[ADR-0005](../../notes/adr/0005-python-hosting.md). Legacy dynamic suggestions are not
 cached by default, and legacy `Match`/`Sort` requests are recorded but do not
 cause host-side matching or sorting of suggestion batches.
 
@@ -802,6 +802,6 @@ Platform services are capability-dependent: Linux window control is optional
 and Wayland depends on compositor protocols; macOS accessibility/Keychain and
 Windows registry/shell operations may require OS permission. Report unavailable
 capabilities rather than assuming every desktop has every service. For the
-complete boundary, link readers to [platform services in the spec](spec/crikey-spec-v1.md#18-platform-services),
-[ADR-0011](adr/0011-wayland-backend.md), and
-[ADR-0015](adr/0015-restricted-c-abi.md).
+complete boundary, link readers to [platform services in the spec](../../notes/spec/crikey-spec-v1.md#18-platform-services),
+[ADR-0011](../../notes/adr/0011-wayland-backend.md), and
+[ADR-0015](../../notes/adr/0015-restricted-c-abi.md).

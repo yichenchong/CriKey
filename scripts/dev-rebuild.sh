@@ -5,7 +5,7 @@
 # WHY THIS EXISTS
 #
 # `scripts/prune-build-cache.sh` reclaims disk when asked, and the user timer in
-# `docs/development.md` asks on a schedule. Neither is tied to a build, so
+# `../notes/development.md` asks on a schedule. Neither is tied to a build, so
 # between two runs of the timer a heavy editing session still accumulates
 # superseded artefacts. This wrapper is the other half: it makes clearing part
 # of the build itself, for the case where you want a rebuild to leave nothing

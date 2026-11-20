@@ -32,7 +32,7 @@ which the Flatpak always does and the other formats do only when built with
 is never on their import path either way. Without a staged runtime the host
 falls back to a configured or discovered interpreter. A development checkout falls through to `python3`; set
 `CRIKEY_PYTHON` to select an interpreter explicitly. See
-[development notes](development.md#python) for runtime layout.
+[development notes](../../notes/development.md#python) for runtime layout.
 
 ## Configuration
 
@@ -170,7 +170,7 @@ behavior is a plugin declaration for modern plugins, not a hidden global rule.
 Catalog rows are fuzzy-matched by the host. Plugin suggestion batches are shown
 in the order the plugin publishes them; they are not host-fuzzy-matched or
 re-ranked by `score_hint`. This distinction is intentional (see
-[architecture](architecture.md#two-paths-two-matching-contracts)).
+[architecture](../../notes/architecture.md#two-paths-two-matching-contracts)).
 
 ## Plugins, signing, and diagnosis
 
@@ -209,7 +209,7 @@ crikey package trust-remove --name NAME
 ```
 
 Unsigned-policy configuration and trust-store details are in
-[ADR-0012](adr/0012-package-signing.md) and the package command's `--help`.
+[ADR-0012](../../notes/adr/0012-package-signing.md) and the package command's `--help`.
 Do not describe a digest as publisher identity: hashes detect changed bytes;
 trusted signatures establish provenance.
 
@@ -235,6 +235,6 @@ confinement off for a whole process. A plugin is therefore not sandboxed
 merely because it declared permissions, and the UI must not claim otherwise.
 WebAssembly and the restricted C ABI are supported out-of-process runtimes,
 each hosted by its own supervised executable rather than loaded into the
-launcher. See [architecture](architecture.md),
-[ADR index](adr/README.md), and the [v1 specification](spec/crikey-spec-v1.md)
+launcher. See [architecture](../../notes/architecture.md),
+[ADR index](../../notes/adr/README.md), and the [v1 specification](../../notes/spec/crikey-spec-v1.md)
 for design boundaries and planned behavior.

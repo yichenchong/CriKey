@@ -705,8 +705,7 @@ jobs:
             printf 'menu. Linux packages are unsigned too; no signed apt/rpm repository is supplied.\n\n'
             printf 'Platform runtime verification (M8) is still open: the Windows and macOS\n'
             printf 'backends compile and are covered by portable tests, but their native\n'
-            printf 'runtime paths have not been exercised on real hardware. See\n'
-            printf '`docs/ROADMAP.md` for the measured status.\n'
+            printf 'runtime paths have not been exercised on real hardware.\n'
           } > release-notes.md
           # A re-run must converge on the same published state rather than
           # failing because the release already exists: a first attempt that

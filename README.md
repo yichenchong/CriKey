@@ -15,7 +15,7 @@ four plugin runtimes, the ecosystem work (signed packages, the plugin index,
 WebAssembly, the restricted C ABI, Wayland shortcuts, remote catalogs) and the
 per-platform packaging. M8, native Windows and macOS runtime verification, is
 planned and is the reason those two platforms are still listed as unverified
-below. [docs/ROADMAP.md](docs/ROADMAP.md)
+below. [docs/ROADMAP.md](../notes/ROADMAP.md)
 is the authoritative, measured status.
 
 - **M0, M1 — core launcher.** Query engine, catalog with a persistent on-disk
@@ -111,8 +111,8 @@ These are stated here because they are easy to assume working:
   explicit caveats in `compatibility/api-matrix/matrix.toml`; they are not
   silently presented as full compatibility.
 
-See [docs/architecture.md](docs/architecture.md) for the component map and
-[docs/development.md](docs/development.md) for how to build and test the tree.
+See [docs/architecture.md](../notes/architecture.md) for the component map and
+[docs/development.md](../notes/development.md) for how to build and test the tree.
 
 ## Layout
 
@@ -169,7 +169,7 @@ edit. It takes Cargo's own build lock and holds it while it works, so it will
 not delete artefacts out from under a running build.
 
 To have it happen without being asked, install the timer described in
-[docs/development.md](docs/development.md). To tie the clearing to a build
+[docs/development.md](../notes/development.md). To tie the clearing to a build
 instead of to the clock, `scripts/dev-rebuild.sh test --workspace` prunes and
 then forwards to Cargo; it costs a cold build every time, so it is a separate
 command rather than a change to `cargo`.

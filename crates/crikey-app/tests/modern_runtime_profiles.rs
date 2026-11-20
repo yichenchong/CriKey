@@ -1,7 +1,6 @@
 //! A modern plugin's declared `requires-python` must decide *which* interpreter
 //! runs it, and two plugins whose requirements cannot be met by one interpreter
-//! must end up in two separate operating-system processes (spec 14.11;
-//! `docs/spec/crikey-spec-v1.md:1059-1069`).
+//! must end up in two separate operating-system processes (spec 14.11).
 //!
 //! # What is actually proved
 //!
