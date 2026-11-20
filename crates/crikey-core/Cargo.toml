@@ -14,3 +14,4 @@ workspace = true
 [dependencies]
 thiserror.workspace = true
 regex.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false }

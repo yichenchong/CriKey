@@ -49,6 +49,7 @@ pub(crate) const LAUNCHER_SETTINGS: &[(&str, &str, bool)] = &[
     (KEY_PROFILE, "Configuration profile", false),
     (KEY_SHOW_HINTS, "Show keyboard hints", true),
     (KEY_ROUNDED_CORNERS, "Rounded corners", true),
+    ("launcher.preview-split", "Preview split proportion", false),
 ];
 
 /// What the source column says for a key no layer supplies.
@@ -153,6 +154,14 @@ pub(crate) fn configured_rounded_corners(store: Option<&ConfigStore>) -> bool {
     store.and_then(|store| store.get(KEY_ROUNDED_CORNERS)) != Some("false")
 }
 
+pub(crate) fn configured_preview_split(store: Option<&ConfigStore>) -> f32 {
+    store
+        .and_then(|store| store.get("launcher.preview-split"))
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && (0.3..=0.7).contains(value))
+        .unwrap_or(0.55)
+}
+
 /// Refuses a value the launcher could not honour, before it reaches the file.
 ///
 /// Validation happens on the way in rather than on the way out, because the
@@ -164,6 +173,10 @@ pub(crate) fn validate(key: &str, value: &str) -> Result<(), String> {
         return Err(format!("`{key}` cannot be set to an empty value"));
     }
     match key {
+        "launcher.preview-split" => match value.parse::<f32>() {
+            Ok(value) if value.is_finite() && (0.3..=0.7).contains(&value) => Ok(()),
+            _ => Err("Preview split must be a number between 0.3 and 0.7".into()),
+        },
         KEY_ACTIVATION_HOTKEY => Accelerator::parse(value)
             .map(|_| ())
             .map_err(|error| format!("`{value}` is not a valid accelerator: {error}")),
@@ -476,6 +489,7 @@ pub(crate) fn residency(effect: &UiEffect) -> Option<Residency> {
         // reason to hide the window or end the process.
         UiEffect::Query(_)
         | UiEffect::Execute { .. }
+        | UiEffect::OpenPreviewLink { .. }
         | UiEffect::SetSetting { .. }
         | UiEffect::PageInput(_)
         | UiEffect::WebInput(_)
@@ -991,7 +1005,8 @@ mod tests {
                 KEY_MAX_RESULTS,
                 KEY_PROFILE,
                 KEY_SHOW_HINTS,
-                KEY_ROUNDED_CORNERS
+                KEY_ROUNDED_CORNERS,
+                "launcher.preview-split",
             ]
         );
         assert_eq!(rows[0].value, "Ctrl+Alt+Space");

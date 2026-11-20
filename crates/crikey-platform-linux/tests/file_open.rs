@@ -59,6 +59,43 @@ fn a_path_full_of_shell_metacharacters_arrives_as_one_argument() {
     );
 }
 
+#[test]
+fn a_web_link_reaches_the_helper_as_one_unchanged_argument() {
+    let recorder = Recorder::new();
+    let url = "hTtPs://example.com/a?x=$(reboot);'\"&next=two words#fragment";
+
+    let argv = recorder.record(|opener| opener.open_url(url));
+
+    assert_eq!(argv, vec![url.as_bytes().to_vec()]);
+}
+
+#[test]
+fn non_web_schemes_and_control_characters_are_refused_before_spawn() {
+    let opener = XdgOpener::with_helper("/nonexistent/xdg-open");
+    for url in [
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "mailto:someone@example.com",
+        "shell:AppsFolder",
+        "-h",
+        " https://example.com",
+    ] {
+        assert!(invalid(opener.open_url(url)).contains("http or https scheme"));
+    }
+    for url in ["https://example.com/\0evil", "http://example.com/\nnext"] {
+        assert!(invalid(opener.open_url(url)).contains("control characters"));
+    }
+}
+
+#[test]
+fn a_web_link_reports_a_missing_helper_instead_of_succeeding() {
+    let opener = XdgOpener::with_helper("/nonexistent/xdg-open");
+    let message = invalid(opener.open_url("http://example.com/a?x=1&y=2"));
+    assert!(message.contains("http://example.com/a?x=1&y=2"));
+    assert!(message.contains("/nonexistent/xdg-open"));
+    assert!(message.contains(&std::io::Error::from_raw_os_error(2).to_string()));
+}
+
 /// A path that is not valid Unicode still opens (spec 18.3, ADR-0007).
 ///
 /// Kills the bug where the path is round-tripped through `String` somewhere on

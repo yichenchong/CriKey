@@ -68,6 +68,54 @@ use crate::{
 /// the key: two packages sharing an entrypoint still own separate processes.
 type WorkerKey = (String, String);
 
+/// UI preview readers only inspect this snapshot. Background lifecycle polling
+/// updates idle workers as well as workers completing a query/action/preview.
+type NativeIncarnations = Arc<Mutex<BTreeMap<PluginId, u64>>>;
+
+fn refresh_incarnation(
+    supervisor: &mut NativeSupervisor,
+    plugin: &PluginId,
+    incarnations: &NativeIncarnations,
+) -> bool {
+    let connection = supervisor.poll_live_connection(plugin);
+    let mut incarnations = incarnations.lock().unwrap_or_else(|error| error.into_inner());
+    match connection {
+        Some(connection) if incarnations.get(plugin) == Some(&connection) => false,
+        Some(connection) => {
+            incarnations.insert(plugin.clone(), connection);
+            true
+        }
+        None => incarnations.remove(plugin).is_some(),
+    }
+}
+/// Process supervision uses one real monotonic epoch, independent of injected
+/// query-pipeline scheduling time. Every native worker access uses this clock.
+fn native_policy_now() -> Millis {
+    static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    EPOCH.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn with_native_worker<T>(
+    supervisor: &mut NativeSupervisor,
+    plugin: &PluginId,
+    incarnations: &NativeIncarnations,
+    call: impl FnOnce(&mut crikey_native_host::NativeWorker) -> Result<T, HostError>,
+) -> Result<T, HostError> {
+    refresh_incarnation(supervisor, plugin, incarnations);
+    let result = match supervisor.worker(plugin, native_policy_now()) {
+        Ok(worker) => {
+            incarnations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(plugin.clone(), worker.connection_id());
+            call(worker)
+        }
+        Err(error) => Err(error),
+    };
+    refresh_incarnation(supervisor, plugin, incarnations);
+    result
+}
+
 /// One native package that could not be made available, and why.
 ///
 /// This is a load-time diagnostic only. Runtime worker failures are reported by
@@ -81,6 +129,9 @@ pub struct NativeUnavailable {
     /// A single-line, attributable reason for the load refusal.
     pub reason: String,
 }
+
+#[path = "native_preview.rs"]
+mod native_preview;
 
 /// One loaded native plugin and the worker key that serves it. The launch
 /// recipe is retained so catalog requests can use an independent process.
@@ -120,11 +171,12 @@ struct NativeCatalogTask {
 /// same capacity never blocks a worker that is completing a legal task.
 #[derive(Debug)]
 struct NativeCatalogDispatcher {
-    result_tx: SyncSender<(u64, CatalogBuildResult)>,
-    result_rx: Receiver<(u64, CatalogBuildResult)>,
+    result_tx: SyncSender<(u64, CatalogBuildResult, u64)>,
+    result_rx: Receiver<(u64, CatalogBuildResult, u64)>,
     tasks: BTreeMap<u64, NativeCatalogTask>,
     latest: BTreeMap<PluginId, u64>,
     next_id: u64,
+    items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
 }
 
 impl Default for NativeCatalogDispatcher {
@@ -136,6 +188,7 @@ impl Default for NativeCatalogDispatcher {
             tasks: BTreeMap::new(),
             latest: BTreeMap::new(),
             next_id: 0,
+            items: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -153,7 +206,7 @@ impl NativeCatalogDispatcher {
 
     fn take(&mut self) -> Vec<CatalogBuildResult> {
         let mut ready = Vec::new();
-        while let Ok((id, result)) = self.result_rx.try_recv() {
+        while let Ok((id, result, incarnation)) = self.result_rx.try_recv() {
             let Some(mut task) = self.tasks.remove(&id) else {
                 continue;
             };
@@ -176,6 +229,18 @@ impl NativeCatalogDispatcher {
                 }
                 other => other,
             };
+            if let CatalogBuildResult::Complete(build) = &result {
+                let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+                items.retain(|(owner, _), _| owner != &build.plugin);
+                if incarnation != 0 {
+                    for item in &build.items {
+                        items.insert(
+                            (build.plugin.clone(), item.stable_id.clone()),
+                            (item.clone(), incarnation),
+                        );
+                    }
+                }
+            }
             ready.push(result);
         }
         ready
@@ -266,14 +331,19 @@ impl CallControl {
 #[derive(Debug, Default)]
 struct NativeCancellation {
     calls: Mutex<BTreeMap<(u64, PluginId), Arc<CallControl>>>,
+    newest_job: AtomicU64,
 }
 
 impl NativeCancellation {
-    fn register(&self, generation: u64, plugin: PluginId, control: Arc<CallControl>) {
+    fn register(&self, job: u64, plugin: PluginId, control: Arc<CallControl>) {
         self.calls
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert((generation, plugin), control);
+            .insert((job, plugin), Arc::clone(&control));
+        // Submission can supersede a job before its dispatcher registers.
+        if job < self.newest_job.load(Ordering::Acquire) {
+            control.cancel();
+        }
     }
 
     fn unregister(&self, generation: u64, plugin: &PluginId) {
@@ -284,6 +354,7 @@ impl NativeCancellation {
     }
 
     fn cancel_before(&self, generation: u64) {
+        self.newest_job.fetch_max(generation, Ordering::AcqRel);
         let controls = self
             .calls
             .lock()
@@ -311,17 +382,25 @@ impl NativeCancellation {
     }
 }
 
+/// Suggestions carry the identity of the child that actually produced them,
+/// not whichever child happens to be current when the result is published.
+#[derive(Debug)]
+struct ProducedSuggestions {
+    suggestions: Suggestions,
+    incarnation: u64,
+}
+
 #[derive(Debug)]
 struct DispatchResult {
     generation: u64,
     plugin: PluginId,
-    result: Result<Suggestions, HostError>,
+    result: Result<ProducedSuggestions, HostError>,
     soft_timeout: bool,
 }
 
 #[derive(Debug)]
 struct InFlightCall {
-    generation: u64,
+    job: u64,
     plugin: PluginId,
     join: Option<JoinHandle<()>>,
 }
@@ -382,10 +461,9 @@ impl Default for NativeWorkerPool {
 }
 
 impl NativeWorkerPool {
-    /// Only one blocking call may own one plugin supervisor at a time. A
-    /// cancelled but uncooperative call remains in this set until its host
-    /// deadline, so newer generations skip that plugin instead of piling up
-    /// unbounded waiter threads.
+    /// Only one blocking call may own one plugin supervisor at a time.
+    /// Cancelled calls retain ownership until their actual completion; newer
+    /// admitted requests wait in the provider's bounded pending map.
     fn has_in_flight(&self, plugin: &PluginId) -> bool {
         self.in_flight
             .keys()
@@ -406,7 +484,7 @@ impl NativeWorkerPool {
     fn finish_call(&mut self, generation: u64, plugin: &PluginId) {
         let key = (generation, plugin.clone());
         if let Some(mut call) = self.in_flight.remove(&key) {
-            self.cancellation.unregister(call.generation, &call.plugin);
+            self.cancellation.unregister(call.job, &call.plugin);
             if let Some(join) = call.join.take() {
                 let _ = join.join();
             }
@@ -424,7 +502,7 @@ impl NativeWorkerPool {
         self.cancellation.cancel_all();
         let calls = std::mem::take(&mut self.in_flight);
         for (_, mut call) in calls {
-            self.cancellation.unregister(call.generation, &call.plugin);
+            self.cancellation.unregister(call.job, &call.plugin);
             if let Some(join) = call.join.take() {
                 // A dispatcher applies bounded-channel backpressure while
                 // publishing its one result. Drain while waiting so shutdown
@@ -493,7 +571,7 @@ impl PluginResourceSource for NativeResourceSource {
         // impl. A child that fails to come up is reported as unavailable
         // rather than absent, so the reference stays retryable instead of
         // being memoized away on one slow start.
-        let Ok(worker) = supervisor.worker(&self.plugin, 0) else {
+        let Ok(worker) = supervisor.worker(&self.plugin, native_policy_now()) else {
             return IconFetch::Unavailable;
         };
         match worker.request_resource(
@@ -529,16 +607,14 @@ impl PluginResourceSource for NativeResourceSource {
 struct NativePageSource {
     plugin: PluginId,
     supervisor: Arc<Mutex<NativeSupervisor>>,
+    incarnations: NativeIncarnations,
 }
 
 impl PageBackend for NativePageSource {
     fn draw(&mut self, draw: &PageDraw) -> Result<crikey_core::PageFrame, String> {
         let mut supervisor = self.supervisor.lock().unwrap_or_else(|error| error.into_inner());
-        let worker = supervisor
-            .worker(&self.plugin, 0)
-            .map_err(|error| error.to_string())?;
-        worker
-            .page(&NativePageRequest {
+        with_native_worker(&mut supervisor, &self.plugin, &self.incarnations, |worker| {
+            worker.page(&NativePageRequest {
                 page_id: draw.page_id.clone(),
                 generation: draw.generation,
                 width: draw.width,
@@ -553,7 +629,8 @@ impl PageBackend for NativePageSource {
                 colour_accent: draw.palette.accent.to_u32(),
                 colour_muted: draw.palette.muted.to_u32(),
             })
-            .map_err(|error| error.to_string())
+        })
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -573,9 +650,10 @@ pub struct NativeProvider {
     /// Catalog-persistence declarations, keyed by plugin, recorded as soon as
     /// a manifest is parsed and independent of whether the plugin then loaded.
     catalog_declarations: BTreeMap<PluginId, bool>,
-    /// Current async suggestion snapshots keyed by the owning plugin and item
-    /// id. Stable item ids are only unique within an owner.
-    action_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    /// Current suggestion snapshots and their producing worker connection,
+    /// published together before their rows enter the query pipeline.
+    action_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
+    incarnations: NativeIncarnations,
     collection_window: Duration,
     /// Answers taken off the completion channel that have not been published
     /// yet, oldest first.
@@ -585,6 +663,10 @@ pub struct NativeProvider {
     /// pipeline retires it. Bounded by the channel it comes from and emptied on
     /// every refresh tick, so it holds at most the calls of one generation.
     late: Vec<DispatchResult>,
+    /// Admitted requests waiting for this plugin's physical callback to retire.
+    pending: BTreeMap<PluginId, Generation>,
+    /// UI submission identity and its independently minted pipeline generation.
+    binding: Option<(Generation, Generation)>,
 }
 
 /// How long one query waits for native workers before presenting what arrived.
@@ -633,8 +715,11 @@ impl NativeProvider {
             plugins: Vec::new(),
             unavailable: Vec::new(),
             action_items: Arc::new(Mutex::new(BTreeMap::new())),
+            incarnations: Arc::new(Mutex::new(BTreeMap::new())),
             collection_window,
             late: Vec::new(),
+            pending: BTreeMap::new(),
+            binding: None,
         };
 
         for root in roots {
@@ -900,7 +985,7 @@ impl NativeProvider {
         // `register` is intentionally lazy. Eager manifests pay the startup
         // handshake here; lazy manifests start on their first query.
         if manifest.performance.startup == Startup::Eager {
-            if let Err(error) = supervisor.worker(&plugin, 0) {
+            if let Err(error) = supervisor.worker(&plugin, native_policy_now()) {
                 self.record_unavailable(
                     package,
                     Some(plugin.clone()),
@@ -910,6 +995,7 @@ impl NativeProvider {
                 return;
             }
         }
+        refresh_incarnation(&mut supervisor, &plugin, &self.incarnations);
         let supervisor = Arc::new(Mutex::new(supervisor));
         self.pool.supervisors.insert(key.clone(), supervisor);
 
@@ -959,11 +1045,10 @@ impl NativeProvider {
             // must not take down the supervisor thread publishing to the rest.
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let mut supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
-                supervisor
-                    .worker(&plugin, 0)
-                    .map_err(|error| error.to_string())?
-                    .send_configuration(values, true)
-                    .map_err(|error| error.to_string())
+                with_native_worker(&mut supervisor, &plugin, &self.incarnations, |worker| {
+                    worker.send_configuration(values, true)
+                })
+                .map_err(|error| error.to_string())
             }));
             match outcome {
                 Ok(Ok(())) => {}
@@ -1039,9 +1124,8 @@ impl NativeProvider {
 
     /// Starts one bounded catalog rebuild for an exactly owned plugin.
     ///
-    /// Catalog work gets a fresh supervised native process rather than the
-    /// query supervisor's worker lock, so a slow rebuild cannot delay healthy
-    /// suggestions. The budget is the exact handle created at registration.
+    /// Catalog callbacks share the plugin's supervised child with suggestions
+    /// and previews. The background task holds its supervisor for the callback.
     pub fn request_catalog_build(
         &mut self,
         plugin: &PluginId,
@@ -1056,14 +1140,12 @@ impl NativeProvider {
                 plugin: plugin.clone(),
             })?;
         let budget = Arc::clone(&loaded.budget);
-        let launch = loaded.launch.clone();
-        // Catalog callbacks are not suggestion callbacks; keep their
-        // independent long transport budget rather than applying the manifest
-        // suggestion hard deadline to catalog construction.
-        let worker_options = loaded
-            .worker_options
-            .clone()
-            .with_call_timeout_ms(NATIVE_CALL_TIMEOUT_MS);
+        let supervisor = Arc::clone(self.pool.supervisors.get(&loaded.key).ok_or_else(|| {
+            CatalogDispatchError::UnknownPlugin {
+                plugin: plugin.clone(),
+            }
+        })?);
+        let incarnations = Arc::clone(&self.incarnations);
         if self.catalog.tasks.len() >= CATALOG_RESULT_CAPACITY {
             return Err(CatalogDispatchError::QueueFull {
                 plugin: plugin.clone(),
@@ -1084,21 +1166,38 @@ impl NativeProvider {
             .name(format!("crikey-native-catalog-{}", plugin.0))
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
-                    supervisor
-                        .register(launch, worker_options)
-                        .map_err(|error| error.to_string())?;
-                    let result = {
-                        let worker = supervisor
-                            .worker(&plugin_for_thread, 0)
-                            .map_err(|error| error.to_string())?;
-                        worker.build_catalog().map_err(|error| error.to_string())
-                    };
-                    supervisor.shutdown_all();
-                    result
+                    let mut supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
+                    let was_live = supervisor.poll_live_connection(&plugin_for_thread).is_some();
+                    let result =
+                        with_native_worker(&mut supervisor, &plugin_for_thread, &incarnations, |worker| {
+                            let incarnation = worker.connection_id();
+                            let supports_preview = worker.handshake().preview;
+                            worker
+                                .build_catalog_with_timeout_ms(NATIVE_CALL_TIMEOUT_MS)
+                                .map(|items| (items, incarnation, supports_preview))
+                        })
+                        .map_err(|error| error.to_string());
+                    let keep_origin = result.as_ref().is_ok_and(|(items, _, supported)| {
+                        *supported
+                            && items.iter().any(|item| {
+                                item.metadata.get("crikey.preview").map(String::as_str) == Some("deferred")
+                            })
+                    });
+                    // Only opted-in deferred catalogs make a newly started
+                    // catalog producer resident; static catalogs still release.
+                    if !was_live && !keep_origin {
+                        supervisor.release_worker(&plugin_for_thread, native_policy_now());
+                        refresh_incarnation(&mut supervisor, &plugin_for_thread, &incarnations);
+                    }
+                    result.map(|(items, incarnation, _)| (items, if keep_origin { incarnation } else { 0 }))
                 }));
+                let incarnation = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|result| result.as_ref().ok())
+                    .map_or(0, |(_, incarnation)| *incarnation);
                 let completion = match result {
-                    Ok(Ok(mut items)) => {
+                    Ok(Ok((mut items, _))) => {
                         for item in &mut items {
                             item.plugin_id = plugin_for_thread.clone();
                         }
@@ -1123,7 +1222,7 @@ impl NativeProvider {
                         reason: "native catalog worker panicked".to_owned(),
                     },
                 };
-                let _ = sender.send((request_id, completion));
+                let _ = sender.send((request_id, completion, incarnation));
                 drop(guard);
             })
             .map_err(|error| CatalogDispatchError::ThreadSpawn {
@@ -1185,7 +1284,7 @@ impl NativeProvider {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(&(plugin.clone(), item_id.clone()))
-            .cloned()
+            .map(|(item, _)| item.clone())
             .ok_or_else(|| {
                 crikey_core::CoreError::Invalid("native action item snapshot is no longer current".to_owned())
             })?;
@@ -1242,14 +1341,14 @@ impl NativeProvider {
         })?;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let mut supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
-            let worker = supervisor.worker(&plugin, 0).map_err(|error| error.to_string())?;
-            worker
-                .execute(
+            with_native_worker(&mut supervisor, &plugin, &self.incarnations, |worker| {
+                worker.execute(
                     &request.item.stable_id,
                     Some(&request.action_id),
                     request.argument.as_deref(),
                 )
-                .map_err(|error| error.to_string())
+            })
+            .map_err(|error| error.to_string())
         }));
         match outcome {
             Ok(Ok(ExecuteOutcome::Ok)) => Ok(ActionEffect::Completed),
@@ -1298,90 +1397,103 @@ impl NativeProvider {
         query: &str,
         now: Millis,
     ) -> Option<ViewModel> {
+        let started = Instant::now();
+        let frame = self.begin_query(pipeline, query, now, None);
+        // The synchronous entrypoint waits out an actual debounce deadline.
+        // The asynchronous driver instead resumes this generation on refresh.
+        let Some(next) = pipeline.next_wakeup().filter(|next| *next > now) else {
+            return frame;
+        };
+        let deadline = Duration::from_millis(next.saturating_sub(now));
+        thread::sleep(deadline.saturating_sub(started.elapsed()));
+        let elapsed = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let generation = self.binding.expect("begin_query binds its generation").1;
+        self.drive_current(pipeline, query, generation, now.saturating_add(elapsed))
+            .or(frame)
+    }
+
+    fn begin_query(
+        &mut self,
+        pipeline: &mut QueryPipeline,
+        query: &str,
+        now: Millis,
+        job: Option<Generation>,
+    ) -> Option<ViewModel> {
         let generation = pipeline.keystroke(query, now);
-        let mut at = now;
-        for _ in 0..64 {
-            // Ask the scheduler first. Starting a worker before this tick would
-            // bypass minimum-query, prefix, and debounce gates and spend a
-            // native callback on work the pipeline never admitted.
-            let tick = pipeline.tick(at);
-            for cancellation in tick.cancellations {
-                let _ = pipeline.complete(&cancellation.plugin, cancellation.generation, at);
-            }
+        self.action_items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        for (plugin, obsolete) in std::mem::take(&mut self.pending) {
+            let _ = pipeline.complete(&plugin, obsolete, now);
+        }
+        let job = job.unwrap_or(generation);
+        self.binding = Some((job, generation));
+        self.pool.cancel_before(job.get());
+        self.drive_current(pipeline, query, generation, now)
+    }
 
-            let mut requests = Vec::new();
-            for request in tick.dispatches {
-                if request.generation == generation {
-                    requests.push(request);
-                } else {
-                    let _ = pipeline.complete(&request.plugin, request.generation, at);
+    /// Advances existing work, without minting a generation or advancing time.
+    fn drive_current(
+        &mut self,
+        pipeline: &mut QueryPipeline,
+        query: &str,
+        generation: Generation,
+        now: Millis,
+    ) -> Option<ViewModel> {
+        self.retire_late_answers(pipeline, now);
+        let tick = pipeline.tick(now);
+        for cancellation in tick.cancellations {
+            let key = (cancellation.generation.get(), cancellation.plugin.clone());
+            // Cancellation is a notification, not callback retirement.
+            if !self.pool.in_flight.contains_key(&key) {
+                if self.pending.get(&cancellation.plugin) == Some(&cancellation.generation) {
+                    self.pending.remove(&cancellation.plugin);
                 }
+                let _ = pipeline.complete(&cancellation.plugin, cancellation.generation, now);
             }
-
-            if requests.is_empty() {
-                match pipeline.next_wakeup() {
-                    Some(next) if next > at => {
-                        at = next;
-                        continue;
-                    }
-                    _ => break,
-                }
+        }
+        for request in tick.dispatches {
+            if request.generation == generation {
+                self.pending.insert(request.plugin, request.generation);
+            } else {
+                let _ = pipeline.complete(&request.plugin, request.generation, now);
             }
-
-            let requested_plugins = requests
-                .iter()
-                .map(|request| request.plugin.clone())
-                .collect::<BTreeSet<_>>();
+        }
+        let ready = self
+            .pending
+            .iter()
+            .filter(|(plugin, pending)| **pending == generation && !self.pool.has_in_flight(plugin))
+            .map(|(plugin, _)| plugin.clone())
+            .collect::<BTreeSet<_>>();
+        if !ready.is_empty() {
             let CollectedSuggestions {
                 mut by_plugin,
                 dead_plugins,
                 outstanding,
-            } = self.collect_suggestions(query, generation, at, &requested_plugins);
-            for request in requests {
-                if dead_plugins.contains(&request.plugin) {
-                    let _ = pipeline.abort_request(&request.plugin, request.generation, at);
-                    continue;
+            } = self.collect_suggestions(query, generation, &ready);
+            for plugin in ready {
+                self.pending.remove(&plugin);
+                if dead_plugins.contains(&plugin) {
+                    let _ = pipeline.abort_request(&plugin, generation, now);
+                } else if !outstanding.contains(&plugin) {
+                    let _ = pipeline.deliver(
+                        ResultBatch {
+                            generation,
+                            plugin: plugin.clone(),
+                            state: BatchState::Final,
+                            items: by_plugin.remove(&plugin).unwrap_or_default(),
+                        },
+                        now,
+                    );
+                    let _ = pipeline.complete(&plugin, generation, now);
                 }
-                let answer = by_plugin.remove(&request.plugin);
-                if answer.is_none() && outstanding.contains(&request.plugin) {
-                    // Still running. Completing it here publishes an empty final
-                    // batch and retires the request, and `deliver` refuses a
-                    // batch whose request is no longer active -- so the answer,
-                    // when it lands a few hundred milliseconds later, is
-                    // rejected as stale and the user never sees those rows.
-                    // Left active, `retire_late_answers` publishes it on the
-                    // driver's next refresh tick. Every call carries its own
-                    // deadline, so a plugin that never answers still produces a
-                    // completion and still retires.
-                    continue;
-                }
-                // Either the plugin answered, or no call for this generation is
-                // running for it -- a plugin still busy with an older
-                // keystroke's call gets no new call and so will never answer
-                // this one. Both retire the request; only a live call may keep
-                // it open.
-                let items = answer.unwrap_or_default();
-                let _ = pipeline.deliver(
-                    ResultBatch {
-                        generation: request.generation,
-                        plugin: request.plugin.clone(),
-                        state: BatchState::Final,
-                        items,
-                    },
-                    at,
-                );
-                let _ = pipeline.complete(&request.plugin, request.generation, at);
             }
         }
-
-        // A completion can land between the collection window closing and this
-        // line. Retired rather than drained: draining would take it off the
-        // channel, drop its rows and leave its request active, and the refresh
-        // tick would then have nothing left to publish.
-        self.retire_late_answers(pipeline, at);
-
-        let frame = pipeline.present(at);
-        frame.filter(|frame| frame.generation == generation)
+        self.retire_late_answers(pipeline, now);
+        pipeline
+            .present(now)
+            .filter(|frame| frame.generation == generation)
     }
 
     /// Cancels outstanding calls, joins their dispatch threads, and asks every
@@ -1393,6 +1505,10 @@ impl NativeProvider {
             }
         }
         self.pool.shutdown();
+        self.incarnations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         // Joining every dispatcher makes all of its outcomes observable on
         // the channel. Consume them before teardown returns so late successes
         // are retired and late failures cannot disappear with the provider.
@@ -1409,16 +1525,14 @@ impl NativeProvider {
         &mut self,
         query: &str,
         generation: Generation,
-        now: Millis,
         requested_plugins: &BTreeSet<PluginId>,
     ) -> CollectedSuggestions {
         let generation_value = generation.get();
-        self.pool.cancel_before(generation_value);
+        let job = self
+            .binding
+            .filter(|(_, pipeline)| *pipeline == generation)
+            .map_or(generation_value, |(job, _)| job.get());
         self.drain_completed_results();
-        self.action_items
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
         let request = NativeSuggestRequest {
             generation: generation_value,
             text: query.to_owned(),
@@ -1434,15 +1548,9 @@ impl NativeProvider {
         let mut pending = 0usize;
 
         let mut dead_plugins = BTreeSet::new();
-        // Plugins this generation actually dispatched a call to. A plugin still
-        // busy with an older keystroke's call is skipped below and never enters
-        // this set: nothing is coming for *this* generation, so its request must
-        // be retired now rather than waited on.
+        // Only physically available plugins are admitted by `drive_current`.
         let mut dispatched = BTreeSet::new();
         for (plugin, key, soft_timeout) in targets {
-            if self.pool.has_in_flight(&plugin) {
-                continue;
-            }
             dispatched.insert(plugin.clone());
             let supervisor = match self.pool.supervisors.get(&key) {
                 Some(supervisor) => Arc::clone(supervisor),
@@ -1456,44 +1564,50 @@ impl NativeProvider {
             let sender = self.pool.result_tx.clone();
             let request_for_thread = request.clone();
             let plugin_for_thread = plugin.clone();
+            let incarnations = Arc::clone(&self.incarnations);
             self.pool
                 .cancellation
-                .register(generation_value, plugin.clone(), Arc::clone(&control));
+                .register(job, plugin.clone(), Arc::clone(&control));
             let join = thread::Builder::new()
                 .name(format!("crikey-native-{}", plugin.0))
                 .spawn(move || {
-                    let (result, soft_timeout) = {
+                    let mut soft_timeout_elapsed = false;
+                    let result = {
                         let mut supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
-                        match supervisor.worker(&plugin_for_thread, now) {
-                            Ok(worker) => {
-                                control_for_thread.install(worker.cancel_handle());
-                                let watch_control = Arc::clone(&control_for_thread);
-                                let watcher = thread::Builder::new()
-                                    .name(format!("crikey-native-cancel-{}", plugin_for_thread.0))
-                                    .spawn(move || watch_control.watch_cancel());
-                                let started = Instant::now();
-                                let result = worker.suggest(&request_for_thread);
-                                let soft_timeout = started.elapsed() > soft_timeout;
-                                control_for_thread.finish();
-                                if let Ok(watcher) = watcher {
-                                    let _ = watcher.join();
-                                }
-                                (result, soft_timeout)
+                        with_native_worker(&mut supervisor, &plugin_for_thread, &incarnations, |worker| {
+                            control_for_thread.install(worker.cancel_handle());
+                            let watch_control = Arc::clone(&control_for_thread);
+                            let watcher = thread::Builder::new()
+                                .name(format!("crikey-native-cancel-{}", plugin_for_thread.0))
+                                .spawn(move || watch_control.watch_cancel());
+                            let started = Instant::now();
+                            let incarnation = worker.connection_id();
+                            let result =
+                                worker
+                                    .suggest(&request_for_thread)
+                                    .map(|suggestions| ProducedSuggestions {
+                                        suggestions,
+                                        incarnation,
+                                    });
+                            soft_timeout_elapsed = started.elapsed() > soft_timeout;
+                            control_for_thread.finish();
+                            if let Ok(watcher) = watcher {
+                                let _ = watcher.join();
                             }
-                            Err(error) => (Err(error), false),
-                        }
+                            result
+                        })
                     };
                     let _ = sender.send(DispatchResult {
                         generation: generation_value,
                         plugin: plugin_for_thread,
                         result,
-                        soft_timeout,
+                        soft_timeout: soft_timeout_elapsed,
                     });
                 });
             let join = match join {
                 Ok(join) => join,
                 Err(error) => {
-                    self.pool.cancellation.unregister(generation_value, &plugin);
+                    self.pool.cancellation.unregister(job, &plugin);
                     self.pool.record_dispatch_failure(
                         plugin.clone(),
                         format!("native dispatch thread did not start: {error}"),
@@ -1505,7 +1619,7 @@ impl NativeProvider {
             self.pool.in_flight.insert(
                 (generation_value, plugin.clone()),
                 InFlightCall {
-                    generation: generation_value,
+                    job,
                     plugin,
                     join: Some(join),
                 },
@@ -1533,14 +1647,15 @@ impl NativeProvider {
             if completion.soft_timeout {
                 self.pool.record_soft_timeout(plugin.clone());
             }
-            let failed = if is_current {
-                pending = pending.saturating_sub(1);
-                answered.insert(plugin.clone());
-                self.apply_dispatch_result(completion.plugin, completion.result, Some(&mut by_plugin))
-            } else {
-                self.apply_dispatch_result(completion.plugin, completion.result, None)
-            };
-            if is_current && failed {
+            if !is_current {
+                self.late.push(completion);
+                continue;
+            }
+            pending = pending.saturating_sub(1);
+            answered.insert(plugin.clone());
+            let failed =
+                self.apply_dispatch_result(completion.plugin, completion.result, Some(&mut by_plugin));
+            if failed {
                 dead_plugins.insert(plugin);
             }
         }
@@ -1588,7 +1703,8 @@ impl NativeProvider {
             let plugin = completion.plugin.clone();
             let generation = Generation::from_raw(completion.generation);
             let mut collected = BTreeMap::new();
-            let dead = self.apply_dispatch_result(plugin.clone(), completion.result, Some(&mut collected));
+            let output = (pipeline.visible_generation() == Some(generation)).then_some(&mut collected);
+            let dead = self.apply_dispatch_result(plugin.clone(), completion.result, output);
             if dead {
                 // The call failed outright, so the request is abandoned rather
                 // than answered: what a dead plugin gets inside the window too.
@@ -1622,11 +1738,13 @@ impl NativeProvider {
     fn apply_dispatch_result(
         &mut self,
         plugin: PluginId,
-        result: Result<Suggestions, HostError>,
+        result: Result<ProducedSuggestions, HostError>,
         output: Option<&mut BTreeMap<PluginId, Vec<Item>>>,
     ) -> bool {
         match result {
-            Ok(suggestions) if matches!(suggestions.state, crikey_native_host::BatchState::Failed) => {
+            Ok(ProducedSuggestions { suggestions, .. })
+                if matches!(suggestions.state, crikey_native_host::BatchState::Failed) =>
+            {
                 let reason = suggestions
                     .error
                     .map(|error| error.message)
@@ -1644,7 +1762,10 @@ impl NativeProvider {
                 }
                 false
             }
-            Ok(suggestions) => {
+            Ok(ProducedSuggestions {
+                suggestions,
+                incarnation,
+            }) => {
                 if let Some(output) = output {
                     let mut items = suggestions.items;
                     // The loader owns identity: a plugin cannot forge a sibling
@@ -1654,7 +1775,10 @@ impl NativeProvider {
                         self.action_items
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
-                            .insert((plugin.clone(), item.stable_id.clone()), item.clone());
+                            .insert(
+                                (plugin.clone(), item.stable_id.clone()),
+                                (item.clone(), incarnation),
+                            );
                     }
                     output.insert(plugin, items);
                 }
@@ -1799,13 +1923,14 @@ struct NativeActionEndpoint {
     sender: SyncSender<NativeActionRequest>,
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
     budgets: BTreeMap<PluginId, PluginBudgetHandle>,
-    items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
     pending: Arc<Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>>,
     in_flight: Arc<AtomicUsize>,
     next_id: Arc<AtomicU64>,
     mailbox: Arc<(Mutex<NativeRequestSlot>, Condvar)>,
     /// Query supervisors, so a page can be served by the child that opened it.
     page_supervisors: BTreeMap<PluginId, Arc<Mutex<NativeSupervisor>>>,
+    incarnations: NativeIncarnations,
     /// The one open page, if any. The launcher shows one surface at a time,
     /// and a second page would be a second plugin drawing over the first.
     page: Mutex<Option<PageSession>>,
@@ -1839,7 +1964,7 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(&(plugin.clone(), item_id))
-            .cloned()
+            .map(|(item, _)| item.clone())
             .ok_or_else(|| {
                 crikey_core::CoreError::Invalid(
                     "selected native plugin result is no longer current".to_owned(),
@@ -1976,7 +2101,7 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
             .unwrap_or_else(|error| error.into_inner())
             .iter()
             .find(|((owner, id), _)| owner == plugin && id == item_id)
-            .map(|(_, item)| item.clone())
+            .map(|(_, (item, _))| item.clone())
             .ok_or_else(|| {
                 crikey_core::CoreError::Invalid(
                     "selected native plugin result is no longer current".to_owned(),
@@ -2032,6 +2157,7 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
             Box::new(NativePageSource {
                 plugin: plugin.clone(),
                 supervisor,
+                incarnations: Arc::clone(&self.incarnations),
             }),
             self.wake.handle(),
         )
@@ -2160,6 +2286,7 @@ pub struct NativeDriver {
     busy: Arc<AtomicBool>,
     has_plugins: bool,
     worker: Option<JoinHandle<()>>,
+    preview_endpoint: Arc<native_preview::NativePreviewEndpoint>,
 }
 
 impl NativeDriver {
@@ -2177,12 +2304,16 @@ impl NativeDriver {
     /// Moves the provider and pipeline to a supervisor thread. A thread spawn
     /// refusal degrades to an inert driver while dropping the provider reaps
     /// all children (spec 24.1, 24.3).
+    ///
+    /// Query timestamps anchor a monotonic runtime clock; elapsed time keeps
+    /// bounded result intake draining while no further queries are submitted.
     pub fn spawn(
         mut provider: NativeProvider,
         mut pipeline: QueryPipeline,
         publish: Box<dyn Fn(&ViewModel) + Send + 'static>,
     ) -> Self {
         let permissions = provider.permissions();
+        let preview_endpoint = native_preview::NativePreviewEndpoint::spawn(&provider);
         let has_plugins = !provider.plugins().is_empty();
         let mailbox = Arc::new((
             Mutex::new(NativeRequestSlot {
@@ -2210,6 +2341,7 @@ impl NativeDriver {
             next_id: Arc::new(AtomicU64::new(0)),
             mailbox: Arc::clone(&mailbox),
             page_supervisors: provider.page_supervisors(),
+            incarnations: Arc::clone(&provider.incarnations),
             page: Mutex::new(None),
             page_closing: Mutex::new(None),
             wake: WakeSlot::default(),
@@ -2223,18 +2355,53 @@ impl NativeDriver {
         let thread_busy = Arc::clone(&busy);
         let thread_completion_mailbox = Arc::clone(&completion_mailbox);
         let thread_wake = Some(action_endpoint.wake.handle());
+        let lifecycle_supervisors = provider.page_supervisors();
+        let lifecycle_incarnations = Arc::clone(&provider.incarnations);
+        let preview_lifecycle_wake = preview_endpoint.lifecycle_wake();
         let spawned = std::thread::Builder::new()
             .name("crikey-native".to_owned())
             .spawn(move || {
                 let (lock, cvar) = &*thread_mailbox;
                 let mut last_now: Millis = 0;
+                // Anchor runtime elapsed time to the caller's logical query
+                // clock. Idle refreshes must keep advancing that same clock:
+                // intake permits only one bounded drain per timestamp.
+                let mut clock_now: Millis = 0;
+                let mut clock_origin = Instant::now();
                 let mut last_context: Option<(Generation, String, Vec<ResultRow>, bool, usize)> = None;
                 loop {
+                    // Poll idle children here, never from the UI incarnation
+                    // reader. A busy callback keeps ownership of its supervisor;
+                    // it publishes its own lifecycle snapshot on completion.
+                    let mut lifecycle_changed = false;
+                    for (plugin, supervisor) in &lifecycle_supervisors {
+                        match supervisor.try_lock() {
+                            Ok(mut supervisor) => {
+                                lifecycle_changed |=
+                                    refresh_incarnation(&mut supervisor, plugin, &lifecycle_incarnations);
+                            }
+                            Err(std::sync::TryLockError::Poisoned(error)) => {
+                                lifecycle_changed |= refresh_incarnation(
+                                    &mut error.into_inner(),
+                                    plugin,
+                                    &lifecycle_incarnations,
+                                );
+                            }
+                            Err(std::sync::TryLockError::WouldBlock) => {}
+                        }
+                    }
+                    if lifecycle_changed {
+                        if let Some(wake) = &thread_wake {
+                            wake();
+                        }
+                        preview_lifecycle_wake();
+                    }
                     for result in provider.take_catalog_results() {
                         thread_catalog_results
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .push(result);
+                        preview_lifecycle_wake();
                     }
                     let work = {
                         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
@@ -2341,6 +2508,9 @@ impl NativeDriver {
                             continue;
                         }
                         NativeWork::Refresh => {
+                            last_now = clock_now.saturating_add(
+                                clock_origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                            );
                             let Some((generation, query, builtin_rows, builtin_pending, selected)) =
                                 last_context.as_ref()
                             else {
@@ -2356,8 +2526,14 @@ impl NativeDriver {
                             // This tick is the only thing still running for
                             // that generation, so an answer that missed the
                             // collection window is published here or never.
-                            provider.retire_late_answers(&mut pipeline, last_now);
-                            let Some(frame) = pipeline.present(last_now) else {
+                            drop(slot);
+                            let inner = provider
+                                .binding
+                                .filter(|(job, _)| job == generation)
+                                .map(|(_, inner)| inner);
+                            let Some(frame) = inner.and_then(|inner| {
+                                provider.drive_current(&mut pipeline, query, inner, last_now)
+                            }) else {
                                 continue;
                             };
                             let mut rows = builtin_rows.clone();
@@ -2375,7 +2551,15 @@ impl NativeDriver {
                                 show_hints: true,
                                 rounded_corners: true,
                                 page: None,
+                                preview: Default::default(),
                             };
+                            let slot = lock.lock().unwrap_or_else(|error| error.into_inner());
+                            if slot.stop
+                                || slot.job.is_some()
+                                || thread_current.load(Ordering::Acquire) != generation.get()
+                            {
+                                continue;
+                            }
                             *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) =
                                 Some(merged.clone());
                             publish(&merged);
@@ -2383,10 +2567,14 @@ impl NativeDriver {
                         }
                         NativeWork::Query(job) => job,
                     };
-                    last_now = job.now;
+                    let elapsed = clock_origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    last_now = job.now.max(clock_now.saturating_add(elapsed));
+                    clock_now = last_now;
+                    clock_origin = Instant::now();
 
                     thread_busy.store(true, Ordering::Release);
-                    let native = provider.drive_query(&mut pipeline, &job.query, job.now);
+                    let native =
+                        provider.begin_query(&mut pipeline, &job.query, last_now, Some(job.generation));
                     let refresh_context = (
                         job.generation,
                         job.query.clone(),
@@ -2415,6 +2603,7 @@ impl NativeDriver {
                         show_hints: true,
                         rounded_corners: true,
                         page: None,
+                        preview: Default::default(),
                     };
 
                     // Hold the mailbox lock across the staleness check and the
@@ -2441,6 +2630,7 @@ impl NativeDriver {
             Ok(worker) => Self {
                 mailbox,
                 action_endpoint,
+                preview_endpoint,
                 permissions,
                 catalog_results,
                 health,
@@ -2455,6 +2645,7 @@ impl NativeDriver {
             Err(_) => Self {
                 mailbox,
                 action_endpoint,
+                preview_endpoint,
                 permissions,
                 catalog_results,
                 health,
@@ -2467,6 +2658,10 @@ impl NativeDriver {
                 worker: None,
             },
         }
+    }
+
+    pub(crate) fn preview_dispatcher(&self) -> Arc<dyn crate::plugin_preview::PreviewDispatcher> {
+        self.preview_endpoint.clone()
     }
 
     /// Submits a query without waiting for a native child. Older generations
@@ -2617,6 +2812,7 @@ impl NativeDriver {
 }
 impl Drop for NativeDriver {
     fn drop(&mut self) {
+        self.preview_endpoint.shutdown();
         // Cancel in-flight callbacks before joining the supervisor so a
         // cooperative native worker gets a chance to return promptly.
         self.cancellation.cancel_all();

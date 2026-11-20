@@ -140,5 +140,6 @@ pub trait Message: Sized + std::fmt::Debug {
 pub mod convert;
 pub mod frame;
 pub mod message;
+pub mod preview;
 pub mod transport;
 pub mod wire;

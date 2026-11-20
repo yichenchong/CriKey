@@ -560,14 +560,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     search
         .complete_stage(StartupStage::LegacyPlugins)
         .map_err(|error| error.to_string())?;
-    // Legacy plugins run out-of-process on a dedicated supervisor thread so a
-    // slow child interpreter can never block the UI thread (Finding 8; spec
-    // 6.5, acceptance 31.1, 31.8). The supervisor publishes each merged frame
-    // straight to the renderer through this cloned handle; the UI thread folds
-    // the same frame into its retained view model on its next turn.
+    // Workers only wake the host. The UI thread owns the complete canonical
+    // merge, so an individual provider cannot publish a partial frame over it.
     let legacy_publish_handle = render_handle.clone();
-    let legacy_driver = LegacyDriver::spawn(legacy_provider, legacy_pipeline, move |frame| {
-        let _ = legacy_publish_handle.submit_results(frame);
+    let legacy_driver = LegacyDriver::spawn(legacy_provider, legacy_pipeline, move |_| {
+        let _ = legacy_publish_handle.request_provider_answer();
     });
 
     // Modern python plugins join the same live query path, driven off the UI
@@ -614,12 +611,10 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     }
     active_plugins.extend_from_slice(modern_provider.plugins());
     ledger.borrow_mut().record_active(&active_plugins);
-    // The supervisor publishes each merged frame straight to the renderer,
-    // mirroring the legacy driver above; both run off the UI thread so a slow
-    // or dead child interpreter can never block it.
+    // Like legacy, modern outcomes are folded only by the host.
     let modern_publish_handle = render_handle.clone();
-    let modern_driver = ModernDriver::spawn(modern_provider, modern_pipeline, move |frame| {
-        let _ = modern_publish_handle.submit_results(frame);
+    let modern_driver = ModernDriver::spawn(modern_provider, modern_pipeline, move |_| {
+        let _ = modern_publish_handle.request_provider_answer();
     });
 
     // Native plugins use the same asynchronous query boundary as the legacy
@@ -664,8 +659,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     let native_driver = NativeDriver::spawn(
         native_provider,
         native_pipeline,
-        Box::new(move |frame| {
-            let _ = native_publish_handle.submit_results(frame);
+        Box::new(move |_| {
+            let _ = native_publish_handle.request_provider_answer();
         }),
     );
     // The host's own file search joins the live query path here. It gets its own
@@ -775,6 +770,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     view_model.set_rounded_corners(settings::configured_rounded_corners(
         configuration.as_ref().map(|configuration| &configuration.store),
     ));
+    view_model.set_preview_ratio(settings::configured_preview_split(
+        configuration.as_ref().map(|configuration| &configuration.store),
+    ));
+    let preview_wake = render_handle.clone();
+    let mut previews = crikey_app::PreviewService::new(&native_driver, &modern_driver, move || {
+        let _ = preview_wake.request_provider_answer();
+    });
     if let Some(reason) = hotkey_refusal {
         let diagnostic = settings::surface_hotkey_failure(&mut view_model, &hotkey_accelerator, &reason);
         eprintln!("{diagnostic}");
@@ -861,6 +863,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     view_model.set_rounded_corners(settings::configured_rounded_corners(Some(
                         &configuration.store,
                     )));
+                    view_model
+                        .set_preview_ratio(settings::configured_preview_split(Some(&configuration.store)));
                     // Aliases are host configuration, so a hand edit takes
                     // effect on the next query rather than the next restart.
                     search.set_aliases(configured_aliases(&configuration.store));
@@ -1008,10 +1012,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 );
                 view_model.publish(outcome.generation, retained.merged(), retained.pending());
             }
-            // Fold the modern supervisor's rows the same way. Both drivers
-            // publish the built-in rows ahead of their own; merging by source
-            // keeps legacy and modern rows coexisting instead of the later fold
-            // clobbering the earlier (contract §8).
+            // Each supervisor returns only its own suggestions. The host keeps
+            // the canonical ranked answer and all other providers' rows.
             if let Some(outcome) = modern_driver.take_outcome() {
                 retained.absorb(
                     outcome.generation,
@@ -1133,6 +1135,12 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             let mut effect = effect;
             loop {
                 match effect {
+                    Some(UiEffect::OpenPreviewLink { target, url }) => {
+                        if let Err(reason) = previews.open_link(&target, &url, &search) {
+                            view_model
+                                .publish_preview(&target.selection, crikey_ui::PreviewStatus::Error(reason));
+                        }
+                    }
                     Some(UiEffect::Query(raw)) => {
                         // Both ranking inputs are refreshed immediately before the
                         // query is scored, because both describe the moment the
@@ -1143,110 +1151,48 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         search.set_history_time(history_clock.advance());
                         search.refresh_foreground_category();
                         if let Ok(generation) = search.submit_query(&raw) {
-                            let items = search.results().iter().map(|hit| hit.item.clone()).collect();
                             view_model.begin_generation(generation);
-
                             let now = u64::try_from(query_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-                            // The built-in provider stays synchronous: it is fast,
-                            // in-process, and its rows must reach this frame without
-                            // waiting on anything. Its pipeline generation stays in
-                            // lockstep with the search generation this frame is
-                            // published under.
-                            let application_frame =
-                                drive_application_provider(&mut query_pipeline, &owner, &raw, items, now);
-                            if let Some(frame) = application_frame {
-                                if frame.generation == generation {
-                                    // The calculator answers from the query text
-                                    // alone, in this frame and on this thread: it
-                                    // owes nothing asynchronously, so it never
-                                    // marks itself pending and can never be the
-                                    // source that leaves the view waiting. Its row
-                                    // leads because when a query parses as
-                                    // arithmetic, the arithmetic is what was asked
-                                    // for. At most one row, so the merged frame
-                                    // grows by one.
-                                    retained.set_calculated(generation, calculator.rows(generation, &raw));
-                                    retained.set_builtin(generation, search.result_rows());
-                                    retained.mark_pending(
-                                        generation,
-                                        RowSource::Builtin,
-                                        frame.pending_plugins,
-                                    );
-                                    // What the asynchronous providers publish ahead
-                                    // of their own rows, which is exactly what is
-                                    // on screen at this instant.
-                                    let rows = retained.merged();
-                                    // Legacy plugins are driven off the UI thread
-                                    // (Finding 8): hand the query to the supervisor
-                                    // and return. The built-in rows publish now, with
-                                    // work marked pending while a legacy answer is
-                                    // outstanding; the legacy rows fold in
-                                    // asynchronously through `take_outcome` and the
-                                    // supervisor's own frame submission, always under
-                                    // this generation (spec 14.5).
-                                    let legacy_outstanding = legacy_driver.has_plugins();
-                                    if legacy_outstanding {
-                                        legacy_driver.submit(
-                                            generation,
-                                            &raw,
-                                            now,
-                                            rows.clone(),
-                                            frame.pending_plugins,
-                                            0,
-                                        );
-                                    }
-                                    // Modern plugins are dispatched off the UI thread
-                                    // just like legacy ones; their supervisor folds
-                                    // its rows into the renderer under this same
-                                    // generation as they arrive.
-                                    let modern_outstanding = modern_driver.has_plugins();
-                                    if modern_outstanding {
-                                        modern_driver.submit(
-                                            generation,
-                                            &raw,
-                                            now,
-                                            rows.clone(),
-                                            frame.pending_plugins,
-                                            0,
-                                        );
-                                    }
-                                    // Native plugins are dispatched through their
-                                    // own supervisor and merged on the same
-                                    // generation as the built-in rows.
-                                    let native_outstanding = native_driver.has_plugins();
-                                    if native_outstanding {
-                                        native_driver.submit(
-                                            generation,
-                                            &raw,
-                                            now,
-                                            rows.clone(),
-                                            frame.pending_plugins,
-                                            0,
-                                        );
-                                    }
-                                    // The file search runs on its own worker thread
-                                    // under a deadline no synchronous provider could
-                                    // afford, so it is handed the query here and its
-                                    // items are ranked in whenever it answers. An
-                                    // empty query is not submitted at all: there is
-                                    // nothing to search for, and walking the user's
-                                    // home directory to prove it would be the most
-                                    // expensive answer the launcher ever produced.
-                                    //
-                                    // Pending is read off the submission rather than
-                                    // asked as a separate question. The driver is the
-                                    // only party that knows whether it took the
-                                    // generation on, and marking a source pending on
-                                    // any other evidence is how a frame ends up
-                                    // waiting forever for an answer nobody owes.
-                                    let files_outstanding =
-                                        !raw.trim().is_empty() && file_driver.submit(generation, &raw, now);
-                                    retained.mark_pending(generation, RowSource::Legacy, legacy_outstanding);
-                                    retained.mark_pending(generation, RowSource::Native, native_outstanding);
-                                    retained.mark_pending(generation, RowSource::Modern, modern_outstanding);
-                                    retained.mark_pending(generation, RowSource::Files, files_outstanding);
-                                    view_model.publish(generation, retained.merged(), retained.pending());
-                                }
+                            retained.set_calculated(generation, calculator.rows(generation, &raw));
+                            let catalog_result = prepare_catalog_rows(
+                                &search,
+                                &mut query_pipeline,
+                                &owner,
+                                &raw,
+                                generation,
+                                now,
+                                &mut retained,
+                            );
+                            // Dispatch never depends on synchronous intake succeeding.
+                            // These workers owe independent answers for this generation.
+                            // Never feed canonical catalog rows back through a
+                            // provider outcome: catalog ownership overlaps with
+                            // suggestion ownership, but these are distinct inputs.
+                            let legacy_outstanding = legacy_driver.has_plugins();
+                            if legacy_outstanding {
+                                legacy_driver.submit(generation, &raw, now, Vec::new(), false, 0);
+                            }
+                            let modern_outstanding = modern_driver.has_plugins();
+                            if modern_outstanding {
+                                modern_driver.submit(generation, &raw, now, Vec::new(), false, 0);
+                            }
+                            let native_outstanding = native_driver.has_plugins();
+                            if native_outstanding {
+                                native_driver.submit(generation, &raw, now, Vec::new(), false, 0);
+                            }
+                            // Only an accepted file submission owes an answer.
+                            let files_outstanding =
+                                !raw.trim().is_empty() && file_driver.submit(generation, &raw, now);
+                            retained.mark_pending(generation, RowSource::Legacy, legacy_outstanding);
+                            retained.mark_pending(generation, RowSource::Native, native_outstanding);
+                            retained.mark_pending(generation, RowSource::Modern, modern_outstanding);
+                            retained.mark_pending(generation, RowSource::Files, files_outstanding);
+                            view_model.publish(generation, retained.merged(), retained.pending());
+                            if let Err(error) = catalog_result {
+                                report_status(
+                                    &mut view_model,
+                                    format!("Application catalog intake failed: {error}"),
+                                );
                             }
                         }
                     }
@@ -1291,6 +1237,9 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             configuration.as_ref().map(|configuration| &configuration.store),
                         ));
                         view_model.set_rounded_corners(settings::configured_rounded_corners(
+                            configuration.as_ref().map(|configuration| &configuration.store),
+                        ));
+                        view_model.set_preview_ratio(settings::configured_preview_split(
                             configuration.as_ref().map(|configuration| &configuration.store),
                         ));
                         eprintln!("crikey: {report}");
@@ -1446,6 +1395,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 None => {}
             }
 
+            previews.synchronize(&mut view_model, &search);
             if let Some(frame) = view_model.frame() {
                 let _ = render_handle.submit_frame(&frame);
             }
@@ -2503,38 +2453,16 @@ enum RowSource {
     Native,
 }
 
-/// Classifies a published row by the source group its owning plugin belongs to
-/// (spec 10.2 namespacing): `legacy.*`, `modern.*` and `native.*` are the three
-/// asynchronous plugin providers, and everything else — the built-in
-/// application catalog, the calculator and the host's file search — is the
-/// host's own.
-fn row_source(plugin_name: &str) -> RowSource {
-    if plugin_name.starts_with("legacy.") {
-        RowSource::Legacy
-    } else if plugin_name.starts_with("modern.") {
-        RowSource::Modern
-    } else if plugin_name.starts_with("native.") {
-        RowSource::Native
-    } else {
-        RowSource::Builtin
-    }
-}
-
 /// The presented row set kept between UI turns, grouped by source so folding one
 /// provider's asynchronous outcome never clobbers another's rows.
 ///
-/// Each asynchronous plugin provider publishes the built-in rows ahead of its
-/// own, and each calls back independently through `take_outcome`; without
-/// per-source retention the second fold of a turn would overwrite the first
-/// provider's rows. Keeping the groups and re-merging on every fold makes
-/// legacy, modern and native rows coexist under one generation (contract §8). A
-/// new generation drops every retained group first, so stale rows never cross a
-/// query boundary.
+/// Drivers are submitted without base rows and only wake the host when their
+/// own suggestion outcomes arrive. Per-source retention keeps one provider's
+/// fold from clobbering another. New generations retire every retained group.
 ///
-/// The built-in group is owned by the UI thread alone and is never rebuilt from
-/// a provider's frame: those frames carry a snapshot of it taken when the query
-/// was handed over, and the file search's rows are ranked into it *after* that.
-/// Rebuilding it from a stale snapshot would drop them on the next plugin fold.
+/// The ranked group is owned by the UI thread and includes catalog entries of
+/// every owner, plus ranked file results. Suggestion groups contain only actual
+/// suggestions, never an echoed snapshot of that ranked group.
 #[derive(Debug, Default)]
 struct RetainedRows {
     generation: Option<Generation>,
@@ -2618,10 +2546,8 @@ impl RetainedRows {
         }
     }
 
-    /// Folds one plugin provider's outcome. `rows` are the built-in rows
-    /// followed by `source`'s own rows; only `source`'s group is refreshed, so
-    /// a sibling provider's rows survive this fold and so does the ranked group
-    /// the UI thread owns. A stale (already-superseded) outcome is ignored.
+    /// Folds a driver's suggestion-only outcome. The caller identifies the
+    /// source by the driver, not by a row's owner or display label.
     fn absorb(
         &mut self,
         generation: Generation,
@@ -2632,11 +2558,7 @@ impl RetainedRows {
         if !self.begin(generation) {
             return;
         }
-        let own: Vec<crikey_ui::ResultRow> = rows
-            .iter()
-            .filter(|row| row_source(&row.plugin_name) == source)
-            .cloned()
-            .collect();
+        let own = rows.to_vec();
         match source {
             // Neither the host's own groups nor the file source publish rows
             // through this path; both are refreshed by the UI thread directly.
@@ -2648,8 +2570,9 @@ impl RetainedRows {
         self.mark_pending(generation, source, pending);
     }
 
-    /// The merged presentation order: the calculated row, the ranked answer,
-    /// then legacy, modern and native.
+    /// Calculated rows lead and supersede every exact-owner/id copy. Ranked
+    /// catalog-only rows follow, then suggestions in provider publication order.
+    /// An exact-owner/id suggestion supersedes its catalog copy and payload.
     fn merged(&self) -> Vec<crikey_ui::ResultRow> {
         let mut rows = Vec::with_capacity(
             self.calculated.len()
@@ -2659,10 +2582,34 @@ impl RetainedRows {
                 + self.native.len(),
         );
         rows.extend(self.calculated.iter().cloned());
-        rows.extend(self.builtin.iter().cloned());
-        rows.extend(self.legacy.iter().cloned());
-        rows.extend(self.modern.iter().cloned());
-        rows.extend(self.native.iter().cloned());
+        rows.extend(
+            self.builtin
+                .iter()
+                .filter(|catalog| {
+                    !self
+                        .legacy
+                        .iter()
+                        .chain(&self.modern)
+                        .chain(&self.native)
+                        .chain(&self.calculated)
+                        .any(|suggestion| {
+                            suggestion.plugin == catalog.plugin && suggestion.item == catalog.item
+                        })
+                })
+                .cloned(),
+        );
+        rows.extend(
+            self.legacy
+                .iter()
+                .chain(&self.modern)
+                .chain(&self.native)
+                .filter(|suggestion| {
+                    !self.calculated.iter().any(|calculated| {
+                        calculated.plugin == suggestion.plugin && calculated.item == suggestion.item
+                    })
+                })
+                .cloned(),
+        );
         rows
     }
 
@@ -2722,16 +2669,51 @@ fn application_provider_policy() -> PluginPolicy {
     }
 }
 
+/// The ranked catalog includes plugin-owned items. Only the host-owned subset
+/// passes through the builtin scheduler; presentation keeps the complete ranked
+/// answer and its original owners, highlights and shared row payloads.
+fn prepare_catalog_rows(
+    search: &SearchService,
+    pipeline: &mut QueryPipeline,
+    owner: &PluginId,
+    query: &str,
+    generation: Generation,
+    now: u64,
+    retained: &mut RetainedRows,
+) -> Result<(), String> {
+    let items = search
+        .results()
+        .iter()
+        .filter(|hit| hit.item.plugin_id == *owner)
+        .map(|hit| hit.item.clone())
+        .collect();
+    let result = drive_application_provider(pipeline, owner, query, items, now).and_then(|frame| {
+        if frame.generation != generation {
+            Err("pipeline and search generations differ".to_owned())
+        } else {
+            Ok(frame)
+        }
+    });
+    retained.set_builtin(generation, search.result_rows());
+    // A failed synchronous request cannot still owe an asynchronous answer.
+    retained.mark_pending(
+        generation,
+        RowSource::Builtin,
+        result.as_ref().is_ok_and(|frame| frame.pending_plugins),
+    );
+    result.map(|_| ())
+}
+
 fn drive_application_provider(
     pipeline: &mut QueryPipeline,
     owner: &PluginId,
     query: &str,
     items: Vec<Item>,
     now: u64,
-) -> Option<ViewModel> {
+) -> Result<ViewModel, String> {
     let generation = pipeline.keystroke(query, now);
     let tick = pipeline.tick(now);
-    let tick_succeeded = tick.errors.is_empty();
+    let mut errors: Vec<String> = tick.errors.iter().map(|error| format!("{error:?}")).collect();
 
     for cancellation in tick.cancellations {
         let _ = pipeline.complete(&cancellation.plugin, cancellation.generation, now);
@@ -2770,33 +2752,34 @@ fn drive_application_provider(
             } else {
                 BatchState::Partial
             };
-            let accepted = pipeline
-                .deliver(
-                    ResultBatch {
-                        generation: request.generation,
-                        plugin: request.plugin.clone(),
-                        state,
-                        items: chunk.to_vec(),
-                    },
-                    now,
-                )
-                .is_ok();
-            delivered_current &= accepted;
+            if let Err(error) = pipeline.deliver(
+                ResultBatch {
+                    generation: request.generation,
+                    plugin: request.plugin.clone(),
+                    state,
+                    items: chunk.to_vec(),
+                },
+                now,
+            ) {
+                errors.push(format!("{error:?}"));
+                delivered_current = false;
+            }
         }
         // An empty result set still owes the pipeline a terminal batch, or the
         // request stays outstanding exactly as an over-large one did.
         if batch_items.is_empty() {
-            delivered_current = pipeline
-                .deliver(
-                    ResultBatch {
-                        generation: request.generation,
-                        plugin: request.plugin.clone(),
-                        state: BatchState::Final,
-                        items: Vec::new(),
-                    },
-                    now,
-                )
-                .is_ok();
+            if let Err(error) = pipeline.deliver(
+                ResultBatch {
+                    generation: request.generation,
+                    plugin: request.plugin.clone(),
+                    state: BatchState::Final,
+                    items: Vec::new(),
+                },
+                now,
+            ) {
+                errors.push(format!("{error:?}"));
+                delivered_current = false;
+            }
         }
         let _ = pipeline.complete(&request.plugin, request.generation, now);
     }
@@ -2804,11 +2787,20 @@ fn drive_application_provider(
     // Drained, not merely presented: every chunk delivered above is already in
     // hand, and leaving any of it queued leaves the request unsettled.
     let frame = pipeline.present_drained(now);
-    let presentation_succeeded = pipeline.take_errors().is_empty();
-    if !tick_succeeded || !delivered_current || !presentation_succeeded {
-        return None;
+    errors.extend(pipeline.take_errors().iter().map(|error| format!("{error:?}")));
+    if !delivered_current || !errors.is_empty() {
+        pipeline.abort_request(owner, generation, now);
+        return Err(format!(
+            "synchronous request did not settle: {}",
+            errors.join("; ")
+        ));
     }
-    frame.filter(|frame| frame.generation == generation)
+    frame
+        .filter(|frame| frame.generation == generation && !frame.pending_plugins)
+        .ok_or_else(|| {
+            pipeline.abort_request(owner, generation, now);
+            "synchronous request produced no settled current frame".to_owned()
+        })
 }
 
 /// Routes a `crikey dev` invocation.
@@ -3907,8 +3899,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cli_catalog_composition_preserves_foreign_owned_matches() {
+        use crikey_core::{ArgumentPolicy, Category, HitPolicy, ItemId};
+        use std::collections::BTreeMap;
+
+        let owner = PluginId(APPLICATION_CATALOG_PLUGIN.to_owned());
+        let native = PluginId("native.preview-demo".to_owned());
+        let modern = PluginId("modern.catalog-demo".to_owned());
+        let item = |plugin: &PluginId, id: &str| Item {
+            stable_id: ItemId(id.to_owned()),
+            plugin_id: plugin.clone(),
+            category: Category::Application,
+            label: format!("Preview {id}"),
+            description: String::new(),
+            target: format!("plugin://{id}"),
+            search_terms: Vec::new(),
+            icon_reference: None,
+            argument_policy: ArgumentPolicy::Forbidden,
+            hit_policy: HitPolicy::Recorded,
+            score_hint: 0,
+            metadata: BTreeMap::new(),
+            actions: Vec::new(),
+        };
+        // Exercise both an empty builtin answer and a mixed-owner answer.
+        for include_builtin in [false, true] {
+            let mut search = SearchService::new(App::new());
+            search.complete_stage(StartupStage::WindowAndHotkey).unwrap();
+            search
+                .replace_catalog(&native, 1, vec![item(&native, "native")])
+                .unwrap();
+            search
+                .replace_catalog(&modern, 1, vec![item(&modern, "modern")])
+                .unwrap();
+            if include_builtin {
+                search
+                    .replace_catalog(&owner, 1, vec![item(&owner, "builtin")])
+                    .unwrap();
+            }
+            search.complete_stage(StartupStage::PersistedCatalog).unwrap();
+            search.complete_stage(StartupStage::AcceptQueries).unwrap();
+            let generation = search.submit_query("preview").unwrap();
+            let expected = search.result_rows();
+            assert_eq!(expected.len(), if include_builtin { 3 } else { 2 });
+            let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+            pipeline
+                .register_plugin(owner.clone(), application_provider_policy())
+                .unwrap();
+            let mut retained = RetainedRows::default();
+            // The same synchronous composition edge used by UiEffect::Query.
+            prepare_catalog_rows(
+                &search,
+                &mut pipeline,
+                &owner,
+                "preview",
+                generation,
+                17,
+                &mut retained,
+            )
+            .expect("foreign catalog owners must not poison builtin intake");
+            let mut view_model = LauncherViewModel::new();
+            view_model.activate();
+            view_model.apply(crikey_ui::UiCommand::SetQuery("preview".to_owned()));
+            view_model.begin_generation(generation);
+            view_model.publish(generation, retained.merged(), retained.pending());
+            let frame = view_model.frame().unwrap();
+            assert_eq!(
+                frame
+                    .rows
+                    .iter()
+                    .map(|row| (&row.plugin, &row.item, &row.highlights))
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|row| (&row.plugin, &row.item, &row.highlights))
+                    .collect::<Vec<_>>(),
+            );
+            assert!(frame.rows.iter().any(|row| row.plugin == native));
+            assert!(frame.rows.iter().any(|row| row.plugin == modern));
+            assert!(!retained.pending());
+            assert_eq!(pipeline.diagnostics().in_flight_requests, 0);
+            assert_eq!(pipeline.intake_depth().batches, 0);
+            assert!(pipeline.take_errors().is_empty());
+            assert!(search.results().iter().any(|hit| hit.item.plugin_id == native));
+        }
+    }
+
+    #[test]
+    fn rejected_synchronous_intake_reports_error_and_retires_request() {
+        use crikey_core::{ArgumentPolicy, Category, HitPolicy, ItemId};
+        let owner = PluginId(APPLICATION_CATALOG_PLUGIN.to_owned());
+        let foreign = Item {
+            stable_id: ItemId("foreign".to_owned()),
+            plugin_id: PluginId("native.foreign".to_owned()),
+            category: Category::Application,
+            label: "Foreign".to_owned(),
+            description: String::new(),
+            target: String::new(),
+            search_terms: Vec::new(),
+            icon_reference: None,
+            argument_policy: ArgumentPolicy::Forbidden,
+            hit_policy: HitPolicy::Recorded,
+            score_hint: 0,
+            metadata: Default::default(),
+            actions: Vec::new(),
+        };
+        let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+        pipeline
+            .register_plugin(owner.clone(), application_provider_policy())
+            .unwrap();
+        let error = drive_application_provider(&mut pipeline, &owner, "foreign", vec![foreign], 17)
+            .expect_err("a rejected batch is not a successful empty answer");
+        assert!(error.contains("OwnerMismatch"), "{error}");
+        assert_eq!(pipeline.diagnostics().in_flight_requests, 0);
+        assert_eq!(pipeline.intake_depth().batches, 0);
+        let next = drive_application_provider(&mut pipeline, &owner, "next", Vec::new(), 18)
+            .expect("a rejected generation must not strand the next query");
+        assert!(!next.pending_plugins);
+    }
+
     fn row(plugin: &str, label: &str) -> crikey_ui::ResultRow {
         crikey_ui::ResultRow {
+            plugin: crikey_core::PluginId(plugin.to_owned()),
             item: crikey_core::ItemId(label.to_owned()),
             label: label.to_owned(),
             description: String::new(),
@@ -3925,6 +4037,191 @@ mod tests {
     }
 
     #[test]
+    fn native_driver_outcomes_merge_catalog_once_and_prefer_live_suggestions() {
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::thread;
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        fn wait_for<T>(stage: &str, mut observe: impl FnMut() -> Option<T>) -> T {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(value) = observe() {
+                    return value;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native CLI composition timed out: {stage}"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        // Reuse the real SDK worker, including its empty catalog-only suggestion
+        // stream. Build separately, as the existing native preview consumers do.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let target = root.join("target/cli-catalog-conformance");
+        let output = std::process::Command::new("cargo")
+            .current_dir(&root)
+            .args([
+                "build",
+                "-p",
+                "crikey-plugin-sdk",
+                "--example",
+                "preview",
+                "--target-dir",
+            ])
+            .arg(&target)
+            .output()
+            .expect("build real SDK preview worker");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let executable = target
+            .join("debug/examples")
+            .join(if cfg!(windows) { "preview.exe" } else { "preview" })
+            .canonicalize()
+            .unwrap();
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let scratch = Scratch(std::env::temp_dir().join(format!(
+            "crikey-cli-catalog-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        )));
+        let package = scratch.0.join("preview-demo");
+        std::fs::create_dir_all(&package).unwrap();
+        let executable = executable
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        std::fs::write(package.join("crikey.toml"), format!(
+            "manifest-version = 1\n[plugin]\nid = \"preview-demo\"\nname = \"Friendly display label\"\nversion = \"0.1.0\"\nruntime = \"native\"\nentrypoint = \"{executable}\"\n",
+        )).unwrap();
+        let plugin = PluginId("native.preview-demo".to_owned());
+        let mut provider_pipeline = QueryPipeline::new(PipelineConfig::default());
+        let mut provider = NativeProvider::load_with_collection_window(
+            &mut provider_pipeline,
+            &[scratch.0.clone()],
+            Duration::from_secs(10),
+            &DisabledPlugins::default(),
+        );
+        assert_eq!(
+            provider.plugins(),
+            &[plugin.clone()],
+            "{:?}",
+            provider.unavailable()
+        );
+        provider
+            .request_catalog_build(&plugin, 1, Generation::ZERO)
+            .unwrap();
+        let build = wait_for("catalog", || provider.take_catalog_results().into_iter().next());
+        let crikey_app::CatalogBuildResult::Complete(build) = build else {
+            panic!("real catalog must complete");
+        };
+        let mut catalog = build.items;
+        // Distinguish stale catalog payloads from live suggestions with identical
+        // identities, while making the worker's empty-query mode host-searchable.
+        for item in &mut catalog {
+            item.description = "Catalog payload".to_owned();
+            item.search_terms.push("catalog-only".to_owned());
+        }
+        let mut catalog_only = catalog[0].clone();
+        catalog_only.stable_id = crikey_core::ItemId("catalog-retained".to_owned());
+        catalog_only.label = "Preview catalog retained".to_owned();
+        catalog.push(catalog_only);
+        let mut search = SearchService::new(App::new());
+        search.complete_stage(StartupStage::WindowAndHotkey).unwrap();
+        search.replace_catalog(&plugin, 1, catalog).unwrap();
+        search.complete_stage(StartupStage::PersistedCatalog).unwrap();
+        search.complete_stage(StartupStage::AcceptQueries).unwrap();
+        let owner = PluginId(APPLICATION_CATALOG_PLUGIN.to_owned());
+        let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+        pipeline
+            .register_plugin(owner.clone(), application_provider_policy())
+            .unwrap();
+        let (wake, awakened) = std::sync::mpsc::channel();
+        let driver = NativeDriver::spawn(
+            provider,
+            provider_pipeline,
+            Box::new(move |_| {
+                let _ = wake.send(());
+            }),
+        );
+        let mut retained = RetainedRows::default();
+        for (now, query) in [(17, "catalog-only"), (18, "preview")] {
+            let generation = search.submit_query(query).unwrap();
+            prepare_catalog_rows(
+                &search,
+                &mut pipeline,
+                &owner,
+                query,
+                generation,
+                now,
+                &mut retained,
+            )
+            .unwrap();
+            assert_eq!(
+                retained.merged().len(),
+                8,
+                "catalog rows publish before worker completion"
+            );
+            retained.mark_pending(generation, RowSource::Native, true);
+            driver.submit(generation, query, now, Vec::new(), false, 0);
+            let outcome = wait_for("suggestions", || {
+                let outcome = driver.take_outcome()?;
+                (outcome.generation == generation && !outcome.pending_plugins).then_some(outcome)
+            });
+            assert!(awakened.recv_timeout(Duration::from_secs(2)).is_ok());
+            let expected_suggestions = outcome.rows.clone();
+            retained.absorb(
+                generation,
+                RowSource::Native,
+                &outcome.rows,
+                outcome.pending_plugins,
+            );
+            let merged = retained.merged();
+            assert_eq!(
+                merged.len(),
+                8,
+                "catalog and suggestions must never duplicate an identity"
+            );
+            assert!(!retained.pending());
+            if query == "catalog-only" {
+                assert!(expected_suggestions.is_empty());
+                assert!(merged.iter().all(|row| row.description == "Catalog payload"));
+            } else {
+                assert_eq!(expected_suggestions.len(), 7);
+                assert_eq!(merged[0].item.0, "catalog-retained");
+                assert_eq!(
+                    merged[1..]
+                        .iter()
+                        .map(|row| (&row.plugin, &row.item, &row.description))
+                        .collect::<Vec<_>>(),
+                    expected_suggestions
+                        .iter()
+                        .map(|row| (&row.plugin, &row.item, &row.description))
+                        .collect::<Vec<_>>(),
+                    "actual suggestion payloads and publication order win over catalog copies",
+                );
+                assert!(merged[1..].iter().all(|row| row.description != "Catalog payload"));
+            }
+            assert!(merged.iter().all(|row| row.plugin == plugin));
+            retained.absorb(Generation::ZERO, RowSource::Native, &[], false);
+            assert_eq!(
+                retained.merged().len(),
+                8,
+                "stale completion cannot restore old rows"
+            );
+        }
+    }
+
+    #[test]
     fn retained_rows_merge_ranked_legacy_and_modern_by_source() {
         let generation = Generation::from_raw(7);
         let mut retained = RetainedRows::default();
@@ -3937,11 +4234,11 @@ mod tests {
         retained.mark_pending(generation, RowSource::Modern, true);
         assert!(retained.pending(), "outstanding providers keep the frame pending");
 
-        // The legacy supervisor answers first with built-in + legacy rows.
+        // The legacy supervisor answers with only its own suggestions.
         retained.absorb(
             generation,
             RowSource::Legacy,
-            &[row("builtin.app", "app"), row("legacy.files", "file")],
+            &[row("legacy.files", "file")],
             false,
         );
         // Then the file provider, whose items were ranked into the answer, so
@@ -3951,16 +4248,9 @@ mod tests {
             vec![row(FILE_SEARCH_PLUGIN, "report.txt"), row("builtin.app", "app")],
         );
         retained.mark_pending(generation, RowSource::Files, false);
-        // Then the modern supervisor answers with the built-in rows it was
-        // handed at submission time — which predate the file merge — and its
-        // own. A fold that rebuilt the ranked group from that stale snapshot
-        // would drop the file row the user is looking at.
-        retained.absorb(
-            generation,
-            RowSource::Modern,
-            &[row("builtin.app", "app"), row("modern.web", "web")],
-            false,
-        );
+        // The modern supervisor also returns only its own suggestions. Its
+        // outcome must not replace the host's newer ranked file answer.
+        retained.absorb(generation, RowSource::Modern, &[row("modern.web", "web")], false);
 
         let sources: Vec<String> = retained.merged().iter().map(|r| r.plugin_name.clone()).collect();
         // Kills two mutations at once: "each supervisor's publish clobbers the
@@ -4059,6 +4349,30 @@ mod tests {
             ["builtin.app"],
             "settling contributes no file rows and removes none of the ranked group"
         );
+    }
+
+    #[test]
+    fn pinned_calculator_identity_wins_without_hiding_foreign_same_id() {
+        let generation = Generation::from_raw(3);
+        let mut calculator = Calculator::new(None);
+        let calculated = calculator.rows(generation, "2+2");
+        let mut echoed = calculated[0].clone();
+        echoed.description = "Echoed calculator payload".to_owned();
+        let mut foreign = echoed.clone();
+        foreign.plugin = PluginId("native.other".to_owned());
+        foreign.label = "Foreign item with calculator's local ID".to_owned();
+        let mut retained = RetainedRows::default();
+        retained.set_calculated(generation, calculated.clone());
+        retained.set_builtin(generation, vec![echoed.clone(), foreign.clone()]);
+        retained.absorb(generation, RowSource::Native, &[echoed], false);
+        let merged = retained.merged();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].plugin, calculated[0].plugin);
+        assert_eq!(merged[0].item, calculated[0].item);
+        assert_eq!(merged[0].description, calculated[0].description);
+        assert_eq!(merged[1].plugin, foreign.plugin);
+        assert_eq!(merged[1].item, foreign.item);
+        assert_eq!(merged[1].label, foreign.label);
     }
 
     #[test]

@@ -99,6 +99,45 @@ impl NativeSupervisor {
         Ok(())
     }
 
+    /// Observes an existing connection without starting, replacing, or cleaning
+    /// up a worker. Dead workers remain owned here until a normal operation or
+    /// shutdown performs cleanup and the usual restart/failure accounting.
+    /// Background callers can publish `None` before that potentially blocking
+    /// cleanup; UI readers should consume their published snapshot instead.
+    pub fn poll_live_connection(&mut self, plugin: &PluginId) -> Option<u64> {
+        if self.closed
+            || self
+                .memory
+                .snapshot(plugin)
+                .is_some_and(|snapshot| snapshot.state == WorkerState::Suspended)
+        {
+            return None;
+        }
+        let worker = self.registrations.get_mut(plugin)?.worker.as_mut()?;
+        worker.poll_alive().then(|| worker.connection_id())
+    }
+
+    /// Borrows an already running worker without starting or replacing it.
+    /// Selection-bound requests must use this path: a fresh process does not
+    /// own the item state produced by the original catalog/suggestion call.
+    /// Caller retains the supervisor lock for the complete operation.
+    pub fn live_worker(&mut self, plugin: &PluginId) -> Option<&mut NativeWorker> {
+        if self.closed
+            || self
+                .memory
+                .snapshot(plugin)
+                .is_some_and(|snapshot| snapshot.state == WorkerState::Suspended)
+        {
+            return None;
+        }
+        let worker = self.registrations.get_mut(plugin)?.worker.as_mut()?;
+        if worker.is_alive() {
+            Some(worker)
+        } else {
+            None
+        }
+    }
+
     pub fn worker(&mut self, plugin: &PluginId, now_ms: u64) -> Result<&mut NativeWorker, HostError> {
         if self.closed {
             return Err(HostError::Closed);
@@ -158,11 +197,7 @@ impl NativeSupervisor {
                 });
             }
         } else if let Some(exit) = dead_exit {
-            let failure = call_failure.unwrap_or_else(|| failure_kind_for_exit(&exit));
-            let registration = self.registrations.get_mut(plugin).expect("checked above");
-            registration.exits.push(exit);
-            registration.restarts = registration.restarts.saturating_add(1);
-            let _ = self.record_failure(plugin, failure, now_ms);
+            self.record_failed_exit(plugin, exit, call_failure, now_ms);
         }
         if !already_alive {
             if !self.prepare_start(plugin, now_ms)? {
@@ -239,6 +274,30 @@ impl NativeSupervisor {
             (Some(left), Some(right)) => Some(left.max(right)),
             (Some(value), None) | (None, Some(value)) => Some(value),
             (None, None) => None,
+        }
+    }
+
+    /// Gracefully releases a child while preserving its registration and all
+    /// prior failure, restart, and backoff accounting. Pending worker failures
+    /// are recorded once at the caller's policy time before releasing the child.
+    /// A later `worker` call may start a new child subject to that policy.
+    /// Missing registrations or children are already released.
+    ///
+    /// Shutdown may block: call only from a background operation, never the UI.
+    pub fn release_worker(&mut self, plugin: &PluginId, now_ms: u64) {
+        if let Some(mut worker) = self
+            .registrations
+            .get_mut(plugin)
+            .and_then(|registration| registration.worker.take())
+        {
+            let alive = worker.is_alive();
+            let failure = worker.take_failure_kind();
+            let exit = worker.shutdown();
+            if !alive {
+                self.record_failed_exit(plugin, exit, failure, now_ms);
+            } else if let Some(failure) = failure {
+                let _ = self.record_failure(plugin, failure, now_ms);
+            }
         }
     }
 
@@ -345,6 +404,20 @@ impl NativeSupervisor {
             _ => {}
         }
         Ok(true)
+    }
+
+    fn record_failed_exit(
+        &mut self,
+        plugin: &PluginId,
+        exit: ExitRecord,
+        failure: Option<FailureKind>,
+        now_ms: u64,
+    ) {
+        let failure = failure.unwrap_or_else(|| failure_kind_for_exit(&exit));
+        let registration = self.registrations.get_mut(plugin).expect("worker is registered");
+        registration.exits.push(exit);
+        registration.restarts = registration.restarts.saturating_add(1);
+        let _ = self.record_failure(plugin, failure, now_ms);
     }
 
     fn record_failure(&mut self, plugin: &PluginId, kind: FailureKind, now_ms: u64) -> Result<(), HostError> {

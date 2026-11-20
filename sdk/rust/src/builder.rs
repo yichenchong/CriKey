@@ -79,6 +79,12 @@ impl ItemBuilder {
         self
     }
 
+    /// Declares an on-demand callback for this item; the plugin must also
+    /// implement `Plugin::supports_preview` and `Plugin::preview`.
+    pub fn preview_deferred(self) -> Self {
+        self.metadata(crikey_core::PREVIEW_METADATA_KEY, "deferred")
+    }
+
     /// Adds one action.
     pub fn action(mut self, action: Action) -> Self {
         self.actions.push(action);

@@ -768,6 +768,59 @@ limitations are documented in [ADR-0006](../../notes/adr/0006-legacy-scheduling.
 cached by default, and legacy `Match`/`Sort` requests are recorded but do not
 cause host-side matching or sorting of suggestion batches.
 
+## Typed result previews
+
+Preview is host-rendered content, separate from custom display-list/web pages.
+It does not consume or create a second custom page session. Declare deferred
+content only for items that can be previewed; the host requests the current
+selection, not every result, and cancels/coalesces selection changes.
+
+Native Rust plugins opt in with `Plugin::supports_preview()`, declare items
+with `ItemBuilder::preview_deferred()`, and implement
+`Plugin::preview(item_id, context) -> Result<PreviewOutcome>`. The optional
+wire capability is `preview_v1`; old workers keep their existing operations.
+The `sdk/rust/examples/preview.rs` worker demonstrates text, formatted markdown,
+decoded pixels, metadata, deliberate links, long content and cancellation.
+
+Modern Python plugins use `Item(..., preview_deferred=True)` and
+`preview(self, item, context)`, returning `Preview(...)` or `None` for an empty
+preview. The SDK supplies `PreviewImage` and `PreviewValue`; the
+`compatibility/test-plugins/modern-preview` package demonstrates the real worker
+path. Both runtimes execute preview in the same originating worker instance as
+the item's catalog or suggestion publication, under its existing concurrency
+and call budgets. Catalog-only deferred items do not require suggestions.
+Preview must not assume that cancellation reverses any effects.
+Rows carry their exact `PluginId` separately from display names; preview
+selection and dispatch use `(PluginId, ItemId)`. Equal item IDs in different
+plugins must neither redirect callbacks nor suppress another owner's preview.
+
+Content is bounded to 256 KiB aggregate text, 4,096 prepared nodes/events,
+128 labeled values (8 KiB each), and image edges of 1,024 with at most 1 MiB
+decoded RGBA per image. Invalid content produces an explicit preview error
+without disabling the selected result. Markdown is parsed before paint:
+headings, paragraphs, emphasis, code, lists and explicit HTTP/HTTPS links are
+supported; HTML, scripts and embedded images are rejected. Supply image pixels
+through the typed image field. The renderer does not fetch remote assets.
+Provider-side networking remains subject to the existing network policy.
+
+Links are semantic host intents, not browser output from the renderer. A click
+is admitted only for the current view/query/selection/request and live producer
+incarnation, and the owner's `process` permission gates the platform document
+opener. A refused or retired link reports a visible error.
+
+| Runtime | Deferred callback | Host-known metadata | Boundary |
+| --- | --- | --- | --- |
+| Native Rust/native protocol | Optional `preview_v1` | Yes | Exact originating worker/connection; bounded transport |
+| Modern Python | Optional `preview_v1` | Yes | Existing driver supervisor and originating interpreter instance |
+| Older native/modern workers | No capability required for existing operations | Yes | Deferred operation explicitly unavailable when unsupported |
+| Legacy Python | No new callback | Yes | Existing legacy callbacks, ordering and arguments unchanged |
+| WASM | Not exposed | Yes | Adapter does not advertise `preview_v1` |
+| Restricted C ABI | Not exposed | Yes | Adapter does not advertise `preview_v1` |
+
+This matrix describes implementation support, not completed platform/runtime
+acceptance. Native-window acceptance evidence is recorded separately; macOS
+does not gain a platform URL opener from this feature.
+
 ## Permissions, security, and troubleshooting
 
 Manifests may request filesystem read/write, network client/listener,

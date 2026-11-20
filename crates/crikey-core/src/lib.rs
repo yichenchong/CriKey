@@ -10,6 +10,7 @@ pub mod generation;
 pub mod item;
 pub mod page;
 pub mod path;
+pub mod preview;
 
 pub use action::{Action, ActionId, ExecutionPolicy};
 pub use activation::{ActivationPattern, ActivationPatternError, COMPILED_SIZE_LIMIT, MAX_PATTERN_BYTES};
@@ -23,3 +24,7 @@ pub use page::{
     MIN_PAGE_REDRAW_MS,
 };
 pub use path::PlatformPath;
+pub use preview::{
+    PreviewContent, PreviewDescriptor, PreviewError, PreviewImage, PreviewOutcome, PreviewText, PreviewValue,
+    PreviewValueKind, PREVIEW_CAPABILITY, PREVIEW_METADATA_KEY,
+};

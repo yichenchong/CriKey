@@ -55,6 +55,8 @@ use crate::protocol::{
     KIND_EXECUTE_RESULT, KIND_HANDSHAKE_ACK, KIND_RESULT_BATCH, MAX_FRAME_BYTES, MAX_STDERR_TAIL_BYTES,
     PROTOCOL_EXCERPT_BYTES, PROTOCOL_VERSION,
 };
+
+static NEXT_WORKER_INCARNATION: AtomicU64 = AtomicU64::new(0);
 use crate::Interpreter;
 
 /// The worker module the child interpreter executes.
@@ -1005,8 +1007,10 @@ pub struct ModernWorker {
     stderr_thread: Option<JoinHandle<()>>,
     child: Option<Child>,
     process_id: u32,
+    incarnation: u64,
     reaped: Option<ExitStatus>,
     hard_stopped: bool,
+    preview_supported: bool,
     alive: bool,
 }
 
@@ -1019,6 +1023,11 @@ impl ModernWorker {
     /// that fails to announce itself is reaped before the error is returned; no
     /// path out of this function leaks a process.
     pub fn spawn(interpreter: &Interpreter, options: WorkerOptions) -> Result<Self, HostError> {
+        let incarnation = NEXT_WORKER_INCARNATION
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
+            .map_err(|_| HostError::Spawn("worker incarnation counter exhausted".into()))?
+            .checked_add(1)
+            .ok_or_else(|| HostError::Spawn("worker incarnation counter exhausted".into()))?;
         let sdk = crate::sdk_root();
         let entry = sdk.join(WORKER_ENTRY_FILE);
         if !entry.is_file() {
@@ -1117,8 +1126,10 @@ impl ModernWorker {
             stderr_thread: Some(stderr_thread),
             child: Some(child),
             process_id,
+            incarnation,
             reaped: None,
             hard_stopped: false,
+            preview_supported: false,
             alive: true,
         };
 
@@ -1132,11 +1143,35 @@ impl ModernWorker {
 
     /// Whether the worker is still serving.
     ///
-    /// A crash, protocol failure or timeout observed by any call marks the
-    /// worker not alive, so this answers without probing the process (and thus
-    /// without `&mut self`).
+    /// A crash, protocol failure or timeout observed by a call marks the worker
+    /// not alive. This cached accessor does not probe the process; a background
+    /// supervisor uses [`Self::poll_alive`] to observe idle exits.
     pub fn is_alive(&self) -> bool {
         self.alive
+    }
+
+    /// Nonblocking child-status probe for a background supervisor.
+    ///
+    /// Unlike `is_alive`, this observes an idle process exit. It only marks the
+    /// worker dead and saves its status: reader/writer cleanup remains with
+    /// shutdown or drop, so callers can publish retirement before cleanup.
+    pub fn poll_alive(&mut self) -> bool {
+        if self.alive {
+            match self.child.as_mut().map(Child::try_wait) {
+                Some(Ok(None)) => {}
+                Some(Ok(Some(status))) => {
+                    self.reaped = Some(status);
+                    self.alive = false;
+                }
+                Some(Err(_)) | None => self.alive = false,
+            }
+        }
+        self.alive
+    }
+
+    /// Process-lifetime identity, never reused even if the operating system reuses a PID.
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 
     /// Returns bounded lifecycle counters for host-managed background work.
@@ -1158,6 +1193,50 @@ impl ModernWorker {
         CancelHandle {
             link: Arc::clone(&self.link),
         }
+    }
+    /// Optional capability negotiated independently of ordinary suggestions.
+    pub fn supports_preview(&self) -> bool {
+        self.preview_supported
+    }
+
+    /// Blocking worker operation. Call only from a supervised background thread.
+    /// Identity is opaque to the plugin and must be echoed without modification.
+    /// Cancellation is latched: the supervisor resets `cancel_handle()` before
+    /// installing its cancellation watcher, avoiding a lost cancel at admission.
+    pub fn preview(&mut self, item: &Item, identity: &Value) -> Result<Value, HostError> {
+        if !self.preview_supported {
+            return Ok(serde_json::json!({"status":"unsupported","identity":identity}));
+        }
+        if !self.alive {
+            return Err(self.crashed());
+        }
+        let id = self
+            .link
+            .next_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
+            .map_err(|_| HostError::Protocol("preview request counter exhausted".into()))?
+            .checked_add(1)
+            .ok_or_else(|| HostError::Protocol("preview request counter exhausted".into()))?;
+        let request = serde_json::json!({
+            "id":id, "kind":"preview", "identity":identity,
+            "item":protocol::encode_item(item),
+        });
+        if self.link.write_frame(&request).is_err() {
+            self.fail_and_reap();
+            return Err(self.crashed());
+        }
+        let line = self.recv_frame(self.options.call_timeout_ms)?;
+        let frame = self.expect_frame(&line, id, "preview_result")?;
+        if frame.get("identity") != Some(identity)
+            || protocol::decode_log(&frame).is_none()
+            || !matches!(
+                frame.get("status").and_then(Value::as_str),
+                Some("content" | "empty" | "unsupported" | "cancelled" | "failed")
+            )
+        {
+            return Err(self.protocol_error(&line));
+        }
+        Ok(Value::Object(frame))
     }
 
     /// Delivers the latest complete configuration state to the plugin (spec 21.4).
@@ -1198,6 +1277,14 @@ impl ModernWorker {
 
     /// Runs the plugin's `build_catalog`, folding its catalog batches.
     pub fn build_catalog(&mut self) -> Result<Vec<Item>, HostError> {
+        self.build_catalog_with_timeout_ms(self.options.call_timeout_ms)
+    }
+
+    /// Runs the plugin's `build_catalog` with a budget for this whole call.
+    ///
+    /// The worker's configured timeout is unchanged, so catalog work on a
+    /// query worker can retain its own budget without extending later queries.
+    pub fn build_catalog_with_timeout_ms(&mut self, timeout_ms: u64) -> Result<Vec<Item>, HostError> {
         if !self.alive {
             return Err(self.crashed());
         }
@@ -1212,7 +1299,7 @@ impl ModernWorker {
         // budget, decremented as time passes, so a plugin that streams partial
         // catalog batches forever is bounded rather than resetting the clock
         // with each frame.
-        let deadline = deadline_after_millis(self.options.call_timeout_ms);
+        let deadline = deadline_after_millis(timeout_ms);
         let mut items = Vec::new();
         let mut log_bytes = 0usize;
         loop {
@@ -1469,6 +1556,10 @@ impl ModernWorker {
             && frame.get("protocol_version").and_then(Value::as_u64) == Some(u64::from(PROTOCOL_VERSION));
 
         if acknowledged {
+            self.preview_supported = frame
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("preview_v1")));
             Ok(())
         } else {
             Err(self.protocol_error(&line))
@@ -1635,6 +1726,7 @@ impl ModernWorker {
         self.alive = false;
         self.background.reap();
         if let Some(status) = self.reaped {
+            self.link.close_stdin();
             self.link.finish_stdin_writer();
             self.drain_stderr();
             return WorkerExit {

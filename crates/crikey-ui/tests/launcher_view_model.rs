@@ -102,6 +102,7 @@ fn action(id: &str) -> Action {
 /// A minimal row identified by `id`, carrying exactly one default action.
 fn row(id: &str) -> ResultRow {
     ResultRow {
+        plugin: PluginId("core".into()),
         item: ItemId(id.to_owned()),
         label: id.to_uppercase(),
         description: String::new(),
@@ -144,6 +145,10 @@ fn selected_id(model: &ViewModel) -> &str {
 fn every_command() -> Vec<UiCommand> {
     vec![
         UiCommand::SetQuery("typed".to_owned()),
+        UiCommand::FocusPreview,
+        UiCommand::LeavePreview,
+        UiCommand::ShowPreviewDetail,
+        UiCommand::SetPreviewRatio(0.6),
         UiCommand::SelectNext,
         UiCommand::SelectPrevious,
         UiCommand::PageDown,
@@ -1144,6 +1149,7 @@ fn no_command_can_leave_the_selection_out_of_range() {
 fn published_rows_reach_the_frame_with_every_display_field_intact() {
     let generation = fresh_generation();
     let decorated = ResultRow {
+        plugin: PluginId("builtin.applications".into()),
         item: ItemId("app:/usr/bin/firefox".to_owned()),
         label: "Firefox".to_owned(),
         description: "Web browser".to_owned(),
@@ -1169,6 +1175,7 @@ fn published_rows_reach_the_frame_with_every_display_field_intact() {
         .rows
         .first()
         .expect("the published row must reach the frame");
+    assert_eq!(presented.plugin, PluginId("builtin.applications".into()));
     assert_eq!(presented.item, ItemId("app:/usr/bin/firefox".to_owned()));
     assert_eq!(presented.label, "Firefox");
     assert_eq!(presented.description, "Web browser");
@@ -1599,7 +1606,8 @@ fn cancel_closes_an_open_action_list_before_it_clears_the_query() {
 
 #[test]
 fn frames_share_one_row_allocation_instead_of_deep_copying_it() {
-    let generation = fresh_generation();
+    let generations = GenerationTracker::new();
+    let generation = generations.advance();
     let mut view_model = open_showing(generation, &["alpha", "beta", "gamma"]);
     let first = expect_frame(&mut view_model);
 
@@ -1629,7 +1637,9 @@ fn frames_share_one_row_allocation_instead_of_deep_copying_it() {
 
     // Only a publish swaps the allocation, and a frame already handed out keeps
     // describing exactly what it was given.
-    view_model.publish(generation, rows(&["delta"]), false);
+    let replacement_generation = generations.advance();
+    view_model.begin_generation(replacement_generation);
+    view_model.publish(replacement_generation, rows(&["delta"]), false);
     let fourth = expect_frame(&mut view_model);
     assert!(!Arc::ptr_eq(&first.rows, &fourth.rows));
     assert_eq!(row_ids(&first), vec!["alpha", "beta", "gamma"]);
@@ -1717,7 +1727,8 @@ fn navigation_stays_put_on_a_single_result() {
 
 #[test]
 fn a_query_of_multi_byte_characters_survives_editing_and_completion() {
-    let generation = fresh_generation();
+    let generations = GenerationTracker::new();
+    let generation = generations.advance();
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
     let _ = view_model.apply(UiCommand::SetQuery(FIXTURE_QUERY.to_owned()));
@@ -1744,7 +1755,9 @@ fn a_query_of_multi_byte_characters_survives_editing_and_completion() {
 
     let mut completion = row("naïve");
     completion.label = "naïve étude".to_owned();
-    view_model.publish(generation, vec![completion], false);
+    let completion_generation = generations.advance();
+    view_model.begin_generation(completion_generation);
+    view_model.publish(completion_generation, vec![completion], false);
     assert_eq!(expect_frame(&mut view_model).query, shortened);
 
     assert_eq!(
@@ -2281,4 +2294,136 @@ fn a_return_search_reconciles_the_existing_user_selection() {
     model.publish(fresh, rows(&["beta", "alpha"]), false);
     let returned = expect_frame(&mut model);
     assert_eq!(returned.rows[returned.selected].item, ItemId("beta".to_owned()));
+}
+
+#[test]
+fn preview_answers_retire_on_selection_query_surface_and_hide() {
+    use crikey_ui::PreviewStatus;
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("preview".into()));
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(Generation::from_raw(1), rows(&["A", "B"]), false);
+    let a = model.preview_selection().unwrap();
+    assert!(model.publish_preview(&a, PreviewStatus::Loading));
+    model.apply(UiCommand::SelectNext);
+    let b = model.preview_selection().unwrap();
+    assert_ne!(a.revision, b.revision);
+    assert!(!model.publish_preview(&a, PreviewStatus::Error("late A".into())));
+    assert!(model.publish_preview(&b, PreviewStatus::Empty));
+    model.apply(UiCommand::SelectPrevious);
+    let a_again = model.preview_selection().unwrap();
+    assert_ne!(a.revision, a_again.revision);
+    assert!(!model.publish_preview(&a, PreviewStatus::Empty));
+    model.apply(UiCommand::SetQuery("new query".into()));
+    assert!(!model.publish_preview(&a_again, PreviewStatus::Empty));
+    model.begin_generation(Generation::from_raw(2));
+    model.publish(Generation::from_raw(2), rows(&["A"]), false);
+    let query_two = model.preview_selection().unwrap();
+    model.open_settings(None);
+    assert!(!model.publish_preview(&query_two, PreviewStatus::Empty));
+    model.close_settings();
+    model.begin_generation(Generation::from_raw(3));
+    model.publish(Generation::from_raw(3), rows(&["A"]), false);
+    let visible = model.preview_selection().unwrap();
+    model.dismiss();
+    assert!(!model.publish_preview(&visible, PreviewStatus::Empty));
+    model.activate();
+    assert!(!model.publish_preview(&visible, PreviewStatus::Empty));
+}
+
+#[test]
+fn preview_focus_and_detail_back_preserve_query_selection_and_content() {
+    use crikey_ui::{prepare_preview, PreviewStatus};
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("preview".into()));
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(Generation::from_raw(1), rows(&["A", "B"]), false);
+    model.apply(UiCommand::SelectNext);
+    let selection = model.preview_selection().unwrap();
+    let content = Arc::new(
+        prepare_preview(Arc::new(crikey_core::PreviewContent {
+            text: Some(crikey_core::PreviewText::Plain("B detail".into())),
+            ..Default::default()
+        }))
+        .unwrap(),
+    );
+    assert!(model.publish_preview(&selection, PreviewStatus::Content(Arc::clone(&content))));
+    model.apply(UiCommand::ShowPreviewDetail);
+    let detail = expect_frame(&mut model);
+    assert!(detail.preview.focused && detail.preview.detail);
+    assert_eq!(selected_id(&detail), "B");
+    model.apply(UiCommand::Cancel);
+    let back = expect_frame(&mut model);
+    assert!(!back.preview.focused && !back.preview.detail);
+    assert_eq!(back.query, "preview");
+    assert_eq!(selected_id(&back), "B");
+    let Some(PreviewStatus::Content(retained)) = &back.preview.status else {
+        panic!("Back lost detail");
+    };
+    assert!(Arc::ptr_eq(&content, retained));
+    model.apply(UiCommand::FocusPreview);
+    model.apply(UiCommand::LeavePreview);
+    assert_eq!(model.preview_selection(), Some(selection));
+}
+
+#[test]
+fn preview_link_intent_cannot_follow_a_changed_selection() {
+    use crikey_ui::{PreviewLinkTarget, PreviewStatus};
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("preview".into()));
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(Generation::from_raw(1), rows(&["A", "B"]), false);
+    let selection = model.preview_selection().unwrap();
+    model.publish_preview(&selection, PreviewStatus::Empty);
+    let target = PreviewLinkTarget {
+        plugin: selection.plugin.clone(),
+        selection,
+        incarnation: 3,
+        request: 5,
+    };
+    model.set_preview_link_target(target.clone());
+    model.apply(UiCommand::SelectNext);
+    assert_eq!(
+        model.apply(UiCommand::OpenPreviewLink {
+            target,
+            url: "https://example.org/".into()
+        }),
+        None
+    );
+}
+
+#[test]
+fn preview_selection_and_republication_keep_exact_owner_for_colliding_item_ids() {
+    use crikey_ui::PreviewStatus;
+    let mut first = row("shared");
+    first.plugin = PluginId("native.first".into());
+    first.plugin_name = "Same display name".into();
+    let mut second = row("shared");
+    second.plugin = PluginId("modern.second".into());
+    second.plugin_name = "Same display name".into();
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("shared".into()));
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(
+        Generation::from_raw(1),
+        vec![first.clone(), second.clone()],
+        false,
+    );
+    let first_request = model.preview_selection().unwrap();
+    assert_eq!(first_request.plugin, first.plugin);
+    model.apply(UiCommand::SelectNext);
+    let second_request = model.preview_selection().unwrap();
+    assert_eq!(second_request.plugin, second.plugin);
+    assert!(!model.publish_preview(&first_request, PreviewStatus::Empty));
+    model.publish(Generation::from_raw(1), vec![second.clone(), first], false);
+    assert_eq!(model.preview_selection(), Some(second_request.clone()));
+    let frame = model.frame().unwrap();
+    assert_eq!(frame.selected, 0);
+    assert_eq!(frame.rows[frame.selected].plugin, second.plugin);
+    model.publish(Generation::from_raw(1), vec![row("shared")], false);
+    assert!(!model.publish_preview(&second_request, PreviewStatus::Empty));
 }

@@ -7,15 +7,16 @@
 
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crikey_core::{CoreError, PageColor, PageFrame, PageInput, PageInputKind, Result};
 use crikey_plugin_sdk::{
-    serve, ActionBuilder, CatalogSink, ExecuteOutcome, ExecuteRequest, ItemBuilder, PageBuilder,
-    PageCanvas, PagePalette, PageRect, PageRequest, Plugin, PluginContext, PluginResource, Query,
-    ResourceKind, SdkError, ServeConfig, SuggestionSink,
+    serve, ActionBuilder, CatalogSink, ExecuteOutcome, ExecuteRequest, ItemBuilder, PageBuilder, PageCanvas,
+    PagePalette, PageRect, PageRequest, Plugin, PluginContext, PluginResource, Query, ResourceKind, SdkError,
+    ServeConfig, SuggestionSink,
 };
 
 const MODE_ENV: &str = "CRIKEY_CONFORMANCE_MODE";
@@ -35,6 +36,7 @@ enum Mode {
     Slow(u64),
     SlowWitness(u64),
     IgnoreCancel(u64),
+    GatedIgnoreCancel,
     CrashOnSuggest,
     CrashOnStart,
     FailSuggest,
@@ -78,6 +80,7 @@ fn parse_mode(spec: &str) -> Mode {
         "icon-slow" => Mode::IconSlow,
         "icon-silent" => Mode::IconSilent,
         "page" => Mode::Page,
+        "gated-ignore-cancel" => Mode::GatedIgnoreCancel,
         _ if spec.starts_with("stream:") => Mode::Stream(
             spec.strip_prefix("stream:")
                 .and_then(|value| value.parse::<usize>().ok())
@@ -292,10 +295,10 @@ const SWATCH_EDGE: u32 = 4;
 /// it into exactly this before building its frame: the host takes raw RGBA8
 /// and parses no image format.
 const SWATCH_RGBA: [u8; (SWATCH_EDGE * SWATCH_EDGE * 4) as usize] = [
-    0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF,
-    0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF,
-    0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF,
-    0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF,
+    0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0xE8,
+    0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0x30, 0x80,
+    0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0xE8, 0xAE, 0x58,
+    0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF,
 ];
 
 /// Columns the counter chart can show, and therefore the counter value at
@@ -430,13 +433,7 @@ impl PageState {
             // A placeholder is the page's own doing: the vocabulary has one
             // text colour per node, so an empty field says so in muted text
             // rather than the host inventing a hint it cannot know.
-            page = page.text(
-                36.0,
-                262.0,
-                "Type here and the page redraws",
-                0.0,
-                palette.muted,
-            );
+            page = page.text(36.0, 262.0, "Type here and the page redraws", 0.0, palette.muted);
         }
         let status = format!(
             "{} characters typed - the counter is {}",
@@ -656,6 +653,29 @@ impl ConformancePlugin {
             )],
         )
     }
+
+    fn suggest_gated_ignore_cancel(&mut self, query: Query, sink: &mut dyn SuggestionSink) -> Result<()> {
+        let mut entered = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("conformance-gate-entered")
+            .map_err(|error| invalid(format!("callback gate entry failed: {error}")))?;
+        writeln!(entered, "{}", query.text)
+            .map_err(|error| invalid(format!("callback gate entry failed: {error}")))?;
+        // The watchdog only bounds a failed test. Release is an explicit
+        // per-query witness in this child's package scratch directory.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while fs::read_to_string("conformance-gate-release").ok().as_deref() != Some(query.text.as_str()) {
+            if Instant::now() >= deadline {
+                return Err(invalid("callback gate was never released"));
+            }
+            thread::yield_now();
+        }
+        emit_final(
+            sink,
+            vec![result_item("gated-1", format!("{} (gated)", query.text))],
+        )
+    }
 }
 
 /// Dies the way a real native plugin dies: a diagnostic on stderr, then the
@@ -721,6 +741,7 @@ impl Plugin for ConformancePlugin {
             Mode::Slow(milliseconds) => self.suggest_slow(query, milliseconds, context, sink),
             Mode::SlowWitness(milliseconds) => self.suggest_slow_witness(query, milliseconds, context, sink),
             Mode::IgnoreCancel(milliseconds) => self.suggest_ignore_cancel(query, milliseconds, sink),
+            Mode::GatedIgnoreCancel => self.suggest_gated_ignore_cancel(query, sink),
             Mode::CrashOnSuggest => crash("crash-on-suggest requested"),
             Mode::CrashOnStart => Err(invalid("crash-on-start should not receive suggest")),
             Mode::FailSuggest => Err(invalid("conformance fail-suggest requested")),
@@ -788,8 +809,7 @@ impl Plugin for ConformancePlugin {
         reference: &str,
         _context: &dyn PluginContext,
     ) -> Result<Option<PluginResource>> {
-        if !matches!(self.mode, Mode::Icon | Mode::IconSlow | Mode::IconSilent)
-            || kind != ResourceKind::Icon
+        if !matches!(self.mode, Mode::Icon | Mode::IconSlow | Mode::IconSilent) || kind != ResourceKind::Icon
         {
             return Ok(None);
         }
@@ -919,7 +939,10 @@ mod tests {
             frame.focus_ring(),
             vec![NODE_DECREASE, NODE_INCREASE, NODE_ANNOUNCE, NODE_NOTE, NODE_CLOSE]
         );
-        assert_eq!(frame.focus_node, NODE_NOTE, "an opened page places the caret itself");
+        assert_eq!(
+            frame.focus_node, NODE_NOTE,
+            "an opened page places the caret itself"
+        );
         assert_eq!(
             frame.node(NODE_ANNOUNCE).map(|node| node.role),
             Some(NodeRole::Checkbox)
@@ -992,7 +1015,10 @@ mod tests {
         let mut state = PageState::default();
         draw(&mut state, 1, &[PageInput::new(PageInputKind::Opened)]);
         let frame = draw(&mut state, 2, &[activate(NODE_CLOSE)]);
-        assert!(frame.close, "the page must end itself rather than wait for Escape");
+        assert!(
+            frame.close,
+            "the page must end itself rather than wait for Escape"
+        );
     }
 
     #[test]
@@ -1001,11 +1027,7 @@ mod tests {
         let frame = draw(&mut state, 1, &[PageInput::new(PageInputKind::Opened)]);
         frame.validate().expect("a page carrying rasters stays drawable");
         let rasters = |frame: &PageFrame| -> Vec<crikey_core::PageImage> {
-            frame
-                .nodes
-                .iter()
-                .filter_map(|node| node.image.clone())
-                .collect()
+            frame.nodes.iter().filter_map(|node| node.image.clone()).collect()
         };
         let opening = rasters(&frame);
         assert_eq!(opening.len(), 2, "the swatch and the chart both reach the host");

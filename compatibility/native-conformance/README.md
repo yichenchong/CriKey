@@ -19,6 +19,7 @@ Mode selection is identical in both binaries: `CRIKEY_CONFORMANCE_MODE`, then
 |  | `stream:<n>` | Catalog and suggestions emit `n` items in batches of 16 and finish the stream. |
 |  | `slow:<ms>` | Polls cooperative cancellation while waiting, then returns cancelled or a final result. |
 |  | `ignore-cancel:<ms>` | Never checks cancellation and returns only after the delay. |
+|  | `gated-ignore-cancel` | Appends each callback's query to working-directory `conformance-gate-entered`, then ignores cancellation until `conformance-gate-release` contains exactly that query. Returns a fresh `(gated)` row; a 60-second watchdog only bounds failed tests. |
 |  | `crash-on-suggest` | Aborts inside `suggest`. |
 |  | `crash-on-start` | Aborts from `start`. |
 |  | `fail-suggest` | Returns a plugin error from `suggest`. |

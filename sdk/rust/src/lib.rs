@@ -22,6 +22,10 @@ pub use crikey_core::{
     NodeRole, NodeShape, PageColor, PageError, PageFrame, PageImage, PageInput, PageInputKind, PageNode,
     PageWebSurface, WebStorage,
 };
+pub use crikey_core::{
+    PreviewContent, PreviewDescriptor, PreviewError, PreviewImage, PreviewOutcome, PreviewText, PreviewValue,
+    PreviewValueKind,
+};
 pub use crikey_native_protocol as protocol;
 pub use serve::{serve, serve_on, HandshakeInfo, ServeConfig};
 
@@ -267,6 +271,18 @@ pub struct PluginResource {
 
 /// The trait a native plugin implements (spec 16.7).
 pub trait Plugin {
+    /// Whether this plugin implements on-demand previews. Default is honest
+    /// unsupported, including adapters for runtimes without preview callbacks.
+    fn supports_preview(&self) -> bool {
+        false
+    }
+
+    /// Produces content only for the selected item, off the host UI thread.
+    /// Poll context cancellation during expensive work.
+    fn preview(&mut self, _item_id: &str, _context: &dyn PluginContext) -> Result<PreviewOutcome> {
+        Ok(PreviewOutcome::Unsupported)
+    }
+
     /// Initializes plugin state before requests are served.
     fn start(&mut self, context: &dyn PluginContext) -> Result<()>;
 
