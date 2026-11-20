@@ -2185,3 +2185,100 @@ fn a_web_caret_rejects_overflowing_endpoints_without_losing_the_valid_anchor() {
         Some((4.0, 5.0, 2.0, 12.0))
     );
 }
+
+#[test]
+fn settings_retire_root_publications_and_return_requests_one_fresh_search() {
+    for close in [UiCommand::Cancel, UiCommand::CloseSettings] {
+        let tracker = GenerationTracker::new();
+        let old = tracker.advance();
+        let mut model = open_showing(old, &["alpha"]);
+        let root = model.view().expect("visible root");
+        assert_eq!(root.1, crikey_ui::ViewKind::RootList);
+        let _ = expect_frame(&mut model);
+
+        model.apply(UiCommand::OpenSettings);
+        let settings = model.view().expect("visible settings");
+        assert_ne!(settings.0, root.0);
+        assert_eq!(settings.1, crikey_ui::ViewKind::Settings);
+        let _ = expect_frame(&mut model);
+        model.publish(old, rows(&["late"]), true);
+        expect_idle(&mut model);
+        assert_eq!(model.take_query_refresh(), None);
+
+        assert_eq!(model.apply(close), None);
+        let returned = expect_frame(&mut model);
+        assert_eq!(row_ids(&returned), vec!["alpha"]);
+        assert!(!returned.pending_plugins);
+        model.publish(old, rows(&["still-late"]), true);
+        model.begin_generation(old);
+        expect_idle(&mut model);
+        assert_eq!(model.take_query_refresh().as_deref(), Some(FIXTURE_QUERY));
+        assert_eq!(model.take_query_refresh(), None);
+
+        let fresh = tracker.advance();
+        let returned_view = model.view();
+        model.begin_generation(fresh);
+        model.publish(fresh, rows(&["fresh"]), false);
+        assert_eq!(row_ids(&expect_frame(&mut model)), vec!["fresh"]);
+        assert_eq!(
+            model.view(),
+            returned_view,
+            "queries do not replace logical views"
+        );
+        model.publish(old, rows(&["late-again"]), true);
+        expect_idle(&mut model);
+    }
+}
+
+#[test]
+fn leaving_custom_pages_retires_old_rows_and_preserves_close_effects() {
+    for close in [UiCommand::Cancel, UiCommand::ClosePage] {
+        let tracker = GenerationTracker::new();
+        let old = tracker.advance();
+        let mut model = open_showing(old, &["alpha"]);
+        let _ = expect_frame(&mut model);
+        assert!(model.open_page(web_page_surface()));
+        assert_eq!(model.view().unwrap().1, crikey_ui::ViewKind::CustomPage);
+        let _ = expect_frame(&mut model);
+        model.publish(old, rows(&["late"]), true);
+        expect_idle(&mut model);
+        assert_eq!(model.apply(close), Some(UiEffect::ClosePage));
+        assert_eq!(row_ids(&expect_frame(&mut model)), vec!["alpha"]);
+        model.publish(old, rows(&["after-close"]), true);
+        expect_idle(&mut model);
+        assert_eq!(model.take_query_refresh().as_deref(), Some(FIXTURE_QUERY));
+        assert_eq!(model.take_query_refresh(), None);
+        let fresh = tracker.advance();
+        model.begin_generation(fresh);
+        model.publish(fresh, rows(&["fresh"]), false);
+        assert_eq!(row_ids(&expect_frame(&mut model)), vec!["fresh"]);
+    }
+}
+
+#[test]
+fn dismissal_discards_an_unconsumed_return_search() {
+    let mut model = open_showing(fresh_generation(), &["alpha"]);
+    model.open_settings(None);
+    model.close_settings();
+    model.dismiss();
+    assert_eq!(model.view(), None);
+    assert_eq!(model.take_query_refresh(), None);
+    model.activate();
+    assert_eq!(model.take_query_refresh(), None);
+}
+
+#[test]
+fn a_return_search_reconciles_the_existing_user_selection() {
+    let tracker = GenerationTracker::new();
+    let old = tracker.advance();
+    let mut model = open_showing(old, &["alpha", "beta"]);
+    select_index(&mut model, 1);
+    model.open_settings(None);
+    model.close_settings();
+    assert_eq!(model.take_query_refresh().as_deref(), Some(FIXTURE_QUERY));
+    let fresh = tracker.advance();
+    model.begin_generation(fresh);
+    model.publish(fresh, rows(&["beta", "alpha"]), false);
+    let returned = expect_frame(&mut model);
+    assert_eq!(returned.rows[returned.selected].item, ItemId("beta".to_owned()));
+}

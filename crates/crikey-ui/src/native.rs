@@ -380,6 +380,9 @@ struct FrameMailbox {
     /// reappearing over the next one, which has not published a host frame yet.
     overlay: Overlay,
     overlay_session: Option<u64>,
+    /// Root query floor and retired covered work, scoped by `overlay_session`.
+    host_generation: Option<crikey_core::Generation>,
+    retired_generation: Option<crikey_core::Generation>,
 }
 
 const VISIBLE_BIT: u64 = 1;
@@ -457,6 +460,17 @@ enum FrameSource {
 
 /// Remembers the host-owned half of a frame the host itself composed.
 fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
+    if mailbox.overlay_session != Some(session) {
+        mailbox.retired_generation = None;
+    }
+    mailbox.host_generation = Some(model.generation);
+    if model.settings_open || model.page.is_some() {
+        mailbox.retired_generation = Some(
+            mailbox
+                .retired_generation
+                .map_or(model.generation, |floor| floor.max(model.generation)),
+        );
+    }
     mailbox.overlay = Overlay {
         settings_open: model.settings_open,
         settings: Arc::clone(&model.settings),
@@ -466,6 +480,20 @@ fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
         page: model.page.clone(),
     };
     mailbox.overlay_session = Some(session);
+}
+
+/// Results may refresh only an uncovered root with work newer than its last
+/// covered lifetime. Returning to the root requires a fresh query generation.
+fn admits_results(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> bool {
+    mailbox.overlay_session != Some(session)
+        || (!mailbox.overlay.settings_open
+            && mailbox.overlay.page.is_none()
+            && mailbox
+                .host_generation
+                .is_none_or(|floor| model.generation >= floor)
+            && mailbox
+                .retired_generation
+                .is_none_or(|floor| model.generation > floor))
 }
 
 /// Puts this session's retained host overlay back onto a provider's frame.
@@ -771,13 +799,19 @@ impl NativeLauncherHandle {
 
     /// Publishes a results-only frame from a provider thread.
     ///
-    /// A provider driver builds its view model from a query and its own rows;
-    /// it has no idea whether the user has the settings surface open, and the
-    /// `false` it necessarily carries would close that surface mid-edit. This
-    /// session's retained host overlay is put back on as the frame is queued,
-    /// so a suggestion arriving during a settings edit updates the results
-    /// behind the panel instead of dismissing it.
+    /// A provider owns results, never settings or custom pages. Covered views
+    /// reject direct frames entirely. Returning to the root requires a fresh
+    /// generation, so queued pre-cover answers cannot overwrite the restored
+    /// list after Back either.
+    ///
+    /// Always announces the stored provider outcome to the host, even when the
+    /// renderer rejects this frame. A fresh return query can finish before the
+    /// host publishes its uncovered frame; only the host can merge that answer.
     pub fn submit_results(&self, model: &ViewModel) -> Result<(), RendererError> {
+        // Announce before taking the frame mailbox lock: rendering admission
+        // must not decide whether the host drains the stored outcome. The
+        // existing answer path keeps hidden sessions inert.
+        self.request_provider_answer()?;
         self.enqueue(model, FrameSource::Provider)
     }
 
@@ -804,7 +838,12 @@ impl NativeLauncherHandle {
                     record_overlay(&mut mailbox, session, model);
                     model.clone()
                 }
-                FrameSource::Provider => with_overlay(&mailbox, session, model),
+                FrameSource::Provider => {
+                    if !admits_results(&mailbox, session, model) {
+                        return Ok(());
+                    }
+                    with_overlay(&mailbox, session, model)
+                }
             };
             mailbox.latest = Some(PendingFrame { session, model });
             if mailbox.wake_session == Some(session) {
@@ -5853,6 +5892,35 @@ mod window_geometry_tests {
             !with_overlay(&mailbox, 8, &view("term", false)).settings_open,
             "a new activation starts with no panel until its host says otherwise"
         );
+    }
+
+    #[test]
+    fn direct_provider_frames_cannot_cross_a_covered_root_lifetime() {
+        let tracker = crikey_core::GenerationTracker::new();
+        let old = tracker.advance();
+        let fresh = tracker.advance();
+        let mut root = view("term", false);
+        root.generation = old;
+        let mut mailbox = FrameMailbox::default();
+        record_overlay(&mut mailbox, 7, &root);
+        assert!(admits_results(&mailbox, 7, &root));
+
+        let mut covered = root.clone();
+        covered.settings_open = true;
+        record_overlay(&mut mailbox, 7, &covered);
+        assert!(!admits_results(&mailbox, 7, &root));
+        let mut next = root.clone();
+        next.generation = fresh;
+        assert!(!admits_results(&mailbox, 7, &next));
+
+        record_overlay(&mut mailbox, 7, &root);
+        assert!(!admits_results(&mailbox, 7, &root));
+        record_overlay(&mut mailbox, 7, &next);
+        assert!(admits_results(&mailbox, 7, &next));
+        assert!(!admits_results(&mailbox, 7, &root));
+
+        record_overlay(&mut mailbox, 8, &root);
+        assert!(admits_results(&mailbox, 8, &root), "retirement is session-local");
     }
 
     #[test]

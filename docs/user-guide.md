@@ -159,6 +159,11 @@ the catalog at rest, and the window stays compact until there is something to
 show. Scrolling the result list with the wheel stays where you put it; the
 list only scrolls itself to follow a selection you moved.
 
+Dismissal clears the current query and results; reopening starts a fresh
+launcher session rather than resuming the previous view. Results still in flight
+from the dismissed session cannot populate the reopened launcher. Opening
+settings does not turn incoming search results into settings content.
+
 Typing updates the visible query immediately. Local catalog search runs in the
 current UI frame; plugin results arrive incrementally and late results from an
 older query are discarded. Modern plugins apply their manifest's debounce and
