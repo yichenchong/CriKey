@@ -2448,20 +2448,20 @@ mod tests {
         const DRAIN_LIMIT: usize = 64;
         for operation in ["navigate", "resize", "input", "ime"] {
             for terminal in ["failed", "gone", "none", "beyond-cap"] {
-                // The pair's bounded 64-message channel cannot synchronously
-                // preload a >64-envelope diagnostic prefix. Use real Unix
-                // buffering for that small-byte, many-envelope boundary.
+                // Real Unix buffering can hold the >64-envelope diagnostic
+                // prefix without blocking on the in-memory pair's queue cap.
                 let endpoint = PrivateEndpoint::create().expect("private buffered endpoint");
                 let listener = Listener::bind(endpoint.endpoint()).expect("buffered listener");
-                let (mut launcher, mut peer) = if terminal == "beyond-cap" {
-                    let peer = transport::connect(endpoint.endpoint(), Some(Duration::from_secs(1)))
-                        .expect("buffered Unix peer");
-                    let launcher = listener
-                        .accept(Some(Duration::from_secs(1)))
-                        .expect("buffered launcher");
-                    (launcher, peer)
-                } else {
-                    transport::pair()
+                let mut peer = std::os::unix::net::UnixStream::connect(match endpoint.endpoint() {
+                    Endpoint::UnixSocket(path) => path,
+                    _ => unreachable!("Linux private endpoint is a Unix socket"),
+                })
+                .expect("buffered Unix peer");
+                let mut launcher = listener
+                    .accept(Some(Duration::from_secs(1)))
+                    .expect("buffered launcher");
+                let mut send = |envelope: Envelope| {
+                    crikey_native_protocol::frame::write_frame(&mut peer, &envelope.encode())
                 };
                 launcher
                     .set_read_timeout(Some(Duration::from_millis(5)))
@@ -2472,27 +2472,27 @@ mod tests {
                     1
                 };
                 for _ in 0..prefix_count {
-                    send_payload(
-                        &mut peer,
-                        Payload::LoadState(LoadState {
+                    send(Envelope {
+                        payload: Some(Payload::LoadState(LoadState {
                             surface_id: 1,
                             state: WebLoadCode::Started,
                             ..LoadState::default()
-                        }),
-                    )
+                        })),
+                        ..Envelope::default()
+                    })
                     .expect("buffered Started");
                 }
-                send_payload(
-                    &mut peer,
-                    Payload::LoadState(LoadState {
+                send(Envelope {
+                    payload: Some(Payload::LoadState(LoadState {
                         surface_id: 2,
                         state: WebLoadCode::Failed,
                         failure: "obsolete owner must not replace the control error".to_owned(),
                         ..LoadState::default()
-                    }),
-                )
+                    })),
+                    ..Envelope::default()
+                })
                 .expect("buffered obsolete terminal");
-                peer.send(&Envelope {
+                send(Envelope {
                     connection_id: 1,
                     ..Envelope::default()
                 })
@@ -2514,10 +2514,22 @@ mod tests {
                             ..LoadState::default()
                         })
                     };
-                    send_payload(&mut peer, payload).expect("buffered terminal");
+                    send(Envelope {
+                        payload: Some(payload),
+                        ..Envelope::default()
+                    })
+                    .expect("buffered terminal");
                 }
-                send_payload(&mut peer, Payload::WebFrame(frame(1, 99)))
-                    .expect("post-terminal frame cannot revive the surface");
+                send(Envelope {
+                    payload: Some(Payload::WebFrame(frame(1, 99))),
+                    ..Envelope::default()
+                })
+                .expect("post-terminal frame cannot revive the surface");
+                // A concurrent fork can retain the descriptor until exec, even
+                // with CLOEXEC. Shutdown affects every inherited reference, so
+                // the queued control must fail while inbound output stays buffered.
+                peer.shutdown(std::net::Shutdown::Read)
+                    .expect("peer no longer accepts controls");
                 drop(peer);
 
                 let terminated = Arc::new(AtomicUsize::new(0));

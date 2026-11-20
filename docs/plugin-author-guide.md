@@ -160,6 +160,16 @@ a host category. The current host preserves plugin publication order and does
 not apply fuzzy matching or consume `score_hint` for plugin suggestions, so
 filter and order suggestions yourself.
 
+Stable item identity is qualified by the owning plugin; a label is not an
+execution target. A stable ID alone also does not declare a reusable command:
+the current item model has no dedicated durable-command declaration. Do not
+use undocumented metadata keys as host command-registration APIs.
+
+Cancellation is cooperative, but display admission is not: a late suggestion
+from an obsolete query or dismissed launcher session is discarded even if its
+callback finishes successfully. Keep request generations separate from any
+plugin-owned item IDs.
+
 `on_configuration(values)` receives the complete latest configuration state,
 not a delta. Declare configuration fields in the manifest's `[configuration]`
 section when schemas are supported, including type, default, validation,

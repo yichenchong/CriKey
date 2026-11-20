@@ -818,6 +818,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         std::collections::BTreeMap::new();
     let outcome = launcher
         .run(ready_on_first_event(Rc::clone(&ledger), move |event| {
+            let mut page_failure_status = None;
             // Live configuration (spec 21.4). Checked once per turn of the loop:
             // the reloader re-stats its files at most every
             // `launcher.configuration-reload-interval-ms`, and the publisher
@@ -940,19 +941,24 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                 if let Err(error) =
                                     web_page.declare(&search, &mut view_model, &plugin, &declaration)
                                 {
-                                    close_failed_web_page(&mut web_page, &mut search, &mut view_model, error);
+                                    page_failure_status = Some(close_failed_web_page(
+                                        &mut web_page,
+                                        &mut search,
+                                        &mut view_model,
+                                        error,
+                                    ));
                                 }
                             }
                             (Some(_), None) => {
                                 web_page.close("page switched to a display list");
                             }
                             (None, _) => {
-                                close_failed_web_page(
+                                page_failure_status = Some(close_failed_web_page(
                                     &mut web_page,
                                     &mut search,
                                     &mut view_model,
                                     "the page owner disappeared before its frame was admitted".to_owned(),
-                                );
+                                ));
                             }
                         }
                     }
@@ -982,7 +988,12 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     }
                 }
                 if let Some(message) = web_failure {
-                    close_failed_web_page(&mut web_page, &mut search, &mut view_model, message);
+                    page_failure_status = Some(close_failed_web_page(
+                        &mut web_page,
+                        &mut search,
+                        &mut view_model,
+                        message,
+                    ));
                 }
             }
             // into the retained view model, so a later navigation keystroke
@@ -1116,265 +1127,305 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             // process are one decision made in one place, so no arm can grow
             // its own private answer to "does this end the launcher".
             let disposition = effect.as_ref().and_then(settings::residency);
-            match effect {
-                Some(UiEffect::Query(raw)) => {
-                    // Both ranking inputs are refreshed immediately before the
-                    // query is scored, because both describe the moment the
-                    // user typed: recency is measured from now, and the
-                    // foreground application is whatever they were working in
-                    // when they reached for the launcher. Reading either once
-                    // at startup would freeze it for the life of the process.
-                    search.set_history_time(history_clock.advance());
-                    search.refresh_foreground_category();
-                    if let Ok(generation) = search.submit_query(&raw) {
-                        let items = search.results().iter().map(|hit| hit.item.clone()).collect();
-                        view_model.begin_generation(generation);
+            // Leaving a covered root retires its old publications. Re-enter it
+            // through ordinary query dispatch, after the page lifecycle effect
+            // has run, and never duplicate a query already requested this turn.
+            let mut effect = effect;
+            loop {
+                match effect {
+                    Some(UiEffect::Query(raw)) => {
+                        // Both ranking inputs are refreshed immediately before the
+                        // query is scored, because both describe the moment the
+                        // user typed: recency is measured from now, and the
+                        // foreground application is whatever they were working in
+                        // when they reached for the launcher. Reading either once
+                        // at startup would freeze it for the life of the process.
+                        search.set_history_time(history_clock.advance());
+                        search.refresh_foreground_category();
+                        if let Ok(generation) = search.submit_query(&raw) {
+                            let items = search.results().iter().map(|hit| hit.item.clone()).collect();
+                            view_model.begin_generation(generation);
 
-                        let now = u64::try_from(query_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        // The built-in provider stays synchronous: it is fast,
-                        // in-process, and its rows must reach this frame without
-                        // waiting on anything. Its pipeline generation stays in
-                        // lockstep with the search generation this frame is
-                        // published under.
-                        let application_frame =
-                            drive_application_provider(&mut query_pipeline, &owner, &raw, items, now);
-                        if let Some(frame) = application_frame {
-                            if frame.generation == generation {
-                                // The calculator answers from the query text
-                                // alone, in this frame and on this thread: it
-                                // owes nothing asynchronously, so it never
-                                // marks itself pending and can never be the
-                                // source that leaves the view waiting. Its row
-                                // leads because when a query parses as
-                                // arithmetic, the arithmetic is what was asked
-                                // for. At most one row, so the merged frame
-                                // grows by one.
-                                retained.set_calculated(generation, calculator.rows(generation, &raw));
-                                retained.set_builtin(generation, search.result_rows());
-                                retained.mark_pending(generation, RowSource::Builtin, frame.pending_plugins);
-                                // What the asynchronous providers publish ahead
-                                // of their own rows, which is exactly what is
-                                // on screen at this instant.
-                                let rows = retained.merged();
-                                // Legacy plugins are driven off the UI thread
-                                // (Finding 8): hand the query to the supervisor
-                                // and return. The built-in rows publish now, with
-                                // work marked pending while a legacy answer is
-                                // outstanding; the legacy rows fold in
-                                // asynchronously through `take_outcome` and the
-                                // supervisor's own frame submission, always under
-                                // this generation (spec 14.5).
-                                let legacy_outstanding = legacy_driver.has_plugins();
-                                if legacy_outstanding {
-                                    legacy_driver.submit(
+                            let now = u64::try_from(query_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            // The built-in provider stays synchronous: it is fast,
+                            // in-process, and its rows must reach this frame without
+                            // waiting on anything. Its pipeline generation stays in
+                            // lockstep with the search generation this frame is
+                            // published under.
+                            let application_frame =
+                                drive_application_provider(&mut query_pipeline, &owner, &raw, items, now);
+                            if let Some(frame) = application_frame {
+                                if frame.generation == generation {
+                                    // The calculator answers from the query text
+                                    // alone, in this frame and on this thread: it
+                                    // owes nothing asynchronously, so it never
+                                    // marks itself pending and can never be the
+                                    // source that leaves the view waiting. Its row
+                                    // leads because when a query parses as
+                                    // arithmetic, the arithmetic is what was asked
+                                    // for. At most one row, so the merged frame
+                                    // grows by one.
+                                    retained.set_calculated(generation, calculator.rows(generation, &raw));
+                                    retained.set_builtin(generation, search.result_rows());
+                                    retained.mark_pending(
                                         generation,
-                                        &raw,
-                                        now,
-                                        rows.clone(),
+                                        RowSource::Builtin,
                                         frame.pending_plugins,
-                                        0,
                                     );
+                                    // What the asynchronous providers publish ahead
+                                    // of their own rows, which is exactly what is
+                                    // on screen at this instant.
+                                    let rows = retained.merged();
+                                    // Legacy plugins are driven off the UI thread
+                                    // (Finding 8): hand the query to the supervisor
+                                    // and return. The built-in rows publish now, with
+                                    // work marked pending while a legacy answer is
+                                    // outstanding; the legacy rows fold in
+                                    // asynchronously through `take_outcome` and the
+                                    // supervisor's own frame submission, always under
+                                    // this generation (spec 14.5).
+                                    let legacy_outstanding = legacy_driver.has_plugins();
+                                    if legacy_outstanding {
+                                        legacy_driver.submit(
+                                            generation,
+                                            &raw,
+                                            now,
+                                            rows.clone(),
+                                            frame.pending_plugins,
+                                            0,
+                                        );
+                                    }
+                                    // Modern plugins are dispatched off the UI thread
+                                    // just like legacy ones; their supervisor folds
+                                    // its rows into the renderer under this same
+                                    // generation as they arrive.
+                                    let modern_outstanding = modern_driver.has_plugins();
+                                    if modern_outstanding {
+                                        modern_driver.submit(
+                                            generation,
+                                            &raw,
+                                            now,
+                                            rows.clone(),
+                                            frame.pending_plugins,
+                                            0,
+                                        );
+                                    }
+                                    // Native plugins are dispatched through their
+                                    // own supervisor and merged on the same
+                                    // generation as the built-in rows.
+                                    let native_outstanding = native_driver.has_plugins();
+                                    if native_outstanding {
+                                        native_driver.submit(
+                                            generation,
+                                            &raw,
+                                            now,
+                                            rows.clone(),
+                                            frame.pending_plugins,
+                                            0,
+                                        );
+                                    }
+                                    // The file search runs on its own worker thread
+                                    // under a deadline no synchronous provider could
+                                    // afford, so it is handed the query here and its
+                                    // items are ranked in whenever it answers. An
+                                    // empty query is not submitted at all: there is
+                                    // nothing to search for, and walking the user's
+                                    // home directory to prove it would be the most
+                                    // expensive answer the launcher ever produced.
+                                    //
+                                    // Pending is read off the submission rather than
+                                    // asked as a separate question. The driver is the
+                                    // only party that knows whether it took the
+                                    // generation on, and marking a source pending on
+                                    // any other evidence is how a frame ends up
+                                    // waiting forever for an answer nobody owes.
+                                    let files_outstanding =
+                                        !raw.trim().is_empty() && file_driver.submit(generation, &raw, now);
+                                    retained.mark_pending(generation, RowSource::Legacy, legacy_outstanding);
+                                    retained.mark_pending(generation, RowSource::Native, native_outstanding);
+                                    retained.mark_pending(generation, RowSource::Modern, modern_outstanding);
+                                    retained.mark_pending(generation, RowSource::Files, files_outstanding);
+                                    view_model.publish(generation, retained.merged(), retained.pending());
                                 }
-                                // Modern plugins are dispatched off the UI thread
-                                // just like legacy ones; their supervisor folds
-                                // its rows into the renderer under this same
-                                // generation as they arrive.
-                                let modern_outstanding = modern_driver.has_plugins();
-                                if modern_outstanding {
-                                    modern_driver.submit(
-                                        generation,
-                                        &raw,
-                                        now,
-                                        rows.clone(),
-                                        frame.pending_plugins,
-                                        0,
-                                    );
-                                }
-                                // Native plugins are dispatched through their
-                                // own supervisor and merged on the same
-                                // generation as the built-in rows.
-                                let native_outstanding = native_driver.has_plugins();
-                                if native_outstanding {
-                                    native_driver.submit(
-                                        generation,
-                                        &raw,
-                                        now,
-                                        rows.clone(),
-                                        frame.pending_plugins,
-                                        0,
-                                    );
-                                }
-                                // The file search runs on its own worker thread
-                                // under a deadline no synchronous provider could
-                                // afford, so it is handed the query here and its
-                                // items are ranked in whenever it answers. An
-                                // empty query is not submitted at all: there is
-                                // nothing to search for, and walking the user's
-                                // home directory to prove it would be the most
-                                // expensive answer the launcher ever produced.
-                                //
-                                // Pending is read off the submission rather than
-                                // asked as a separate question. The driver is the
-                                // only party that knows whether it took the
-                                // generation on, and marking a source pending on
-                                // any other evidence is how a frame ends up
-                                // waiting forever for an answer nobody owes.
-                                let files_outstanding =
-                                    !raw.trim().is_empty() && file_driver.submit(generation, &raw, now);
-                                retained.mark_pending(generation, RowSource::Legacy, legacy_outstanding);
-                                retained.mark_pending(generation, RowSource::Native, native_outstanding);
-                                retained.mark_pending(generation, RowSource::Modern, modern_outstanding);
-                                retained.mark_pending(generation, RowSource::Files, files_outstanding);
-                                view_model.publish(generation, retained.merged(), retained.pending());
                             }
                         }
                     }
-                }
-                // Hiding is the shared disposition below; the arm itself has
-                // nothing left to do.
-                Some(UiEffect::Dismissed) => {
-                    // The window is going away, so the surface is too. Without
-                    // this the plugin keeps a page session alive for a screen
-                    // nobody is looking at, and goes on being asked to draw it
-                    // (spec 32.10). `close_page` is inert when none is open.
-                    web_page.close("launcher was dismissed");
-                    search.close_page();
-                    view_model.close_page();
-                }
-                Some(UiEffect::Quit) => {
-                    web_page.close("launcher is quitting");
-                }
-                Some(UiEffect::SetSetting { key, value }) => {
-                    let report = {
-                        let mut registrar = settings::PlatformHotkeys {
-                            search: &mut search,
-                            handle: render_handle.clone(),
+                    // Hiding is the shared disposition below; the arm itself has
+                    // nothing left to do.
+                    Some(UiEffect::Dismissed) => {
+                        // The window is going away, so the surface is too. Without
+                        // this the plugin keeps a page session alive for a screen
+                        // nobody is looking at, and goes on being asked to draw it
+                        // (spec 32.10). `close_page` is inert when none is open.
+                        web_page.close("launcher was dismissed");
+                        search.close_page();
+                        view_model.close_page();
+                    }
+                    Some(UiEffect::Quit) => {
+                        web_page.close("launcher is quitting");
+                    }
+                    Some(UiEffect::SetSetting { key, value }) => {
+                        let report = {
+                            let mut registrar = settings::PlatformHotkeys {
+                                search: &mut search,
+                                handle: render_handle.clone(),
+                            };
+                            settings::apply_setting(
+                                configuration
+                                    .as_mut()
+                                    .map(|configuration| &mut configuration.store),
+                                &mut activation_hotkey,
+                                &mut registrar,
+                                &key,
+                                &value,
+                            )
                         };
-                        settings::apply_setting(
-                            configuration
-                                .as_mut()
-                                .map(|configuration| &mut configuration.store),
-                            &mut activation_hotkey,
-                            &mut registrar,
-                            &key,
-                            &value,
-                        )
-                    };
-                    // Republished from the store rather than patched from the
-                    // value that was typed: a refused edit, or one a higher
-                    // layer outranks, must leave the panel showing what the
-                    // launcher will actually do.
-                    view_model.set_settings(settings::rows(
-                        configuration.as_ref().map(|configuration| &configuration.store),
-                    ));
-                    view_model.set_show_hints(settings::configured_show_hints(
-                        configuration.as_ref().map(|configuration| &configuration.store),
-                    ));
-                    view_model.set_rounded_corners(settings::configured_rounded_corners(
-                        configuration.as_ref().map(|configuration| &configuration.store),
-                    ));
-                    eprintln!("crikey: {report}");
-                }
-                Some(UiEffect::PageInput(input)) => {
-                    // A page that has stopped answering is reported once, on
-                    // the input that discovered it, rather than leaving the
-                    // user pressing keys at a surface nobody owns.
-                    if let Err(error) = search.send_page_input(input) {
-                        close_failed_web_page(&mut web_page, &mut search, &mut view_model, error.to_string());
+                        // Republished from the store rather than patched from the
+                        // value that was typed: a refused edit, or one a higher
+                        // layer outranks, must leave the panel showing what the
+                        // launcher will actually do.
+                        view_model.set_settings(settings::rows(
+                            configuration.as_ref().map(|configuration| &configuration.store),
+                        ));
+                        view_model.set_show_hints(settings::configured_show_hints(
+                            configuration.as_ref().map(|configuration| &configuration.store),
+                        ));
+                        view_model.set_rounded_corners(settings::configured_rounded_corners(
+                            configuration.as_ref().map(|configuration| &configuration.store),
+                        ));
+                        eprintln!("crikey: {report}");
                     }
-                }
-                #[cfg(target_os = "linux")]
-                Some(UiEffect::WebInput(input)) => {
-                    if let Err(error) = web_page.send_input(input) {
-                        close_failed_web_page(&mut web_page, &mut search, &mut view_model, error);
+                    Some(UiEffect::PageInput(input)) => {
+                        // A page that has stopped answering is reported once, on
+                        // the input that discovered it, rather than leaving the
+                        // user pressing keys at a surface nobody owns.
+                        if let Err(error) = search.send_page_input(input) {
+                            page_failure_status = Some(close_failed_web_page(
+                                &mut web_page,
+                                &mut search,
+                                &mut view_model,
+                                error.to_string(),
+                            ));
+                        }
                     }
-                }
-                #[cfg(not(target_os = "linux"))]
-                Some(UiEffect::WebInput(_)) => {}
-                #[cfg(target_os = "linux")]
-                Some(UiEffect::WebIme(event)) => {
-                    if let Err(error) = web_page.send_ime(event) {
-                        close_failed_web_page(&mut web_page, &mut search, &mut view_model, error);
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                Some(UiEffect::WebIme(_)) => {}
-                Some(UiEffect::ResizePage { width, height }) => {
-                    search.resize_page(width, height);
                     #[cfg(target_os = "linux")]
-                    if let Err(error) = web_page.resize(width, height) {
-                        close_failed_web_page(&mut web_page, &mut search, &mut view_model, error);
-                    }
-                }
-                Some(UiEffect::ClosePage) => {
-                    // The model has already forgotten the page; this is what
-                    // tells the plugin, and it runs even when the model had
-                    // nothing open so a session can never outlive its surface.
-                    web_page.close("page was closed");
-                    search.close_page();
-                    view_model.close_page();
-                }
-                Some(UiEffect::Execute { item, action }) => {
-                    // A calculated row is resolved first and settled entirely
-                    // here. Its value never entered the catalog and copying it
-                    // is not one of the three host-mediated catalog actions, so
-                    // neither `execute` nor `execute_host_action` could do
-                    // anything but refuse it; the calculator owns the clipboard
-                    // capability and makes the call itself.
-                    let calculated = retained
-                        .generation()
-                        .and_then(|generation| calculator.resolve(generation, &item))
-                        .map(str::to_owned);
-                    if let Some(text) = calculated {
-                        match calculator.copy(&text) {
-                            Ok(()) => {
-                                view_model.dismiss();
-                                if let Some(session) = command_session {
-                                    let _ = render_handle.request_hide_session(session);
-                                }
-                            }
-                            // The launcher stays open on a failed copy: the
-                            // result is still on screen for the user to read,
-                            // which is the only thing left that can be done
-                            // for them.
-                            Err(error) => {
-                                report_status(&mut view_model, format!("Copy failed: {error}"));
-                            }
-                        }
-                    } else {
-                        // Everything else — catalog item, plugin item, or a
-                        // file the search merged into this generation's answer
-                        // — is looked up in that answer. A file item is in
-                        // `results` like any other now, so `execute` finds it,
-                        // applies the same host-mediated gate, and
-                        // `record_selection` below can finally record having
-                        // opened it.
-                        let submission = search.execute(&item, &action);
-                        match submission {
-                            Ok(ActionSubmission::Completed) => {
-                                search.set_history_time(history_clock.advance());
-                                if search.record_selection(&item) {
-                                    commit_selection_history(selection_history.as_ref(), &search);
-                                }
-                                view_model.dismiss();
-                                if let Some(session) = command_session {
-                                    let _ = render_handle.request_hide_session(session);
-                                }
-                            }
-                            Ok(ActionSubmission::Pending(request_id)) => {
-                                let message = format!(
-                                    "Action pending ({} / request {})",
-                                    request_id.plugin.0, request_id.sequence
-                                );
-                                report_status(&mut view_model, message);
-                            }
-                            Err(error) => {
-                                report_status(&mut view_model, format!("Launch failed: {error}"));
-                            }
+                    Some(UiEffect::WebInput(input)) => {
+                        if let Err(error) = web_page.send_input(input) {
+                            page_failure_status = Some(close_failed_web_page(
+                                &mut web_page,
+                                &mut search,
+                                &mut view_model,
+                                error,
+                            ));
                         }
                     }
+                    #[cfg(not(target_os = "linux"))]
+                    Some(UiEffect::WebInput(_)) => {}
+                    #[cfg(target_os = "linux")]
+                    Some(UiEffect::WebIme(event)) => {
+                        if let Err(error) = web_page.send_ime(event) {
+                            page_failure_status = Some(close_failed_web_page(
+                                &mut web_page,
+                                &mut search,
+                                &mut view_model,
+                                error,
+                            ));
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    Some(UiEffect::WebIme(_)) => {}
+                    Some(UiEffect::ResizePage { width, height }) => {
+                        search.resize_page(width, height);
+                        #[cfg(target_os = "linux")]
+                        if let Err(error) = web_page.resize(width, height) {
+                            page_failure_status = Some(close_failed_web_page(
+                                &mut web_page,
+                                &mut search,
+                                &mut view_model,
+                                error,
+                            ));
+                        }
+                    }
+                    Some(UiEffect::ClosePage) => {
+                        // The model has already forgotten the page; this is what
+                        // tells the plugin, and it runs even when the model had
+                        // nothing open so a session can never outlive its surface.
+                        web_page.close("page was closed");
+                        search.close_page();
+                        view_model.close_page();
+                    }
+                    Some(UiEffect::Execute { item, action }) => {
+                        // A calculated row is resolved first and settled entirely
+                        // here. Its value never entered the catalog and copying it
+                        // is not one of the three host-mediated catalog actions, so
+                        // neither `execute` nor `execute_host_action` could do
+                        // anything but refuse it; the calculator owns the clipboard
+                        // capability and makes the call itself.
+                        let calculated = retained
+                            .generation()
+                            .and_then(|generation| calculator.resolve(generation, &item))
+                            .map(str::to_owned);
+                        if let Some(text) = calculated {
+                            match calculator.copy(&text) {
+                                Ok(()) => {
+                                    view_model.dismiss();
+                                    if let Some(session) = command_session {
+                                        let _ = render_handle.request_hide_session(session);
+                                    }
+                                }
+                                // The launcher stays open on a failed copy: the
+                                // result is still on screen for the user to read,
+                                // which is the only thing left that can be done
+                                // for them.
+                                Err(error) => {
+                                    report_status(&mut view_model, format!("Copy failed: {error}"));
+                                }
+                            }
+                        } else {
+                            // Everything else — catalog item, plugin item, or a
+                            // file the search merged into this generation's answer
+                            // — is looked up in that answer. A file item is in
+                            // `results` like any other now, so `execute` finds it,
+                            // applies the same host-mediated gate, and
+                            // `record_selection` below can finally record having
+                            // opened it.
+                            let submission = search.execute(&item, &action);
+                            match submission {
+                                Ok(ActionSubmission::Completed) => {
+                                    search.set_history_time(history_clock.advance());
+                                    if search.record_selection(&item) {
+                                        commit_selection_history(selection_history.as_ref(), &search);
+                                    }
+                                    view_model.dismiss();
+                                    if let Some(session) = command_session {
+                                        let _ = render_handle.request_hide_session(session);
+                                    }
+                                }
+                                Ok(ActionSubmission::Pending(request_id)) => {
+                                    let message = format!(
+                                        "Action pending ({} / request {})",
+                                        request_id.plugin.0, request_id.sequence
+                                    );
+                                    report_status(&mut view_model, message);
+                                }
+                                Err(error) => {
+                                    report_status(&mut view_model, format!("Launch failed: {error}"));
+                                }
+                            }
+                        }
+                    }
+                    None => {}
                 }
-                None => {}
+                effect = match view_model.take_query_refresh() {
+                    Some(raw) => Some(UiEffect::Query(raw)),
+                    None => break,
+                };
+            }
+            // Returning from a failed page republishes root rows synchronously.
+            // Attach its diagnostic only afterwards, so that publication cannot
+            // erase the message before the next graphical frame.
+            if let Some(message) = page_failure_status {
+                report_status(&mut view_model, message);
             }
 
             // The launcher is resident: a dismiss hides the window and the
@@ -1589,16 +1640,18 @@ fn activate_launcher_session(
     view_model.activate();
 }
 
+/// Retires the failed page and returns the diagnostic to report after the
+/// caller drains the root query refresh, before presenting its next frame.
 fn close_failed_web_page(
     runtime: &mut WebPageRuntime,
     search: &mut SearchService,
     view_model: &mut LauncherViewModel,
     message: String,
-) {
+) -> String {
     runtime.close("web surface failed");
     search.close_page();
     view_model.close_page();
-    report_status(view_model, format!("Page closed: {message}"));
+    format!("Page closed: {message}")
 }
 
 /// Opens a plugin-drawn page and puts it on screen.
@@ -3256,6 +3309,77 @@ mod tests {
             "the page owns the screen"
         );
         assert!(view_model.page().is_some(), "the model shows the surface");
+    }
+
+    #[test]
+    fn failed_page_diagnostic_reaches_the_first_refreshed_root_frame() {
+        let runtime = Arc::new(PageRuntime::default());
+        let mut search = page_service(&runtime);
+        for stage in [
+            StartupStage::WindowAndHotkey,
+            StartupStage::PersistedCatalog,
+            StartupStage::AcceptQueries,
+        ] {
+            search.complete_stage(stage).expect("query startup completes");
+        }
+        let owner = PluginId(APPLICATION_CATALOG_PLUGIN.to_owned());
+        search
+            .replace_catalog(&owner, 1, vec![application("Alpha old")])
+            .expect("the initial catalog is valid");
+        let mut view_model = LauncherViewModel::default();
+        let mut web_page = web_page_runtime();
+        view_model.activate();
+        view_model.apply(crikey_ui::UiCommand::SetQuery("Alpha".to_owned()));
+        let old = search.submit_query("Alpha").expect("the initial query succeeds");
+        view_model.begin_generation(old);
+        view_model.publish(old, search.result_rows(), false);
+        open_plugin_page(
+            &mut search,
+            &mut view_model,
+            &mut web_page,
+            &PluginId("test.page".to_owned()),
+            "page",
+            (800, 600),
+        )
+        .expect("the page opens");
+        let _ = view_model.frame();
+        let refreshed_item = application("Alpha fresh");
+        let refreshed_id = refreshed_item.stable_id.clone();
+        search
+            .replace_catalog(&owner, 2, vec![refreshed_item])
+            .expect("the catalog changes while the page covers the root");
+
+        let message = close_failed_web_page(
+            &mut web_page,
+            &mut search,
+            &mut view_model,
+            "input transport failed".to_owned(),
+        );
+        assert!(search.page_owner().is_none());
+        assert!(view_model.page().is_none());
+        assert_eq!(*runtime.closes.lock().expect("runtime state"), 1);
+
+        // Match the callback's refresh drain without consuming a graphical
+        // frame between the failure and the fresh synchronous publication.
+        let raw = view_model
+            .take_query_refresh()
+            .expect("closing requests a search");
+        assert_eq!(raw, "Alpha");
+        let fresh = search.submit_query(&raw).expect("the return query succeeds");
+        assert!(fresh > old);
+        view_model.begin_generation(fresh);
+        view_model.publish(fresh, search.result_rows(), false);
+        assert_eq!(view_model.take_query_refresh(), None);
+        report_status(&mut view_model, message);
+
+        let frame = view_model.frame().expect("the next graphical frame is ready");
+        assert_eq!(frame.generation, fresh);
+        assert_eq!(frame.rows.len(), 1);
+        assert_eq!(frame.rows[frame.selected].item, refreshed_id);
+        assert_eq!(
+            frame.rows[frame.selected].status.as_deref(),
+            Some("Page closed: input transport failed")
+        );
     }
 
     #[test]
