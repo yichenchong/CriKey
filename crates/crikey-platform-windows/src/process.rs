@@ -164,6 +164,14 @@ impl FileOpener for ShellLauncher {
         dispatch("open", file, None, None)
     }
 
+    fn open_url(&self, url: &str) -> Result<()> {
+        crikey_platform::validate_web_url(url)?;
+        let url = OsStr::new(url);
+        carriable("web URL", url)?;
+        // lpFile holds the entire URL; no lpParameters or interpreter.
+        dispatch("open", url, None, None)
+    }
+
     /// Opens the *containing folder* in Explorer.
     ///
     /// Not a true reveal: selecting the item needs `SHOpenFolderAndSelectItems`

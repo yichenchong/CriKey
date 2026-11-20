@@ -8,6 +8,10 @@ from typing import Any, Awaitable, Callable, Coroutine, Iterable, Protocol
 
 __all__ = [
     "Action",
+    "Preview",
+    "PreviewContext",
+    "PreviewImage",
+    "PreviewValue",
     "Item",
     "Plugin",
     "Query",
@@ -71,6 +75,34 @@ class Item:
     argument_policy: str = "forbidden"
     #: "recorded" or "ignored" (spec 10.1).
     hit_policy: str = "recorded"
+    #: Request the optional callback only when this row is selected.
+    preview_deferred: bool = False
+
+@dataclass(frozen=True)
+class PreviewImage:
+    """Host-rendered pixels, not a URL or executable document."""
+
+    width: int
+    height: int
+    rgba: bytes
+
+
+@dataclass(frozen=True)
+class PreviewValue:
+    label: str
+    value: str
+    kind: str = "text"
+
+
+@dataclass(frozen=True)
+class Preview:
+    """Deferred content; links require deliberate host activation."""
+
+    text: str | None = None
+    markdown: bool = False
+    image: PreviewImage | None = None
+    values: tuple[PreviewValue, ...] = ()
+
 
 
 @dataclass(frozen=True)
@@ -103,6 +135,16 @@ class SuggestContext(Protocol):
         """
 
 
+class PreviewContext(Protocol):
+    """Cancellation and diagnostics for selected-only content production."""
+
+    @property
+    def cancelled(self) -> bool:
+        """True when this selection has been retired."""
+
+    def log(self, message: str) -> None: ...
+
+
 class Plugin:
     """Base class for modern Python plugins.
 
@@ -125,6 +167,18 @@ class Plugin:
         self, item: Item, action_id: str | None, argument: str | None
     ) -> None | Awaitable[None]:
         return None
+
+    def preview(
+        self, item: Item, context: PreviewContext
+    ) -> Preview | None | Awaitable[Preview | None]:
+        """Produce content only for the selected item.
+
+        Override this callback to declare ``preview_v1`` support. Poll
+        ``context.cancelled`` during expensive work. Returning None means empty;
+        raising reports a recoverable preview error without hiding suggestions.
+        """
+        raise NotImplementedError("preview_v1 is unavailable")
+
 
     def on_configuration(self, values: dict[str, str]) -> None | Awaitable[None]:
         """Receives the plugin's complete configuration state (spec 21.4).

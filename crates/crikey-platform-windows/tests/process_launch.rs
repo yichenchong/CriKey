@@ -21,7 +21,7 @@
 //! is run as a local file, so both are refused before dispatch on every host.
 
 use crikey_core::{CoreError, PlatformPath};
-use crikey_platform::ProcessLauncher;
+use crikey_platform::{FileOpener, ProcessLauncher};
 use crikey_platform_windows::{quote_arguments, split_arguments, ShellLauncher, WindowsBackend};
 
 /// The argument vector `args` names, as [`ProcessLauncher::launch`] takes it.
@@ -192,6 +192,37 @@ fn a_string_that_names_no_scheme_is_not_opened_as_a_uri() {
             reason.contains("scheme"),
             "{candidate:?} should be refused for naming no scheme, got: {reason}"
         );
+    }
+}
+
+#[test]
+fn web_opening_refuses_non_web_schemes_and_controls_before_dispatch() {
+    let launcher = ShellLauncher::new();
+    for url in [
+        "file:///C:/Windows/notepad.exe",
+        "javascript:alert(1)",
+        "mailto:someone@example.com",
+        "shell:AppsFolder",
+        "C:\\Windows\\notepad.exe",
+        " https://example.com",
+    ] {
+        assert!(refusal(launcher.open_url(url)).contains("http or https scheme"));
+    }
+    for url in ["https://example.com/\0evil", "http://example.com/\nnext"] {
+        assert!(refusal(launcher.open_url(url)).contains("control characters"));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn web_links_reach_dispatch_whole_but_never_pretend_to_open_off_target() {
+    for url in [
+        "http://example.com",
+        "hTtPs://example.com/a?x=$(reboot);'\"&next=two words#fragment",
+    ] {
+        let reason = refusal(ShellLauncher::new().open_url(url));
+        assert!(reason.contains("does not target Windows"));
+        assert!(reason.contains(url));
     }
 }
 

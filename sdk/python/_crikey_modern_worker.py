@@ -32,7 +32,7 @@ import sys
 import threading
 import traceback
 
-from crikey_sdk import Action, Item, Query, WorkerContext
+from crikey_sdk import Action, Item, Query, WorkerContext, Plugin, Preview
 
 
 def _pin_text_stream(stream, name, newline):
@@ -337,6 +337,8 @@ def _item_to_wire(item):
     metadata = {}
     for key, value in dict(getattr(item, "metadata", None) or {}).items():
         metadata[str(key)] = value if isinstance(value, str) else str(value)
+    if getattr(item, "preview_deferred", False):
+        metadata["crikey.preview"] = "deferred"
     return {
         "stable_id": getattr(item, "stable_id", ""),
         "label": getattr(item, "label", ""),
@@ -398,6 +400,7 @@ def _item_from_wire(payload):
         actions=actions,
         argument_policy=payload.get("argument_policy", "forbidden") or "forbidden",
         hit_policy=payload.get("hit_policy", "recorded") or "recorded",
+        preview_deferred=raw_metadata.get("crikey.preview") == "deferred",
     )
 
 
@@ -455,6 +458,11 @@ def _emit(frame):
             "[err][crikey] a reply frame could not be serialised: {}".format(error)
         ]
         line = _encode(trimmed)
+    _emit_line(line)
+
+
+def _emit_line(line):
+    """Writes an already encoded line without serializing it a second time."""
     with _EMIT_LOCK:
         try:
             _PROTOCOL.write(line)
@@ -767,6 +775,8 @@ class _Worker:
             self._build_catalog(frame)
         elif kind == "execute":
             self._execute(frame)
+        elif kind == "preview":
+            self._preview(frame)
         elif kind == _KIND_CONFIGURATION:
             self._configuration(frame)
         else:
@@ -781,14 +791,95 @@ class _Worker:
                 "kind": "handshake_ack",
                 "protocol_version": _PROTOCOL_VERSION,
                 "capabilities": [
-                    "suggest",
-                    "build_catalog",
-                    "execute",
-                    "background-tasks",
-                    "configuration",
-                ],
+                    "suggest", "build_catalog", "execute",
+                    "background-tasks", "configuration",
+                ] + (["preview_v1"] if self._supports_preview() else []),
             }
         )
+
+    def _supports_preview(self):
+        callback = getattr(type(self._plugin), "preview", None)
+        return callable(callback) and callback is not Plugin.preview
+
+    def _preview(self, frame):
+        reply = {
+            "id": frame.get("id"), "kind": "preview_result",
+            "identity": frame.get("identity"), "status": "empty",
+        }
+        _CAPTURE.reset()
+        try:
+            if not self._supports_preview():
+                reply["status"] = "unsupported"
+            else:
+                context = WorkerContext(
+                    self._cancel.is_set, lambda _item: None, _CAPTURE.line,
+                    self._loop, self._register_background,
+                )
+                result = self._plugin.preview(_item_from_wire(frame["item"]), context)
+                if inspect.isawaitable(result):
+                    result = self._loop.run_until_complete(self._drain(context, result))
+                if self._cancel.is_set():
+                    reply["status"] = "cancelled"
+                elif result is not None:
+                    if not isinstance(result, Preview):
+                        raise TypeError("preview must return Preview or None")
+                    total_bytes = 0 if result.text is None else len(result.text.encode("utf-8"))
+                    if total_bytes > 256 * 1024:
+                        raise ValueError("preview aggregate text exceeds 256 KiB")
+                    if type(result.markdown) is not bool:
+                        raise TypeError("preview markdown must be a boolean")
+                    if len(result.values) > 128:
+                        raise ValueError("preview exceeds 128 values")
+                    values = []
+                    for value in result.values:
+                        if value.kind not in ("text", "link", "tag"):
+                            raise ValueError("invalid preview value kind")
+                        label_bytes = len(value.label.encode("utf-8"))
+                        value_bytes = len(value.value.encode("utf-8"))
+                        if max(label_bytes, value_bytes) > 8192:
+                            raise ValueError("preview value exceeds 8 KiB")
+                        total_bytes += label_bytes + value_bytes
+                        if total_bytes > 256 * 1024:
+                            raise ValueError("preview aggregate text exceeds 256 KiB")
+                        if value.kind == "link" and (
+                            not value.value.startswith(("https://", "http://"))
+                            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value.value)
+                        ):
+                            raise ValueError("invalid preview link")
+                        values.append({"label": value.label, "value": value.value, "kind": value.kind})
+                    image = None
+                    if result.image is not None:
+                        img = result.image
+                        if (not isinstance(img.rgba, bytes)
+                            or type(img.width) is not int or type(img.height) is not int
+                            or not 0 < img.width <= 1024 or not 0 < img.height <= 1024
+                            or img.width * img.height * 4 > 1024 * 1024
+                            or len(img.rgba) != img.width * img.height * 4):
+                            raise ValueError("invalid or oversized preview RGBA image")
+                        image = {"width": img.width, "height": img.height, "rgba": list(img.rgba)}
+                    reply.update(status="content", content={
+                        "text": result.text, "markdown": result.markdown,
+                        "image": image, "values": values,
+                    })
+            reply["log"] = _CAPTURE.take()
+            # Metadata nodes are bounded above by the 128-value limit. Markdown
+            # nodes remain the host parser's responsibility; do not parse twice.
+            # Check the actual escaped wire size, including logs, before sending.
+            line = _encode(reply)
+            if len(line) > _MAX_FRAME_BYTES:
+                raise ValueError("preview frame exceeds 8 MiB after JSON escaping")
+        except Exception as error:
+            reply.pop("content", None)
+            detail = str(error)[:1024].encode("utf-8", "replace").decode("utf-8")
+            reply.update(status="failed", detail=detail)
+            reply.setdefault("log", _CAPTURE.take())
+            line = _encode(reply)
+            if len(line) > _MAX_FRAME_BYTES:
+                # Logs, unlike preview content, may already have been clipped.
+                # Explicitly diagnose their omission rather than kill the worker.
+                reply.update(log=[], detail=detail + " (oversized captured log omitted)")
+                line = _encode(reply)
+        _emit_line(line)
 
     def _configuration(self, frame):
         """Hands the latest complete configuration state to the plugin (spec 21.4).

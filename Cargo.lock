@@ -621,6 +621,7 @@ dependencies = [
  "crikey-sandbox",
  "crikey-ui",
  "libc",
+ "serde_json",
  "sha2",
  "ureq",
 ]
@@ -699,6 +700,7 @@ dependencies = [
 name = "crikey-core"
 version = "0.1.19"
 dependencies = [
+ "pulldown-cmark",
  "regex",
  "thiserror 2.0.19",
 ]
@@ -743,6 +745,7 @@ name = "crikey-native-protocol"
 version = "0.1.19"
 dependencies = [
  "crikey-core",
+ "png",
  "thiserror 2.0.19",
  "windows 0.61.3",
 ]
@@ -2443,6 +2446,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
+name = "pulldown-cmark"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
+dependencies = [
+ "bitflags 2.13.1",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3282,6 +3296,12 @@ dependencies = [
  "tempfile",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-casefold"

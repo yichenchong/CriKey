@@ -202,6 +202,7 @@ impl Calculator {
         let text = format_value(calculation.value);
         let item = ItemId::derived(&self.owner, &Category::Expression, &expression);
         let row = ResultRow {
+            plugin: self.owner.clone(),
             item: item.clone(),
             label: text.clone(),
             description: expression,

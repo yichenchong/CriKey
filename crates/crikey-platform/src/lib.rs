@@ -50,15 +50,12 @@ pub enum Capability {
     ProcessLaunch,
     /// Handing a URI to whatever the session registered for its scheme.
     UriOpen,
-    /// Handing a filesystem path to the desktop's default handler for it, and
-    /// showing that path in the desktop's file manager.
+    /// Handing a filesystem path or HTTP(S) URL to its default desktop
+    /// handler, and showing a path in the desktop's file manager.
     ///
-    /// Deliberately not folded into [`Self::UriOpen`]. The two questions have
-    /// different answers on Linux: opening a `https:` URI means resolving a
-    /// scheme handler, which this workspace has no portal client and no rule
-    /// for, while opening a path means `xdg-open`, which every freedesktop
-    /// desktop ships. One arm would have to answer both, and whichever answer
-    /// it gave would be a lie about the other.
+    /// Separate from [`Self::UriOpen`], which permits arbitrary registered URI
+    /// schemes. A backend can support deliberate web links via `xdg-open`
+    /// without offering general scheme dispatch.
     FileOpen,
     WindowEnumeration,
     WindowActivation,
@@ -1066,23 +1063,30 @@ pub trait ProcessLauncher {
     fn open_uri(&self, uri: &str) -> Result<()>;
 }
 
-/// Handing a filesystem path to the desktop (spec 18.2, [`Capability::FileOpen`]).
+/// Handing a path or web URL to the desktop (spec 18.2, [`Capability::FileOpen`]).
 ///
 /// Separate from [`ProcessLauncher`] because the authority is different, not
 /// because the mechanism is: a launcher runs a program *this workspace chose*
-/// with an argument vector it assembled, while an opener hands a path the user
-/// picked to whatever that user's desktop has registered for it. Keeping the
-/// two traits apart keeps that distinction visible at every call site, and
-/// lets a backend offer one without claiming the other.
+/// with an argument vector it assembled, while an opener hands a path or web
+/// URL the user picked to whatever that user's desktop has registered for it.
+/// Keeping the two traits apart makes that distinction visible at every call
+/// site and lets a backend offer one without claiming the other.
 ///
-/// Every implementation takes a [`PlatformPath`], never a `String`, and every
-/// implementation passes it as one argv entry or one Win32 argument. A path is
-/// not text on either platform family (ADR-0007), and a filename containing
-/// `;`, `$(reboot)` or a newline is an ordinary filename that must open --
-/// never a command. No implementation here may reach a shell.
+/// Filesystem paths use [`PlatformPath`], never a `String` (ADR-0007). Each
+/// path or URL travels as one argv entry or one Win32 argument, never a command
+/// string: shell metacharacters remain ordinary data. No implementation here
+/// may reach a command interpreter. URL opening accepts only HTTP(S); callers
+/// remain responsible for authorization before invoking the opener.
 pub trait FileOpener {
     /// Opens `path` with the desktop's default handler for it.
     fn open_path(&self, path: &PlatformPath) -> Result<()>;
+
+    /// Opens a deliberately selected HTTP(S) URL with its default handler.
+    ///
+    /// Implementations must call [`validate_web_url`] before dispatch and pass
+    /// the URL unchanged as one operand, without command-line interpolation.
+    /// Success means dispatch succeeded, not that the browser loaded the page.
+    fn open_url(&self, url: &str) -> Result<()>;
 
     /// Shows `path` in the desktop's file manager.
     ///
@@ -1091,6 +1095,29 @@ pub trait FileOpener {
     /// manager on the directory holding it. How closely a backend can select
     /// the item itself is the backend's business and is documented there.
     fn reveal_path(&self, path: &PlatformPath) -> Result<()>;
+}
+
+/// Checks the scheme boundary for desktop web-link opening.
+///
+/// Only `http` and `https` (ASCII case-insensitive) are allowed. Control
+/// characters are rejected, including NUL, which native APIs cannot carry
+/// without truncation. This is not a URL normalizer or a network policy:
+/// accepted text is dispatched unchanged, and authorization belongs to callers.
+pub fn validate_web_url(url: &str) -> Result<()> {
+    let allowed_scheme = url.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    });
+    if !allowed_scheme {
+        return Err(CoreError::Invalid(
+            "web URL opening requires an http or https scheme".to_owned(),
+        ));
+    }
+    if url.chars().any(char::is_control) {
+        return Err(CoreError::Invalid(
+            "web URL opening refuses control characters, including NUL".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub trait Notifications {

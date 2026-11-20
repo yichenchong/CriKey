@@ -254,6 +254,33 @@ pub fn create_launcher_context() -> egui::Context {
     context
 }
 
+/// Retires the current frame's page, web, and typed-preview texture ownership.
+///
+/// Call on hide, when no next frame will sweep invisible content. Returned IDs
+/// must also be freed by a GPU consumer immediately; egui records their normal
+/// free deltas for consumers that resume by building another frame.
+pub fn release_launcher_textures(context: &egui::Context) -> Vec<egui::TextureId> {
+    let mut retired = Vec::new();
+    if let Some(cache) = context.data(|data| data.get_temp::<Arc<Mutex<PageTextures>>>(page_textures_id())) {
+        retired.extend(lock_recover(&cache).by_content.values().map(TextureHandle::id));
+    }
+    if let Some(cache) =
+        context.data(|data| data.get_temp::<Arc<Mutex<Option<WebTexture>>>>(web_texture_id()))
+    {
+        let cache = lock_recover(&cache);
+        if let Some(texture) = cache.as_ref() {
+            retired.push(texture.handle.id());
+        }
+    }
+    if let Some(id) = preview_render::release_texture(context) {
+        retired.push(id);
+    }
+    release_page_textures(context);
+    release_web_texture(context);
+    clear_web_page_geometry(context);
+    retired
+}
+
 /// Builds one immutable launcher frame by calling [`egui::Context::run`].
 ///
 /// Text editing and pointer actions are returned as existing [`UiCommand`]
@@ -431,6 +458,7 @@ struct Overlay {
     /// a page, so leaving it out would blank the page the moment any plugin
     /// answered a query behind it.
     page: Option<PageSurface>,
+    preview: crate::PreviewPane,
 }
 
 impl Default for Overlay {
@@ -445,6 +473,7 @@ impl Default for Overlay {
             show_hints: true,
             rounded_corners: true,
             page: None,
+            preview: crate::PreviewPane::default(),
         }
     }
 }
@@ -478,22 +507,23 @@ fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
         show_hints: model.show_hints,
         rounded_corners: model.rounded_corners,
         page: model.page.clone(),
+        preview: model.preview.clone(),
     };
     mailbox.overlay_session = Some(session);
 }
 
-/// Results may refresh only an uncovered root with work newer than its last
-/// covered lifetime. Returning to the root requires a fresh query generation.
+/// Only the host can admit a query into the current activation. Direct results
+/// must match that exact nonzero generation on an uncovered root; providers
+/// cannot establish a query by arriving before its host frame.
 fn admits_results(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> bool {
-    mailbox.overlay_session != Some(session)
-        || (!mailbox.overlay.settings_open
-            && mailbox.overlay.page.is_none()
-            && mailbox
-                .host_generation
-                .is_none_or(|floor| model.generation >= floor)
-            && mailbox
-                .retired_generation
-                .is_none_or(|floor| model.generation > floor))
+    mailbox.overlay_session == Some(session)
+        && model.generation != crikey_core::Generation::ZERO
+        && mailbox.host_generation == Some(model.generation)
+        && !mailbox.overlay.settings_open
+        && mailbox.overlay.page.is_none()
+        && mailbox
+            .retired_generation
+            .is_none_or(|floor| model.generation > floor)
 }
 
 /// Puts this session's retained host overlay back onto a provider's frame.
@@ -511,7 +541,33 @@ fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> View
         show_hints: mailbox.overlay.show_hints,
         rounded_corners: mailbox.overlay.rounded_corners,
         page: mailbox.overlay.page.clone(),
+        // A provider frame lacks the exact logical selection/request admission
+        // identity. Only the host-reconciled frame may carry typed preview.
+        preview: crate::PreviewPane {
+            ratio: mailbox.overlay.preview.ratio,
+            ..Default::default()
+        },
         ..model.clone()
+    }
+}
+
+impl FrameMailbox {
+    /// Reconciles admission and storage atomically under the mailbox lock.
+    fn publish(&mut self, session: u64, model: &ViewModel, source: FrameSource) -> bool {
+        let model = match source {
+            FrameSource::Host => {
+                record_overlay(self, session, model);
+                model.clone()
+            }
+            FrameSource::Provider => {
+                if !admits_results(self, session, model) {
+                    return false;
+                }
+                with_overlay(self, session, model)
+            }
+        };
+        self.latest = Some(PendingFrame { session, model });
+        true
     }
 }
 
@@ -595,6 +651,15 @@ impl SharedState {
         if mailbox.wake_session == Some(session) {
             mailbox.wake_session = None;
         }
+        // Admission tags prevent replay, but do not release the content owned
+        // by an overlay. Retire only this session: a delayed hide must not
+        // discard a newer activation's host-owned surface or query floor.
+        if mailbox.overlay_session == Some(session) {
+            mailbox.overlay = Overlay::default();
+            mailbox.overlay_session = None;
+            mailbox.host_generation = None;
+            mailbox.retired_generation = None;
+        }
     }
 
     /// Retires the pending wake for `session` without touching the frame it
@@ -647,6 +712,10 @@ impl SharedState {
         let mut mailbox = lock_recover(&self.frames);
         mailbox.latest = None;
         mailbox.wake_session = None;
+        mailbox.overlay = Overlay::default();
+        mailbox.overlay_session = None;
+        mailbox.host_generation = None;
+        mailbox.retired_generation = None;
     }
 }
 
@@ -833,19 +902,9 @@ impl NativeLauncherHandle {
             if self.shared.snapshot() != state {
                 return Ok(());
             }
-            let model = match source {
-                FrameSource::Host => {
-                    record_overlay(&mut mailbox, session, model);
-                    model.clone()
-                }
-                FrameSource::Provider => {
-                    if !admits_results(&mailbox, session, model) {
-                        return Ok(());
-                    }
-                    with_overlay(&mailbox, session, model)
-                }
-            };
-            mailbox.latest = Some(PendingFrame { session, model });
+            if !mailbox.publish(session, model, source) {
+                return Ok(());
+            }
             if mailbox.wake_session == Some(session) {
                 false
             } else {
@@ -1116,7 +1175,7 @@ where
     }
 
     fn hide(&mut self) {
-        if let Some(graphics) = &self.graphics {
+        if let Some(graphics) = &mut self.graphics {
             graphics.hide();
         }
         self.frame = None;
@@ -1802,7 +1861,7 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     // both get the whole window: the page's own extent is the plugin's to
     // choose, so there is nothing to compute it from, and a page laid out into
     // the compact window would have almost no room to draw in.
-    if model.settings_open || model.page.is_some() {
+    if model.settings_open || model.page.is_some() || model.preview.status.is_some() {
         return expanded_height;
     }
     if !shows_results(model) {
@@ -2220,9 +2279,12 @@ impl GraphicsState {
         self.window.request_redraw();
     }
 
-    fn hide(&self) {
+    fn hide(&mut self) {
         self.window.set_ime_allowed(false);
         self.window.set_visible(false);
+        for id in release_launcher_textures(&self.egui_context) {
+            self.renderer.free_texture(&id);
+        }
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -2732,6 +2794,19 @@ fn translate_keyboard(
         return matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
             .then_some(UiCommand::Cancel);
     }
+    if model.is_some_and(|model| model.preview.status.is_some()) {
+        if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::F6)) {
+            return Some(if model.is_some_and(|model| model.preview.focused) {
+                UiCommand::LeavePreview
+            } else {
+                UiCommand::FocusPreview
+            });
+        }
+        if model.is_some_and(|model| model.preview.focused) {
+            return matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
+                .then_some(UiCommand::LeavePreview);
+        }
+    }
     match event.logical_key.as_ref() {
         Key::Named(NamedKey::ArrowDown) => Some(UiCommand::SelectNext),
         Key::Named(NamedKey::ArrowUp) => Some(UiCommand::SelectPrevious),
@@ -2782,6 +2857,10 @@ fn draw_launcher(
     native_web_input: bool,
 ) {
     let colors = theme::palette();
+    if model.page.is_some() || model.settings_open || !shows_results(model) {
+        preview_render::release_texture(context);
+    }
+    preview_render::keyboard(context, model, commands);
     // Ctrl+, is what every desktop means by "open preferences". It is consumed
     // from the egui frame rather than translated out of the raw key event so
     // that the headless frame builder answers to the shortcut exactly as the
@@ -2844,7 +2923,7 @@ fn draw_launcher(
                 // when they did, a search that matched nothing put the footer
                 // on the window's bottom edge.
                 ui.add_space(theme::SPACE_3);
-                draw_results(ui, model, commands, colors);
+                preview_render::draw_results_and_preview(ui, model, commands, colors);
                 if model.actions_open {
                     ui.add_space(theme::SPACE_3);
                     draw_actions(ui, model, commands, colors);
@@ -2890,11 +2969,11 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
             // and an editor that keeps it goes on swallowing every `Text`
             // event, so the user would type into a query they cannot see
             // instead of into the field the page is showing them.
-            if model.page.is_some() {
+            if model.page.is_some() || model.preview.focused {
                 if response.has_focus() {
                     response.surrender_focus();
                 }
-            } else if !model.settings_open {
+            } else if !model.settings_open && !model.preview.focused {
                 response.request_focus();
             }
             if response.changed() {
@@ -2939,7 +3018,13 @@ fn scroll_anchor_id() -> egui::Id {
     egui::Id::new("crikey-result-scroll-anchor")
 }
 
-fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
+fn draw_results(
+    ui: &mut egui::Ui,
+    model: &ViewModel,
+    commands: &mut Vec<UiCommand>,
+    colors: theme::Palette,
+    body_height: Option<f32>,
+) {
     // Nothing below the field until there is something to put there. The card
     // that used to stand here said "Searching" or "No matches" inside a
     // full-width box, so the moment a key was pressed the launcher grew into a
@@ -2983,7 +3068,7 @@ fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
         0.0
     };
     let reserved = overlay + BLOCK_GAP + STATUS_BLOCK_HEIGHT;
-    let list_height = (ui.available_height() - reserved).max(theme::SPACE_8 * 3.0);
+    let list_height = body_height.unwrap_or_else(|| (ui.available_height() - reserved).max(0.0));
     egui::ScrollArea::vertical()
         // Vertically the list is exactly as tall as its rows, up to the cap:
         // filling the cap regardless would put empty space between the last
@@ -3029,6 +3114,9 @@ fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
             }
         });
 }
+
+#[path = "preview_render.rs"]
+mod preview_render;
 
 /// Draws one result row and hands back the response covering it, which is what
 /// [`draw_results`] needs to decide whether the list should follow the
@@ -3101,7 +3189,7 @@ fn draw_result_row(
                         }
                     });
                 });
-                if selected {
+                if selected && ui.max_rect().width() > 520.0 {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if !row.alternate_actions.is_empty() && ui.button("Actions  Alt+Enter").clicked() {
                             commands.push(UiCommand::ShowActions);
@@ -5170,6 +5258,7 @@ mod transparency_tests {
             page: None,
             show_hints: true,
             rounded_corners: true,
+            preview: Default::default(),
         };
         let input = RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -5240,6 +5329,158 @@ mod transparency_tests {
 mod lifecycle_tests {
     use super::*;
 
+    fn image_frame() -> (
+        ViewModel,
+        std::sync::Weak<crate::PreparedPreview>,
+        std::sync::Weak<crikey_core::PreviewContent>,
+    ) {
+        let content = Arc::new(crikey_core::PreviewContent {
+            text: Some(crikey_core::PreviewText::Plain("Current session image".into())),
+            image: Some(crikey_core::PreviewImage {
+                width: 2,
+                height: 1,
+                rgba: vec![17, 81, 203, 255, 17, 81, 203, 255],
+            }),
+            ..Default::default()
+        });
+        let pixels = Arc::downgrade(&content);
+        let prepared = Arc::new(crate::prepare_preview(content).unwrap());
+        let weak = Arc::downgrade(&prepared);
+        let mut host = crate::LauncherViewModel::new();
+        host.activate();
+        host.apply(UiCommand::SetQuery("image".into()));
+        host.begin_generation(crikey_core::Generation::from_raw(4));
+        host.publish(
+            crikey_core::Generation::from_raw(4),
+            vec![ResultRow {
+                plugin: crikey_core::PluginId("lifecycle-image-fixture".into()),
+                item: crikey_core::ItemId("image".into()),
+                label: "Image".into(),
+                description: String::new(),
+                icon_reference: None,
+                icon: None,
+                category: String::new(),
+                plugin_name: String::new(),
+                highlights: Vec::new(),
+                argument_hint: None,
+                status: None,
+                default_action: None,
+                alternate_actions: Vec::new(),
+            }],
+            false,
+        );
+        let selection = host.preview_selection().unwrap();
+        host.publish_preview(&selection, crate::PreviewStatus::Content(prepared));
+        (host.frame().unwrap(), weak, pixels)
+    }
+
+    fn assert_current_image_draws(view: &ViewModel) {
+        let frame = build_launcher_frame(
+            &create_launcher_context(),
+            RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(720.0, 520.0),
+                )),
+                ..Default::default()
+            },
+            view,
+        );
+        let image = frame
+            .output
+            .textures_delta
+            .set
+            .iter()
+            .find(|(_, delta)| delta.image.size() == [2, 1])
+            .expect("the surviving session must still upload its image");
+        let egui::ImageData::Color(pixels) = &image.1.image else {
+            panic!("preview pixels must be a color texture");
+        };
+        assert!(pixels
+            .pixels
+            .iter()
+            .all(|pixel| *pixel == egui::Color32::from_rgb(17, 81, 203)));
+    }
+
+    #[test]
+    fn hiding_releases_queued_and_consumed_preview_content_including_overlay_ownership() {
+        for shutdown in [false, true] {
+            for queued in [false, true] {
+                let state = SharedState::default();
+                let session = state.claim_activation().unwrap();
+                let (view, prepared, pixels) = image_frame();
+                assert_current_image_draws(&view);
+                {
+                    let mut mailbox = lock_recover(&state.frames);
+                    record_overlay(&mut mailbox, session, &view);
+                    if queued {
+                        mailbox.latest = Some(PendingFrame { session, model: view });
+                    } else {
+                        drop(view);
+                    }
+                }
+                // The host frame has moved into the mailbox, or was consumed
+                // and dropped; only native retained owners now remain.
+                assert!(prepared.upgrade().is_some());
+                assert!(state.claim_hide(session));
+                if shutdown {
+                    state.clear_all_frames();
+                } else {
+                    state.clear_frames(session);
+                }
+                assert!(
+                    prepared.upgrade().is_none(),
+                    "hide must release prepared presentation content"
+                );
+                assert!(
+                    pixels.upgrade().is_none(),
+                    "hide must release the producer's CPU image bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stale_hide_preserves_the_new_sessions_image_and_overlay() {
+        let state = SharedState::default();
+        let first = state.claim_activation().unwrap();
+        assert!(state.claim_hide(first));
+        let current = state.claim_activation().unwrap();
+        let (view, prepared, pixels) = image_frame();
+        {
+            let mut mailbox = lock_recover(&state.frames);
+            record_overlay(&mut mailbox, current, &view);
+            mailbox.latest = Some(PendingFrame {
+                session: current,
+                model: view,
+            });
+        }
+        state.clear_frames(first);
+        {
+            let mailbox = lock_recover(&state.frames);
+            assert_current_image_draws(
+                &mailbox
+                    .latest
+                    .as_ref()
+                    .expect("new frame survives stale hide")
+                    .model,
+            );
+            let Some(crate::PreviewStatus::Content(content)) = &mailbox.overlay.preview.status else {
+                panic!("new session's overlay image must survive stale hide");
+            };
+            assert!(std::ptr::eq(Arc::as_ptr(content), prepared.as_ptr()));
+            assert_eq!(mailbox.overlay_session, Some(current));
+            assert_eq!(
+                mailbox.host_generation,
+                Some(crikey_core::Generation::from_raw(4))
+            );
+        }
+        assert!(pixels.upgrade().is_some());
+        state.clear_frames(current);
+        assert!(prepared.upgrade().is_none());
+        assert!(pixels.upgrade().is_none());
+    }
+
     #[test]
     fn a_hide_from_an_old_session_cannot_claim_a_new_activation() {
         let state = SharedState::default();
@@ -5289,6 +5530,7 @@ mod lifecycle_tests {
                     page: None,
                     show_hints: true,
                     rounded_corners: true,
+                    preview: Default::default(),
                 },
             });
             mailbox.wake_session = Some(7);
@@ -5399,6 +5641,7 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
                 page: None,
                 show_hints: true,
                 rounded_corners: true,
+                preview: Default::default(),
             },
         });
         mailbox.wake_session = Some(1);
@@ -5464,6 +5707,7 @@ mod label_tests {
     #[test]
     fn an_empty_result_label_gets_a_visible_fallback() {
         let row = ResultRow {
+            plugin: crikey_core::PluginId("label-fixture".into()),
             item: crikey_core::ItemId("untitled".to_owned()),
             label: String::new(),
             description: String::new(),
@@ -5484,6 +5728,7 @@ mod label_tests {
     #[test]
     fn a_highlight_range_inside_a_utf8_character_is_ignored_safely() {
         let row = ResultRow {
+            plugin: crikey_core::PluginId("label-fixture".into()),
             item: crikey_core::ItemId("cafe".to_owned()),
             label: "café".to_owned(),
             description: String::new(),
@@ -5752,6 +5997,7 @@ mod window_geometry_tests {
             page: None,
             show_hints: true,
             rounded_corners: true,
+            preview: Default::default(),
         }
     }
 
@@ -5760,6 +6006,7 @@ mod window_geometry_tests {
     fn view_with_rows(count: usize) -> ViewModel {
         let rows: Vec<ResultRow> = (0..count)
             .map(|index| ResultRow {
+                plugin: crikey_core::PluginId("geometry-fixture".into()),
                 item: crikey_core::ItemId(format!("item-{index}")),
                 label: format!("Result {index}"),
                 description: "A description that occupies the second line".to_owned(),
@@ -5921,6 +6168,95 @@ mod window_geometry_tests {
 
         record_overlay(&mut mailbox, 8, &root);
         assert!(admits_results(&mailbox, 8, &root), "retirement is session-local");
+    }
+
+    #[test]
+    fn reopened_empty_launcher_rejects_late_results_until_the_host_admits_the_exact_query() {
+        fn has_text(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => text.galley.text().contains(needle),
+                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| has_text(shape, needle)),
+                _ => false,
+            }
+        }
+        fn paints(view: &ViewModel, needle: &str) -> bool {
+            let frame = build_launcher_frame(
+                &create_launcher_context(),
+                RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(720.0, 520.0),
+                    )),
+                    ..Default::default()
+                },
+                view,
+            );
+            frame
+                .output
+                .shapes
+                .iter()
+                .any(|shape| has_text(&shape.shape, needle))
+        }
+        let state = SharedState::default();
+        let first = state.claim_activation().unwrap();
+        let tracker = crikey_core::GenerationTracker::new();
+        let mut old = view_with_rows(1);
+        old.query = "old query".into();
+        old.generation = tracker.advance();
+        Arc::make_mut(&mut old.rows)[0].label = "Old provider row".into();
+        {
+            let mut mailbox = lock_recover(&state.frames);
+            assert!(
+                !mailbox.publish(first, &old, FrameSource::Provider),
+                "a provider cannot establish a query before the first host frame"
+            );
+            assert!(mailbox.latest.is_none());
+            assert!(mailbox.publish(first, &old, FrameSource::Host));
+        }
+        assert!(state.claim_hide(first));
+        state.clear_frames(first);
+        let current = state.claim_activation().unwrap();
+        let empty = view("", false);
+        let mut fresh = old.clone();
+        fresh.query = "fresh query".into();
+        fresh.generation = tracker.advance();
+        Arc::make_mut(&mut fresh.rows)[0].label = "Fresh provider row".into();
+        let mut future = fresh.clone();
+        future.generation = tracker.advance();
+        Arc::make_mut(&mut future.rows)[0].label = "Unadmitted future row".into();
+        {
+            let mut mailbox = lock_recover(&state.frames);
+            assert!(
+                !mailbox.publish(current, &old, FrameSource::Provider),
+                "reactivation cannot borrow the previous activation's admission"
+            );
+            assert!(mailbox.publish(current, &empty, FrameSource::Host));
+            assert!(!mailbox.publish(current, &old, FrameSource::Provider));
+            assert!(
+                !mailbox.publish(current, &fresh, FrameSource::Provider),
+                "even a newer answer must wait for its own host query frame"
+            );
+            assert!(
+                !mailbox.publish(current, &empty, FrameSource::Provider),
+                "a ZERO host frame admits no active provider query"
+            );
+            let displayed = &mailbox.latest.as_ref().unwrap().model;
+            assert!(displayed.query.is_empty());
+            assert!(displayed.rows.is_empty());
+            assert!(!paints(displayed, "old query"));
+            assert!(!paints(displayed, "Old provider row"));
+            assert!(!paints(displayed, "Fresh provider row"));
+            let mut host_query = fresh.clone();
+            host_query.rows = Arc::default();
+            assert!(mailbox.publish(current, &host_query, FrameSource::Host));
+            assert!(mailbox.publish(current, &fresh, FrameSource::Provider));
+            assert!(!mailbox.publish(current, &future, FrameSource::Provider));
+            let displayed = &mailbox.latest.as_ref().unwrap().model;
+            assert!(paints(displayed, "fresh query"));
+            assert!(paints(displayed, "Fresh provider row"));
+            assert!(!paints(displayed, "Old provider row"));
+            assert!(!paints(displayed, "Unadmitted future row"));
+        }
     }
 
     #[test]
@@ -7473,5 +7809,51 @@ mod web_scroll_lifecycle_tests {
             pointer.scroll_position(rect, TouchPhase::Cancelled).is_none(),
             "a replacement cannot inherit the old gesture"
         );
+    }
+}
+
+#[cfg(test)]
+mod preview_admission_tests {
+    use super::*;
+
+    #[test]
+    fn direct_provider_publication_cannot_reuse_host_preview_admission() {
+        let mut state = crate::LauncherViewModel::new();
+        state.activate();
+        state.apply(UiCommand::SetQuery("preview".into()));
+        state.begin_generation(crikey_core::Generation::from_raw(1));
+        state.publish(
+            crikey_core::Generation::from_raw(1),
+            vec![ResultRow {
+                plugin: crikey_core::PluginId("preview-admission-fixture".into()),
+                item: crikey_core::ItemId("A".into()),
+                label: "A".into(),
+                description: String::new(),
+                icon_reference: None,
+                icon: None,
+                category: String::new(),
+                plugin_name: String::new(),
+                highlights: Vec::new(),
+                argument_hint: None,
+                status: None,
+                default_action: None,
+                alternate_actions: Vec::new(),
+            }],
+            false,
+        );
+        let selection = state.preview_selection().unwrap();
+        state.publish_preview(&selection, crate::PreviewStatus::Loading);
+        let host = state.frame().unwrap();
+        let mut mailbox = FrameMailbox::default();
+        record_overlay(&mut mailbox, 1, &host);
+        let mut provider = host.clone();
+        provider.preview = Default::default();
+        // Even equal row IDs and generations do not grant a provider frame the
+        // logical view/selection/request admission held only by the host.
+        let admitted = with_overlay(&mailbox, 1, &provider);
+        assert!(admitted.preview.status.is_none());
+        assert!(Arc::ptr_eq(&admitted.rows, &provider.rows));
+        provider.generation = crikey_core::Generation::from_raw(2);
+        assert!(with_overlay(&mailbox, 1, &provider).preview.status.is_none());
     }
 }

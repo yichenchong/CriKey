@@ -107,6 +107,14 @@ impl Plugin for StartupProbe {
         self.plugin.page(request, context)
     }
 
+    fn supports_preview(&self) -> bool {
+        self.plugin.supports_preview()
+    }
+
+    fn preview(&mut self, item_id: &str, context: &dyn PluginContext) -> Result<crikey_core::PreviewOutcome> {
+        self.plugin.preview(item_id, context)
+    }
+
     fn stop(&mut self, context: &dyn PluginContext) -> Result<()> {
         self.plugin.stop(context)
     }
@@ -227,6 +235,7 @@ impl TestHarness {
                     "streaming_catalog".to_owned(),
                     "streaming_suggestions".to_owned(),
                     "cancellation".to_owned(),
+                    crikey_core::PREVIEW_CAPABILITY.to_owned(),
                 ],
                 host_version: "sdk-test-harness".to_owned(),
                 accepted: true,
@@ -451,6 +460,42 @@ impl TestHarness {
                     )))
                 }
                 None => return Err(SdkError::Protocol("empty execute response".to_owned())),
+            }
+        }
+    }
+
+    /// Exercises the real serving callback and validates its typed response.
+    pub fn preview(
+        &mut self,
+        item_id: &str,
+        generation: u64,
+    ) -> Result<crikey_core::PreviewOutcome, SdkError> {
+        let request_id = self
+            .next_request
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| SdkError::Protocol("preview request identity exhausted".into()))?;
+        self.send(Envelope {
+            connection_id: 1,
+            request_id,
+            generation,
+            deadline_ms: 0,
+            payload: Some(Payload::PreviewRequest(message::PreviewRequest {
+                item_id: item_id.to_owned(),
+                ..Default::default()
+            })),
+            unknown: Default::default(),
+        })?;
+        loop {
+            let envelope = self.recv()?;
+            self.check_identity(&envelope, request_id, generation)?;
+            match envelope.payload {
+                Some(Payload::Log(_)) => {}
+                Some(Payload::PreviewResponse(response)) => {
+                    return crikey_native_protocol::preview::from_response(response)
+                        .map_err(SdkError::Protocol)
+                }
+                Some(Payload::Error(error)) => return Err(SdkError::Protocol(error.message)),
+                _ => return Err(SdkError::Protocol("unexpected preview response".into())),
             }
         }
     }

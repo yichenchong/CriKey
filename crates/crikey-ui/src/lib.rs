@@ -15,7 +15,9 @@ use crikey_core::{Action, ActionId, Generation, ItemId, PageFrame, PageInput, Pl
 use crikey_platform::IconImage;
 
 mod native;
+mod preview_content;
 mod session_end;
+pub use preview_content::{prepare_preview, PreparedPreview, PreviewBlock, PreviewBlockKind, PreviewSpan};
 /// The one Windows message the launcher's window procedure must rewrite before
 /// `DefWindowProc` can turn a keystroke into an alert sound.
 ///
@@ -39,8 +41,9 @@ pub mod window_shape;
 pub use egui;
 pub use native::{
     build_launcher_frame, create_launcher_context, initial_page_viewport, page_palette,
-    ActivationLatencySnapshot, ActivationLatencyTracker, NativeLauncher, NativeLauncherConfig,
-    NativeLauncherEvent, NativeLauncherHandle, NativeUiFrame, RendererError, ACTIVATION_SAMPLE_CAPACITY,
+    release_launcher_textures, ActivationLatencySnapshot, ActivationLatencyTracker, NativeLauncher,
+    NativeLauncherConfig, NativeLauncherEvent, NativeLauncherHandle, NativeUiFrame, RendererError,
+    ACTIVATION_SAMPLE_CAPACITY,
 };
 /// Re-exported so a caller can name [`NativeLauncherConfig::present_mode`]
 /// without taking its own `wgpu` dependency and risking a version skew with
@@ -50,6 +53,8 @@ pub use wgpu;
 /// One row in the result list (spec 6.4).
 #[derive(Debug, Clone)]
 pub struct ResultRow {
+    /// Exact producing owner; display names never establish identity.
+    pub plugin: PluginId,
     pub item: ItemId,
     pub label: String,
     pub description: String,
@@ -353,6 +358,7 @@ pub struct ViewModel {
     /// keyboard, so the model closes one when the other opens and the renderer
     /// never has to decide which of two full-height surfaces wins.
     pub page: Option<PageSurface>,
+    pub preview: PreviewPane,
 }
 
 /// Keyboard-only interaction surface (spec 6.3).
@@ -360,6 +366,14 @@ pub struct ViewModel {
 /// Not [`Eq`]: a page input carries pointer coordinates, which are floats.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiCommand {
+    FocusPreview,
+    LeavePreview,
+    ShowPreviewDetail,
+    SetPreviewRatio(f32),
+    OpenPreviewLink {
+        target: PreviewLinkTarget,
+        url: String,
+    },
     SetQuery(String),
     SelectNext,
     SelectPrevious,
@@ -434,13 +448,23 @@ pub enum UiEffect {
     Query(String),
     /// Run `action` on `item` (spec 6.2.10). The launcher stays open —
     /// dismissing after an execution is the host's decision, not the UI's.
-    Execute { item: ItemId, action: ActionId },
+    Execute {
+        item: ItemId,
+        action: ActionId,
+    },
+    OpenPreviewLink {
+        target: PreviewLinkTarget,
+        url: String,
+    },
     /// The launcher closed itself and is warm again for the next hotkey.
     Dismissed,
     /// Persist `value` under `key` (spec 6.3). Opening and closing the
     /// settings surface is the UI's own business, but the value behind a row
     /// belongs to the host's configuration store.
-    SetSetting { key: String, value: String },
+    SetSetting {
+        key: String,
+        value: String,
+    },
     /// Deliver `PageInput` to the plugin that owns the open page (spec 32.9).
     /// The model holds no transport, so the round trip is the host's.
     PageInput(PageInput),
@@ -457,7 +481,10 @@ pub enum UiEffect {
     ClosePage,
     /// Tell the owning plugin how large its surface actually is, so the next
     /// frame it draws is laid out for the space it has.
-    ResizePage { width: u32, height: u32 },
+    ResizePage {
+        width: u32,
+        height: u32,
+    },
     /// The user asked the launcher to exit for good, not to hide until the
     /// next hotkey press.
     Quit,
@@ -474,6 +501,60 @@ pub enum ViewKind {
 /// Process-local identity of a logical surface lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ViewId(u64);
+
+impl ViewId {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Host content only: never a custom page or another embedded engine.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreviewStatus {
+    Loading,
+    Content(Arc<PreparedPreview>),
+    Empty,
+    Unavailable(String),
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreviewPane {
+    pub status: Option<PreviewStatus>,
+    pub focused: bool,
+    pub detail: bool,
+    pub ratio: f32,
+    pub link_target: Option<PreviewLinkTarget>,
+}
+
+impl Default for PreviewPane {
+    fn default() -> Self {
+        Self {
+            status: None,
+            focused: false,
+            detail: false,
+            ratio: 0.55,
+            link_target: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewSelection {
+    pub view: ViewId,
+    pub generation: Generation,
+    pub plugin: PluginId,
+    pub item: ItemId,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewLinkTarget {
+    pub selection: PreviewSelection,
+    pub plugin: PluginId,
+    pub incarnation: u64,
+    pub request: u64,
+}
 
 /// The renderer-free launcher state machine (spec 6.1 - 6.5; ADR-0002).
 ///
@@ -561,6 +642,9 @@ pub struct LauncherViewModel {
     /// Generation `rows` were published for. A publish whose generation differs
     /// from this one is the first of its generation and starts at the top.
     published: Option<Generation>,
+    preview: PreviewPane,
+    preview_selection: Option<PreviewSelection>,
+    selection_revision: u64,
 }
 
 impl Default for LauncherViewModel {
@@ -597,6 +681,9 @@ impl LauncherViewModel {
             floor: None,
             active: None,
             published: None,
+            preview: PreviewPane::default(),
+            preview_selection: None,
+            selection_revision: 0,
         }
     }
 
@@ -761,6 +848,7 @@ impl LauncherViewModel {
     /// the list is drawn once per batch and never once per plugin item
     /// (spec 25.5).
     pub fn frame(&mut self) -> Option<ViewModel> {
+        self.preview_selection();
         if !self.visible || !self.dirty {
             return None;
         }
@@ -786,6 +874,7 @@ impl LauncherViewModel {
             page: self.page.clone(),
             show_hints: self.show_hints,
             rounded_corners: self.rounded_corners,
+            preview: self.preview.clone(),
         })
     }
 
@@ -806,6 +895,37 @@ impl LauncherViewModel {
         }
 
         match command {
+            UiCommand::OpenPreviewLink { target, url } => {
+                if self.preview_selection().as_ref() == Some(&target.selection)
+                    && self.preview.link_target.as_ref() == Some(&target)
+                {
+                    Some(UiEffect::OpenPreviewLink { target, url })
+                } else {
+                    None
+                }
+            }
+            UiCommand::FocusPreview | UiCommand::ShowPreviewDetail => {
+                if self.preview.status.is_some() {
+                    self.preview.focused = true;
+                    self.preview.detail = matches!(command, UiCommand::ShowPreviewDetail);
+                    self.actions_open = false;
+                    self.dirty = true;
+                }
+                None
+            }
+            UiCommand::LeavePreview => {
+                self.preview.focused = false;
+                self.preview.detail = false;
+                self.dirty = true;
+                None
+            }
+            UiCommand::SetPreviewRatio(ratio) => {
+                self.set_preview_ratio(ratio);
+                Some(UiEffect::SetSetting {
+                    key: "launcher.preview-split".into(),
+                    value: self.preview.ratio.to_string(),
+                })
+            }
             UiCommand::SetQuery(text) => self.retype(text),
             UiCommand::SelectNext => {
                 self.select(self.selected.saturating_add(1));
@@ -880,6 +1000,12 @@ impl LauncherViewModel {
             // A page rung ends the plugin's session as well as the surface,
             // which is why this one carries an effect where the other UI-state
             // rungs do not.
+            UiCommand::Cancel if self.preview.focused || self.preview.detail => {
+                self.preview.focused = false;
+                self.preview.detail = false;
+                self.dirty = true;
+                None
+            }
             UiCommand::Cancel if self.page.is_some() => {
                 self.close_page();
                 Some(UiEffect::ClosePage)
@@ -914,6 +1040,8 @@ impl LauncherViewModel {
             return None;
         }
         self.restore_selection = false;
+        self.publication_view = None;
+        self.preview_selection();
 
         // Reuse the buffer rather than swapping it in: a keystroke on the hot
         // path must not allocate, and `text` is already owned by the effect.
@@ -941,6 +1069,8 @@ impl LauncherViewModel {
 
         self.query.clear();
         self.query.push_str(&row.label);
+        self.publication_view = None;
+        self.preview_selection();
         self.dirty = true;
         Some(UiEffect::Query(self.query.clone()))
     }
@@ -1026,6 +1156,93 @@ impl LauncherViewModel {
         // the new value anyway.
         self.dirty |= self.visible;
         true
+    }
+
+    pub fn set_preview_ratio(&mut self, ratio: f32) {
+        if ratio.is_finite() {
+            let ratio = ratio.clamp(0.3, 0.7);
+            self.dirty |= self.visible && self.preview.ratio != ratio;
+            self.preview.ratio = ratio;
+        }
+    }
+
+    /// Reconciles selection once after a host event, coalescing publications.
+    /// Retire presentation before the caller signals cancellation.
+    pub fn preview_selection(&mut self) -> Option<PreviewSelection> {
+        let current = if self.view().is_some_and(|(_, kind)| kind == ViewKind::RootList)
+            && self.active == self.published
+            && self.publication_view == Some(self.view_id)
+            && !self.query.is_empty()
+        {
+            self.rows
+                .get(self.selected)
+                .map(|row| (self.view_id, self.active.unwrap(), &row.plugin, &row.item))
+        } else {
+            None
+        };
+        let unchanged = match (&self.preview_selection, &current) {
+            (Some(old), Some((view, generation, plugin, item))) => {
+                old.view == *view
+                    && old.generation == *generation
+                    && &old.plugin == *plugin
+                    && &old.item == *item
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            let Some(revision) = self.selection_revision.checked_add(1) else {
+                self.preview_selection = None;
+                self.preview.link_target = None;
+                self.preview.focused = false;
+                self.preview.detail = false;
+                if !matches!(&self.preview.status, Some(PreviewStatus::Unavailable(reason)) if reason == "Preview selection identity exhausted")
+                {
+                    self.preview.status = Some(PreviewStatus::Unavailable(
+                        "Preview selection identity exhausted".into(),
+                    ));
+                    self.dirty |= self.visible;
+                }
+                return None;
+            };
+            self.selection_revision = revision;
+            self.preview_selection = current.map(|(view, generation, plugin, item)| PreviewSelection {
+                view,
+                generation,
+                plugin: plugin.clone(),
+                item: item.clone(),
+                revision: self.selection_revision,
+            });
+            self.preview.status = None;
+            self.preview.link_target = None;
+            self.preview.focused = false;
+            self.preview.detail = false;
+            self.dirty |= self.visible;
+        }
+        self.preview_selection.clone()
+    }
+
+    pub fn publish_preview(&mut self, selection: &PreviewSelection, status: PreviewStatus) -> bool {
+        if self.preview_selection().as_ref() != Some(selection) {
+            return false;
+        }
+        self.preview.status = Some(status);
+        self.preview.link_target = None;
+        self.dirty = true;
+        true
+    }
+
+    pub fn set_preview_link_target(&mut self, target: PreviewLinkTarget) {
+        if target.plugin == target.selection.plugin
+            && self.preview_selection().as_ref() == Some(&target.selection)
+        {
+            self.preview.link_target = Some(target);
+            self.dirty = true;
+        }
+    }
+
+    pub fn selected_preview_row(&self) -> Option<&ResultRow> {
+        self.rows.get(self.selected)
     }
 
     /// The settings the surface would list right now.
@@ -1335,6 +1552,7 @@ impl LauncherViewModel {
         }
 
         self.selected = target;
+        self.preview_selection();
         // The only path a person's arrow or page key reaches, so this is where
         // a default becomes a choice.
         self.navigated = true;
@@ -1368,13 +1586,13 @@ impl LauncherViewModel {
             return 0;
         }
 
-        let Some(anchor) = self.rows.get(self.selected).map(|row| &row.item) else {
+        let Some(anchor) = self.rows.get(self.selected) else {
             return 0;
         };
 
         incoming
             .iter()
-            .position(|row| row.item == *anchor)
+            .position(|row| row.plugin == anchor.plugin && row.item == anchor.item)
             .unwrap_or(self.selected.min(last))
     }
 }

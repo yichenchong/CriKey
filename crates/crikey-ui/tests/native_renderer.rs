@@ -32,11 +32,13 @@ fn model(query: &str) -> ViewModel {
         page: None,
         show_hints: true,
         rounded_corners: true,
+        preview: Default::default(),
     }
 }
 
 fn result_row(index: usize) -> ResultRow {
     ResultRow {
+        plugin: PluginId("renderer-fixture".into()),
         item: ItemId(format!("item-{index}")),
         label: format!("row-{index}"),
         description: String::new(),
@@ -3183,4 +3185,447 @@ fn admission_uses_pointer_motion_from_pending_frames_for_the_first_stationary_wh
             }
         }
     }
+}
+
+#[test]
+fn preview_split_and_narrow_detail_keep_results_and_footer_in_bounds() {
+    use crikey_ui::PreviewStatus;
+    for width in [480.0, 720.0, 1000.0] {
+        for height in [260.0, 520.0] {
+            for scale in [1.0, 1.5, 2.0] {
+                for status in [
+                    PreviewStatus::Loading,
+                    PreviewStatus::Empty,
+                    PreviewStatus::Unavailable("Worker unavailable".into()),
+                    PreviewStatus::Error("Worker failed".into()),
+                ] {
+                    let context = create_launcher_context();
+                    context.set_pixels_per_point(scale);
+                    let mut view = scrollable_model(20, 0);
+                    view.preview.status = Some(status);
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, height),
+                        )),
+                        focused: true,
+                        ..Default::default()
+                    };
+                    let _ = build_launcher_frame(&context, input.clone(), &view);
+                    let frame = build_launcher_frame(&context, input, &view);
+                    assert!(painted(&frame, "row-0"));
+                    assert!(position_of(&frame, "20 results").y < height - 10.0);
+                    if width < 624.0 {
+                        assert!(painted(&frame, "Show detail"));
+                        assert!(!painted(&frame, "Loading preview"));
+                    } else {
+                        assert!(painted(&frame, "Detail"));
+                        assert!(position_of(&frame, "Detail").x > position_of(&frame, "row-0").x);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn preview_focus_is_explicit_and_back_returns_typing_to_search() {
+    let context = create_launcher_context();
+    let mut view = scrollable_model(2, 0);
+    view.preview.status = Some(crikey_ui::PreviewStatus::Loading);
+    let key = |key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let focus = build_launcher_frame(&context, launcher_input(vec![key(egui::Key::F6)]), &view);
+    assert!(focus.commands.contains(&UiCommand::FocusPreview));
+    view.preview.focused = true;
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let preview_typing = build_launcher_frame(
+        &context,
+        launcher_input(vec![egui::Event::Text("x".into())]),
+        &view,
+    );
+    assert!(!preview_typing
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetQuery(_))));
+    let leave = build_launcher_frame(&context, launcher_input(vec![key(egui::Key::Escape)]), &view);
+    assert!(leave.commands.contains(&UiCommand::LeavePreview));
+    view.preview.focused = false;
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let typing = build_launcher_frame(
+        &context,
+        launcher_input(vec![egui::Event::Text("x".into())]),
+        &view,
+    );
+    assert!(typing
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetQuery(_))));
+}
+
+#[test]
+fn formatted_preview_link_click_reports_host_intent_without_browser_output() {
+    use crikey_ui::{prepare_preview, LauncherViewModel, PreviewLinkTarget, PreviewStatus};
+    let mut state = LauncherViewModel::new();
+    state.activate();
+    state.apply(UiCommand::SetQuery("preview".into()));
+    state.begin_generation(Generation::from_raw(1));
+    state.publish(Generation::from_raw(1), vec![result_row(0)], false);
+    let selection = state.preview_selection().unwrap();
+    let target = PreviewLinkTarget {
+        selection: selection.clone(),
+        plugin: selection.plugin.clone(),
+        incarnation: 7,
+        request: 9,
+    };
+    let prepared = Arc::new(
+        prepare_preview(Arc::new(crikey_core::PreviewContent {
+            text: Some(crikey_core::PreviewText::Markdown(
+                "# Heading\n\n**Strong** and [Deliberate link](https://example.org/)".into(),
+            )),
+            ..Default::default()
+        }))
+        .unwrap(),
+    );
+    assert!(!prepared.blocks.is_empty());
+    state.publish_preview(&selection, PreviewStatus::Content(prepared));
+    state.set_preview_link_target(target.clone());
+    let view = state.frame().unwrap();
+    let context = create_launcher_context();
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(painted(&frame, "Heading"));
+    assert!(painted(&frame, "Strong"));
+    let clicked = build_launcher_frame(
+        &context,
+        launcher_input(click_at(
+            position_of(&frame, "Deliberate link") + egui::vec2(5.0, 5.0),
+        )),
+        &view,
+    );
+    assert!(clicked.output.platform_output.open_url.is_none());
+    assert!(clicked.commands.contains(&UiCommand::OpenPreviewLink {
+        target,
+        url: "https://example.org/".into()
+    }));
+}
+
+#[test]
+fn list_and_long_preview_scroll_independently_without_moving_footer() {
+    let mut view = scrollable_model(20, 0);
+    view.preview.status = Some(crikey_ui::PreviewStatus::Content(Arc::new(
+        crikey_ui::prepare_preview(Arc::new(crikey_core::PreviewContent {
+            text: Some(crikey_core::PreviewText::Plain(format!(
+                "PREVIEW_LONG_BEGIN\n{}",
+                "Long bounded detail line\n".repeat(150)
+            ))),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )));
+    let mut frames = Frames::new();
+    let initial = frames.settle(&view);
+    let list_before = position_of(&initial, "row-0");
+    let list_probe_before = position_of(&initial, "row-2");
+    let preview_before = position_of(&initial, "PREVIEW_LONG_BEGIN");
+    let footer = position_of(&initial, "20 results");
+    let _ = frames.draw(
+        &view,
+        vec![
+            egui::Event::PointerMoved(egui::pos2(620.0, 300.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -200.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    let detail_scrolled = frames.settle(&view);
+    assert_eq!(position_of(&detail_scrolled, "row-0"), list_before);
+    let preview_scrolled = position_of(&detail_scrolled, "PREVIEW_LONG_BEGIN");
+    assert!(preview_scrolled.y < preview_before.y);
+    // Keep the position probe in view: wheel_over_list deliberately scrolls
+    // 400 points and culls row-0 (as the dedicated list-wheel test asserts).
+    // A one-row gesture still proves motion without querying off-screen text.
+    let _ = frames.draw(
+        &view,
+        vec![
+            egui::Event::PointerMoved(list_probe_before + egui::vec2(5.0, 5.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -40.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    let list_scrolled = frames.settle(&view);
+    assert!(position_of(&list_scrolled, "row-2").y < list_probe_before.y);
+    assert_eq!(
+        position_of(&list_scrolled, "PREVIEW_LONG_BEGIN"),
+        preview_scrolled
+    );
+    assert_eq!(position_of(&list_scrolled, "20 results"), footer);
+}
+
+#[test]
+fn narrow_detail_offers_back_instead_of_compressing_the_result_list() {
+    let context = create_launcher_context();
+    let mut view = scrollable_model(20, 0);
+    view.preview.status = Some(crikey_ui::PreviewStatus::Loading);
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(480.0, 520.0),
+        )),
+        focused: true,
+        ..Default::default()
+    };
+    let _ = build_launcher_frame(&context, input(), &view);
+    let list = build_launcher_frame(&context, input(), &view);
+    assert!(painted(&list, "Show detail"));
+    assert!(painted(&list, "row-0"));
+    view.preview.detail = true;
+    view.preview.focused = true;
+    let _ = build_launcher_frame(&context, input(), &view);
+    let detail = build_launcher_frame(&context, input(), &view);
+    assert!(painted(&detail, "Back to results"));
+    assert!(painted(&detail, "Loading preview"));
+    assert!(!painted(&detail, "row-0"));
+    assert!(position_of(&detail, "20 results").y < 510.0);
+    let mut back_input = input();
+    back_input.events = click_at(position_of(&detail, "Back to results") + egui::vec2(5.0, 5.0));
+    let back = build_launcher_frame(&context, back_input, &view);
+    assert!(back.commands.contains(&UiCommand::LeavePreview));
+    assert!(!back
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetQuery(_))));
+}
+
+#[test]
+fn preview_divider_drag_reports_one_bounded_remembered_ratio() {
+    let mut view = scrollable_model(20, 0);
+    view.preview.status = Some(crikey_ui::PreviewStatus::Loading);
+    let mut frames = Frames::new();
+    let initial = frames.settle(&view);
+    let detail = position_of(&initial, "Detail");
+    let divider = egui::pos2(detail.x - 5.0, detail.y + 40.0);
+    let pressed = frames.draw(
+        &view,
+        vec![
+            egui::Event::PointerMoved(divider),
+            egui::Event::PointerButton {
+                pos: divider,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(!pressed
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetPreviewRatio(_))));
+    let moved = egui::pos2(divider.x + 80.0, divider.y);
+    let dragging = frames.draw(&view, vec![egui::Event::PointerMoved(moved)]);
+    assert!(!dragging
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetPreviewRatio(_))));
+    let released = frames.draw(
+        &view,
+        vec![egui::Event::PointerButton {
+            pos: moved,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    let ratios: Vec<f32> = released
+        .commands
+        .iter()
+        .filter_map(|command| {
+            if let UiCommand::SetPreviewRatio(ratio) = command {
+                Some(*ratio)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(ratios.len(), 1);
+    assert!((0.3..=0.7).contains(&ratios[0]));
+    assert!(ratios[0] > view.preview.ratio);
+}
+
+fn image_preview(view: &mut ViewModel, color: [u8; 4]) -> std::sync::Weak<crikey_core::PreviewContent> {
+    let content = Arc::new(crikey_core::PreviewContent {
+        image: Some(crikey_core::PreviewImage {
+            width: RASTER[0] as u32,
+            height: RASTER[1] as u32,
+            rgba: color.repeat(RASTER[0] * RASTER[1]),
+        }),
+        ..Default::default()
+    });
+    let weak = Arc::downgrade(&content);
+    view.preview.status = Some(crikey_ui::PreviewStatus::Content(Arc::new(
+        crikey_ui::prepare_preview(content).unwrap(),
+    )));
+    weak
+}
+
+fn preview_frame(context: &egui::Context, view: &ViewModel, width: f32) -> crikey_ui::NativeUiFrame {
+    build_launcher_frame(
+        context,
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 520.0),
+            )),
+            focused: true,
+            ..Default::default()
+        },
+        view,
+    )
+}
+
+#[test]
+fn invisible_preview_retires_its_pixels_and_the_exact_texture_it_painted() {
+    for transition in [
+        "loading",
+        "text",
+        "none",
+        "empty",
+        "error",
+        "unavailable",
+        "settings",
+        "page",
+        "narrow-results",
+        "no-results",
+        "empty-query",
+        "hide",
+    ] {
+        let context = create_launcher_context();
+        let mut view = scrollable_model(2, 0);
+        let pixels = image_preview(&mut view, [31, 170, 89, 255]);
+        let opened = preview_frame(&context, &view, 720.0);
+        let id = raster_texture(&opened);
+        let mut sampled = Vec::new();
+        for shape in &opened.output.shapes {
+            textured_rects(&shape.shape, &mut sampled);
+        }
+        assert!(
+            sampled.iter().any(|(texture, _)| *texture == id),
+            "{transition}: image must actually be painted"
+        );
+        let mut width = 720.0;
+        match transition {
+            "loading" => {
+                view.selected = 1;
+                view.preview.status = Some(crikey_ui::PreviewStatus::Loading);
+            }
+            "text" => {
+                view.preview.status = Some(crikey_ui::PreviewStatus::Content(Arc::new(
+                    crikey_ui::prepare_preview(Arc::new(crikey_core::PreviewContent {
+                        text: Some(crikey_core::PreviewText::Plain("Replacement detail".into())),
+                        ..Default::default()
+                    }))
+                    .unwrap(),
+                )))
+            }
+            "none" => view.preview.status = None,
+            "empty" => view.preview.status = Some(crikey_ui::PreviewStatus::Empty),
+            "error" => view.preview.status = Some(crikey_ui::PreviewStatus::Error("failed".into())),
+            "unavailable" => {
+                view.preview.status = Some(crikey_ui::PreviewStatus::Unavailable("unsupported".into()))
+            }
+            "settings" => view.settings_open = true,
+            "page" => view.page = page_view(vec![probe_node()]).page,
+            "narrow-results" => width = 480.0,
+            "no-results" => view.rows = Arc::default(),
+            "empty-query" => view.query.clear(),
+            "hide" => {
+                let retired = crikey_ui::release_launcher_textures(&context);
+                assert!(
+                    retired.contains(&id),
+                    "hide must immediately tell the GPU consumer to free the painted texture"
+                );
+            }
+            _ => unreachable!(),
+        }
+        let hidden = model("");
+        let retired = preview_frame(
+            &context,
+            if transition == "hide" { &hidden } else { &view },
+            width,
+        );
+        assert!(
+            retired.output.textures_delta.free.contains(&id),
+            "{transition}: exact painted texture must be freed"
+        );
+        let mut sampled = Vec::new();
+        for shape in &retired.output.shapes {
+            textured_rects(&shape.shape, &mut sampled);
+        }
+        assert!(
+            !sampled.iter().any(|(texture, _)| *texture == id),
+            "{transition}: retired image cannot remain painted"
+        );
+        if transition == "text" {
+            assert!(painted(&retired, "Replacement detail"));
+        }
+        // Covered models may legitimately own their content, but the renderer
+        // must not keep the producer's pixels alive after that model is gone.
+        drop(view);
+        assert!(
+            pixels.upgrade().is_none(),
+            "{transition}: renderer retained retired CPU image"
+        );
+    }
+}
+
+#[test]
+fn split_and_narrow_detail_share_one_current_image_and_retire_it_on_replacement() {
+    let context = create_launcher_context();
+    let mut view = scrollable_model(2, 0);
+    view.preview.detail = true;
+    let previous = image_preview(&mut view, [41, 150, 99, 255]);
+    let opened = preview_frame(&context, &view, 720.0);
+    let old_id = raster_texture(&opened);
+    for width in [480.0, 720.0, 480.0, 1000.0] {
+        let frame = preview_frame(&context, &view, width);
+        let mut sampled = Vec::new();
+        for shape in &frame.output.shapes {
+            textured_rects(&shape.shape, &mut sampled);
+        }
+        assert!(
+            sampled.iter().any(|(id, _)| *id == old_id),
+            "visible detail must reuse the same texture across layouts"
+        );
+        assert!(!frame
+            .output
+            .textures_delta
+            .set
+            .iter()
+            .any(|(_, delta)| delta.image.size() == RASTER));
+        assert!(!frame.output.textures_delta.free.contains(&old_id));
+    }
+    let current = image_preview(&mut view, [210, 42, 61, 255]);
+    assert!(
+        previous.upgrade().is_none(),
+        "no layout cache may retain old producer pixels"
+    );
+    let replacement = preview_frame(&context, &view, 720.0);
+    let new_id = raster_texture(&replacement);
+    assert_ne!(new_id, old_id);
+    assert!(replacement.output.textures_delta.free.contains(&old_id));
+    view.preview.status = None;
+    let closed = preview_frame(&context, &view, 480.0);
+    assert!(closed.output.textures_delta.free.contains(&new_id));
+    assert!(current.upgrade().is_none());
 }
