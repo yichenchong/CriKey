@@ -354,37 +354,12 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         eprintln!("crikey: catalog cache error during startup load: {error}");
     }
 
-    // The global activation hotkey, and with it the launcher's reachability
-    // after a dismiss. Registration fails when another application already owns
-    // the accelerator, which is a conflict on the user's desktop and not a
-    // fault in this launch: it is reported and the launch continues, because
-    // refusing to start would let any program that grabbed Ctrl+Alt+Space first
-    // take the launcher away entirely.
-    //
-    // The refusal no longer shortens the process's life. It used to: the
-    // dismiss and execute arms exited instead of hiding, on the theory that a
-    // hidden launcher nothing can raise is worse than none. What that produced
-    // in practice was a launcher that vanished on the first Escape with no
-    // explanation. The reason is carried to the view model below instead, which
-    // opens the settings panel on the hotkey row so the user can pick a chord
-    // that is free.
-    let mut activation_hotkey = settings::ActivationHotkey::default();
-    let hotkey_accelerator =
-        settings::configured_hotkey(configuration.as_ref().map(|configuration| &configuration.store));
-    let hotkey_refusal = {
-        let mut registrar = settings::PlatformHotkeys {
-            search: &mut search,
-            handle: render_handle.clone(),
-        };
-        match activation_hotkey.bind(&mut registrar, &hotkey_accelerator) {
-            Ok(None) => None,
-            Ok(Some(warning)) => {
-                eprintln!("crikey: {warning}");
-                None
-            }
-            Err(reason) => Some(reason),
-        }
-    };
+    let hotkey_wake = render_handle.clone();
+    let mut hotkeys = search.command_hotkeys(move || {
+        let _ = hotkey_wake.request_action_completion();
+    });
+    let mut hotkey_inputs = None;
+    let mut hotkey_authoritative = true;
 
     search
         .complete_stage(StartupStage::WindowAndHotkey)
@@ -812,23 +787,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         directories.clone(),
         overrides.to_vec(),
         move || {
-            let _ = preference_wake.request_provider_answer();
+            let _ = preference_wake.request_action_completion();
         },
     )?;
     let history_wake = render_handle.clone();
     let history_writer = command_history::HistoryWorker::spawn(selection_history.clone(), move || {
         let _ = history_wake.request_action_completion();
     })?;
-    if let Some(reason) = hotkey_refusal {
-        let diagnostic = settings::surface_hotkey_failure(&mut view_model, &hotkey_accelerator, &reason);
-        eprintln!("{diagnostic}");
-        // Also durable: `crikey-launcher` is GUI-subsystem on Windows, so that
-        // stderr line went nowhere, and this is precisely the failure nobody
-        // can diagnose from the outside afterwards.
-        if let Err(error) = append_startup_log(&diagnostic) {
-            eprintln!("crikey: the startup log could not be written: {error}");
-        }
-    }
     // The built-in calculator, holding this session's clipboard if it has one.
     // Taken here, before the event loop, and then owned by the closure for the
     // rest of the process: on X11 a copied value is served by the client that
@@ -873,6 +838,10 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     let mut command_management_revision = None;
     let mut command_failure_notice = None;
     let mut configuration_retry = Instant::now();
+    let mut hotkey_intent = 0u64;
+    let mut hotkey_presentations = std::collections::BTreeMap::new();
+    let mut prepared_activation = false;
+    let mut hotkey_report = crikey_app::ReconcileReport::default();
     retained.max_results = Some(pipeline_bounds.limits.max_items_per_query);
     // Per-plugin refusal totals already reported, so a growing counter is
     // announced once per increase rather than on every turn of the loop.
@@ -880,8 +849,24 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         std::collections::BTreeMap::new();
     let outcome = launcher
         .run(ready_on_first_event(Rc::clone(&ledger), move |event| {
+            if matches!(&event, NativeLauncherEvent::Command { .. })
+                || matches!(&event, NativeLauncherEvent::Activated) && !prepared_activation
+            {
+                hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
+            }
+            let hotkey_receipts = hotkeys.drain_events();
+            if !hotkey_receipts.is_empty() {
+                hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
+            }
             let mut page_failure_status = None;
             while let Some(completion) = preference_worker.take() {
+                hotkey_authoritative = matches!(
+                    completion.state,
+                    command_preferences::CompletionState::Authoritative
+                );
+                if let Some(outcome) = completion.command_edit {
+                    view_model.command_edit_completed(outcome);
+                }
                 if let Some(outcome) = completion.setting_edit {
                     view_model.setting_edit_completed(outcome);
                 }
@@ -970,37 +955,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 if let Some(state) = configuration.poll(Instant::now(), &preference_worker) {
                     publish_configuration(&modern_driver, &native_driver, state);
                 }
-                // A hand edit to `config.toml` changes the accelerator exactly
-                // as the settings panel does, so the binding follows the file
-                // too. Gated on an actual reload rather than run every turn:
-                // rebuilding the rows on each event would allocate three
-                // strings per keystroke and mark a visible frame dirty for a
-                // panel nothing changed. `is_current` then keeps a chord the
-                // platform has already refused from being re-attempted on every
-                // subsequent reload.
                 if configuration.take_reloaded() {
-                    let configured = settings::configured_hotkey(Some(&configuration.store));
-                    if !activation_hotkey.is_current(&configured) {
-                        let mut registrar = settings::PlatformHotkeys {
-                            search: &mut search,
-                            handle: render_handle.clone(),
-                        };
-                        match activation_hotkey.bind(&mut registrar, &configured) {
-                            Ok(None) => {}
-                            Ok(Some(warning)) => {
-                                eprintln!("crikey: {warning}");
-                                view_model.set_navigation_notice(warning);
-                            }
-                            Err(reason) => {
-                                let message = format!(
-                                    "Activation hotkey {configured} could not be registered ({reason}); actual binding: {}",
-                                    activation_hotkey.bound().unwrap_or("none")
-                                );
-                                eprintln!("crikey: {message}");
-                                view_model.set_navigation_notice(message);
-                            }
-                        }
-                    }
+                    command_projection_dirty |= retained.configure(&configuration.store);
                     view_model.set_settings(settings::rows(Some(&configuration.store)));
                     view_model.set_show_hints(settings::configured_show_hints(Some(&configuration.store)));
                     view_model.set_rounded_corners(settings::configured_rounded_corners(Some(
@@ -1061,6 +1017,21 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     render_handle.is_visible_session(session)
                         && view_model.view().is_some_and(|(current, _)| current == view)
                 });
+                let deliberate = hotkey_presentations
+                    .remove(&completion.request_id)
+                    .is_some_and(|intent| intent == hotkey_intent);
+                let mut may_present = may_present;
+                if deliberate && matches!(&completion.outcome, Ok(ActionEffect::ShowPage { .. })) {
+                    if render_handle.is_visible() {
+                        may_present = true;
+                    } else {
+                        activate_launcher_session(&mut search, &mut view_model, &mut web_page);
+                        if render_handle.request_activation().is_ok() {
+                            prepared_activation = true;
+                            may_present = true;
+                        }
+                    }
+                }
                 if !may_present {
                     // Draining still releases endpoint admission/budgets. A
                     // completion from a hidden or replaced view cannot open a
@@ -1324,6 +1295,148 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 eprintln!("crikey: modern command intake refused: {error:?}");
             }
             command_projection_dirty |= registry_before != search.command_snapshot().revision;
+            let registry = search.command_snapshot();
+            let preferences = search.command_preferences_snapshot();
+            let activation = settings::configured_hotkey(configuration.as_ref().map(|config| &config.store));
+            let inputs = (registry.revision, preferences.revision, activation.clone());
+            if hotkey_authoritative && hotkey_inputs.as_ref() != Some(&inputs) {
+                hotkeys.reconcile(Arc::clone(&registry), Arc::clone(&preferences), Some(activation));
+                hotkey_inputs = Some(inputs);
+            }
+            if let Some(report) = hotkeys.take_report() {
+                for (owner, status) in &report.bindings {
+                    if let Some(problem) = &status.problem {
+                        let message = format!(
+                            "Shortcut {owner:?}: desired {:?}, active {:?}: {problem:?}",
+                            status.requested, status.active
+                        );
+                        eprintln!("crikey: {message}");
+                        view_model.set_navigation_notice(message);
+                        if *owner == crikey_app::BindingOwner::Launcher && status.active.is_none() {
+                            let diagnostic = settings::surface_hotkey_failure(
+                                &mut view_model,
+                                status.requested.as_deref().unwrap_or("none"),
+                                &format!("{problem:?}"),
+                            );
+                            if let Err(error) = append_startup_log(&diagnostic) {
+                                eprintln!("crikey: startup log failed: {error}");
+                            }
+                        }
+                    }
+                }
+                for failure in &report.cleanup_failures {
+                    view_model.set_navigation_notice(format!(
+                        "Shortcut cleanup {}: {}",
+                        failure.accelerator, failure.error
+                    ));
+                }
+                let mut rows = settings::rows(configuration.as_ref().map(|config| &config.store));
+                if let Some(row) = rows
+                    .iter_mut()
+                    .find(|row| row.key == crikey_config::KEY_ACTIVATION_HOTKEY)
+                {
+                    row.label = format!(
+                        "Activation hotkey · active: {}",
+                        report
+                            .bindings
+                            .get(&crikey_app::BindingOwner::Launcher)
+                            .and_then(|status| status.active.as_deref())
+                            .unwrap_or("none")
+                    );
+                }
+                view_model.set_settings(rows);
+                hotkey_report = report;
+                command_management_revision = None;
+            }
+            let mut shortcut_root_query = None;
+            for receipt in hotkey_receipts {
+                let Some(dispatch) = hotkeys.resolve_event(&receipt, &registry, &preferences) else {
+                    continue;
+                };
+                if view_model.shortcut_capture().is_some() && render_handle.is_visible() {
+                    view_model.apply(crikey_ui::UiCommand::RecordShortcut(receipt.accelerator().into()));
+                    continue;
+                }
+                hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
+                retained.explicit_input = None;
+                shortcut_root_query = None;
+                match dispatch {
+                    crikey_app::HotkeyDispatch::Launcher => {
+                        let _ = render_handle.request_toggle();
+                    }
+                    crikey_app::HotkeyDispatch::OpenInput { reference } => {
+                        let hidden = !render_handle.is_visible();
+                        activate_launcher_session(&mut search, &mut view_model, &mut web_page);
+                        if hidden && render_handle.request_activation().is_ok() {
+                            prepared_activation = true;
+                        }
+                        if let Some(row) = search
+                            .command_management_rows()
+                            .into_iter()
+                            .find(|row| row.target == crikey_ui::ActionTarget::Command(reference.clone()))
+                        {
+                            let query = row.label.clone();
+                            view_model.apply(crikey_ui::UiCommand::SetQuery(query.clone()));
+                            retained.explicit_input = Some(row);
+                            // Use the ordinary query effect so search, catalog
+                            // pipeline, retained rows and model share one admission.
+                            shortcut_root_query = Some(query);
+                        }
+                    }
+                    crikey_app::HotkeyDispatch::Execute { reference } => {
+                        match search.invoke_command(&reference, None, registry.revision) {
+                            Ok(crikey_app::CommandSubmission::Host(
+                                crikey_core::HostCommand::OpenSettings,
+                            )) => {
+                                if !render_handle.is_visible() {
+                                    activate_launcher_session(&mut search, &mut view_model, &mut web_page);
+                                    if render_handle.request_activation().is_ok() {
+                                        prepared_activation = true;
+                                    }
+                                }
+                                web_page.close("shortcut opened settings");
+                                search.close_page();
+                                view_model.open_settings(None);
+                                if let Err(message) = publish_learning(
+                                    command_history::Learning::Host(reference, history_clock.advance()),
+                                    &mut search,
+                                    &history_writer,
+                                    ranking_reset_pending,
+                                    &mut deferred_learning,
+                                ) {
+                                    view_model.set_navigation_notice(message);
+                                }
+                            }
+                            Ok(crikey_app::CommandSubmission::Action {
+                                receipt,
+                                mut learning,
+                            }) => {
+                                // A process shortcut has no root-query affinity or argument text.
+                                learning.query = None;
+                                previews.retire_for_foreground(&mut view_model, &reference.provider_id);
+                                if let ActionSubmission::Pending(id) = receipt.submission {
+                                    pending_command_learning.insert(id.clone(), learning);
+                                    hotkey_presentations.insert(id, hotkey_intent);
+                                } else if let Err(message) = publish_learning(
+                                    command_history::Learning::Command(learning, history_clock.advance()),
+                                    &mut search,
+                                    &history_writer,
+                                    ranking_reset_pending,
+                                    &mut deferred_learning,
+                                ) {
+                                    view_model.set_navigation_notice(message);
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("crikey: shortcut command refused: {error}");
+                                if render_handle.is_visible() {
+                                    view_model.set_navigation_notice(error.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // A plugin at its declared `[concurrency]` limit is throttled, not
             // broken, and the two are indistinguishable from the outside
             // (spec 13.5, 24.3). Reporting the per-kind counters as they grow
@@ -1342,7 +1455,12 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     // A rapid off/on hotkey pair may supersede the queued
                     // dismissal. Reset the old session before opening the new
                     // one so its query and rows cannot cross the boundary.
-                    activate_launcher_session(&mut search, &mut view_model, &mut web_page);
+                    if prepared_activation {
+                        prepared_activation = false;
+                    } else {
+                        retained.explicit_input = None;
+                        activate_launcher_session(&mut search, &mut view_model, &mut web_page);
+                    }
                     // A new session searches from cold. Within one burst of
                     // typing the filesystem is effectively still, but between
                     // two sessions the user has had time to create the file
@@ -1354,7 +1472,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     root_submission = matches!(&command, crikey_ui::UiCommand::ExecuteDefault)
                         && (view_model.submitted_root_query().is_some()
                             || view_model.submitted_command_query().is_some());
-                    let effect = view_model.apply(command);
+                    let effect =
+                        apply_native_command(&mut view_model, &mut retained, &mut hotkey_intent, command);
                     (Some(session), effect)
                 }
                 // The wake that brought this turn about. Everything it asks
@@ -1372,7 +1491,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             // Leaving a covered root retires its old publications. Re-enter it
             // through ordinary query dispatch, after the page lifecycle effect
             // has run, and never duplicate a query already requested this turn.
-            let mut effect = effect;
+            let open_shortcut_input = shortcut_root_query.is_some();
+            let mut effect = effect.or_else(|| shortcut_root_query.map(UiEffect::Query));
             let mut registry_query_refresh =
                 command_projection_revision != search.command_snapshot().revision;
             loop {
@@ -1403,21 +1523,19 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         // at startup would freeze it for the life of the process.
                         search.set_history_time(history_clock.advance());
                         search.refresh_foreground_category();
-                        if let Ok(generation) = search.submit_query(&raw) {
+                        let now = u64::try_from(query_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        if let Ok((generation, catalog_result)) = admit_root_query(
+                            &mut search,
+                            &mut query_pipeline,
+                            &owner,
+                            &mut view_model,
+                            &mut retained,
+                            &raw,
+                            now,
+                        ) {
                             active_root_query = raw.clone();
                             command_projection_dirty = true;
-                            view_model.begin_generation(generation);
-                            let now = u64::try_from(query_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
                             retained.set_calculated(generation, calculator.rows(generation, &raw));
-                            let catalog_result = prepare_catalog_rows(
-                                &search,
-                                &mut query_pipeline,
-                                &owner,
-                                &raw,
-                                generation,
-                                now,
-                                &mut retained,
-                            );
                             ordinary_catalog_state = if search.last_query_stats().matches_found == 0 {
                                 crikey_app::OrdinaryProviderState::Empty
                             } else {
@@ -1471,6 +1589,12 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     }
                     Some(UiEffect::Quit) => {
                         web_page.close("launcher is quitting");
+                        for failure in hotkeys.shutdown() {
+                            eprintln!(
+                                "crikey: shortcut cleanup {}: {}",
+                                failure.accelerator, failure.error
+                            );
+                        }
                     }
                     Some(UiEffect::Execute { .. }) | Some(UiEffect::InvokeCommand { .. })
                         if ranking_reset_pending =>
@@ -1572,32 +1696,37 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         }
                     }
                     Some(UiEffect::MutateCommandPreferences {
+                        request_id,
                         reference,
                         expected_revision,
                         edit,
                     }) => {
                         let snapshot = search.command_preferences_snapshot();
-                        let result = if snapshot.revision != expected_revision {
-                            Err("Command preferences changed; refresh and retry this edit".to_owned())
-                        } else {
-                            configuration
+                        let failed = crikey_ui::CommandPreferenceEditOutcome {
+                            request_id,
+                            reference: reference.clone(),
+                            edit: edit.clone(),
+                            status: crikey_ui::SettingEditStatus::Failed,
+                        };
+                        let result =
+                            if snapshot.revision != expected_revision {
+                                Err("Command preferences changed; refresh and retry this edit".to_owned())
+                            } else {
+                                configuration
                                 .as_ref()
                                 .ok_or_else(|| {
                                     "Configuration authority unavailable; command preferences were not saved"
                                         .to_owned()
                                 })
                                 .and_then(|configuration| {
-                                    preference_worker.submit(command_preferences::Request::Mutate {
-                                        config: configuration.store.clone(),
-                                        registry: search.command_snapshot(),
-                                        expected_revision,
-                                        reference,
-                                        edit,
-                                        session: false,
-                                    })
+                                    preference_worker.submit_mutation(
+                                        request_id, configuration.store.clone(), search.command_snapshot(),
+                                        expected_revision, reference, edit, false,
+                                    ).map_err(|(_, message)| message)
                                 })
-                        };
+                            };
                         if let Err(message) = result {
+                            view_model.command_edit_completed(failed);
                             view_model.set_navigation_notice(message);
                         }
                     }
@@ -1849,6 +1978,14 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     None => break,
                 };
             }
+            if open_shortcut_input
+                && retained.explicit_input.is_some()
+                && view_model
+                    .view()
+                    .is_some_and(|(_, kind)| kind == crikey_ui::ViewKind::RootList)
+            {
+                view_model.apply(crikey_ui::UiCommand::ShowActions);
+            }
             // Returning from a failed page republishes root rows synchronously.
             // Attach its diagnostic only afterwards, so that publication cannot
             // erase the message before the next graphical frame.
@@ -1883,7 +2020,29 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 search.command_preferences_snapshot().revision,
             );
             if command_management_revision != Some(management_revision) {
-                view_model.set_command_management_rows(search.command_management_rows());
+                let mut rows = search.command_management_rows();
+                for row in &mut rows {
+                    if let crikey_ui::ActionTarget::Command(reference) = &row.target {
+                        let status = hotkey_report
+                            .bindings
+                            .get(&crikey_app::BindingOwner::Command(reference.clone()));
+                        row.status = Some(format!(
+                            "Desired: {} · Active: {} · Source: {}{}",
+                            row.command_state
+                                .as_ref()
+                                .and_then(|state| state.hotkey.as_deref())
+                                .unwrap_or("none"),
+                            status
+                                .and_then(|status| status.active.as_deref())
+                                .unwrap_or("none"),
+                            preferences.layer.map_or("default", |layer| layer.as_str()),
+                            status
+                                .and_then(|status| status.problem.as_ref())
+                                .map_or(String::new(), |problem| format!(" · {problem:?}"))
+                        ));
+                    }
+                }
+                view_model.set_command_management_rows(rows);
                 command_management_revision = Some(management_revision);
             }
             if let (Some((view, crikey_ui::ViewKind::RootList)), Some(generation)) =
@@ -2457,8 +2616,12 @@ fn configured_aliases(store: &ConfigStore) -> AliasTable {
 /// own default stands when the key is absent, which is why this crate does not
 /// carry a second copy of that number.
 fn pipeline_config(configuration: Option<&LauncherConfiguration>) -> PipelineConfig {
+    pipeline_config_store(configuration.map(|configuration| &configuration.store))
+}
+
+fn pipeline_config_store(store: Option<&ConfigStore>) -> PipelineConfig {
     let mut config = PipelineConfig::default();
-    let Some(text) = configuration.and_then(|configuration| configuration.store.get(KEY_MAX_RESULTS)) else {
+    let Some(text) = store.and_then(|store| store.get(KEY_MAX_RESULTS)) else {
         return config;
     };
     match text.parse::<usize>() {
@@ -2988,6 +3151,9 @@ struct RetainedRows {
     /// does — cannot drop it.
     calculated: Vec<crikey_ui::ResultRow>,
     commands: Vec<crikey_ui::ResultRow>,
+    alias_query: String,
+    /// Deliberate Required-input target, not discovery or stored dispatch authority.
+    explicit_input: Option<crikey_ui::ResultRow>,
     max_results: Option<usize>,
     /// The ranked answer: catalog items, and the file items merged into them.
     builtin: Vec<crikey_ui::ResultRow>,
@@ -3002,6 +3168,14 @@ struct RetainedRows {
 }
 
 impl RetainedRows {
+    /// Final presentation follows the complete effective configuration, including
+    /// command rows which do not pass through a provider's startup pipeline.
+    fn configure(&mut self, store: &ConfigStore) -> bool {
+        let limit = Some(pipeline_config_store(Some(store)).limits.max_items_per_query);
+        let changed = self.max_results != limit;
+        self.max_results = limit;
+        changed
+    }
     /// Prepares the retained set for `generation`, returning whether it is
     /// current-or-newer (and therefore worth folding). A NEWER generation drops
     /// every stale group first; the SAME generation keeps the groups; an OLDER
@@ -3016,6 +3190,7 @@ impl RetainedRows {
                 *self = RetainedRows {
                     generation: Some(generation),
                     max_results: self.max_results,
+                    explicit_input: self.explicit_input.take(),
                     ..RetainedRows::default()
                 };
                 true
@@ -3098,12 +3273,34 @@ impl RetainedRows {
     /// catalog-only rows follow, then suggestions in provider publication order.
     /// An exact-owner/id suggestion supersedes its catalog copy and payload.
     fn merged(&self) -> Vec<crikey_ui::ResultRow> {
+        if let Some(row) = &self.explicit_input {
+            return vec![row.clone()];
+        }
         let mut rows = Vec::with_capacity(
             self.calculated.len()
                 + self.builtin.len()
                 + self.legacy.len()
                 + self.modern.len()
                 + self.native.len(),
+        );
+        let mut commands = std::collections::BTreeSet::new();
+        rows.extend(
+            self.commands
+                .iter()
+                .filter(|row| {
+                    !self.alias_query.is_empty()
+                        && row.command_state.as_ref().is_some_and(|state| {
+                            state
+                                .aliases
+                                .iter()
+                                .any(|alias| alias.to_lowercase().starts_with(&self.alias_query))
+                        })
+                })
+                .filter(|row| match &row.target {
+                    crikey_ui::ActionTarget::Command(reference) => commands.insert(reference.clone()),
+                    _ => false,
+                })
+                .cloned(),
         );
         rows.extend(self.calculated.iter().cloned());
         rows.extend(
@@ -3133,7 +3330,6 @@ impl RetainedRows {
                 })
                 .cloned(),
         );
-        let mut commands = std::collections::BTreeSet::new();
         rows.extend(
             self.commands
                 .iter()
@@ -3203,6 +3399,24 @@ fn application_provider_policy() -> PluginPolicy {
     }
 }
 
+/// One admission edge for ordinary queries and deliberately opened command input.
+/// Never advance SearchService without advancing its catalog pipeline as well.
+fn admit_root_query(
+    search: &mut SearchService,
+    pipeline: &mut QueryPipeline,
+    owner: &PluginId,
+    model: &mut LauncherViewModel,
+    retained: &mut RetainedRows,
+    query: &str,
+    now: u64,
+) -> Result<(Generation, Result<(), String>), String> {
+    let generation = search.submit_query(query).map_err(|error| error.to_string())?;
+    model.begin_generation(generation);
+    retained.begin(generation);
+    let catalog = prepare_catalog_rows(search, pipeline, owner, query, generation, now, retained);
+    Ok((generation, catalog))
+}
+
 /// The ranked catalog includes plugin-owned items. Only the host-owned subset
 /// passes through the builtin scheduler; presentation keeps the complete ranked
 /// answer and its original owners, highlights and shared row payloads.
@@ -3219,6 +3433,13 @@ fn prepare_catalog_rows(
         .results()
         .iter()
         .filter(|hit| hit.item.plugin_id == *owner)
+        // This synchronous producer already holds ranked results. Respect both
+        // aggregate quotas before copying/enqueuing, not after boundary refusal.
+        .take(
+            pipeline
+                .max_items_per_query()
+                .min(pipeline.max_items_per_plugin_per_query()),
+        )
         .map(|hit| hit.item.clone())
         .collect();
     let result = drive_application_provider(pipeline, owner, query, items, now).and_then(|frame| {
@@ -3245,6 +3466,12 @@ fn drive_application_provider(
     items: Vec<Item>,
     now: u64,
 ) -> Result<ViewModel, String> {
+    let mut items = items;
+    items.truncate(
+        pipeline
+            .max_items_per_query()
+            .min(pipeline.max_items_per_plugin_per_query()),
+    );
     let generation = pipeline.keystroke(query, now);
     let tick = pipeline.tick(now);
     let mut errors: Vec<String> = tick.errors.iter().map(|error| format!("{error:?}")).collect();
@@ -5095,6 +5322,61 @@ mod tests {
         service
     }
 
+    #[test]
+    fn rapid_builtin_queries_cap_ranked_matches_before_one_item_intake_boundary() {
+        let mut search = ranked_service(&["amber", "amethyst", "amaranth", "alpine"]);
+        let owner = PluginId(APPLICATION_CATALOG_PLUGIN.into());
+        let mut config = PipelineConfig::default();
+        config.limits.max_items_per_query = 1;
+        config.intake_limits.capacity_items = 1;
+        config.intake_limits.capacity_batches = 1;
+        let mut pipeline = QueryPipeline::new(config);
+        pipeline
+            .register_plugin(owner.clone(), application_provider_policy())
+            .unwrap();
+        let mut retained = RetainedRows::default();
+        retained.max_results = Some(1);
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        for (index, query) in ["a", "am", "amb", "a", "", "am", "no-match-at-all", "a"]
+            .into_iter()
+            .enumerate()
+        {
+            model.apply(crikey_ui::UiCommand::SetQuery(query.into()));
+            // Adjacent keystrokes deliberately share a scheduler timestamp.
+            let (generation, catalog) = admit_root_query(
+                &mut search,
+                &mut pipeline,
+                &owner,
+                &mut model,
+                &mut retained,
+                query,
+                index as u64 / 2,
+            )
+            .unwrap();
+            catalog.expect("bounded ranked builtin publication must settle without boundary refusal");
+            if matches!(query, "a" | "am") {
+                assert!(
+                    search.results().len() > 1,
+                    "exercise multiple genuine catalog matches"
+                );
+            }
+            let expected = search.result_rows().first().map(|row| row.target.clone());
+            publish_root_rows(&search, None, &mut retained, &mut model, generation, query, None);
+            let frame = model.frame().unwrap();
+            assert_eq!(
+                frame.rows.first().map(|row| row.target.clone()),
+                expected,
+                "retain the first ranked match rather than discarding an oversized answer"
+            );
+            assert!(frame.rows.len() <= 1);
+            assert!(!frame.pending_plugins);
+            assert_eq!(pipeline.diagnostics().in_flight_requests, 0);
+            assert_eq!(pipeline.intake_depth().batches, 0);
+            assert!(pipeline.take_errors().is_empty());
+        }
+    }
+
     /// The file items a backend would produce for `names`, through the real
     /// mapping, so their ids, categories and actions are the ones the launcher
     /// actually has to rank.
@@ -5539,6 +5821,45 @@ mod tests {
     }
 
     #[test]
+    fn aliases_precede_ordinary_rows_before_one_result_cap_and_deduplication() {
+        let generation = Generation::from_raw(1);
+        let ordinary = row("owner", "ordinary");
+        let mut alias = row("owner", "canonical");
+        alias.target = crikey_ui::ActionTarget::Command(crikey_core::CommandRef {
+            provider_id: PluginId("owner".into()),
+            command_id: "command".into(),
+        });
+        alias.command_state = Some(crikey_ui::CommandRowState {
+            registry_revision: 1,
+            preference_revision: 1,
+            available: true,
+            unavailable_reason: None,
+            favorite: None,
+            favorite_count: 0,
+            hidden: false,
+            fallback: None,
+            fallback_count: 0,
+            aliases: vec!["go".into()],
+            hotkey: None,
+            argument_policy: crikey_core::ArgumentPolicy::Forbidden,
+            argument: None,
+            ranking_reset_available: true,
+        });
+        let mut retained = RetainedRows::default();
+        retained.set_builtin(generation, vec![ordinary]);
+        retained.set_commands(generation, vec![alias.clone(), alias.clone()]);
+        retained.alias_query = "go".into();
+        retained.max_results = Some(1);
+        assert_eq!(retained.merged()[0].target, alias.target);
+        retained.max_results = None;
+        assert_eq!(
+            retained.merged().len(),
+            2,
+            "alias is not repeated in the ordinary command group"
+        );
+    }
+
+    #[test]
     fn fallback_requires_current_terminal_empty_evidence_and_retains_literal_argument() {
         use crikey_app::OrdinaryProviderState;
         let mut model = LauncherViewModel::new();
@@ -5694,6 +6015,326 @@ mod tests {
             Some(UiEffect::InvokeCommand { reference: invoked, generation, .. })
                 if invoked == reference && generation == refreshed));
     }
+
+    #[test]
+    fn saved_effective_result_limit_reprojects_aliases_before_live_global_cap() {
+        use crikey_platform::{DirectoryConvention, DirectoryEnvironment};
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch = Scratch(std::env::temp_dir().join(format!(
+            "crikey-live-command-cap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        std::fs::write(scratch.0.join("config.toml"), "[launcher]\nmax-results = 6\n").unwrap();
+        let environment = [
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "CRIKEY_CONFIG_DIR",
+            "CRIKEY_DATA_DIR",
+            "CRIKEY_CACHE_DIR",
+            "CRIKEY_STATE_DIR",
+        ]
+        .into_iter()
+        .fold(DirectoryEnvironment::new(), |environment, key| {
+            environment.set(key, scratch.0.as_os_str())
+        });
+        let directories = StandardDirectories::resolve(DirectoryConvention::current(), &environment).unwrap();
+        let store = ConfigStore::load_with_policy(&directories, None).unwrap();
+        let mut configuration = LauncherConfiguration::from_store(store);
+        let mut search = SearchService::new(App::new());
+        for stage in [
+            StartupStage::WindowAndHotkey,
+            StartupStage::PersistedCatalog,
+            StartupStage::AcceptQueries,
+        ] {
+            search.complete_stage(stage).unwrap();
+        }
+        let reference = search.command_snapshot().commands.keys().next().unwrap().clone();
+        let mut preferences = search.command_preferences_snapshot();
+        Arc::make_mut(&mut preferences).preferences.records.push(
+            crikey_config::command_preferences::CommandPreference {
+                reference: reference.clone(),
+                hidden: false,
+                alias: Some("cap-alias".into()),
+                hotkey: None,
+            },
+        );
+        search.publish_command_preferences(preferences);
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        model.apply(crikey_ui::UiCommand::SetQuery("cap-alias".into()));
+        let generation = search.submit_query("cap-alias").unwrap();
+        model.begin_generation(generation);
+        let mut retained = RetainedRows::default();
+        retained.configure(&configuration.store);
+        retained.set_builtin(
+            generation,
+            (0..6)
+                .map(|index| row("ordinary", &format!("row-{index}")))
+                .collect(),
+        );
+        publish_root_rows(
+            &search,
+            Some(&configuration.store),
+            &mut retained,
+            &mut model,
+            generation,
+            "cap-alias",
+            None,
+        );
+        assert_eq!(model.frame().unwrap().rows.len(), 6);
+
+        settings::persist(&mut configuration.store, KEY_MAX_RESULTS, "1").unwrap();
+        configuration.reloaded = true;
+        assert!(configuration.take_reloaded());
+        assert!(
+            retained.configure(&configuration.store),
+            "authoritative reload owes a new projection"
+        );
+        publish_root_rows(
+            &search,
+            Some(&configuration.store),
+            &mut retained,
+            &mut model,
+            generation,
+            "cap-alias",
+            None,
+        );
+        let capped = model.frame().unwrap();
+        assert_eq!(capped.rows.len(), 1);
+        assert_eq!(
+            capped.rows[0].target,
+            crikey_ui::ActionTarget::Command(reference.clone())
+        );
+        assert_eq!(
+            ConfigStore::load_with_policy(&directories, None)
+                .unwrap()
+                .get(KEY_MAX_RESULTS),
+            Some("1")
+        );
+
+        // Registration/presentation consume the winning layer, never the saved draft.
+        configuration.store =
+            ConfigStore::load_with_overrides(&directories, None, &[(KEY_MAX_RESULTS.into(), "3".into())])
+                .unwrap();
+        assert!(retained.configure(&configuration.store));
+        publish_root_rows(
+            &search,
+            Some(&configuration.store),
+            &mut retained,
+            &mut model,
+            generation,
+            "cap-alias",
+            None,
+        );
+        let shadowed = model.frame().unwrap();
+        assert_eq!(shadowed.rows.len(), 3);
+        assert_eq!(
+            shadowed.rows[0].target,
+            crikey_ui::ActionTarget::Command(reference)
+        );
+    }
+
+    #[test]
+    fn hidden_required_input_survives_projection_refresh_and_cap_until_user_replaces_it() {
+        let mut search = SearchService::new(App::new());
+        for stage in [
+            StartupStage::WindowAndHotkey,
+            StartupStage::PersistedCatalog,
+            StartupStage::AcceptQueries,
+        ] {
+            search.complete_stage(stage).unwrap();
+        }
+        let owner = PluginId("test.required-input".into());
+        let item = Item {
+            stable_id: ItemId("required".into()),
+            plugin_id: owner.clone(),
+            category: crikey_core::Category::Command,
+            label: "Required input".into(),
+            description: String::new(),
+            target: String::new(),
+            search_terms: Vec::new(),
+            icon_reference: None,
+            argument_policy: crikey_core::ArgumentPolicy::Required,
+            hit_policy: crikey_core::HitPolicy::Recorded,
+            score_hint: 0,
+            metadata: std::collections::BTreeMap::new(),
+            actions: Vec::new(),
+        };
+        let reference = crikey_core::CommandRef {
+            provider_id: owner.clone(),
+            command_id: "required".into(),
+        };
+        let source_generation = Generation::from_raw(1);
+        search.replace_catalog(&owner, 1, vec![item.clone()]).unwrap();
+        search
+            .accept_command_catalog(&owner, 1, source_generation)
+            .unwrap();
+        search
+            .intake_modern_commands(&crikey_app::ModernCommandSnapshot {
+                revision: 1,
+                owners: std::collections::BTreeMap::from([(
+                    owner.clone(),
+                    Arc::new(crikey_app::ModernOwnerCommands {
+                        request_id: 1,
+                        instance: 1,
+                        generation: source_generation,
+                        incarnation: 1,
+                        status: crikey_app::ModernCommandStatus::Ready,
+                        declarations: vec![crikey_core::CommandDeclaration {
+                            reference: reference.clone(),
+                            label: item.label.clone(),
+                            executable_target: crikey_core::ExecutableTarget::Item {
+                                item_id: item.stable_id,
+                                action_id: None,
+                            },
+                            availability: crikey_core::CommandAvailability::Available,
+                            argument_policy: crikey_core::ArgumentPolicy::Required,
+                        }],
+                    }),
+                )]),
+            })
+            .unwrap();
+        let mut preferences = search.command_preferences_snapshot();
+        Arc::make_mut(&mut preferences).preferences.records.push(
+            crikey_config::command_preferences::CommandPreference {
+                reference: reference.clone(),
+                hidden: true,
+                alias: None,
+                hotkey: None,
+            },
+        );
+        search.publish_command_preferences(preferences);
+        let row = search
+            .command_management_rows()
+            .into_iter()
+            .find(|row| row.target == crikey_ui::ActionTarget::Command(reference.clone()))
+            .unwrap();
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        let mut retained = RetainedRows::default();
+        retained.max_results = Some(0);
+        let application_owner = PluginId(APPLICATION_CATALOG_PLUGIN.into());
+        let mut catalog_pipeline = QueryPipeline::new(PipelineConfig::default());
+        catalog_pipeline
+            .register_plugin(application_owner.clone(), application_provider_policy())
+            .unwrap();
+        let (_, initial_catalog) = admit_root_query(
+            &mut search,
+            &mut catalog_pipeline,
+            &application_owner,
+            &mut model,
+            &mut retained,
+            "prior root",
+            0,
+        )
+        .unwrap();
+        initial_catalog.expect("ordinary catalog admission before dismissal");
+        model.dismiss();
+        model.activate();
+        model.apply(crikey_ui::UiCommand::SetQuery(item.label.clone()));
+        retained.explicit_input = Some(row);
+        let (generation, catalog) = admit_root_query(
+            &mut search,
+            &mut catalog_pipeline,
+            &application_owner,
+            &mut model,
+            &mut retained,
+            &item.label,
+            1,
+        )
+        .unwrap();
+        catalog.expect("Required activation uses the same real catalog generation admission");
+        publish_root_rows(
+            &search,
+            None,
+            &mut retained,
+            &mut model,
+            generation,
+            &item.label,
+            None,
+        );
+        model.apply(crikey_ui::UiCommand::ShowActions);
+        publish_root_rows(
+            &search,
+            None,
+            &mut retained,
+            &mut model,
+            generation,
+            &item.label,
+            None,
+        );
+        let frame = model.frame().unwrap();
+        assert_eq!(frame.rows.len(), 1);
+        assert_eq!(
+            frame.rows[0].target,
+            crikey_ui::ActionTarget::Command(reference.clone())
+        );
+        assert!(frame.action_panel.is_some());
+        assert_eq!(
+            frame.rows[0].command_state.as_ref().unwrap().argument_policy,
+            crikey_core::ArgumentPolicy::Required
+        );
+        let (refreshed, catalog) = admit_root_query(
+            &mut search,
+            &mut catalog_pipeline,
+            &application_owner,
+            &mut model,
+            &mut retained,
+            &item.label,
+            2,
+        )
+        .unwrap();
+        catalog.expect("refresh after Required activation does not desynchronize intake");
+        publish_root_rows(
+            &search,
+            None,
+            &mut retained,
+            &mut model,
+            refreshed,
+            &item.label,
+            None,
+        );
+        assert_eq!(
+            model.frame().unwrap().rows[0].target,
+            crikey_ui::ActionTarget::Command(reference)
+        );
+
+        // This receipt was admitted during the native command's drain, before
+        // the user's new text was applied. It must not retain presentation authority.
+        let queued_receipt_intent = 42;
+        let mut current_intent = queued_receipt_intent;
+        assert_eq!(
+            apply_native_command(
+                &mut model,
+                &mut retained,
+                &mut current_intent,
+                crikey_ui::UiCommand::SetQuery("new user query".into())
+            ),
+            Some(UiEffect::Query("new user query".into()))
+        );
+        assert_ne!(queued_receipt_intent, current_intent);
+        assert!(retained.explicit_input.is_none());
+        let (next, catalog) = admit_root_query(
+            &mut search,
+            &mut catalog_pipeline,
+            &application_owner,
+            &mut model,
+            &mut retained,
+            "new user query",
+            3,
+        )
+        .unwrap();
+        catalog.expect("next ordinary query still shares the catalog pipeline generation");
+        assert!(next > refreshed);
+    }
 }
 
 fn publish_learning(
@@ -5743,6 +6384,14 @@ fn publish_root_rows(
     query: &str,
     fallback: Option<&crikey_app::FallbackSearch>,
 ) {
+    if let Some(target) = retained.explicit_input.as_ref().map(|row| row.target.clone()) {
+        // Refresh presentation from the registry, but never run discovery or cap
+        // an explicitly requested input target (including hidden declarations).
+        retained.explicit_input = search
+            .command_management_rows()
+            .into_iter()
+            .find(|row| row.target == target);
+    }
     let home = configuration
         .and_then(|store| store.get("launcher.command-home"))
         .unwrap_or("compact");
@@ -5752,5 +6401,29 @@ fn publish_root_rows(
     context.include_recent = matches!(home, "recent" | "favorites-and-recent");
     context.fallback = fallback;
     retained.set_commands(generation, search.compose_command_rows(context));
+    retained.alias_query = query.trim().to_lowercase();
     model.publish(generation, retained.merged(), retained.pending());
+}
+
+/// Apply the current native intent after draining queued shortcuts. A newly
+/// admitted shortcut cannot borrow authority from before this command executes.
+fn apply_native_command(
+    model: &mut LauncherViewModel,
+    retained: &mut RetainedRows,
+    hotkey_intent: &mut u64,
+    command: crikey_ui::UiCommand,
+) -> Option<UiEffect> {
+    *hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
+    if matches!(
+        &command,
+        crikey_ui::UiCommand::SetQuery(_)
+            | crikey_ui::UiCommand::Cancel
+            | crikey_ui::UiCommand::Back
+            | crikey_ui::UiCommand::Dismiss
+            | crikey_ui::UiCommand::OpenSettings
+            | crikey_ui::UiCommand::CloseSettings
+    ) {
+        retained.explicit_input = None;
+    }
+    model.apply(command)
 }

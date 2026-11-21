@@ -11,8 +11,10 @@
 
 mod cabi_provider;
 mod command_composition;
+mod command_hotkeys;
 mod command_preferences;
 mod command_registry;
+pub use command_hotkeys::*;
 mod legacy_provider;
 mod modern_provider;
 mod native_provider;
@@ -117,8 +119,6 @@ use crikey_platform::{
     Clipboard, FileSearchQuery, FileSearchResults, IconImage, IconProvider, WindowInfo,
     APPLICATION_LAUNCH_ACTION_ID, DEFAULT_ICON_SIZE, FILE_OPEN_ACTION_ID, FILE_REVEAL_ACTION_ID,
 };
-#[cfg(any(windows, target_os = "linux"))]
-use crikey_platform::{HotkeyActivationHandler, HotkeyBinding};
 use crikey_query::{
     DefaultMatcher, DefaultNormalizer, MatchMethod, MatchOutcome, MatchPolicy, Matcher, NormalizedQuery,
     Normalizer, PreparedLabel,
@@ -430,55 +430,19 @@ impl App {
         }))
     }
 
-    /// Registers the activation shortcut and connects it to the native UI
-    /// loop's wake-up callback.
-    ///
-    /// Compiled for the targets whose backend has a real global-shortcut
-    /// implementation behind [`Capability::GlobalHotkeys`]: Win32
-    /// `RegisterHotKey`, X11 `GrabKey`, and Linux Wayland's portal-backed
-    /// GlobalShortcuts service. A target without one has no method here at all,
-    /// so a host that calls it fails to build rather than being handed a
-    /// shortcut nothing can deliver.
-    ///
-    /// [`Capability::GlobalHotkeys`]: crikey_platform::Capability::GlobalHotkeys
-    #[cfg(any(windows, target_os = "linux"))]
-    pub fn register_activation_hotkey(
-        &mut self,
-        accelerator: &str,
-        handler: HotkeyActivationHandler,
-    ) -> CoreResult<()> {
-        let binding = HotkeyBinding {
-            accelerator: accelerator.to_owned(),
-        };
-        // The Windows backend always has a service; the Linux one has to reach
-        // an X display first, and says so when it cannot.
-        #[cfg(windows)]
-        let hotkeys = self.backend.hotkeys();
-        #[cfg(target_os = "linux")]
-        let hotkeys = self.backend.hotkeys()?;
-        register_activation_binding(hotkeys, &binding, handler)
-    }
-
-    /// Releases the activation shortcut, so a launcher that re-binds its
-    /// accelerator hands the old chord back to the desktop.
-    ///
-    /// Same targets and same error type as
-    /// [`register_activation_hotkey`](Self::register_activation_hotkey): the
-    /// pair is one API, and a host able to take a grab it can never release
-    /// would leave every chord it has ever bound swallowing that key press for
-    /// the life of the process. The handler is left installed, because the
-    /// caller re-binds rather than goes silent -- a launcher that unregisters
-    /// its last accelerator has nothing left that can fire.
-    #[cfg(any(windows, target_os = "linux"))]
-    pub fn unregister_activation_hotkey(&mut self, accelerator: &str) -> CoreResult<()> {
-        let binding = HotkeyBinding {
-            accelerator: accelerator.to_owned(),
-        };
-        #[cfg(windows)]
-        let hotkeys = self.backend.hotkeys();
-        #[cfg(target_os = "linux")]
-        let hotkeys = self.backend.hotkeys()?;
-        hotkeys.unregister(&binding)
+    /// Creates the sole process-scoped shortcut owner; platform work stays off-thread.
+    pub fn command_hotkeys(&self, wake: impl Fn() + Send + Sync + 'static) -> CommandHotkeys {
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            CommandHotkeys::new(self.backend.hotkey_factory(), wake)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            CommandHotkeys::new(
+                || Err("Global shortcuts are unavailable on this platform".into()),
+                wake,
+            )
+        }
     }
 
     fn launch_application(&self, item: &Item) -> CoreResult<()> {
@@ -1337,20 +1301,8 @@ impl SearchService {
         self.app.search_file_items(plugin, query)
     }
 
-    /// Connects the platform global shortcut to a native UI event-loop wake-up.
-    #[cfg(any(windows, target_os = "linux"))]
-    pub fn register_activation_hotkey(
-        &mut self,
-        accelerator: &str,
-        handler: HotkeyActivationHandler,
-    ) -> CoreResult<()> {
-        self.app.register_activation_hotkey(accelerator, handler)
-    }
-
-    /// Releases a global shortcut this service registered.
-    #[cfg(any(windows, target_os = "linux"))]
-    pub fn unregister_activation_hotkey(&mut self, accelerator: &str) -> CoreResult<()> {
-        self.app.unregister_activation_hotkey(accelerator)
+    pub fn command_hotkeys(&self, wake: impl Fn() + Send + Sync + 'static) -> CommandHotkeys {
+        self.app.command_hotkeys(wake)
     }
 
     /// Admits every readable cached slice into the live catalog and reports
@@ -2863,119 +2815,6 @@ mod reset_admission_tests {
         assert!(
             search.selection_history_snapshot().commands.is_empty(),
             "submission alone is not terminal success"
-        );
-    }
-}
-
-#[cfg(any(windows, target_os = "linux"))]
-fn register_activation_binding(
-    hotkeys: &mut dyn crikey_platform::HotkeyService,
-    binding: &HotkeyBinding,
-    handler: HotkeyActivationHandler,
-) -> CoreResult<()> {
-    // A refused replacement must preserve both the old grab and its
-    // callback. Existing bindings share this backend-wide handler.
-    hotkeys.register(binding)?;
-    hotkeys.set_activation_handler(Some(handler));
-    Ok(())
-}
-
-#[cfg(all(test, any(windows, target_os = "linux")))]
-mod activation_hotkey_tests {
-    use super::*;
-    use crikey_platform::HotkeyService;
-    use std::sync::mpsc;
-
-    #[derive(Default)]
-    struct ActivationService {
-        bindings: Vec<HotkeyBinding>,
-        handler: Option<HotkeyActivationHandler>,
-    }
-
-    impl ActivationService {
-        fn activate(&self, accelerator: &str) {
-            if let Some(binding) = self
-                .bindings
-                .iter()
-                .find(|binding| binding.accelerator == accelerator)
-            {
-                if let Some(handler) = &self.handler {
-                    handler(binding);
-                }
-            }
-        }
-    }
-
-    impl HotkeyService for ActivationService {
-        fn register(&mut self, binding: &HotkeyBinding) -> CoreResult<()> {
-            if binding.accelerator == "Ctrl+Alt+K" {
-                return Err(crikey_core::CoreError::Invalid(
-                    "accelerator already grabbed".into(),
-                ));
-            }
-            self.bindings.push(binding.clone());
-            Ok(())
-        }
-
-        fn unregister(&mut self, binding: &HotkeyBinding) -> CoreResult<()> {
-            self.bindings.retain(|existing| existing != binding);
-            Ok(())
-        }
-
-        fn set_activation_handler(&mut self, handler: Option<HotkeyActivationHandler>) {
-            self.handler = handler;
-        }
-    }
-
-    #[test]
-    fn refused_replacement_preserves_activation_delivery_and_later_replacement_still_works() {
-        let mut service = ActivationService::default();
-        let (events, received) = mpsc::channel();
-        let old = HotkeyBinding {
-            accelerator: "Ctrl+Alt+Space".into(),
-        };
-        let busy = HotkeyBinding {
-            accelerator: "Ctrl+Alt+K".into(),
-        };
-        let replacement = HotkeyBinding {
-            accelerator: "Ctrl+Alt+J".into(),
-        };
-        let original = events.clone();
-        register_activation_binding(
-            &mut service,
-            &old,
-            Box::new(move |binding| original.send(("original", binding.accelerator.clone())).unwrap()),
-        )
-        .unwrap();
-
-        let refused = events.clone();
-        assert!(register_activation_binding(
-            &mut service,
-            &busy,
-            Box::new(move |binding| refused.send(("refused", binding.accelerator.clone())).unwrap()),
-        )
-        .is_err());
-        service.activate(&old.accelerator);
-        assert_eq!(
-            received.try_recv().unwrap(),
-            ("original", old.accelerator.clone())
-        );
-        service.activate(&busy.accelerator);
-        assert_eq!(received.try_recv(), Err(mpsc::TryRecvError::Empty));
-
-        register_activation_binding(
-            &mut service,
-            &replacement,
-            Box::new(move |binding| events.send(("replacement", binding.accelerator.clone())).unwrap()),
-        )
-        .unwrap();
-        service.unregister(&old).unwrap();
-        service.activate(&old.accelerator);
-        assert_eq!(received.try_recv(), Err(mpsc::TryRecvError::Empty));
-        service.activate(&replacement.accelerator);
-        assert_eq!(
-            received.try_recv().unwrap(),
-            ("replacement", replacement.accelerator)
         );
     }
 }

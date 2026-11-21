@@ -1105,6 +1105,164 @@ impl NativeImeState {
     }
 }
 
+/// Query server-owned input focus rather than winit's Grab/Ungrab-derived cache.
+/// Failure is not permission to ignore focus loss.
+#[cfg(target_os = "linux")]
+fn x11_focus_within(connection: &impl x11rb::connection::Connection, window: u32) -> bool {
+    use x11rb::protocol::xproto::ConnectionExt;
+    let Some(mut focus) = connection
+        .get_input_focus()
+        .ok()
+        .and_then(|reply| reply.reply().ok())
+        .map(|reply| reply.focus)
+    else {
+        return false;
+    };
+    for _ in 0..64 {
+        if focus == window {
+            return true;
+        }
+        // None and PointerRoot are not launcher-owned keyboard focus.
+        if focus <= 1 {
+            return false;
+        }
+        let Some(parent) = connection
+            .query_tree(focus)
+            .ok()
+            .and_then(|reply| reply.reply().ok())
+            .map(|reply| reply.parent)
+        else {
+            return false;
+        };
+        if parent == focus {
+            return false;
+        }
+        focus = parent;
+    }
+    false
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod x11_focus_tests {
+    use super::x11_focus_within;
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Child, Command, Stdio},
+        sync::mpsc,
+        time::Duration,
+    };
+    use x11rb::{
+        connection::Connection,
+        protocol::xproto::{ConnectionExt, CreateWindowAux, GrabMode, GrabStatus, InputFocus, WindowClass},
+    };
+
+    #[test]
+    fn server_input_focus_distinguishes_keyboard_grab_from_real_departure() {
+        // Never borrow the user's display; Xvfb atomically selects this private one.
+        struct Server(Child);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut server = Server(
+            Command::new("Xvfb")
+                .args([
+                    "-displayfd",
+                    "1",
+                    "-screen",
+                    "0",
+                    "800x600x24",
+                    "-nolisten",
+                    "tcp",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("focus authority regression requires private Xvfb"),
+        );
+        let descriptor = server.0.stdout.take().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(descriptor).read_line(&mut line).map(|_| line);
+            let _ = sender.send(result);
+        });
+        let number = receiver.recv_timeout(Duration::from_secs(20)).unwrap().unwrap();
+        let display = format!(":{}", number.trim());
+        let (connection, screen) = x11rb::connect(Some(&display)).unwrap();
+        let root = connection.setup().roots[screen].root;
+        let visual = connection.setup().roots[screen].root_visual;
+        let owner = connection.generate_id().unwrap();
+        let child = connection.generate_id().unwrap();
+        let outside = connection.generate_id().unwrap();
+        for (window, parent) in [(owner, root), (child, owner), (outside, root)] {
+            connection
+                .create_window(
+                    x11rb::COPY_DEPTH_FROM_PARENT,
+                    window,
+                    parent,
+                    0,
+                    0,
+                    100,
+                    100,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    visual,
+                    &CreateWindowAux::new(),
+                )
+                .unwrap()
+                .check()
+                .unwrap();
+            connection.map_window(window).unwrap().check().unwrap();
+        }
+        connection
+            .set_input_focus(InputFocus::PARENT, child, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        assert!(
+            x11_focus_within(&connection, owner),
+            "a focused native descendant belongs to its launcher"
+        );
+        let grab = connection
+            .grab_keyboard(false, root, x11rb::CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert_eq!(grab.status, GrabStatus::SUCCESS);
+        assert!(
+            x11_focus_within(&connection, owner),
+            "keyboard Grab focus notifications do not transfer the server's input-focus target"
+        );
+        connection
+            .ungrab_keyboard(x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        connection
+            .set_input_focus(InputFocus::PARENT, outside, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        assert!(
+            !x11_focus_within(&connection, owner),
+            "actual outside focus must cancel capture and permit dismissal"
+        );
+        connection
+            .set_input_focus(InputFocus::PARENT, x11rb::NONE, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        assert!(
+            !x11_focus_within(&connection, owner),
+            "missing focus is not a blanket exemption"
+        );
+    }
+}
+
 struct NativeApplication<F> {
     config: NativeLauncherConfig,
     proxy: Arc<EventProxy>,
@@ -1131,6 +1289,8 @@ struct NativeApplication<F> {
     /// otherwise close the launcher the instant a stray `Focused(false)`
     /// arrived at startup.
     focused: bool,
+    #[cfg(target_os = "linux")]
+    x11_focus: std::cell::OnceCell<Option<x11rb::rust_connection::RustConnection>>,
     next_repaint: Option<Instant>,
     consecutive_surface_retries: u32,
     on_event: F,
@@ -1158,12 +1318,35 @@ where
             web_pointer: WebPointerState::default(),
             ime: NativeImeState::default(),
             focused: false,
+            #[cfg(target_os = "linux")]
+            x11_focus: std::cell::OnceCell::new(),
             next_repaint: None,
             consecutive_surface_retries: 0,
             on_event,
             terminal_error: None,
             exiting: false,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn x11_retains_input_focus(&self) -> bool {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Some(window) = self
+            .graphics
+            .as_ref()
+            .and_then(|graphics| graphics.window.window_handle().ok())
+            .and_then(|handle| match handle.as_raw() {
+                RawWindowHandle::Xlib(handle) => u32::try_from(handle.window).ok(),
+                RawWindowHandle::Xcb(handle) => Some(handle.window.get()),
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        self.x11_focus
+            .get_or_init(|| x11rb::connect(None).ok().map(|(connection, _)| connection))
+            .as_ref()
+            .is_some_and(|connection| x11_focus_within(connection, window))
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: RendererError) {
@@ -1675,6 +1858,13 @@ where
         {
             return;
         }
+        #[cfg(target_os = "linux")]
+        if matches!(&event, WindowEvent::Focused(false)) && self.x11_retains_input_focus() {
+            // winit also reports XI_FocusOut for passive Grab/Ungrab. Those
+            // notifications do not transfer X input focus: do not clear egui,
+            // cancel recording, or dismiss before the queued global receipt.
+            return;
+        }
 
         // Touch must cross the same immediate ownership boundary as native
         // keys and mouse input. Deferring it until redraw reorders a tap before
@@ -1794,6 +1984,25 @@ where
 
         if let Some(command) = command {
             self.dispatch_command(event_loop, command);
+        } else if matches!(
+            &event,
+            WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    state: ElementState::Pressed,
+                    ..
+                },
+                ..
+            } | WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            } | WindowEvent::Touch(Touch {
+                phase: TouchPhase::Started,
+                ..
+            }) | WindowEvent::Ime(Ime::Commit(_))
+        ) {
+            // Editor/document-owned input does not execute a host shortcut, but
+            // it still retires older deliberate page-presentation intent.
+            self.dispatch_command(event_loop, UiCommand::UserActivity);
         }
 
         match event {
@@ -1812,6 +2021,9 @@ where
             // clear the view model and hide the window; hiding here as well
             // would be a second, divergent path.
             WindowEvent::Focused(focused) => {
+                if !focused {
+                    self.dispatch_command(event_loop, UiCommand::CancelShortcutCapture);
+                }
                 let dismiss =
                     should_dismiss_on_focus_change(focused, self.active_session.is_some(), self.focused);
                 let web_surface_id = self.web_surface_id();
@@ -2842,6 +3054,39 @@ fn translate_keyboard(
     if event.state != ElementState::Pressed {
         return None;
     }
+    if let Some(key) = model
+        .and_then(|model| model.settings_focus.as_deref())
+        .and_then(|focus| focus.strip_prefix("record:"))
+    {
+        if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+            return Some(UiCommand::CancelShortcutCapture);
+        }
+        let key_name = match event.logical_key.as_ref() {
+            Key::Character(text) => text.to_uppercase(),
+            Key::Named(NamedKey::ArrowUp) => "Up".into(),
+            Key::Named(NamedKey::ArrowDown) => "Down".into(),
+            Key::Named(NamedKey::ArrowLeft) => "Left".into(),
+            Key::Named(NamedKey::ArrowRight) => "Right".into(),
+            Key::Named(named) => format!("{named:?}"),
+            _ => String::new(),
+        };
+        let mut chord = String::new();
+        for (pressed, name) in [
+            (modifiers.control_key(), "Ctrl+"),
+            (modifiers.alt_key(), "Alt+"),
+            (modifiers.shift_key(), "Shift+"),
+            (modifiers.super_key(), "Super+"),
+        ] {
+            if pressed {
+                chord.push_str(name);
+            }
+        }
+        chord.push_str(&key_name);
+        return Some(match crikey_platform::Accelerator::parse(&chord) {
+            Ok(chord) => UiCommand::RecordShortcut(chord.canonical()),
+            Err(_) => UiCommand::BeginShortcutCapture(key.into()),
+        });
+    }
     // While a page is open the plugin's surface owns the keyboard, exactly as
     // the settings surface does below: Enter presses the focused node, Tab
     // walks the page's focus ring, and typing goes into whatever field the
@@ -3383,6 +3628,14 @@ fn draw_result_row(
                             );
                             if let Some(hint) = &row.argument_hint {
                                 ui.label(RichText::new(hint).size(theme::TEXT_SMALL).color(colors.accent));
+                            }
+                            if let Some(state) = &row.command_state {
+                                for alias in &state.aliases {
+                                    ui.label(RichText::new(alias).small().color(colors.accent));
+                                }
+                                if let Some(hotkey) = &state.hotkey {
+                                    ui.label(RichText::new(hotkey).small().color(colors.text_muted));
+                                }
                             }
                         }
                     });
@@ -5021,7 +5274,17 @@ fn draw_settings(
             if ui.button("Clear query history").clicked() {
                 commands.push(UiCommand::ClearQueryHistory);
             }
-            egui::CollapsingHeader::new("Configure Commands")
+            let search_id = egui::Id::new("shortcut-settings-search");
+            let mut shortcut_search = ui
+                .data(|data| data.get_temp::<String>(search_id))
+                .unwrap_or_default();
+            ui.add(
+                TextEdit::singleline(&mut shortcut_search)
+                    .hint_text("Search Shortcuts by command, alias, or key"),
+            );
+            ui.data_mut(|data| data.insert_temp(search_id, shortcut_search.clone()));
+            let shortcut_search = shortcut_search.to_lowercase();
+            egui::CollapsingHeader::new("Shortcuts / Configure Commands")
                 .id_salt("configure-commands")
                 .show(ui, |ui| {
                     if model.command_management.is_empty() {
@@ -5032,6 +5295,21 @@ fn draw_settings(
                         .max_height(320.0)
                         .show(ui, |ui| {
                             for row in model.command_management.iter() {
+                                if !shortcut_search.is_empty()
+                                    && !row.label.to_lowercase().contains(&shortcut_search)
+                                    && !row.description.to_lowercase().contains(&shortcut_search)
+                                    && !row.command_state.as_ref().is_some_and(|state| {
+                                        state
+                                            .aliases
+                                            .iter()
+                                            .any(|alias| alias.to_lowercase().contains(&shortcut_search))
+                                            || state.hotkey.as_ref().is_some_and(|hotkey| {
+                                                hotkey.to_lowercase().contains(&shortcut_search)
+                                            })
+                                    })
+                                {
+                                    continue;
+                                }
                                 let crate::ActionTarget::Command(reference) = &row.target else {
                                     continue;
                                 };
@@ -5143,6 +5421,23 @@ fn draw_setting_row(
     let mut state = ui
         .data(|data| data.get_temp::<SettingDraftState>(state_id))
         .unwrap_or_default();
+    let capture_id = state_id.with("capture");
+    if let Some(captured) = outcomes
+        .iter()
+        .find(|outcome| outcome.key == format!("capture:{}", row.key))
+    {
+        let seen = ui.data(|data| data.get_temp::<u64>(capture_id)).unwrap_or(0);
+        if captured.request_id > seen {
+            state.revision = state
+                .revision
+                .checked_add(1)
+                .expect("shortcut draft revision exhausted");
+            ui.data_mut(|data| {
+                data.insert_temp(draft_id, captured.value.clone());
+                data.insert_temp(capture_id, captured.request_id);
+            });
+        }
+    }
     if let Some(pending) = &state.pending {
         if let Some(outcome) = outcomes.iter().find(|outcome| {
             outcome.request_id == pending.request_id
@@ -5206,6 +5501,11 @@ fn draw_setting_row(
             if state.pending.is_some() {
                 ui.small("Saving…");
             }
+            if row.key == "launcher.activation-hotkey" && ui.button("Record").clicked() {
+                commands.push(UiCommand::BeginShortcutCapture(row.key.clone()));
+            }
+            // TextEdit may consume Return; retain its presence before dispatch.
+            let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
             let response = ui.add(
                 TextEdit::singleline(&mut draft)
                     .id(draft_id.with("editor"))
@@ -5219,7 +5519,7 @@ fn draw_setting_row(
                     .expect("setting draft revision exhausted");
                 ui.data_mut(|data| data.insert_temp(draft_id, draft.clone()));
             }
-            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            if response.lost_focus() && enter_pressed {
                 committed = true;
             }
         });

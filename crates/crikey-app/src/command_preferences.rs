@@ -24,6 +24,14 @@ pub enum PreferenceError {
 #[derive(Debug, Clone)]
 pub enum PreferenceMutation {
     SetRecord(CommandPreference),
+    SetAlias {
+        reference: CommandRef,
+        alias: Option<String>,
+    },
+    SetHotkey {
+        reference: CommandRef,
+        hotkey: Option<String>,
+    },
     RemoveRecord(CommandRef),
     SetFavorites(Vec<CommandRef>),
     SetFallbacks(Vec<CommandRef>),
@@ -182,6 +190,8 @@ impl CommandPreferencesStore {
         };
         let valid = match &mutation {
             PreferenceMutation::SetRecord(record) => declared(&record.reference),
+            PreferenceMutation::SetAlias { reference, .. }
+            | PreferenceMutation::SetHotkey { reference, .. } => declared(reference),
             PreferenceMutation::RemoveRecord(_) => true,
             PreferenceMutation::SetFavorites(list) | PreferenceMutation::SetFallbacks(list) => {
                 list.iter().all(declared)
@@ -206,6 +216,7 @@ impl CommandPreferencesStore {
                 }
             }
         }
+        let changes_hotkey = matches!(&mutation, PreferenceMutation::SetHotkey { hotkey: Some(_), .. });
         match mutation {
             PreferenceMutation::SetRecord(record) => {
                 if let Some(existing) = preferences
@@ -218,13 +229,40 @@ impl CommandPreferencesStore {
                     preferences.records.push(record);
                 }
             }
+            PreferenceMutation::SetAlias { reference, alias } => {
+                let record = target_record(&mut preferences, reference);
+                record.alias = alias;
+            }
+            PreferenceMutation::SetHotkey { reference, hotkey } => {
+                let record = target_record(&mut preferences, reference);
+                record.hotkey = hotkey;
+            }
             PreferenceMutation::RemoveRecord(reference) => {
                 preferences.records.retain(|record| record.reference != reference)
             }
             PreferenceMutation::SetFavorites(favorites) => preferences.favorites = favorites,
             PreferenceMutation::SetFallbacks(fallbacks) => preferences.fallbacks = fallbacks,
         }
-        preferences.encode().map_err(PreferenceError::Invalid)?;
+        let encoded = preferences.encode().map_err(PreferenceError::Invalid)?;
+        if changes_hotkey {
+            if session {
+                let mut candidate = config.clone();
+                candidate.set_session_override(KEY_COMMAND_PREFERENCES, &encoded);
+                candidate
+                    .validate_command_hotkey_conflicts()
+                    .map_err(PreferenceError::Invalid)?;
+            } else {
+                let (current, retained) = config
+                    .project_user_global_candidates(KEY_COMMAND_PREFERENCES, &encoded)
+                    .map_err(|error| PreferenceError::Persistence(error.to_string()))?;
+                current
+                    .validate_command_hotkey_conflicts()
+                    .map_err(PreferenceError::Invalid)?;
+                retained
+                    .validate_command_hotkey_conflicts()
+                    .map_err(PreferenceError::Invalid)?;
+            }
+        }
         let expected_config = self
             .config_revision
             .clone()
@@ -243,8 +281,9 @@ impl CommandPreferencesStore {
                 ))
             }
         }
-        let effective = read(config)?;
-        let editable_documents = EditableDocuments::read(config)?;
+        let effective = read(config).map_err(|_| PreferenceError::PersistedReload)?;
+        let editable_documents =
+            EditableDocuments::read(config).map_err(|_| PreferenceError::PersistedReload)?;
         let published = self.publish(
             effective,
             config.layer_of(KEY_COMMAND_PREFERENCES),
@@ -262,22 +301,7 @@ impl CommandPreferencesStore {
     }
     /// Exact aliases precede prefixes; textual aliases remain owned by the existing query layer.
     pub fn aliases<'a>(&'a self, registry: &CommandRegistry, query: &str) -> Vec<&'a CommandRef> {
-        let query = query.to_lowercase();
-        let mut hits: Vec<_> = self
-            .snapshot
-            .preferences
-            .records
-            .iter()
-            .filter_map(|record| {
-                registry.resolve(&record.reference)?;
-                let alias = record.alias.as_ref()?.to_lowercase();
-                alias
-                    .starts_with(&query)
-                    .then_some((alias != query, alias, &record.reference))
-            })
-            .collect();
-        hits.sort_unstable();
-        hits.into_iter().map(|(_, _, reference)| reference).collect()
+        self.snapshot.aliases(&registry.snapshot(), query)
     }
     /// Unavailable favorites remain in their saved order for management/home presentation.
     pub fn home<'a>(
@@ -310,6 +334,58 @@ impl CommandPreferencesStore {
             })
             .collect()
     }
+}
+impl CommandPreferencesSnapshot {
+    /// Projects raw root text against this immutable published input, never a draft.
+    pub fn aliases<'a>(&'a self, registry: &CommandRegistrySnapshot, query: &str) -> Vec<&'a CommandRef> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let query = query.to_lowercase();
+        let mut hits: Vec<_> = self
+            .preferences
+            .records
+            .iter()
+            .filter_map(|record| {
+                if record.hidden {
+                    return None;
+                }
+                let command = registry.commands.get(&record.reference)?;
+                if !matches!(
+                    command.declaration.availability,
+                    crikey_core::CommandAvailability::Available
+                ) {
+                    return None;
+                }
+                let alias = record.alias.as_ref()?.to_lowercase();
+                alias
+                    .starts_with(&query)
+                    .then_some((alias != query, &record.reference))
+            })
+            .collect();
+        hits.sort_unstable();
+        hits.into_iter().map(|(_, reference)| reference).collect()
+    }
+}
+
+fn target_record(preferences: &mut CommandPreferences, reference: CommandRef) -> &mut CommandPreference {
+    let index = match preferences
+        .records
+        .iter()
+        .position(|record| record.reference == reference)
+    {
+        Some(index) => index,
+        None => {
+            preferences.records.push(CommandPreference {
+                reference,
+                hidden: false,
+                alias: None,
+                hotkey: None,
+            });
+            preferences.records.len() - 1
+        }
+    };
+    &mut preferences.records[index]
 }
 fn read(config: &ConfigStore) -> Result<CommandPreferences, PreferenceError> {
     config
@@ -371,6 +447,81 @@ impl FallbackSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_fields_preserve_target_record_and_memberships_without_promoting_effective_fields() {
+        let reference = crikey_core::command::builtin_commands().remove(0).reference;
+        let mut target = CommandPreferences {
+            records: vec![CommandPreference {
+                reference: reference.clone(),
+                hidden: true,
+                alias: Some("existing".into()),
+                hotkey: Some("Ctrl+Shift+E".into()),
+            }],
+            favorites: vec![reference.clone()],
+            fallbacks: vec![reference.clone()],
+        };
+        target_record(&mut target, reference.clone()).alias = None;
+        assert!(target.records[0].hidden);
+        assert_eq!(target.records[0].hotkey.as_deref(), Some("Ctrl+Shift+E"));
+        target_record(&mut target, reference.clone()).hotkey = None;
+        assert!(target.records[0].hidden);
+        assert_eq!(target.favorites, vec![reference.clone()]);
+        assert_eq!(target.fallbacks, vec![reference.clone()]);
+        let mut absent_target = CommandPreferences::default();
+        target_record(&mut absent_target, reference.clone()).alias = Some("new".into());
+        assert!(!absent_target.records[0].hidden);
+        assert_eq!(absent_target.records[0].hotkey, None);
+        assert!(absent_target.favorites.is_empty());
+        assert!(absent_target.fallbacks.is_empty());
+    }
+
+    #[test]
+    fn published_alias_projection_uses_raw_text_exact_then_prefix_and_reference_ties() {
+        let mut registry = CommandRegistrySnapshot::default();
+        let mut preferences = CommandPreferences::default();
+        for (id, alias, hidden, available) in [
+            ("z-exact", "go", false, true),
+            ("b-prefix", "gone", false, true),
+            ("a-prefix", "going", false, true),
+            ("hidden", "goblin", true, true),
+            ("unavailable", "gold", false, false),
+        ] {
+            let mut declaration = crikey_core::command::builtin_commands().remove(0);
+            declaration.reference.command_id = id.into();
+            if !available {
+                declaration.availability = crikey_core::CommandAvailability::Unavailable;
+            }
+            let reference = declaration.reference.clone();
+            registry.commands.insert(
+                reference.clone(),
+                RegisteredCommand {
+                    declaration,
+                    incarnation: 1,
+                },
+            );
+            preferences.records.push(CommandPreference {
+                reference,
+                alias: Some(alias.into()),
+                hidden,
+                hotkey: None,
+            });
+        }
+        let snapshot = CommandPreferencesSnapshot {
+            revision: 1,
+            preferences,
+            layer: None,
+        };
+        let ids: Vec<_> = snapshot
+            .aliases(&registry, "GO")
+            .into_iter()
+            .map(|reference| reference.command_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["z-exact", "a-prefix", "b-prefix"]);
+        assert!(snapshot.aliases(&registry, "").is_empty());
+        assert!(snapshot.aliases(&registry, "go ").is_empty());
+        assert!(snapshot.aliases(&registry, "go argument").is_empty());
+    }
     use crikey_platform::{DirectoryConvention, DirectoryEnvironment, StandardDirectories};
 
     #[test]

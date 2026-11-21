@@ -765,9 +765,66 @@ pub struct HotkeyBinding {
 /// without doing query, rendering, or plugin work itself.
 pub type HotkeyActivationHandler = Box<dyn Fn(&HotkeyBinding) + Send + Sync + 'static>;
 
+/// Cross-thread cancellation for blocking platform approval, without moving the
+/// native service away from its owning thread.
+#[derive(Debug, Clone, Default)]
+pub struct HotkeyCancellation(std::sync::Arc<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicBool)>);
+
+impl HotkeyCancellation {
+    pub fn cancel(&self) {
+        use std::sync::atomic::Ordering;
+        if self
+            .0
+             .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| epoch.checked_add(1))
+            .is_err()
+        {
+            self.0 .1.store(true, Ordering::Release);
+        }
+    }
+    pub fn stop(&self) {
+        self.0 .1.store(true, std::sync::atomic::Ordering::Release);
+        self.cancel();
+    }
+    pub fn epoch(&self) -> u64 {
+        self.0 .0.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub fn cancelled(&self, epoch: u64) -> bool {
+        self.0 .1.load(std::sync::atomic::Ordering::Acquire) || self.epoch() != epoch
+    }
+}
+
 pub trait HotkeyService {
     fn register(&mut self, binding: &HotkeyBinding) -> Result<()>;
     fn unregister(&mut self, binding: &HotkeyBinding) -> Result<()>;
+
+    /// Services without blocking approval need no cancellation handle.
+    fn cancellation_handle(&self) -> Option<HotkeyCancellation> {
+        None
+    }
+
+    /// A blocking backend uses the admission epoch captured by the worker,
+    /// closing the cancellation race between its queue check and native entry.
+    fn register_at(&mut self, binding: &HotkeyBinding, _epoch: u64) -> Result<()> {
+        self.register(binding)
+    }
+
+    /// Retire process resources. The default releases each known binding through
+    /// the ordinary acknowledged unregister operation.
+    fn shutdown(&mut self, bindings: &[HotkeyBinding]) -> Result<()> {
+        self.set_activation_handler(None);
+        let mut errors = Vec::new();
+        for binding in bindings {
+            if let Err(error) = self.unregister(binding) {
+                errors.push(error.to_string());
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(crikey_core::CoreError::Invalid(errors.join("; ")))
+        }
+    }
 
     /// Replaces the handler invoked when a registered accelerator fires.
     ///

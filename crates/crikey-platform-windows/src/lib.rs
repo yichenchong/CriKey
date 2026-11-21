@@ -69,7 +69,6 @@ pub use process::{quote_arguments, ShellLauncher};
 #[derive(Debug)]
 pub struct WindowsBackend {
     applications: StartMenuDiscovery,
-    hotkeys: WindowsHotkeys,
     launcher: ShellLauncher,
     /// Built on first use and cached: resolving the cache directory reads the
     /// environment, which a constructor that touches nothing should not do.
@@ -88,13 +87,11 @@ impl WindowsBackend {
     ///
     /// Construction touches neither the filesystem nor COM nor the message
     /// queue: the known folders are resolved here, but scanning happens inside
-    /// [`ApplicationDiscovery::discover`] and the hotkey message thread starts
-    /// on the first successful registration. A backend that is built and never
-    /// used therefore costs one allocation and no thread.
+    /// [`ApplicationDiscovery::discover`]. The process hotkey service is created
+    /// separately on its registration-owner thread.
     pub fn new() -> Self {
         Self {
             applications: StartMenuDiscovery::new(),
-            hotkeys: WindowsHotkeys::new(),
             launcher: ShellLauncher::new(),
             icons: OnceLock::new(),
             files: OnceLock::new(),
@@ -107,7 +104,6 @@ impl WindowsBackend {
     pub fn with_application_roots(roots: Vec<PathBuf>, packaged: bool) -> Self {
         Self {
             applications: StartMenuDiscovery::with_roots(roots, packaged),
-            hotkeys: WindowsHotkeys::new(),
             launcher: ShellLauncher::new(),
             icons: OnceLock::new(),
             files: OnceLock::new(),
@@ -281,12 +277,11 @@ impl WindowsBackend {
         Some(self.files.get_or_init(WindowsFileSearch::new))
     }
 
-    /// The hotkey service behind [`Capability::GlobalHotkeys`].
-    ///
-    /// Registration mutates the backend because it owns the Win32 registration
-    /// ids and, on Windows, the message thread they live on.
-    pub fn hotkeys(&mut self) -> &mut dyn HotkeyService {
-        &mut self.hotkeys
+    /// Constructs the process registrar on its owning service thread.
+    pub fn hotkey_factory(
+        &self,
+    ) -> impl FnOnce() -> std::result::Result<Box<dyn HotkeyService>, String> + Send + 'static {
+        || Ok(Box::new(WindowsHotkeys::new()) as Box<dyn HotkeyService>)
     }
 }
 

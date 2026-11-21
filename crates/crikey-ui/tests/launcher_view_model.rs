@@ -3086,12 +3086,14 @@ fn ordinary_management_lists_all_exact_declarations_without_changing_result_disp
     assert_eq!(management[0].target, command_row("a").target);
     assert_eq!(management[1].target, command_row("b").target);
     assert_eq!(
-        model.apply(UiCommand::EditCommandPreference {
+        model.apply(UiCommand::EditCommandShortcut {
+            request_id: 71,
             target: management[1].target.clone(),
             expected_revision: 12,
             edit: crikey_ui::CommandPreferenceEdit::Hidden(true),
         }),
         Some(UiEffect::MutateCommandPreferences {
+            request_id: 71,
             reference: crikey_core::CommandRef {
                 provider_id: PluginId("core".into()),
                 command_id: "b".into()
@@ -3444,4 +3446,83 @@ fn matching_dispatch_notice_retirement_cannot_erase_a_newer_unrelated_failure() 
     );
     model.clear_navigation_notice(newer);
     assert!(model.frame().unwrap().navigation.unavailable.is_none());
+}
+
+#[test]
+fn shortcut_capture_is_transient_and_never_emits_an_execution() {
+    let mut model = open_showing(Generation::from_raw(1), &["row"]);
+    assert_eq!(
+        model.apply(UiCommand::BeginShortcutCapture("command-key".into())),
+        None
+    );
+    assert_eq!(model.shortcut_capture(), Some("command-key"));
+    assert_eq!(
+        model.apply(UiCommand::RecordShortcut("Ctrl+Alt+Space".into())),
+        None
+    );
+    assert_eq!(model.shortcut_capture(), None);
+    let frame = model.frame().unwrap();
+    assert!(frame
+        .setting_edits
+        .iter()
+        .any(|edit| edit.key == "capture:command-key" && edit.value == "Ctrl+Alt+Space"));
+    model.apply(UiCommand::BeginShortcutCapture("command-key".into()));
+    model.apply(UiCommand::CancelShortcutCapture);
+    assert_eq!(model.shortcut_capture(), None);
+    model.apply(UiCommand::BeginShortcutCapture("command-key".into()));
+    model.dismiss();
+    assert_eq!(model.shortcut_capture(), None);
+    model.activate();
+    assert_eq!(model.shortcut_capture(), None);
+}
+
+#[test]
+fn command_shortcut_acknowledgments_preserve_newer_request_identity() {
+    let mut model = open_showing(Generation::from_raw(1), &["row"]);
+    let reference = crikey_core::CommandRef {
+        provider_id: PluginId("owner".into()),
+        command_id: "command".into(),
+    };
+    for (request_id, status) in [
+        (72, crikey_ui::SettingEditStatus::Failed),
+        (71, crikey_ui::SettingEditStatus::Saved),
+    ] {
+        model.command_edit_completed(crikey_ui::CommandPreferenceEditOutcome {
+            request_id,
+            reference: reference.clone(),
+            edit: crikey_ui::CommandPreferenceEdit::SetHotkey(Some("Ctrl+K".into())),
+            status,
+        });
+    }
+    let frame = model.frame().unwrap();
+    let ack = frame
+        .setting_edits
+        .iter()
+        .find(|edit| edit.key == crikey_ui::command_edit_key(&reference, true))
+        .unwrap();
+    assert_eq!(ack.request_id, 72);
+    assert_eq!(ack.status, crikey_ui::SettingEditStatus::Failed);
+}
+
+#[test]
+fn settings_resume_never_restores_transient_shortcut_recording() {
+    let mut model = open_showing(Generation::from_raw(1), &["row"]);
+    model.set_resume_delay(std::time::Duration::from_secs(60));
+    model.open_settings(Some("launcher.activation-hotkey"));
+    model.apply(UiCommand::BeginShortcutCapture(
+        "launcher.activation-hotkey".into(),
+    ));
+    assert_eq!(model.shortcut_capture(), Some("launcher.activation-hotkey"));
+    model.dismiss();
+    assert_eq!(model.shortcut_capture(), None);
+    model.activate();
+    let frame = model.frame().unwrap();
+    assert!(frame.settings_open, "the logical settings route still resumes");
+    assert_eq!(frame.settings_focus, None);
+    assert_eq!(model.shortcut_capture(), None);
+    assert_eq!(model.apply(UiCommand::RecordShortcut("Ctrl+K".into())), None);
+    assert!(
+        model.frame().is_none(),
+        "retired recording cannot mutate a resumed settings route"
+    );
 }
