@@ -156,11 +156,6 @@ fn cancellation_before_preview_entry_is_replayed_and_does_not_leak() {
     // Deterministically occupy the endpoint's handle-installed / call-entry
     // gap: cancellation still targets the completed catalog request here.
     cancel.cancel();
-    let old_cancel = cancel
-        .observations()
-        .into_iter()
-        .find(|event| event.direction == "host->plugin" && event.kind == "cancel")
-        .unwrap();
     let requested = std::sync::atomic::AtomicBool::new(false);
     // The actual callback waits indefinitely for cooperative cancellation;
     // WorkerOptions::call_timeout_ms only bounds a broken replay's failure.
@@ -171,10 +166,19 @@ fn cancellation_before_preview_entry_is_replayed_and_does_not_leak() {
         PreviewOutcome::Cancelled,
     );
     let observations = worker.observations();
+    // Cancellation enqueues without waiting for trace publication. The real
+    // terminal response establishes dispatch; FIFO must still put the old
+    // cancellation before this preview's request and replayed cancellation.
+    let old_cancel_position = observations
+        .iter()
+        .position(|event| event.direction == "host->plugin" && event.kind == "cancel")
+        .unwrap();
+    let old_cancel = &observations[old_cancel_position];
     let request_position = observations
         .iter()
         .position(|event| event.kind == "preview_request" && event.generation == 201)
         .unwrap();
+    assert!(old_cancel_position < request_position);
     let request = &observations[request_position];
     assert_ne!(old_cancel.request_id, request.request_id);
     assert!(observations[request_position + 1..]
