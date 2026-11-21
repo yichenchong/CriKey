@@ -1364,7 +1364,13 @@ fn renderer_rows_preserve_ranked_hit_content_and_action_order() {
 
     let rows = service.result_rows();
     let row = rows.first().expect("matching item becomes one renderer row");
-    assert_eq!(row.item, ItemId("terminal".to_owned()));
+    assert_eq!(
+        row.target,
+        crikey_ui::ActionTarget::Result {
+            owner: owner.clone(),
+            item: ItemId("terminal".to_owned()),
+        }
+    );
     assert_eq!(row.label, "Terminal");
     assert_eq!(row.description, "Open a shell");
     assert_eq!(row.icon_reference.as_deref(), Some("terminal-icon"));

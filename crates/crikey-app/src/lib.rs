@@ -10,6 +10,9 @@
 //! ranked answer.
 
 mod cabi_provider;
+mod command_composition;
+mod command_preferences;
+mod command_registry;
 mod legacy_provider;
 mod modern_provider;
 mod native_provider;
@@ -17,6 +20,7 @@ mod plugin_action;
 mod plugin_icons;
 mod plugin_page;
 mod plugin_preview;
+mod preview_action_budget;
 mod query_history_store;
 mod query_pipeline;
 pub use query_history_store::{
@@ -27,6 +31,12 @@ mod selection_history_store;
 mod startup_recovery;
 mod wasm_provider;
 
+pub use command_composition::*;
+pub use command_preferences::{
+    CommandPreferencesSnapshot, CommandPreferencesStore, FallbackSearch, OrdinaryProviderState,
+    PreferenceError, PreferenceMutation,
+};
+pub use command_registry::{CommandRegistry, CommandRegistrySnapshot, RegisteredCommand, RegistryError};
 /// Re-exported so the composition root can report per-plugin diagnostics
 /// without depending on the supervisor crate directly; the driver accessors
 /// that return these live here.
@@ -34,7 +44,9 @@ pub use crikey_plugin_supervisor::{BudgetKind, ConcurrencyRefusals, PluginHealth
 pub use crikey_query::AliasTable;
 /// Re-exported so a host can persist ranking history without naming the
 /// ranking crate: [`SelectionHistoryStore`] speaks in exactly these types.
-pub use crikey_ranking::{QueryAffinityRecord, SelectionHistorySnapshot, SelectionRecord};
+pub use crikey_ranking::{
+    CommandSelectionRecord, QueryAffinityRecord, SelectionHistorySnapshot, SelectionRecord,
+};
 pub use crikey_result_aggregator::{
     BatchPriority, BatchState, DrainBudget, DrainReport, InboundBatch, IntakePolicy, MergedBatch,
     OverflowPolicy, ProducerState, QueueDepth, QueueDiagnostics, QueueEvent, QueueEventKind, QueueLimits,
@@ -43,18 +55,25 @@ pub use crikey_result_aggregator::{
 pub use legacy_provider::{
     LegacyDirectories, LegacyDriver, LegacyProvider, LegacyUnavailable, LegacyWorkerPool,
 };
-pub use modern_provider::{ModernDriver, ModernProvider, ModernUnavailable};
-pub use native_provider::{NativeDriver, NativeProvider, NativeUnavailable};
+pub use modern_provider::{
+    ModernCommandSnapshot, ModernCommandStatus, ModernDriver, ModernOwnerCommands, ModernProvider,
+    ModernUnavailable,
+};
+pub use native_provider::{
+    NativeCommandSnapshot, NativeCommandStatus, NativeDriver, NativeProvider, NativeUnavailable,
+};
 pub use plugin_action::{
-    ActionEffect, ActionReceipt, ActionRequestId, ActionSubmission, HostCapability, PluginActionCompletion,
-    PluginActionExecutor, PluginActionReceipt, PluginActionRouter,
+    ActionEffect, ActionReceipt, ActionRequestId, ActionSubmission, DeclaredCommandSource, HostCapability,
+    PluginActionCompletion, PluginActionExecutor, PluginActionReceipt, PluginActionRouter,
 };
 pub use plugin_icons::{
     IconFetch, PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
 };
 pub use plugin_page::PageUpdate;
 pub use plugin_preview::{PreviewIdentity, PreviewRequest, PreviewService, PreviewState, PreviewUpdate};
-pub use query_pipeline::{PipelineConfig, PipelineError, PipelineTick, QueryPipeline};
+pub use query_pipeline::{
+    OrdinarySearchProvider, OrdinarySearchSummary, PipelineConfig, PipelineError, PipelineTick, QueryPipeline,
+};
 pub use remote_catalog::{
     fetch_source, remote_owner, CatalogFetcher, DefaultCatalogFetcher, RemoteCatalogError,
     RemoteCatalogService, RemoteManifest, RemoteOutcome, RemoteReport, RemoteSlice, RemoteSource,
@@ -437,12 +456,7 @@ impl App {
         let hotkeys = self.backend.hotkeys();
         #[cfg(target_os = "linux")]
         let hotkeys = self.backend.hotkeys()?;
-        hotkeys.set_activation_handler(Some(handler));
-        if let Err(error) = hotkeys.register(&binding) {
-            hotkeys.set_activation_handler(None);
-            return Err(error);
-        }
-        Ok(())
+        register_activation_binding(hotkeys, &binding, handler)
     }
 
     /// Releases the activation shortcut, so a launcher that re-binds its
@@ -596,6 +610,7 @@ pub struct SearchHit {
 type Outcomes = HashMap<PluginId, HashMap<ItemId, MatchOutcome>>;
 
 type PositionCache = HashMap<PluginId, Vec<usize>>;
+type RepresentedCatalog = HashMap<PluginId, HashSet<ItemId>>;
 
 #[derive(Debug)]
 struct CandidateCache {
@@ -681,6 +696,7 @@ struct SearchPlan<'a> {
     per_plugin_limit: usize,
     global_limit: usize,
     batch_limit: usize,
+    represented_catalog: &'a RepresentedCatalog,
 }
 
 #[derive(Debug)]
@@ -698,6 +714,7 @@ struct PluginSelection<'items, 'query> {
     stats: SearchStats,
     retained: BinaryHeap<Reverse<RankedCandidate<'items>>>,
     limit: usize,
+    represented_catalog: &'query RepresentedCatalog,
 }
 
 impl<'items, 'query> PluginSelection<'items, 'query> {
@@ -717,6 +734,7 @@ impl<'items, 'query> PluginSelection<'items, 'query> {
             stats: SearchStats::default(),
             retained: BinaryHeap::with_capacity(plan.per_plugin_limit),
             limit: plan.per_plugin_limit,
+            represented_catalog: plan.represented_catalog,
         }
     }
 
@@ -730,6 +748,15 @@ impl<'items, 'query> PluginSelection<'items, 'query> {
         };
         self.matched_positions.push(position);
         self.stats.matches_found = self.stats.matches_found.saturating_add(1);
+        // Raw matching evidence precedes discovery projection and all quotas.
+        // A declared canonical primary is represented by command rows instead.
+        if self
+            .represented_catalog
+            .get(&item.plugin_id)
+            .is_some_and(|items| items.contains(&item.stable_id))
+        {
+            return;
+        }
         let mut signals = RankingSignals::default();
         self.history.augment(
             item,
@@ -870,7 +897,11 @@ impl CatalogBuild {
     /// where it publishes a replacement.
     pub fn publish(self, search: &mut SearchService) -> Result<usize, CatalogError> {
         search.set_catalog_persistence(&self.plugin, self.persist);
-        search.replace_catalog(&self.plugin, self.instance, self.items)
+        let retained = search.replace_catalog(&self.plugin, self.instance, self.items)?;
+        search
+            .accept_command_catalog(&self.plugin, self.instance, self.generation)
+            .map_err(|_| CatalogError::StaleInstance)?;
+        Ok(retained)
     }
 }
 
@@ -917,6 +948,13 @@ pub struct SearchService {
     last_query: Option<NormalizedQuery>,
     /// Exact-owner runtime endpoints for plugin-owned actions.
     plugin_actions: Option<Arc<PluginActionRouter>>,
+    command_registry: CommandRegistry,
+    command_sources: command_composition::CommandSourceLedger,
+    command_preferences: Arc<Mutex<CommandPreferencesStore>>,
+    command_preferences_snapshot: Arc<CommandPreferencesSnapshot>,
+    command_admission_paused: bool,
+    represented_catalog_revision: u64,
+    represented_catalog: RepresentedCatalog,
     /// The plugin and page id of the one open plugin-drawn page.
     ///
     /// One at a time, and the host remembers which: every later page call
@@ -936,6 +974,8 @@ impl SearchService {
     /// Wraps an [`App`], sharing its result limits with the aggregator.
     pub fn new(app: App) -> Self {
         let aggregator = MemoryResultAggregator::new(*app.limits());
+        let preferences = CommandPreferencesStore::empty();
+        let preferences_snapshot = preferences.snapshot();
         Self {
             app,
             catalog: MemoryCatalog::new(),
@@ -958,9 +998,83 @@ impl SearchService {
             now_secs: 0,
             last_query: None,
             plugin_actions: None,
+            command_registry: CommandRegistry::with_builtins(),
+            command_sources: command_composition::CommandSourceLedger::default(),
+            command_preferences: Arc::new(Mutex::new(preferences)),
+            command_preferences_snapshot: preferences_snapshot,
+            command_admission_paused: false,
+            represented_catalog_revision: 0,
+            represented_catalog: RepresentedCatalog::new(),
             page: None,
             icons: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The serialized ranking-reset owner closes admission until publication.
+    pub fn set_history_reset_pending(&mut self, pending: bool) {
+        self.command_admission_paused = pending;
+    }
+
+    fn refresh_command_catalog_projection(&mut self) {
+        let snapshot = self.command_snapshot();
+        if self.represented_catalog_revision == snapshot.revision {
+            return;
+        }
+        let mut represented = std::mem::take(&mut self.represented_catalog);
+        represented.clear();
+        for (reference, command) in &snapshot.commands {
+            let crikey_core::ExecutableTarget::Item { item_id, .. } = &command.declaration.executable_target
+            else {
+                continue;
+            };
+            if represented
+                .get(&reference.provider_id)
+                .is_some_and(|items| items.contains(item_id))
+            {
+                continue;
+            }
+            let Some(item) = self.catalog.get(&reference.provider_id, item_id) else {
+                continue;
+            };
+            if self.is_declared_primary_catalog_item(item) {
+                represented
+                    .entry(reference.provider_id.clone())
+                    .or_default()
+                    .insert(item_id.clone());
+            }
+        }
+        self.represented_catalog = represented;
+        self.represented_catalog_revision = snapshot.revision;
+    }
+    /// Handle passed only to the serialized configuration edit worker.
+    pub fn command_preferences_store(&self) -> Arc<Mutex<CommandPreferencesStore>> {
+        Arc::clone(&self.command_preferences)
+    }
+
+    /// Publish a completed immutable preference snapshot without waiting for I/O.
+    pub fn publish_command_preferences(&mut self, snapshot: Arc<CommandPreferencesSnapshot>) {
+        if snapshot.revision >= self.command_preferences_snapshot.revision {
+            self.command_preferences_snapshot = snapshot;
+        }
+    }
+
+    pub fn selection_learning(&self, owner: &PluginId, item: &ItemId) -> Option<SelectionLearning> {
+        let item = self
+            .results
+            .iter()
+            .find(|hit| &hit.item.plugin_id == owner && &hit.item.stable_id == item)?
+            .item
+            .clone();
+        Some(SelectionLearning {
+            item,
+            query: self.last_query.clone()?,
+        })
+    }
+
+    pub fn record_selection_learning(&mut self, learning: SelectionLearning) {
+        self.history
+            .record(&learning.item, &learning.query, self.now_secs);
+        self.candidate_cache = None;
     }
 
     /// Chooses which readings the matcher credits (spec 11.1).
@@ -1041,6 +1155,7 @@ impl SearchService {
 
     /// Removes a plugin's live catalog slice and everything derived from it.
     fn withdraw_slice(&mut self, plugin: &PluginId) {
+        let _ = self.withdraw_command_catalog(plugin);
         self.catalog.invalidate(plugin);
         self.non_prefix_upper.remove(plugin);
         if let Ok(at) = self.owners.binary_search(plugin) {
@@ -1149,10 +1264,11 @@ impl SearchService {
     /// Replaces the ranking history with a previously taken snapshot.
     ///
     /// Replaces rather than merges: the snapshot is the whole history, and a
-    /// merge would double every count on a host that restored twice. Callers
-    /// restore once, before queries are accepted.
+    /// merge would double every count on a host that restored twice. Live
+    /// selective-reset publication must serialize any pending success learning.
     pub fn restore_selection_history(&mut self, snapshot: SelectionHistorySnapshot) {
         self.history = SelectionHistory::from_snapshot(snapshot);
+        self.candidate_cache = None;
     }
 
     /// Clears all selection and query affinity records.
@@ -1308,6 +1424,7 @@ impl SearchService {
             let _ = self.catalog.retire_instance(plugin, instance);
             return Err(error);
         }
+        let _ = self.retire_command_catalog_binding(plugin);
         // A successful catalog replacement invalidates the visible answer.
         // Keeping old hits would let a user execute an item no longer in the catalog.
         self.results.clear();
@@ -1407,6 +1524,7 @@ impl SearchService {
                 pending: self.app.stage(),
             });
         }
+        self.refresh_command_catalog_projection();
 
         let generation = self.app.generations().advance();
         self.aggregator.begin_generation(generation);
@@ -1442,6 +1560,7 @@ impl SearchService {
                 per_plugin_limit,
                 global_limit,
                 batch_limit,
+                represented_catalog: &self.represented_catalog,
             },
         );
         self.candidate_cache = cache_complete.then(|| CandidateCache {
@@ -1604,6 +1723,7 @@ impl SearchService {
     pub fn result_rows(&self) -> Vec<ResultRow> {
         self.results
             .iter()
+            .filter(|hit| hit.ephemeral || !self.is_declared_primary_catalog_item(&hit.item))
             .map(|hit| {
                 let mut actions = hit.item.actions.iter();
                 let default_action = actions.next().cloned();
@@ -1614,8 +1734,16 @@ impl SearchService {
                     ArgumentPolicy::Required => Some("argument required".to_owned()),
                 };
                 ResultRow {
-                    plugin: hit.item.plugin_id.clone(),
-                    item: hit.item.stable_id.clone(),
+                    target: crikey_ui::ActionTarget::Result {
+                        owner: hit.item.plugin_id.clone(),
+                        item: hit.item.stable_id.clone(),
+                    },
+                    source: Some(crikey_ui::ResultSource {
+                        owner: hit.item.plugin_id.clone(),
+                        item: hit.item.stable_id.clone(),
+                        kind: crikey_ui::ResultSourceKind::Ordinary,
+                    }),
+                    command_state: None,
                     label: hit.item.label.clone(),
                     description: hit.item.description.clone(),
                     icon: hit
@@ -2357,7 +2485,7 @@ mod tests {
         }
         let generation = service.submit_query("fire").unwrap();
         let rows = service.result_rows();
-        let selected_owner = rows[0].plugin.clone();
+        let selected_owner = rows[0].source.as_ref().unwrap().owner.clone();
         let mut ui = LauncherViewModel::new();
         ui.activate();
         let _ = ui.apply(UiCommand::SetQuery("fire".into()));
@@ -2690,5 +2818,164 @@ mod page_ownership {
         // A page the host already saw close needs no second close call.
         service.close_page();
         assert_eq!(*stub.closes.lock().expect("stub state"), 0);
+    }
+}
+
+/// Exact admitted owner/item and query evidence retained until terminal success.
+#[derive(Debug)]
+pub struct SelectionLearning {
+    pub item: Item,
+    pub query: NormalizedQuery,
+}
+
+/// Worker-only selective persistence using the existing history store and format.
+pub fn reset_ranking_snapshot(
+    store: &SelectionHistoryStore,
+    snapshot: SelectionHistorySnapshot,
+    owner: &PluginId,
+    item: &ItemId,
+) -> std::io::Result<SelectionHistorySnapshot> {
+    let mut candidate = SelectionHistory::from_snapshot(snapshot);
+    store.reset_item(&mut candidate, owner, item)?;
+    Ok(candidate.snapshot())
+}
+
+#[cfg(test)]
+mod reset_admission_tests {
+    use super::*;
+
+    #[test]
+    fn common_command_admission_refuses_busy_without_learning_or_host_effect() {
+        let mut search = SearchService::new(App::new());
+        let snapshot = search.command_snapshot();
+        let reference = snapshot.commands.keys().next().unwrap();
+        search.set_history_reset_pending(true);
+        assert!(matches!(
+            search.invoke_command(reference, None, snapshot.revision),
+            Err(CommandInvokeError::Busy)
+        ));
+        assert!(search.selection_history_snapshot().commands.is_empty());
+        search.set_history_reset_pending(false);
+        assert!(matches!(
+            search.invoke_command(reference, None, snapshot.revision),
+            Ok(CommandSubmission::Host(crikey_core::HostCommand::OpenSettings))
+        ));
+        assert!(
+            search.selection_history_snapshot().commands.is_empty(),
+            "submission alone is not terminal success"
+        );
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn register_activation_binding(
+    hotkeys: &mut dyn crikey_platform::HotkeyService,
+    binding: &HotkeyBinding,
+    handler: HotkeyActivationHandler,
+) -> CoreResult<()> {
+    // A refused replacement must preserve both the old grab and its
+    // callback. Existing bindings share this backend-wide handler.
+    hotkeys.register(binding)?;
+    hotkeys.set_activation_handler(Some(handler));
+    Ok(())
+}
+
+#[cfg(all(test, any(windows, target_os = "linux")))]
+mod activation_hotkey_tests {
+    use super::*;
+    use crikey_platform::HotkeyService;
+    use std::sync::mpsc;
+
+    #[derive(Default)]
+    struct ActivationService {
+        bindings: Vec<HotkeyBinding>,
+        handler: Option<HotkeyActivationHandler>,
+    }
+
+    impl ActivationService {
+        fn activate(&self, accelerator: &str) {
+            if let Some(binding) = self
+                .bindings
+                .iter()
+                .find(|binding| binding.accelerator == accelerator)
+            {
+                if let Some(handler) = &self.handler {
+                    handler(binding);
+                }
+            }
+        }
+    }
+
+    impl HotkeyService for ActivationService {
+        fn register(&mut self, binding: &HotkeyBinding) -> CoreResult<()> {
+            if binding.accelerator == "Ctrl+Alt+K" {
+                return Err(crikey_core::CoreError::Invalid(
+                    "accelerator already grabbed".into(),
+                ));
+            }
+            self.bindings.push(binding.clone());
+            Ok(())
+        }
+
+        fn unregister(&mut self, binding: &HotkeyBinding) -> CoreResult<()> {
+            self.bindings.retain(|existing| existing != binding);
+            Ok(())
+        }
+
+        fn set_activation_handler(&mut self, handler: Option<HotkeyActivationHandler>) {
+            self.handler = handler;
+        }
+    }
+
+    #[test]
+    fn refused_replacement_preserves_activation_delivery_and_later_replacement_still_works() {
+        let mut service = ActivationService::default();
+        let (events, received) = mpsc::channel();
+        let old = HotkeyBinding {
+            accelerator: "Ctrl+Alt+Space".into(),
+        };
+        let busy = HotkeyBinding {
+            accelerator: "Ctrl+Alt+K".into(),
+        };
+        let replacement = HotkeyBinding {
+            accelerator: "Ctrl+Alt+J".into(),
+        };
+        let original = events.clone();
+        register_activation_binding(
+            &mut service,
+            &old,
+            Box::new(move |binding| original.send(("original", binding.accelerator.clone())).unwrap()),
+        )
+        .unwrap();
+
+        let refused = events.clone();
+        assert!(register_activation_binding(
+            &mut service,
+            &busy,
+            Box::new(move |binding| refused.send(("refused", binding.accelerator.clone())).unwrap()),
+        )
+        .is_err());
+        service.activate(&old.accelerator);
+        assert_eq!(
+            received.try_recv().unwrap(),
+            ("original", old.accelerator.clone())
+        );
+        service.activate(&busy.accelerator);
+        assert_eq!(received.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        register_activation_binding(
+            &mut service,
+            &replacement,
+            Box::new(move |binding| events.send(("replacement", binding.accelerator.clone())).unwrap()),
+        )
+        .unwrap();
+        service.unregister(&old).unwrap();
+        service.activate(&old.accelerator);
+        assert_eq!(received.try_recv(), Err(mpsc::TryRecvError::Empty));
+        service.activate(&replacement.accelerator);
+        assert_eq!(
+            received.try_recv().unwrap(),
+            ("replacement", replacement.accelerator)
+        );
     }
 }

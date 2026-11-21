@@ -447,6 +447,8 @@ pub enum Payload {
     PageFrame(PageFrame),
     PreviewRequest(PreviewRequest),
     PreviewResponse(PreviewResponse),
+    CommandsRequest(CommandsRequest),
+    CommandsResponse(CommandsResponse),
     // Host-to-host web surface traffic. Never sent to or by a plugin.
     OpenSurface(OpenSurface),
     RawInput(RawInput),
@@ -488,6 +490,8 @@ impl Payload {
             Self::PageFrame(_) => "page_frame",
             Self::PreviewRequest(_) => "preview_request",
             Self::PreviewResponse(_) => "preview_response",
+            Self::CommandsRequest(_) => "commands_request",
+            Self::CommandsResponse(_) => "commands_response",
             Self::OpenSurface(_) => "open_surface",
             Self::RawInput(_) => "raw_input",
             Self::ImeEvent(_) => "ime_event",
@@ -554,6 +558,8 @@ impl Message for Envelope {
                 Payload::Gone(value) => put_message(42, value, &mut out),
                 Payload::PreviewRequest(value) => put_message(43, value, &mut out),
                 Payload::PreviewResponse(value) => put_message(44, value, &mut out),
+                Payload::CommandsRequest(value) => put_message(45, value, &mut out),
+                Payload::CommandsResponse(value) => put_message(46, value, &mut out),
             }
         }
         finish(out, &self.unknown)
@@ -638,6 +644,8 @@ impl DecodeWithBudget for Envelope {
                 30 => value.payload = Some(Payload::LifecycleAck(nested(field, budget)?)),
                 43 => merge_web_payload!(&mut value.payload, PreviewRequest, field, budget),
                 44 => merge_web_payload!(&mut value.payload, PreviewResponse, field, budget),
+                45 => merge_web_payload!(&mut value.payload, CommandsRequest, field, budget),
+                46 => merge_web_payload!(&mut value.payload, CommandsResponse, field, budget),
                 31 => value.payload = Some(Payload::PageRequest(nested(field, budget)?)),
                 // PageFrame carries the plugin's web declaration, so merge
                 // both its envelope occurrences and its nested `web` fields.
@@ -722,14 +730,14 @@ macro_rules! impl_simple_impl {
             ) -> Result<(), ProtocolError> {
                 let $value = self;
                 let mut cursor = 0;
-                let mut seen = 0_u64;
+                let mut _seen = 0_u64;
                 while cursor < bytes.len() {
                     let start = cursor;
                     let $field = read_field(bytes, &mut cursor)?;
                     match $field.number {
                         $( $number => {
                             if !field_is_repeated!($field.number; $repeated) {
-                                mark_singular(&mut seen, $field.number)?;
+                                mark_singular(&mut _seen, $field.number)?;
                             }
                             $body
                         },)*
@@ -818,6 +826,47 @@ impl_simple!(PreviewRequest {
     if !this.item_id.is_empty() { put_string(1, &this.item_id, &mut out); }
 } decode(value, field, budget) {
     1 => value.item_id = preview_string(field, budget, 256)?,
+});
+
+impl_simple!(CommandsRequest {} repeated [] encode(_this, _out) {} decode(_value, _field, _budget) {});
+
+impl_simple!(CommandDeclaration {
+    command_id: String = String::new(),
+    label: String = String::new(),
+    item_id: String = String::new(),
+    action_id: String = String::new(),
+    argument_policy: i32 = 0
+} repeated [] encode(this, out) {
+    put_string(1, &this.command_id, &mut out);
+    put_string(2, &this.label, &mut out);
+    put_string(3, &this.item_id, &mut out);
+    put_string(4, &this.action_id, &mut out);
+    encode_enum(5, this.argument_policy, &mut out);
+} decode(value, field, budget) {
+    1 => value.command_id = preview_string(field, budget, 256)?,
+    2 => value.label = preview_string(field, budget, 8192)?,
+    3 => value.item_id = preview_string(field, budget, 256)?,
+    4 => value.action_id = preview_string(field, budget, 256)?,
+    5 => value.argument_policy = decode_i32(field)?,
+});
+
+impl_simple!(CommandsResponse {
+    status: i32 = 0,
+    commands: Vec<CommandDeclaration> = Vec::new(),
+    detail: String = String::new()
+} repeated [2] encode(this, out) {
+    encode_enum(1, this.status, &mut out);
+    for command in &this.commands { put_message(2, command, &mut out); }
+    put_string(3, &this.detail, &mut out);
+} decode(value, field, budget) {
+    1 => value.status = decode_i32(field)?,
+    2 => {
+        if value.commands.len() >= crikey_core::command::MAX_COMMANDS {
+            return Err(ProtocolError::Malformed("too many command declarations".into()));
+        }
+        push_decoded(&mut value.commands, nested(field, budget)?, budget)?;
+    },
+    3 => value.detail = preview_string(field, budget, 8192)?,
 });
 
 impl_simple!(PreviewValue {

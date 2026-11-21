@@ -60,9 +60,9 @@ pub use wgpu;
 /// One row in the result list (spec 6.4).
 #[derive(Debug, Clone)]
 pub struct ResultRow {
-    /// Exact producing owner; display names never establish identity.
-    pub plugin: PluginId,
-    pub item: ItemId,
+    pub target: ActionTarget,
+    pub source: Option<ResultSource>,
+    pub command_state: Option<CommandRowState>,
     pub label: String,
     pub description: String,
     /// What the producing plugin or backend said about this item's icon, which
@@ -90,6 +90,85 @@ pub struct ResultRow {
     pub alternate_actions: Vec<Action>,
 }
 
+/// Presentation provenance, never command dispatch authority.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResultSource {
+    pub owner: PluginId,
+    pub item: ItemId,
+    pub kind: ResultSourceKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResultSourceKind {
+    Ordinary,
+    DeclaredCatalog { epoch: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRowState {
+    pub registry_revision: u64,
+    pub preference_revision: u64,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+    pub favorite: Option<usize>,
+    pub favorite_count: usize,
+    pub hidden: bool,
+    pub fallback: Option<usize>,
+    pub fallback_count: usize,
+    pub aliases: Vec<String>,
+    pub hotkey: Option<String>,
+    pub argument_policy: crikey_core::ArgumentPolicy,
+    pub argument: Option<String>,
+    pub ranking_reset_available: bool,
+}
+
+/// Membership edits preserve every other preference record field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandPreferenceEdit {
+    Favorite(bool),
+    MoveFavorite { position: usize },
+    Hidden(bool),
+    Fallback(bool),
+    MoveFallback { position: usize },
+}
+
+impl ResultRow {
+    pub fn has_primary_action(&self) -> bool {
+        match &self.target {
+            ActionTarget::Command(_) => self.command_state.as_ref().is_some_and(|state| state.available),
+            ActionTarget::Result { .. } => self.default_action.is_some(),
+        }
+    }
+    pub fn primary_identity(&self) -> Option<ActionIdentity> {
+        match &self.target {
+            ActionTarget::Command(_) => self.has_primary_action().then_some(ActionIdentity::InvokeCommand),
+            ActionTarget::Result { .. } => self
+                .default_action
+                .as_ref()
+                .map(|action| ActionIdentity::Plugin(action.action_id.clone())),
+        }
+    }
+
+    pub fn primary_command(&self, generation: Generation, query: &str) -> Option<UiCommand> {
+        if !self.has_primary_action() {
+            return None;
+        }
+        match &self.target {
+            ActionTarget::Command(_) => Some(UiCommand::InvokeCommand {
+                target: self.target.clone(),
+                argument: None,
+                generation,
+                query: query.to_owned(),
+                registry_revision: self.command_state.as_ref()?.registry_revision,
+            }),
+            ActionTarget::Result { .. } => Some(UiCommand::ActivateAction {
+                target: self.target.clone(),
+                identity: self.primary_identity()?,
+            }),
+        }
+    }
+}
+
 /// One configurable value the settings surface shows (spec 6.3).
 ///
 /// Entirely host-supplied: the UI knows nothing about the configuration
@@ -108,6 +187,30 @@ pub struct SettingRow {
     pub source: String,
     /// Which control the value is edited with.
     pub control: SettingControl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingEditStatus {
+    Saved,
+    Failed,
+}
+
+/// An actual persistence result, correlated with the original submitted edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingEditOutcome {
+    pub request_id: u64,
+    pub key: String,
+    pub value: String,
+    pub status: SettingEditStatus,
+}
+
+static NEXT_SETTING_EDIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn next_setting_edit_id() -> u64 {
+    use std::sync::atomic::Ordering;
+    NEXT_SETTING_EDIT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+        .expect("setting edit identity exhausted")
 }
 
 /// What kind of control edits a [`SettingRow`].
@@ -336,6 +439,9 @@ pub struct ViewModel {
     /// about the settings costs a refcount bump rather than a copy of every
     /// key, label and value.
     pub settings: Arc<[SettingRow]>,
+    pub setting_edits: Arc<[SettingEditOutcome]>,
+    /// Full authoritative management projection, including hidden and unavailable references.
+    pub command_management: Arc<[ResultRow]>,
     /// The setting whose editor should take the keyboard when the surface
     /// opens, by key. `None` leaves the focus where the user put it.
     pub settings_focus: Option<String>,
@@ -374,6 +480,22 @@ pub struct ViewModel {
 /// Not [`Eq`]: a page input carries pointer coordinates, which are floats.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiCommand {
+    InvokeCommand {
+        target: ActionTarget,
+        argument: Option<String>,
+        generation: Generation,
+        query: String,
+        registry_revision: u64,
+    },
+    EditCommandPreference {
+        target: ActionTarget,
+        expected_revision: u64,
+        edit: CommandPreferenceEdit,
+    },
+    ResetCommandRanking {
+        target: ActionTarget,
+        registry_revision: u64,
+    },
     Back,
     SetLogicalScroll(LogicalScroll),
     RecallQuery,
@@ -429,6 +551,7 @@ pub enum UiCommand {
     /// Asks the host to persist one setting; the UI neither validates nor
     /// stores it.
     SetSetting {
+        request_id: u64,
         key: String,
         value: String,
     },
@@ -463,6 +586,23 @@ pub const PAGE_SIZE: usize = 8;
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiEffect {
     RecallQuery,
+    InvokeCommand {
+        reference: crikey_core::CommandRef,
+        argument: Option<String>,
+        registry_revision: u64,
+        view: ViewId,
+        generation: Generation,
+        query: String,
+    },
+    MutateCommandPreferences {
+        reference: crikey_core::CommandRef,
+        expected_revision: u64,
+        edit: CommandPreferenceEdit,
+    },
+    ResetCommandRanking {
+        reference: crikey_core::CommandRef,
+        registry_revision: u64,
+    },
     ClearQueryHistory,
     /// The query text changed; schedule a generation for it (spec 6.2.2).
     Query(String),
@@ -483,6 +623,7 @@ pub enum UiEffect {
     /// settings surface is the UI's own business, but the value behind a row
     /// belongs to the host's configuration store.
     SetSetting {
+        request_id: u64,
         key: String,
         value: String,
     },
@@ -563,6 +704,8 @@ impl Default for PreviewPane {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewSelection {
     pub view: ViewId,
+    pub target: ActionTarget,
+    pub source: ResultSource,
     pub generation: Generation,
     pub plugin: PluginId,
     pub item: ItemId,
@@ -634,6 +777,7 @@ pub struct LauncherViewModel {
     /// host owns the configuration; the model only carries its description to
     /// the renderer, which is why this survives `dismiss`.
     settings: Arc<[SettingRow]>,
+    setting_edits: Arc<[SettingEditOutcome]>,
     /// The setting an opening surface should put the keyboard in, by key.
     settings_focus: Option<String>,
     /// The plugin-drawn page the launcher is showing, if any (spec 32).
@@ -670,11 +814,14 @@ pub struct LauncherViewModel {
     navigation_scroll: LogicalScroll,
     navigation_restore: u64,
     navigation_unavailable: Option<String>,
+    navigation_notice_revision: u64,
+    navigation_notice_token: Option<NavigationNoticeToken>,
     page_reopen: Option<NavigationRoute>,
     reopening: bool,
     resume_delay: std::time::Duration,
     suspended_at: Option<std::time::Duration>,
     suspended: Option<navigation::Entry>,
+    command_management: Arc<[ResultRow]>,
     navigation_clock: Arc<dyn NavigationClock>,
     recall: Arc<[String]>,
     recall_selected: usize,
@@ -697,6 +844,7 @@ impl LauncherViewModel {
     /// startup. Default reset-mode activation needs no reconstruction.
     pub fn new() -> Self {
         Self {
+            command_management: Arc::default(),
             visible: false,
             view_id: ViewId(0),
             publication_view: None,
@@ -711,6 +859,7 @@ impl LauncherViewModel {
             pending_plugins: false,
             settings_open: false,
             settings: Arc::default(),
+            setting_edits: Arc::default(),
             settings_focus: None,
             page: None,
             show_hints: true,
@@ -725,6 +874,8 @@ impl LauncherViewModel {
             navigation_scroll: LogicalScroll::default(),
             navigation_restore: 0,
             navigation_unavailable: None,
+            navigation_notice_revision: 0,
+            navigation_notice_token: None,
             page_reopen: None,
             reopening: false,
             resume_delay: std::time::Duration::ZERO,
@@ -738,6 +889,27 @@ impl LauncherViewModel {
             navigation_title: Arc::from("Search"),
             preserve_scroll: false,
         }
+    }
+
+    /// Refresh from the same authoritative registry/preferences projection as discovery.
+    pub fn set_command_management_rows(&mut self, mut rows: Vec<ResultRow>) {
+        rows.sort_by(|left, right| match (&left.target, &right.target) {
+            (ActionTarget::Command(left), ActionTarget::Command(right)) => left.cmp(right),
+            (ActionTarget::Command(_), _) => std::cmp::Ordering::Less,
+            (_, ActionTarget::Command(_)) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        });
+        rows.dedup_by(|left, right| left.target == right.target);
+        self.command_management = rows.into();
+        if let Some(panel) = &mut self.action_panel {
+            let replacement = self
+                .rows
+                .iter()
+                .find(|row| panel.tree().target().matches(row))
+                .and_then(|row| action_tree(row, &self.command_management).ok());
+            let _ = Arc::make_mut(panel).reconcile(replacement);
+        }
+        self.dirty |= self.visible;
     }
 
     /// Inject before first activation; expiry is monotonic and exact at the boundary.
@@ -759,12 +931,12 @@ impl LauncherViewModel {
     }
 
     pub fn navigation_restoration(&self) -> NavigationRestoration {
-        // Legacy/free-form argument-bearing targets cannot donate raw argument text.
-        if self
-            .rows
-            .get(self.selected)
-            .is_some_and(|row| row.argument_hint.is_some())
-        {
+        // Legacy result queries can contain free-form arguments. Command
+        // discovery queries are not argument drafts; their editor drafts stay
+        // in renderer state and are never copied into this restoration payload.
+        if self.rows.get(self.selected).is_some_and(|row| {
+            matches!(row.target, ActionTarget::Result { .. }) && row.argument_hint.is_some()
+        }) {
             return NavigationRestoration::default();
         }
         NavigationRestoration {
@@ -828,11 +1000,7 @@ impl LauncherViewModel {
             NavigationRoute::Root
         };
         let state = self.navigation_restoration();
-        let rows = if state.query.is_empty() {
-            Arc::default()
-        } else {
-            self.rows.clone()
-        };
+        let rows = self.rows.clone();
         navigation::Entry { route, rows, state }
     }
 
@@ -844,11 +1012,13 @@ impl LauncherViewModel {
         {
             self.navigation_unavailable =
                 Some("Navigation limit reached. Go Back before opening another view.".into());
+            self.navigation_notice_token = None;
             self.dirty = true;
             return false;
         }
         self.navigation_stack.push(entry);
         self.navigation_unavailable = None;
+        self.navigation_notice_token = None;
         self.navigation_scroll = LogicalScroll::default();
         true
     }
@@ -862,6 +1032,7 @@ impl LauncherViewModel {
         self.restore_navigation_state(entry.state);
         self.query_refresh = false;
         self.navigation_unavailable = None;
+        self.navigation_notice_token = None;
         match entry.route {
             NavigationRoute::Root => {
                 self.navigation_title = Arc::from("Search");
@@ -948,14 +1119,33 @@ impl LauncherViewModel {
         self.dirty = true;
     }
 
-    pub fn set_navigation_notice(&mut self, mut message: String) {
+    pub fn set_navigation_notice(&mut self, message: String) {
+        let _ = self.publish_navigation_notice(message);
+    }
+
+    /// Publishes a notice whose source may later retire only this exact notice.
+    pub fn publish_navigation_notice(&mut self, mut message: String) -> Option<NavigationNoticeToken> {
         let mut end = message.len().min(action_panel::MAX_ACTION_TEXT_BYTES);
         while !message.is_char_boundary(end) {
             end -= 1;
         }
         message.truncate(end);
+        let token = self.navigation_notice_revision.checked_add(1).map(|revision| {
+            self.navigation_notice_revision = revision;
+            NavigationNoticeToken(revision)
+        });
+        self.navigation_notice_token = token;
         self.navigation_unavailable = Some(message);
         self.dirty |= self.visible;
+        token
+    }
+
+    pub fn clear_navigation_notice(&mut self, token: NavigationNoticeToken) {
+        if self.navigation_notice_token == Some(token) {
+            self.navigation_unavailable = None;
+            self.navigation_notice_token = None;
+            self.dirty |= self.visible;
+        }
     }
 
     pub fn is_visible(&self) -> bool {
@@ -984,7 +1174,33 @@ impl LauncherViewModel {
             && !self.query.trim().is_empty()
             && row.argument_hint.is_none()
             && row.default_action.is_some())
-        .then_some((self.query.as_str(), &row.plugin, &row.item))
+        .then_some(())?;
+        let ActionTarget::Result { owner, item } = &row.target else {
+            return None;
+        };
+        Some((self.query.as_str(), owner, item))
+    }
+
+    /// Root-query recall candidate for a deliberate command Enter. Argument
+    /// editors and action search never supply recall text; the host still waits
+    /// for successful, privacy-admitted completion before recording this query.
+    pub fn submitted_command_query(&self) -> Option<&str> {
+        let row = self.current_action_row()?;
+        if self.view().is_none_or(|(_, kind)| kind != ViewKind::RootList)
+            || self.action_panel.is_some()
+            || self.query.trim().is_empty()
+            || !matches!(row.target, ActionTarget::Command(_))
+        {
+            return None;
+        }
+        let state = row.command_state.as_ref()?;
+        if !state.available
+            || (state.argument_policy == crikey_core::ArgumentPolicy::Required
+                && state.argument.as_ref().is_none_or(|argument| argument.is_empty()))
+        {
+            return None;
+        }
+        Some(self.query.as_str())
     }
 
     /// Drains the fresh search owed after uncovering the root list.
@@ -1007,6 +1223,18 @@ impl LauncherViewModel {
         Some(self.query.clone())
     }
 
+    /// Refreshes host-owned discovery inputs without resetting user selection.
+    pub fn refresh_root_query(&mut self) -> Option<String> {
+        if !self.view().is_some_and(|(_, kind)| kind == ViewKind::RootList) {
+            return None;
+        }
+        if self.navigated {
+            self.restoration_target = self.rows.get(self.selected).map(|row| row.target.clone());
+        }
+        self.query_refresh = true;
+        self.take_query_refresh()
+    }
+
     fn change_view(&mut self) {
         self.view_id = ViewId(self.view_id.0.checked_add(1).expect("view identity exhausted"));
         self.recall = Arc::default();
@@ -1024,6 +1252,7 @@ impl LauncherViewModel {
 
         self.visible = true;
         self.change_view();
+        self.query_refresh = true;
         if let Some(entry) = self.suspended.take() {
             if self
                 .suspended_at
@@ -1059,6 +1288,7 @@ impl LauncherViewModel {
         }
 
         self.navigation_unavailable = None;
+        self.navigation_notice_token = None;
         self.navigation_title = Arc::from("Search");
         if !self.resume_delay.is_zero() {
             let entry = self.capture_entry();
@@ -1073,6 +1303,7 @@ impl LauncherViewModel {
                 self.navigation_stack.clear();
                 self.navigation_unavailable =
                     Some("Previous view exceeded the 8 MiB resume limit; search was reset.".into());
+                self.navigation_notice_token = None;
             }
         } else {
             self.suspended = None;
@@ -1158,7 +1389,6 @@ impl LauncherViewModel {
             return;
         }
 
-        let rows: Vec<ResultRow> = if self.query.is_empty() { Vec::new() } else { rows };
         self.selected = self.resolve_selection(&rows, generation);
         // One move into a shared allocation per accepted publish; from here on
         // every frame of this result set is a refcount bump.
@@ -1168,7 +1398,7 @@ impl LauncherViewModel {
                 .rows
                 .iter()
                 .find(|row| panel.tree().target().matches(row))
-                .and_then(|row| action_tree(row).ok());
+                .and_then(|row| action_tree(row, &self.command_management).ok());
             let _ = Arc::make_mut(panel).reconcile(replacement);
         }
         self.pending_plugins = pending_plugins;
@@ -1201,9 +1431,11 @@ impl LauncherViewModel {
             selected: self.selected,
             pending_plugins: self.pending_plugins,
             action_panel: self.action_panel.clone(),
+            command_management: Arc::clone(&self.command_management),
             settings_open: self.settings_open,
             // Shared for the same reason the rows are.
             settings: Arc::clone(&self.settings),
+            setting_edits: Arc::clone(&self.setting_edits),
             settings_focus: self.settings_focus.clone(),
             // One refcount bump on the node list plus the surface's own three
             // short strings, so a page redrawing on a timer does not copy its
@@ -1281,6 +1513,7 @@ impl LauncherViewModel {
             UiCommand::SetPreviewRatio(ratio) => {
                 self.set_preview_ratio(ratio);
                 Some(UiEffect::SetSetting {
+                    request_id: next_setting_edit_id(),
                     key: "launcher.preview-split".into(),
                     value: self.preview.ratio.to_string(),
                 })
@@ -1328,6 +1561,99 @@ impl LauncherViewModel {
                 }
                 None
             }
+            UiCommand::InvokeCommand {
+                target,
+                argument,
+                generation,
+                query,
+                registry_revision,
+            } => {
+                if self.active != Some(generation) || self.query != query {
+                    return None;
+                }
+                self.current_action_row()?;
+                let row = self.command_row(&target)?;
+                if row.target != target {
+                    return None;
+                }
+                let ActionTarget::Command(reference) = &row.target else {
+                    return None;
+                };
+                let state = row.command_state.as_ref()?;
+                if state.registry_revision != registry_revision {
+                    return None;
+                }
+                if !state.available {
+                    return None;
+                }
+                let argument = argument.or_else(|| state.argument.clone());
+                match state.argument_policy {
+                    crikey_core::ArgumentPolicy::Required
+                        if argument.as_ref().is_none_or(|value| value.is_empty()) =>
+                    {
+                        self.open_actions();
+                        return None;
+                    }
+                    crikey_core::ArgumentPolicy::Forbidden if argument.is_some() => return None,
+                    _ => {}
+                }
+                Some(UiEffect::InvokeCommand {
+                    reference: reference.clone(),
+                    argument,
+                    registry_revision: state.registry_revision,
+                    view: self.view_id,
+                    generation,
+                    query,
+                })
+            }
+            UiCommand::EditCommandPreference {
+                target,
+                expected_revision,
+                edit,
+            } => {
+                let row = self.command_row(&target)?;
+                if row.target != target {
+                    return None;
+                }
+                let ActionTarget::Command(reference) = &row.target else {
+                    return None;
+                };
+                let state = row.command_state.as_ref()?;
+                if state.preference_revision != expected_revision {
+                    return None;
+                }
+                if matches!(edit, CommandPreferenceEdit::Fallback(true))
+                    && state.available
+                    && state.argument_policy == crikey_core::ArgumentPolicy::Forbidden
+                {
+                    return None;
+                }
+                Some(UiEffect::MutateCommandPreferences {
+                    reference: reference.clone(),
+                    expected_revision,
+                    edit,
+                })
+            }
+            UiCommand::ResetCommandRanking {
+                target,
+                registry_revision,
+            } => {
+                let row = self.command_row(&target)?;
+                if row.target != target {
+                    return None;
+                }
+                let ActionTarget::Command(reference) = &row.target else {
+                    return None;
+                };
+                let state = row.command_state.as_ref()?;
+                if !state.ranking_reset_available || state.registry_revision != registry_revision {
+                    return None;
+                }
+                Some(UiEffect::ResetCommandRanking {
+                    reference: reference.clone(),
+                    registry_revision,
+                })
+            }
             UiCommand::ActivateAction { target, identity } => self.dispatch_action(&target, &identity),
             UiCommand::ActivateSelectedAction => self.activate_panel(),
             UiCommand::ActionBack => {
@@ -1343,7 +1669,7 @@ impl LauncherViewModel {
                 }
                 let row = self.current_action_row()?;
                 let target = ActionTarget::of(row);
-                let identity = ActionIdentity::Plugin(row.default_action.as_ref()?.action_id.clone());
+                let identity = row.primary_identity()?;
                 self.dispatch_action(&target, &identity)
             }
             UiCommand::OpenSettings => {
@@ -1373,7 +1699,15 @@ impl LauncherViewModel {
                 self.close_page();
                 Some(UiEffect::ClosePage)
             }
-            UiCommand::SetSetting { key, value } => Some(UiEffect::SetSetting { key, value }),
+            UiCommand::SetSetting {
+                request_id,
+                key,
+                value,
+            } => Some(UiEffect::SetSetting {
+                request_id,
+                key,
+                value,
+            }),
             UiCommand::Quit => Some(UiEffect::Quit),
             // Cancel backs out one rung at a time: it closes an open page
             // first, then the settings surface, then an open action list, then
@@ -1519,12 +1853,33 @@ impl LauncherViewModel {
         true
     }
 
+    pub fn setting_edit_completed(&mut self, outcome: SettingEditOutcome) {
+        if self
+            .setting_edits
+            .iter()
+            .find(|edit| edit.key == outcome.key)
+            .is_some_and(|previous| previous.request_id > outcome.request_id || previous == &outcome)
+        {
+            return;
+        }
+        let mut edits = self.setting_edits.to_vec();
+        if let Some(previous) = edits.iter_mut().find(|edit| edit.key == outcome.key) {
+            *previous = outcome;
+        } else {
+            edits.push(outcome);
+        }
+        self.setting_edits = edits.into();
+        self.dirty |= self.visible;
+    }
+
     /// Replaces what the settings surface lists.
     ///
     /// Accepted while hidden, unlike everything else here, because these rows
     /// describe the host's configuration rather than a launcher session: the
     /// host publishes them at startup and again after each write, and the
     /// launcher must already know them the first time it is shown.
+    /// Active renderer text drafts are keyed by setting identity separately
+    /// from this snapshot and survive reloads until acknowledged saved or cancelled.
     pub fn set_settings(&mut self, settings: Vec<SettingRow>) {
         if *self.settings == *settings {
             return;
@@ -1587,20 +1942,21 @@ impl LauncherViewModel {
         let current = if self.view().is_some_and(|(_, kind)| kind == ViewKind::RootList)
             && self.active == self.published
             && self.publication_view == Some(self.view_id)
-            && !self.query.is_empty()
         {
-            self.rows
-                .get(self.selected)
-                .map(|row| (self.view_id, self.active.unwrap(), &row.plugin, &row.item))
+            self.rows.get(self.selected).and_then(|row| {
+                row.source
+                    .as_ref()
+                    .map(|source| (self.view_id, self.active.unwrap(), &row.target, source))
+            })
         } else {
             None
         };
         let unchanged = match (&self.preview_selection, &current) {
-            (Some(old), Some((view, generation, plugin, item))) => {
+            (Some(old), Some((view, generation, target, source))) => {
                 old.view == *view
                     && old.generation == *generation
-                    && &old.plugin == *plugin
-                    && &old.item == *item
+                    && &old.target == *target
+                    && &old.source == *source
             }
             (None, None) => true,
             _ => false,
@@ -1621,11 +1977,13 @@ impl LauncherViewModel {
                 return None;
             };
             self.selection_revision = revision;
-            self.preview_selection = current.map(|(view, generation, plugin, item)| PreviewSelection {
+            self.preview_selection = current.map(|(view, generation, target, source)| PreviewSelection {
                 view,
                 generation,
-                plugin: plugin.clone(),
-                item: item.clone(),
+                target: target.clone(),
+                source: source.clone(),
+                plugin: source.owner.clone(),
+                item: source.item.clone(),
                 revision: self.selection_revision,
             });
             self.preview.status = None;
@@ -1701,6 +2059,7 @@ impl LauncherViewModel {
         self.page_reopen = None;
         self.reopening = false;
         self.navigation_unavailable = None;
+        self.navigation_notice_token = None;
         self.settings_open = true;
         self.settings_focus = focus;
         self.navigation_title = Arc::from("Settings");
@@ -1932,7 +2291,7 @@ impl LauncherViewModel {
         let Some(row) = self.current_action_row() else {
             return;
         };
-        match action_tree(row) {
+        match action_tree(row, &self.command_management) {
             Ok(tree) => {
                 self.action_panel = Some(Arc::new(ActionPanel::new(tree)));
                 self.navigated = true;
@@ -1998,7 +2357,7 @@ impl LauncherViewModel {
             }
             return self.activate_panel();
         }
-        let tree = action_tree(row).ok()?;
+        let tree = action_tree(row, &self.command_management).ok()?;
         let execution = tree.execution(identity, row).ok().flatten()?;
         self.execute_action(execution)
     }
@@ -2006,6 +2365,16 @@ impl LauncherViewModel {
     fn execute_action(&mut self, execution: ActionExecution) -> Option<UiEffect> {
         self.close_actions();
         match execution {
+            ActionExecution::Command { reference } => {
+                let state = self.current_action_row()?.command_state.as_ref()?;
+                self.apply(UiCommand::InvokeCommand {
+                    target: ActionTarget::Command(reference),
+                    argument: None,
+                    registry_revision: state.registry_revision,
+                    generation: self.active?,
+                    query: self.query.clone(),
+                })
+            }
             ActionExecution::Plugin { owner, item, action } => {
                 Some(UiEffect::Execute { owner, item, action })
             }
@@ -2013,6 +2382,26 @@ impl LauncherViewModel {
                 self.open_settings(None).then_some(UiEffect::ClosePage)
             }
         }
+    }
+
+    fn command_row(&self, target: &ActionTarget) -> Option<&ResultRow> {
+        if self.visible && self.settings_open {
+            return self.command_management.iter().find(|row| &row.target == target);
+        }
+        let selected = self.current_action_row()?;
+        if &selected.target == target {
+            return Some(selected);
+        }
+        let ActionTarget::Result { owner, item } = &selected.target else {
+            return None;
+        };
+        self.command_management.iter().find(|row| {
+            &row.target == target
+                && row
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| &source.owner == owner && &source.item == item)
+        })
     }
 
     /// Closes the action list. An already closed list is not a change, so this
@@ -2087,12 +2476,15 @@ impl LauncherViewModel {
 
         incoming
             .iter()
-            .position(|row| row.plugin == anchor.plugin && row.item == anchor.item)
+            .position(|row| row.target == anchor.target)
             .unwrap_or(self.selected.min(last))
     }
 }
 
-fn action_tree(row: &ResultRow) -> Result<Arc<ActionTree>, action_panel::ActionPanelRefusal> {
+fn action_tree(
+    row: &ResultRow,
+    management: &[ResultRow],
+) -> Result<Arc<ActionTree>, action_panel::ActionPanelRefusal> {
     use action_panel::{ActionEntry, ActionPresentation};
     let host = ActionEntry::Submenu {
         id: "launcher-settings".into(),
@@ -2104,5 +2496,9 @@ fn action_tree(row: &ResultRow) -> Result<Arc<ActionTree>, action_panel::ActionP
         },
         entries: vec![ActionTree::open_settings_entry()],
     };
-    ActionTree::from_flat(row, vec![host])
+    ActionTree::from_flat(row, vec![host]).map(|tree| ActionTree::with_management(tree, row, management))
 }
+
+/// Opaque authority to retire one host notice, never a newer unrelated notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NavigationNoticeToken(u64);

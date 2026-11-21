@@ -2,6 +2,8 @@
 //!
 //! Target: at least 500,000 indexed items with responsive search.
 
+pub mod command_discovery;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,

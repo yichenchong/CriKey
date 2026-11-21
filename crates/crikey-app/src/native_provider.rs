@@ -42,6 +42,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::preview_action_budget::{ForegroundActionAdmission, PreviewActionGate, PreviewCancellation};
+use crikey_core::command::{
+    validate_plugin_commands, CommandAvailability, CommandDeclaration, PluginCommands, MAX_COMMANDS,
+    MAX_COMMAND_BYTES,
+};
 use crikey_core::{ActionId, ArgumentPolicy, ExecutionPolicy, Generation, Item, ItemId, PageInput, PluginId};
 use crikey_input_scheduler::Millis;
 use crikey_native_host::{
@@ -49,7 +54,7 @@ use crikey_native_host::{
     NativeSupervisor, ResourceKind, ResourceOutcome, Suggestions, SupervisorConfig, WorkerOptions,
 };
 use crikey_plugin_model::{Manifest, Permissions, Runtime, Startup};
-use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
+use crikey_plugin_supervisor::{BudgetKind, PluginBudgetHandle};
 use crikey_ui::{ResultRow, ViewModel};
 
 use crate::plugin_icons::{
@@ -70,7 +75,34 @@ type WorkerKey = (String, String);
 
 /// UI preview readers only inspect this snapshot. Background lifecycle polling
 /// updates idle workers as well as workers completing a query/action/preview.
-type NativeIncarnations = Arc<Mutex<BTreeMap<PluginId, u64>>>;
+type NativeIncarnations = Arc<Mutex<NativeIncarnationState>>;
+
+/// Preview liveness and declaration provenance are deliberately distinct:
+/// healthy release clears `live` but must not forget a replacement was seen.
+#[derive(Debug, Default)]
+struct NativeIncarnationState {
+    live: BTreeMap<PluginId, u64>,
+    observed: BTreeMap<PluginId, u64>,
+}
+
+impl NativeIncarnationState {
+    fn get(&self, plugin: &PluginId) -> Option<&u64> {
+        self.live.get(plugin)
+    }
+    fn insert(&mut self, plugin: PluginId, incarnation: u64) {
+        if self.observed.get(&plugin) != Some(&incarnation) {
+            self.observed.insert(plugin.clone(), incarnation);
+        }
+        self.live.insert(plugin, incarnation);
+    }
+    fn remove(&mut self, plugin: &PluginId) -> Option<u64> {
+        self.live.remove(plugin)
+    }
+    fn clear(&mut self) {
+        self.live.clear();
+        self.observed.clear();
+    }
+}
 
 fn refresh_incarnation(
     supervisor: &mut NativeSupervisor,
@@ -133,8 +165,8 @@ pub struct NativeUnavailable {
 #[path = "native_preview.rs"]
 mod native_preview;
 
-/// One loaded native plugin and the worker key that serves it. The launch
-/// recipe is retained so catalog requests can use an independent process.
+/// One loaded native plugin and the shared query/catalog worker key that serves
+/// it. The launch recipe is retained for the isolated resource supervisor.
 #[derive(Debug, Clone)]
 struct LoadedPlugin {
     plugin: PluginId,
@@ -142,6 +174,7 @@ struct LoadedPlugin {
     launch: LaunchSpec,
     worker_options: WorkerOptions,
     budget: PluginBudgetHandle,
+    action_gate: Arc<PreviewActionGate>,
     soft_timeout: Duration,
     permissions: Permissions,
     /// Whether this plugin's catalog may be written to the persistent cache.
@@ -153,6 +186,195 @@ struct LoadedPlugin {
 /// Admission counts active and completed-but-undrained tasks together, so the
 /// synchronous result channel cannot back up behind a hidden UI.
 const CATALOG_RESULT_CAPACITY: usize = 64;
+
+/// Terminal declaration intake state, independent of preview-worker liveness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeCommandStatus {
+    Ready,
+    Unsupported,
+    Cancelled,
+    Invalid(String),
+    Failed(String),
+    Stale,
+    Unavailable,
+}
+
+/// Immutable installed-owner declaration publication. `revision` is a host
+/// publication identity, not a worker connection; use it as registry incarnation.
+/// Ready declarations require matching catalog admission. Empty error or
+/// invalidation publications revoke registry entries without a successful catalog.
+#[derive(Debug, Clone)]
+pub struct NativeCommandSnapshot {
+    pub plugin: PluginId,
+    pub revision: u64,
+    pub instance: u64,
+    pub generation: Generation,
+    pub producer: u64,
+    pub status: NativeCommandStatus,
+    released: bool,
+    pub declarations: Arc<[CommandDeclaration]>,
+}
+
+#[derive(Debug, Default)]
+struct NativeCommandPublications {
+    revision: u64,
+    latest: BTreeMap<PluginId, u64>,
+    owners: BTreeMap<PluginId, Arc<NativeCommandSnapshot>>,
+}
+
+impl NativeCommandPublications {
+    fn publish(&mut self, mut snapshot: NativeCommandSnapshot) {
+        let Some(revision) = self.revision.checked_add(1) else {
+            // Exhaustion cannot revive an earlier executable publication.
+            self.owners.clear();
+            self.latest.clear();
+            return;
+        };
+        let retained = self
+            .owners
+            .values()
+            .filter(|owner| owner.plugin != snapshot.plugin);
+        let (mut count, mut bytes) = (snapshot.declarations.len(), command_bytes(&snapshot.declarations));
+        for owner in retained {
+            count = count.saturating_add(owner.declarations.len());
+            bytes = bytes.saturating_add(command_bytes(&owner.declarations));
+        }
+        if count > MAX_COMMANDS || bytes > MAX_COMMAND_BYTES {
+            snapshot.status =
+                NativeCommandStatus::Invalid("native declaration publications exceed bounds".into());
+            snapshot.declarations = Arc::from([]);
+        }
+        self.revision = revision;
+        snapshot.revision = revision;
+        self.owners.insert(snapshot.plugin.clone(), Arc::new(snapshot));
+    }
+
+    fn invalidate(&mut self, plugin: &PluginId) {
+        let pending = self.latest.remove(plugin).is_some();
+        if let Some(previous) = self.owners.get(plugin) {
+            let mut snapshot = (**previous).clone();
+            snapshot.status = NativeCommandStatus::Unavailable;
+            snapshot.declarations = Arc::from([]);
+            self.publish(snapshot);
+        } else if pending {
+            // Invalidation is a revocation even before the first catalog has
+            // succeeded. Empty terminal publications need no catalog admission.
+            self.publish(NativeCommandSnapshot {
+                plugin: plugin.clone(),
+                revision: 0,
+                instance: 0,
+                generation: Generation::ZERO,
+                producer: 0,
+                released: false,
+                status: NativeCommandStatus::Unavailable,
+                declarations: Arc::from([]),
+            });
+        }
+    }
+}
+
+fn command_bytes(commands: &[CommandDeclaration]) -> usize {
+    commands
+        .iter()
+        .map(|command| {
+            let target = match &command.executable_target {
+                crikey_core::command::ExecutableTarget::Item { item_id, action_id } => {
+                    item_id.0.len() + action_id.as_ref().map_or(0, |id| id.0.len())
+                }
+                crikey_core::command::ExecutableTarget::Host(_) => 0,
+            };
+            command.reference.provider_id.0.len()
+                + command.reference.command_id.len()
+                + command.label.len()
+                + target
+        })
+        .sum()
+}
+
+fn bounded_command_error(mut reason: String) -> String {
+    if reason.len() > 8192 {
+        let mut end = 8192;
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+    }
+    reason
+}
+
+fn native_commands(
+    owner: &PluginId,
+    items: &[Item],
+    outcome: Result<PluginCommands, HostError>,
+) -> (NativeCommandStatus, Arc<[CommandDeclaration]>) {
+    let commands = match outcome {
+        Ok(PluginCommands::Unsupported) => return (NativeCommandStatus::Unsupported, Arc::from([])),
+        Ok(PluginCommands::Cancelled) => return (NativeCommandStatus::Cancelled, Arc::from([])),
+        Err(error) => {
+            let reason = bounded_command_error(error.to_string());
+            return (NativeCommandStatus::Failed(reason), Arc::from([]));
+        }
+        Ok(PluginCommands::Declarations(commands)) => commands,
+    };
+    let invalid = |reason: &str| -> (NativeCommandStatus, Arc<[CommandDeclaration]>) {
+        (NativeCommandStatus::Invalid(reason.into()), Arc::from([]))
+    };
+    if let Err(reason) = validate_plugin_commands(&commands) {
+        return invalid(reason);
+    }
+    // Catalog owner is host-bound before this function; no suggestion/cache
+    // fallback is eligible. Duplicate item identities are ambiguous targets.
+    let mut catalog = BTreeMap::new();
+    for item in items {
+        if &item.plugin_id != owner || catalog.insert(&item.stable_id, item).is_some() {
+            return invalid("command catalog has ambiguous ownership or item identity");
+        }
+    }
+    let mut declarations = Vec::with_capacity(commands.len());
+    // Borrow catalog identities and cache action validity once per targeted
+    // item. Repeated declarations must not rescan the same action/category set.
+    let mut action_indexes: BTreeMap<&ItemId, Option<BTreeMap<&ActionId, bool>>> = BTreeMap::new();
+    for command in commands {
+        let Some(item) = catalog.get(&command.item_id) else {
+            return invalid("command target is absent from the exact owner's catalog");
+        };
+        if command.argument_policy != item.argument_policy {
+            return invalid("command argument policy differs from its catalog target");
+        }
+        // Omitted action IDs dispatch through the catalog's primary action,
+        // unless the item is genuinely actionless. Preserve None on binding.
+        let selected_action = command
+            .action_id
+            .as_ref()
+            .or_else(|| item.actions.first().map(|action| &action.action_id));
+        if let Some(id) = selected_action {
+            let actions = action_indexes.entry(&item.stable_id).or_insert_with(|| {
+                let mut actions = BTreeMap::new();
+                for action in &item.actions {
+                    let valid = action.execution_policy == ExecutionPolicy::Plugin
+                        && (action.applicable_categories.is_empty()
+                            || action.applicable_categories.contains(&item.category));
+                    if actions.insert(&action.action_id, valid).is_some() {
+                        return None;
+                    }
+                }
+                Some(actions)
+            });
+            let Some(actions) = actions.as_ref() else {
+                return invalid("command target catalog item has duplicate action IDs");
+            };
+            if actions.get(id) != Some(&true) {
+                return invalid("command action is absent, ambiguous or not plugin executable");
+            }
+        }
+        let declaration = command.bind(owner.clone(), CommandAvailability::Available);
+        if let Err(reason) = declaration.validate() {
+            return invalid(reason);
+        }
+        declarations.push(declaration);
+    }
+    (NativeCommandStatus::Ready, declarations.into())
+}
 /// Capacity of the bounded native suggestion-result channel. Dispatchers use
 /// blocking send as backpressure; shutdown drains this channel while joining
 /// calls so a full channel cannot strand a worker thread.
@@ -171,10 +393,11 @@ struct NativeCatalogTask {
 /// same capacity never blocks a worker that is completing a legal task.
 #[derive(Debug)]
 struct NativeCatalogDispatcher {
-    result_tx: SyncSender<(u64, CatalogBuildResult, u64)>,
-    result_rx: Receiver<(u64, CatalogBuildResult, u64)>,
+    result_tx: SyncSender<(u64, CatalogBuildResult, u64, NativeCommandSnapshot)>,
+    result_rx: Receiver<(u64, CatalogBuildResult, u64, NativeCommandSnapshot)>,
     tasks: BTreeMap<u64, NativeCatalogTask>,
-    latest: BTreeMap<PluginId, u64>,
+    commands: Arc<Mutex<NativeCommandPublications>>,
+    incarnations: NativeIncarnations,
     next_id: u64,
     items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
     /// Canonical targets whose healthy static catalog producer was released.
@@ -188,7 +411,8 @@ impl Default for NativeCatalogDispatcher {
             result_tx,
             result_rx,
             tasks: BTreeMap::new(),
-            latest: BTreeMap::new(),
+            commands: Arc::new(Mutex::new(NativeCommandPublications::default())),
+            incarnations: Arc::new(Mutex::new(NativeIncarnationState::default())),
             next_id: 0,
             items: Arc::new(Mutex::new(BTreeMap::new())),
             static_items: Arc::new(Mutex::new(BTreeMap::new())),
@@ -198,31 +422,39 @@ impl Default for NativeCatalogDispatcher {
 
 impl NativeCatalogDispatcher {
     fn next_id(&mut self) -> u64 {
-        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("catalog admission checks request identity exhaustion");
         self.next_id
     }
 
     fn insert(&mut self, id: u64, plugin: PluginId, join: JoinHandle<()>) {
-        self.latest.insert(plugin.clone(), id);
+        self.commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .latest
+            .insert(plugin, id);
         self.tasks.insert(id, NativeCatalogTask { join: Some(join) });
     }
 
     fn take(&mut self) -> Vec<CatalogBuildResult> {
         let mut ready = Vec::new();
-        while let Ok((id, result, incarnation)) = self.result_rx.try_recv() {
+        while let Ok((id, result, incarnation, mut commands)) = self.result_rx.try_recv() {
             let Some(mut task) = self.tasks.remove(&id) else {
                 continue;
             };
             if let Some(join) = task.join.take() {
                 let _ = join.join();
             }
+            let mut publications = self.commands.lock().unwrap_or_else(|error| error.into_inner());
             // `latest` is the newest request ever issued for this plugin,
             // not merely the newest still-running task. Keeping it after its
             // completion ensures an older task that retires later remains
             // explicitly obsolete.
             let result = match result {
                 CatalogBuildResult::Complete(build)
-                    if self.latest.get(&build.plugin).is_some_and(|latest| *latest != id) =>
+                    if publications.latest.get(&build.plugin) != Some(&id) =>
                 {
                     CatalogBuildResult::Obsolete(ObsoleteCatalogBuild {
                         plugin: build.plugin,
@@ -232,6 +464,26 @@ impl NativeCatalogDispatcher {
                 }
                 other => other,
             };
+            if publications.latest.get(&commands.plugin) == Some(&id) {
+                // A deliberate healthy release leaves no live connection and
+                // remains installed. A replacement/dead retained origin cannot
+                // lend its identity to an undrained declaration response.
+                let incarnations = self
+                    .incarnations
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let current = incarnations.get(&commands.plugin).copied();
+                let observed = incarnations.observed.get(&commands.plugin).copied();
+                if commands.status == NativeCommandStatus::Ready
+                    && commands.producer != 0
+                    && (observed != Some(commands.producer)
+                        || (!commands.released && current != Some(commands.producer)))
+                {
+                    commands.status = NativeCommandStatus::Stale;
+                    commands.declarations = Arc::from([]);
+                }
+                publications.publish(commands);
+            }
             if let CatalogBuildResult::Complete(build) = &result {
                 let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
                 items.retain(|(owner, _), _| owner != &build.plugin);
@@ -266,7 +518,11 @@ impl NativeCatalogDispatcher {
             }
         }
         let results = self.take();
-        self.latest.clear();
+        self.commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .latest
+            .clear();
         self.tasks.clear();
         results
     }
@@ -337,6 +593,12 @@ impl CallControl {
         let _wake = self.wake_lock.lock().unwrap_or_else(|error| error.into_inner());
         self.finished.store(true, Ordering::Release);
         self.wake.notify_all();
+    }
+}
+
+impl PreviewCancellation for CallControl {
+    fn cancel_preview(&self) {
+        self.cancel();
     }
 }
 
@@ -728,12 +990,13 @@ impl NativeProvider {
             plugins: Vec::new(),
             unavailable: Vec::new(),
             action_items: Arc::new(Mutex::new(BTreeMap::new())),
-            incarnations: Arc::new(Mutex::new(BTreeMap::new())),
+            incarnations: Arc::new(Mutex::new(NativeIncarnationState::default())),
             collection_window,
             late: Vec::new(),
             pending: BTreeMap::new(),
             binding: None,
         };
+        provider.catalog.incarnations = Arc::clone(&provider.incarnations);
 
         for root in roots {
             let entries = match fs::read_dir(root) {
@@ -1018,6 +1281,7 @@ impl NativeProvider {
             key,
             launch,
             worker_options: options,
+            action_gate: PreviewActionGate::new(Arc::clone(&budget)),
             budget,
             soft_timeout,
             catalog_persist: manifest.catalog.persist,
@@ -1159,7 +1423,16 @@ impl NativeProvider {
             }
         })?);
         let incarnations = Arc::clone(&self.incarnations);
-        if self.catalog.tasks.len() >= CATALOG_RESULT_CAPACITY {
+        let publications = self
+            .catalog
+            .commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let full = publications.revision == u64::MAX
+            || (!publications.latest.contains_key(plugin) && publications.latest.len() >= MAX_COMMANDS)
+            || (!publications.owners.contains_key(plugin) && publications.owners.len() >= MAX_COMMANDS);
+        drop(publications);
+        if full || self.catalog.next_id == u64::MAX || self.catalog.tasks.len() >= CATALOG_RESULT_CAPACITY {
             return Err(CatalogDispatchError::QueueFull {
                 plugin: plugin.clone(),
             });
@@ -1185,12 +1458,18 @@ impl NativeProvider {
                         with_native_worker(&mut supervisor, &plugin_for_thread, &incarnations, |worker| {
                             let incarnation = worker.connection_id();
                             let supports_preview = worker.handshake().preview;
-                            worker
-                                .build_catalog_with_timeout_ms(NATIVE_CALL_TIMEOUT_MS)
-                                .map(|items| (items, incarnation, supports_preview))
+                            let mut items = worker.build_catalog_with_timeout_ms(NATIVE_CALL_TIMEOUT_MS)?;
+                            for item in &mut items {
+                                item.plugin_id = plugin_for_thread.clone();
+                            }
+                            // Still holding this exact supervisor/worker after
+                            // its complete catalog; no other call can replace it.
+                            let commands =
+                                native_commands(&plugin_for_thread, &items, worker.commands(request_id));
+                            Ok((items, incarnation, supports_preview, commands))
                         })
-                        .map_err(|error| error.to_string());
-                    let keep_origin = result.as_ref().is_ok_and(|(items, _, supported)| {
+                        .map_err(|error| bounded_command_error(error.to_string()));
+                    let keep_origin = result.as_ref().is_ok_and(|(items, _, supported, _)| {
                         *supported
                             && items.iter().any(|item| {
                                 item.metadata.get("crikey.preview").map(String::as_str) == Some("deferred")
@@ -1202,18 +1481,41 @@ impl NativeProvider {
                         supervisor.release_worker(&plugin_for_thread, native_policy_now());
                         refresh_incarnation(&mut supervisor, &plugin_for_thread, &incarnations);
                     }
-                    result.map(|(items, incarnation, _)| (items, if keep_origin { incarnation } else { 0 }))
+                    result.map(|(items, incarnation, _, commands)| {
+                        (
+                            items,
+                            if keep_origin { incarnation } else { 0 },
+                            NativeCommandSnapshot {
+                                plugin: plugin_for_thread.clone(),
+                                revision: 0,
+                                instance,
+                                generation,
+                                producer: incarnation,
+                                released: !was_live && !keep_origin,
+                                status: commands.0,
+                                declarations: commands.1,
+                            },
+                        )
+                    })
                 }));
                 let incarnation = result
                     .as_ref()
                     .ok()
                     .and_then(|result| result.as_ref().ok())
-                    .map_or(0, |(_, incarnation)| *incarnation);
+                    .map_or(0, |(_, incarnation, _)| *incarnation);
+                let mut commands = NativeCommandSnapshot {
+                    plugin: thread_plugin.clone(),
+                    revision: 0,
+                    instance,
+                    generation,
+                    producer: 0,
+                    released: false,
+                    status: NativeCommandStatus::Failed("native catalog worker panicked".into()),
+                    declarations: Arc::from([]),
+                };
                 let completion = match result {
-                    Ok(Ok((mut items, _))) => {
-                        for item in &mut items {
-                            item.plugin_id = plugin_for_thread.clone();
-                        }
+                    Ok(Ok((items, _, declaration_snapshot))) => {
+                        commands = declaration_snapshot;
                         CatalogBuildResult::Complete(crate::CatalogBuild {
                             plugin: plugin_for_thread,
                             instance,
@@ -1222,12 +1524,15 @@ impl NativeProvider {
                             persist: catalog_persist,
                         })
                     }
-                    Ok(Err(reason)) => CatalogBuildResult::Failed {
-                        plugin: thread_plugin.clone(),
-                        instance,
-                        generation,
-                        reason: format!("native catalog build failed: {reason}"),
-                    },
+                    Ok(Err(reason)) => {
+                        commands.status = NativeCommandStatus::Failed(reason.clone());
+                        CatalogBuildResult::Failed {
+                            plugin: thread_plugin.clone(),
+                            instance,
+                            generation,
+                            reason: format!("native catalog build failed: {reason}"),
+                        }
+                    }
                     Err(_) => CatalogBuildResult::Failed {
                         plugin: thread_plugin,
                         instance,
@@ -1235,7 +1540,7 @@ impl NativeProvider {
                         reason: "native catalog worker panicked".to_owned(),
                     },
                 };
-                let _ = sender.send((request_id, completion, incarnation));
+                let _ = sender.send((request_id, completion, incarnation, commands));
                 drop(guard);
             })
             .map_err(|error| CatalogDispatchError::ThreadSpawn {
@@ -1244,6 +1549,30 @@ impl NativeProvider {
             })?;
         self.catalog.insert(request_id, plugin.clone(), join);
         Ok(request_id)
+    }
+
+    /// Latest bounded per-owner publication, with no supervisor access or work.
+    /// Drain catalog results first. Ready declarations require matching catalog
+    /// admission; empty terminal states revoke even if the catalog failed.
+    pub fn command_snapshot(&self, plugin: &PluginId) -> Option<Arc<NativeCommandSnapshot>> {
+        self.catalog
+            .commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .owners
+            .get(plugin)
+            .cloned()
+    }
+
+    /// Package disable/removal or host catalog invalidation retires executable
+    /// declarations and fences already admitted catalog/declaration responses.
+    /// A later explicit catalog build may establish a fresh publication.
+    pub fn invalidate_commands(&mut self, plugin: &PluginId) {
+        self.catalog
+            .commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .invalidate(plugin);
     }
 
     /// Retires completed catalog tasks and returns their tagged outcomes.
@@ -1261,12 +1590,10 @@ impl NativeProvider {
         results
     }
 
-    /// Clones the provider-owned action budget handles for the asynchronous
-    /// driver endpoint. These are the same `Arc`s retained by the pipeline.
-    fn action_budgets(&self) -> BTreeMap<PluginId, PluginBudgetHandle> {
+    fn action_gates(&self) -> BTreeMap<PluginId, Arc<PreviewActionGate>> {
         self.loaded
             .iter()
-            .map(|loaded| (loaded.plugin.clone(), Arc::clone(&loaded.budget)))
+            .map(|loaded| (loaded.plugin.clone(), Arc::clone(&loaded.action_gate)))
             .collect()
     }
 
@@ -1289,7 +1616,7 @@ impl NativeProvider {
     /// Validates and executes one admitted plugin action on the exact native
     /// worker that owns the item's plugin id.
     fn execute_action_request(&mut self, request: NativeActionRequest) -> crikey_core::Result<ActionEffect> {
-        let _guard = request.guard;
+        let _guard = request.admission.acquire(request.deadline, &request.cancelled)?;
         let plugin = request.plugin;
         // Admission froze both validation and privacy evidence for this item.
         // Current ownership/liveness still come from the loaded runtime below;
@@ -1311,46 +1638,99 @@ impl NativeProvider {
                     plugin.0
                 ))
             })?;
-        let action = item
-            .actions
-            .iter()
-            .find(|action| action.action_id == request.action_id)
-            .ok_or_else(|| {
-                crikey_core::CoreError::Invalid("selected action is no longer available".to_owned())
-            })?;
-        if action.execution_policy != ExecutionPolicy::Plugin {
-            return Err(crikey_core::CoreError::Invalid(
-                "native action request is not plugin-owned".to_owned(),
-            ));
-        }
-        if !action.applicable_categories.is_empty() && !action.applicable_categories.contains(&item.category)
-        {
-            return Err(crikey_core::CoreError::Invalid(
-                "native action is not applicable to the selected item category".to_owned(),
-            ));
-        }
-        match item.argument_policy {
-            ArgumentPolicy::Forbidden if request.argument.is_some() => {
-                return Err(crikey_core::CoreError::Invalid(
-                    "native action item forbids arguments".to_owned(),
-                ));
+        request.work.validate(item, request.argument.as_deref())?;
+        let validate_command = || -> crikey_core::Result<()> {
+            if let Some((declaration, source)) = request.work.command_source() {
+                let publications = self
+                    .catalog
+                    .commands
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let current = publications
+                    .owners
+                    .get(&plugin)
+                    .filter(|current| {
+                        current.status == NativeCommandStatus::Ready
+                            && current.revision == source.publication
+                            && current.instance == source.instance
+                            && current.generation == source.generation
+                            && current.producer == source.producer
+                            && current.declarations.contains(declaration)
+                    })
+                    .ok_or_else(|| {
+                        crikey_core::CoreError::Invalid(
+                            "declared native command source is no longer current".into(),
+                        )
+                    })?;
+                let items = self
+                    .catalog
+                    .items
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let static_items = self
+                    .catalog
+                    .static_items
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let (canonical, _) = native_preview::canonical_preview_item(
+                    &publications,
+                    &items,
+                    &static_items,
+                    &plugin,
+                    &item.stable_id,
+                    source,
+                )
+                .ok_or_else(|| {
+                    crikey_core::CoreError::Invalid("canonical command item is unavailable".into())
+                })?;
+                request.work.validate(canonical, request.argument.as_deref())?;
+                if canonical.plugin_id != item.plugin_id
+                    || canonical.stable_id != item.stable_id
+                    || canonical.target != item.target
+                    || canonical.argument_policy != item.argument_policy
+                    || canonical.category != item.category
+                    || current.plugin != plugin
+                {
+                    return Err(crikey_core::CoreError::Invalid(
+                        "canonical native command target changed".into(),
+                    ));
+                }
             }
-            ArgumentPolicy::Required if request.argument.as_deref().is_none_or(str::is_empty) => {
-                return Err(crikey_core::CoreError::Invalid(
-                    "native action item requires an argument".to_owned(),
-                ));
-            }
-            ArgumentPolicy::Optional | ArgumentPolicy::Forbidden | ArgumentPolicy::Required => {}
-        }
+            Ok(())
+        };
 
         let supervisor = self.pool.supervisors.get(&loaded.key).cloned().ok_or_else(|| {
             crikey_core::CoreError::Invalid(format!("native worker for `{}` is unavailable", plugin.0))
         })?;
         let mut supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
+        if request.cancelled.load(Ordering::Acquire) {
+            return Err(crikey_core::CoreError::Cancelled);
+        }
+        if Instant::now() >= request.deadline {
+            return Err(crikey_core::CoreError::Invalid(
+                "native action timed out before execution".into(),
+            ));
+        }
         let execute = |worker: &mut crikey_native_host::NativeWorker| {
+            if request.cancelled.load(Ordering::Acquire) {
+                return Err(HostError::PluginFailed {
+                    plugin: plugin.clone(),
+                    detail: "action cancelled before execution".into(),
+                });
+            }
+            if Instant::now() >= request.deadline {
+                return Err(HostError::Timeout {
+                    plugin: plugin.clone(),
+                    detail: "action timed out before execution".into(),
+                });
+            }
+            validate_command().map_err(|error| HostError::PluginFailed {
+                plugin: plugin.clone(),
+                detail: error.to_string(),
+            })?;
             worker.execute(
                 &item.stable_id,
-                Some(&request.action_id),
+                request.work.action_id(),
                 request.argument.as_deref(),
             )
         };
@@ -1451,7 +1831,7 @@ impl NativeProvider {
             .unwrap_or_else(|error| error.into_inner())
             .clear();
         for (plugin, obsolete) in std::mem::take(&mut self.pending) {
-            let _ = pipeline.complete(&plugin, obsolete, now);
+            let _ = pipeline.cancel_request(&plugin, obsolete, now);
         }
         let job = job.unwrap_or(generation);
         self.binding = Some((job, generation));
@@ -1476,14 +1856,14 @@ impl NativeProvider {
                 if self.pending.get(&cancellation.plugin) == Some(&cancellation.generation) {
                     self.pending.remove(&cancellation.plugin);
                 }
-                let _ = pipeline.complete(&cancellation.plugin, cancellation.generation, now);
+                let _ = pipeline.cancel_request(&cancellation.plugin, cancellation.generation, now);
             }
         }
         for request in tick.dispatches {
             if request.generation == generation {
                 self.pending.insert(request.plugin, request.generation);
             } else {
-                let _ = pipeline.complete(&request.plugin, request.generation, now);
+                let _ = pipeline.cancel_request(&request.plugin, request.generation, now);
             }
         }
         let ready = self
@@ -1501,7 +1881,7 @@ impl NativeProvider {
             for plugin in ready {
                 self.pending.remove(&plugin);
                 if dead_plugins.contains(&plugin) {
-                    let _ = pipeline.abort_request(&plugin, generation, now);
+                    let _ = pipeline.fail_request(&plugin, generation, now);
                 } else if !outstanding.contains(&plugin) {
                     let _ = pipeline.deliver(
                         ResultBatch {
@@ -1530,6 +1910,15 @@ impl NativeProvider {
                 self.pool.record_dispatch_failure(plugin, reason);
             }
         }
+        let mut publications = self
+            .catalog
+            .commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for plugin in &self.plugins {
+            publications.invalidate(plugin);
+        }
+        drop(publications);
         self.pool.shutdown();
         self.incarnations
             .lock()
@@ -1734,7 +2123,7 @@ impl NativeProvider {
             if dead {
                 // The call failed outright, so the request is abandoned rather
                 // than answered: what a dead plugin gets inside the window too.
-                let _ = pipeline.abort_request(&plugin, generation, now);
+                let _ = pipeline.fail_request(&plugin, generation, now);
                 continue;
             }
             let items = collected.remove(&plugin).unwrap_or_default();
@@ -1889,9 +2278,9 @@ struct NativeActionRequest {
     item: Item,
     /// Suggestions require the producing live incarnation; canonical targets do not.
     origin: Option<u64>,
-    action_id: ActionId,
+    work: crate::plugin_action::AdmittedPluginWork,
     argument: Option<String>,
-    guard: OwnedBudgetGuard,
+    admission: ForegroundActionAdmission,
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
 }
@@ -1950,10 +2339,11 @@ impl std::fmt::Debug for WakeSlot {
 struct NativeActionEndpoint {
     sender: SyncSender<NativeActionRequest>,
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
-    budgets: BTreeMap<PluginId, PluginBudgetHandle>,
+    gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
     items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
     catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
     static_catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    commands: Arc<Mutex<NativeCommandPublications>>,
     pending: Arc<Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>>,
     in_flight: Arc<AtomicUsize>,
     next_id: Arc<AtomicU64>,
@@ -1974,7 +2364,162 @@ struct NativeActionEndpoint {
     wake: WakeSlot,
     action_wake: crate::plugin_action::CompletionWake,
 }
+impl NativeActionEndpoint {
+    fn enqueue(
+        &self,
+        plugin: &PluginId,
+        item: Item,
+        origin: Option<u64>,
+        work: crate::plugin_action::AdmittedPluginWork,
+        argument: Option<&str>,
+        query_history_allowed: bool,
+    ) -> crikey_core::Result<crate::plugin_action::PluginActionReceipt> {
+        let reserved = self
+            .in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < ACTION_IN_FLIGHT_CAPACITY).then_some(current + 1)
+            })
+            .is_ok();
+        if !reserved {
+            return Err(crikey_core::CoreError::Invalid(
+                "native action mailbox is full".to_owned(),
+            ));
+        }
+        let gate = match self.gates.get(plugin) {
+            Some(gate) => gate,
+            None => {
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                return Err(crikey_core::CoreError::Invalid(format!(
+                    "no native action runtime owns plugin `{}`",
+                    plugin.0
+                )));
+            }
+        };
+        let admission = match gate.reserve_foreground() {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
+                return Err(error);
+            }
+        };
+        let sequence = self
+            .next_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.wrapping_add(1).max(1))
+            })
+            .unwrap_or(1);
+        let request_id = ActionRequestId {
+            plugin: plugin.clone(),
+            sequence,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(request_id.clone(), Arc::clone(&cancelled));
+        let request = NativeActionRequest {
+            request_id: request_id.clone(),
+            plugin: plugin.clone(),
+            item,
+            origin,
+            work,
+            argument: argument.map(str::to_owned),
+            admission,
+            deadline: Instant::now() + Duration::from_millis(ACTION_TIMEOUT_MS),
+            cancelled,
+        };
+        if let Err(error) = self.sender.try_send(request) {
+            self.pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&request_id);
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            return Err(match error {
+                mpsc::TrySendError::Full(_) => crikey_core::CoreError::Invalid(format!(
+                    "native plugin `{}` action queue is full",
+                    plugin.0
+                )),
+                mpsc::TrySendError::Disconnected(_) => crikey_core::CoreError::Invalid(format!(
+                    "native plugin `{}` action runtime stopped",
+                    plugin.0
+                )),
+            });
+        }
+        self.mailbox.1.notify_one();
+        Ok(crate::plugin_action::PluginActionReceipt {
+            request_id,
+            query_history_allowed,
+        })
+    }
+}
+
 impl crate::PluginActionExecutor for NativeActionEndpoint {
+    fn submit_declared_command_with_receipt(
+        &self,
+        declaration: &CommandDeclaration,
+        source: &crate::plugin_action::DeclaredCommandSource,
+        argument: Option<&str>,
+    ) -> crikey_core::Result<crate::plugin_action::PluginActionReceipt> {
+        let plugin = &declaration.reference.provider_id;
+        // Publication and canonical item replacement share this lock. Never
+        // release it between validating provenance and freezing the item.
+        let publications = self.commands.lock().unwrap_or_else(|error| error.into_inner());
+        let current = publications
+            .owners
+            .get(plugin)
+            .filter(|current| {
+                current.status == NativeCommandStatus::Ready
+                    && current.revision == source.publication
+                    && current.instance == source.instance
+                    && current.generation == source.generation
+                    && current.producer == source.producer
+                    && current.declarations.contains(declaration)
+            })
+            .ok_or_else(|| {
+                crikey_core::CoreError::Invalid("declared native command source is no longer current".into())
+            })?;
+        let crikey_core::command::ExecutableTarget::Item { item_id, .. } = &declaration.executable_target
+        else {
+            return Err(crikey_core::CoreError::Invalid(
+                "host command cannot execute in a plugin".into(),
+            ));
+        };
+        let key = (plugin.clone(), item_id.clone());
+        let item = self
+            .catalog_items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .map(|(item, _)| item.clone())
+            .or_else(|| {
+                self.static_catalog_items
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(&key)
+                    .cloned()
+            })
+            .ok_or_else(|| crikey_core::CoreError::Invalid("canonical command item is unavailable".into()))?;
+        let action_id = crate::plugin_action::validate_declared_command_item(declaration, &item, argument)?;
+        let query_history_allowed = item.argument_policy == ArgumentPolicy::Forbidden
+            && argument.is_none()
+            && action_id.as_ref() == item.actions.first().map(|action| &action.action_id);
+        // The producing worker may be healthily released; canonical commands
+        // use the existing lazy worker path, unlike dynamic suggestions.
+        let _ = current;
+        self.enqueue(
+            plugin,
+            item,
+            None,
+            crate::plugin_action::AdmittedPluginWork::Command {
+                declaration: declaration.clone(),
+                source: source.clone(),
+                action_id,
+            },
+            argument,
+            query_history_allowed,
+        )
+    }
+
     fn submit_plugin_action(
         &self,
         plugin: &PluginId,
@@ -2022,85 +2567,14 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
                 "selected action is not plugin-owned".into(),
             ));
         }
-        let reserved = self
-            .in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < ACTION_IN_FLIGHT_CAPACITY).then_some(current + 1)
-            })
-            .is_ok();
-        if !reserved {
-            return Err(crikey_core::CoreError::Invalid(
-                "native action mailbox is full".to_owned(),
-            ));
-        }
-        let budget = match self.budgets.get(plugin) {
-            Some(budget) => budget,
-            None => {
-                self.in_flight.fetch_sub(1, Ordering::AcqRel);
-                return Err(crikey_core::CoreError::Invalid(format!(
-                    "no native action runtime owns plugin `{}`",
-                    plugin.0
-                )));
-            }
-        };
-        let guard = match budget.try_acquire_owned(BudgetKind::Action) {
-            Some(guard) => guard,
-            None => {
-                self.in_flight.fetch_sub(1, Ordering::AcqRel);
-                return Err(crikey_core::CoreError::Invalid(format!(
-                    "native plugin `{}` action budget is full",
-                    plugin.0
-                )));
-            }
-        };
-        let sequence = self
-            .next_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.wrapping_add(1).max(1))
-            })
-            .unwrap_or(1);
-        let request_id = ActionRequestId {
-            plugin: plugin.clone(),
-            sequence,
-        };
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(request_id.clone(), Arc::clone(&cancelled));
-        let request = NativeActionRequest {
-            request_id: request_id.clone(),
-            plugin: plugin.clone(),
+        self.enqueue(
+            plugin,
             item,
             origin,
-            action_id: action_id.clone(),
-            argument: argument.map(str::to_owned),
-            guard,
-            deadline: Instant::now() + Duration::from_millis(ACTION_TIMEOUT_MS),
-            cancelled,
-        };
-        if let Err(error) = self.sender.try_send(request) {
-            self.pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&request_id);
-            self.in_flight.fetch_sub(1, Ordering::AcqRel);
-            return Err(match error {
-                mpsc::TrySendError::Full(_) => crikey_core::CoreError::Invalid(format!(
-                    "native plugin `{}` action queue is full",
-                    plugin.0
-                )),
-                mpsc::TrySendError::Disconnected(_) => crikey_core::CoreError::Invalid(format!(
-                    "native plugin `{}` action runtime stopped",
-                    plugin.0
-                )),
-            });
-        }
-        self.mailbox.1.notify_one();
-        Ok(crate::plugin_action::PluginActionReceipt {
-            request_id,
+            crate::plugin_action::AdmittedPluginWork::Action(action_id.clone()),
+            argument,
             query_history_allowed,
-        })
+        )
     }
 
     fn poll_plugin_actions(&self) -> Vec<PluginActionCompletion> {
@@ -2311,7 +2785,11 @@ fn enqueue_native_completion(
     if mailbox.len() >= ACTION_COMPLETION_CAPACITY {
         eprintln!(
             "crikey: native action completion mailbox overflow for {} / {}",
-            completion.plugin.0, completion.action_id.0
+            completion.plugin.0,
+            completion
+                .action_id
+                .as_ref()
+                .map_or("<default>", |id| id.0.as_str())
         );
         return;
     }
@@ -2330,11 +2808,14 @@ pub struct NativeDriver {
     action_endpoint: Arc<NativeActionEndpoint>,
     permissions: BTreeMap<PluginId, Permissions>,
     catalog_results: Arc<Mutex<Vec<CatalogBuildResult>>>,
+    commands: Arc<Mutex<NativeCommandPublications>>,
     /// Per-plugin diagnostics refreshed by the supervisor thread after every
     /// unit of work, so the UI thread can report a throttled plugin without
     /// reaching into the pipeline it does not own.
     health: Arc<Mutex<Vec<(PluginId, crikey_plugin_supervisor::PluginHealth)>>>,
     outcome: Arc<Mutex<Option<ViewModel>>>,
+    search_summary: Arc<Mutex<Option<crate::query_pipeline::OrdinarySearchSummary>>>,
+    query_policies: BTreeMap<PluginId, crikey_input_scheduler::PluginPolicy>,
     current: Arc<AtomicU64>,
     cancellation: Arc<NativeCancellation>,
     replacements: Arc<AtomicU64>,
@@ -2369,6 +2850,16 @@ impl NativeDriver {
         publish: Box<dyn Fn(&ViewModel) + Send + 'static>,
     ) -> Self {
         let permissions = provider.permissions();
+        let query_policies = permissions
+            .keys()
+            .filter_map(|plugin| {
+                pipeline
+                    .plugin_policy(plugin)
+                    .cloned()
+                    .map(|policy| (plugin.clone(), policy))
+            })
+            .collect();
+        let commands = Arc::clone(&provider.catalog.commands);
         let preview_endpoint = native_preview::NativePreviewEndpoint::spawn(&provider);
         let has_plugins = !provider.plugins().is_empty();
         let mailbox = Arc::new((
@@ -2380,6 +2871,7 @@ impl NativeDriver {
             Condvar::new(),
         ));
         let outcome = Arc::new(Mutex::new(None));
+        let search_summary = Arc::new(Mutex::new(None));
         let catalog_results = Arc::new(Mutex::new(Vec::new()));
         let health = Arc::new(Mutex::new(Vec::new()));
         let current = Arc::new(AtomicU64::new(0));
@@ -2390,10 +2882,11 @@ impl NativeDriver {
         let action_endpoint = Arc::new(NativeActionEndpoint {
             sender: action_sender,
             completions: Arc::clone(&completion_mailbox),
-            budgets: provider.action_budgets(),
+            gates: provider.action_gates(),
             items: Arc::clone(&provider.action_items),
             catalog_items: Arc::clone(&provider.catalog.items),
             static_catalog_items: Arc::clone(&provider.catalog.static_items),
+            commands: Arc::clone(&provider.catalog.commands),
             pending: Arc::new(Mutex::new(BTreeMap::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
             next_id: Arc::new(AtomicU64::new(0)),
@@ -2409,6 +2902,7 @@ impl NativeDriver {
         let thread_mailbox = Arc::clone(&mailbox);
         let thread_catalog_results = Arc::clone(&catalog_results);
         let thread_health = Arc::clone(&health);
+        let thread_search_summary = Arc::clone(&search_summary);
         let thread_outcome = Arc::clone(&outcome);
         let thread_current = Arc::clone(&current);
         let thread_busy = Arc::clone(&busy);
@@ -2462,6 +2956,9 @@ impl NativeDriver {
                             .unwrap_or_else(|error| error.into_inner())
                             .push(result);
                         preview_lifecycle_wake();
+                        if let Some(wake) = &thread_wake {
+                            wake();
+                        }
                     }
                     let work = {
                         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
@@ -2472,7 +2969,7 @@ impl NativeDriver {
                                         request_id: request.request_id.clone(),
                                         plugin: request.plugin.clone(),
                                         item_id: request.item.stable_id.clone(),
-                                        action_id: request.action_id.clone(),
+                                        action_id: request.work.action_id().cloned(),
                                         outcome: Err(crikey_core::CoreError::Cancelled),
                                     };
                                     enqueue_native_completion(
@@ -2511,7 +3008,7 @@ impl NativeDriver {
                             let request_id = request.request_id.clone();
                             let plugin = request.plugin.clone();
                             let item_id = request.item.stable_id.clone();
-                            let action_id = request.action_id.clone();
+                            let action_id = request.work.action_id().cloned();
                             let deadline = request.deadline;
                             let cancelled = Arc::clone(&request.cancelled);
                             let result = if cancelled.load(Ordering::Acquire) {
@@ -2591,9 +3088,31 @@ impl NativeDriver {
                                 .binding
                                 .filter(|(job, _)| job == generation)
                                 .map(|(_, inner)| inner);
-                            let Some(frame) = inner.and_then(|inner| {
+                            let frame = inner.and_then(|inner| {
                                 provider.drive_current(&mut pipeline, query, inner, last_now)
-                            }) else {
+                            });
+                            let mut summary = pipeline.ordinary_search_summary(0);
+                            summary.generation = *generation;
+                            let slot = lock.lock().unwrap_or_else(|error| error.into_inner());
+                            if slot.stop
+                                || slot.job.is_some()
+                                || thread_current.load(Ordering::Acquire) != generation.get()
+                            {
+                                continue;
+                            }
+                            let mut evidence = thread_search_summary
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            let evidence_changed = evidence.as_ref() != Some(&summary);
+                            *evidence = Some(summary);
+                            drop(evidence);
+                            drop(slot);
+                            let Some(frame) = frame else {
+                                if evidence_changed {
+                                    if let Some(wake) = &thread_wake {
+                                        wake();
+                                    }
+                                }
                                 continue;
                             };
                             let mut rows = builtin_rows.clone();
@@ -2608,6 +3127,8 @@ impl NativeDriver {
                                 settings_open: false,
                                 settings: Arc::default(),
                                 settings_focus: None,
+                                command_management: Arc::default(),
+                                setting_edits: Arc::default(),
                                 show_hints: true,
                                 rounded_corners: true,
                                 page: None,
@@ -2661,6 +3182,8 @@ impl NativeDriver {
                         settings_open: false,
                         settings: Arc::default(),
                         settings_focus: None,
+                        command_management: Arc::default(),
+                        setting_edits: Arc::default(),
                         show_hints: true,
                         rounded_corners: true,
                         page: None,
@@ -2680,6 +3203,11 @@ impl NativeDriver {
                         thread_busy.store(false, Ordering::Release);
                         continue;
                     }
+                    let mut summary = pipeline.ordinary_search_summary(0);
+                    summary.generation = job.generation;
+                    *thread_search_summary
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(summary);
                     *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) = Some(merged.clone());
                     last_context = Some(refresh_context);
                     publish(&merged);
@@ -2695,8 +3223,11 @@ impl NativeDriver {
                 preview_endpoint,
                 permissions,
                 catalog_results,
+                commands,
                 health,
                 outcome,
+                search_summary,
+                query_policies,
                 current,
                 cancellation,
                 replacements,
@@ -2710,8 +3241,11 @@ impl NativeDriver {
                 preview_endpoint,
                 permissions,
                 catalog_results,
+                commands,
                 health,
                 outcome,
+                search_summary,
+                query_policies,
                 current,
                 cancellation,
                 replacements,
@@ -2724,6 +3258,26 @@ impl NativeDriver {
 
     pub(crate) fn preview_dispatcher(&self) -> Arc<dyn crate::plugin_preview::PreviewDispatcher> {
         self.preview_endpoint.clone()
+    }
+
+    /// Ready declarations require matching catalog admission; empty terminal
+    /// states revoke registry entries even without a successful catalog. Registry
+    /// replacement uses `snapshot.revision`, never its preview producer ID.
+    pub fn command_snapshot(&self, plugin: &PluginId) -> Option<Arc<NativeCommandSnapshot>> {
+        self.commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .owners
+            .get(plugin)
+            .cloned()
+    }
+
+    /// Revoke on package/catalog invalidation, independent of preview liveness.
+    pub fn invalidate_commands(&self, plugin: &PluginId) {
+        self.commands
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .invalidate(plugin);
     }
 
     /// Submits a query without waiting for a native child. Older generations
@@ -2763,6 +3317,28 @@ impl NativeDriver {
         if slot.stop {
             return;
         }
+        let state = if self.worker.is_some() {
+            crate::command_preferences::OrdinaryProviderState::Pending
+        } else {
+            crate::command_preferences::OrdinaryProviderState::Failed
+        };
+        *self
+            .search_summary
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(crate::query_pipeline::OrdinarySearchSummary {
+                view: 0,
+                generation,
+                providers: self
+                    .query_policies
+                    .iter()
+                    .filter(|(_, policy)| policy.query_applicable(query))
+                    .map(|(plugin, _)| crate::query_pipeline::OrdinarySearchProvider {
+                        plugin: plugin.clone(),
+                        state,
+                    })
+                    .collect(),
+            });
         if slot.job.is_some() {
             self.replacements.fetch_add(1, Ordering::Relaxed);
         }
@@ -2806,6 +3382,20 @@ impl NativeDriver {
             .take()
     }
 
+    /// Terminal evidence is independent of visible rows and optional frames.
+    pub fn ordinary_search_summary(&self, view: u64) -> Option<crate::query_pipeline::OrdinarySearchSummary> {
+        let mut summary = self
+            .search_summary
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()?;
+        if summary.generation.get() != self.current.load(Ordering::Acquire) {
+            return None;
+        }
+        summary.view = view;
+        Some(summary)
+    }
+
     /// Whether at least one native plugin loaded at provider startup.
     pub fn has_plugins(&self) -> bool {
         self.has_plugins
@@ -2837,7 +3427,7 @@ impl NativeDriver {
 
     /// Returns the exact plugin ids owned by this driver's action endpoint.
     pub fn plugins(&self) -> Vec<PluginId> {
-        self.action_endpoint.budgets.keys().cloned().collect()
+        self.action_endpoint.gates.keys().cloned().collect()
     }
     /// Manifest grants used by the host-mediated action boundary.
     pub fn permissions(&self) -> BTreeMap<PluginId, Permissions> {
@@ -2858,7 +3448,8 @@ impl NativeDriver {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        for (plugin, budget) in &self.action_endpoint.budgets {
+        for (plugin, gate) in &self.action_endpoint.gates {
+            let budget = gate.budget();
             if let Some((_, health)) = report.iter_mut().find(|(id, _)| id == plugin) {
                 health.concurrency_refusals = budget.refusals_snapshot();
             } else {
@@ -2874,6 +3465,15 @@ impl NativeDriver {
 }
 impl Drop for NativeDriver {
     fn drop(&mut self) {
+        for cancelled in self
+            .action_endpoint
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+        {
+            cancelled.store(true, Ordering::Release);
+        }
         self.preview_endpoint.shutdown();
         // Cancel in-flight callbacks before joining the supervisor so a
         // cooperative native worker gets a chance to return promptly.
@@ -2922,6 +3522,85 @@ mod query_history_receipt_tests {
         }
     }
 
+    #[test]
+    fn declared_admission_pins_catalog_and_preserves_actionless_callback() {
+        use crate::plugin_action::{AdmittedPluginWork, DeclaredCommandSource};
+        use crikey_core::command::{CommandRef, ExecutableTarget};
+        let suggestion = item();
+        let (endpoint, receiver) = endpoint(suggestion.clone());
+        let mut canonical = suggestion.clone();
+        canonical.label = "Canonical default".into();
+        canonical.actions.clear();
+        let declaration = CommandDeclaration {
+            reference: CommandRef {
+                provider_id: canonical.plugin_id.clone(),
+                command_id: "default".into(),
+            },
+            label: "Default callback".into(),
+            executable_target: ExecutableTarget::Item {
+                item_id: canonical.stable_id.clone(),
+                action_id: None,
+            },
+            argument_policy: canonical.argument_policy,
+            availability: CommandAvailability::Available,
+        };
+        let source = DeclaredCommandSource {
+            instance: 2,
+            generation: Generation::ZERO,
+            producer: 7,
+            publication: 3,
+        };
+        endpoint.commands.lock().unwrap().owners.insert(
+            canonical.plugin_id.clone(),
+            Arc::new(NativeCommandSnapshot {
+                plugin: canonical.plugin_id.clone(),
+                revision: source.publication,
+                instance: source.instance,
+                generation: source.generation,
+                producer: source.producer,
+                status: NativeCommandStatus::Ready,
+                released: true,
+                declarations: Arc::from([declaration.clone()]),
+            }),
+        );
+        endpoint.static_catalog_items.lock().unwrap().insert(
+            (canonical.plugin_id.clone(), canonical.stable_id.clone()),
+            canonical.clone(),
+        );
+        let receipt = endpoint
+            .submit_declared_command_with_receipt(&declaration, &source, None)
+            .unwrap();
+        assert!(receipt.query_history_allowed);
+        let admitted = receiver.try_recv().unwrap();
+        assert_eq!(admitted.item.label, canonical.label);
+        assert!(
+            admitted.origin.is_none(),
+            "released producers use existing lazy execution"
+        );
+        assert!(matches!(
+            &admitted.work,
+            AdmittedPluginWork::Command { action_id: None, .. }
+        ));
+        admitted
+            .work
+            .validate(&admitted.item, admitted.argument.as_deref())
+            .unwrap();
+        assert!(
+            admitted.work.action_id().is_none(),
+            "the worker receives None, not a fabricated ID"
+        );
+        let mut stale = source.clone();
+        stale.publication += 1;
+        assert!(endpoint
+            .submit_declared_command_with_receipt(&declaration, &stale, None)
+            .is_err());
+        assert!(receiver.try_recv().is_err());
+        assert!(endpoint
+            .submit_declared_command_with_receipt(&declaration, &source, Some("secret"))
+            .is_err());
+        assert!(receiver.try_recv().is_err());
+    }
+
     fn endpoint(item: Item) -> (NativeActionEndpoint, mpsc::Receiver<NativeActionRequest>) {
         let (sender, receiver) = mpsc::sync_channel(1);
         let owner = item.plugin_id.clone();
@@ -2931,9 +3610,11 @@ mod query_history_receipt_tests {
             NativeActionEndpoint {
                 sender,
                 completions: Arc::default(),
-                budgets: BTreeMap::from([(
+                gates: BTreeMap::from([(
                     owner.clone(),
-                    crikey_plugin_supervisor::shared_budget_from_section(&Default::default()),
+                    PreviewActionGate::new(crikey_plugin_supervisor::shared_budget_from_section(
+                        &Default::default(),
+                    )),
                 )]),
                 items: Arc::new(Mutex::new(BTreeMap::from([(
                     (owner, item.stable_id.clone()),
@@ -2941,6 +3622,7 @@ mod query_history_receipt_tests {
                 )]))),
                 catalog_items: Arc::default(),
                 static_catalog_items: Arc::default(),
+                commands: Arc::default(),
                 pending: Arc::default(),
                 in_flight: Arc::default(),
                 next_id: Arc::default(),
@@ -3170,7 +3852,60 @@ mod query_history_receipt_tests {
         endpoint.catalog_items = Arc::clone(&provider.catalog.items);
         endpoint.static_catalog_items = Arc::clone(&provider.catalog.static_items);
         endpoint.incarnations = Arc::clone(&provider.incarnations);
-        endpoint.budgets = provider.action_budgets();
+        endpoint.gates = provider.action_gates();
+        endpoint.commands = Arc::clone(&provider.catalog.commands);
+        // Exercise revocation after admission, while the foreground lease is
+        // still waiting for the speculative slot, against a real loaded owner.
+        let declaration = CommandDeclaration {
+            reference: crikey_core::command::CommandRef {
+                provider_id: owner.clone(),
+                command_id: "revoked".into(),
+            },
+            label: "Revoked".into(),
+            executable_target: crikey_core::command::ExecutableTarget::Item {
+                item_id: displayed.stable_id.clone(),
+                action_id: Some(displayed.actions[0].action_id.clone()),
+            },
+            argument_policy: displayed.argument_policy,
+            availability: CommandAvailability::Available,
+        };
+        let source = crate::plugin_action::DeclaredCommandSource {
+            instance: 1,
+            generation: Generation::ZERO,
+            producer: 1,
+            publication: 1,
+        };
+        endpoint.commands.lock().unwrap().owners.insert(
+            owner.clone(),
+            Arc::new(NativeCommandSnapshot {
+                plugin: owner.clone(),
+                revision: source.publication,
+                instance: source.instance,
+                generation: source.generation,
+                producer: source.producer,
+                status: NativeCommandStatus::Ready,
+                released: true,
+                declarations: Arc::from([declaration.clone()]),
+            }),
+        );
+        let preview_cancelled = Arc::new(AtomicBool::new(false));
+        let preview_guard = endpoint.gates[&owner]
+            .try_preview(preview_cancelled.clone())
+            .unwrap();
+        let revoked = endpoint
+            .submit_declared_command_with_receipt(&declaration, &source, None)
+            .unwrap();
+        assert!(preview_cancelled.load(Ordering::Acquire));
+        let waiting = receiver.try_recv().unwrap();
+        provider.invalidate_commands(&owner);
+        drop(preview_guard);
+        let refusal = provider.execute_action_request(waiting).unwrap_err();
+        assert!(
+            refusal.to_string().contains("source is no longer current"),
+            "{refusal}"
+        );
+        endpoint.pending.lock().unwrap().remove(&revoked.request_id);
+        endpoint.in_flight.fetch_sub(1, Ordering::AcqRel);
         let action = displayed.actions[0].action_id.clone();
         let receipt = endpoint
             .submit_plugin_action_with_receipt(&owner, &displayed, &action, None)
@@ -3242,5 +3977,107 @@ mod query_history_receipt_tests {
                 .count(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod command_preview_handoff_tests {
+    use super::*;
+    use crate as crikey_app;
+    use crate::PipelineConfig;
+    use std::process::Command;
+    use std::sync::LazyLock;
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/native_command_fixture.rs"
+    ));
+    #[test]
+    fn real_deferred_preview_yields_to_one_frozen_canonical_intent() {
+        use crikey_app::{NativeDriver, PreviewIdentity, PreviewRequest, PreviewState};
+        let (scratch, pipeline, mut provider, owner) = setup("handoff");
+        provider
+            .request_catalog_build(&owner, 7, Generation::from_raw(1))
+            .unwrap();
+        assert_catalog(complete(&mut provider));
+        let commands = snapshot(&provider, &owner);
+        let source = crikey_app::DeclaredCommandSource {
+            instance: commands.instance,
+            generation: commands.generation,
+            producer: commands.producer,
+            publication: commands.revision,
+        };
+        let budget = pipeline.plugin_budget(&owner).unwrap().clone();
+        let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| {}));
+        let actions = driver.action_executor();
+        let previews = driver.preview_dispatcher();
+        let package = scratch.0.join("commands");
+        let declaration = &commands.declarations[0];
+        for index in 0..4 {
+            let _ = fs::remove_file(package.join("preview-started"));
+            let _ = fs::remove_file(package.join("preview-cancelled"));
+            let _ = fs::remove_file(package.join("preview-release"));
+            let identity = PreviewIdentity {
+                view: 1,
+                query: Generation::from_raw(1),
+                plugin: owner.clone(),
+                incarnation: source.producer,
+                item: crikey_core::ItemId("installed".into()),
+                target: crikey_ui::ActionTarget::Command(declaration.reference.clone()),
+                catalog_source: Some(source.clone()),
+                selection: index + 1,
+                request: index + 1,
+            };
+            let (send, receive) = std::sync::mpsc::channel();
+            previews
+                .submit(
+                    PreviewRequest { identity },
+                    Arc::new(move |update| {
+                        send.send(update).unwrap();
+                    }),
+                )
+                .unwrap();
+            wait_for(|| package.join("preview-started").exists().then_some(()));
+            let argument = format!("literal argument {index}");
+            let receipt = actions
+                .submit_declared_command_with_receipt(declaration, &source, Some(&argument))
+                .unwrap();
+            wait_for(|| package.join("preview-cancelled").exists().then_some(()));
+            assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+            assert!(actions
+                .submit_declared_command_with_receipt(declaration, &source, Some("duplicate"))
+                .is_err());
+            assert_eq!(
+                fs::read_to_string(package.join("executions"))
+                    .unwrap_or_default()
+                    .lines()
+                    .count(),
+                index as usize
+            );
+            if index == 3 {
+                assert!(actions.cancel_plugin_action(&receipt.request_id));
+            }
+            fs::write(package.join("preview-release"), "").unwrap();
+            let completion = wait_for(|| actions.poll_plugin_actions().into_iter().next());
+            assert_eq!(completion.request_id, receipt.request_id);
+            if index == 3 {
+                assert!(matches!(
+                    completion.outcome,
+                    Err(crikey_core::CoreError::Cancelled)
+                ));
+            } else {
+                assert_eq!(completion.outcome.unwrap(), crikey_app::ActionEffect::Completed);
+            }
+            let update = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(update.state, PreviewState::Cancelled));
+        }
+        assert_eq!(fs::read_to_string(package.join("executions")).unwrap(),
+        "installed:alternate:literal argument 0\ninstalled:alternate:literal argument 1\ninstalled:alternate:literal argument 2\n");
+        let occupied = budget.try_acquire_owned(BudgetKind::Action).unwrap();
+        assert!(actions
+            .submit_declared_command_with_receipt(declaration, &source, Some("saturated"))
+            .is_err());
+        drop(occupied);
+        assert!(actions.poll_plugin_actions().is_empty());
     }
 }

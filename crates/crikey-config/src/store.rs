@@ -94,6 +94,8 @@ pub const BUILT_IN_DEFAULTS: &[(&str, &str)] = &[
     (KEY_SHOW_HINTS, "true"),
     (KEY_ROUNDED_CORNERS, "true"),
     (KEY_PREVIEW_SPLIT, "0.55"),
+    // The settings/UI declaration validates the four supported home modes.
+    ("launcher.command-home", "compact"),
 ];
 /// Keys under this prefix are operator-pinned: a user may supply a source
 /// declaration, but cannot redirect one an administrator has specified.
@@ -144,10 +146,10 @@ const ALIASES_PREFIX: &str = "aliases.";
 /// because of a typo is worse than refusing to start with the reason.
 #[derive(Clone)]
 pub struct ConfigStore {
-    layers: [BTreeMap<String, String>; LAYER_COUNT],
+    pub(crate) layers: [BTreeMap<String, String>; LAYER_COUNT],
     /// Where [`Self::save`] writes. Retained so a store built for a temporary
     /// directory saves back into it.
-    config_path: PathBuf,
+    pub(crate) config_path: PathBuf,
     /// Every file consulted, in read order, for change detection.
     sources: Vec<PathBuf>,
     /// Registered `[configuration]` schemas, by plugin id. The only thing that
@@ -158,6 +160,11 @@ pub struct ConfigStore {
     /// Set by [`Self::redact_unregistered_plugins`] when schema discovery was
     /// incomplete. See that method for why the default is `false`.
     redact_unregistered: bool,
+    pub(crate) revision: crate::ConfigRevision,
+    directories: StandardDirectories,
+    policy: Option<PathBuf>,
+    pending: BTreeMap<String, Option<String>>,
+    user_document: BTreeMap<String, String>,
 }
 
 /// Prints the SHAPE of the store and none of its values.
@@ -228,6 +235,11 @@ impl ConfigStore {
             sources: Vec::new(),
             schemas: BTreeMap::new(),
             redact_unregistered: false,
+            revision: Default::default(),
+            directories: directories.clone(),
+            policy: policy.map(Path::to_path_buf),
+            pending: BTreeMap::new(),
+            user_document: BTreeMap::new(),
         };
         for (key, value) in BUILT_IN_DEFAULTS {
             store.layers[ConfigLayer::BuiltInDefaults.index()].insert((*key).to_owned(), (*value).to_owned());
@@ -236,6 +248,7 @@ impl ConfigStore {
             store.read_file_into(ConfigLayer::AdministratorPolicy, policy, "")?;
         }
         store.read_file_into(ConfigLayer::UserGlobal, &config_path, "")?;
+        store.user_document = store.layers[ConfigLayer::UserGlobal.index()].clone();
         for (key, value) in overrides {
             store.set_session_override(key, value);
         }
@@ -251,6 +264,8 @@ impl ConfigStore {
             store.read_file_into(ConfigLayer::Profile, &path, "")?;
         }
         store.read_plugin_files(&config_dir.join(PLUGIN_DIRECTORY))?;
+        store.revision.session = store.layers[ConfigLayer::SessionOverride.index()].clone();
+        store.revision.check()?;
         Ok(store)
     }
 
@@ -261,15 +276,24 @@ impl ConfigStore {
     /// already existed would never notice the first `config.toml` a user writes.
     fn read_file_into(&mut self, layer: ConfigLayer, path: &Path, prefix: &str) -> Result<(), ConfigError> {
         self.sources.push(path.to_path_buf());
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(ConfigError::Read {
-                    path: path.to_path_buf(),
-                    source: error,
-                })
-            }
+        let state = crate::persistence::SourceState::read(path)?;
+        if state.is_directory {
+            return Err(ConfigError::Read {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "configuration document is a directory",
+                ),
+            });
+        }
+        let bytes = state.bytes.clone();
+        self.revision.sources.insert(path.to_path_buf(), state);
+        let text = match bytes {
+            Some(bytes) => String::from_utf8(bytes).map_err(|_| ConfigError::Read {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, "configuration is not UTF-8"),
+            })?,
+            None => return Ok(()),
         };
         let table: toml::Table = text
             .parse()
@@ -289,6 +313,10 @@ impl ConfigStore {
     /// the same way on every machine.
     fn read_plugin_files(&mut self, directory: &Path) -> Result<(), ConfigError> {
         self.sources.push(directory.to_path_buf());
+        self.revision.sources.insert(
+            directory.to_path_buf(),
+            crate::persistence::SourceState::read(directory)?,
+        );
         let entries = match std::fs::read_dir(directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -458,7 +486,7 @@ impl ConfigStore {
 
     /// Records whether `plugin` may be loaded, in the user's global file.
     pub fn set_plugin_enabled(&mut self, plugin: &PluginId, on: bool) {
-        self.layers[ConfigLayer::UserGlobal.index()].insert(plugin_enabled_key(plugin), on.to_string());
+        self.set_user_global(&plugin_enabled_key(plugin), &on.to_string());
     }
 
     /// The scheduling profile an operator pinned for `plugin`, if any.
@@ -475,11 +503,11 @@ impl ConfigStore {
         let key = plugin_scheduling_profile_key(plugin);
         match profile {
             Some(profile) => {
-                self.layers[ConfigLayer::UserGlobal.index()]
-                    .insert(key, scheduling_profile_name(profile).to_owned());
+                self.set_user_global(&key, scheduling_profile_name(profile));
             }
             None => {
                 self.layers[ConfigLayer::UserGlobal.index()].remove(&key);
+                self.pending.insert(key, None);
             }
         }
     }
@@ -495,6 +523,7 @@ impl ConfigStore {
     /// user is not permitted to change.
     pub fn set_user_global(&mut self, key: &str, value: &str) {
         self.layers[ConfigLayer::UserGlobal.index()].insert(key.to_owned(), value.to_owned());
+        self.pending.insert(key.to_owned(), Some(value.to_owned()));
     }
 
     /// Sets a value for this process only (spec 21.2, layer 7).
@@ -503,11 +532,13 @@ impl ConfigStore {
     /// session override that survived the session would not be one.
     pub fn set_session_override(&mut self, key: &str, value: &str) {
         self.layers[ConfigLayer::SessionOverride.index()].insert(key.to_owned(), value.to_owned());
+        self.revision.session = self.layers[ConfigLayer::SessionOverride.index()].clone();
     }
 
     /// Drops a session override, exposing whatever layer was underneath.
     pub fn clear_session_override(&mut self, key: &str) {
         self.layers[ConfigLayer::SessionOverride.index()].remove(key);
+        self.revision.session = self.layers[ConfigLayer::SessionOverride.index()].clone();
     }
 
     /// Installs `section`'s defaults and validates the values already loaded
@@ -699,28 +730,132 @@ impl ConfigStore {
         &self.config_path
     }
 
-    /// Writes the user-global layer back to `config_dir()/config.toml`.
-    ///
-    /// Only that layer, and therefore only that file: an administrator's policy
-    /// and a plugin's own defaults are not this process's to rewrite, and a save
-    /// that folded them in would turn a policy the administrator can change into
-    /// a copy the user now owns.
-    pub fn save(&self) -> Result<(), ConfigError> {
-        if let Some(parent) = self.config_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
-                path: parent.to_path_buf(),
-                source,
-            })?;
+    /// Atomically saves pending user-global edits, checking the exact loaded
+    /// sources under the shared cross-process writer lock. Blocking: worker only.
+    /// Prefer `commit_user_global` when editing a published store: setters stage
+    /// drafts immediately, whereas that method publishes only after success.
+    pub fn save(&mut self) -> Result<(), ConfigError> {
+        let lock = crate::persistence::writer_lock(&self.config_path)?;
+        self.revision.check()?;
+        // Freshly load retained layers while holding the writer lock.
+        let mut validation = self.reload()?;
+        for (key, value) in &self.pending {
+            let Some(value) = value else { continue };
+            if key == KEY_PROFILE && !valid_profile_name(value) {
+                return Err(ConfigError::Setting {
+                    key: key.clone(),
+                    reason: "profile must be one safe path component",
+                });
+            }
+            if let Some((plugin, field)) = split_setting_key(key) {
+                if let Some(field) = self.schemas.get(plugin).and_then(|schema| schema.field(field)) {
+                    field.validate(value).map_err(|violation| ConfigError::Schema {
+                        plugin: plugin.to_owned(),
+                        violation,
+                    })?;
+                }
+            }
         }
-        let document = tomlmap::nest(&self.layers[ConfigLayer::UserGlobal.index()], &self.config_path)?;
+        let mut flat = self.user_document.clone();
+        for (key, value) in &self.pending {
+            match value {
+                Some(value) => {
+                    flat.insert(key.clone(), value.clone());
+                }
+                None => {
+                    flat.remove(key);
+                }
+            }
+        }
+        // Validate the prospective profile before persisting its selector. Its
+        // exact source joins the final check even if the old store never read it.
+        validation.layers[ConfigLayer::UserGlobal.index()] = flat;
+        validation.layers[ConfigLayer::Profile.index()].clear();
+        if let Some(profile) = validation.get(KEY_PROFILE).map(str::to_owned) {
+            if !valid_profile_name(&profile) {
+                return Err(ConfigError::Setting {
+                    key: KEY_PROFILE.to_owned(),
+                    reason: "profile must be one safe path component",
+                });
+            }
+            let path = self
+                .directories
+                .config_dir()
+                .join(PROFILE_DIRECTORY)
+                .join(format!("{profile}.toml"));
+            validation.read_file_into(ConfigLayer::Profile, &path, "")?;
+        }
+        let document = tomlmap::nest(
+            &validation.layers[ConfigLayer::UserGlobal.index()],
+            &self.config_path,
+        )?;
         let text = toml::to_string_pretty(&document).map_err(|source| ConfigError::Serialize {
             path: self.config_path.clone(),
             source,
         })?;
-        std::fs::write(&self.config_path, text).map_err(|source| ConfigError::Write {
-            path: self.config_path.clone(),
-            source,
-        })
+        // A non-cooperating editor is not protected by our lock. Recheck after
+        // validation, immediately before replacement; never overwrite a change
+        // observed while preparing the candidate.
+        self.revision.check()?;
+        crate::persistence::atomic_write(&self.config_path, text.as_bytes(), &validation.revision)?;
+        let reloaded = self.reload().map_err(|_| ConfigError::PersistedReload)?;
+        *self = reloaded;
+        drop(lock);
+        Ok(())
+    }
+
+    fn reload(&self) -> Result<Self, ConfigError> {
+        let overrides: Vec<_> = self.layers[ConfigLayer::SessionOverride.index()]
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let mut store = Self::load_with_overrides(&self.directories, self.policy.as_deref(), &overrides)?;
+        for (plugin, schema) in &self.schemas {
+            store.register_plugin_schema(&PluginId(plugin.clone()), schema);
+        }
+        store.redact_unregistered = self.redact_unregistered;
+        Ok(store)
+    }
+
+    /// An opaque exact-source token, including shadowed documents and session
+    /// values. Keep it with the caller-owned draft, not just its winning value.
+    pub fn revision(&self) -> crate::ConfigRevision {
+        self.revision.clone()
+    }
+
+    /// Validates and persists one edit without changing this published store on
+    /// failure. Blocking filesystem/lock operations must run off the UI thread.
+    pub fn commit_user_global(
+        &mut self,
+        key: &str,
+        value: &str,
+        expected: &crate::ConfigRevision,
+    ) -> Result<(), ConfigError> {
+        if &self.revision != expected {
+            return Err(ConfigError::Conflict);
+        }
+        if let Some((plugin, field)) = split_setting_key(key) {
+            let declaration = self
+                .schemas
+                .get(plugin)
+                .and_then(|schema| schema.field(field))
+                .filter(|field| field.applies_to(std::env::consts::OS))
+                .ok_or_else(|| ConfigError::Setting {
+                    key: key.to_owned(),
+                    reason: "configuration field is unavailable",
+                })?;
+            declaration
+                .validate(value)
+                .map_err(|violation| ConfigError::Schema {
+                    plugin: plugin.to_owned(),
+                    violation,
+                })?;
+        }
+        let mut candidate = self.clone();
+        candidate.set_user_global(key, value);
+        candidate.save()?;
+        *self = candidate;
+        Ok(())
     }
 }
 

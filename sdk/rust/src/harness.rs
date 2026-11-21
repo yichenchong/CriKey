@@ -107,6 +107,14 @@ impl Plugin for StartupProbe {
         self.plugin.page(request, context)
     }
 
+    fn supports_commands(&self) -> bool {
+        self.plugin.supports_commands()
+    }
+
+    fn commands(&mut self, context: &dyn PluginContext) -> Result<crate::PluginCommands> {
+        self.plugin.commands(context)
+    }
+
     fn supports_preview(&self) -> bool {
         self.plugin.supports_preview()
     }
@@ -236,6 +244,7 @@ impl TestHarness {
                     "streaming_suggestions".to_owned(),
                     "cancellation".to_owned(),
                     crikey_core::PREVIEW_CAPABILITY.to_owned(),
+                    crikey_core::command::COMMANDS_CAPABILITY.to_owned(),
                 ],
                 host_version: "sdk-test-harness".to_owned(),
                 accepted: true,
@@ -390,6 +399,32 @@ impl TestHarness {
     /// Latches cancellation for the next explicit cancelled suggestion call.
     pub fn cancel(&mut self) {
         self.cancel_latched = true;
+    }
+
+    /// Request explicit declarations after building this plugin's catalog.
+    pub fn commands(&mut self, generation: u64) -> Result<crate::PluginCommands, SdkError> {
+        let request_id = self.next_request();
+        self.send(Envelope {
+            connection_id: 1,
+            request_id,
+            generation,
+            deadline_ms: 0,
+            payload: Some(Payload::CommandsRequest(message::CommandsRequest::default())),
+            unknown: Default::default(),
+        })?;
+        loop {
+            let envelope = self.recv()?;
+            self.check_identity(&envelope, request_id, generation)?;
+            match envelope.payload {
+                Some(Payload::Log(_)) => {}
+                Some(Payload::CommandsResponse(response)) => {
+                    return crikey_native_protocol::commands::from_response(response)
+                        .map_err(SdkError::Protocol);
+                }
+                Some(Payload::Error(error)) => return Err(SdkError::Protocol(error.message)),
+                _ => return Err(SdkError::Protocol("unexpected commands response".into())),
+            }
+        }
     }
 
     /// Executes an action and requires it to have completed.

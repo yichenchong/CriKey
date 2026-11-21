@@ -256,7 +256,7 @@ fn a_corrupt_history_file_loads_as_an_empty_history_rather_than_failing_startup(
         ("no-magic", r#"{"selections":[],"query_affinities":[]}"#),
         (
             "future-version",
-            r#"{"crikey_selection_history":2,"selections":[],"query_affinities":[]}"#,
+            r#"{"crikey_selection_history":3,"selections":[],"query_affinities":[]}"#,
         ),
         (
             "unknown-key",
@@ -618,5 +618,128 @@ fn an_oversized_snapshot_is_trimmed_rather_than_written_unreadable() {
     assert!(
         !reloaded.query_affinities.is_empty(),
         "and the file still carries affinities rather than loading empty"
+    );
+}
+
+#[test]
+fn v1_migration_keeps_item_and_affinity_evidence_with_empty_commands() {
+    let scratch = Scratch::new("v1-commands");
+    let store = SelectionHistoryStore::new(scratch.join("history.json"));
+    fs::write(store.path(), r#"{"crikey_selection_history":1,"selections":[{"plugin":"p","item":"i","frequency":7,"last_selected_secs":42}],"query_affinities":[{"plugin":"p","item":"i","query":"prefix","count":3}]}"#).unwrap();
+    let loaded = store.load();
+    assert_eq!(loaded.selections[0].frequency, 7);
+    assert_eq!(loaded.selections[0].last_selected_secs, Some(42));
+    assert_eq!(loaded.query_affinities[0].count, 3);
+    assert!(loaded.commands.is_empty());
+    store.save(&loaded).unwrap();
+    assert!(fs::read_to_string(store.path())
+        .unwrap()
+        .starts_with("{\"crikey_selection_history\":2,"));
+    assert_eq!(store.load(), loaded);
+}
+
+#[test]
+fn command_success_history_roundtrips_exact_identity_and_selective_reset() {
+    let scratch = Scratch::new("command-roundtrip");
+    let store = SelectionHistoryStore::new(scratch.join("history.json"));
+    let mut history = crikey_ranking::SelectionHistory::default();
+    let target = item("shared", "Shared", Category::Application, &[]);
+    let a = crikey_core::CommandRef {
+        provider_id: target.plugin_id.clone(),
+        command_id: "first".into(),
+    };
+    let b = crikey_core::CommandRef {
+        provider_id: target.plugin_id.clone(),
+        command_id: "second".into(),
+    };
+    let normalizer = crikey_query::DefaultNormalizer::default();
+    use crikey_query::Normalizer as _;
+    history.record(&target, &normalizer.normalize("shared"), 1);
+    history.record_command_success(&a, 2).unwrap();
+    history.record_command_success(&b, 3).unwrap();
+    history.record_command_success(&a, 4).unwrap();
+    store.save(&history.snapshot()).unwrap();
+    assert_eq!(store.load(), history.snapshot());
+    let before = history.recent_commands();
+    assert!(store
+        .reset_item(&mut history, &target.plugin_id, &target.stable_id)
+        .unwrap());
+    let loaded = store.load();
+    assert!(loaded.selections.is_empty());
+    assert!(loaded.query_affinities.is_empty());
+    assert_eq!(
+        crikey_ranking::SelectionHistory::from_snapshot(loaded).recent_commands(),
+        before
+    );
+}
+
+#[test]
+fn malformed_command_records_are_rejected_without_guessing() {
+    let scratch = Scratch::new("malformed-commands");
+    let store = SelectionHistoryStore::new(scratch.join("history.json"));
+    let valid = r#"{"provider_id":"p","command_id":"c","frequency":1,"last_selected_secs":2}"#;
+    let invalid = [
+        valid.replace("\"c\"", "\"\""),
+        valid.replace("\"p\"", "\"\""),
+        valid.replace("\"c\"", "\"line\\nbreak\""),
+        valid.replace("\"c\"", &format!("\"{}\"", "x".repeat(257))),
+        valid.replace("\"frequency\":1", "\"frequency\":0"),
+        valid.replace("\"last_selected_secs\":2", "\"last_selected_secs\":null"),
+        valid.replace("\"last_selected_secs\":2", "\"last_selected_secs\":-1"),
+        valid.replace(",\"frequency\":1", ""),
+        format!("{valid},{valid}"),
+        valid.replace("\"frequency\":1", "\"frequency\":1,\"arguments\":\"secret\""),
+        std::iter::repeat_n(valid, crikey_ranking::MAX_COMMAND_RECORDS + 1)
+            .collect::<Vec<_>>()
+            .join(","),
+    ];
+    for records in invalid {
+        let text = format!("{{\"crikey_selection_history\":2,\"selections\":[],\"query_affinities\":[],\"commands\":[{records}]}}");
+        fs::write(store.path(), text).unwrap();
+        assert_eq!(store.load(), crikey_ranking::SelectionHistorySnapshot::default());
+    }
+    let mut snapshot = crikey_ranking::SelectionHistorySnapshot::default();
+    snapshot.commands.push(crikey_ranking::CommandSelectionRecord {
+        reference: crikey_core::CommandRef {
+            provider_id: PluginId("p".into()),
+            command_id: "".into(),
+        },
+        frequency: 1,
+        last_selected_secs: 2,
+    });
+    let before = fs::read(store.path()).unwrap();
+    assert_eq!(
+        store.save(&snapshot).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(fs::read(store.path()).unwrap(), before);
+}
+
+#[test]
+fn direct_command_snapshot_is_count_and_byte_bounded_on_disk() {
+    let scratch = Scratch::new("command-bounds");
+    let store = SelectionHistoryStore::new(scratch.join("history.json"));
+    let mut snapshot = crikey_ranking::SelectionHistorySnapshot::default();
+    for index in 0..crikey_ranking::MAX_COMMAND_RECORDS + 100 {
+        snapshot.commands.push(crikey_ranking::CommandSelectionRecord {
+            reference: crikey_core::CommandRef {
+                provider_id: PluginId("\"".repeat(256)),
+                command_id: format!("{index:06}{}", "\\".repeat(250)),
+            },
+            frequency: if index == 0 { 100 } else { 1 },
+            last_selected_secs: index as u64,
+        });
+    }
+    store.save(&snapshot).unwrap();
+    assert!(fs::metadata(store.path()).unwrap().len() <= SelectionHistoryStore::MAX_BYTES);
+    let loaded = store.load();
+    assert_eq!(loaded.commands.len(), crikey_ranking::MAX_COMMAND_RECORDS);
+    assert!(loaded.commands.iter().any(|record| record.frequency == 100));
+    store.save(&loaded).unwrap();
+    assert_eq!(store.load(), loaded);
+    snapshot.commands.push(snapshot.commands[0].clone());
+    assert_eq!(
+        store.save(&snapshot).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
     );
 }

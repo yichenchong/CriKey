@@ -450,6 +450,8 @@ struct SharedState {
 struct Overlay {
     settings_open: bool,
     settings: Arc<[SettingRow]>,
+    setting_edits: Arc<[crate::SettingEditOutcome]>,
+    command_management: Arc<[ResultRow]>,
     settings_focus: Option<String>,
     /// Whether the footer draws its hint line, and whether the window is
     /// rounded. Both are preferences the host read from configuration and no
@@ -475,6 +477,8 @@ impl Default for Overlay {
         Self {
             settings_open: false,
             settings: Arc::from([] as [SettingRow; 0]),
+            setting_edits: Arc::default(),
+            command_management: Arc::default(),
             settings_focus: None,
             show_hints: true,
             rounded_corners: true,
@@ -510,6 +514,8 @@ fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
     mailbox.overlay = Overlay {
         settings_open: model.settings_open,
         settings: Arc::clone(&model.settings),
+        setting_edits: Arc::clone(&model.setting_edits),
+        command_management: Arc::clone(&model.command_management),
         settings_focus: model.settings_focus.clone(),
         show_hints: model.show_hints,
         rounded_corners: model.rounded_corners,
@@ -545,6 +551,8 @@ fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> View
     ViewModel {
         settings_open: mailbox.overlay.settings_open,
         settings: Arc::clone(&mailbox.overlay.settings),
+        setting_edits: Arc::clone(&mailbox.overlay.setting_edits),
+        command_management: Arc::clone(&mailbox.overlay.command_management),
         settings_focus: mailbox.overlay.settings_focus.clone(),
         show_hints: mailbox.overlay.show_hints,
         rounded_corners: mailbox.overlay.rounded_corners,
@@ -1894,12 +1902,9 @@ struct GraphicsState {
 /// `draw_results` floors the list at a minimum height, the footer was pushed
 /// onto the bottom edge of a window that had never reserved room for a list.
 ///
-/// Both conditions carry weight. Rows with no query are the stale answer to a
-/// query the user has already cleared, and an untyped launcher is the query
-/// field and nothing else. A query with no rows has nothing to list, and the
-/// count in the footer already says so.
+/// Rows are admitted by the view model, including the root command home.
 fn shows_results(model: &ViewModel) -> bool {
-    !model.query.is_empty() && (!model.rows.is_empty() || model.action_panel.is_some())
+    !model.rows.is_empty() || model.action_panel.is_some()
 }
 
 /// How tall the window has to be to show `model`, in logical pixels.
@@ -3042,7 +3047,11 @@ fn draw_launcher(
                 // floating over it: the launcher is one column, and a list the
                 // user cannot reach behind a panel is only noise.
                 ui.add_space(theme::SPACE_3);
-                draw_settings(ui, model, commands, colors);
+                egui::ScrollArea::vertical()
+                    .id_salt("settings-scroll")
+                    .max_height((ui.available_height() - theme::FOOTER_HEIGHT - theme::SPACE_3).max(0.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| draw_settings(ui, model, commands, colors));
             } else if shows_results(model)
                 && !(model.navigation.can_go_back && model.navigation.unavailable.is_some())
             {
@@ -3238,7 +3247,7 @@ fn draw_results(
             let mut selected_row = None;
             let mut first_visible = None;
             for (index, row) in model.rows.iter().enumerate() {
-                let response = draw_result_row(ui, row, index == model.selected, commands, colors);
+                let response = draw_result_row(ui, row, model, index == model.selected, commands, colors);
                 if first_visible.is_none()
                     && response.rect.max.y > ui.clip_rect().top()
                     && response.rect.min.y < ui.clip_rect().bottom()
@@ -3306,6 +3315,7 @@ mod preview_render;
 fn draw_result_row(
     ui: &mut egui::Ui,
     row: &ResultRow,
+    model: &ViewModel,
     selected: bool,
     commands: &mut Vec<UiCommand>,
     colors: theme::Palette,
@@ -3382,13 +3392,10 @@ fn draw_result_row(
                         if ui.button("Actions").clicked() {
                             commands.push(UiCommand::ShowActions);
                         }
-                        if row.default_action.is_some() && ui.button("Run  Enter").clicked() {
-                            commands.push(UiCommand::ActivateAction {
-                                target: crate::ActionTarget::of(row),
-                                identity: crate::ActionIdentity::Plugin(
-                                    row.default_action.as_ref().unwrap().action_id.clone(),
-                                ),
-                            });
+                        if row.has_primary_action() && ui.button("Run  Enter").clicked() {
+                            if let Some(command) = row.primary_command(model.generation, &model.query) {
+                                commands.push(command);
+                            }
                         }
                     });
                 }
@@ -3420,6 +3427,14 @@ fn row_metadata(row: &ResultRow) -> String {
             line.push_str("  ·  ");
         }
         line.push_str(part);
+    }
+    if let crate::ActionTarget::Command(reference) = &row.target {
+        if !line.is_empty() {
+            line.push_str("  ·  ");
+        }
+        line.push_str(&reference.provider_id.0);
+        line.push_str(" / ");
+        line.push_str(&reference.command_id);
     }
     line
 }
@@ -5006,6 +5021,31 @@ fn draw_settings(
             if ui.button("Clear query history").clicked() {
                 commands.push(UiCommand::ClearQueryHistory);
             }
+            egui::CollapsingHeader::new("Configure Commands")
+                .id_salt("configure-commands")
+                .show(ui, |ui| {
+                    if model.command_management.is_empty() {
+                        ui.label("No declared or saved commands.");
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("all-command-management")
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for row in model.command_management.iter() {
+                                let crate::ActionTarget::Command(reference) = &row.target else {
+                                    continue;
+                                };
+                                egui::CollapsingHeader::new(format!(
+                                    "{} — {} / {}",
+                                    row.label, reference.provider_id.0, reference.command_id
+                                ))
+                                .id_salt(("configure-command", &row.target))
+                                .show(ui, |ui| {
+                                    action_render::draw_command_controls(ui, row, model, commands, false)
+                                });
+                            }
+                        });
+                });
             if model.settings.is_empty() {
                 ui.label(
                     RichText::new("The launcher host published no settings.")
@@ -5014,7 +5054,14 @@ fn draw_settings(
                 );
             }
             for row in model.settings.iter() {
-                draw_setting_row(ui, row, model.settings_focus.as_deref(), commands, colors);
+                draw_setting_row(
+                    ui,
+                    row,
+                    &model.setting_edits,
+                    model.settings_focus.as_deref(),
+                    commands,
+                    colors,
+                );
                 ui.add_space(theme::SPACE_1);
             }
             // The footer of the sheet is set apart by space rather than by a
@@ -5065,25 +5112,56 @@ fn commit_hint(settings: &[SettingRow]) -> Option<&'static str> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PendingSettingEdit {
+    request_id: u64,
+    value: Arc<str>,
+    revision: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SettingDraftState {
+    revision: u64,
+    pending: Option<PendingSettingEdit>,
+}
+
 /// One editable setting.
 ///
-/// The half-typed value has to be kept somewhere between frames: the model
-/// carries what the host has stored, so an editor bound straight to it would
-/// lose every keystroke on the next repaint. The draft is dropped again the
-/// moment the edit is committed, which is what makes the host's answer --
-/// validated, normalised, or refused -- the value the row shows next.
+/// A draft survives publication, pending work and failures. Only a matching
+/// successful request clears its submitted revision; edits made while that
+/// request was pending remain independent drafts.
 fn draw_setting_row(
     ui: &mut egui::Ui,
     row: &SettingRow,
+    outcomes: &[crate::SettingEditOutcome],
     focus_key: Option<&str>,
     commands: &mut Vec<UiCommand>,
     colors: theme::Palette,
 ) {
     let draft_id = egui::Id::new(("crikey-setting-draft", row.key.as_str()));
-    let mut draft = ui
-        .data(|data| data.get_temp::<String>(draft_id))
-        .unwrap_or_else(|| row.value.clone());
+    let state_id = draft_id.with("state");
+    let mut state = ui
+        .data(|data| data.get_temp::<SettingDraftState>(state_id))
+        .unwrap_or_default();
+    if let Some(pending) = &state.pending {
+        if let Some(outcome) = outcomes.iter().find(|outcome| {
+            outcome.request_id == pending.request_id
+                && outcome.key == row.key
+                && outcome.value == pending.value.as_ref()
+        }) {
+            if outcome.status == crate::SettingEditStatus::Saved && state.revision == pending.revision {
+                ui.data_mut(|data| data.remove::<String>(draft_id));
+                state = SettingDraftState::default();
+            } else {
+                state.pending = None;
+            }
+        }
+    }
+    let stored = ui.data(|data| data.get_temp::<String>(draft_id));
+    let has_draft = stored.is_some();
+    let mut draft = stored.unwrap_or_else(|| row.value.clone());
     let mut committed = false;
+    let mut cancelled = false;
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.label(
@@ -5107,6 +5185,7 @@ fn draw_setting_row(
                 focus_once(ui, &response, row, focus_key);
                 if response.changed() {
                     commands.push(UiCommand::SetSetting {
+                        request_id: crate::next_setting_edit_id(),
                         key: row.key.clone(),
                         // The two words the host validates. A switch cannot
                         // produce anything else, which is the point of it.
@@ -5118,25 +5197,56 @@ fn draw_setting_row(
             if ui.button("Save").clicked() {
                 committed = true;
             }
+            if ui
+                .add_enabled(has_draft, egui::Button::new("Cancel edit"))
+                .clicked()
+            {
+                cancelled = true;
+            }
+            if state.pending.is_some() {
+                ui.small("Saving…");
+            }
             let response = ui.add(
                 TextEdit::singleline(&mut draft)
                     .id(draft_id.with("editor"))
                     .desired_width(theme::SPACE_8 * 6.0),
             );
             focus_once(ui, &response, row, focus_key);
+            if response.changed() {
+                state.revision = state
+                    .revision
+                    .checked_add(1)
+                    .expect("setting draft revision exhausted");
+                ui.data_mut(|data| data.insert_temp(draft_id, draft.clone()));
+            }
             if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 committed = true;
-            } else if response.changed() {
-                ui.data_mut(|data| data.insert_temp(draft_id, draft.clone()));
             }
         });
     });
-    if committed {
-        commands.push(UiCommand::SetSetting {
-            key: row.key.clone(),
-            value: draft,
+    if cancelled {
+        ui.data_mut(|data| {
+            data.remove::<String>(draft_id);
+            data.remove::<SettingDraftState>(state_id);
         });
-        ui.data_mut(|data| data.remove::<String>(draft_id));
+        return;
+    }
+    if committed {
+        let request_id = crate::next_setting_edit_id();
+        state.pending = Some(PendingSettingEdit {
+            request_id,
+            value: Arc::from(draft.as_str()),
+            revision: state.revision,
+        });
+        commands.push(UiCommand::SetSetting {
+            request_id,
+            key: row.key.clone(),
+            value: draft.clone(),
+        });
+        ui.data_mut(|data| data.insert_temp(draft_id, draft));
+    }
+    if matches!(row.control, SettingControl::Text) {
+        ui.data_mut(|data| data.insert_temp(state_id, state));
     }
 }
 
@@ -5336,20 +5446,26 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
                     commands.push(UiCommand::ShowActions);
                 }
                 if let Some(row) = model.rows.get(model.selected) {
-                    if let Some(action) = &row.default_action {
+                    if row.has_primary_action() {
+                        let label = if matches!(row.target, crate::ActionTarget::Command(_)) {
+                            "Invoke Command"
+                        } else {
+                            row.default_action
+                                .as_ref()
+                                .map_or("Run", |action| action.label.as_str())
+                        };
                         let primary = ui
                             .add_sized(
                                 [110.0, theme::FOOTER_HEIGHT],
-                                egui::Label::new(RichText::new(format!("{}  Enter", action.label)).small())
+                                egui::Label::new(RichText::new(format!("{}  Enter", label)).small())
                                     .truncate()
                                     .sense(egui::Sense::click()),
                             )
-                            .on_hover_text(&action.label);
+                            .on_hover_text(label);
                         if primary.clicked() {
-                            commands.push(UiCommand::ActivateAction {
-                                target: crate::ActionTarget::of(row),
-                                identity: crate::ActionIdentity::Plugin(action.action_id.clone()),
-                            });
+                            if let Some(command) = row.primary_command(model.generation, &model.query) {
+                                commands.push(command);
+                            }
                         }
                     }
                 }
@@ -5433,6 +5549,8 @@ mod transparency_tests {
             action_panel: None,
             settings_open: false,
             settings: Arc::default(),
+            setting_edits: Arc::default(),
+            command_management: Arc::default(),
             settings_focus: None,
             page: None,
             show_hints: true,
@@ -5533,8 +5651,16 @@ mod lifecycle_tests {
         host.publish(
             crikey_core::Generation::from_raw(4),
             vec![ResultRow {
-                plugin: crikey_core::PluginId("lifecycle-image-fixture".into()),
-                item: crikey_core::ItemId("image".into()),
+                target: crate::ActionTarget::Result {
+                    owner: crikey_core::PluginId("lifecycle-image-fixture".into()),
+                    item: crikey_core::ItemId("image".into()),
+                },
+                source: Some(crate::ResultSource {
+                    owner: crikey_core::PluginId("lifecycle-image-fixture".into()),
+                    item: crikey_core::ItemId("image".into()),
+                    kind: crate::ResultSourceKind::Ordinary,
+                }),
+                command_state: None,
                 label: "Image".into(),
                 description: String::new(),
                 icon_reference: None,
@@ -5706,6 +5832,8 @@ mod lifecycle_tests {
                     action_panel: None,
                     settings_open: false,
                     settings: Arc::default(),
+                    setting_edits: Arc::default(),
+                    command_management: Arc::default(),
                     settings_focus: None,
                     page: None,
                     show_hints: true,
@@ -5840,6 +5968,8 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
                 action_panel: None,
                 settings_open: false,
                 settings: Arc::default(),
+                setting_edits: Arc::default(),
+                command_management: Arc::default(),
                 settings_focus: None,
                 page: None,
                 show_hints: true,
@@ -5911,8 +6041,16 @@ mod label_tests {
     #[test]
     fn an_empty_result_label_gets_a_visible_fallback() {
         let row = ResultRow {
-            plugin: crikey_core::PluginId("label-fixture".into()),
-            item: crikey_core::ItemId("untitled".to_owned()),
+            target: crate::ActionTarget::Result {
+                owner: crikey_core::PluginId("label-fixture".into()),
+                item: crikey_core::ItemId("untitled".to_owned()),
+            },
+            source: Some(crate::ResultSource {
+                owner: crikey_core::PluginId("label-fixture".into()),
+                item: crikey_core::ItemId("untitled".to_owned()),
+                kind: crate::ResultSourceKind::Ordinary,
+            }),
+            command_state: None,
             label: String::new(),
             description: String::new(),
             icon_reference: None,
@@ -5932,8 +6070,16 @@ mod label_tests {
     #[test]
     fn a_highlight_range_inside_a_utf8_character_is_ignored_safely() {
         let row = ResultRow {
-            plugin: crikey_core::PluginId("label-fixture".into()),
-            item: crikey_core::ItemId("cafe".to_owned()),
+            target: crate::ActionTarget::Result {
+                owner: crikey_core::PluginId("label-fixture".into()),
+                item: crikey_core::ItemId("cafe".to_owned()),
+            },
+            source: Some(crate::ResultSource {
+                owner: crikey_core::PluginId("label-fixture".into()),
+                item: crikey_core::ItemId("cafe".to_owned()),
+                kind: crate::ResultSourceKind::Ordinary,
+            }),
+            command_state: None,
             label: "café".to_owned(),
             description: String::new(),
             icon_reference: None,
@@ -6197,6 +6343,8 @@ mod window_geometry_tests {
             action_panel: None,
             settings_open,
             settings: Arc::default(),
+            setting_edits: Arc::default(),
+            command_management: Arc::default(),
             settings_focus: None,
             page: None,
             show_hints: true,
@@ -6211,8 +6359,16 @@ mod window_geometry_tests {
     fn view_with_rows(count: usize) -> ViewModel {
         let rows: Vec<ResultRow> = (0..count)
             .map(|index| ResultRow {
-                plugin: crikey_core::PluginId("geometry-fixture".into()),
-                item: crikey_core::ItemId(format!("item-{index}")),
+                target: crate::ActionTarget::Result {
+                    owner: crikey_core::PluginId("geometry-fixture".into()),
+                    item: crikey_core::ItemId(format!("item-{index}")),
+                },
+                source: Some(crate::ResultSource {
+                    owner: crikey_core::PluginId("geometry-fixture".into()),
+                    item: crikey_core::ItemId(format!("item-{index}")),
+                    kind: crate::ResultSourceKind::Ordinary,
+                }),
+                command_state: None,
                 label: format!("Result {index}"),
                 description: "A description that occupies the second line".to_owned(),
                 icon_reference: None,
@@ -6923,7 +7079,7 @@ mod window_geometry_tests {
             all[0] = first;
             model.rows = all.into();
             model.action_panel = Some(Arc::new(crate::ActionPanel::new(
-                crate::action_tree(&model.rows[model.selected]).unwrap(),
+                crate::action_tree(&model.rows[model.selected], &model.command_management).unwrap(),
             )));
 
             let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
@@ -6989,7 +7145,7 @@ mod window_geometry_tests {
             model.rows = rows.into();
             model.action_panel = actions_open.then(|| {
                 Arc::new(crate::ActionPanel::new(
-                    crate::action_tree(&model.rows[model.selected]).unwrap(),
+                    crate::action_tree(&model.rows[model.selected], &model.command_management).unwrap(),
                 ))
             });
 
@@ -8085,8 +8241,16 @@ mod preview_admission_tests {
         state.publish(
             crikey_core::Generation::from_raw(1),
             vec![ResultRow {
-                plugin: crikey_core::PluginId("preview-admission-fixture".into()),
-                item: crikey_core::ItemId("A".into()),
+                target: crate::ActionTarget::Result {
+                    owner: crikey_core::PluginId("preview-admission-fixture".into()),
+                    item: crikey_core::ItemId("A".into()),
+                },
+                source: Some(crate::ResultSource {
+                    owner: crikey_core::PluginId("preview-admission-fixture".into()),
+                    item: crikey_core::ItemId("A".into()),
+                    kind: crate::ResultSourceKind::Ordinary,
+                }),
+                command_state: None,
                 label: "A".into(),
                 description: String::new(),
                 icon_reference: None,

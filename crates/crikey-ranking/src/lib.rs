@@ -16,7 +16,7 @@
 
 use std::{cmp::Ordering, collections::BTreeMap, ops::Bound};
 
-use crikey_core::{Category, Item, ItemId, PluginId};
+use crikey_core::{Category, CommandRef, Item, ItemId, PluginId};
 use crikey_query::{MatchMethod, MatchOutcome, MatchSummary, NormalizedQuery};
 
 // ---------------------------------------------------------------------------
@@ -126,6 +126,7 @@ pub struct RankingSignals {
 pub struct SelectionHistory {
     entries: BTreeMap<(PluginId, ItemId), HistoryEntry>,
     query_counts: BTreeMap<(String, PluginId, ItemId), u32>,
+    commands: BTreeMap<CommandRef, HistoryEntry>,
 }
 
 /// Most items a history retains, and most affinities it retains.
@@ -139,9 +140,12 @@ pub struct SelectionHistory {
 ///
 /// Eviction keeps the most-used records, which is also the useful policy: what
 /// a launcher must never forget is the handful of things a user picks
-/// constantly.
+/// constantly. Exact command uses follow the same frequency/recency/key eviction
+/// policy but have an independent cap and validated, bounded CommandRef keys.
 const MAX_ITEM_RECORDS: usize = 4_096;
 const MAX_QUERY_AFFINITIES: usize = 8_192;
+/// Command history shares the item retention policy, with independently bounded keys.
+pub const MAX_COMMAND_RECORDS: usize = 1_024;
 
 /// Largest affinity key, in bytes, that is worth keeping.
 ///
@@ -199,6 +203,14 @@ pub struct QueryAffinityRecord {
     pub count: u32,
 }
 
+/// One exact declaration's successful uses. Contains no arguments or query text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSelectionRecord {
+    pub reference: CommandRef,
+    pub frequency: u32,
+    pub last_selected_secs: u64,
+}
+
 /// A lossless copy of a [`SelectionHistory`].
 ///
 /// Lossless is the whole contract: a snapshot restored into a fresh history
@@ -210,6 +222,7 @@ pub struct QueryAffinityRecord {
 pub struct SelectionHistorySnapshot {
     pub selections: Vec<SelectionRecord>,
     pub query_affinities: Vec<QueryAffinityRecord>,
+    pub commands: Vec<CommandSelectionRecord>,
 }
 
 /// Per-item affinity for one query, resolved once and read per candidate.
@@ -238,6 +251,47 @@ impl QueryAffinity<'_> {
 }
 
 impl SelectionHistory {
+    /// Credits this exact declaration only after its invocation reaches terminal success.
+    ///
+    /// Admission, failure and cancellation must not call this method. Item learning is
+    /// deliberately separate: call [`Self::record`] only with independently verified
+    /// admitted item evidence, never by reverse-joining an item to a declaration.
+    pub fn record_command_success(
+        &mut self,
+        reference: &CommandRef,
+        now_secs: u64,
+    ) -> Result<(), &'static str> {
+        reference.validate()?;
+        let entry = self.commands.entry(reference.clone()).or_default();
+        entry.frequency = entry.frequency.saturating_add(1);
+        entry.last_selected_secs = Some(now_secs);
+        self.evict_to_capacity();
+        Ok(())
+    }
+
+    /// Successful declarations, newest first; equal timestamps use exact identity.
+    /// Uses the caller's clock convention, just like item selection history.
+    pub fn recent_commands(&self) -> Vec<CommandSelectionRecord> {
+        let mut records = self.command_records().collect::<Vec<_>>();
+        records.sort_unstable_by(|left, right| {
+            right
+                .last_selected_secs
+                .cmp(&left.last_selected_secs)
+                .then_with(|| left.reference.cmp(&right.reference))
+        });
+        records
+    }
+
+    fn command_records(&self) -> impl Iterator<Item = CommandSelectionRecord> + '_ {
+        self.commands
+            .iter()
+            .map(|(reference, entry)| CommandSelectionRecord {
+                reference: reference.clone(),
+                frequency: entry.frequency,
+                last_selected_secs: entry.last_selected_secs.expect("command success has a timestamp"),
+            })
+    }
+
     /// Records one successful item selection.
     ///
     /// Both halves are guarded by size, and neither key is safe to assume
@@ -252,6 +306,15 @@ impl SelectionHistory {
     /// A refusal costs one selection's learning about a pathological item, and
     /// buys the bound that keeps the persisted history loadable at all.
     pub fn record(&mut self, item: &Item, query: &NormalizedQuery, now_secs: u64) {
+        self.record_selection(item, Some(query), now_secs);
+    }
+
+    /// Records item frequency/recency without collecting any query affinity.
+    pub fn record_item_selection(&mut self, item: &Item, now_secs: u64) {
+        self.record_selection(item, None, now_secs);
+    }
+
+    fn record_selection(&mut self, item: &Item, query: Option<&NormalizedQuery>, now_secs: u64) {
         if !item_key_fits(&item.plugin_id, &item.stable_id) {
             return;
         }
@@ -263,7 +326,9 @@ impl SelectionHistory {
         entry.frequency = entry.frequency.saturating_add(1);
         entry.last_selected_secs = Some(now_secs);
 
-        if affinity_key_fits(&item.plugin_id, &item.stable_id, &query.normalized) {
+        if let Some(query) =
+            query.filter(|query| affinity_key_fits(&item.plugin_id, &item.stable_id, &query.normalized))
+        {
             let query_key = (
                 query.normalized.clone(),
                 item.plugin_id.clone(),
@@ -353,6 +418,19 @@ impl SelectionHistory {
     /// key clone per record for the rest of the process; reclaiming a batch
     /// amortizes it to once per `cap / 8` selections.
     fn evict_to_capacity(&mut self) {
+        if self.commands.len() > MAX_COMMAND_RECORDS {
+            let target = MAX_COMMAND_RECORDS - MAX_COMMAND_RECORDS / 8;
+            let mut ranked: Vec<_> = self
+                .commands
+                .iter()
+                .map(|(key, entry)| (entry.frequency, entry.last_selected_secs, key.clone()))
+                .collect();
+            ranked.sort_unstable();
+            let excess = self.commands.len() - target;
+            for (_, _, key) in ranked.into_iter().take(excess) {
+                self.commands.remove(&key);
+            }
+        }
         if self.entries.len() > MAX_ITEM_RECORDS {
             let target = MAX_ITEM_RECORDS - MAX_ITEM_RECORDS / 8;
             let mut ranked: Vec<_> = self
@@ -385,6 +463,17 @@ impl SelectionHistory {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.query_counts.clear();
+        self.commands.clear();
+    }
+
+    /// Removes learned frequency, recency and every query affinity for this exact owner/item.
+    /// Exact command success history is independent and remains unchanged.
+    pub fn reset_item(&mut self, owner: &PluginId, item: &ItemId) -> bool {
+        let removed = self.entries.remove(&(owner.clone(), item.clone())).is_some();
+        let before = self.query_counts.len();
+        self.query_counts
+            .retain(|(_, plugin, id), _| plugin != owner || id != item);
+        removed || before != self.query_counts.len()
     }
 
     /// Copies every record out, in the store's own deterministic key order.
@@ -414,6 +503,7 @@ impl SelectionHistory {
                     count: *count,
                 })
                 .collect(),
+            commands: self.command_records().collect(),
         }
     }
 
@@ -452,6 +542,19 @@ impl SelectionHistory {
                 .query_counts
                 .insert((record.query, record.plugin, record.item), record.count);
         }
+        for record in snapshot.commands {
+            if record.reference.validate().is_err() || record.frequency == 0 {
+                continue;
+            }
+            history.commands.insert(
+                record.reference,
+                HistoryEntry {
+                    frequency: record.frequency,
+                    last_selected_secs: Some(record.last_selected_secs),
+                },
+            );
+        }
+        // Invalid command references and zero-use records carry no successful evidence.
         // A file may be older than the caps, or hand edited past them.
         history.evict_to_capacity();
         history
@@ -783,4 +886,60 @@ fn saturating_decay(value: f32, half: f32) -> f32 {
 fn bounded_signed(value: f32, half: f32) -> f32 {
     let scaled = value / half;
     scaled / (1.0 + scaled.abs())
+}
+
+#[cfg(test)]
+mod selective_reset_tests {
+    use super::*;
+    #[test]
+    fn reset_is_exact_owner_and_preserves_unrelated_affinities() {
+        let a = PluginId("owner-a".into());
+        let b = PluginId("owner-b".into());
+        let item = ItemId("shared-id".into());
+        let snapshot = SelectionHistorySnapshot {
+            selections: vec![
+                SelectionRecord {
+                    plugin: a.clone(),
+                    item: item.clone(),
+                    frequency: 3,
+                    last_selected_secs: Some(5),
+                },
+                SelectionRecord {
+                    plugin: b.clone(),
+                    item: item.clone(),
+                    frequency: 7,
+                    last_selected_secs: Some(8),
+                },
+            ],
+            query_affinities: vec![
+                QueryAffinityRecord {
+                    plugin: a.clone(),
+                    item: item.clone(),
+                    query: "first".into(),
+                    count: 2,
+                },
+                QueryAffinityRecord {
+                    plugin: a.clone(),
+                    item: item.clone(),
+                    query: "second".into(),
+                    count: 1,
+                },
+                QueryAffinityRecord {
+                    plugin: b.clone(),
+                    item: item.clone(),
+                    query: "first".into(),
+                    count: 7,
+                },
+            ],
+            commands: Vec::new(),
+        };
+        let mut history = SelectionHistory::from_snapshot(snapshot);
+        assert!(history.reset_item(&a, &item));
+        assert!(!history.reset_item(&a, &item));
+        let remaining = history.snapshot();
+        assert_eq!(remaining.selections.len(), 1);
+        assert_eq!(remaining.selections[0].plugin, b);
+        assert_eq!(remaining.query_affinities.len(), 1);
+        assert_eq!(remaining.query_affinities[0].count, 7);
+    }
 }
