@@ -541,6 +541,110 @@ fn crash_on_suggest_is_contained_and_records_bounded_stderr() {
     assert!(exit.stderr_tail.len() <= STDERR_TAIL_BYTES);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(unsafe_code)]
+fn an_exited_native_leader_with_delayed_pipe_eof_is_a_crash_not_a_timeout() {
+    use std::os::unix::fs::DirBuilderExt;
+    struct FixtureDirectory(PathBuf);
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    const HELPER: &str = "CRIKEY_NATIVE_EXIT_REAPER_HELPER";
+    if std::env::var_os(HELPER).is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "an_exited_native_leader_with_delayed_pipe_eof_is_a_crash_not_a_timeout",
+            ])
+            .env(HELPER, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated native reaper failed: {status}");
+        return;
+    }
+    // Only this single-test subprocess adopts fixture descendants. The shared
+    // test runner is untouched, and no unrelated child is ever waited on.
+    let (plugin, _) = conformance_binaries();
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+        0
+    );
+    let directory = std::env::temp_dir().join(format!(
+        "crikey-native-exit-eof-{}-{}",
+        std::process::id(),
+        unique_suffix(),
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&directory).unwrap();
+    let fixture = FixtureDirectory(directory);
+    let pid_path = fixture.0.join("stream-holder-pid");
+    let owner = PluginId("conformance".to_owned());
+    let (result, stopped, reaped, exits) = std::thread::scope(|scope| {
+        // On unwind this canonical supervisor is dropped before scoped joins,
+        // so physical cancellation precedes waiting for the owned reaper.
+        let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+        let mut options = options(TransportKind::Stdio);
+        options.sandbox = crikey_sandbox::plugin_policy(vec![fixture.0.clone()], false);
+        supervisor
+            .register(
+                launch(
+                    &plugin,
+                    &owner.0,
+                    "exit-with-held-streams",
+                    &[(
+                        "CRIKEY_CONFORMANCE_STREAM_HOLDER_PID".into(),
+                        pid_path.to_str().unwrap().into(),
+                    )],
+                ),
+                options,
+            )
+            .expect("register real leader and inherited-stream descendant");
+        let worker = supervisor
+            .worker(&owner, 0)
+            .expect("real SDK handshake completes");
+        let end = std::time::Instant::now() + Duration::from_millis(CALL_TIMEOUT_MS + SHUTDOWN_TIMEOUT_MS);
+        let reap = scope.spawn(move || {
+            let descendant = loop {
+                if let Ok(pid) = fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
+                if std::time::Instant::now() >= end {
+                    return Err("stream-holder PID was not published");
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            loop {
+                let mut status = 0;
+                if unsafe { libc::waitpid(descendant, &mut status, libc::WNOHANG) } == descendant {
+                    return Ok(status);
+                }
+                if std::time::Instant::now() >= end {
+                    return Err("the exact adopted stream holder was not reaped");
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let result = worker.suggest(&request("exit before its stream holder", 1));
+        let stopped = supervisor.shutdown_all_checked();
+        let reaped = reap.join();
+        (result, stopped, reaped, supervisor.termination_ledger())
+    });
+    let status = reaped
+        .expect("the owned reaper panicked")
+        .expect("actual descendant reap");
+    assert!(libc::WIFSIGNALED(status));
+    assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+    assert!(matches!(result, Err(HostError::Crashed { .. })), "{result:?}");
+    stopped.expect("the actual leader, containment descendants, and pipes are settled");
+    assert!(exits.iter().any(|(plugin, exit)| {
+        plugin == &owner && exit.kind == ExitKind::Crashed && exit.code == Some(17)
+    }));
+}
+
 #[test]
 fn kill_returns_a_killed_exit_record_and_reaps_the_worker() {
     let (plugin, _) = conformance_binaries();

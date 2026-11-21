@@ -21,6 +21,8 @@ Mode selection is identical in both binaries: `CRIKEY_CONFORMANCE_MODE`, then
 |  | `ignore-cancel:<ms>` | Never checks cancellation and returns only after the delay. |
 |  | `gated-ignore-cancel` | Appends each callback's query to working-directory `conformance-gate-entered`, then ignores cancellation until `conformance-gate-release` contains exactly that query. Returns a fresh `(gated)` row; a 60-second watchdog only bounds failed tests. |
 |  | `crash-on-suggest` | Aborts inside `suggest`. |
+|  | `exit-on-suggest` | Exits with status 17 inside `suggest`, without a terminal response or SDK finalization. Isolates completed-crash ledger tests from OS abort-reporting latency. |
+|  | `exit-with-held-streams` | Starts a real inherited-stdio descendant and exits with status 17. Requires `CRIKEY_CONFORMANCE_STREAM_HOLDER_PID` for its actual PID witness; the regression uses an isolated known-PID reaper. Host containment must settle the descendant and its pipes, and delayed EOF must not relabel the exited leader as a callback timeout. |
 |  | `crash-on-start` | Aborts from `start`. |
 |  | `fail-suggest` | Returns a plugin error from `suggest`. |
 |  | `sequence` | Uses `CRIKEY_SEQUENCE_FILE` as a launch-count file: the first and third processes abort in `suggest`, while the second behaves like `echo`. |

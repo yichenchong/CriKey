@@ -48,6 +48,9 @@ enum Mode {
     IgnoreCancel(u64),
     GatedIgnoreCancel,
     CrashOnSuggest,
+    ExitOnSuggest {
+        hold_streams: bool,
+    },
     CrashOnStart,
     FailSuggest,
     Sequence,
@@ -88,6 +91,8 @@ fn parse_mode(spec: &str) -> Mode {
         "env-witness" => Mode::EnvWitness,
         "acceptance" => Mode::Acceptance,
         "crash-on-suggest" => Mode::CrashOnSuggest,
+        "exit-on-suggest" => Mode::ExitOnSuggest { hold_streams: false },
+        "exit-with-held-streams" => Mode::ExitOnSuggest { hold_streams: true },
         "crash-on-start" => Mode::CrashOnStart,
         "fail-suggest" => Mode::FailSuggest,
         "sequence" => Mode::Sequence,
@@ -1020,6 +1025,43 @@ impl Plugin for ConformancePlugin {
             Mode::IgnoreCancel(milliseconds) => self.suggest_ignore_cancel(query, milliseconds, sink),
             Mode::GatedIgnoreCancel => self.suggest_gated_ignore_cancel(query, sink),
             Mode::CrashOnSuggest => crash("crash-on-suggest requested"),
+            Mode::ExitOnSuggest { hold_streams } => {
+                let _stream_holder = if hold_streams {
+                    let path = env::var_os("CRIKEY_CONFORMANCE_STREAM_HOLDER_PID")
+                        .ok_or_else(|| invalid("the stream-holder PID witness is required"))?;
+                    let mut witness = fs::File::create(path).map_err(|error| invalid(error.to_string()))?;
+                    let mut child = std::process::Command::new(
+                        env::current_exe().map_err(|error| invalid(error.to_string()))?,
+                    )
+                    .arg("--hold-streams")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                    .map_err(|error| invalid(error.to_string()))?;
+                    if let Err(error) = writeln!(witness, "{}", child.id()) {
+                        child.kill().map_err(|error| invalid(error.to_string()))?;
+                        let end = Instant::now() + Duration::from_secs(5);
+                        while child
+                            .try_wait()
+                            .map_err(|error| invalid(error.to_string()))?
+                            .is_none()
+                        {
+                            if Instant::now() >= end {
+                                return Err(invalid("the stream holder could not be reaped"));
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        return Err(invalid(error.to_string()));
+                    }
+                    Some(child)
+                } else {
+                    None
+                };
+                // No callback terminal or SDK shutdown: the native owner must
+                // observe and reap this real unexpected process termination.
+                std::process::exit(17);
+            }
             Mode::CrashOnStart => Err(invalid("crash-on-start should not receive suggest")),
             Mode::FailSuggest => Err(invalid("conformance fail-suggest requested")),
             Mode::Sequence => Err(invalid("sequence mode must be resolved before serving")),
@@ -1168,6 +1210,13 @@ fn run() -> Result<(), SdkError> {
 }
 
 fn main() {
+    if env::args().nth(1).as_deref() == Some("--hold-streams") {
+        // An inherited-pipe descendant deliberately outlives the SDK leader.
+        // Its existing host process group/job must settle it; the isolated
+        // harness reaps its exact PID rather than leaving a zombie to init.
+        thread::sleep(Duration::from_secs(30));
+        return;
+    }
     if let Err(error) = run() {
         eprintln!("crikey-conformance-plugin: {error:?}");
         std::process::exit(1);

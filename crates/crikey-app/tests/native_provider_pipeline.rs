@@ -2410,7 +2410,9 @@ fn a_physically_settled_historical_native_crash_does_not_taint_stop() {
     let (conformance, _) = conformance_binaries();
     let scratch = Scratch::new("checked-crash");
     let root = scratch.subdir("plugins");
-    let package = write_native_plugin(&root, "checkedcrash", &conformance, "crash-on-suggest");
+    // Abort behavior is covered by native-host supervision; this consumer
+    // requires an actual completed nonzero exit, independent of OS reporters.
+    let package = write_native_plugin(&root, "checkedcrash", &conformance, "exit-on-suggest");
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
     let mut provider = NativeProvider::load_with_collection_window(
         &mut pipeline,
@@ -2419,14 +2421,19 @@ fn a_physically_settled_historical_native_crash_does_not_taint_stop() {
         &DisabledPlugins::default(),
     );
     let _ = provider.drive_query(&mut pipeline, "crash", 1);
+    let failures = provider.dispatch_failures().to_vec();
     let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| ()));
     let control = driver.control();
     let epoch = std::num::NonZeroU64::MIN;
     let proof = control.request_stop(epoch).unwrap().wait().unwrap();
-    assert!(proof
-        .native_exits()
-        .iter()
-        .any(|exit| exit.kind == crikey_native_host::ExitKind::Crashed));
+    assert!(
+        proof
+            .native_exits()
+            .iter()
+            .any(|exit| exit.kind == crikey_native_host::ExitKind::Crashed),
+        "actual exits: {:?}; dispatch failures before stop: {failures:?}",
+        proof.native_exits(),
+    );
     assert!(control.request_stop(epoch).unwrap().wait().is_ok());
     assert!(matches!(
         control.admission().state(),

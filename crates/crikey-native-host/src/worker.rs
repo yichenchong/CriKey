@@ -545,7 +545,7 @@ pub struct NativeWorker {
     // refreshers never wait for descendants that retain a standard stream.
     observed_exit: Option<Result<(), ()>>,
     process_status: Option<std::process::ExitStatus>,
-    tree_signalled: bool,
+    containment_reap_ready: bool,
     thread_failure: Option<&'static str>,
     retirement_kind: Option<ExitKind>,
     closing_failure: Option<&'static str>,
@@ -928,7 +928,7 @@ impl NativeWorker {
             exit: None,
             observed_exit: None,
             process_status: None,
-            tree_signalled: false,
+            containment_reap_ready: false,
             thread_failure: None,
             retirement_kind: None,
             closing_failure: None,
@@ -2201,6 +2201,9 @@ impl NativeWorker {
         if let Some(error) = self.thread_failure {
             return Err(self.teardown_error(error));
         }
+        // Retrying physical cleanup must not overwrite the guest failure that
+        // initiated it, even when the first attempt cannot yet reap or join.
+        self.retirement_kind = self.retirement_kind.or(kind);
         let mut forced = false;
         if self.process_status.is_none() {
             let child = self
@@ -2209,10 +2212,10 @@ impl NativeWorker {
                 .ok_or_else(|| self.teardown_error("native child ownership unavailable"))?;
             let mut exited =
                 child_exited(child).map_err(|_| self.teardown_error("native exit observation failed"))?;
-            if graceful && exited && !self.tree_signalled && self.link.admission.is_closed() {
+            if graceful && exited && !self.containment_reap_ready && self.link.admission.is_closed() {
                 self.closing_failure = Some("native worker exited before shutdown");
             }
-            if graceful && !exited && !self.tree_signalled {
+            if graceful && !exited && !self.containment_reap_ready {
                 let request_id = self.begin_request(0);
                 let end = deadline(self.options.shutdown_timeout_ms);
                 // Cleanup control is permitted after callback admission closes.
@@ -2249,11 +2252,11 @@ impl NativeWorker {
                 }
                 forced = !exited;
             }
-            if !self.tree_signalled {
+            if !self.containment_reap_ready {
                 // The leader remains unreaped here, even after EOF or a clean
                 // graceful exit, so its process-group identity cannot be reused.
                 #[cfg(unix)]
-                let signalled = kill_group_checked(self.child.as_ref().expect("owned child").id());
+                let signalled = prepare_group_reap(self.child.as_ref().expect("owned child"));
                 #[cfg(windows)]
                 let signalled = self.job.as_ref().is_some_and(|job| terminate_job_checked(job.0));
                 #[cfg(not(any(unix, windows)))]
@@ -2261,7 +2264,7 @@ impl NativeWorker {
                 if !signalled {
                     return Err(self.teardown_error("native containment termination failed"));
                 }
-                self.tree_signalled = true;
+                self.containment_reap_ready = true;
             }
             self.link.close();
             let end = Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS);
@@ -2273,7 +2276,7 @@ impl NativeWorker {
         }
         self.link.close();
         let status = self.process_status.expect("confirmed native process status");
-        let retirement_kind = kind.or(self.retirement_kind).unwrap_or_else(|| {
+        let retirement_kind = self.retirement_kind.unwrap_or_else(|| {
             if forced {
                 ExitKind::Killed
             } else {
@@ -2603,6 +2606,17 @@ impl NativeWorker {
             self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::ProtocolViolation);
             self.fail_and_reap(ExitKind::ProtocolViolation);
             return HostError::Protocol("transport protocol violation detected".to_owned());
+        }
+        // Pipe EOF can lag process termination. A guest that has already
+        // exited did not exhaust a live callback's execution budget.
+        if self
+            .child
+            .as_ref()
+            .is_some_and(|child| matches!(child_exited(child), Ok(true)))
+        {
+            self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::Crash);
+            self.fail_and_reap(ExitKind::Crashed);
+            return self.crashed_error("transport closed: native worker exited before its terminal response");
         }
         self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::Timeout);
         self.fail_and_reap(ExitKind::Killed);
@@ -3997,14 +4011,27 @@ fn close_job_handle(handle: usize) {
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn kill_group_checked(pid: u32) -> bool {
+fn prepare_group_reap(child: &Child) -> bool {
+    let pid = child.id();
     if pid <= 1 || pid > i32::MAX as u32 {
         return false;
     }
-    unsafe extern "C" {
-        fn killpg(pgrp: i32, sig: i32) -> i32;
+    if unsafe { libc::killpg(pid as i32, libc::SIGKILL) } == 0 {
+        return true;
     }
-    (unsafe { killpg(pid as i32, 9) == 0 }) || std::io::Error::last_os_error().raw_os_error() == Some(3)
+    let error = std::io::Error::last_os_error().raw_os_error();
+    if error == Some(libc::ESRCH) {
+        return true;
+    }
+    // Darwin skips zombies when signaling a group, so an exited, unreaped
+    // owned leader can cause EPERM even with no live members. This permits
+    // only its reap; the caller must still prove actual group absence after
+    // reaping, and must never signal that now-reusable group ID again.
+    #[cfg(target_vendor = "apple")]
+    if error == Some(libc::EPERM) && matches!(child_exited(child), Ok(true)) {
+        return true;
+    }
+    false
 }
 
 #[cfg(unix)]
@@ -4602,8 +4629,9 @@ mod checked_native_ownership_tests {
             assert!(Instant::now() < end, "the actual writer reader did not finish");
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(kill_group_checked(child.id()));
+        assert!(prepare_group_reap(&child));
         assert!(wait_child_after_termination(&mut child, end).is_some());
+        assert!(wait_group_absent(child.id()));
         assert_eq!(revoked.load(Ordering::Acquire), 1);
         assert_eq!(pending.load(Ordering::Acquire), 0);
         let bytes = std::fs::read(&path).unwrap();
@@ -4633,8 +4661,9 @@ mod checked_native_ownership_tests {
         assert!(result.is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!child_exited(&child).unwrap());
-        assert!(kill_group_checked(child.id()));
+        assert!(prepare_group_reap(&child));
         assert!(wait_child_after_termination(&mut child, Instant::now() + Duration::from_secs(5)).is_some());
+        assert!(wait_group_absent(child.id()));
     }
 }
 
@@ -4680,7 +4709,7 @@ impl NativeStartupOwner {
                 child_exited(&self.child).map_err(|_| error("native startup exit observation failed"))?;
             if !self.signalled {
                 #[cfg(unix)]
-                let signalled = kill_group_checked(self.child.id());
+                let signalled = prepare_group_reap(&self.child);
                 #[cfg(windows)]
                 let signalled = match &self.job {
                     Some(job) => terminate_job_checked(job.0),
