@@ -470,9 +470,9 @@ fn unique_suffix() -> String {
 fn bad_token_handshake_is_rejected_as_a_handshake_error() {
     let (_, misbehaving) = conformance_binaries();
     let spec = launch(&misbehaving, "conformance", "bad-token", &[]);
-    let error = NativeWorker::spawn(spec, options(TransportKind::Stdio))
+    let mut error = NativeWorker::spawn(spec, options(TransportKind::Stdio))
         .expect_err("a wrong session token must not be accepted");
-    match error {
+    match error.error() {
         HostError::Handshake(detail) => {
             assert!(
                 detail.contains("token"),
@@ -481,15 +481,18 @@ fn bad_token_handshake_is_rejected_as_a_handshake_error() {
         }
         other => panic!("wrong-token handshake returned {other:?}, not HostError::Handshake"),
     }
+    error
+        .retry_cleanup()
+        .expect("the rejected real child is physically settled");
 }
 
 #[test]
 fn bad_protocol_version_handshake_is_rejected_as_a_handshake_error() {
     let (_, misbehaving) = conformance_binaries();
     let spec = launch(&misbehaving, "conformance", "bad-version:99", &[]);
-    let error = NativeWorker::spawn(spec, options(TransportKind::Stdio))
+    let mut error = NativeWorker::spawn(spec, options(TransportKind::Stdio))
         .expect_err("an unsupported protocol version must not be accepted");
-    match error {
+    match error.error() {
         HostError::Handshake(detail) => {
             assert!(
                 detail.contains("99"),
@@ -498,6 +501,9 @@ fn bad_protocol_version_handshake_is_rejected_as_a_handshake_error() {
         }
         other => panic!("bad-version handshake returned {other:?}, not HostError::Handshake"),
     }
+    error
+        .retry_cleanup()
+        .expect("the rejected real child is physically settled");
 }
 
 #[test]
@@ -750,7 +756,7 @@ fn zero_initial_credits_are_rejected_before_launch() {
         options,
     )
     .expect_err("a zero-credit stream cannot make progress");
-    assert!(matches!(error, HostError::ResourceLimit { .. }));
+    assert!(matches!(error.error(), HostError::ResourceLimit { .. }));
 }
 
 #[test]
@@ -1229,4 +1235,199 @@ fn liveness_poll_publishes_dead_connection_before_retained_stderr_cleanup() {
         .next_retry_at_ms(&plugin)
         .is_some_and(|retry| retry > 100));
     supervisor.shutdown_all();
+}
+
+#[test]
+fn checked_shutdown_delivers_the_real_plugin_finalizer() {
+    let (binary, _) = conformance_binaries();
+    let witness = std::env::temp_dir().join(format!(
+        "crikey-native-stop-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let owner = PluginId("checked.finalizer".into());
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+    supervisor
+        .register(
+            launch(
+                &binary,
+                &owner.0,
+                "echo",
+                &[(
+                    "CRIKEY_CONFORMANCE_STOP_FILE".into(),
+                    witness.to_string_lossy().into_owned(),
+                )],
+            ),
+            options(TransportKind::Stdio),
+        )
+        .unwrap();
+    supervisor.worker(&owner, 0).unwrap();
+    supervisor.admission().close();
+    supervisor.shutdown_all_checked().unwrap();
+    assert_eq!(fs::read(&witness).unwrap(), b"finished");
+    assert_eq!(supervisor.exits(&owner).last().unwrap().kind, ExitKind::Clean);
+    supervisor.shutdown_all_checked().unwrap();
+    fs::remove_file(witness).unwrap();
+}
+
+#[test]
+fn checked_shutdown_forces_a_finalizer_only_after_its_deadline() {
+    let (binary, _) = conformance_binaries();
+    let witness = std::env::temp_dir().join(format!(
+        "crikey-native-stop-bound-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let owner = PluginId("checked.blocked-finalizer".into());
+    let mut policy = options(TransportKind::Stdio);
+    policy.shutdown_timeout_ms = 100;
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+    supervisor
+        .register(
+            launch(
+                &binary,
+                &owner.0,
+                "echo",
+                &[
+                    (
+                        "CRIKEY_CONFORMANCE_STOP_FILE".into(),
+                        witness.to_string_lossy().into_owned(),
+                    ),
+                    ("CRIKEY_CONFORMANCE_STOP_DELAY_MS".into(), "15000".into()),
+                ],
+            ),
+            policy,
+        )
+        .unwrap();
+    supervisor.worker(&owner, 0).unwrap();
+    supervisor.admission().close();
+    let started = std::time::Instant::now();
+    supervisor.shutdown_all_checked().unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let exit = supervisor.exits(&owner).last().unwrap();
+    assert_eq!(exit.kind, ExitKind::Killed);
+    assert!(exit.code.is_some() || exit.signal.is_some());
+    assert_ne!(fs::read(&witness).ok().as_deref(), Some(b"finished".as_slice()));
+    let _ = fs::remove_file(witness);
+}
+
+#[test]
+fn losing_guest_control_during_checked_shutdown_is_retained_failure() {
+    let (binary, _) = conformance_binaries();
+    let witness = std::env::temp_dir().join(format!(
+        "crikey-native-stop-crash-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let owner = PluginId("checked.crashed-finalizer".into());
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+    supervisor
+        .register(
+            launch(
+                &binary,
+                &owner.0,
+                "echo",
+                &[
+                    (
+                        "CRIKEY_CONFORMANCE_STOP_FILE".into(),
+                        witness.to_string_lossy().into_owned(),
+                    ),
+                    ("CRIKEY_CONFORMANCE_CRASH_ON_STOP".into(), "1".into()),
+                ],
+            ),
+            options(TransportKind::Stdio),
+        )
+        .unwrap();
+    supervisor.worker(&owner, 0).unwrap();
+    supervisor.admission().close();
+    assert!(supervisor.shutdown_all_checked().is_err());
+    assert_eq!(fs::read(&witness).unwrap(), b"started");
+    assert!(supervisor.shutdown_all_checked().is_err());
+    assert!(matches!(supervisor.worker(&owner, 1), Err(HostError::Closed)));
+    fs::remove_file(witness).unwrap();
+}
+
+#[test]
+fn checked_shutdown_accounts_for_an_actual_failed_startup_child() {
+    let (_, binary) = conformance_binaries();
+    let owner = PluginId("checked.partial-startup".into());
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+    supervisor
+        .register(
+            launch(&binary, &owner.0, "bad-token", &[]),
+            options(TransportKind::Stdio),
+        )
+        .unwrap();
+    assert!(supervisor.worker(&owner, 0).is_err());
+    supervisor.admission().close();
+    supervisor.shutdown_all_checked().unwrap();
+    let ledger = supervisor.termination_ledger();
+    assert!(ledger
+        .iter()
+        .any(|(plugin, exit)| plugin == &owner && (exit.code.is_some() || exit.signal.is_some())));
+    assert!(matches!(supervisor.worker(&owner, 1), Err(HostError::Closed)));
+}
+
+#[test]
+fn checked_shared_settlement_releases_the_owner_lock_and_refuses_inflight_proof() {
+    let (binary, _) = conformance_binaries();
+    let witness = std::env::temp_dir().join(format!(
+        "crikey-native-shared-stop-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let release = witness.with_extension("release");
+    let owner = PluginId("checked.shared-finalizer".into());
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+    let mut policy = options(TransportKind::Stdio);
+    policy.shutdown_timeout_ms = 30_000;
+    supervisor
+        .register(
+            launch(
+                &binary,
+                &owner.0,
+                "echo",
+                &[
+                    (
+                        "CRIKEY_CONFORMANCE_STOP_FILE".into(),
+                        witness.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "CRIKEY_CONFORMANCE_STOP_RELEASE_FILE".into(),
+                        release.to_string_lossy().into_owned(),
+                    ),
+                ],
+            ),
+            policy,
+        )
+        .unwrap();
+    supervisor.worker(&owner, 0).unwrap();
+    let supervisor = std::sync::Arc::new(std::sync::Mutex::new(supervisor));
+    let worker_owner = std::sync::Arc::clone(&supervisor);
+    let stopping = std::thread::spawn(move || NativeSupervisor::shutdown_shared(&worker_owner));
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    while fs::read(&witness).ok().as_deref() != Some(b"started".as_slice()) {
+        assert!(
+            std::time::Instant::now() < end,
+            "the actual stop callback never started"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    {
+        let mut state = supervisor
+            .try_lock()
+            .expect("physical shutdown must not hold the owner mutex");
+        assert!(
+            state.shutdown_all_checked().is_err(),
+            "Settling cannot acknowledge an empty transferred slot"
+        );
+        assert!(matches!(state.worker(&owner, 1), Err(HostError::Closed)));
+    }
+    fs::write(&release, b"release").unwrap();
+    stopping.join().unwrap().unwrap();
+    assert_eq!(fs::read(&witness).unwrap(), b"finished");
+    NativeSupervisor::shutdown_shared(&supervisor).unwrap();
+    fs::remove_file(release).unwrap();
+    fs::remove_file(witness).unwrap();
 }

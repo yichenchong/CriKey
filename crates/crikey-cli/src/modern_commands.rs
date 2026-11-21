@@ -184,7 +184,7 @@ fn dispatch(command: &str, args: &[String]) -> ExitCode {
         // Anything that stops the run from starting — a missing manifest, a bad
         // entrypoint, a plugin that will not import — is the caller's fault and
         // prints nothing on stdout.
-        Err(message) => refuse(command, &message),
+        Err(error) => refuse(command, &error.to_string()),
     }
 }
 
@@ -399,11 +399,69 @@ fn help(command: &str) -> String {
 struct Report {
     text: String,
     found_fault: bool,
+    // Keep uncertain process/thread ownership alive through report rendering.
+    _cleanup: Option<InvocationCleanup>,
+}
+
+struct InvocationCleanup {
+    _worker: ModernWorker,
+    _cache_root: PrivateTempDir,
+}
+
+/// Loading errors retain their typed worker source and environment until the
+/// invocation has rendered its final diagnostic, rather than dropping them
+/// while merely constructing a message.
+enum InvocationError {
+    Usage(String),
+    Startup {
+        plugin: String,
+        error: HostError,
+        _cache_root: PrivateTempDir,
+    },
+}
+
+impl From<String> for InvocationError {
+    fn from(message: String) -> Self {
+        Self::Usage(message)
+    }
+}
+
+impl std::fmt::Display for InvocationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Usage(message) => f.write_str(message),
+            Self::Startup { plugin, error, .. } => {
+                let reason = match error {
+                    HostError::StartupCleanup { .. } | HostError::TeardownFailed => {
+                        "modern worker cleanup did not settle"
+                    }
+                    HostError::AdmissionClosed => "modern runtime admission closed",
+                    _ => "modern worker startup failed",
+                };
+                write!(f, "the modern plugin at `{plugin}` could not be loaded: {reason}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for InvocationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InvocationError")
+    }
+}
+
+impl std::error::Error for InvocationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Startup { error, .. } => Some(error),
+            Self::Usage(_) => None,
+        }
+    }
 }
 
 /// Loads the plugin, materialises its environment, spawns a worker and runs
 /// every query. An `Err` means the run never started — the caller's fault.
-fn load_and_run(command: &str, options: &Options) -> Result<Report, String> {
+fn load_and_run(command: &str, options: &Options) -> Result<Report, InvocationError> {
     let plugin_dir = Path::new(&options.plugin);
 
     let manifest_path = plugin_dir.join("crikey.toml");
@@ -468,12 +526,16 @@ fn load_and_run(command: &str, options: &Options) -> Result<Report, String> {
     // Spawn loads the plugin's entrypoint class during the handshake, so a
     // missing class or an import-time raise fails here — an unloadable plugin,
     // not a completed run that found a fault.
-    let mut worker = ModernWorker::spawn(&interpreter, worker_options).map_err(|error| {
-        format!(
-            "the modern plugin at `{}` could not be loaded: {error}",
-            options.plugin
-        )
-    })?;
+    let mut worker = match ModernWorker::spawn(&interpreter, worker_options) {
+        Ok(worker) => worker,
+        Err(error) => {
+            return Err(InvocationError::Startup {
+                plugin: options.plugin.clone(),
+                error,
+                _cache_root: cache_root,
+            })
+        }
+    };
 
     // `dev run` drives exactly one query; an omitted `--query` there means the
     // empty query rather than a refusal, so the smoke always exercises the path.
@@ -538,14 +600,26 @@ fn load_and_run(command: &str, options: &Options) -> Result<Report, String> {
         }
     }
 
-    let worker_exit = worker.shutdown();
-    if !any_failed && (worker_exit.code != Some(0) || worker_exit.hard_stopped) {
-        any_failed = true;
-        faults.push(format!(
-            "modern worker did not exit cleanly (code={:?}, hard_stopped={})",
-            worker_exit.code, worker_exit.hard_stopped
-        ));
-    }
+    let cleanup = match worker.shutdown_checked() {
+        Ok(worker_exit) => {
+            if !any_failed && (worker_exit.code != Some(0) || worker_exit.hard_stopped) {
+                any_failed = true;
+                faults.push(format!(
+                    "modern worker did not exit cleanly (code={:?}, hard_stopped={})",
+                    worker_exit.code, worker_exit.hard_stopped
+                ));
+            }
+            None
+        }
+        Err(error) => {
+            any_failed = true;
+            faults.push(format!("modern worker cleanup did not settle: {error}"));
+            Some(InvocationCleanup {
+                _worker: worker,
+                _cache_root: cache_root,
+            })
+        }
+    };
 
     let state = if any_failed {
         "failed"
@@ -579,6 +653,7 @@ fn load_and_run(command: &str, options: &Options) -> Result<Report, String> {
     Ok(Report {
         text,
         found_fault: any_failed,
+        _cleanup: cleanup,
     })
 }
 
@@ -664,6 +739,103 @@ fn encode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn startup_cleanup_error_keeps_worker_and_cache_through_diagnostic_rendering() {
+        const HELPER: &str = "CRIKEY_CLI_STARTUP_OWNER_TEST_HELPER";
+        if std::env::var_os(HELPER).is_none() {
+            let module = module_path!().split_once("::").unwrap().1;
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(format!(
+                    "{module}::startup_cleanup_error_keeps_worker_and_cache_through_diagnostic_rendering"
+                ))
+                .env(HELPER, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        unsafe extern "C" {
+            fn prctl(option: i32, ...) -> i32;
+            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        // Adoption is confined to this isolated single-test subprocess.
+        assert_eq!(unsafe { prctl(36, 1i32, 0i32, 0i32, 0i32) }, 0);
+        let fixture = PrivateTempDir::new("startup-owner").unwrap();
+        fs::write(fixture.path().join("crikey.toml"),
+            "manifest-version = 1\n[plugin]\nid = \"startup-owner\"\nname = \"Startup owner\"\nversion = \"1.0.0\"\nruntime = \"python\"\nentrypoint = \"startup_failure:NeverLoaded\"\n[python]\nrequires-python = \">=3.8\"\n").unwrap();
+        fs::write(
+            fixture.path().join("startup_failure.py"),
+            r#"
+import os, pathlib, time
+marker = pathlib.Path(__file__).with_name("child-pid")
+child = os.fork()
+if child == 0:
+    os.setsid()
+    marker.write_text(str(os.getpid()))
+    while True:
+        time.sleep(1)
+while not marker.exists():
+    time.sleep(0.001)
+os.write(2, b"PRIVATE_STARTUP_DETAIL\n")
+os.write(1, b"not-a-protocol-frame\n")
+while True:
+    time.sleep(1)
+"#,
+        )
+        .unwrap();
+        let options = Options {
+            plugin: fixture.path().to_str().unwrap().to_owned(),
+            index: None,
+            queries: Vec::new(),
+            cancel: false,
+        };
+        let error = match load_and_run("run", &options) {
+            Err(error) => error,
+            Ok(_) => panic!("the malformed startup must fail"),
+        };
+        let (weak, cache) = match &error {
+            InvocationError::Startup {
+                error: HostError::StartupCleanup { worker },
+                _cache_root,
+                ..
+            } => (
+                std::sync::Arc::downgrade(worker),
+                _cache_root.path().to_path_buf(),
+            ),
+            _ => panic!("the typed unfinished worker must survive the invocation error"),
+        };
+        assert!(cache.is_dir());
+        assert!(weak.upgrade().is_some());
+        assert!(!error.to_string().contains("PRIVATE_STARTUP_DETAIL"));
+        assert_eq!(format!("{error:?}"), "InvocationError");
+        assert!(weak.upgrade().is_some(), "rendering discarded the physical owner");
+        let descendant: i32 = fs::read_to_string(fixture.path().join("child-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { kill(descendant, 9) }, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut status = 0;
+            if unsafe { waitpid(descendant, &mut status, 1) } == descendant {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        {
+            let worker = weak.upgrade().unwrap();
+            let _ = worker.lock().unwrap().shutdown_checked();
+        }
+        drop(error);
+        assert!(weak.upgrade().is_none());
+        assert!(!cache.exists());
+    }
 
     #[test]
     fn developer_temp_directories_are_private_and_unique() {

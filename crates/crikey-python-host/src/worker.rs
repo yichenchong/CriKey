@@ -167,6 +167,15 @@ fn deadline_after_millis(milliseconds: u64) -> Instant {
 /// another.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum HostError {
+    /// The runtime's permanent fence refused bounded process/writer insertion.
+    #[error("modern runtime admission closed")]
+    AdmissionClosed,
+    /// A child existed, but its process or owned pipe threads did not settle.
+    #[error("modern worker cleanup failed")]
+    TeardownFailed,
+    /// Startup could not settle its child; ownership travels with the failure.
+    #[error("modern worker startup cleanup failed")]
+    StartupCleanup { worker: Arc<Mutex<ModernWorker>> },
     /// The child interpreter could not be started at all.
     #[error("the modern worker could not be started: {0}")]
     Spawn(String),
@@ -454,8 +463,14 @@ impl Drop for PipeBytes {
         self.0.fill(0);
     }
 }
+type CallbackAdmissionFn = dyn Fn(&mut dyn FnMut() -> bool) -> bool + Send + Sync;
+struct CallbackAdmission(Arc<CallbackAdmissionFn>);
+impl std::fmt::Debug for CallbackAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CallbackAdmission")
+    }
+}
 /// The parts of a worker that outlive the thread that owns it.
-///
 /// Frames are handed to a dedicated writer thread. The mutex protects only
 /// taking or cloning the channel sender; no child I/O happens while it is held.
 #[derive(Debug)]
@@ -464,22 +479,26 @@ struct WorkerLink {
     stdin: Mutex<Option<SyncSender<StdinRequest>>>,
     stdin_thread: Mutex<Option<JoinHandle<()>>>,
     sensitive: AtomicBool,
+    callback_admission: Mutex<Option<CallbackAdmission>>,
+    cleanup_failed: AtomicBool,
 }
 
-fn spawn_stdin_writer(mut stdin: ChildStdin, receiver: Receiver<StdinRequest>) -> JoinHandle<()> {
-    thread::spawn(move || {
-        for request in receiver {
-            let result = stdin
-                .write_all(&request.bytes)
-                .and_then(|()| stdin.flush())
-                .map_err(|error| error.to_string());
-            let failed = result.is_err();
-            let _ = request.completion.send(result);
-            if failed {
-                return;
+fn spawn_stdin_writer(mut stdin: ChildStdin, receiver: Receiver<StdinRequest>) -> io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("crikey-python-stdin".into())
+        .spawn(move || {
+            for request in receiver {
+                let result = stdin
+                    .write_all(&request.bytes)
+                    .and_then(|()| stdin.flush())
+                    .map_err(|error| error.to_string());
+                let failed = result.is_err();
+                let _ = request.completion.send(result);
+                if failed {
+                    return;
+                }
             }
-        }
-    })
+        })
 }
 
 impl WorkerLink {
@@ -496,10 +515,43 @@ impl WorkerLink {
         let mut encoded = Vec::with_capacity(size.0);
         serde_json::to_writer(&mut encoded, frame).map_err(io::Error::other)?;
         encoded.push(b'\n');
-        self.enqueue_bytes(encoded)
+        if matches!(
+            frame.get("kind").and_then(Value::as_str),
+            Some("set_cancel" | "shutdown" | "background_refuse" | "background_cancel")
+        ) {
+            self.enqueue_bytes_unfenced(encoded)
+        } else {
+            self.enqueue_bytes(encoded)
+        }
     }
 
     fn enqueue_bytes(&self, mut encoded: Vec<u8>) -> io::Result<Receiver<Result<(), String>>> {
+        let admission = self.callback_admission.lock().unwrap_or_else(|e| e.into_inner());
+        let mut result = None;
+        let mut send = || {
+            let queued = self.enqueue_bytes_unfenced(std::mem::take(&mut encoded));
+            let ok = queued.is_ok();
+            result = Some(queued);
+            ok
+        };
+        match admission.as_ref() {
+            Some(admission) => {
+                (admission.0)(&mut send);
+            }
+            None => {
+                send();
+            }
+        }
+        encoded.fill(0);
+        result.unwrap_or_else(|| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "runtime admission closed",
+            ))
+        })
+    }
+
+    fn enqueue_bytes_unfenced(&self, mut encoded: Vec<u8>) -> io::Result<Receiver<Result<(), String>>> {
         let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
         let sender = {
             let guard = self.stdin.lock().unwrap_or_else(|error| error.into_inner());
@@ -552,12 +604,11 @@ impl WorkerLink {
     /// Joins the writer after the child has been stopped, without allowing a
     /// grandchild that inherited stdin to hold teardown forever.
     fn finish_stdin_writer(&self) {
-        let handle = self
+        let mut owner = self
             .stdin_thread
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        let Some(handle) = handle else {
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(handle) = owner.as_ref() else {
             return;
         };
         let deadline = Instant::now() + REAP_GRACE;
@@ -565,7 +616,11 @@ impl WorkerLink {
             thread::sleep(REAP_POLL_INTERVAL);
         }
         if handle.is_finished() {
-            let _ = handle.join();
+            if owner.take().expect("finished writer retained").join().is_err() {
+                self.cleanup_failed.store(true, Ordering::Release);
+            }
+        } else {
+            self.cleanup_failed.store(true, Ordering::Release);
         }
     }
 }
@@ -758,12 +813,12 @@ impl CancelHandle {
     /// call begins. A failed write is deliberately ignored: a dead worker is
     /// reported by the call that discovers it, not by the canceller.
     pub fn cancel(&self) {
-        let _ = self.link.write_frame(&encode_set_cancel(true));
+        let _ = self.link.queue_frame(&encode_set_cancel(true));
     }
 
     /// Lowers the flag so the next call starts uninterrupted.
     pub fn reset(&self) {
-        let _ = self.link.write_frame(&encode_set_cancel(false));
+        let _ = self.link.queue_frame(&encode_set_cancel(false));
     }
 }
 
@@ -849,55 +904,63 @@ fn spawn_stdout_reader(
     sender: SyncSender<StdoutEvent>,
     link: Arc<WorkerLink>,
     background: Arc<BackgroundState>,
-) {
-    thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut line = PipeBytes(Vec::new());
-        loop {
-            if link.sensitive.load(Ordering::Acquire) {
-                line.fill(0);
-            }
-            line.clear();
-            let event = match read_frame_line(&mut reader, &mut line) {
-                Ok(LineRead::Frame) => {
-                    let bytes = strip_carriage_return(&line);
-                    match std::str::from_utf8(bytes) {
-                        Ok(text) => {
-                            let sensitive = link.sensitive.load(Ordering::Acquire);
-                            match crate::bounded_json::decode(text, sensitive) {
-                                Some(frame) => match handle_background_frame(&frame, &link, &background) {
-                                    Ok(true) => continue,
-                                    Ok(false) => StdoutEvent::Frame(Arc::new(frame), sensitive),
-                                    Err(error) => StdoutEvent::Protocol(error),
-                                },
-                                None => StdoutEvent::Protocol(if link.sensitive.load(Ordering::Acquire) {
-                                    "invalid bounded JSON frame".into()
-                                } else {
-                                    bounded_excerpt(text)
-                                }),
+) -> io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("crikey-python-stdout".into())
+        .spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = PipeBytes(Vec::new());
+            loop {
+                if link.sensitive.load(Ordering::Acquire) {
+                    line.fill(0);
+                }
+                line.clear();
+                let event = match read_frame_line(&mut reader, &mut line) {
+                    Ok(LineRead::Frame) => {
+                        let bytes = strip_carriage_return(&line);
+                        match std::str::from_utf8(bytes) {
+                            Ok(text) => {
+                                let sensitive = link.sensitive.load(Ordering::Acquire);
+                                match crate::bounded_json::decode(text, sensitive) {
+                                    Some(frame) => {
+                                        match handle_background_frame(&frame, &link, &background) {
+                                            Ok(true) => continue,
+                                            Ok(false) => StdoutEvent::Frame(Arc::new(frame), sensitive),
+                                            Err(error) => StdoutEvent::Protocol(error),
+                                        }
+                                    }
+                                    None => {
+                                        StdoutEvent::Protocol(if link.sensitive.load(Ordering::Acquire) {
+                                            "invalid bounded JSON frame".into()
+                                        } else {
+                                            bounded_excerpt(text)
+                                        })
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                StdoutEvent::Protocol("the modern worker emitted invalid UTF-8".to_owned())
                             }
                         }
-                        Err(_) => StdoutEvent::Protocol("the modern worker emitted invalid UTF-8".to_owned()),
                     }
-                }
-                Ok(LineRead::Eof) => return,
-                Ok(LineRead::Oversized(bytes)) => StdoutEvent::Oversized {
-                    excerpt: if link.sensitive.load(Ordering::Acquire) {
-                        String::new()
-                    } else {
-                        excerpt(&line)
+                    Ok(LineRead::Eof) => return,
+                    Ok(LineRead::Oversized(bytes)) => StdoutEvent::Oversized {
+                        excerpt: if link.sensitive.load(Ordering::Acquire) {
+                            String::new()
+                        } else {
+                            excerpt(&line)
+                        },
+                        bytes,
                     },
-                    bytes,
-                },
-                Err(error) => StdoutEvent::Failed(error.to_string()),
-            };
+                    Err(error) => StdoutEvent::Failed(error.to_string()),
+                };
 
-            let fatal = !matches!(event, StdoutEvent::Frame(..));
-            if sender.send(event).is_err() || fatal {
-                return;
+                let fatal = !matches!(event, StdoutEvent::Frame(..));
+                if sender.send(event).is_err() || fatal {
+                    return;
+                }
             }
-        }
-    });
+        })
 }
 
 /// Handles lifecycle frames independently of foreground request replies. This
@@ -1030,46 +1093,48 @@ fn add_restricted_environment(command: &mut Command) {
     }
 }
 
-fn spawn_stderr_drain(stderr: ChildStderr, tail: Arc<Mutex<StderrTail>>) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = PipeBytes(Vec::new());
-        loop {
-            let available = match reader.fill_buf() {
-                Ok([]) => {
-                    let mut tail = tail.lock().unwrap_or_else(|error| error.into_inner());
-                    if !tail.sensitive && !line.is_empty() {
-                        tail.push(String::from_utf8_lossy(strip_carriage_return(&line)).into_owned());
-                    }
-                    return;
-                }
-                Err(_) => return,
-                Ok(bytes) => bytes,
-            };
-            let count = available
-                .iter()
-                .position(|b| *b == b'\n')
-                .map_or(available.len(), |n| n + 1);
-            {
-                let mut tail = tail.lock().unwrap_or_else(|error| error.into_inner());
-                if tail.sensitive {
-                    line.fill(0);
-                    line.clear();
-                } else {
-                    let room = MAX_FRAME_BYTES.saturating_sub(line.len());
-                    line.extend_from_slice(&available[..count.min(room)]);
-                    if available[count - 1] == b'\n' {
-                        if line.last() == Some(&b'\n') {
-                            line.pop();
+fn spawn_stderr_drain(stderr: ChildStderr, tail: Arc<Mutex<StderrTail>>) -> io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("crikey-python-stderr".into())
+        .spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut line = PipeBytes(Vec::new());
+            loop {
+                let available = match reader.fill_buf() {
+                    Ok([]) => {
+                        let mut tail = tail.lock().unwrap_or_else(|error| error.into_inner());
+                        if !tail.sensitive && !line.is_empty() {
+                            tail.push(String::from_utf8_lossy(strip_carriage_return(&line)).into_owned());
                         }
-                        tail.push(String::from_utf8_lossy(strip_carriage_return(&line)).into_owned());
+                        return;
+                    }
+                    Err(_) => return,
+                    Ok(bytes) => bytes,
+                };
+                let count = available
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map_or(available.len(), |n| n + 1);
+                {
+                    let mut tail = tail.lock().unwrap_or_else(|error| error.into_inner());
+                    if tail.sensitive {
+                        line.fill(0);
                         line.clear();
+                    } else {
+                        let room = MAX_FRAME_BYTES.saturating_sub(line.len());
+                        line.extend_from_slice(&available[..count.min(room)]);
+                        if available[count - 1] == b'\n' {
+                            if line.last() == Some(&b'\n') {
+                                line.pop();
+                            }
+                            tail.push(String::from_utf8_lossy(strip_carriage_return(&line)).into_owned());
+                            line.clear();
+                        }
                     }
                 }
+                reader.consume(count);
             }
-            reader.consume(count);
-        }
-    })
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,8 +1157,13 @@ pub struct ModernWorker {
     background: Arc<BackgroundState>,
     stderr: Arc<Mutex<StderrTail>>,
     stderr_thread: Option<JoinHandle<()>>,
+    stdout_thread: Option<JoinHandle<()>>,
+    cleanup_failed: bool,
     child: Option<Child>,
     process_id: u32,
+    tree_settled: bool,
+    #[cfg(windows)]
+    job: Option<crikey_native_host::ContainedChildJob>,
     incarnation: u64,
     reaped: Option<ExitStatus>,
     hard_stopped: bool,
@@ -1118,6 +1188,16 @@ impl ModernWorker {
     /// that fails to announce itself is reaped before the error is returned; no
     /// path out of this function leaks a process.
     pub fn spawn(interpreter: &Interpreter, options: WorkerOptions) -> Result<Self, HostError> {
+        Self::spawn_with_admission(interpreter, options, |send| send())
+    }
+
+    /// Serializes process creation and all callback writer insertions with closure.
+    pub fn spawn_with_admission(
+        interpreter: &Interpreter,
+        options: WorkerOptions,
+        admission: impl Fn(&mut dyn FnMut() -> bool) -> bool + Send + Sync + 'static,
+    ) -> Result<Self, HostError> {
+        let admission = CallbackAdmission(Arc::new(admission));
         let incarnation = NEXT_WORKER_INCARNATION
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
             .map_err(|_| HostError::Spawn("worker incarnation counter exhausted".into()))?
@@ -1137,6 +1217,8 @@ impl ModernWorker {
             .map_err(|error| HostError::Spawn(format!("the plugin import path is invalid: {error}")))?;
 
         let mut command = Command::new(interpreter.path());
+        #[cfg(windows)]
+        crikey_native_host::ContainedChildJob::prepare(&mut command);
         if options.inherit_environment {
             // The manifest bought the ambient environment. `PYTHON*` is still
             // the host's to own: those variables select an interpreter's
@@ -1185,8 +1267,15 @@ impl ModernWorker {
         let sandbox = options.sandbox.prepare();
         sandbox.install(&mut command);
 
-        let mut child = command
-            .spawn()
+        let mut spawned = None;
+        (admission.0)(&mut || {
+            let result = command.spawn();
+            let ok = result.is_ok();
+            spawned = Some(result);
+            ok
+        });
+        let mut child = spawned
+            .ok_or(HostError::AdmissionClosed)?
             .map_err(|error| HostError::Spawn(format!("the process could not be started: {error}")))?;
         let process_id = child.id();
 
@@ -1199,20 +1288,19 @@ impl ModernWorker {
         // prefetched foreground frame; pipe backpressure bounds decoded memory.
         let (sender, frames) = mpsc::sync_channel(1);
         let (stdin_sender, stdin_requests) = mpsc::sync_channel(128);
-        let stdin_thread = spawn_stdin_writer(stdin, stdin_requests);
         let link = Arc::new(WorkerLink {
             next_id: AtomicU64::new(0),
             stdin: Mutex::new(Some(stdin_sender)),
-            stdin_thread: Mutex::new(Some(stdin_thread)),
+            stdin_thread: Mutex::new(None),
             sensitive: AtomicBool::new(false),
+            callback_admission: Mutex::new(Some(admission)),
+            cleanup_failed: AtomicBool::new(false),
         });
         let background = Arc::new(BackgroundState::new(
             options.shared_budget.clone(),
             options.allow_background_execution,
         ));
-        spawn_stdout_reader(stdout, sender, Arc::clone(&link), Arc::clone(&background));
         let tail = Arc::new(Mutex::new(StderrTail::default()));
-        let stderr_thread = spawn_stderr_drain(stderr, Arc::clone(&tail));
 
         let mut worker = Self {
             plugin: options.plugin.clone(),
@@ -1221,9 +1309,14 @@ impl ModernWorker {
             frames,
             background,
             stderr: tail,
-            stderr_thread: Some(stderr_thread),
+            stderr_thread: None,
             child: Some(child),
+            stdout_thread: None,
+            cleanup_failed: false,
             process_id,
+            tree_settled: false,
+            #[cfg(windows)]
+            job: None,
             incarnation,
             reaped: None,
             hard_stopped: false,
@@ -1238,13 +1331,67 @@ impl ModernWorker {
             query_schemas: BTreeMap::new(),
             alive: true,
         };
+        let writer = match spawn_stdin_writer(stdin, stdin_requests) {
+            Ok(thread) => thread,
+            Err(_) => {
+                return Err(worker.failed_startup(HostError::Spawn("stdin thread could not start".into())))
+            }
+        };
+        *worker.link.stdin_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
+        worker.stdout_thread = match spawn_stdout_reader(
+            stdout,
+            sender,
+            Arc::clone(&worker.link),
+            Arc::clone(&worker.background),
+        ) {
+            Ok(thread) => Some(thread),
+            Err(_) => {
+                return Err(worker.failed_startup(HostError::Spawn("stdout thread could not start".into())))
+            }
+        };
+        worker.stderr_thread = match spawn_stderr_drain(stderr, Arc::clone(&worker.stderr)) {
+            Ok(thread) => Some(thread),
+            Err(_) => {
+                return Err(worker.failed_startup(HostError::Spawn("stderr thread could not start".into())))
+            }
+        };
 
+        #[cfg(windows)]
+        match crikey_native_host::ContainedChildJob::assign_suspended(
+            worker.child.as_ref().expect("new suspended child"),
+            &crikey_native_host::ResourceLimits::default(),
+        ) {
+            Ok(job) => worker.job = Some(job),
+            Err(_) => {
+                return Err(worker.failed_startup(HostError::Spawn("worker containment failed".into())));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let resumed = worker
+                .job
+                .as_ref()
+                .expect("assigned job retained")
+                .resume(worker.child.as_ref().expect("suspended child retained"));
+            if resumed.is_err() {
+                return Err(worker.failed_startup(HostError::Spawn("worker could not resume".into())));
+            }
+        }
         if let Err(error) = worker.handshake() {
-            let _ = worker.reap();
-            return Err(error);
+            return Err(worker.failed_startup(error));
         }
 
         Ok(worker)
+    }
+
+    fn failed_startup(mut self, error: HostError) -> HostError {
+        if self.shutdown_checked().is_err() {
+            HostError::StartupCleanup {
+                worker: Arc::new(Mutex::new(self)),
+            }
+        } else {
+            error
+        }
     }
 
     /// Whether the worker is still serving.
@@ -1263,13 +1410,9 @@ impl ModernWorker {
     /// shutdown or drop, so callers can publish retirement before cleanup.
     pub fn poll_alive(&mut self) -> bool {
         if self.alive {
-            match self.child.as_mut().map(Child::try_wait) {
-                Some(Ok(None)) => {}
-                Some(Ok(Some(status))) => {
-                    self.reaped = Some(status);
-                    self.alive = false;
-                }
-                Some(Err(_)) | None => self.alive = false,
+            match self.child.as_ref().map(child_exited) {
+                Some(Ok(false)) => {}
+                Some(Ok(true)) | Some(Err(_)) | None => self.alive = false,
             }
         }
         self.alive
@@ -1294,12 +1437,14 @@ impl ModernWorker {
         let _ = self.link.write_frame(&encode_background_cancel(None));
         self.background.release_all();
     }
+
     /// A handle that cancels this worker's in-flight call from another thread.
     pub fn cancel_handle(&self) -> CancelHandle {
         CancelHandle {
             link: Arc::clone(&self.link),
         }
     }
+
     pub fn supports_structured_views(&self) -> bool {
         self.structured_supported
     }
@@ -1356,9 +1501,9 @@ impl ModernWorker {
         if !admitted && queued.is_none() {
             return Err(HostError::Protocol("structured view unavailable".into()));
         }
-        let Some(completion) = queued.and_then(Result::ok) else {
-            self.fail_and_reap();
-            return Err(self.crashed());
+        let completion = match queued {
+            Some(result) => self.checked_callback_io(result)?,
+            None => return Err(HostError::Protocol("callback admission unavailable".into())),
         };
         match completion.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Ok(())) => {}
@@ -1485,10 +1630,8 @@ impl ModernWorker {
             "id":id, "kind":"preview", "identity":identity,
             "item":protocol::encode_item(item),
         });
-        if self.link.write_frame(&request).is_err() {
-            self.fail_and_reap();
-            return Err(self.crashed());
-        }
+        let sent = self.link.write_frame(&request);
+        self.checked_callback_io(sent)?;
         let line = self.recv_frame(self.options.call_timeout_ms)?;
         let frame = self.expect_frame(&line, id, "preview_result")?;
         if frame.get("identity") != Some(identity)
@@ -1533,14 +1676,10 @@ impl ModernWorker {
             .map_err(|_| HostError::Protocol("commands request counter exhausted".into()))?
             .checked_add(1)
             .ok_or_else(|| HostError::Protocol("commands request counter exhausted".into()))?;
-        if self
+        let sent = self
             .link
-            .write_frame(&serde_json::json!({"id":id, "kind":"commands"}))
-            .is_err()
-        {
-            self.fail_and_reap();
-            return Err(self.crashed());
-        }
+            .write_frame(&serde_json::json!({"id":id, "kind":"commands"}));
+        self.checked_callback_io(sent)?;
         let line = self.recv_frame(self.options.call_timeout_ms)?;
         let frame = self.expect_frame(&line, id, "commands_result")?;
         if protocol::decode_log(&frame).is_none() {
@@ -1588,14 +1727,10 @@ impl ModernWorker {
         if !self.alive {
             return Err(self.crashed());
         }
-        if self
+        let sent = self
             .link
-            .queue_frame(&protocol::encode_configuration(values, complete))
-            .is_err()
-        {
-            self.fail_and_reap();
-            return Err(self.crashed());
-        }
+            .queue_frame(&protocol::encode_configuration(values, complete));
+        self.checked_callback_io(sent)?;
         Ok(())
     }
 
@@ -1615,10 +1750,8 @@ impl ModernWorker {
         self.catalog_schemas.clear();
 
         let id = self.link.next_id();
-        if self.link.write_frame(&encode_build_catalog(id)).is_err() {
-            self.fail_and_reap();
-            return Err(self.crashed());
-        }
+        let sent = self.link.write_frame(&encode_build_catalog(id));
+        self.checked_callback_io(sent)?;
 
         // One deadline for the WHOLE call: every frame is read against the same
         // budget, decremented as time passes, so a plugin that streams partial
@@ -1914,9 +2047,9 @@ impl ModernWorker {
                 SubmissionFailureCode::Unavailable,
             )));
         }
-        let Some(completion) = queued.and_then(Result::ok) else {
-            self.fail_and_reap();
-            return Err(self.crashed());
+        let completion = match queued {
+            Some(result) => self.checked_callback_io(result)?,
+            None => return Err(HostError::Protocol("callback admission unavailable".into())),
         };
         match completion.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Ok(())) => {}
@@ -1966,7 +2099,7 @@ impl ModernWorker {
         // cancellation for this request opts out; its next ordinary request
         // resets the flag.
         if reset_cancel {
-            let _ = self.link.write_frame(&encode_set_cancel(false));
+            let _ = self.link.queue_frame(&encode_set_cancel(false));
         }
 
         let id = self.link.next_id();
@@ -1978,10 +2111,8 @@ impl ModernWorker {
         } else if scope.is_some() {
             return Err(HostError::Protocol("scope unsupported".into()));
         }
-        if self.link.write_frame(&outgoing).is_err() {
-            self.fail_and_reap();
-            return Err(self.crashed());
-        }
+        let sent = self.link.write_frame(&outgoing);
+        self.checked_callback_io(sent)?;
 
         // One deadline for the WHOLE call (see `build_catalog`): a plugin that
         // streams partial batches forever is bounded, not hung, because each
@@ -2154,9 +2285,9 @@ impl ModernWorker {
                 traceback: String::new(),
             }));
         }
-        let Some(completion) = queued.and_then(Result::ok) else {
-            self.fail_and_reap();
-            return Err(self.crashed());
+        let completion = match queued {
+            Some(result) => self.checked_callback_io(result)?,
+            None => return Err(HostError::Protocol("callback admission unavailable".into())),
         };
         match completion.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Ok(())) => {}
@@ -2209,15 +2340,56 @@ impl ModernWorker {
         self.stop_child()
     }
 
+    /// Retains every unfinished child and pipe thread on failure.
+    pub fn shutdown_checked(&mut self) -> Result<WorkerExit, HostError> {
+        let exit = self.stop_child();
+        // Release a reader blocked delivering its final frame, after child exit.
+        let (_, empty) = mpsc::sync_channel(1);
+        drop(std::mem::replace(&mut self.frames, empty));
+        if let Some(reader) = self.stdout_thread.as_ref() {
+            let deadline = Instant::now() + REAP_GRACE;
+            while !reader.is_finished() && Instant::now() < deadline {
+                thread::sleep(REAP_POLL_INTERVAL);
+            }
+            if reader.is_finished() {
+                self.cleanup_failed |= self
+                    .stdout_thread
+                    .take()
+                    .expect("finished reader retained")
+                    .join()
+                    .is_err();
+            } else {
+                self.cleanup_failed = true;
+            }
+        }
+        if self.reaped.is_none()
+            || !self.tree_settled
+            || self.cleanup_failed
+            || self.link.cleanup_failed.load(Ordering::Acquire)
+        {
+            return Err(HostError::TeardownFailed);
+        }
+        Ok(exit)
+    }
+
     // -- internals ----------------------------------------------------------
+
+    fn checked_callback_io<T>(&mut self, result: io::Result<T>) -> Result<T, HostError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Err(HostError::AdmissionClosed),
+            Err(_) => {
+                self.fail_and_reap();
+                Err(self.crashed())
+            }
+        }
+    }
 
     /// Sends the handshake and waits for the child's acknowledgement.
     fn handshake(&mut self) -> Result<(), HostError> {
         let id = self.link.next_id();
-        if self.link.write_frame(&encode_handshake(id)).is_err() {
-            self.fail_and_reap();
-            return Err(self.crashed());
-        }
+        let sent = self.link.write_frame(&encode_handshake(id));
+        self.checked_callback_io(sent)?;
 
         let line = self.recv_frame(self.options.startup_timeout_ms)?;
         let frame = &line;
@@ -2365,7 +2537,6 @@ impl ModernWorker {
     /// finish so a crash diagnostic is complete.
     fn fail_and_reap(&mut self) {
         self.alive = false;
-        self.background.reap();
         let _ = self.reap();
         self.drain_stderr();
     }
@@ -2373,7 +2544,7 @@ impl ModernWorker {
     /// Lets the stderr drain thread finish reading a dead child's output, giving
     /// up after a bound so a grandchild that inherited the pipe cannot block.
     fn drain_stderr(&mut self) {
-        let Some(handle) = self.stderr_thread.take() else {
+        let Some(handle) = self.stderr_thread.as_ref() else {
             return;
         };
         let deadline = Instant::now() + STDERR_DRAIN_GRACE;
@@ -2381,10 +2552,17 @@ impl ModernWorker {
             thread::sleep(REAP_POLL_INTERVAL);
         }
         if handle.is_finished() {
-            let _ = handle.join();
+            self.cleanup_failed |= self
+                .stderr_thread
+                .take()
+                .expect("finished stderr retained")
+                .join()
+                .is_err();
         }
-        // Otherwise the handle is dropped (detached): the tail is whatever the
-        // drain thread had read, and it keeps updating the shared buffer.
+        // A failed bounded join retains its canonical handle for later settlement.
+        else {
+            self.cleanup_failed = true;
+        }
     }
 
     fn crashed(&self) -> HostError {
@@ -2421,111 +2599,83 @@ impl ModernWorker {
         }
     }
 
-    /// Ends the child, killing it only if it is still alive.
+    /// Settles the complete tree before relinquishing the leader's identity.
     fn reap(&mut self) -> Option<ExitStatus> {
-        self.background.reap();
+        self.alive = false;
         self.link.close_stdin();
-        let Some(mut child) = self.child.take() else {
-            self.link.finish_stdin_writer();
-            return self.reaped;
-        };
-
-        let status = match child.try_wait() {
-            Ok(Some(status)) => Some(status),
-            Ok(None) | Err(_) => {
-                hard_kill(self.process_id, &mut child);
-                self.hard_stopped = true;
-                let status = wait_bounded(&mut child, REAP_GRACE);
-                if status.is_none() {
-                    reap_in_background(child);
-                }
-                status
+        if let Some(child) = self.child.as_mut() {
+            let exited = child_exited(child).unwrap_or(false);
+            #[cfg(unix)]
+            let signalled = kill_process_group(self.process_id);
+            #[cfg(windows)]
+            let signalled = match &self.job {
+                Some(job) => job.terminate_and_wait().is_ok(),
+                None => exited || child.kill().is_ok(), // failed containment, never resumed
+            };
+            #[cfg(not(any(unix, windows)))]
+            let signalled = false;
+            if !signalled {
+                self.cleanup_failed = true;
+                return self.reaped;
             }
-        };
+            self.hard_stopped |= !exited;
+            if let Some(status) = wait_bounded(child, REAP_GRACE) {
+                self.reaped = Some(status);
+                self.child = None;
+            }
+        }
+        if self.reaped.is_some() && !self.tree_settled {
+            #[cfg(unix)]
+            {
+                let deadline = Instant::now() + REAP_GRACE;
+                loop {
+                    match process_group_absent(self.process_id) {
+                        Ok(true) => {
+                            self.tree_settled = true;
+                            break;
+                        }
+                        Ok(false) if Instant::now() < deadline => thread::sleep(REAP_POLL_INTERVAL),
+                        _ => break,
+                    }
+                }
+            }
+            #[cfg(windows)]
+            {
+                self.tree_settled = self
+                    .job
+                    .as_ref()
+                    .is_none_or(|job| job.terminate_and_wait().is_ok());
+            }
+            if self.tree_settled {
+                self.background.reap();
+            }
+        }
         self.link.finish_stdin_writer();
-        self.reaped = status;
         self.reaped
     }
 
     /// Asks the child to exit cooperatively, then makes sure it did.
     fn stop_child(&mut self) -> WorkerExit {
         self.alive = false;
-        self.background.reap();
-        if let Some(status) = self.reaped {
+        if self.child.is_some() && self.reaped.is_none() {
+            let id = self.link.next_id();
+            let _ = self.link.queue_frame(&encode_shutdown(id));
             self.link.close_stdin();
-            self.link.finish_stdin_writer();
-            self.drain_stderr();
-            return WorkerExit {
-                code: status.code(),
-                hard_stopped: self.hard_stopped,
-            };
-        }
-        let Some(mut child) = self.child.take() else {
-            self.link.close_stdin();
-            self.link.finish_stdin_writer();
-            self.drain_stderr();
-            return WorkerExit {
-                code: None,
-                hard_stopped: self.hard_stopped,
-            };
-        };
-
-        let id = self.link.next_id();
-        let _ = self.link.queue_frame(&encode_shutdown(id));
-        // Redundant on purpose: end of file on stdin means the same thing, and a
-        // shim that missed the frame still sees the pipe close.
-        self.link.close_stdin();
-
-        // The child closing stdout is the event that says it is leaving; waiting
-        // for that rather than polling for a status keeps an orderly shutdown as
-        // fast as the child is.
-        let budget = Duration::from_millis(self.options.shutdown_timeout_ms);
-        let started = Instant::now();
-        let mut left_voluntarily = false;
-        loop {
-            let remaining = budget.checked_sub(started.elapsed()).unwrap_or_default();
-            if remaining.is_zero() {
-                break;
-            }
-            match self.frames.recv_timeout(remaining) {
-                // A farewell frame. Nothing asked for one, and nothing reads it.
-                Ok(_) => continue,
-                Err(RecvTimeoutError::Disconnected) => {
-                    left_voluntarily = true;
-                    break;
-                }
-                Err(RecvTimeoutError::Timeout) => break,
+            let deadline = Instant::now() + Duration::from_millis(self.options.shutdown_timeout_ms);
+            while self
+                .child
+                .as_ref()
+                .is_some_and(|child| matches!(child_exited(child), Ok(false)))
+                && Instant::now() < deadline
+            {
+                while self.frames.try_recv().is_ok() {}
+                thread::sleep(REAP_POLL_INTERVAL);
             }
         }
-
-        let status = if left_voluntarily {
-            wait_bounded(&mut child, REAP_GRACE)
-        } else {
-            wait_bounded(&mut child, Duration::ZERO)
-        };
-
-        let status = match status {
-            Some(status) => status,
-            None => {
-                hard_kill(self.process_id, &mut child);
-                self.hard_stopped = true;
-                let Some(status) = wait_bounded(&mut child, REAP_GRACE) else {
-                    reap_in_background(child);
-                    self.link.finish_stdin_writer();
-                    self.drain_stderr();
-                    return WorkerExit {
-                        code: None,
-                        hard_stopped: true,
-                    };
-                };
-                status
-            }
-        };
-        self.reaped = Some(status);
-        self.link.finish_stdin_writer();
+        self.reap();
         self.drain_stderr();
         WorkerExit {
-            code: status.code(),
+            code: self.reaped.and_then(|status| status.code()),
             hard_stopped: self.hard_stopped,
         }
     }
@@ -2536,13 +2686,7 @@ impl ModernWorker {
 /// listening (spec 24.3).
 impl Drop for ModernWorker {
     fn drop(&mut self) {
-        self.background.reap();
-        if self.child.is_some() {
-            let _ = self.reap();
-        } else {
-            self.link.close_stdin();
-            self.link.finish_stdin_writer();
-        }
+        self.reap();
         self.drain_stderr();
     }
 }
@@ -2613,78 +2757,85 @@ fn log_byte_len(frame: &Map<String, Value>) -> usize {
 // Process teardown
 // ---------------------------------------------------------------------------
 
-/// Hard-stops the child, reaching its whole process group on Unix.
-///
-/// On Unix the child is its own group leader (`process_group(0)` at spawn), so
-/// signalling the group kills any grandchildren a plugin forked as well as the
-/// leader (spec 24.3). Off Unix `std::process` offers no portable group kill, so
-/// only the direct child is reached — an honest, documented limit. The caller
-/// still `wait()`s the leader to reap it after this returns.
-fn hard_kill(process_id: u32, child: &mut Child) {
-    #[cfg(unix)]
-    kill_process_group(process_id);
-    #[cfg(not(unix))]
-    {
-        let _ = process_id;
+/// Signals the whole owned group while its leader PID is still unreaped.
+#[cfg(unix)]
+fn kill_process_group(pgid: u32) -> bool {
+    if pgid <= 1 || pgid > i32::MAX as u32 {
+        return false;
     }
-    let _ = child.kill();
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Sends `SIGKILL` to an entire process group (spec 24.3).
-///
-/// Killing a process *group* needs the `killpg(3)`/`kill(2)` syscall; the
-/// standard library only kills a single child ([`Child::kill`]) and exposes no
-/// safe wrapper for the group case. This is therefore this crate's only
-/// `unsafe`, isolated to this one function and declaring `killpg` directly so no
-/// new dependency is pulled in. Its arguments are a validated pid-as-pgid (the
-/// group was created by `CommandExt::process_group(0)`) and a constant signal;
-/// the call reads and writes no memory.
 #[cfg(unix)]
-fn kill_process_group(pgid: u32) {
-    // `killpg(0)` signals the CALLER's process group - this launcher, its shell
-    // and its session. Callers pass a live `Child::id()`, and each kill precedes
-    // its reap so the pid cannot have been recycled, but a misdirected group
-    // kill is unrecoverable: refuse the values that could only mean "myself" or
-    // "init".
-    if pgid <= 1 {
-        return;
+#[allow(unsafe_code)]
+fn child_exited(child: &Child) -> io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
     }
-    extern "C" {
-        fn killpg(pgrp: i32, sig: i32) -> i32;
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn child_exited(child: &Child) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
     }
-    const SIGKILL: i32 = 9;
-    #[allow(
-        unsafe_code,
-        reason = "no safe std API kills a process group; args are a validated pgid and a constant signal (spec 24.3)"
-    )]
-    unsafe {
-        let _ = killpg(pgid as i32, SIGKILL);
+    match unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } {
+        0 => Ok(true),
+        258 => Ok(false),
+        _ => Err(io::Error::last_os_error()),
     }
 }
-/// Finishes a killed child's reap without blocking the caller. `try_wait`
-/// reaps an exited child, so this loop has no unbounded blocking wait.
-fn reap_in_background(mut child: Child) {
-    let _ = thread::spawn(move || loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => break,
-            Ok(None) => thread::sleep(REAP_POLL_INTERVAL),
-        }
-    });
+
+#[cfg(not(any(unix, windows)))]
+fn child_exited(_: &Child) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process observation unavailable",
+    ))
+}
+
+#[cfg(unix)]
+fn process_group_absent(pgid: u32) -> io::Result<bool> {
+    if pgid <= 1 || pgid > i32::MAX as u32 {
+        return Err(io::Error::other("invalid process group"));
+    }
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::killpg(pgid as i32, 0) };
+    if result == 0 {
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(true)
+    } else {
+        Err(error)
+    }
 }
 
 /// Waits for an exiting child's status, giving up after `budget`.
 fn wait_bounded(child: &mut Child, budget: Duration) -> Option<ExitStatus> {
-    let started = Instant::now();
+    let deadline = Instant::now() + budget;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) => {}
-            Err(_) => return None,
+        match child_exited(child) {
+            Ok(true) => return child.wait().ok(),
+            Ok(false) if Instant::now() < deadline => thread::sleep(REAP_POLL_INTERVAL),
+            _ => return None,
         }
-        if started.elapsed() >= budget {
-            return None;
-        }
-        thread::sleep(REAP_POLL_INTERVAL);
     }
 }
 
@@ -2748,6 +2899,34 @@ fn decode_commands(value: Option<&Value>) -> Option<Vec<PluginCommandDeclaration
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_writer_join_retains_the_actual_unfinished_thread() {
+        let (release, blocked) = mpsc::sync_channel(1);
+        let thread = thread::Builder::new()
+            .name("retained-writer-test".into())
+            .spawn(move || {
+                blocked.recv().unwrap();
+            })
+            .unwrap();
+        let link = WorkerLink {
+            next_id: AtomicU64::new(0),
+            stdin: Mutex::new(None),
+            stdin_thread: Mutex::new(Some(thread)),
+            sensitive: AtomicBool::new(false),
+            callback_admission: Mutex::new(None),
+            cleanup_failed: AtomicBool::new(false),
+        };
+        link.finish_stdin_writer();
+        {
+            let owner = link.stdin_thread.lock().unwrap();
+            assert!(owner.as_ref().is_some_and(|thread| !thread.is_finished()));
+        }
+        assert!(link.cleanup_failed.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        link.finish_stdin_writer();
+        assert!(link.stdin_thread.lock().unwrap().is_none());
+    }
 
     #[test]
     fn command_decode_refuses_authority_fields_and_invalid_targets() {
@@ -2824,6 +3003,8 @@ mod tests {
                 stdin: Mutex::new(None),
                 stdin_thread: Mutex::new(None),
                 sensitive: AtomicBool::new(false),
+                callback_admission: Mutex::new(None),
+                cleanup_failed: AtomicBool::new(false),
             });
             let mut worker = ModernWorker {
                 plugin: owner,
@@ -2833,8 +3014,13 @@ mod tests {
                 background: Arc::new(BackgroundState::new(None, false)),
                 stderr: Arc::new(Mutex::new(StderrTail::default())),
                 stderr_thread: None,
+                stdout_thread: None,
+                cleanup_failed: false,
                 child: None,
                 process_id: 0,
+                tree_settled: false,
+                #[cfg(windows)]
+                job: None,
                 incarnation: 1,
                 reaped: None,
                 hard_stopped: false,

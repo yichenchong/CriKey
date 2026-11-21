@@ -1,12 +1,114 @@
 //! Configuration edit work is admitted by semantic intent, never performed by paint.
+use crikey_app::package_jobs::{JobError, PackageConfiguration};
+use crikey_app::{
+    launcher_settings,
+    settings_search::{SettingsSearch, SettingsSearchResults},
+};
 use crikey_app::{
     CommandPreferencesSnapshot, CommandPreferencesStore, CommandRegistrySnapshot, PreferenceError,
     PreferenceMutation,
 };
 #[cfg(test)]
 use crikey_config::command_preferences::KEY_COMMAND_PREFERENCES;
+use crikey_config::{ConfigError, DiscoveredSchema};
 use crikey_config::{ConfigLayer, ConfigRevision, ConfigSourceWatch, ConfigStore};
+use crikey_core::PluginId;
 use crikey_platform::StandardDirectories;
+use std::path::PathBuf;
+
+pub(crate) enum SettingsTarget {
+    UserGlobal,
+    PluginUser { plugin: PluginId },
+}
+pub(crate) enum SettingsOperation {
+    Search {
+        text: String,
+    },
+    BrowsePlugin {
+        plugin: PluginId,
+    },
+    Edit {
+        key: String,
+        target: SettingsTarget,
+        draft: String,
+    },
+}
+pub(crate) struct SettingsRequest {
+    pub view: crikey_ui::ViewId,
+    pub request_id: u64,
+    pub expected_config: u64,
+    pub expected_schema: u64,
+    pub operation: SettingsOperation,
+}
+pub(crate) struct SettingsRow {
+    pub key: String,
+    pub value: String,
+    pub source: String,
+    pub requires_restart: bool,
+    pub secret: bool,
+    /// False means no editable effective value was projected; `value` is not a draft.
+    pub value_available: bool,
+}
+pub(crate) enum SettingsPayload {
+    Search {
+        results: SettingsSearchResults,
+        rows: Vec<SettingsRow>,
+    },
+    Saved {
+        row: SettingsRow,
+    },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsFailure {
+    Conflict,
+    StaleSchema,
+    Unavailable,
+    Invalid,
+    PersistedReload,
+}
+pub(crate) struct SettingsResponse {
+    pub view: crikey_ui::ViewId,
+    pub request_id: u64,
+    pub config_revision: u64,
+    pub schema_revision: u64,
+    pub result: Result<SettingsPayload, SettingsFailure>,
+}
+#[derive(Default)]
+struct SettingsAuthority {
+    roots: Vec<PathBuf>,
+    policy: Option<PathBuf>,
+    schemas: Vec<DiscoveredSchema>,
+    config_revision: u64,
+    schema_revision: u64,
+}
+
+struct PackageConfigurationClient {
+    sender: mpsc::SyncSender<Request>,
+}
+impl PackageConfigurationClient {
+    fn request(&self, change: Option<(PluginId, bool)>) -> Result<ConfigStore, JobError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.sender
+            .try_send(Request::Package { change, reply })
+            .map_err(|_| {
+                JobError::new(
+                    "configuration-unavailable",
+                    "Configuration authority is unavailable or busy",
+                )
+            })?;
+        response
+            .recv()
+            .map_err(|_| JobError::new("configuration-unavailable", "Configuration authority is closed"))?
+    }
+}
+impl PackageConfiguration for PackageConfigurationClient {
+    fn load(&self) -> Result<ConfigStore, JobError> {
+        self.request(None)
+    }
+    fn set_plugin_enabled(&self, plugin: &PluginId, enabled: bool) -> Result<ConfigStore, JobError> {
+        self.request(Some((plugin.clone(), enabled)))
+    }
+}
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -22,6 +124,11 @@ pub(crate) struct MutationRequest {
 
 pub(crate) enum Request {
     Poll,
+    Settings(SettingsRequest),
+    Package {
+        change: Option<(PluginId, bool)>,
+        reply: mpsc::SyncSender<Result<ConfigStore, JobError>>,
+    },
     Mutate(MutationRequest),
     Setting {
         config: ConfigStore,
@@ -49,6 +156,8 @@ pub(crate) struct PreferenceWorker {
     sender: Option<mpsc::SyncSender<Request>>,
     receiver: mpsc::Receiver<Completion>,
     worker: Option<JoinHandle<()>>,
+    settings: Option<mpsc::Receiver<SettingsResponse>>,
+    closing: Arc<std::sync::atomic::AtomicBool>,
 }
 impl PreferenceWorker {
     pub fn spawn(
@@ -56,10 +165,15 @@ impl PreferenceWorker {
         initial: Option<ConfigStore>,
         directories: StandardDirectories,
         session_overrides: Vec<(String, String)>,
+        policy: Option<PathBuf>,
+        roots: Vec<PathBuf>,
         wake: impl Fn() + Send + 'static,
     ) -> Result<Self, String> {
         let (sender, requests) = mpsc::sync_channel(16);
         let (results, receiver) = mpsc::sync_channel(32);
+        let (settings_results, settings) = mpsc::sync_channel(16);
+        let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_closing = Arc::clone(&closing);
         let worker = thread::Builder::new()
             .name("configuration-edits".into())
             .spawn(move || {
@@ -69,17 +183,84 @@ impl PreferenceWorker {
                     authoritative: false,
                     directories,
                     session_overrides,
+                    settings: SettingsAuthority { policy, roots, ..Default::default() },
                 };
                 let startup = state.reload(&store);
                 if results.send(startup).is_err() {
                     return;
                 }
                 wake();
-                while let Ok(request) = requests.recv() {
+                while !worker_closing.load(std::sync::atomic::Ordering::Acquire) {
+                    let request = match requests.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(request) => request,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     let completion = match request {
+                        Request::Settings(request) => {
+                            let mut completion = state.reload(&store);
+                            let mut result = state.settings_request(&request);
+                            let saved = matches!(&result, Ok(SettingsPayload::Saved { .. }));
+                            if saved {
+                                let preferences = store.lock().unwrap_or_else(|p| p.into_inner())
+                                    .reload(state.config.as_ref().expect("authoritative store"));
+                                match preferences {
+                                    Ok(preferences) => completion = state.completion(completion.based_on.clone(), Some(preferences), None),
+                                    Err(_) => result = Err(SettingsFailure::PersistedReload),
+                                }
+                            }
+                            if matches!(&result, Err(SettingsFailure::PersistedReload)) {
+                                completion = state.persisted_reload(completion.based_on.clone());
+                            }
+                            let response = SettingsResponse {
+                                view: request.view,
+                                request_id: request.request_id,
+                                config_revision: state.settings.config_revision,
+                                schema_revision: state.settings.schema_revision,
+                                result,
+                            };
+                            if settings_results.send(response).is_err() { break; }
+                            completion
+                        }
+                        Request::Package { change, reply } => {
+                            let mut completion = state.reload(&store);
+                            let result = if state.authoritative && state.settings.config_revision < u64::MAX {
+                                if let Some((plugin, enabled)) = change {
+                                    let based_on = completion.based_on.clone();
+                                    match state.config.as_mut().expect("authoritative store").commit_plugin_enabled(&plugin, enabled) {
+                                        Ok(()) => {
+                                            let config = state.config.take().expect("authoritative store");
+                                            state.replace(config);
+                                            let preferences = store.lock().unwrap_or_else(|p| p.into_inner())
+                                                .reload(state.config.as_ref().expect("authoritative store"));
+                                            match preferences {
+                                                Ok(preferences) => {
+                                                    completion = state.completion(based_on, Some(preferences), None);
+                                                    Ok(state.config.as_ref().expect("authoritative store").clone())
+                                                }
+                                                Err(_) => {
+                                                    completion = state.persisted_reload(based_on);
+                                                    Err(JobError::new("configuration-persisted-reload", "Configuration was saved but effective publication failed"))
+                                                }
+                                            }
+                                        }
+                                        Err(ConfigError::PersistedReload) => {
+                                            completion = state.persisted_reload(based_on);
+                                            Err(JobError::new("configuration-persisted-reload", "Configuration was saved but effective reload failed"))
+                                        }
+                                        Err(_) => Err(JobError::new("configuration-save", "Configuration could not be saved")),
+                                    }
+                                } else { Ok(state.config.as_ref().expect("authoritative store").clone()) }
+                            } else {
+                                Err(JobError::new("configuration-unavailable", "Configuration authority is unavailable"))
+                            };
+                            let _ = reply.send(result);
+                            completion
+                        }
                         Request::Poll => {
                             if state.authoritative
                                 && state.watch.as_ref().is_some_and(|watch| !watch.changed())
+                                && state.settings.roots.is_empty()
                             {
                                 continue;
                             }
@@ -157,8 +338,8 @@ impl PreferenceWorker {
                             let mut saved = false;
                             let mut completion = if !state.accepts(&config) {
                                 state.conflict(&store)
-                            } else if let Err(report) = validate_setting_edit(&config, &key, &value) {
-                                state.completion(based_on, None, Some(report))
+                            } else if validate_setting_edit(&config, &key, &value).is_err() {
+                                state.completion(based_on, None, Some("Setting edit is invalid".into()))
                             } else {
                                 match crate::settings::persist_typed(&mut config, &key, &value) {
                                     Ok(report) => {
@@ -178,7 +359,7 @@ impl PreferenceWorker {
                                     Err(crikey_config::ConfigError::PersistedReload) => {
                                         state.persisted_reload(based_on)
                                     }
-                                    Err(error) => state.completion(based_on, None, Some(error.to_string())),
+                                    Err(_) => state.completion(based_on, None, Some("Configuration could not be saved".into())),
                                 }
                             };
                             completion.setting_edit = Some(crikey_ui::SettingEditOutcome {
@@ -201,7 +382,42 @@ impl PreferenceWorker {
             sender: Some(sender),
             receiver,
             worker: Some(worker),
+            settings: Some(settings),
+            closing,
         })
+    }
+    /// Transfer settlement off the UI thread; continue draining both reply
+    /// channels while the returned handle is joined by the shutdown owner.
+    pub fn take_shutdown(&mut self) -> Option<JoinHandle<()>> {
+        self.closing.store(true, std::sync::atomic::Ordering::Release);
+        self.sender.take();
+        self.worker.take()
+    }
+    pub fn package_configuration(&self) -> Arc<dyn PackageConfiguration> {
+        Arc::new(PackageConfigurationClient {
+            sender: self.sender.as_ref().expect("live worker").clone(),
+        })
+    }
+    pub fn submit_settings(&self, request: SettingsRequest) -> Result<(), String> {
+        let bounded = match &request.operation {
+            SettingsOperation::Search { text } => text.len() <= 4096,
+            SettingsOperation::BrowsePlugin { plugin } => plugin.0.len() <= 1024,
+            SettingsOperation::Edit { key, draft, target } => {
+                key.len() <= 4096
+                    && draft.len() <= 4096
+                    && match target {
+                        SettingsTarget::UserGlobal => true,
+                        SettingsTarget::PluginUser { plugin } => plugin.0.len() <= 1024,
+                    }
+            }
+        };
+        if !bounded {
+            return Err("Settings request exceeds its limit".into());
+        }
+        self.submit(Request::Settings(request))
+    }
+    pub fn take_settings(&self) -> Option<SettingsResponse> {
+        self.settings.as_ref()?.try_recv().ok()
     }
     pub fn submit(&self, request: Request) -> Result<(), String> {
         self.try_submit(request).map_err(|error| match error {
@@ -294,6 +510,8 @@ impl PreferenceWorker {
 }
 impl Drop for PreferenceWorker {
     fn drop(&mut self) {
+        self.closing.store(true, std::sync::atomic::Ordering::Release);
+        self.settings.take();
         self.sender.take();
         if let Some(worker) = self.worker.take() {
             while self.receiver.recv().is_ok() {}
@@ -308,8 +526,211 @@ struct WorkerConfiguration {
     authoritative: bool,
     directories: StandardDirectories,
     session_overrides: Vec<(String, String)>,
+    settings: SettingsAuthority,
 }
 impl WorkerConfiguration {
+    fn settings_row(
+        &self,
+        key: &str,
+        requires_restart: bool,
+        secret: bool,
+    ) -> Result<SettingsRow, SettingsFailure> {
+        let config = self.config.as_ref().ok_or(SettingsFailure::Unavailable)?;
+        let value = if secret {
+            ""
+        } else {
+            launcher_settings::declaration(key)
+                .map(|declaration| declaration.read(Some(config)).value)
+                .unwrap_or_else(|| config.display_value(key).unwrap_or(""))
+        };
+        if key.len() > 4096 {
+            return Err(SettingsFailure::Invalid);
+        }
+        let value_available = secret || value.len() <= 8192 - key.len();
+        Ok(SettingsRow {
+            key: key.to_owned(),
+            value: if value_available {
+                value.to_owned()
+            } else {
+                String::new()
+            },
+            source: launcher_settings::declaration(key)
+                .map(|declaration| declaration.read(Some(config)).source)
+                .unwrap_or_else(|| config.layer_of(key).map_or("unset", |layer| layer.as_str()))
+                .to_owned(),
+            requires_restart,
+            secret,
+            value_available,
+        })
+    }
+
+    fn settings_request(&mut self, request: &SettingsRequest) -> Result<SettingsPayload, SettingsFailure> {
+        if !self.authoritative {
+            return Err(SettingsFailure::Unavailable);
+        }
+        if request.expected_schema != 0 && request.expected_schema != self.settings.schema_revision {
+            return Err(SettingsFailure::StaleSchema);
+        }
+        match &request.operation {
+            SettingsOperation::Search { text } => {
+                let definitions = launcher_settings::search_definitions();
+                let index = SettingsSearch::new(
+                    self.settings.schema_revision,
+                    &definitions,
+                    &self.settings.schemas,
+                    std::env::consts::OS,
+                )
+                .map_err(|_| SettingsFailure::Unavailable)?;
+                let mut results = index
+                    .search_owned(text, self.settings.schema_revision)
+                    .map_err(|_| SettingsFailure::Invalid)?;
+                let mut rows = Vec::with_capacity(results.hits.len());
+                let mut bytes = 1024
+                    + results.hits.capacity()
+                        * std::mem::size_of::<crikey_app::settings_search::OwnedSettingMatch>()
+                    + rows.capacity() * std::mem::size_of::<SettingsRow>();
+                for hit in &results.hits {
+                    let row = self.settings_row(&hit.key, hit.requires_restart, false)?;
+                    bytes += row.key.capacity()
+                        + row.value.capacity()
+                        + row.source.capacity()
+                        + hit.key.capacity()
+                        + hit.label.capacity()
+                        + hit.description.capacity()
+                        + hit.category.capacity()
+                        + hit.navigation_target.capacity()
+                        + hit.control.capacity();
+                    if bytes > 60 * 1024 {
+                        break;
+                    }
+                    rows.push(row);
+                }
+                if rows.len() < results.hits.len() {
+                    results.truncated = true;
+                    results.hits.truncate(rows.len());
+                }
+                Ok(SettingsPayload::Search { results, rows })
+            }
+            SettingsOperation::BrowsePlugin { plugin } => {
+                let owner = self
+                    .settings
+                    .schemas
+                    .iter()
+                    .find(|owner| &owner.plugin == plugin)
+                    .ok_or(SettingsFailure::Unavailable)?;
+                let capacity = owner.section.fields.len().min(128);
+                let mut results = SettingsSearchResults {
+                    schema_revision: self.settings.schema_revision,
+                    hits: Vec::with_capacity(capacity),
+                    truncated: false,
+                };
+                let mut rows = Vec::with_capacity(capacity);
+                let mut bytes = 1024
+                    + results.hits.capacity()
+                        * std::mem::size_of::<crikey_app::settings_search::OwnedSettingMatch>()
+                    + rows.capacity() * std::mem::size_of::<SettingsRow>();
+                for field in owner
+                    .section
+                    .fields
+                    .iter()
+                    .filter(|field| field.applies_to(std::env::consts::OS))
+                {
+                    let key = format!("plugins.{}.settings.{}", plugin.0, field.name);
+                    let row = self.settings_row(&key, field.requires_restart, field.secret)?;
+                    bytes += key.len() * 2
+                        + row.value.len()
+                        + row.source.len()
+                        + field.name.len()
+                        + field.description.len()
+                        + plugin.0.len()
+                        + field.kind.as_str().len()
+                        + 512;
+                    if rows.len() == 128 || bytes > 60 * 1024 {
+                        results.truncated = true;
+                        break;
+                    }
+                    results.hits.push(crikey_app::settings_search::OwnedSettingMatch {
+                        key,
+                        label: field.name.clone(),
+                        description: field.description.clone(),
+                        category: "Plugins".into(),
+                        navigation_target: plugin.0.clone(),
+                        control: field.kind.as_str().into(),
+                        requires_restart: field.requires_restart,
+                    });
+                    rows.push(row);
+                }
+                Ok(SettingsPayload::Search { results, rows })
+            }
+            SettingsOperation::Edit { key, target, draft } => {
+                if key.len() > 4096 || draft.len() > 4096 {
+                    return Err(SettingsFailure::Invalid);
+                }
+                if request.expected_schema != self.settings.schema_revision {
+                    return Err(SettingsFailure::StaleSchema);
+                }
+                if request.expected_config != self.settings.config_revision {
+                    return Err(SettingsFailure::Conflict);
+                }
+                if self.settings.config_revision == u64::MAX {
+                    return Err(SettingsFailure::Unavailable);
+                }
+                let config = self.config.as_mut().ok_or(SettingsFailure::Unavailable)?;
+                let expected = config.revision();
+                let (result, restart, secret) = match target {
+                    SettingsTarget::UserGlobal => {
+                        let declaration =
+                            launcher_settings::declaration(key).ok_or(SettingsFailure::Invalid)?;
+                        validate_setting_edit(config, key, draft).map_err(|_| SettingsFailure::Invalid)?;
+                        (
+                            config.commit_user_global(key, draft, &expected),
+                            declaration.restart == launcher_settings::Restart::Required,
+                            false,
+                        )
+                    }
+                    SettingsTarget::PluginUser { plugin } => {
+                        let owner = self
+                            .settings
+                            .schemas
+                            .iter()
+                            .find(|owner| &owner.plugin == plugin)
+                            .ok_or(SettingsFailure::Unavailable)?;
+                        let prefix = format!("plugins.{}.settings.", plugin.0);
+                        let name = key.strip_prefix(&prefix).ok_or(SettingsFailure::Invalid)?;
+                        let field = owner
+                            .section
+                            .fields
+                            .iter()
+                            .find(|field| field.name == name && field.applies_to(std::env::consts::OS))
+                            .ok_or(SettingsFailure::Unavailable)?;
+                        (
+                            config.commit_plugin_user(owner, name, draft, &expected),
+                            field.requires_restart,
+                            field.secret,
+                        )
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        let config = self.config.take().ok_or(SettingsFailure::Unavailable)?;
+                        self.replace(config);
+                        if !self.authoritative {
+                            return Err(SettingsFailure::Unavailable);
+                        }
+                        Ok(SettingsPayload::Saved {
+                            row: self.settings_row(key, restart, secret)?,
+                        })
+                    }
+                    Err(ConfigError::Conflict) => Err(SettingsFailure::Conflict),
+                    Err(ConfigError::PersistedReload) => {
+                        self.authoritative = false;
+                        Err(SettingsFailure::PersistedReload)
+                    }
+                    Err(_) => Err(SettingsFailure::Invalid),
+                }
+            }
+        }
+    }
     fn revision(&self) -> ConfigRevision {
         self.config
             .as_ref()
@@ -321,12 +742,25 @@ impl WorkerConfiguration {
             self.authoritative = false;
         }
         self.authoritative
+            && self.settings.config_revision < u64::MAX
             && self
                 .config
                 .as_ref()
                 .is_some_and(|current| current.revision() == draft.revision())
     }
     fn replace(&mut self, config: ConfigStore) {
+        if self.settings.config_revision == 0
+            || self
+                .config
+                .as_ref()
+                .is_none_or(|old| old.revision() != config.revision())
+        {
+            let Some(next) = self.settings.config_revision.checked_add(1) else {
+                self.authoritative = false;
+                return;
+            };
+            self.settings.config_revision = next;
+        }
         self.watch = Some(config.source_watch());
         self.config = Some(config);
         self.authoritative = true;
@@ -374,13 +808,54 @@ impl WorkerConfiguration {
         let based_on = self.revision();
         self.authoritative = false;
         let loaded = match &self.config {
-            Some(current) => current.reload().map_err(|error| error.to_string()),
-            None => crate::LauncherConfiguration::load_store(&self.directories, &self.session_overrides),
+            Some(current) => current.reload_unregistered(),
+            None => ConfigStore::load_with_overrides(
+                &self.directories,
+                self.settings.policy.as_deref(),
+                &self.session_overrides,
+            ),
         };
-        let config = match loaded {
+        let mut config = match loaded {
             Ok(config) => config,
-            Err(report) => return self.completion(based_on, None, Some(report)),
+            Err(_) => {
+                return self.completion(based_on, None, Some("Configuration could not be reloaded".into()))
+            }
         };
+        let (schemas, problems) = crikey_config::discover_plugin_schemas(&self.settings.roots);
+        if !problems.is_empty() {
+            return self.completion(
+                based_on,
+                None,
+                Some("Plugin configuration declarations are unavailable".into()),
+            );
+        }
+        let problems = config.replace_discovered_schemas(&schemas);
+        if problems
+            .iter()
+            .any(|problem| !matches!(problem, ConfigError::Schema { .. }))
+        {
+            return self.completion(
+                based_on,
+                None,
+                Some("Plugin configuration declaration changed or is unavailable".into()),
+            );
+        }
+        if self.settings.schema_revision == 0
+            || self
+                .config
+                .as_ref()
+                .is_none_or(|previous| !config.same_discovered_schemas(previous))
+        {
+            let Some(next) = self.settings.schema_revision.checked_add(1) else {
+                return self.completion(
+                    based_on,
+                    None,
+                    Some("Settings schema revision is exhausted".into()),
+                );
+            };
+            self.settings.schema_revision = next;
+        }
+        self.settings.schemas = schemas;
         let result = store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -398,7 +873,7 @@ impl WorkerConfiguration {
 fn describe(error: PreferenceError) -> String {
     match error {
         PreferenceError::Conflict { .. } => "Command preferences changed; reload and retry this edit".into(),
-        PreferenceError::Invalid(message) => message,
+        PreferenceError::Invalid(_) => "Command preference edit is invalid".into(),
         PreferenceError::Persistence(_) => "Command preferences were not saved".into(),
         PreferenceError::PersistedReload => {
             "Command preferences were saved, but the effective configuration could not be reloaded".into()
@@ -493,11 +968,11 @@ fn edit_status(saved: bool, state: CompletionState) -> crikey_ui::SettingEditSta
 }
 
 fn validate_setting_edit(config: &ConfigStore, key: &str, value: &str) -> Result<(), String> {
-    crate::settings::validate(key, value)?;
+    launcher_settings::validate(key, value)?;
     if key == crikey_config::KEY_ACTIVATION_HOTKEY {
         let (current, retained) = config
             .project_user_global_candidates(key, value)
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| "Configuration could not be projected".to_owned())?;
         current.validate_command_hotkey_conflicts()?;
         retained.validate_command_hotkey_conflicts()?;
     }
@@ -673,6 +1148,314 @@ mod authority_tests {
     }
 
     #[test]
+    fn external_edit_then_package_transaction_publishes_from_consumers_accepted_revision() {
+        use std::time::{Duration, Instant};
+        let scratch = Scratch::new();
+        let directories = StandardDirectories::resolve(
+            DirectoryConvention::current(),
+            &DirectoryEnvironment::new()
+                .set("HOME", &scratch.0)
+                .set("APPDATA", &scratch.0)
+                .set("LOCALAPPDATA", &scratch.0)
+                .set("CRIKEY_CONFIG_DIR", &scratch.0),
+        )
+        .unwrap();
+        let initial = ConfigStore::load_with_policy(&directories, None).unwrap();
+        let path = initial.config_path().to_owned();
+        std::fs::write(&path, "[plugins.modern.fixture.settings]\nstatus = \"before\"\n").unwrap();
+        let initial = initial.reload().unwrap();
+        let worker = PreferenceWorker::spawn(
+            Arc::new(Mutex::new(CommandPreferencesStore::empty())),
+            Some(initial),
+            directories,
+            Vec::new(),
+            None,
+            Vec::new(),
+            || {},
+        )
+        .unwrap();
+        let startup = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut consumer = crate::LauncherConfiguration::from_store(startup.config.unwrap());
+        let plugin = PluginId("modern.fixture".into());
+        let now = Instant::now();
+        consumer.seed(now);
+        let before = consumer.publisher.poll(now + Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            before
+                .values_for(&plugin)
+                .unwrap()
+                .get("status")
+                .map(String::as_str),
+            Some("before")
+        );
+
+        let client = worker.package_configuration();
+        std::fs::write(
+            &path,
+            "[plugins.modern.fixture.settings]\nstatus = \"external\"\n",
+        )
+        .unwrap();
+        let effective = client.set_plugin_enabled(&plugin, true).unwrap();
+        let completion = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The composition owner still has A, not the worker's intermediate
+        // fresh external read B. Only an A-based completion can publish C.
+        assert_eq!(completion.based_on, consumer.store.revision());
+        assert_ne!(effective.revision(), consumer.store.revision());
+        assert_eq!(
+            completion.config.as_ref().unwrap().revision(),
+            effective.revision()
+        );
+        consumer.store = completion.config.unwrap();
+        assert_eq!(consumer.store.get("plugins.modern.fixture.enabled"), Some("true"));
+        consumer.seed(now + Duration::from_secs(3));
+        let published = consumer.publisher.poll(now + Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            published
+                .values_for(&plugin)
+                .unwrap()
+                .get("status")
+                .map(String::as_str),
+            Some("external")
+        );
+
+        // A read-only package admission reload also owes its external edge.
+        std::fs::write(&path, "[plugins.modern.fixture]\nenabled = true\n[plugins.modern.fixture.settings]\nstatus = \"load-only\"\n").unwrap();
+        let loaded = client.load().unwrap();
+        let completion = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(completion.based_on, consumer.store.revision());
+        assert_eq!(completion.config.as_ref().unwrap().revision(), loaded.revision());
+        consumer.store = completion.config.unwrap();
+        consumer.seed(now + Duration::from_secs(6));
+        let published = consumer.publisher.poll(now + Duration::from_secs(8)).unwrap();
+        assert_eq!(
+            published
+                .values_for(&plugin)
+                .unwrap()
+                .get("status")
+                .map(String::as_str),
+            Some("load-only")
+        );
+
+        client.set_plugin_enabled(&plugin, false).unwrap();
+        let next = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(next.based_on, consumer.store.revision());
+        assert_eq!(
+            next.config.unwrap().get("plugins.modern.fixture.enabled"),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn saved_plugin_edit_publishes_when_large_session_value_cannot_be_displayed() {
+        use std::time::{Duration, Instant};
+        let scratch = Scratch::new();
+        let directories = StandardDirectories::resolve(
+            DirectoryConvention::current(),
+            &DirectoryEnvironment::new()
+                .set("HOME", &scratch.0)
+                .set("APPDATA", &scratch.0)
+                .set("LOCALAPPDATA", &scratch.0)
+                .set("CRIKEY_CONFIG_DIR", &scratch.0),
+        )
+        .unwrap();
+        let root = scratch.0.join("packages");
+        let package = root.join("fixture");
+        std::fs::create_dir_all(&package).unwrap();
+        let manifest = concat!(
+            include_str!("../../crikey-plugin-model/tests/data/spec-example.crikey.toml"),
+            "\n[[configuration.field]]\nname = \"visible\"\ntype = \"string\"\n",
+        );
+        std::fs::write(package.join("crikey.toml"), manifest).unwrap();
+        let plugin = PluginId("native.dev.example.repositories".into());
+        let key = format!("plugins.{}.settings.visible", plugin.0);
+        let large = "x".repeat(9000);
+        let overrides = vec![(key.clone(), large.clone())];
+        let config = ConfigStore::load_with_overrides(&directories, None, &overrides).unwrap();
+        let worker = PreferenceWorker::spawn(
+            Arc::new(Mutex::new(CommandPreferencesStore::empty())),
+            Some(config),
+            directories.clone(),
+            overrides,
+            None,
+            vec![root],
+            || {},
+        )
+        .unwrap();
+        let startup = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut consumer = crate::LauncherConfiguration::from_store(startup.config.unwrap());
+        let mut model = crikey_ui::LauncherViewModel::new();
+        model.activate();
+        let view = model.view().unwrap().0;
+        worker
+            .submit_settings(SettingsRequest {
+                view,
+                request_id: 1,
+                expected_config: 0,
+                expected_schema: 0,
+                operation: SettingsOperation::BrowsePlugin {
+                    plugin: plugin.clone(),
+                },
+            })
+            .unwrap();
+        let browse = worker
+            .settings
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let SettingsPayload::Search { rows, .. } = browse.result.unwrap() else {
+            panic!("browse")
+        };
+        assert!(!rows[0].value_available);
+        assert!(rows[0].value.is_empty());
+        let refresh = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(refresh.based_on, consumer.store.revision());
+        consumer.store = refresh.config.unwrap();
+
+        worker
+            .submit_settings(SettingsRequest {
+                view,
+                request_id: 2,
+                expected_config: browse.config_revision,
+                expected_schema: browse.schema_revision,
+                operation: SettingsOperation::Edit {
+                    key: key.clone(),
+                    target: SettingsTarget::PluginUser {
+                        plugin: plugin.clone(),
+                    },
+                    draft: "persisted".into(),
+                },
+            })
+            .unwrap();
+        let response = worker
+            .settings
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(response.view, view);
+        assert_eq!(response.request_id, 2);
+        let SettingsPayload::Saved { row } = response.result.unwrap() else {
+            panic!("saved acknowledgement")
+        };
+        assert!(!row.value_available);
+        assert!(row.value.is_empty());
+        let completion = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(completion.state, CompletionState::Authoritative);
+        assert_eq!(completion.based_on, consumer.store.revision());
+        let saved = completion.config.unwrap();
+        assert_ne!(saved.revision(), consumer.store.revision());
+        assert_eq!(saved.get(&key), Some(large.as_str()));
+        consumer.store = saved;
+        let now = Instant::now();
+        consumer.seed(now);
+        let published = consumer.publisher.poll(now + Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            published
+                .values_for(&plugin)
+                .unwrap()
+                .get("visible")
+                .map(String::as_str),
+            Some(large.as_str())
+        );
+        let persisted = ConfigStore::load_with_policy(&directories, None).unwrap();
+        assert_eq!(persisted.get(&key), Some("persisted"));
+    }
+
+    #[test]
+    fn owned_settings_survive_reload_and_keep_secret_drafts_out_of_projection() {
+        use crikey_plugin_model::{ConfigurationField, ConfigurationKind, ConfigurationSection};
+        let scratch = Scratch::new();
+        let directories = StandardDirectories::resolve(
+            DirectoryConvention::current(),
+            &DirectoryEnvironment::new()
+                .set("HOME", &scratch.0)
+                .set("APPDATA", &scratch.0)
+                .set("LOCALAPPDATA", &scratch.0)
+                .set("CRIKEY_CONFIG_DIR", &scratch.0),
+        )
+        .unwrap();
+        let mut config = ConfigStore::load_with_policy(&directories, None).unwrap();
+        let plugin = PluginId("modern.fixture".into());
+        let owner = DiscoveredSchema {
+            plugin: plugin.clone(),
+            package: scratch.0.join("package"),
+            section: ConfigurationSection {
+                fields: vec![ConfigurationField {
+                    name: "token".into(),
+                    kind: ConfigurationKind::String,
+                    default: None,
+                    description: "Private token".into(),
+                    secret: true,
+                    requires_restart: true,
+                    platforms: Vec::new(),
+                    required: false,
+                    minimum: None,
+                    maximum: None,
+                    max_length: None,
+                    allowed: Vec::new(),
+                }],
+            },
+        };
+        assert!(config.register_discovered_schema(&owner).is_empty());
+        config.set_session_override("plugins.modern.fixture.settings.token", "private-canary");
+        let mut state = WorkerConfiguration {
+            watch: Some(config.source_watch()),
+            config: Some(config),
+            authoritative: true,
+            directories,
+            session_overrides: Vec::new(),
+            settings: SettingsAuthority {
+                schemas: vec![owner],
+                config_revision: 4,
+                schema_revision: 7,
+                ..Default::default()
+            },
+        };
+        let mut model = crikey_ui::LauncherViewModel::new();
+        model.activate();
+        let view = model.view().unwrap().0;
+        let mut request = SettingsRequest {
+            view,
+            request_id: 1,
+            expected_config: 4,
+            expected_schema: 7,
+            operation: SettingsOperation::BrowsePlugin {
+                plugin: plugin.clone(),
+            },
+        };
+        let response = state.settings_request(&request).unwrap();
+        let SettingsPayload::Search { results, rows } = response else {
+            panic!("browse")
+        };
+        assert_eq!(results.hits[0].key, "plugins.modern.fixture.settings.token");
+        assert!(rows[0].secret);
+        assert!(rows[0].value.is_empty());
+        state.settings.schemas.clear();
+        state.settings.schema_revision = 8;
+        assert_eq!(rows[0].key, "plugins.modern.fixture.settings.token");
+        request.operation = SettingsOperation::Edit {
+            key: rows[0].key.clone(),
+            target: SettingsTarget::PluginUser { plugin },
+            draft: "new-private-canary".into(),
+        };
+        assert!(matches!(
+            state.settings_request(&request),
+            Err(SettingsFailure::StaleSchema)
+        ));
+        request.expected_schema = 8;
+        request.expected_config = 3;
+        assert!(matches!(
+            state.settings_request(&request),
+            Err(SettingsFailure::Conflict)
+        ));
+        let SettingsOperation::Edit { draft, .. } = request.operation else {
+            panic!("draft")
+        };
+        assert_eq!(draft, "new-private-canary");
+    }
+
+    #[test]
     fn failed_external_reload_revokes_edits_until_successful_recovery() {
         let scratch = Scratch::new();
         let directories = StandardDirectories::resolve(
@@ -694,6 +1477,7 @@ mod authority_tests {
             authoritative: true,
             directories,
             session_overrides: Vec::new(),
+            settings: SettingsAuthority::default(),
         };
         let published = store.lock().unwrap().snapshot();
         assert!(state.accepts(&draft));
@@ -734,8 +1518,16 @@ mod authority_tests {
         let config = crate::LauncherConfiguration::load_store(&directories, &[]).unwrap();
         let path = config.config_path().to_owned();
         let store = Arc::new(Mutex::new(CommandPreferencesStore::empty()));
-        let worker =
-            PreferenceWorker::spawn(store, Some(config), directories.clone(), Vec::new(), || {}).unwrap();
+        let worker = PreferenceWorker::spawn(
+            store,
+            Some(config),
+            directories.clone(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            || {},
+        )
+        .unwrap();
         let initial = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
         let initial_config = initial.config.unwrap();
         let key = "launcher.command-home";
@@ -858,6 +1650,7 @@ mod authority_tests {
             authoritative: true,
             directories,
             session_overrides: Vec::new(),
+            settings: SettingsAuthority::default(),
         };
         let mut desired = config.clone();
         desired
@@ -925,8 +1718,16 @@ mod authority_tests {
             &CommandPreferences::default().encode().unwrap(),
         );
         let store = Arc::new(Mutex::new(CommandPreferencesStore::empty()));
-        let worker =
-            PreferenceWorker::spawn(store, Some(config), directories.clone(), Vec::new(), || {}).unwrap();
+        let worker = PreferenceWorker::spawn(
+            store,
+            Some(config),
+            directories.clone(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            || {},
+        )
+        .unwrap();
         let startup = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(startup
             .preferences
@@ -936,7 +1737,7 @@ mod authority_tests {
             .records
             .is_empty());
         let before = startup.config.unwrap();
-        let activation_before = crate::settings::configured_hotkey(Some(&before));
+        let activation_before = launcher_settings::configured_hotkey(Some(&before));
         worker
             .submit_setting(
                 41,
@@ -957,7 +1758,7 @@ mod authority_tests {
             })
         );
         assert_eq!(
-            crate::settings::configured_hotkey(refused.config.as_ref()),
+            launcher_settings::configured_hotkey(refused.config.as_ref()),
             activation_before
         );
         assert_eq!(std::fs::read(&path).unwrap(), disk_before);
@@ -967,7 +1768,7 @@ mod authority_tests {
             Some(durable)
         );
         assert_eq!(
-            crate::settings::configured_hotkey(Some(&restarted)),
+            launcher_settings::configured_hotkey(Some(&restarted)),
             activation_before
         );
     }
@@ -1025,8 +1826,16 @@ mod authority_tests {
             let disk_before = std::fs::read(&path).unwrap();
             config.set_session_override(KEY_COMMAND_PREFERENCES, &empty.encode().unwrap());
             let store = Arc::new(Mutex::new(CommandPreferencesStore::empty()));
-            let worker =
-                PreferenceWorker::spawn(store, Some(config), directories.clone(), Vec::new(), || {}).unwrap();
+            let worker = PreferenceWorker::spawn(
+                store,
+                Some(config),
+                directories.clone(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                || {},
+            )
+            .unwrap();
             let initial = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
             worker
                 .submit_setting(
@@ -1052,7 +1861,7 @@ mod authority_tests {
             );
             assert!(restarted.validate_command_hotkey_conflicts().is_ok());
             if let Some(activation) = profile_activation {
-                assert_eq!(crate::settings::configured_hotkey(Some(&restarted)), activation);
+                assert_eq!(launcher_settings::configured_hotkey(Some(&restarted)), activation);
             }
         }
     }
@@ -1105,8 +1914,16 @@ mod authority_tests {
             let disk_before = std::fs::read(&path).unwrap();
             config.set_session_override(crikey_config::KEY_ACTIVATION_HOTKEY, "Ctrl+Shift+H");
             let store = Arc::new(Mutex::new(CommandPreferencesStore::empty()));
-            let worker =
-                PreferenceWorker::spawn(store, Some(config), directories.clone(), Vec::new(), || {}).unwrap();
+            let worker = PreferenceWorker::spawn(
+                store,
+                Some(config),
+                directories.clone(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                || {},
+            )
+            .unwrap();
             let initial = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
             worker
                 .submit_mutation(MutationRequest {
@@ -1216,8 +2033,16 @@ mod layer_consumer_tests {
         config.save().unwrap();
         config.set_session_override(KEY_COMMAND_PREFERENCES, &session.encode().unwrap());
         let store = Arc::new(Mutex::new(CommandPreferencesStore::empty()));
-        let worker =
-            PreferenceWorker::spawn(store, Some(config), directories.clone(), Vec::new(), || {}).unwrap();
+        let worker = PreferenceWorker::spawn(
+            store,
+            Some(config),
+            directories.clone(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            || {},
+        )
+        .unwrap();
         let mut current = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(current.report.is_none());
         let registry = Arc::new(CommandRegistrySnapshot::default());
@@ -1304,7 +2129,7 @@ mod layer_consumer_tests {
         for (index, edit) in [
             CommandPreferenceEdit::SetAlias(Some("OCCUPIED".into())),
             CommandPreferenceEdit::SetHotkey(Some("Shift+Ctrl+O".into())),
-            CommandPreferenceEdit::SetHotkey(Some(crate::settings::configured_hotkey(
+            CommandPreferenceEdit::SetHotkey(Some(launcher_settings::configured_hotkey(
                 current.config.as_ref(),
             ))),
         ]

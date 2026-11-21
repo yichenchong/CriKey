@@ -43,6 +43,10 @@
 //! generation. A captured suggestion scope survives executable retirement only
 //! while its declaration and physical producer remain current. Typed submissions
 //! retain the frozen item/schema and confirm it on that physical worker.
+//!
+//! Global stop permanently fences bounded endpoint and wire admission. Its wait
+//! joins the existing supervisor, catalog transfers, process trees and pipe
+//! threads; failed settlement retains their canonical owners behind the control.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -82,6 +86,7 @@ use crate::plugin_preview::{
 };
 use crate::preview_action_budget::{ForegroundActionAdmission, PreviewActionGate};
 use crate::query_pipeline::ProviderQueryContext;
+use crate::runtime_control::{AdmissionGate, DriverControl, StopError, StoppedRuntime};
 use crate::{
     plugin_icons::PluginIconResolver, ActionRequestId, BatchState, CatalogBuildResult, CatalogDispatchError,
     DisabledPlugins, ObsoleteCatalogBuild, PluginActionCompletion, QueryPipeline, ResultBatch,
@@ -99,6 +104,7 @@ struct ModernPreviewJob {
 
 struct ModernPreviewEndpoint {
     sender: SyncSender<ModernPreviewJob>,
+    admission: AdmissionGate,
     gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
     action_in_flight: Arc<AtomicUsize>,
     incarnations: Arc<Mutex<BTreeMap<PluginId, u64>>>,
@@ -121,6 +127,7 @@ impl ModernPreviewEndpoint {
     fn new(provider: &ModernProvider, sender: SyncSender<ModernPreviewJob>) -> Arc<Self> {
         let endpoint = Arc::new(Self {
             sender,
+            admission: provider.cancellation.admission.clone(),
             gates: provider
                 .action_budgets()
                 .into_iter()
@@ -286,9 +293,23 @@ impl ModernPreviewEndpoint {
                 "plugin":identity.plugin.0, "incarnation":identity.incarnation,
                 "item":identity.item.0, "selection":identity.selection, "request":identity.request,
             });
-            let reply = worker.preview(&current, &wire_identity);
+            let was_live = worker.is_alive();
+            let reply = catch_unwind(AssertUnwindSafe(|| {
+                worker.preview(&current, &wire_identity).inspect_err(|error| {
+                    provider
+                        .cancellation
+                        .observe_transport_error(was_live, worker, error);
+                })
+            }));
             control.finish();
-            let _ = watcher.join();
+            provider
+                .cancellation
+                .failed
+                .fetch_or(watcher.join().is_err(), Ordering::AcqRel);
+            let reply = reply.map_err(|_| {
+                provider.cancellation.failed.store(true, Ordering::Release);
+                "modern preview callback failed".to_owned()
+            })?;
             if job.cancelled.load(Ordering::Acquire) {
                 return Ok(PreviewState::Cancelled);
             }
@@ -297,7 +318,10 @@ impl ModernPreviewEndpoint {
         let state = match result {
             Ok(Ok(state)) => state,
             Ok(Err(reason)) => PreviewState::Error(reason),
-            Err(_) => PreviewState::Error("modern preview supervisor panicked".into()),
+            Err(_) => {
+                provider.cancellation.failed.store(true, Ordering::Release);
+                PreviewState::Error("modern preview supervisor panicked".into())
+            }
         };
         self.refresh_liveness(provider);
         self.complete(job, state);
@@ -331,6 +355,9 @@ impl PreviewDispatcher for ModernPreviewEndpoint {
         item: &ItemId,
         source: Option<&crate::plugin_action::DeclaredCommandSource>,
     ) -> Option<(Item, u64)> {
+        if self.admission.state() != crate::runtime_control::PluginAdmission::Open {
+            return None;
+        }
         let key = (plugin.clone(), item.clone());
         if let Some(source) = source {
             let publications = self
@@ -385,6 +412,9 @@ impl PreviewDispatcher for ModernPreviewEndpoint {
         item: &ItemId,
         source: Option<&crate::plugin_action::DeclaredCommandSource>,
     ) -> Option<u64> {
+        if self.admission.state() != crate::runtime_control::PluginAdmission::Open {
+            return None;
+        }
         if source.is_some() {
             return self.lookup(plugin, item, source).map(|(_, origin)| origin);
         }
@@ -407,6 +437,9 @@ impl PreviewDispatcher for ModernPreviewEndpoint {
     }
 
     fn incarnation(&self, plugin: &PluginId) -> Option<u64> {
+        if self.admission.state() != crate::runtime_control::PluginAdmission::Open {
+            return None;
+        }
         if self.stopped.load(Ordering::Acquire) {
             return None;
         }
@@ -441,15 +474,16 @@ impl PreviewDispatcher for ModernPreviewEndpoint {
         let identity = id.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         pending.push((identity.clone(), Arc::clone(&cancelled)));
-        if self
-            .sender
-            .try_send(ModernPreviewJob {
-                request,
-                publish,
-                cancelled,
-            })
-            .is_err()
-        {
+        let job = ModernPreviewJob {
+            request,
+            publish,
+            cancelled,
+        };
+        let sent = match self.admission.admit() {
+            Ok(_admission) => self.sender.try_send(job),
+            Err(_) => Err(mpsc::TrySendError::Disconnected(job)),
+        };
+        if sent.is_err() {
             pending.retain(|(candidate, _)| candidate != &identity);
             return Err("modern preview mailbox is full or unavailable".into());
         }
@@ -861,12 +895,20 @@ fn bind_modern_commands(
 struct ModernCatalogTask {
     join: Option<JoinHandle<()>>,
     key: WorkerKey,
+    owner: Arc<Mutex<ModernCatalogOwner>>,
+}
+
+#[derive(Debug)]
+struct ModernCatalogOwner {
+    worker: Option<ModernWorker>,
+    watcher: Option<JoinHandle<()>>,
 }
 
 /// Returning a healthy, deliberately released lazy producer is not a failure.
 #[derive(Debug)]
 enum CatalogWorkerReturn {
     Retained(ModernWorker),
+    Unsettled(ModernWorker),
     Released,
     Failed(String),
 }
@@ -895,6 +937,7 @@ struct ModernCatalogDispatcher {
     tasks: BTreeMap<u64, ModernCatalogTask>,
     latest: BTreeMap<PluginId, u64>,
     next_id: u64,
+    failed: bool,
     items: SharedOriginItems,
     static_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     commands: ModernCommands,
@@ -911,6 +954,7 @@ impl Default for ModernCatalogDispatcher {
             tasks: BTreeMap::new(),
             latest: BTreeMap::new(),
             next_id: 0,
+            failed: false,
             items: Arc::new(Mutex::new(BTreeMap::new())),
             static_items: Arc::new(Mutex::new(BTreeMap::new())),
             commands: Arc::new(Mutex::new(Arc::new(ModernCommandSnapshot::default()))),
@@ -926,13 +970,21 @@ impl ModernCatalogDispatcher {
         Some(self.next_id)
     }
 
-    fn insert(&mut self, id: u64, plugin: PluginId, key: WorkerKey, join: JoinHandle<()>) {
+    fn insert(
+        &mut self,
+        id: u64,
+        plugin: PluginId,
+        key: WorkerKey,
+        join: JoinHandle<()>,
+        owner: Arc<Mutex<ModernCatalogOwner>>,
+    ) {
         self.latest.insert(plugin.clone(), id);
         self.tasks.insert(
             id,
             ModernCatalogTask {
                 join: Some(join),
                 key,
+                owner,
             },
         );
     }
@@ -944,13 +996,24 @@ impl ModernCatalogDispatcher {
                 continue;
             };
             if let Some(join) = task.join.take() {
-                let _ = join.join();
+                self.failed |= join.join().is_err();
             }
             let incarnation = match worker {
                 CatalogWorkerReturn::Retained(worker) => {
                     let incarnation = worker.incarnation();
                     pool.workers.insert(task.key, WorkerLifecycle::Live(worker));
                     incarnation
+                }
+                CatalogWorkerReturn::Unsettled(worker) => {
+                    self.failed = true;
+                    pool.workers.insert(
+                        task.key.clone(),
+                        WorkerLifecycle::Failed {
+                            reason: "worker reap failed".into(),
+                        },
+                    );
+                    pool.retired.insert(task.key, worker);
+                    0
                 }
                 CatalogWorkerReturn::Released => {
                     pool.workers.insert(task.key, WorkerLifecycle::NeverStarted);
@@ -1077,12 +1140,21 @@ impl ModernCatalogDispatcher {
     fn shutdown(&mut self, pool: &mut ModernWorkerPool) -> Vec<CatalogBuildResult> {
         for task in self.tasks.values_mut() {
             if let Some(join) = task.join.take() {
-                let _ = join.join();
+                self.failed |= join.join().is_err();
             }
         }
         let results = self.take(pool);
+        self.failed |= !self.tasks.is_empty();
+        for task in self.tasks.values() {
+            let mut owner = task.owner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(watcher) = owner.watcher.take() {
+                self.failed |= watcher.join().is_err();
+            }
+            if let Some(worker) = owner.worker.as_mut() {
+                self.failed |= worker.shutdown_checked().is_err();
+            }
+        }
         self.latest.clear();
-        self.tasks.clear();
         results
     }
 }
@@ -1153,7 +1225,11 @@ impl ModernCallControl {
 
 #[derive(Debug, Default)]
 struct ModernCancellation {
+    startup_workers: Mutex<BTreeMap<PluginId, Arc<Mutex<ModernWorker>>>>,
+    admission: AdmissionGate,
+    failed: AtomicBool,
     calls: Mutex<BTreeMap<(u64, PluginId), Arc<ModernCallControl>>>,
+    catalog_calls: Mutex<BTreeMap<u64, Arc<ModernCallControl>>>,
     /// Monotonic count of queries the driver's intake has admitted.
     ///
     /// Supersession has to be observable by the provider even while it is doing
@@ -1170,10 +1246,86 @@ struct ModernCancellation {
     suggestion_intake: AtomicU64,
     #[cfg(test)]
     publication_pause: Mutex<Option<(SyncSender<()>, Receiver<()>)>>,
+    #[cfg(test)]
+    spawn_pause: Mutex<Option<(SyncSender<()>, Receiver<()>)>>,
 }
 
 impl ModernCancellation {
+    fn spawn_worker(
+        &self,
+        interpreter: &Interpreter,
+        options: WorkerOptions,
+    ) -> Result<ModernWorker, crikey_python_host::HostError> {
+        let owner = options.plugin.clone();
+        if self
+            .startup_workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&owner)
+        {
+            return Err(crikey_python_host::HostError::TeardownFailed);
+        }
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.spawn_pause.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        }
+        let gate = self.admission.clone();
+        ModernWorker::spawn_with_admission(interpreter, options, move |send| {
+            let Ok(_admission) = gate.admit() else {
+                return false;
+            };
+            send()
+        })
+        .inspect_err(|error| {
+            if let crikey_python_host::HostError::StartupCleanup { worker } = error {
+                self.startup_workers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(owner.clone(), Arc::clone(worker));
+                self.failed.store(true, Ordering::Release);
+            }
+            if matches!(error, crikey_python_host::HostError::TeardownFailed)
+                || (self.admission.state() != crate::runtime_control::PluginAdmission::Open
+                    && matches!(
+                        error,
+                        crikey_python_host::HostError::Crashed { .. }
+                            | crikey_python_host::HostError::Protocol(_)
+                            | crikey_python_host::HostError::Timeout
+                    ))
+            {
+                self.failed.store(true, Ordering::Release);
+            }
+        })
+    }
+
+    fn observe_transport_error(
+        &self,
+        was_live: bool,
+        worker: &ModernWorker,
+        error: &crikey_python_host::HostError,
+    ) {
+        // A completed guest error or historical retired slot is not lost work.
+        // AdmissionClosed proves the writer refused before handing work over.
+        if was_live
+            && !worker.is_alive()
+            && matches!(
+                error,
+                crikey_python_host::HostError::Crashed { .. }
+                    | crikey_python_host::HostError::Protocol(_)
+                    | crikey_python_host::HostError::Timeout
+            )
+            && self.admission.state() != crate::runtime_control::PluginAdmission::Open
+        {
+            self.failed.store(true, Ordering::Release);
+        }
+    }
+
     fn register(&self, generation: u64, plugin: PluginId, control: Arc<ModernCallControl>) {
+        let admission = self.admission.admit();
+        if admission.is_err() {
+            control.cancel();
+        }
         self.calls
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1198,8 +1350,9 @@ impl ModernCancellation {
     }
 
     fn source_current(&self, source: &RootSource) -> bool {
-        matches!(source, RootSource::Catalog(_))
-            || self.suggestion_intake.load(Ordering::Acquire) == self.intake()
+        self.admission.state() == crate::runtime_control::PluginAdmission::Open
+            && (matches!(source, RootSource::Catalog(_))
+                || self.suggestion_intake.load(Ordering::Acquire) == self.intake())
     }
 
     fn cancel_before(&self, generation: u64) {
@@ -1225,6 +1378,16 @@ impl ModernCancellation {
             .cloned()
             .collect::<Vec<_>>();
         for control in controls {
+            control.cancel();
+        }
+        let catalog_controls = self
+            .catalog_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for control in catalog_controls {
             control.cancel();
         }
     }
@@ -1279,6 +1442,8 @@ impl WorkerLifecycle {
 #[derive(Default)]
 struct ModernWorkerPool {
     workers: BTreeMap<WorkerKey, WorkerLifecycle>,
+    retired: BTreeMap<WorkerKey, ModernWorker>,
+    teardown_failed: bool,
     failures: Vec<(PluginId, String)>,
     /// Saturating count of callbacks that exceeded their soft deadline.
     soft_timeouts: BTreeMap<PluginId, u32>,
@@ -1343,8 +1508,15 @@ impl ModernWorkerPool {
     /// dropped here, which reaps it, and nothing may dispatch to or respawn
     /// the slot until a supervised restart.
     fn fail(&mut self, key: &WorkerKey, reason: String) {
-        self.workers
-            .insert(key.clone(), WorkerLifecycle::Failed { reason });
+        if let Some(WorkerLifecycle::Live(mut worker)) = self
+            .workers
+            .insert(key.clone(), WorkerLifecycle::Failed { reason })
+        {
+            if worker.shutdown_checked().is_err() {
+                self.teardown_failed = true;
+                self.retired.insert(key.clone(), worker);
+            }
+        }
     }
 
     fn record_soft_timeout(&mut self, plugin: PluginId) {
@@ -1362,6 +1534,7 @@ impl ModernWorkerPool {
 #[derive(Debug)]
 pub struct ModernProvider {
     pool: ModernWorkerPool,
+    icon_resolver: Option<Arc<PluginIconResolver>>,
     loaded: Vec<LoadedPlugin>,
     catalog: ModernCatalogDispatcher,
     plugins: Vec<PluginId>,
@@ -1405,6 +1578,7 @@ impl ModernProvider {
             plugins: Vec::new(),
             unavailable: Vec::new(),
             action_items: Arc::new(Mutex::new(BTreeMap::new())),
+            icon_resolver: None,
             cancellation: Arc::new(ModernCancellation::default()),
             serving_intake: 0,
         };
@@ -1497,12 +1671,15 @@ impl ModernProvider {
     /// references that pass its relative-component check to this directory,
     /// and only for a plugin whose manifest permits the host-mediated package
     /// read in the first place.
-    fn install_icon_resolver(&self, pipeline: &mut QueryPipeline) {
+    fn install_icon_resolver(&mut self, pipeline: &mut QueryPipeline) {
         let mut resolver = PluginIconResolver::default();
+        resolver.set_admission(self.cancellation.admission.clone());
         for loaded in &self.loaded {
             resolver.insert_package(&loaded.plugin, loaded.package_dir.clone(), &loaded.permissions);
         }
-        pipeline.set_plugin_icons(Arc::new(resolver));
+        let resolver = Arc::new(resolver);
+        pipeline.set_plugin_icons(Arc::clone(&resolver));
+        self.icon_resolver = Some(resolver);
     }
 
     /// Opens the offline package index, or an empty one when no index root is
@@ -1718,7 +1895,10 @@ impl ModernProvider {
         // Spawn only eager workers at load. Lazy workers retain their resolved
         // interpreter/options and are started on their first query.
         if manifest.performance.startup == Startup::Eager && self.pool.never_started(&key) {
-            let worker = match ModernWorker::spawn(&interpreter, worker_options.clone()) {
+            let worker = match self
+                .cancellation
+                .spawn_worker(&interpreter, worker_options.clone())
+            {
                 Ok(worker) => worker,
                 Err(error) => {
                     self.record_unavailable(
@@ -1781,7 +1961,7 @@ impl ModernProvider {
             self.pool.fail(key, reason.clone());
             return Err(reason);
         };
-        match ModernWorker::spawn(&interpreter, options) {
+        match self.cancellation.spawn_worker(&interpreter, options) {
             Ok(worker) => {
                 self.pool
                     .workers
@@ -1831,6 +2011,16 @@ impl ModernProvider {
         else {
             return Err(format!("modern plugin `{}` is not loaded", plugin.0));
         };
+        if self.pool.retired.contains_key(&key)
+            || self
+                .cancellation
+                .startup_workers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(plugin)
+        {
+            return Err("modern worker teardown is still owned".into());
+        }
         if self.pool.failure_reason(&key).is_none() {
             return Err(format!("modern plugin `{}` has no failed worker", plugin.0));
         }
@@ -1924,7 +2114,11 @@ impl ModernProvider {
             // Caught rather than propagated for the same reason every other
             // dispatch seam here catches: a panic inside one plugin's transport
             // must not take down the supervisor thread publishing to the rest.
+            let was_live = worker.is_alive();
             let outcome = catch_unwind(AssertUnwindSafe(|| worker.send_configuration(&values, true)));
+            if let Ok(Err(error)) = &outcome {
+                self.cancellation.observe_transport_error(was_live, worker, error);
+            }
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -1933,6 +2127,7 @@ impl ModernProvider {
                     failures.push((plugin, reason));
                 }
                 Err(_) => {
+                    self.cancellation.failed.store(true, Ordering::Release);
                     let reason = "configuration delivery panicked".to_owned();
                     self.pool.record_dispatch_failure(plugin.clone(), reason.clone());
                     failures.push((plugin, reason));
@@ -1953,6 +2148,10 @@ impl ModernProvider {
         instance: u64,
         generation: Generation,
     ) -> Result<u64, CatalogDispatchError> {
+        let gate = self.cancellation.admission.clone();
+        let _admission = gate.admit().map_err(|_| CatalogDispatchError::BudgetRefused {
+            plugin: plugin.clone(),
+        })?;
         let loaded = self
             .loaded
             .iter()
@@ -2015,20 +2214,45 @@ impl ModernProvider {
         let sender = self.catalog.result_tx.clone();
         let plugin_for_thread = plugin.clone();
         let thread_plugin = plugin.clone();
+        let cancellation = Arc::clone(&self.cancellation);
+        let control = Arc::new(ModernCallControl::new());
+        self.cancellation
+            .catalog_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_id, Arc::clone(&control));
+        let worker_owner = Arc::new(Mutex::new(ModernCatalogOwner {
+            worker,
+            watcher: None,
+        }));
+        let thread_owner = Arc::clone(&worker_owner);
         let join = thread::Builder::new()
             .name(format!("crikey-modern-catalog-{}", plugin.0))
             .spawn(move || {
-                let mut worker = worker;
+                let mut ownership = thread_owner.lock().unwrap_or_else(|e| e.into_inner());
+                let ModernCatalogOwner { worker, watcher } = &mut *ownership;
                 let was_live = worker.is_some();
+                let watcher_control = Arc::clone(&control);
+                *watcher = match thread::Builder::new().name("crikey-modern-catalog-cancel".into())
+                    .spawn(move || watcher_control.watch_cancel()) {
+                        Ok(handle) => Some(handle),
+                        Err(_) => { cancellation.failed.store(true, Ordering::Release); None }
+                    };
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     if worker.is_none() {
-                        worker = Some(ModernWorker::spawn(&interpreter, worker_options)
+                        *worker = Some(cancellation.spawn_worker(&interpreter, worker_options)
                             .map_err(|error| error.to_string())?);
                     }
-                    worker.as_mut().expect("worker installed")
-                        .build_catalog_with_timeout_ms(CALL_BUDGET_MS).map_err(|error| error.to_string())
+                    let active = worker.as_mut().expect("worker installed");
+                    active.cancel_handle().reset();
+                    control.install(active.cancel_handle());
+                    let was_live = active.is_alive();
+                    active.build_catalog_with_timeout_ms(CALL_BUDGET_MS).inspect_err(|error| {
+                        cancellation.observe_transport_error(was_live, active, error);
+                    }).map_err(|error| error.to_string())
                 }));
                 let mut panicked = result.is_err();
+                cancellation.failed.fetch_or(panicked, Ordering::AcqRel);
                 let completion = match result {
                     Ok(Ok(mut items)) => {
                         for item in &mut items {
@@ -2072,7 +2296,10 @@ impl ModernProvider {
                         let _action_guard = budget.try_acquire_owned(BudgetKind::Action)
                             .ok_or_else(|| "command action budget refused".to_owned())?;
                         worker.cancel_handle().reset();
-                        let reply = worker.commands().map_err(|error| error.to_string())?;
+                        let was_live = worker.is_alive();
+                        let reply = worker.commands().inspect_err(|error| {
+                            cancellation.observe_transport_error(was_live, worker, error);
+                        }).map_err(|error| error.to_string())?;
                         if worker.incarnation() != commands.incarnation || !worker.is_alive() {
                             return Err("command catalog source is no longer current".into());
                         }
@@ -2094,10 +2321,19 @@ impl ModernProvider {
                         if build.items.iter().any(|item| item.metadata.get("crikey.preview").map(String::as_str) == Some("deferred")));
                 let presentation = worker.as_ref().map(|worker| worker.presentation().clone())
                     .unwrap_or_default();
-                let worker = if !panicked && worker.as_ref().is_some_and(ModernWorker::is_alive) {
+                control.finish();
+                if let Some(watcher) = watcher.take() {
+                    cancellation.failed.fetch_or(watcher.join().is_err(), Ordering::AcqRel);
+                }
+                cancellation.catalog_calls.lock().unwrap_or_else(|e| e.into_inner()).remove(&request_id);
+                let returned = if !panicked && worker.as_ref().is_some_and(ModernWorker::is_alive) {
                     if !was_live && !keep_origin {
-                        let _ = worker.take().expect("healthy producer").shutdown();
-                        CatalogWorkerReturn::Released
+                        let mut producer = worker.take().expect("healthy producer");
+                        if producer.shutdown_checked().is_ok() {
+                            CatalogWorkerReturn::Released
+                        } else {
+                            CatalogWorkerReturn::Unsettled(producer)
+                        }
                     } else {
                         CatalogWorkerReturn::Retained(worker.take().expect("healthy producer"))
                     }
@@ -2106,16 +2342,35 @@ impl ModernProvider {
                         CatalogBuildResult::Failed { reason, .. } => reason.clone(),
                         _ => "modern catalog worker is no longer alive".to_owned(),
                     };
-                    CatalogWorkerReturn::Failed(reason)
+                    cancellation.failed.fetch_or(panicked, Ordering::AcqRel);
+                    if let Some(mut producer) = worker.take() {
+                        if producer.shutdown_checked().is_err() {
+                            cancellation.failed.store(true, Ordering::Release);
+                            CatalogWorkerReturn::Unsettled(producer)
+                        } else {
+                            CatalogWorkerReturn::Failed(reason)
+                        }
+                    } else {
+                        CatalogWorkerReturn::Failed(reason)
+                    }
                 };
-                let _ = sender.send((request_id, completion, worker, commands, presentation));
+                if let Err(error) = sender.send((request_id, completion, returned, commands, presentation)) {
+                    if let CatalogWorkerReturn::Retained(producer) | CatalogWorkerReturn::Unsettled(producer) = error.0.2 {
+                        *worker = Some(producer);
+                    }
+                }
                 drop(guard);
             })
             .map_err(|error| {
+                self.cancellation.catalog_calls.lock().unwrap_or_else(|e| e.into_inner()).remove(&request_id);
+                if let Some(worker) = worker_owner.lock().unwrap_or_else(|e| e.into_inner()).worker.take() {
+                    self.pool.workers.insert(key.clone(), WorkerLifecycle::Live(worker));
+                }
                 self.pool.fail(&key, format!("catalog thread spawn failed: {error}"));
                 CatalogDispatchError::ThreadSpawn { plugin: plugin.clone(), reason: error.to_string() }
             })?;
-        self.catalog.insert(request_id, plugin.clone(), key, join);
+        self.catalog
+            .insert(request_id, plugin.clone(), key, join, worker_owner);
         publish_modern_commands(
             &self.catalog.commands,
             plugin.clone(),
@@ -2241,7 +2496,13 @@ impl ModernProvider {
                 let reply = crate::standard_view::with_cancellation(
                     queued,
                     || cancel.cancel(),
-                    || worker.structured_view_with_admission(request, |send| queued.deliver(send)),
+                    || {
+                        worker
+                            .structured_view_with_admission(request, |send| queued.deliver(send))
+                            .inspect_err(|error| {
+                                self.cancellation.observe_transport_error(true, worker, error)
+                            })
+                    },
                 )
                 .map_err(|_| crikey_core::CoreError::Invalid("standard view request failed".into()))?;
                 // Publication retires pending-request identity only after the
@@ -2277,6 +2538,9 @@ impl ModernProvider {
                                 Some(context),
                                 |send| queued.deliver(send),
                             )
+                            .inspect_err(|error| {
+                                self.cancellation.observe_transport_error(true, worker, error)
+                            })
                             .map_err(|_| {
                                 crikey_core::CoreError::Invalid("typed view execution failed".into())
                             })?;
@@ -2290,6 +2554,9 @@ impl ModernProvider {
                                 Some(context),
                                 |send| queued.deliver(send),
                             )
+                            .inspect_err(|error| {
+                                self.cancellation.observe_transport_error(true, worker, error)
+                            })
                             .map_err(|_| crikey_core::CoreError::Invalid("view execution failed".into()))?
                         {
                             ExecuteOutcome::Ok => Ok(crate::ActionEffect::Completed),
@@ -2520,6 +2787,7 @@ impl ModernProvider {
             let action = binding.executable.action.as_ref().map(|id| id.0.as_str());
             if !worker
                 .confirm_typed_schema(item, action, &binding.schema)
+                .inspect_err(|error| self.cancellation.observe_transport_error(true, worker, error))
                 .map_err(|_| {
                     crikey_core::CoreError::Invalid("typed modern schema confirmation failed".into())
                 })?
@@ -2572,13 +2840,19 @@ impl ModernProvider {
                                 && Instant::now() < request.deadline
                                 && send()
                         })
+                        .inspect_err(|error| cancellation.observe_transport_error(true, worker, error))
                         .map_err(|_| crikey_core::CoreError::Invalid("typed modern execution failed".into()))
                 }));
                 finished.store(true, Ordering::Release);
                 watcher.thread().unpark();
-                let _ = watcher.join();
+                cancellation
+                    .failed
+                    .fetch_or(watcher.join().is_err(), Ordering::AcqRel);
                 outcome
             });
+            if outcome.is_err() {
+                self.cancellation.failed.store(true, Ordering::Release);
+            }
             return match outcome {
                 Ok(Ok(outcome)) => Ok(crate::standard_view::typed_effect(outcome, physical_producer)),
                 Ok(Err(error)) => Err(error),
@@ -2593,25 +2867,28 @@ impl ModernProvider {
         // The current request flag/deadline are still checked by the writer gate.
         worker.cancel_handle().reset();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            worker.execute_with_admission(
-                item,
-                request.work.action_id().map(|id| id.0.as_str()),
-                request.argument.as_deref(),
-                None,
-                |send| {
-                    if request.cancelled.load(Ordering::Acquire) || Instant::now() >= request.deadline {
-                        return false;
-                    }
-                    if let crate::plugin_action::AdmittedPluginWork::Actionless { source } = &request.work {
-                        let root = self.catalog.root.lock().unwrap_or_else(|e| e.into_inner());
-                        self.cancellation.source_current(source)
-                            && root.actionless_item(&plugin, &item.stable_id, source).is_some()
-                            && send()
-                    } else {
-                        send()
-                    }
-                },
-            )
+            worker
+                .execute_with_admission(
+                    item,
+                    request.work.action_id().map(|id| id.0.as_str()),
+                    request.argument.as_deref(),
+                    None,
+                    |send| {
+                        if request.cancelled.load(Ordering::Acquire) || Instant::now() >= request.deadline {
+                            return false;
+                        }
+                        if let crate::plugin_action::AdmittedPluginWork::Actionless { source } = &request.work
+                        {
+                            let root = self.catalog.root.lock().unwrap_or_else(|e| e.into_inner());
+                            self.cancellation.source_current(source)
+                                && root.actionless_item(&plugin, &item.stable_id, source).is_some()
+                                && send()
+                        } else {
+                            send()
+                        }
+                    },
+                )
+                .inspect_err(|error| self.cancellation.observe_transport_error(true, worker, error))
         }));
         match outcome {
             Ok(Ok(ExecuteOutcome::Ok)) => Ok(crate::ActionEffect::Completed),
@@ -2636,6 +2913,7 @@ impl ModernProvider {
                 )))
             }
             Err(_) => {
+                self.cancellation.failed.store(true, Ordering::Release);
                 self.pool
                     .record_dispatch_failure(plugin.clone(), "modern action worker panicked".to_owned());
                 Err(crikey_core::CoreError::Invalid(format!(
@@ -2817,19 +3095,50 @@ impl ModernProvider {
 
     /// Cooperative teardown of every modern worker (spec 24.3).
     pub fn shutdown(&mut self, _now: Millis) {
+        let _ = self.shutdown_checked();
+    }
+
+    fn shutdown_checked(&mut self) -> Result<(), StopError> {
         self.cancellation.cancel_all();
         for result in self.catalog.shutdown(&mut self.pool) {
             if let CatalogBuildResult::Failed { plugin, reason, .. } = result {
                 self.pool.record_dispatch_failure(plugin, reason);
             }
         }
-        for (_, state) in std::mem::take(&mut self.pool.workers) {
-            // Best effort: the child is reaped on drop even if orderly shutdown
-            // reports an error, so no worker is leaked. A slot that never
-            // started or already failed owns no child to tear down.
-            if let WorkerLifecycle::Live(worker) = state {
-                let _ = worker.shutdown();
+        let mut failed = self.catalog.failed
+            || self.pool.teardown_failed
+            || self.cancellation.failed.load(Ordering::Acquire);
+        for state in self.pool.workers.values_mut() {
+            match state {
+                WorkerLifecycle::Live(worker) => failed |= worker.shutdown_checked().is_err(),
+                WorkerLifecycle::CatalogBusy => failed = true,
+                WorkerLifecycle::NeverStarted | WorkerLifecycle::Failed { .. } => {}
             }
+        }
+        for worker in self.pool.retired.values_mut() {
+            failed |= worker.shutdown_checked().is_err();
+        }
+        for worker in self
+            .cancellation
+            .startup_workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            failed |= worker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .shutdown_checked()
+                .is_err();
+        }
+        failed |= self
+            .icon_resolver
+            .as_ref()
+            .is_some_and(|resolver| resolver.shutdown().is_err());
+        if failed {
+            Err(StopError::new("modern-shutdown-failed"))
+        } else {
+            Ok(())
         }
     }
 
@@ -2965,12 +3274,19 @@ impl ModernProvider {
                     .spawn(move || control_for_thread.watch_cancel());
                 let started = Instant::now();
                 let answer = catch_unwind(AssertUnwindSafe(|| {
-                    worker.suggest_scoped(&request, scope.map(|scope| scope.id.0.as_str()))
+                    let was_live = worker.is_alive();
+                    worker
+                        .suggest_scoped(&request, scope.map(|scope| scope.id.0.as_str()))
+                        .inspect_err(|error| {
+                            self.cancellation.observe_transport_error(was_live, worker, error)
+                        })
                 }));
                 let elapsed = started.elapsed();
                 control.finish();
                 if let Ok(watcher) = watcher {
-                    let _ = watcher.join();
+                    self.cancellation
+                        .failed
+                        .fetch_or(watcher.join().is_err(), Ordering::AcqRel);
                 }
                 (answer, elapsed, worker.incarnation())
             };
@@ -2981,6 +3297,7 @@ impl ModernProvider {
             let answer = match answer {
                 Ok(answer) => answer,
                 Err(_) => {
+                    self.cancellation.failed.store(true, Ordering::Release);
                     dead_plugins.insert(plugin.clone());
                     let reason = "modern worker panicked".to_owned();
                     self.pool.fail(&key, reason.clone());
@@ -3198,6 +3515,9 @@ struct ModernActionEndpoint {
 
 impl ModernActionEndpoint {
     fn view_producer(&self, owner: &PluginId) -> Option<u64> {
+        if self.cancellation.admission.state() != crate::runtime_control::PluginAdmission::Open {
+            return None;
+        }
         self.incarnations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3220,6 +3540,7 @@ impl ModernActionEndpoint {
         }
         let request_id = crate::standard_view::enqueue(
             &self.sender,
+            &self.cancellation.admission,
             &self.gates,
             &self.pending,
             &self.in_flight,
@@ -3327,10 +3648,15 @@ impl ModernActionEndpoint {
             deadline: Instant::now() + Duration::from_millis(ACTION_TIMEOUT_MS),
             cancelled,
         };
-        if let Err(error) = self
-            .sender
-            .try_send(crate::standard_view::ForegroundRequest::Action(request))
-        {
+        let sent = match self.cancellation.admission.admit() {
+            Ok(_admission) => self
+                .sender
+                .try_send(crate::standard_view::ForegroundRequest::Action(request)),
+            Err(_) => Err(mpsc::TrySendError::Disconnected(
+                crate::standard_view::ForegroundRequest::Action(request),
+            )),
+        };
+        if let Err(error) = sent {
             self.pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3504,6 +3830,9 @@ impl crate::PluginActionExecutor for ModernActionEndpoint {
         state: &crikey_core::structured_view::HostViewState,
         url: &str,
     ) -> crikey_core::Result<()> {
+        if self.cancellation.admission.admit().is_err() {
+            return Err(crikey_core::CoreError::Cancelled);
+        }
         let producer = self
             .view_producer(owner)
             .ok_or_else(|| crikey_core::CoreError::Invalid("view producer unavailable".into()))?;
@@ -3533,6 +3862,9 @@ impl crate::PluginActionExecutor for ModernActionEndpoint {
     }
 
     fn root_scope_current(&self, scope: &RootScope) -> bool {
+        if self.cancellation.admission.state() != crate::runtime_control::PluginAdmission::Open {
+            return false;
+        }
         if !self.gates.contains_key(&scope.owner) || !scope_declared(&self.root, scope) {
             return false;
         }
@@ -3754,6 +4086,9 @@ impl crate::PluginActionExecutor for ModernActionEndpoint {
     }
 
     fn owns_item(&self, plugin: &PluginId, item_id: &ItemId) -> bool {
+        if self.cancellation.admission.state() != crate::runtime_control::PluginAdmission::Open {
+            return false;
+        }
         let key = (plugin.clone(), item_id.clone());
         self.items
             .lock()
@@ -3859,7 +4194,10 @@ pub struct ModernDriver {
     current: Arc<AtomicU64>,
     cancellation: Arc<ModernCancellation>,
     has_plugins: bool,
-    worker: Option<JoinHandle<()>>,
+    control: DriverControl,
+    worker_started: bool,
+    #[cfg(test)]
+    runtime_owner: Arc<Mutex<ModernProvider>>,
 }
 
 impl ModernDriver {
@@ -3868,13 +4206,23 @@ impl ModernDriver {
     ///
     /// `publish` runs on the supervisor thread with each merged frame. A thread
     /// that fails to spawn degrades to an inert driver rather than a panic:
-    /// `provider` is dropped, reaping every child, and
+    /// the canonical runtime remains owned for checked settlement, and
     /// [`has_plugins`](Self::has_plugins) reports false.
-    pub fn spawn<P>(mut provider: ModernProvider, mut pipeline: QueryPipeline, publish: P) -> Self
+    pub fn spawn<P>(provider: ModernProvider, mut pipeline: QueryPipeline, publish: P) -> Self
     where
         P: Fn(&ViewModel) + Send + 'static,
     {
         let permissions = provider.permissions();
+        let owners: Vec<PluginId> = provider
+            .plugins()
+            .iter()
+            .cloned()
+            .chain(provider.catalog_declarations.keys().cloned())
+            .chain(provider.unavailable.iter().filter_map(|item| item.plugin.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let admission = provider.cancellation.admission.clone();
         let query_policies = permissions
             .keys()
             .filter_map(|plugin| {
@@ -3934,15 +4282,19 @@ impl ModernDriver {
         let thread_action_wake = action_endpoint.action_wake.clone();
         let thread_views = Arc::clone(&action_endpoint.views);
         let thread_preview_endpoint = Arc::clone(&preview_endpoint);
+        let thread_failed = Arc::clone(&cancellation);
+        let runtime = Arc::new(Mutex::new(provider));
+        let thread_runtime = Arc::clone(&runtime);
         let spawned = std::thread::Builder::new()
             .name("crikey-modern".to_owned())
             .spawn(move || {
+                let mut runtime = thread_runtime.lock().unwrap_or_else(|e| e.into_inner());
+                let provider = &mut *runtime;
                 let (lock, cvar) = &*thread_mailbox;
-                let mut last_now: Millis = 0;
                 let mut deferred_preview: Option<ModernPreviewJob> = None;
                 loop {
                     let catalog_results = provider.take_catalog_results();
-                    thread_preview_endpoint.refresh_liveness(&mut provider);
+                    thread_preview_endpoint.refresh_liveness(provider);
                     {
                         let live = thread_preview_endpoint
                             .incarnations
@@ -4007,7 +4359,6 @@ impl ModernDriver {
                                     thread_preview_endpoint.complete(request, PreviewState::Cancelled);
                                 }
                                 drop(slot);
-                                provider.shutdown(last_now);
                                 return;
                             }
                             if let Ok(request) = action_receiver.try_recv() {
@@ -4063,12 +4414,13 @@ impl ModernDriver {
                                 provider.execute_view_request(&mut request)
                             }))
                             .unwrap_or_else(|_| {
+                                thread_failed.failed.store(true, Ordering::Release);
                                 Err(crikey_core::CoreError::Invalid(
                                     "standard view worker failed".into(),
                                 ))
                             });
                             let result = request.finish(result);
-                            thread_preview_endpoint.refresh_liveness(&mut provider);
+                            thread_preview_endpoint.refresh_liveness(provider);
                             enqueue_modern_completion(
                                 &thread_completion_mailbox,
                                 &thread_action_wake,
@@ -4078,7 +4430,7 @@ impl ModernDriver {
                         }
                         ModernWork::Refresh => continue,
                         ModernWork::Preview(request) => {
-                            thread_preview_endpoint.execute(&mut provider, request);
+                            thread_preview_endpoint.execute(provider, request);
                             continue;
                         }
                         ModernWork::Action(request) => {
@@ -4100,10 +4452,12 @@ impl ModernDriver {
                                     provider.execute_action_request(*request)
                                 })) {
                                     Ok(result) => result,
-                                    Err(_) => Err(crikey_core::CoreError::Invalid(format!(
-                                        "modern plugin `{}` action worker panicked",
-                                        plugin.0
-                                    ))),
+                                    Err(_) => {
+                                        thread_failed.failed.store(true, Ordering::Release);
+                                        Err(crikey_core::CoreError::Invalid(
+                                            "modern action worker failed".into(),
+                                        ))
+                                    }
                                 }
                             };
                             let result = if cancelled.load(Ordering::Acquire) {
@@ -4123,7 +4477,7 @@ impl ModernDriver {
                                 action_id,
                                 outcome: result,
                             };
-                            thread_preview_endpoint.refresh_liveness(&mut provider);
+                            thread_preview_endpoint.refresh_liveness(provider);
                             enqueue_modern_completion(
                                 &thread_completion_mailbox,
                                 &thread_action_wake,
@@ -4144,7 +4498,6 @@ impl ModernDriver {
                         }
                         ModernWork::Query(job) => job,
                     };
-                    last_now = job.now;
                     // Tell the provider which admitted query it is serving, so
                     // a lazy plugin's blocking startup can abandon an obsolete
                     // target list instead of walking the whole chain.
@@ -4154,7 +4507,7 @@ impl ModernDriver {
                     // thread — never on the caller's. Stale answers are refused
                     // at the pipeline's intake boundary inside `drive_query`.
                     let modern = provider.drive_query_admitted(&mut pipeline, &job.query, job.now, job.scope);
-                    thread_preview_endpoint.refresh_liveness(&mut provider);
+                    thread_preview_endpoint.refresh_liveness(provider);
                     *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
                         pipeline.plugin_health_report();
 
@@ -4209,40 +4562,78 @@ impl ModernDriver {
                 }
             });
 
-        match spawned {
-            Ok(worker) => Self {
-                mailbox,
-                action_endpoint,
-                preview_endpoint,
-                permissions,
-                catalog_results,
-                commands,
-                health,
-                outcome,
-                search_summary,
-                query_policies,
-                current,
-                cancellation,
-                has_plugins,
-                worker: Some(worker),
+        let worker_started = spawned.is_ok();
+        let signal_mailbox = Arc::clone(&mailbox);
+        let signal_preview = Arc::clone(&preview_endpoint);
+        let signal_actions = Arc::clone(&action_endpoint);
+        let signal_cancellation = Arc::clone(&cancellation);
+        let signal_runtime = Arc::clone(&runtime);
+        #[cfg(test)]
+        let test_runtime = Arc::clone(&runtime);
+        let owners: Arc<[PluginId]> = owners.into();
+        let control = DriverControl::new(
+            "modern",
+            Arc::clone(&owners),
+            admission,
+            move || {
+                let _retained_runtime = &signal_runtime;
+                signal_preview.shutdown();
+                for token in signal_actions
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                {
+                    token.store(true, Ordering::Release);
+                }
+                signal_cancellation.cancel_all();
+                let mut slot = signal_mailbox.0.lock().unwrap_or_else(|e| e.into_inner());
+                slot.stop = true;
+                slot.job = None;
+                slot.configuration = None;
+                drop(slot);
+                signal_mailbox.1.notify_all();
             },
-            Err(_) => Self {
-                mailbox,
-                action_endpoint,
-                preview_endpoint,
-                permissions,
-                catalog_results,
-                commands,
-                health,
-                outcome,
-                search_summary,
-                query_policies,
-                current,
-                cancellation,
-                has_plugins: false,
-                worker: None,
+            move |epoch| {
+                let result = match spawned {
+                    Ok(worker) => worker
+                        .join()
+                        .map_err(|_| StopError::new("modern-supervisor-panicked")),
+                    Err(_) => Err(StopError::new("modern-supervisor-spawn-failed")),
+                };
+                let physical = runtime
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .shutdown_checked();
+                result?;
+                physical?;
+                Ok(StoppedRuntime::validated("modern", epoch, owners.to_vec()))
             },
+        );
+        Self {
+            mailbox,
+            action_endpoint,
+            preview_endpoint,
+            permissions,
+            catalog_results,
+            commands,
+            health,
+            outcome,
+            search_summary,
+            query_policies,
+            current,
+            cancellation,
+            has_plugins: has_plugins && worker_started,
+            control,
+            worker_started,
+            #[cfg(test)]
+            runtime_owner: test_runtime,
         }
+    }
+
+    /// Permanent admission fence and checked physical settlement.
+    pub fn control(&self) -> DriverControl {
+        self.control.clone()
     }
 
     /// Installs the terminal action notification independently of result and preview wakes.
@@ -4304,6 +4695,8 @@ impl ModernDriver {
         builtin_pending: bool,
         scope: Option<RootScope>,
     ) -> crikey_core::Result<()> {
+        let admission = self.control.admission();
+        // Acquire the fence only at bounded mailbox insertion, after source locks.
         let ProviderQueryContext {
             generation,
             text: query,
@@ -4366,7 +4759,8 @@ impl ModernDriver {
                 .suggestion_intake
                 .store(intake, Ordering::Release);
         }
-        let state = if self.worker.is_some() {
+        let _admission = admission.admit().map_err(|_| crikey_core::CoreError::Cancelled)?;
+        let state = if self.worker_started {
             crate::command_preferences::OrdinaryProviderState::Pending
         } else {
             crate::command_preferences::OrdinaryProviderState::Failed
@@ -4414,11 +4808,15 @@ impl ModernDriver {
     /// coalescing rule the host applied upstream, enforced again here because the
     /// two are separated by a thread boundary.
     pub fn publish_configuration(&self, configuration: crate::PluginConfiguration) {
+        let admission = self.control.admission();
         let (lock, cvar) = &*self.mailbox;
         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
         if slot.stop {
             return;
         }
+        let Ok(_admission) = admission.admit() else {
+            return;
+        };
         slot.configuration = Some(Box::new(configuration));
         drop(slot);
         cvar.notify_one();
@@ -4524,21 +4922,15 @@ impl ModernDriver {
 }
 impl Drop for ModernDriver {
     fn drop(&mut self) {
-        self.preview_endpoint.shutdown();
-        // Cancel any callback before signalling shutdown, so a cooperative
-        // child can return and let the supervisor join promptly.
-        self.cancellation.cancel_all();
-        // Signal shutdown and join, so the supervisor thread and every child it
-        // owns are torn down with the launcher — no thread leak.
-        {
-            let (lock, cvar) = &*self.mailbox;
-            let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
-            slot.stop = true;
-            drop(slot);
-            cvar.notify_one();
-        }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        let gate = self.control.admission();
+        let epoch = match gate.state() {
+            crate::runtime_control::PluginAdmission::Open => std::num::NonZeroU64::MIN,
+            crate::runtime_control::PluginAdmission::Closing { epoch }
+            | crate::runtime_control::PluginAdmission::Offline { epoch }
+            | crate::runtime_control::PluginAdmission::FailedClosed { epoch } => epoch,
+        };
+        if let Ok(ticket) = self.control.request_stop(epoch) {
+            let _ = ticket.wait();
         }
     }
 }
@@ -4569,6 +4961,7 @@ mod preview_origin_tests {
         let (sender, _receiver) = mpsc::sync_channel(2);
         let endpoint = ModernPreviewEndpoint {
             sender,
+            admission: AdmissionGate::default(),
             gates: BTreeMap::new(),
             action_in_flight: Arc::default(),
             catalog_items: Arc::new(Mutex::new(BTreeMap::new())),
@@ -4646,6 +5039,7 @@ mod preview_origin_tests {
         let (sender, receiver) = mpsc::sync_channel(2);
         let endpoint = ModernPreviewEndpoint {
             sender,
+            admission: AdmissionGate::default(),
             gates: BTreeMap::new(),
             action_in_flight: Arc::default(),
             incarnations: Arc::new(Mutex::new(BTreeMap::from([(plugin.clone(), 7)]))),
@@ -4821,6 +5215,514 @@ mod preview_origin_tests {
             assert!(Instant::now() < deadline, "real producer did not complete");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn graceful_root_settles_redirected_descendant_and_retains_unfinished_reader() {
+        const CHILD_MODE: &str = "CRIKEY_MODERN_TREE_TEST_HELPER";
+        if std::env::var_os(CHILD_MODE).is_none() {
+            let module = module_path!().split_once("::").unwrap().1;
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(format!(
+                    "{module}::graceful_root_settles_redirected_descendant_and_retains_unfinished_reader"
+                ))
+                .env(CHILD_MODE, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        // This single-test subprocess owns and reaps only its known adopted
+        // fixture descendants; the shared test runner is never a subreaper.
+        unsafe extern "C" {
+            fn prctl(option: i32, ...) -> i32;
+            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        assert_eq!(unsafe { prctl(36, 1i32, 0i32, 0i32, 0i32) }, 0);
+        for escaped_pipe in [false, true] {
+            let source = format!(
+                r#"
+import os, pathlib, time
+from crikey_sdk import Item, Plugin, Preview
+class TreeFixture(Plugin):
+    def build_catalog(self):
+        root = pathlib.Path(__file__).parent
+        root.joinpath("root-pid").write_text(str(os.getpid()))
+        child = os.fork()
+        if child == 0:
+            if {escaped}:
+                os.setsid()
+            else:
+                null = os.open(os.devnull, os.O_RDWR)
+                for fd in (0, 1, 2):
+                    os.dup2(null, fd)
+                os.close(null)
+            root.joinpath("child-pid").write_text(str(os.getpid()))
+            while True:
+                time.sleep(1)
+        return [Item("row", "Row", "row", preview_deferred=True)]
+    def preview(self, item, context):
+        return Preview(text="row")
+"#,
+                escaped = if escaped_pipe { "True" } else { "False" }
+            );
+            let (fixture, mut provider, pipeline) = Fixture::load_source("TreeFixture", &source);
+            assert!(matches!(
+                Fixture::catalog(&mut provider),
+                CatalogBuildResult::Complete(_)
+            ));
+            let key = provider.loaded[0].key.clone();
+            let producer = provider.pool.live_mut(&key).unwrap().incarnation();
+            let root = fixture.root.join("plugins/fixture");
+            wait_for(|| {
+                fs::read_to_string(root.join("child-pid")).is_ok_and(|pid| pid.parse::<i32>().is_ok())
+            });
+            let descendant: i32 = fs::read_to_string(root.join("child-pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let root_pid: String = fs::read_to_string(root.join("root-pid")).unwrap();
+            let reap = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let mut status = 0;
+                    if unsafe { waitpid(descendant, &mut status, 1) } == descendant {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "known descendant was not reaped");
+                    thread::sleep(Duration::from_millis(2));
+                }
+            });
+            let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+            let control = driver.control();
+            let epoch = std::num::NonZeroU64::new(47).unwrap();
+            let result = control.request_stop(epoch).unwrap().wait();
+            assert!(!Path::new("/proc").join(root_pid).exists());
+            if escaped_pipe {
+                assert!(result.is_err(), "an unfinished reader cannot support a proof");
+                {
+                    let mut runtime = driver.runtime_owner.lock().unwrap();
+                    let retained = runtime
+                        .pool
+                        .live_mut(&key)
+                        .expect("failed worker remains canonically owned");
+                    assert_eq!(retained.incarnation(), producer);
+                    assert!(retained.shutdown_checked().is_err());
+                }
+                assert_eq!(unsafe { kill(descendant, 9) }, 0);
+            } else {
+                result.unwrap();
+            }
+            reap.join().unwrap();
+            assert!(!Path::new("/proc").join(descendant.to_string()).exists());
+            if escaped_pipe {
+                // The same owner can physically join the now-finished pipes,
+                // but the original epoch remains permanently FailedClosed.
+                let mut runtime = driver.runtime_owner.lock().unwrap();
+                let _ = runtime.pool.live_mut(&key).unwrap().shutdown_checked();
+                assert!(control.request_stop(epoch).unwrap().wait().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn global_stop_before_lazy_process_insertion_is_clean_cancellation() {
+        use std::num::NonZeroU64;
+        let (fixture, provider, pipeline) = Fixture::load_source(
+            "StopLazy",
+            r#"
+import pathlib
+from crikey_sdk import Plugin
+pathlib.Path(__file__).with_name("child-created").touch()
+class StopLazy(Plugin):
+    def suggest(self, query, context):
+        return None
+"#,
+        );
+        assert!(provider
+            .pool
+            .workers
+            .values()
+            .all(|slot| matches!(slot, WorkerLifecycle::NeverStarted)));
+        let (entered, started) = mpsc::sync_channel(1);
+        let (resume, resumed) = mpsc::sync_channel(1);
+        *provider.cancellation.spawn_pause.lock().unwrap() = Some((entered, resumed));
+        let owner = provider.loaded[0].plugin.clone();
+        let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+        driver.submit(Generation::ZERO, "lazy", 0, Vec::new(), false, 0);
+        started.recv_timeout(Duration::from_secs(30)).unwrap();
+        let ticket = driver
+            .control()
+            .request_stop(NonZeroU64::new(37).unwrap())
+            .unwrap();
+        resume.send(()).unwrap();
+        let proof = thread::spawn(move || ticket.wait()).join().unwrap().unwrap();
+        assert_eq!(proof.owners(), &[owner]);
+        assert!(!driver.cancellation.failed.load(Ordering::Acquire));
+        assert!(!fixture.root.join("plugins/fixture/child-created").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lost_real_callback_terminal_during_stop_fails_closed_but_settled_history_does_not() {
+        use std::num::NonZeroU64;
+        for during_stop in [false, true] {
+            let (fixture, provider, pipeline) = Fixture::load_source(
+                "StopCrash",
+                r#"
+import os, pathlib, time
+from crikey_sdk import Plugin
+class StopCrash(Plugin):
+    def suggest(self, query, context):
+        pathlib.Path(__file__).with_name("started").write_text(str(os.getpid()))
+        deadline = time.monotonic() + 5
+        while not pathlib.Path(__file__).with_name("release").exists():
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.002)
+        os._exit(19)
+"#,
+            );
+            let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+            driver.submit(Generation::ZERO, "crash", 0, Vec::new(), false, 0);
+            let root = fixture.root.join("plugins/fixture");
+            let marker = root.join("started");
+            wait_for(|| fs::read_to_string(&marker).is_ok_and(|pid| pid.parse::<u32>().is_ok()));
+            let pid = fs::read_to_string(marker).unwrap();
+            if !during_stop {
+                fs::write(root.join("release"), "").unwrap();
+                wait_for(|| driver.cancellation.calls.lock().unwrap().is_empty());
+                // Unregistration precedes checked pool retirement; the supervisor
+                // publishes its outcome only after that physical cleanup.
+                wait_for(|| driver.take_outcome().is_some());
+            }
+            let control = driver.control();
+            let epoch = NonZeroU64::new(41).unwrap();
+            let ticket = control.request_stop(epoch).unwrap();
+            if during_stop {
+                fs::write(root.join("release"), "").unwrap();
+            }
+            let result = thread::spawn(move || ticket.wait()).join().unwrap();
+            assert!(!Path::new("/proc").join(pid).exists());
+            if during_stop {
+                assert!(result.is_err());
+                assert_eq!(
+                    result.unwrap_err(),
+                    control.request_stop(epoch).unwrap().wait().unwrap_err()
+                );
+                assert!(matches!(control.admission().state(),
+                    crate::runtime_control::PluginAdmission::FailedClosed { epoch: failed } if failed == epoch));
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn global_stop_holds_real_view_slot_until_physical_callback_terminal() {
+        use std::num::NonZeroU64;
+        let source = format!(
+            "{}\n{}",
+            include_str!("../../../compatibility/test-plugins/modern-views/views_plugin.py"),
+            r#"
+class StopViews(ViewsPlugin):
+    async def structured_view(self, request, context):
+        import time
+        Path(__file__).with_name("started").write_text(str(os.getpid()))
+        deadline = time.monotonic() + 5
+        while not Path(__file__).with_name("release").exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("view release barrier expired")
+            time.sleep(0.002)
+        return await super().structured_view(request, context)
+"#
+        );
+        let (fixture, mut provider, pipeline) = Fixture::load_source("StopViews", &source);
+        let owner = provider.loaded[0].plugin.clone();
+        let key = provider.loaded[0].key.clone();
+        let budget = Arc::clone(&provider.loaded[0].budget);
+        provider.ensure_worker(&owner, &key).unwrap();
+        let producer = provider.pool.live_mut(&key).unwrap().incarnation();
+        let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+        let endpoint = driver.action_executor();
+        let request = endpoint
+            .request_view(
+                &owner,
+                producer,
+                crikey_core::structured_view::ViewRequest {
+                    mode: crikey_core::structured_view::ViewRequestMode::Open,
+                    route: crikey_core::structured_view::RouteId("gallery".into()),
+                    session: crikey_core::structured_view::ViewSessionIdentity {
+                        logical_view: NonZeroU64::MIN,
+                        surface: NonZeroU64::MIN,
+                    },
+                    previous_revision: None,
+                    state: None,
+                    query: String::new(),
+                    scroll: None,
+                    reason: crikey_core::structured_view::ViewRefreshReason::Explicit,
+                },
+            )
+            .unwrap();
+        let marker = fixture.root.join("plugins/fixture/started");
+        wait_for(|| fs::read_to_string(&marker).is_ok_and(|pid| pid.parse::<u32>().is_ok()));
+        let pid = fs::read_to_string(marker).unwrap();
+        let ticket = driver
+            .control()
+            .request_stop(NonZeroU64::new(29).unwrap())
+            .unwrap();
+        assert!(
+            budget.try_acquire_owned(BudgetKind::Action).is_none(),
+            "logical cancellation released a physical view slot"
+        );
+        let wait = thread::spawn(move || ticket.wait());
+        assert!(!wait.is_finished(), "view callback has not physically returned");
+        fs::write(fixture.root.join("plugins/fixture/release"), "").unwrap();
+        wait.join().unwrap().unwrap();
+        assert!(!Path::new("/proc").join(pid).exists());
+        let completions = endpoint.poll_plugin_actions();
+        assert!(completions.iter().any(|result| result.request_id == request
+            && matches!(result.outcome, Err(crikey_core::CoreError::Cancelled))));
+        assert!(budget.try_acquire_owned(BudgetKind::Action).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn global_stop_holds_real_preview_slot_until_physical_callback_terminal() {
+        use std::num::NonZeroU64;
+        let source = format!(
+            "{}\n{}",
+            include_str!("../../../compatibility/test-plugins/modern-preview/preview_plugin.py"),
+            r#"
+class StopPreview(PreviewPlugin):
+    async def preview(self, item, context):
+        import pathlib, time
+        pathlib.Path(__file__).with_name("started").write_text(str(os.getpid()))
+        deadline = time.monotonic() + 5
+        while not pathlib.Path(__file__).with_name("release").exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("preview release barrier expired")
+            time.sleep(0.002)
+        return Preview(text="terminal")
+"#
+        );
+        let (fixture, mut provider, pipeline) = Fixture::load_source("StopPreview", &source);
+        let CatalogBuildResult::Complete(build) = Fixture::catalog(&mut provider) else {
+            panic!("real catalog must complete");
+        };
+        let item = build.items[0].stable_id.clone();
+        let owner = provider.loaded[0].plugin.clone();
+        let key = provider.loaded[0].key.clone();
+        let budget = Arc::clone(&provider.loaded[0].budget);
+        let producer = provider.pool.live_mut(&key).unwrap().incarnation();
+        let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+        let endpoint = driver.preview_dispatcher();
+        let (updates, terminal) = mpsc::sync_channel(1);
+        endpoint
+            .submit(
+                PreviewRequest {
+                    identity: PreviewIdentity {
+                        target: crikey_ui::ActionTarget::Result {
+                            owner: owner.clone(),
+                            item: item.clone(),
+                        },
+                        catalog_source: None,
+                        view: 1,
+                        query: Generation::ZERO,
+                        plugin: owner,
+                        incarnation: producer,
+                        item,
+                        selection: 1,
+                        request: 1,
+                    },
+                },
+                Arc::new(move |update| {
+                    updates.send(update).unwrap();
+                }),
+            )
+            .unwrap();
+        let marker = fixture.root.join("plugins/fixture/started");
+        wait_for(|| fs::read_to_string(&marker).is_ok_and(|pid| pid.parse::<u32>().is_ok()));
+        let pid = fs::read_to_string(marker).unwrap();
+        let ticket = driver
+            .control()
+            .request_stop(NonZeroU64::new(31).unwrap())
+            .unwrap();
+        assert!(
+            budget.try_acquire_owned(BudgetKind::Action).is_none(),
+            "logical cancellation released a physical preview slot"
+        );
+        let wait = thread::spawn(move || ticket.wait());
+        assert!(!wait.is_finished());
+        fs::write(fixture.root.join("plugins/fixture/release"), "").unwrap();
+        wait.join().unwrap().unwrap();
+        assert!(matches!(terminal.recv().unwrap().state, PreviewState::Cancelled));
+        assert!(!Path::new("/proc").join(pid).exists());
+        assert!(budget.try_acquire_owned(BudgetKind::Action).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn global_stop_joins_real_catalog_busy_owner_and_reuses_exact_terminal() {
+        use std::num::NonZeroU64;
+        for keep_preview in [false, true] {
+            let source = format!(
+                r#"
+import os, pathlib, time
+from crikey_sdk import Item, Plugin, Preview
+class StopFixture(Plugin):
+    def build_catalog(self):
+        pathlib.Path(__file__).with_name("started").write_text(str(os.getpid()))
+        time.sleep(0.2)
+        return [Item(stable_id="row", label="Row", target="row", preview_deferred={})]
+    def preview(self, item, context):
+        return Preview(text="row")
+"#,
+                if keep_preview { "True" } else { "False" }
+            );
+            let (fixture, mut provider, pipeline) = Fixture::load_source("StopFixture", &source);
+            let owner = provider.loaded[0].plugin.clone();
+            let key = provider.loaded[0].key.clone();
+            provider
+                .request_catalog_build(&owner, 1, Generation::ZERO)
+                .unwrap();
+            assert!(matches!(
+                provider.pool.workers.get(&key),
+                Some(WorkerLifecycle::CatalogBusy)
+            ));
+            let marker = fixture.root.join("plugins/fixture/started");
+            wait_for(|| fs::read_to_string(&marker).is_ok_and(|pid| pid.parse::<u32>().is_ok()));
+            let pid = fs::read_to_string(&marker).unwrap();
+            assert!(Path::new("/proc").join(&pid).exists());
+            let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+            let endpoint = driver.action_executor();
+            let control = driver.control();
+            let epoch = NonZeroU64::new(17).unwrap();
+            let first = control.request_stop(epoch).unwrap();
+            let repeated = control.request_stop(epoch).unwrap();
+            let proof = thread::spawn(move || first.wait()).join().unwrap().unwrap();
+            let again = repeated.wait().unwrap();
+            assert_eq!(proof.runtime(), "modern");
+            assert_eq!(proof.epoch(), again.epoch());
+            assert_eq!(proof.owners(), &[owner.clone()]);
+            assert_eq!(proof.owners(), again.owners());
+            assert!(
+                !Path::new("/proc").join(pid).exists(),
+                "receipt preceded child exit"
+            );
+            assert!(control.request_stop(NonZeroU64::new(18).unwrap()).is_err());
+            assert!(endpoint
+                .request_view(
+                    &owner,
+                    1,
+                    crikey_core::structured_view::ViewRequest {
+                        mode: crikey_core::structured_view::ViewRequestMode::Open,
+                        route: crikey_core::structured_view::RouteId("retained".into()),
+                        session: crikey_core::structured_view::ViewSessionIdentity {
+                            logical_view: NonZeroU64::MIN,
+                            surface: NonZeroU64::MIN,
+                        },
+                        previous_revision: None,
+                        state: None,
+                        query: String::new(),
+                        scroll: None,
+                        reason: crikey_core::structured_view::ViewRefreshReason::Explicit,
+                    }
+                )
+                .is_err());
+            assert!(driver
+                .submit_scoped(
+                    ProviderQueryContext {
+                        generation: Generation::ZERO,
+                        text: "retained",
+                        now: 0,
+                        selected: 0,
+                    },
+                    Vec::new(),
+                    false,
+                    None
+                )
+                .is_err());
+            assert!(driver.preview_endpoint.incarnation(&owner).is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn global_stop_fences_concurrent_queries_and_waits_for_real_callback_exit() {
+        use std::num::NonZeroU64;
+        let (fixture, provider, pipeline) = Fixture::load_source(
+            "StopFixture",
+            r#"
+import os, pathlib, time
+from crikey_sdk import Item, Plugin
+class StopFixture(Plugin):
+    def suggest(self, query, context):
+        pathlib.Path(__file__).with_name("started").write_text(str(os.getpid()))
+        time.sleep(0.2)
+        context.emit(Item(stable_id="row", label="Row", target="row"))
+"#,
+        );
+        let owner = provider.loaded[0].plugin.clone();
+        let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+        driver.submit(Generation::ZERO, "start", 0, Vec::new(), false, 0);
+        let marker = fixture.root.join("plugins/fixture/started");
+        wait_for(|| fs::read_to_string(&marker).is_ok_and(|pid| pid.parse::<u32>().is_ok()));
+        let pid = fs::read_to_string(marker).unwrap();
+        let control = driver.control();
+        thread::scope(|scope| {
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let enqueue_barrier = Arc::clone(&barrier);
+            let driver = &driver;
+            let enqueue = scope.spawn(move || {
+                enqueue_barrier.wait();
+                for _ in 0..64 {
+                    let _ = driver.submit_scoped(
+                        ProviderQueryContext {
+                            generation: Generation::ZERO,
+                            text: "racing",
+                            now: 0,
+                            selected: 0,
+                        },
+                        Vec::new(),
+                        false,
+                        None,
+                    );
+                }
+            });
+            let configuration_barrier = Arc::clone(&barrier);
+            let configuration = scope.spawn(move || {
+                configuration_barrier.wait();
+                for _ in 0..64 {
+                    driver.publish_configuration(crate::PluginConfiguration::default());
+                }
+            });
+            barrier.wait();
+            let ticket = control.request_stop(NonZeroU64::new(23).unwrap()).unwrap();
+            enqueue.join().unwrap();
+            configuration.join().unwrap();
+            let proof = scope.spawn(move || ticket.wait()).join().unwrap().unwrap();
+            assert_eq!(proof.owners(), &[owner]);
+        });
+        assert!(!Path::new("/proc").join(pid).exists());
+        assert!(driver
+            .submit_scoped(
+                ProviderQueryContext {
+                    generation: Generation::ZERO,
+                    text: "closed",
+                    now: 0,
+                    selected: 0,
+                },
+                Vec::new(),
+                false,
+                None
+            )
+            .is_err());
     }
 
     #[test]
@@ -5553,9 +6455,11 @@ mod query_history_receipt_tests {
             let pending = Mutex::new(BTreeMap::new());
             let in_flight = AtomicUsize::new(0);
             let next_id = AtomicU64::new(0);
+            let admission_gate = provider.cancellation.admission.clone();
             let enqueue = |request| {
                 crate::standard_view::enqueue::<ModernActionRequest>(
                     &sender,
+                    &admission_gate,
                     &gates,
                     &pending,
                     &in_flight,
@@ -6405,5 +7309,12 @@ class Typed(Plugin):
         assert_eq!(retained.executable, sibling_binding.executable);
         assert_eq!(retained.source, sibling_binding.source);
         assert_eq!(retained.fingerprint, sibling_binding.fingerprint);
+    }
+}
+
+impl Drop for ModernProvider {
+    fn drop(&mut self) {
+        // In particular, a supervisor panic must not detach CatalogBusy owners.
+        let _ = catch_unwind(AssertUnwindSafe(|| self.shutdown_checked()));
     }
 }

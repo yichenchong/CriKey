@@ -1,6 +1,7 @@
 //! Native worker restart and circuit supervision (spec 13.7, 24.1-24.4).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crikey_core::PluginId;
@@ -10,7 +11,7 @@ use crikey_plugin_supervisor::{
 };
 
 use crate::launch::{LaunchSpec, WorkerOptions};
-use crate::worker::{ExitKind, ExitRecord, HostError, NativeWorker};
+use crate::worker::{ExitKind, ExitRecord, HostError, NativeStartupOwner, NativeWorker};
 
 /// Restart policy and circuit-breaker configuration.
 #[derive(Debug, Clone)]
@@ -42,10 +43,47 @@ struct Registration {
     spec: LaunchSpec,
     options: WorkerOptions,
     worker: Option<NativeWorker>,
+    startup: Option<NativeStartupOwner>,
     exits: Vec<ExitRecord>,
+    /// Last already-validated release; retired generations need no live owner.
+    retired: Option<ExitRecord>,
     restarts: u32,
     failure_times: VecDeque<u64>,
     last_failure_at: Option<u64>,
+}
+
+/// One-way process-start revocation without taking a busy supervisor lock.
+#[derive(Debug, Clone, Default)]
+pub struct NativeAdmission(Arc<Mutex<DispatchState>>);
+#[derive(Debug, Default)]
+struct DispatchState {
+    closed: bool,
+    committed: usize,
+}
+pub(crate) struct NativeDispatch(NativeAdmission);
+impl NativeAdmission {
+    pub fn close(&self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+    }
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).closed
+    }
+    pub(crate) fn commit(&self, callback: bool) -> Option<NativeDispatch> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if callback && state.closed {
+            return None;
+        }
+        state.committed = state.committed.checked_add(1)?;
+        Some(NativeDispatch(self.clone()))
+    }
+    fn committed(&self) -> usize {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).committed
+    }
+}
+impl Drop for NativeDispatch {
+    fn drop(&mut self) {
+        self.0 .0.lock().unwrap_or_else(|e| e.into_inner()).committed -= 1;
+    }
 }
 
 /// Lazily-started native workers with deterministic caller-supplied time.
@@ -55,6 +93,9 @@ pub struct NativeSupervisor {
     memory: MemorySupervisor,
     registrations: BTreeMap<PluginId, Registration>,
     closed: bool,
+    cleanup_failed: bool,
+    settling: bool,
+    admission: NativeAdmission,
 }
 
 impl NativeSupervisor {
@@ -64,11 +105,14 @@ impl NativeSupervisor {
             config,
             registrations: BTreeMap::new(),
             closed: false,
+            cleanup_failed: false,
+            settling: false,
+            admission: NativeAdmission::default(),
         }
     }
 
     pub fn register(&mut self, spec: LaunchSpec, options: WorkerOptions) -> Result<(), HostError> {
-        if self.closed {
+        if self.closed || self.admission.is_closed() {
             return Err(HostError::Closed);
         }
         let plugin = spec.plugin.clone();
@@ -90,7 +134,9 @@ impl NativeSupervisor {
                 spec,
                 options,
                 worker: None,
+                startup: None,
                 exits: Vec::new(),
+                retired: None,
                 restarts: 0,
                 failure_times: VecDeque::new(),
                 last_failure_at: None,
@@ -106,6 +152,7 @@ impl NativeSupervisor {
     /// cleanup; UI readers should consume their published snapshot instead.
     pub fn poll_live_connection(&mut self, plugin: &PluginId) -> Option<u64> {
         if self.closed
+            || self.admission.is_closed()
             || self
                 .memory
                 .snapshot(plugin)
@@ -120,6 +167,7 @@ impl NativeSupervisor {
     /// Observes the actual process without starting or replacing a worker.
     pub fn poll_live_incarnation(&mut self, plugin: &PluginId) -> Option<u64> {
         if self.closed
+            || self.admission.is_closed()
             || self
                 .memory
                 .snapshot(plugin)
@@ -137,6 +185,7 @@ impl NativeSupervisor {
     /// Caller retains the supervisor lock for the complete operation.
     pub fn live_worker(&mut self, plugin: &PluginId) -> Option<&mut NativeWorker> {
         if self.closed
+            || self.admission.is_closed()
             || self
                 .memory
                 .snapshot(plugin)
@@ -153,7 +202,7 @@ impl NativeSupervisor {
     }
 
     pub fn worker(&mut self, plugin: &PluginId, now_ms: u64) -> Result<&mut NativeWorker, HostError> {
-        if self.closed {
+        if self.closed || self.admission.is_closed() {
             return Err(HostError::Closed);
         }
         if !self.registrations.contains_key(plugin) {
@@ -161,6 +210,13 @@ impl NativeSupervisor {
                 plugin: plugin.clone(),
                 detail: "plugin is not registered".to_owned(),
             });
+        }
+        {
+            let registration = self.registrations.get_mut(plugin).expect("checked above");
+            if let Some(startup) = registration.startup.as_mut() {
+                registration.retired = Some(startup.settle()?);
+                registration.startup.take();
+            }
         }
         if self
             .memory
@@ -183,12 +239,12 @@ impl NativeSupervisor {
             if alive {
                 (true, None, call_failure, call_success)
             } else {
-                (
-                    false,
-                    registration.worker.take().map(NativeWorker::shutdown),
-                    call_failure,
-                    call_success,
-                )
+                let exit = match registration.worker.as_mut() {
+                    Some(worker) => Some(worker.shutdown_checked()?),
+                    None => None,
+                };
+                registration.worker.take();
+                (false, exit, call_failure, call_success)
             }
         };
 
@@ -224,11 +280,18 @@ impl NativeSupervisor {
                 let registration = self.registrations.get(plugin).expect("checked above");
                 (registration.spec.clone(), registration.options.clone())
             };
-            let replacement = match NativeWorker::spawn(spec, options) {
+            let registration = self.registrations.get_mut(plugin).expect("checked above");
+            let replacement = match NativeWorker::spawn_with_admission(
+                spec,
+                options,
+                self.admission.clone(),
+                &mut registration.startup,
+            ) {
                 Ok(worker) => worker,
                 Err(error) => {
                     let registration = self.registrations.get_mut(plugin).expect("checked above");
                     registration.restarts = registration.restarts.saturating_add(1);
+                    self.cleanup_failed |= self.admission.is_closed() && registration.startup.is_some();
                     let failure = failure_kind_for_error(&error);
                     let _ = self.record_failure(plugin, failure, now_ms);
                     return Err(error);
@@ -291,7 +354,7 @@ impl NativeSupervisor {
         }
     }
 
-    /// Gracefully releases a child while preserving its registration and all
+    /// Releases a child with checked settlement, preserving its registration and
     /// prior failure, restart, and backoff accounting. Pending worker failures
     /// are recorded once at the caller's policy time before releasing the child.
     /// A later `worker` call may start a new child subject to that policy.
@@ -299,20 +362,38 @@ impl NativeSupervisor {
     ///
     /// Shutdown may block: call only from a background operation, never the UI.
     pub fn release_worker(&mut self, plugin: &PluginId, now_ms: u64) {
-        if let Some(mut worker) = self
-            .registrations
-            .get_mut(plugin)
-            .and_then(|registration| registration.worker.take())
-        {
+        let (alive, failure, outcome) = {
+            let Some(registration) = self.registrations.get_mut(plugin) else {
+                return;
+            };
+            let Some(worker) = registration.worker.as_mut() else {
+                return;
+            };
             let alive = worker.is_alive();
             let failure = worker.take_failure_kind();
-            let exit = worker.shutdown();
+            let outcome = worker.shutdown_checked();
+            if outcome.is_ok() {
+                registration.worker.take();
+            }
+            (alive, failure, outcome)
+        };
+        if let Ok(exit) = outcome {
             if !alive {
                 self.record_failed_exit(plugin, exit, failure, now_ms);
-            } else if let Some(failure) = failure {
-                let _ = self.record_failure(plugin, failure, now_ms);
+            } else {
+                if let Some(registration) = self.registrations.get_mut(plugin) {
+                    registration.retired = Some(exit);
+                }
+                if let Some(failure) = failure {
+                    let _ = self.record_failure(plugin, failure, now_ms);
+                }
             }
         }
+    }
+
+    /// Returns this supervisor's permanent, cancellation-only start revocation.
+    pub fn admission(&self) -> NativeAdmission {
+        self.admission.clone()
     }
 
     /// Stops every child and permanently closes this supervisor.
@@ -321,17 +402,140 @@ impl NativeSupervisor {
             return;
         }
         self.closed = true;
+        self.admission.close();
         for registration in self.registrations.values_mut() {
-            if let Some(worker) = registration.worker.take() {
-                registration.exits.push(worker.shutdown());
+            if let Some(startup) = registration.startup.as_mut() {
+                match startup.settle() {
+                    Ok(exit) => {
+                        registration.retired = Some(exit);
+                        registration.startup.take();
+                    }
+                    Err(_) => self.cleanup_failed = true,
+                }
+            }
+            if let Some(worker) = registration.worker.as_mut() {
+                match worker.shutdown_checked() {
+                    Ok(exit) => {
+                        registration.exits.push(exit);
+                        registration.worker.take();
+                    }
+                    Err(_) => self.cleanup_failed = true,
+                }
             }
         }
     }
 
+    /// Retained actual process outcomes, including healthy catalog releases.
+    pub fn termination_ledger(&self) -> Vec<(PluginId, ExitRecord)> {
+        self.registrations
+            .iter()
+            .flat_map(|(owner, registration)| {
+                registration
+                    .exits
+                    .iter()
+                    .chain(registration.retired.iter())
+                    .cloned()
+                    .map(|exit| (owner.clone(), exit))
+            })
+            .collect()
+    }
+
+    /// Permanent shutdown with retained, physical process-exit validation.
+    /// Historical guest health is separate from physical ownership settlement.
+    pub fn shutdown_all_checked(&mut self) -> Result<(), HostError> {
+        if self.settling {
+            return Err(HostError::Closed);
+        }
+        self.shutdown_all();
+        if self.admission.committed() != 0 {
+            return Err(HostError::Closed);
+        }
+        if self
+            .registrations
+            .values()
+            .any(|registration| registration.worker.is_some() || registration.startup.is_some())
+        {
+            return Err(HostError::Closed);
+        }
+        if self.cleanup_failed {
+            return Err(HostError::Closed);
+        }
+        for (plugin, registration) in &self.registrations {
+            for exit in &registration.exits {
+                if exit.code.is_none() && exit.signal.is_none() {
+                    return Err(HostError::PluginFailed {
+                        plugin: plugin.clone(),
+                        detail: "native process termination was not cleanly confirmed".into(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Settles the canonical shared owner without holding its mutex across I/O
+    /// or joins. Failed and unwinding owners are restored by the transfer guard.
+    pub fn shutdown_shared(supervisor: &Arc<Mutex<Self>>) -> Result<(), HostError> {
+        {
+            let mut state = supervisor.lock().unwrap_or_else(|e| e.into_inner());
+            if state.closed {
+                return state.shutdown_all_checked();
+            }
+            state.closed = true;
+            state.settling = true;
+            state.admission.close();
+        }
+        let mut run = NativeShutdownRun {
+            supervisor: Arc::clone(supervisor),
+            complete: false,
+        };
+        let mut cursor = None;
+        loop {
+            let transfer = {
+                use std::ops::Bound::{Excluded, Unbounded};
+                let mut state = supervisor.lock().unwrap_or_else(|e| e.into_inner());
+                let next = match &cursor {
+                    Some(last) => state
+                        .registrations
+                        .range_mut::<PluginId, _>((Excluded(last), Unbounded))
+                        .next(),
+                    None => state.registrations.iter_mut().next(),
+                };
+                next.map(|(plugin, registration)| {
+                    let plugin = plugin.clone();
+                    NativeShutdownTransfer {
+                        supervisor: Arc::clone(supervisor),
+                        plugin,
+                        worker: registration.worker.take(),
+                        startup: registration.startup.take(),
+                        worker_exit: None,
+                        startup_exit: None,
+                        failed: false,
+                    }
+                })
+            };
+            let Some(mut transfer) = transfer else {
+                break;
+            };
+            cursor = Some(transfer.plugin.clone());
+            transfer.settle();
+            drop(transfer);
+        }
+        let mut state = supervisor.lock().unwrap_or_else(|e| e.into_inner());
+        state.settling = false;
+        let result = state.shutdown_all_checked();
+        drop(state);
+        run.complete = true;
+        result
+    }
+
     fn discard_worker(&mut self, plugin: &PluginId) {
         if let Some(registration) = self.registrations.get_mut(plugin) {
-            if let Some(mut worker) = registration.worker.take() {
-                registration.exits.push(worker.kill());
+            if let Some(worker) = registration.worker.as_mut() {
+                if let Ok(exit) = worker.finish_forced_checked() {
+                    registration.exits.push(exit);
+                    registration.worker.take();
+                }
             }
         }
     }
@@ -486,5 +690,69 @@ fn failure_kind_for_error(error: &HostError) -> FailureKind {
         HostError::Crashed { .. } | HostError::Closed => FailureKind::Crash,
         HostError::ResourceLimit { .. } => FailureKind::ResourceLimit,
         HostError::PluginFailed { .. } => FailureKind::Crash,
+    }
+}
+
+struct NativeShutdownRun {
+    supervisor: Arc<Mutex<NativeSupervisor>>,
+    complete: bool,
+}
+impl Drop for NativeShutdownRun {
+    fn drop(&mut self) {
+        if !self.complete {
+            let mut state = self.supervisor.lock().unwrap_or_else(|e| e.into_inner());
+            state.settling = false;
+            state.cleanup_failed = true;
+        }
+    }
+}
+
+struct NativeShutdownTransfer {
+    supervisor: Arc<Mutex<NativeSupervisor>>,
+    plugin: PluginId,
+    worker: Option<NativeWorker>,
+    startup: Option<NativeStartupOwner>,
+    worker_exit: Option<ExitRecord>,
+    startup_exit: Option<ExitRecord>,
+    failed: bool,
+}
+impl NativeShutdownTransfer {
+    fn settle(&mut self) {
+        if let Some(startup) = self.startup.as_mut() {
+            match startup.settle() {
+                Ok(exit) => {
+                    self.startup_exit = Some(exit);
+                    drop(self.startup.take());
+                }
+                Err(_) => self.failed = true,
+            }
+        }
+        if let Some(worker) = self.worker.as_mut() {
+            match worker.shutdown_checked() {
+                Ok(exit) => {
+                    self.worker_exit = Some(exit);
+                    drop(self.worker.take());
+                }
+                Err(_) => self.failed = true,
+            }
+        }
+    }
+}
+impl Drop for NativeShutdownTransfer {
+    fn drop(&mut self) {
+        let mut state = self.supervisor.lock().unwrap_or_else(|e| e.into_inner());
+        let registration = state
+            .registrations
+            .get_mut(&self.plugin)
+            .expect("closed registration remains owned");
+        registration.worker = self.worker.take();
+        registration.startup = self.startup.take();
+        if let Some(exit) = self.worker_exit.take() {
+            registration.exits.push(exit);
+        }
+        if let Some(exit) = self.startup_exit.take() {
+            registration.retired = Some(exit);
+        }
+        state.cleanup_failed |= self.failed || std::thread::panicking();
     }
 }

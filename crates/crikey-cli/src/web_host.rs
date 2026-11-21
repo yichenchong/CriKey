@@ -12,7 +12,8 @@ use std::fmt::Write as _;
 #[cfg(target_os = "linux")]
 use std::fs::File;
 #[cfg(target_os = "linux")]
-use std::io::Write as _;
+use std::io::{Read as _, Seek as _, Write as _};
+use std::num::NonZeroU64;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(target_os = "linux")]
@@ -31,7 +32,7 @@ use std::process::ExitStatus;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -137,6 +138,7 @@ struct Mailbox {
     latest_frame: Option<Arc<WebSurfaceFrame>>,
     latest_caret: Option<(u64, f32, f32, f32, f32)>,
     notices: VecDeque<WebHostNotice>,
+    shutdown_epoch: Option<NonZeroU64>,
 }
 
 impl Mailbox {
@@ -166,6 +168,73 @@ impl Mailbox {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WebStopError {
+    EpochMismatch,
+    ManagerPanicked,
+    Disconnected,
+    ProcessTeardown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WebStoppedRuntime {
+    epoch: NonZeroU64,
+}
+
+impl WebStoppedRuntime {
+    pub(crate) fn epoch(&self) -> NonZeroU64 {
+        self.epoch
+    }
+}
+
+#[derive(Default)]
+struct StopState {
+    manager: Option<JoinHandle<Result<(), WebStopError>>>,
+    joining: bool,
+    terminal: Option<Result<(), WebStopError>>,
+}
+
+#[derive(Default)]
+struct StopCompletion {
+    state: Mutex<StopState>,
+    ready: Condvar,
+}
+
+#[must_use = "wait for web teardown on a worker before releasing runtime ownership"]
+pub(crate) struct WebStopTicket {
+    epoch: NonZeroU64,
+    completion: Arc<StopCompletion>,
+}
+
+impl WebStopTicket {
+    /// Joins the existing manager and its contained process teardown. Worker-only.
+    pub(crate) fn wait(self) -> Result<WebStoppedRuntime, WebStopError> {
+        let mut state = lock_recover(&self.completion.state);
+        loop {
+            if let Some(result) = state.terminal {
+                return result.map(|()| WebStoppedRuntime { epoch: self.epoch });
+            }
+            if let Some(manager) = state.manager.take() {
+                state.joining = true;
+                drop(state);
+                let result = manager.join().unwrap_or(Err(WebStopError::ManagerPanicked));
+                state = lock_recover(&self.completion.state);
+                state.terminal = Some(result);
+                state.joining = false;
+                self.completion.ready.notify_all();
+            } else if state.joining {
+                state = self
+                    .completion
+                    .ready
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+            } else {
+                state.terminal = Some(Err(WebStopError::Disconnected));
+            }
+        }
+    }
+}
+
 /// One manager for the process-wide single visible plugin page.
 ///
 /// Construction starts one sleeping Rust thread, not an engine. The WPE host
@@ -179,7 +248,7 @@ pub(crate) struct WebHostSupervisor {
     next_surface_id: u64,
     #[cfg(target_os = "linux")]
     storage_root: PathBuf,
-    manager: Option<JoinHandle<()>>,
+    completion: Arc<StopCompletion>,
 }
 
 impl std::fmt::Debug for WebHostSupervisor {
@@ -209,9 +278,15 @@ impl WebHostSupervisor {
         let manager_mailbox = Arc::clone(&mailbox);
         let manager_desired = Arc::clone(&desired_surface);
         let manager_shutdown = Arc::clone(&shutdown);
+        let completion = Arc::new(StopCompletion::default());
+        let manager_completion = Arc::clone(&completion);
         let manager = std::thread::Builder::new()
             .name("crikey-web-supervisor".to_owned())
             .spawn(move || {
+                // Retain join ownership even if all presentation/ticket owners
+                // disappear. It can be released only after cleanup (or unwind)
+                // has completed on this same manager.
+                let _completion = manager_completion;
                 manager_loop(
                     command_rx,
                     manager_mailbox,
@@ -219,9 +294,10 @@ impl WebHostSupervisor {
                     manager_shutdown,
                     wake,
                     spawner,
-                );
+                )
             })
             .expect("the web supervisor thread must start");
+        lock_recover(&completion.state).manager = Some(manager);
         Self {
             command: command_tx,
             mailbox,
@@ -230,7 +306,7 @@ impl WebHostSupervisor {
             next_surface_id: 1,
             #[cfg(target_os = "linux")]
             storage_root,
-            manager: Some(manager),
+            completion,
         }
     }
 
@@ -276,6 +352,7 @@ impl WebHostSupervisor {
     }
 
     pub(crate) fn navigate(&self, surface_id: u64, url: String) -> Result<(), String> {
+        let _admission = self.admit()?;
         if self.desired_surface.load(Ordering::Acquire) != surface_id || url.is_empty() {
             return Ok(());
         }
@@ -285,6 +362,7 @@ impl WebHostSupervisor {
     }
 
     pub(crate) fn resize(&self, surface_id: u64, pixel_width: u32, pixel_height: u32) -> Result<(), String> {
+        let _admission = self.admit()?;
         if self.desired_surface.load(Ordering::Acquire) != surface_id {
             return Ok(());
         }
@@ -301,6 +379,7 @@ impl WebHostSupervisor {
     }
 
     pub(crate) fn send_input(&self, input: WebSurfaceInput) -> Result<(), String> {
+        let _admission = self.admit()?;
         let raw = raw_input(input);
         let surface_id = raw.surface_id;
         if self.desired_surface.load(Ordering::Acquire) != surface_id {
@@ -315,6 +394,7 @@ impl WebHostSupervisor {
     }
 
     pub(crate) fn send_ime(&self, event: WebImeEvent) -> Result<(), String> {
+        let _admission = self.admit()?;
         let event = ime_event(event);
         let surface_id = event.surface_id;
         if self.desired_surface.load(Ordering::Acquire) != surface_id {
@@ -376,15 +456,40 @@ impl WebHostSupervisor {
         }
         output
     }
+    fn admit(&self) -> Result<std::sync::MutexGuard<'_, Mailbox>, String> {
+        let mailbox = lock_recover(&self.mailbox);
+        if mailbox.shutdown_epoch.is_some() {
+            return Err("the web-host runtime is permanently offline".to_owned());
+        }
+        Ok(mailbox)
+    }
+
+    /// Closes admission and invalidates all queued and late surface work.
+    /// This bounded request never waits for manager or process termination.
+    pub(crate) fn request_shutdown(&self, epoch: NonZeroU64) -> Result<WebStopTicket, WebStopError> {
+        let mut mailbox = lock_recover(&self.mailbox);
+        if mailbox.shutdown_epoch.is_some_and(|closed| closed != epoch) {
+            return Err(WebStopError::EpochMismatch);
+        }
+        mailbox.shutdown_epoch = Some(epoch);
+        self.desired_surface.store(0, Ordering::Release);
+        mailbox.latest_frame = None;
+        mailbox.latest_caret = None;
+        mailbox.notices.clear();
+        self.shutdown.store(true, Ordering::Release);
+        Ok(WebStopTicket {
+            epoch,
+            completion: Arc::clone(&self.completion),
+        })
+    }
 }
 
 impl Drop for WebHostSupervisor {
     fn drop(&mut self) {
         self.desired_surface.store(0, Ordering::Release);
         self.shutdown.store(true, Ordering::Release);
-        if let Some(manager) = self.manager.take() {
-            let _ = manager.join();
-        }
+        // Cleanup remains owned by the same manager; explicit stop tickets join
+        // it off the UI thread. Dropping presentation ownership must not join.
     }
 }
 
@@ -397,12 +502,13 @@ fn queue_surface_open(
     surface_id: u64,
     enqueue: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    {
-        let mut mailbox = lock_recover(mailbox);
-        mailbox.latest_frame = None;
-        mailbox.latest_caret = None;
-        desired_surface.store(surface_id, Ordering::Release);
+    let mut mailbox = lock_recover(mailbox);
+    if mailbox.shutdown_epoch.is_some() {
+        return Err("the web-host runtime is permanently offline".to_owned());
     }
+    mailbox.latest_frame = None;
+    mailbox.latest_caret = None;
+    desired_surface.store(surface_id, Ordering::Release);
     if let Err(error) = enqueue() {
         desired_surface.store(0, Ordering::Release);
         return Err(error);
@@ -557,11 +663,57 @@ fn ime_event(event: WebImeEvent) -> ImeEvent {
 
 trait HostSpawner: Send + Sync {
     fn spawn(&self, request: &OpenRequest) -> Result<RunningHost, String>;
+    fn spawn_with_ledger(
+        &self,
+        request: &OpenRequest,
+        _failure: &Mutex<Option<WebStopError>>,
+    ) -> Result<RunningHost, String> {
+        self.spawn(request)
+    }
 }
 
 trait ManagedProcess: Send {
     fn try_wait(&mut self) -> Result<Option<ExitStatus>, String>;
-    fn terminate(&mut self);
+    fn terminate_checked(&mut self) -> Result<(), WebStopError>;
+
+    fn terminate(&mut self) {
+        let _ = self.terminate_checked();
+    }
+}
+
+struct RecordingSpawner {
+    inner: Arc<dyn HostSpawner>,
+    failure: Arc<Mutex<Option<WebStopError>>>,
+}
+
+impl HostSpawner for RecordingSpawner {
+    fn spawn(&self, request: &OpenRequest) -> Result<RunningHost, String> {
+        let mut runtime = self.inner.spawn_with_ledger(request, &self.failure)?;
+        runtime.process = Box::new(RecordingProcess {
+            inner: runtime.process,
+            failure: Arc::clone(&self.failure),
+        });
+        Ok(runtime)
+    }
+}
+
+struct RecordingProcess {
+    inner: Box<dyn ManagedProcess>,
+    failure: Arc<Mutex<Option<WebStopError>>>,
+}
+
+impl ManagedProcess for RecordingProcess {
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>, String> {
+        self.inner.try_wait()
+    }
+
+    fn terminate_checked(&mut self) -> Result<(), WebStopError> {
+        let result = self.inner.terminate_checked();
+        if let Err(error) = result {
+            *lock_recover(&self.failure) = Some(error);
+        }
+        result
+    }
 }
 
 struct RunningHost {
@@ -594,6 +746,14 @@ impl HostSpawner for ProductionSpawner {
     fn spawn(&self, request: &OpenRequest) -> Result<RunningHost, String> {
         spawn_production(request)
     }
+
+    fn spawn_with_ledger(
+        &self,
+        request: &OpenRequest,
+        failure: &Mutex<Option<WebStopError>>,
+    ) -> Result<RunningHost, String> {
+        spawn_production_checked(request, failure)
+    }
 }
 
 fn manager_loop(
@@ -603,7 +763,12 @@ fn manager_loop(
     shutdown: Arc<AtomicBool>,
     wake: WebWake,
     spawner: Arc<dyn HostSpawner>,
-) {
+) -> Result<(), WebStopError> {
+    let failure = Arc::new(Mutex::new(None));
+    let spawner = RecordingSpawner {
+        inner: spawner,
+        failure: Arc::clone(&failure),
+    };
     let mut active: Option<ActiveHost> = None;
     while !shutdown.load(Ordering::Acquire) {
         let desired = desired_surface.load(Ordering::Acquire);
@@ -614,20 +779,16 @@ fn manager_loop(
         let mut did_work = false;
         for _ in 0..COMMAND_QUEUE_CAPACITY {
             match command.try_recv() {
+                _ if shutdown.load(Ordering::Acquire) => break,
                 Ok(next) => {
                     did_work = true;
-                    handle_control(
-                        next,
-                        &mut active,
-                        &mailbox,
-                        &desired_surface,
-                        &wake,
-                        spawner.as_ref(),
-                    );
+                    handle_control(next, &mut active, &mailbox, &desired_surface, &wake, &spawner);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    shutdown.store(true, Ordering::Release);
+                    if !shutdown.swap(true, Ordering::AcqRel) {
+                        lock_recover(&failure).get_or_insert(WebStopError::Disconnected);
+                    }
                     break;
                 }
             }
@@ -681,20 +842,21 @@ fn manager_loop(
             }
         } else if !did_work {
             match command.recv_timeout(MANAGER_IDLE_POLL) {
-                Ok(next) => handle_control(
-                    next,
-                    &mut active,
-                    &mailbox,
-                    &desired_surface,
-                    &wake,
-                    spawner.as_ref(),
-                ),
+                Ok(next) => handle_control(next, &mut active, &mailbox, &desired_surface, &wake, &spawner),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if !shutdown.load(Ordering::Acquire) {
+                        let mut failure = lock_recover(&failure);
+                        failure.get_or_insert(WebStopError::Disconnected);
+                    }
+                    break;
+                }
             }
         }
     }
     teardown(&mut active, "launcher is shutting down");
+    let result = *lock_recover(&failure);
+    result.map_or(Ok(()), Err)
 }
 
 fn handle_control(
@@ -1107,7 +1269,17 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(target_os = "linux")]
 fn spawn_production(request: &OpenRequest) -> Result<RunningHost, String> {
-    start_cgroup_supervised(CgroupLease::prepare, |cgroup| spawn_contained(request, cgroup))
+    spawn_production_checked(request, &Mutex::new(None))
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_production_checked(
+    request: &OpenRequest,
+    failure: &Mutex<Option<WebStopError>>,
+) -> Result<RunningHost, String> {
+    start_cgroup_supervised(CgroupLease::prepare, |cgroup| {
+        spawn_contained(request, cgroup, failure)
+    })
 }
 
 /// Keep admission ahead of every host-execution path, with injectable setup
@@ -1125,7 +1297,11 @@ fn start_cgroup_supervised<T>(
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn spawn_contained(request: &OpenRequest, mut cgroup: CgroupLease) -> Result<RunningHost, String> {
+fn spawn_contained(
+    request: &OpenRequest,
+    mut cgroup: CgroupLease,
+    failure: &Mutex<Option<WebStopError>>,
+) -> Result<RunningHost, String> {
     let executable = web_host_executable()?;
     let storage_dir = match request.storage {
         WebStorage::Ephemeral => None,
@@ -1160,7 +1336,9 @@ fn spawn_contained(request: &OpenRequest, mut cgroup: CgroupLease) -> Result<Run
     let mut transport = match listener.accept(Some(ACCEPT_TIMEOUT)) {
         Ok(transport) => transport,
         Err(error) => {
-            terminate_child_tree(&mut child, &mut cgroup);
+            if let Err(error) = terminate_child_tree(&mut child, &mut cgroup) {
+                *lock_recover(failure) = Some(error);
+            }
             return Err(format!(
                 "web host did not connect to its private endpoint within {} ms: {error}",
                 ACCEPT_TIMEOUT.as_millis()
@@ -1169,12 +1347,16 @@ fn spawn_contained(request: &OpenRequest, mut cgroup: CgroupLease) -> Result<Run
     };
     if let Err(error) = transport.set_read_timeout(Some(READ_POLL)) {
         transport.close();
-        terminate_child_tree(&mut child, &mut cgroup);
+        if let Err(error) = terminate_child_tree(&mut child, &mut cgroup) {
+            *lock_recover(failure) = Some(error);
+        }
         return Err(format!("cannot set the web-host receive deadline: {error}"));
     }
     if let Err(error) = transport.set_write_timeout(Some(WRITE_TIMEOUT)) {
         transport.close();
-        terminate_child_tree(&mut child, &mut cgroup);
+        if let Err(error) = terminate_child_tree(&mut child, &mut cgroup) {
+            *lock_recover(failure) = Some(error);
+        }
         return Err(format!("cannot set the web-host send deadline: {error}"));
     }
     drop(listener);
@@ -1184,7 +1366,7 @@ fn spawn_contained(request: &OpenRequest, mut cgroup: CgroupLease) -> Result<Run
         process: Box::new(ProductionProcess {
             child,
             cgroup,
-            terminated: false,
+            terminated: None,
         }),
     })
 }
@@ -1213,6 +1395,14 @@ fn prepare_host_process(launcher_pid: libc::pid_t, attachment: RawFd) -> std::io
 fn spawn_production(_request: &OpenRequest) -> Result<RunningHost, String> {
     Err("web surfaces require Linux and an installed WPE web host; this launcher remains available without them"
         .to_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_production_checked(
+    request: &OpenRequest,
+    _failure: &Mutex<Option<WebStopError>>,
+) -> Result<RunningHost, String> {
+    spawn_production(request)
 }
 
 #[cfg(target_os = "linux")]
@@ -1755,12 +1945,23 @@ impl CgroupLease {
         })
     }
 
-    fn kill_tree(&mut self) {
-        if let Err(error) = self.kill.write_all(b"1") {
-            eprintln!(
-                "cannot kill the supervised web-host cgroup `{}`: {error}",
-                self.path.display()
-            );
+    fn kill_tree(&mut self) -> Result<(), WebStopError> {
+        self.kill
+            .write_all(b"1")
+            .map_err(|_| WebStopError::ProcessTeardown)
+    }
+
+    fn is_empty(events: &mut File) -> Result<bool, WebStopError> {
+        events.rewind().map_err(|_| WebStopError::ProcessTeardown)?;
+        let mut buffer = [0_u8; 128];
+        let length = events
+            .read(&mut buffer)
+            .map_err(|_| WebStopError::ProcessTeardown)?;
+        let contents = std::str::from_utf8(&buffer[..length]).map_err(|_| WebStopError::ProcessTeardown)?;
+        match contents.lines().find_map(|line| line.strip_prefix("populated ")) {
+            Some("0") => Ok(true),
+            Some("1") => Ok(false),
+            _ => Err(WebStopError::ProcessTeardown),
         }
     }
 }
@@ -1794,7 +1995,7 @@ fn attach_current_process(fd: RawFd) -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 impl Drop for CgroupLease {
     fn drop(&mut self) {
-        self.kill_tree();
+        let _ = self.kill_tree();
         for _ in 0..20 {
             if std::fs::remove_dir(&self.path).is_ok() {
                 return;
@@ -1809,7 +2010,7 @@ impl Drop for CgroupLease {
 struct ProductionProcess {
     child: Child,
     cgroup: CgroupLease,
-    terminated: bool,
+    terminated: Option<Result<(), WebStopError>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1818,12 +2019,13 @@ impl ManagedProcess for ProductionProcess {
         self.child.try_wait().map_err(|error| error.to_string())
     }
 
-    fn terminate(&mut self) {
-        if self.terminated {
-            return;
+    fn terminate_checked(&mut self) -> Result<(), WebStopError> {
+        if let Some(result) = self.terminated {
+            return result;
         }
-        terminate_child_tree(&mut self.child, &mut self.cgroup);
-        self.terminated = true;
+        let result = terminate_child_tree(&mut self.child, &mut self.cgroup);
+        self.terminated = Some(result);
+        result
     }
 }
 
@@ -1836,7 +2038,7 @@ impl Drop for ProductionProcess {
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn terminate_child_tree(child: &mut Child, cgroup: &mut CgroupLease) {
+fn terminate_child_tree(child: &mut Child, cgroup: &mut CgroupLease) -> Result<(), WebStopError> {
     terminate_child_tree_with(child, cgroup, |root| {
         // SAFETY: the caller has just observed this owned child still running
         // and has not reaped it. Even if it exits now, its PID cannot be reused
@@ -1844,14 +2046,19 @@ fn terminate_child_tree(child: &mut Child, cgroup: &mut CgroupLease) {
         unsafe {
             libc::kill(-(root as i32), libc::SIGTERM);
         }
-    });
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn terminate_child_tree_with(child: &mut Child, cgroup: &mut CgroupLease, signal_group: impl FnOnce(u32)) {
+fn terminate_child_tree_with(
+    child: &mut Child,
+    cgroup: &mut CgroupLease,
+    signal_group: impl FnOnce(u32),
+) -> Result<(), WebStopError> {
     // Only Ok(None) establishes that we still own the unreaped root identity.
     // An already-cached exit status or a wait error must bypass numeric signals.
     let mut root_exited = false;
+    let mut failure = None;
     match child.try_wait() {
         Ok(None) => {
             signal_group(child.id());
@@ -1862,30 +2069,56 @@ fn terminate_child_tree_with(child: &mut Child, cgroup: &mut CgroupLease, signal
                         break;
                     }
                     Ok(None) => std::thread::sleep(PROCESS_TERMINATION_POLL),
-                    Err(_) => break,
+                    Err(_) => {
+                        failure = Some(WebStopError::ProcessTeardown);
+                        break;
+                    }
                 }
             }
         }
         Ok(Some(_)) => root_exited = true,
-        Err(_) => {}
+        Err(_) => failure = Some(WebStopError::ProcessTeardown),
     }
 
     // The held dedicated controller, not remembered PIDs or process groups,
     // owns escalation. This is mandatory even after the root has been reaped:
     // detached descendants remain contained, including forks during SIGTERM.
-    cgroup.kill_tree();
-    if root_exited {
-        return;
+    if let Err(error) = cgroup.kill_tree() {
+        failure = Some(error);
     }
+    let mut events = match File::open(cgroup.path.join("cgroup.events")) {
+        Ok(events) => Some(events),
+        Err(_) => {
+            failure = Some(WebStopError::ProcessTeardown);
+            None
+        }
+    };
     for _ in 0..PROCESS_TERMINATION_PASSES {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
+        if !root_exited {
+            match child.try_wait() {
+                Ok(status) => root_exited = status.is_some(),
+                Err(_) => failure = Some(WebStopError::ProcessTeardown),
+            }
+        }
+        let empty = match events.as_mut().map(CgroupLease::is_empty) {
+            Some(Ok(empty)) => empty,
+            Some(Err(error)) => {
+                failure = Some(error);
+                events = None;
+                false
+            }
+            None => false,
+        };
+        // Inspection failure must not skip root reaping. Once the root is
+        // reaped, it can only produce the retained failure, never success.
+        if root_exited && (empty || events.is_none()) {
+            return failure.map_or(Ok(()), Err);
         }
         std::thread::sleep(PROCESS_TERMINATION_POLL);
     }
-    // Never turn bounded manager teardown into an unbounded Child::wait when
-    // the kernel cannot complete exit promptly (for example, uninterruptible I/O).
-    eprintln!("supervised web-host root did not exit within the bounded teardown deadline");
+    // Root reaping AND an empty held containment domain are required. Neither
+    // a sent kill nor a root exit alone proves descendants have stopped.
+    Err(WebStopError::ProcessTeardown)
 }
 
 #[cfg(test)]
@@ -1913,8 +2146,9 @@ mod tests {
             Ok(None)
         }
 
-        fn terminate(&mut self) {
+        fn terminate_checked(&mut self) -> Result<(), WebStopError> {
             self.terminated.fetch_add(1, Ordering::AcqRel);
+            Ok(())
         }
     }
 
@@ -1966,6 +2200,264 @@ mod tests {
             }),
         );
         (supervisor, receiver, starts, terminated)
+    }
+
+    fn shutdown(supervisor: WebHostSupervisor) {
+        let ticket = supervisor
+            .request_shutdown(NonZeroU64::new(1).unwrap())
+            .expect("stop admitted");
+        drop(supervisor);
+        ticket.wait().expect("manager and contained process settled");
+    }
+
+    #[test]
+    fn shutdown_during_open_joins_late_process_and_reuses_exact_terminal() {
+        let release = Arc::new(Barrier::new(2));
+        let terminated = Arc::new(AtomicUsize::new(0));
+        let (peers, receiver) = mpsc::channel();
+        let mut supervisor = WebHostSupervisor::with_spawner(
+            PathBuf::from("/unused"),
+            Arc::new(|| {}),
+            Arc::new(BlockingSpawner {
+                peers,
+                release: Arc::clone(&release),
+                terminated: Arc::clone(&terminated),
+            }),
+        );
+        let surface = open(&mut supervisor);
+        let mut peer = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("spawn entered");
+        let epoch = NonZeroU64::new(7).unwrap();
+        let ticket = supervisor.request_shutdown(epoch).expect("bounded stop request");
+        assert_eq!(
+            terminated.load(Ordering::Acquire),
+            0,
+            "request must not join blocked spawn"
+        );
+        assert!(supervisor
+            .navigate(surface, "https://late.test".to_owned())
+            .is_err());
+        assert!(supervisor.resize(surface, 3, 3).is_err());
+        assert!(supervisor
+            .open(
+                PluginId("native.test".to_owned()),
+                2,
+                1,
+                "https://late.test".to_owned(),
+                WebStorage::Ephemeral,
+            )
+            .is_err());
+        assert!(matches!(
+            supervisor.request_shutdown(NonZeroU64::new(8).unwrap()),
+            Err(WebStopError::EpochMismatch),
+        ));
+        release.wait();
+        let proof = ticket.wait().expect("late process actually terminated");
+        assert_eq!(proof.epoch(), epoch);
+        assert_eq!(terminated.load(Ordering::Acquire), 1);
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("timeout");
+        assert!(
+            matches!(peer.recv(), Err(ProtocolError::Closed)),
+            "no late OpenSurface"
+        );
+        assert_eq!(supervisor.request_shutdown(epoch).unwrap().wait(), Ok(proof));
+        assert_eq!(
+            terminated.load(Ordering::Acquire),
+            1,
+            "terminal reuse does not reap twice"
+        );
+    }
+
+    struct FailedReap;
+
+    impl ManagedProcess for FailedReap {
+        fn try_wait(&mut self) -> Result<Option<ExitStatus>, String> {
+            Ok(None)
+        }
+
+        fn terminate_checked(&mut self) -> Result<(), WebStopError> {
+            Err(WebStopError::ProcessTeardown)
+        }
+    }
+
+    #[test]
+    fn close_failure_is_retained_after_process_leaves_active_slot() {
+        let (launcher, mut peer) = transport::pair();
+        let mut launcher = launcher;
+        launcher.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
+        let mut supervisor = WebHostSupervisor::with_spawner(
+            PathBuf::from("/unused"),
+            Arc::new(|| {}),
+            Arc::new(OneShotSpawner(Mutex::new(Some(RunningHost {
+                transport: launcher,
+                process: Box::new(FailedReap),
+            })))),
+        );
+        open(&mut supervisor);
+        recv(&mut peer);
+        supervisor.close("pending close before package stop");
+        let epoch = NonZeroU64::new(11).unwrap();
+        assert_eq!(
+            supervisor.request_shutdown(epoch).unwrap().wait(),
+            Err(WebStopError::ProcessTeardown),
+        );
+        assert_eq!(
+            supervisor.request_shutdown(epoch).unwrap().wait(),
+            Err(WebStopError::ProcessTeardown),
+        );
+    }
+
+    struct PanickingSpawner(mpsc::Sender<()>);
+
+    impl HostSpawner for PanickingSpawner {
+        fn spawn(&self, _: &OpenRequest) -> Result<RunningHost, String> {
+            self.0.send(()).expect("panic observer");
+            panic!("private manager panic fixture");
+        }
+    }
+
+    #[test]
+    fn manager_panic_and_missing_join_owner_never_mint_stop_proof() {
+        let (entered, observer) = mpsc::channel();
+        let mut supervisor = WebHostSupervisor::with_spawner(
+            PathBuf::from("/unused"),
+            Arc::new(|| {}),
+            Arc::new(PanickingSpawner(entered)),
+        );
+        open(&mut supervisor);
+        observer
+            .recv_timeout(Duration::from_secs(1))
+            .expect("manager entered panic fixture");
+        let epoch = NonZeroU64::new(13).unwrap();
+        assert_eq!(
+            supervisor.request_shutdown(epoch).unwrap().wait(),
+            Err(WebStopError::ManagerPanicked)
+        );
+        assert_eq!(
+            supervisor.request_shutdown(epoch).unwrap().wait(),
+            Err(WebStopError::ManagerPanicked)
+        );
+        let missing = WebStopTicket {
+            epoch,
+            completion: Arc::new(StopCompletion::default()),
+        };
+        assert_eq!(missing.wait(), Err(WebStopError::Disconnected));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_ticket_joins_real_root_reap_and_rejects_unsettled_containment() {
+        for populated in [false, true] {
+            let directory = TestDirectory::new();
+            let cgroup = directory.cgroup();
+            // This fixture substitutes the delegated kernel controller only;
+            // the manager still owns and reaps a real isolated OS child.
+            std::fs::write(
+                cgroup.path.join("cgroup.events"),
+                if populated {
+                    "populated 1\n"
+                } else {
+                    "populated 0\n"
+                },
+            )
+            .unwrap();
+            let child = session_shell("exec sleep 30")
+                .spawn()
+                .expect("real isolated root");
+            let pid = child.id();
+            let (mut launcher, mut peer) = transport::pair();
+            launcher.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
+            let mut supervisor = WebHostSupervisor::with_spawner(
+                PathBuf::from("/unused"),
+                Arc::new(|| {}),
+                Arc::new(OneShotSpawner(Mutex::new(Some(RunningHost {
+                    transport: launcher,
+                    process: Box::new(ProductionProcess {
+                        child,
+                        cgroup,
+                        terminated: None,
+                    }),
+                })))),
+            );
+            open(&mut supervisor);
+            assert!(matches!(recv(&mut peer).payload, Some(Payload::OpenSurface(_))));
+            let epoch = NonZeroU64::new(17).unwrap();
+            let terminal = supervisor.request_shutdown(epoch).unwrap().wait();
+            assert!(
+                !process_is_running(pid),
+                "ticket waits for real root termination/reaping"
+            );
+            if populated {
+                assert_eq!(terminal, Err(WebStopError::ProcessTeardown));
+            } else {
+                assert_eq!(terminal.unwrap().epoch(), epoch);
+            }
+            assert_eq!(supervisor.request_shutdown(epoch).unwrap().wait(), terminal);
+        }
+    }
+
+    #[test]
+    fn requested_idle_stop_survives_supervisor_drop_before_ticket_wait() {
+        for _ in 0..32 {
+            let (supervisor, _, _, _) = harness();
+            // Let the real manager enter its blocking idle receive.
+            std::thread::sleep(MANAGER_IDLE_POLL / 2);
+            let epoch = NonZeroU64::new(23).unwrap();
+            let ticket = supervisor.request_shutdown(epoch).unwrap();
+            drop(supervisor);
+            assert_eq!(ticket.wait().unwrap().epoch(), epoch);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn containment_inspection_failure_still_reaps_late_exiting_root() {
+        for unreadable in [false, true] {
+            let directory = TestDirectory::new();
+            let cgroup = directory.cgroup();
+            let events = cgroup.path.join("cgroup.events");
+            std::fs::remove_file(&events).unwrap();
+            if unreadable {
+                std::fs::create_dir(&events).unwrap();
+            }
+            // Ignore graceful termination and exit only after the graceful
+            // polling budget, requiring the post-escalation reap loop.
+            let mut command = session_shell("trap '' TERM; echo ready; sleep 0.3");
+            command.stdout(Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            let mut ready = String::new();
+            BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready.trim(), "ready");
+            let pid = child.id();
+            let (mut launcher, mut peer) = transport::pair();
+            launcher.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
+            let mut supervisor = WebHostSupervisor::with_spawner(
+                PathBuf::from("/unused"),
+                Arc::new(|| {}),
+                Arc::new(OneShotSpawner(Mutex::new(Some(RunningHost {
+                    transport: launcher,
+                    process: Box::new(ProductionProcess {
+                        child,
+                        cgroup,
+                        terminated: None,
+                    }),
+                })))),
+            );
+            open(&mut supervisor);
+            recv(&mut peer);
+            let epoch = NonZeroU64::new(29).unwrap();
+            let ticket = supervisor.request_shutdown(epoch).unwrap();
+            drop(supervisor);
+            assert_eq!(ticket.wait(), Err(WebStopError::ProcessTeardown));
+            assert!(
+                !Path::new("/proc").join(pid.to_string()).exists(),
+                "root must be reaped, not left as an unreaped zombie after inspection failure"
+            );
+        }
     }
 
     fn open(supervisor: &mut WebHostSupervisor) -> u64 {
@@ -2119,31 +2611,36 @@ mod tests {
     }
 
     #[test]
-    fn opening_preserves_a_first_frame_published_before_enqueue_returns() {
+    fn opening_preserves_a_first_frame_racing_with_enqueue() {
         let mailbox = Arc::new(Mutex::new(Mailbox::default()));
         let desired = AtomicU64::new(1);
         let wake: WebWake = Arc::new(|| {});
         publish_frame(&mailbox, &desired, &wake, frame(1, 1));
-        queue_surface_open(&mailbox, &desired, 2, || {
-            assert_eq!(desired.load(Ordering::Acquire), 2);
-            assert!(lock_recover(&mailbox).latest_frame.is_none());
-            // Model a host that answers synchronously as soon as Open is
-            // queued: clearing after enqueue would erase its only frame.
-            publish_frame(&mailbox, &desired, &wake, frame(2, 1));
-            publish_caret(
-                &mailbox,
-                &desired,
-                &wake,
-                CaretArea {
-                    surface_id: 2,
-                    width: 1.0,
-                    height: 2.0,
-                    ..CaretArea::default()
-                },
-            );
-            Ok(())
-        })
-        .expect("open queues");
+        std::thread::scope(|scope| {
+            let mut publication = None;
+            queue_surface_open(&mailbox, &desired, 2, || {
+                assert_eq!(desired.load(Ordering::Acquire), 2);
+                // Publication shares the admission lock. A fast host can
+                // answer during enqueue, but cannot publish until it returns.
+                publication = Some(scope.spawn(|| {
+                    publish_frame(&mailbox, &desired, &wake, frame(2, 1));
+                    publish_caret(
+                        &mailbox,
+                        &desired,
+                        &wake,
+                        CaretArea {
+                            surface_id: 2,
+                            width: 1.0,
+                            height: 2.0,
+                            ..CaretArea::default()
+                        },
+                    );
+                }));
+                Ok(())
+            })
+            .expect("open queues");
+            publication.unwrap().join().expect("first frame publisher");
+        });
         // Obsolete publishers may run after replacement, but cannot erase
         // the new owner's first frame or caret with data or a fatal error.
         publish_frame(&mailbox, &desired, &wake, frame(1, 9));
@@ -2197,7 +2694,7 @@ mod tests {
             .expect("startup begins");
         supervisor.close("dismissed during startup");
         release.wait();
-        drop(supervisor);
+        shutdown(supervisor);
         peer.set_read_timeout(Some(Duration::from_secs(1)))
             .expect("pair timeout");
         assert!(matches!(peer.recv(), Err(ProtocolError::Closed)));
@@ -2234,7 +2731,7 @@ mod tests {
             next_surface_id: 3,
             #[cfg(target_os = "linux")]
             storage_root: PathBuf::from("/unused"),
-            manager: None,
+            completion: Arc::new(StopCompletion::default()),
         };
         supervisor
             .navigate(1, "https://example.test".to_owned())
@@ -2291,10 +2788,8 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     struct OneShotSpawner(Mutex<Option<RunningHost>>);
 
-    #[cfg(target_os = "linux")]
     impl HostSpawner for OneShotSpawner {
         fn spawn(&self, _request: &OpenRequest) -> Result<RunningHost, String> {
             lock_recover(&self.0)
@@ -2313,8 +2808,8 @@ mod tests {
             Ok(Some(ExitStatus::from_raw(0)))
         }
 
-        fn terminate(&mut self) {
-            self.0.terminate();
+        fn terminate_checked(&mut self) -> Result<(), WebStopError> {
+            self.0.terminate_checked()
         }
     }
 
@@ -2387,7 +2882,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(1))
                 .expect("the completed host publishes a terminal notice");
             let notices = supervisor.poll();
-            drop(supervisor);
+            shutdown(supervisor);
             assert_eq!(notices.len(), 1, "post-terminal frames are discarded");
             assert!(
                 matches!(&notices[0], WebHostNotice::Fatal { surface_id: 1, message } if message == expected),
@@ -2856,7 +3351,7 @@ mod tests {
         wake_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("write error reports fatal");
-        drop(supervisor);
+        shutdown(supervisor);
         assert_eq!(sends.load(Ordering::Acquire), 2);
         assert!(!sent_after_error.load(Ordering::Acquire));
         assert_eq!(terminated.load(Ordering::Acquire), 1);
@@ -2903,7 +3398,7 @@ mod tests {
         )));
         let (finished_tx, finished_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            drop(supervisor);
+            shutdown(supervisor);
             finished_tx.send(()).expect("shutdown receiver");
         });
         finished_rx
@@ -2934,6 +3429,7 @@ mod tests {
             for name in ["memory.max", "cgroup.procs", "cgroup.kill"] {
                 File::create(path.join(name)).expect("control fixture");
             }
+            std::fs::write(path.join("cgroup.events"), "populated 0\n").expect("empty fixture cgroup");
             CgroupLease::open_controls(&path, MIN_WEB_MEMORY_BYTES).expect("fixture controls")
         }
     }
@@ -3299,7 +3795,7 @@ mod tests {
         let mut process = ProductionProcess {
             child,
             cgroup,
-            terminated: false,
+            terminated: None,
         };
         let mut detached = String::new();
         BufReader::new(stdout)
@@ -3320,7 +3816,7 @@ mod tests {
         );
         // Exercise cgroup.kill itself, not process-group cleanup: setsid has
         // deliberately removed the descendant from the host process group.
-        process.cgroup.kill_tree();
+        process.cgroup.kill_tree().expect("contained tree kill");
         assert_process_stopped(detached);
         assert_process_stopped(process.child.id());
         assert!(process.child.try_wait().expect("root is reaped").is_some());
@@ -3976,7 +4472,7 @@ mod tests {
         let mut process = ProductionProcess {
             child,
             cgroup,
-            terminated: false,
+            terminated: None,
         };
         let mut survivor = String::new();
         BufReader::new(stdout)
@@ -3993,12 +4489,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(status.is_some(), "contained root must exit before teardown");
-        assert!(!process.terminated, "observing root exit is not cleanup");
+        assert!(process.terminated.is_none(), "observing root exit is not cleanup");
         assert!(process_is_running(survivor), "surviving child must outlive root");
 
         process.terminate();
 
-        assert!(process.terminated);
+        assert!(process.terminated.is_some());
         assert_process_stopped(survivor);
         assert!(process.child.try_wait().expect("root remains reaped").is_some());
     }
@@ -4027,7 +4523,7 @@ mod tests {
         let mut process = ProductionProcess {
             child,
             cgroup,
-            terminated: false,
+            terminated: None,
         };
         let mut ready = String::new();
         BufReader::new(stdout)
@@ -4062,7 +4558,7 @@ mod tests {
         let mut process = ProductionProcess {
             child,
             cgroup: directory.cgroup(),
-            terminated: false,
+            terminated: None,
         };
         let mut ready = String::new();
         BufReader::new(stdout)
@@ -4102,7 +4598,8 @@ mod tests {
         // It never sends a real signal to a potentially reused/unrelated PID.
         terminate_child_tree_with(&mut child, &mut cgroup, |_| {
             panic!("an already-reaped root must never trigger numeric signaling");
-        });
+        })
+        .expect("cached root and empty containment are proven");
 
         assert_eq!(child.try_wait().expect("cached root status"), Some(status));
         assert_eq!(

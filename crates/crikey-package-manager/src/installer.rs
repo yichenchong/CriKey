@@ -45,7 +45,7 @@ use crate::native::{
     unsigned_binary_in, write_members,
 };
 use crate::signature::SignaturePolicy;
-use crate::{build_package, inspect_package, install_native_with_policy, InstallSource, PackageError};
+use crate::{build_package, inspect_package, InstallSource, PackageError};
 
 /// Extension of a Keypirinha package, without the dot.
 ///
@@ -87,6 +87,7 @@ pub struct PluginInstaller {
     directories: StandardDirectories,
     fetcher: Box<dyn PackageFetcher>,
     signatures: SignaturePolicy,
+    expected_identity: Option<(String, Runtime)>,
 }
 
 // Hand-written because a `PackageFetcher` is not required to be `Debug`: the
@@ -125,6 +126,7 @@ impl PluginInstaller {
             // place the decision is made, and it is the place that read the
             // configuration.
             signatures: SignaturePolicy::unchecked(),
+            expected_identity: None,
         }
     }
 
@@ -142,6 +144,21 @@ impl PluginInstaller {
     pub fn with_signature_policy(mut self, policy: SignaturePolicy) -> Self {
         self.signatures = policy;
         self
+    }
+
+    /// Restricts installation to the selected index identity and exact runtime.
+    /// Checked against the metadata used by each installer before stop/swap;
+    /// signatures and pinned digests do not authorize another package identity.
+    #[must_use]
+    pub fn with_expected_identity(mut self, id: String, runtime: Runtime) -> Self {
+        self.expected_identity = Some((id, runtime));
+        self
+    }
+
+    fn expected_identity(&self) -> Option<(&str, Runtime)> {
+        self.expected_identity
+            .as_ref()
+            .map(|(id, runtime)| (id.as_str(), *runtime))
     }
 
     /// The provenance policy native installs are subject to.
@@ -163,7 +180,23 @@ impl PluginInstaller {
         source: &InstallSource,
         stop: &mut dyn FnMut(&str) -> Result<(), PackageError>,
     ) -> Result<InstalledPlugin, PackageError> {
-        let _lock = LauncherLock::acquire(&self.directories)?;
+        let lock = LauncherLock::acquire(&self.directories)?;
+        self.install_under_owned_lock(&lock, source, stop)
+    }
+
+    /// Uses the resident launcher's existing lock without releasing or
+    /// reacquiring it. The owner must close admission, drain actions/pages and
+    /// queries, stop and reap affected workers (including children), and keep
+    /// admission closed until this call and its reconciliation finish.
+    /// `stop` must acknowledge that shutdown; an error aborts before the swap.
+    /// A lock borrowed for another state directory is refused.
+    pub fn install_under_owned_lock(
+        &mut self,
+        lock: &LauncherLock,
+        source: &InstallSource,
+        stop: &mut dyn FnMut(&str) -> Result<(), PackageError>,
+    ) -> Result<InstalledPlugin, PackageError> {
+        lock.authorizes(&self.directories)?;
         let scratch = Scratch::new(&self.directories)?;
         let installed = self.install_locked(source, stop, &scratch);
         scratch.discard();
@@ -184,7 +217,20 @@ impl PluginInstaller {
     /// id-only lookup would scan the runtimes in a fixed order and delete
     /// whichever it reached first, which is the wrong plugin half the time.
     pub fn remove(&mut self, kind: PluginKind, id: &str) -> Result<InstalledPlugin, PackageError> {
-        let _lock = LauncherLock::acquire(&self.directories)?;
+        let lock = LauncherLock::acquire(&self.directories)?;
+        self.remove_under_owned_lock(&lock, kind, id)
+    }
+
+    /// Removes under the already-owned resident lock. The caller must hold
+    /// the same quiescence admission barrier described by
+    /// [`Self::install_under_owned_lock`] through reconciliation.
+    pub fn remove_under_owned_lock(
+        &mut self,
+        lock: &LauncherLock,
+        kind: PluginKind,
+        id: &str,
+    ) -> Result<InstalledPlugin, PackageError> {
+        lock.authorizes(&self.directories)?;
         let installed = self
             .list()?
             .into_iter()
@@ -225,7 +271,14 @@ impl PluginInstaller {
 
     /// Every installed plugin, ordered by kind and then by id.
     pub fn list(&self) -> Result<Vec<InstalledPlugin>, PackageError> {
+        self.list_bounded(usize::MAX)
+    }
+
+    /// Lists with an explicit scan/allocation ceiling for interactive jobs.
+    /// Refuses excess entries instead of presenting a silently partial list.
+    pub fn list_bounded(&self, maximum: usize) -> Result<Vec<InstalledPlugin>, PackageError> {
         let mut installed = Vec::new();
+        let mut metadata_bytes = 0usize;
         for kind in PluginKind::ALL {
             let root = self.directories.plugin_dir(kind);
             let entries = match fs::read_dir(&root) {
@@ -234,13 +287,30 @@ impl PluginInstaller {
                 Err(error) => return Err(PackageError::Io(error)),
             };
             let mut paths = entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| !is_hidden(path))
-                .collect::<Vec<_>>();
+                .map(|entry| entry.map(|entry| entry.path()))
+                .take(maximum.saturating_add(1))
+                .collect::<Result<Vec<_>, _>>()?;
+            if paths.len() > maximum {
+                return Err(PackageError::Install(
+                    "plugin inventory scan limit exceeded".into(),
+                ));
+            }
+            paths.retain(|path| !is_hidden(path));
             paths.sort();
             for path in paths {
                 if let Some(plugin) = self.describe(kind, &path)? {
+                    if installed.len() >= maximum {
+                        return Err(PackageError::Install("plugin inventory limit exceeded".into()));
+                    }
+                    metadata_bytes = metadata_bytes
+                        .saturating_add(plugin.id.len())
+                        .saturating_add(plugin.version.len())
+                        .saturating_add(plugin.root.as_os_str().len());
+                    if maximum != usize::MAX && metadata_bytes > 8 * 1024 * 1024 {
+                        return Err(PackageError::Install(
+                            "plugin inventory metadata exceeds 8 MiB".into(),
+                        ));
+                    }
                     installed.push(plugin);
                 }
             }
@@ -383,14 +453,21 @@ impl PluginInstaller {
         if let Some(holder) = previous.parent() {
             fs::create_dir_all(holder)?;
         }
-        let install = install_native_with_policy(
+        let install = native::install_native_checked(
             archive,
             &root,
             std::env::consts::OS,
             std::env::consts::ARCH,
-            stop,
+            &mut |actual_id| {
+                if actual_id != report.plugin {
+                    return Err(PackageError::Install(
+                        "package identity changed during validation".into(),
+                    ));
+                }
+                stop(actual_id)
+            },
             Some(&previous),
-            policy,
+            (policy, self.expected_identity()),
         )?;
         Ok(InstalledPlugin {
             id: install.report.plugin.clone(),
@@ -407,6 +484,11 @@ impl PluginInstaller {
         stop: &mut dyn FnMut(&str) -> Result<(), PackageError>,
     ) -> Result<InstalledPlugin, PackageError> {
         let manifest = native::archive_manifest(&members)?;
+        require_identity(
+            self.expected_identity(),
+            &manifest.plugin.id,
+            manifest.plugin.runtime,
+        )?;
         let id = native::safe_id_component(&manifest.plugin.id)?;
         let root = self.directories.plugin_dir(PluginKind::Modern).join(id);
         let unsigned_binary = unsigned_binary_in(&members);
@@ -443,6 +525,7 @@ impl PluginInstaller {
             )));
         }
         read_archive(archive)?;
+        require_identity(self.expected_identity(), &id, Runtime::LegacyPython)?;
         let root = self
             .directories
             .plugin_dir(PluginKind::Legacy)
@@ -469,6 +552,7 @@ impl PluginInstaller {
         stop: &mut dyn FnMut(&str) -> Result<(), PackageError>,
     ) -> Result<InstalledPlugin, PackageError> {
         let id = native::safe_id_component(id)?.to_owned();
+        require_identity(self.expected_identity(), &id, Runtime::LegacyPython)?;
         let root = self.directories.plugin_dir(PluginKind::Legacy).join(&id);
         let alternate = self
             .directories
@@ -512,6 +596,7 @@ impl PluginInstaller {
         stop: &mut dyn FnMut(&str) -> Result<(), PackageError>,
     ) -> Result<InstalledPlugin, PackageError> {
         let id = native::safe_id_component(id)?.to_owned();
+        require_identity(self.expected_identity(), &id, Runtime::LegacyPython)?;
         let members = collect_directory_members(path)?;
         if !members.keys().any(|name| name.ends_with(".py")) {
             return Err(PackageError::Manifest(format!(
@@ -666,7 +751,16 @@ impl Scratch {
 }
 
 fn read_manifest(path: &Path) -> Result<Manifest, PackageError> {
-    let text = fs::read_to_string(path)?;
+    use std::io::Read as _;
+    let mut text = String::new();
+    fs::File::open(path)?
+        .take(MAX_PACKAGE_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_PACKAGE_BYTES {
+        return Err(PackageError::Manifest(
+            "manifest exceeds the package byte limit".into(),
+        ));
+    }
     Manifest::parse(&text).map_err(|error| PackageError::Manifest(error.to_string()))
 }
 
@@ -746,4 +840,19 @@ fn url_file_name(url: &str) -> String {
         return "package".to_owned();
     }
     tail.to_owned()
+}
+
+pub(crate) fn require_identity(
+    expected: Option<(&str, Runtime)>,
+    id: &str,
+    runtime: Runtime,
+) -> Result<(), PackageError> {
+    if let Some((expected_id, expected_runtime)) = expected {
+        if id != expected_id || runtime != expected_runtime {
+            return Err(PackageError::Install(format!(
+                "indexed identity mismatch: selected {expected_runtime:?}.{expected_id}, package declares {runtime:?}.{id}"
+            )));
+        }
+    }
+    Ok(())
 }

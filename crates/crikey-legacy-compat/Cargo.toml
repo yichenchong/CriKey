@@ -25,6 +25,12 @@ toml.workspace = true
 # refuses entries that escape the package root.
 zip.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+crikey-native-host.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Builds the well-formed `.keypirinha-package` fixtures in
 # `tests/package_loading.rs`. Adversarial fixtures (path traversal, non-UTF-8

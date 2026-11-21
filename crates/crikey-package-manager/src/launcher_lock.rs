@@ -91,6 +91,23 @@ impl LauncherLock {
         }
         Ok(Self { pid_path, file })
     }
+
+    /// Verifies that an in-process operation borrows the lock for this state
+    /// directory, rather than a lock for a different launcher installation.
+    pub(crate) fn authorizes(&self, directories: &StandardDirectories) -> Result<(), PackageError> {
+        let held = fs::canonicalize(
+            self.pid_path
+                .parent()
+                .ok_or_else(|| PackageError::Install("launcher lock has no state directory".into()))?,
+        )?;
+        let requested = fs::canonicalize(directories.state_dir())?;
+        if held != requested {
+            return Err(PackageError::Install(
+                "launcher lock belongs to another state directory".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for LauncherLock {

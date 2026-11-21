@@ -722,9 +722,11 @@ version = "0.1.19"
 dependencies = [
  "crikey-core",
  "crikey-input-scheduler",
+ "crikey-native-host",
  "crikey-plugin-model",
  "crikey-python-host",
  "crikey-sandbox",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -742,6 +744,7 @@ dependencies = [
  "crikey-plugin-supervisor",
  "crikey-sandbox",
  "getrandom 0.3.4",
+ "libc",
 ]
 
 [[package]]
@@ -849,11 +852,13 @@ name = "crikey-python-host"
 version = "0.1.19"
 dependencies = [
  "crikey-core",
+ "crikey-native-host",
  "crikey-native-protocol",
  "crikey-package-manager",
  "crikey-plugin-model",
  "crikey-plugin-supervisor",
  "crikey-sandbox",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.19",

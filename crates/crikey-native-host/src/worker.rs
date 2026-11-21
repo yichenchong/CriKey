@@ -35,6 +35,7 @@ use crate::stream::{
     NativeSuggestRequest, PluginError, ProtocolObservation, StreamDiagnostics, Suggestions, MAX_LOG_RECORDS,
     OBSERVATION_CAPACITY, READER_QUEUE_CAPACITY, READER_QUEUE_MAX_BYTES,
 };
+use crate::supervisor::NativeAdmission;
 
 const SOCKET_POLL_MS: u64 = 20;
 const CONTROL_WRITE_TIMEOUT_MS: u64 = 200;
@@ -121,6 +122,46 @@ impl fmt::Display for HostError {
 }
 
 impl std::error::Error for HostError {}
+
+/// Startup failure retaining the exact child and pipe owners, if one was
+/// created. Diagnostic access borrows the cause rather than extracting it and
+/// silently dropping unfinished cleanup.
+pub struct NativeSpawnFailure {
+    error: HostError,
+    startup: Option<NativeStartupOwner>,
+}
+
+impl NativeSpawnFailure {
+    pub fn error(&self) -> &HostError {
+        &self.error
+    }
+
+    /// Retries bounded physical cleanup without consuming a failed owner.
+    pub fn retry_cleanup(&mut self) -> Result<(), HostError> {
+        match self.startup.as_mut() {
+            Some(owner) => owner.settle().map(|_| ()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl fmt::Debug for NativeSpawnFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NativeSpawnFailure")
+    }
+}
+
+impl fmt::Display for NativeSpawnFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for NativeSpawnFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
 
 /// Identity and capabilities reported by the plugin during startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,22 +302,11 @@ struct WorkerLink {
     view_request: Arc<AtomicU64>,
     reader: Mutex<Option<JoinHandle<()>>>,
     writer_thread: Mutex<Option<JoinHandle<()>>>,
+    admission: NativeAdmission,
+    revoked_request: Arc<AtomicU64>,
 }
 
 impl WorkerLink {
-    fn observe(&self, direction: &'static str, envelope: &Envelope) {
-        push_observation(
-            &self.observations,
-            ProtocolObservation {
-                direction,
-                kind: envelope_kind(envelope),
-                request_id: envelope.request_id,
-                connection_id: envelope.connection_id,
-                generation: envelope.generation,
-            },
-        );
-    }
-
     fn observations(&self) -> Vec<ProtocolObservation> {
         lock_unpoisoned(&self.observations).iter().cloned().collect()
     }
@@ -293,6 +323,9 @@ impl WorkerLink {
     }
 
     fn send_until(&self, envelope: Envelope, end: Instant) -> Result<(), HostError> {
+        if is_callback(&envelope) && self.admission.is_closed() {
+            return Err(HostError::Closed);
+        }
         if self.closed.load(Ordering::Acquire) {
             return Err(HostError::Closed);
         }
@@ -303,8 +336,28 @@ impl WorkerLink {
                 detail: "outbound envelope exceeds protocol bounds".into(),
             });
         }
-        self.observe("host->plugin", &envelope);
-        let _guard = lock_unpoisoned(&self.write_mutex);
+        let callback = is_callback(&envelope);
+        let _guard = if callback {
+            match self.write_mutex.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(HostError::ResourceLimit {
+                        plugin: self.plugin.clone(),
+                        detail: "native callback writer is busy".into(),
+                    })
+                }
+            }
+        } else {
+            loop {
+                match self.write_mutex.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) if Instant::now() < end => thread::yield_now(),
+                    Err(_) => return Err(self.write_error(envelope_kind(&envelope), ProtocolError::Timeout)),
+                }
+            }
+        };
         match &self.writer {
             WriterKind::Queued { sender, pending } => {
                 let kind = envelope_kind(&envelope);
@@ -322,6 +375,13 @@ impl WorkerLink {
                             return Err(self.write_error(kind, ProtocolError::Closed));
                         }
                         Err(TrySendError::Full(next)) => {
+                            if callback {
+                                pending.fetch_sub(1, Ordering::AcqRel);
+                                return Err(HostError::ResourceLimit {
+                                    plugin: self.plugin.clone(),
+                                    detail: "native callback writer queue is full".into(),
+                                });
+                            }
                             value = next;
                             if Instant::now() >= end {
                                 pending.fetch_sub(1, Ordering::AcqRel);
@@ -348,25 +408,35 @@ impl WorkerLink {
     }
 
     fn recv(&self, timeout: Duration) -> Result<ReaderEvent, RecvTimeoutError> {
-        let receiver = lock_unpoisoned(&self.events);
-        match receiver.recv_timeout(timeout) {
-            Ok(event) => {
-                let _ = self
-                    .queued_events
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
-                        Some(depth.saturating_sub(1))
-                    });
-                let bytes = reader_event_size(&event);
-                let _ = self
-                    .queued_bytes
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
-                        Some(depth.saturating_sub(bytes))
-                    });
-                let mut event = event;
-                sanitize_event(&mut event, &self.privacy);
-                Ok(event)
+        let end = Instant::now() + timeout;
+        loop {
+            let revoked = self.revoked_request.load(Ordering::Acquire);
+            if revoked != 0 && revoked == self.current_request.load(Ordering::Acquire) {
+                return Err(RecvTimeoutError::Disconnected);
             }
-            Err(error) => Err(error),
+            let remaining = end.saturating_duration_since(Instant::now());
+            let result = lock_unpoisoned(&self.events)
+                .recv_timeout(remaining.min(Duration::from_millis(SOCKET_POLL_MS)));
+            match result {
+                Ok(event) => {
+                    let _ = self
+                        .queued_events
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+                            Some(depth.saturating_sub(1))
+                        });
+                    let bytes = reader_event_size(&event);
+                    let _ = self
+                        .queued_bytes
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+                            Some(depth.saturating_sub(bytes))
+                        });
+                    let mut event = event;
+                    sanitize_event(&mut event, &self.privacy);
+                    return Ok(event);
+                }
+                Err(RecvTimeoutError::Timeout) if Instant::now() < end => (),
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -426,15 +496,6 @@ impl WorkerLink {
         self.protocol_violation.load(Ordering::Acquire)
     }
 
-    fn join_reader(&self) {
-        if let Some(handle) = lock_unpoisoned(&self.reader).take() {
-            join_bounded(handle, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
-        }
-        if let Some(handle) = lock_unpoisoned(&self.writer_thread).take() {
-            join_bounded(handle, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
-        }
-    }
-
     fn wait_writer_idle(&self, end: Instant) {
         let WriterKind::Queued { pending, .. } = &self.writer;
         let pending = Arc::clone(pending);
@@ -482,7 +543,12 @@ pub struct NativeWorker {
     exit: Option<ExitRecord>,
     // Exit observation is separate from pipe/process cleanup so snapshot
     // refreshers never wait for descendants that retain a standard stream.
-    observed_exit: Option<Result<std::process::ExitStatus, ()>>,
+    observed_exit: Option<Result<(), ()>>,
+    process_status: Option<std::process::ExitStatus>,
+    tree_signalled: bool,
+    thread_failure: Option<&'static str>,
+    retirement_kind: Option<ExitKind>,
+    closing_failure: Option<&'static str>,
     diagnostics: StreamDiagnostics,
     sandbox_report: crikey_sandbox::SandboxReport,
     next_request_id: u64,
@@ -535,16 +601,41 @@ impl NativeWorker {
     }
 
     /// Launches a child and completes the authenticated handshake (spec 16.3, 16.6).
-    pub fn spawn(spec: LaunchSpec, options: WorkerOptions) -> Result<Self, HostError> {
+    ///
+    /// A failure retains any created child and unfinished pipes. Keep that
+    /// [`NativeSpawnFailure`] through the invocation boundary; bounded cleanup
+    /// can be retried without giving up ownership.
+    pub fn spawn(spec: LaunchSpec, options: WorkerOptions) -> Result<Self, NativeSpawnFailure> {
+        let mut startup = None;
+        match Self::spawn_with_admission(spec, options, NativeAdmission::default(), &mut startup) {
+            Ok(worker) => Ok(worker),
+            Err(error) => Err(NativeSpawnFailure { error, startup }),
+        }
+    }
+
+    pub(crate) fn spawn_with_admission(
+        spec: LaunchSpec,
+        options: WorkerOptions,
+        admission: NativeAdmission,
+        retained: &mut Option<NativeStartupOwner>,
+    ) -> Result<Self, HostError> {
         let plugin = spec.plugin.clone();
-        Self::spawn_inner(spec, options).map_err(|error| match error {
+        Self::spawn_inner(spec, options, admission, retained).map_err(|error| match error {
             HostError::Spawn(detail) => HostError::Spawn(format!("plugin `{}`: {detail}", plugin.0)),
             HostError::Handshake(detail) => HostError::Handshake(format!("plugin `{}`: {detail}", plugin.0)),
             other => other,
         })
     }
 
-    fn spawn_inner(spec: LaunchSpec, options: WorkerOptions) -> Result<Self, HostError> {
+    fn spawn_inner(
+        spec: LaunchSpec,
+        options: WorkerOptions,
+        admission: NativeAdmission,
+        retained: &mut Option<NativeStartupOwner>,
+    ) -> Result<Self, HostError> {
+        if retained.is_some() {
+            return Err(HostError::Closed);
+        }
         if options.limits.initial_credits == 0 {
             return Err(HostError::ResourceLimit {
                 plugin: spec.plugin.clone(),
@@ -601,23 +692,32 @@ impl NativeWorker {
         // `process_group(0)` above already covers the whole tree from creation.
         #[cfg(windows)]
         command.creation_flags(CREATE_SUSPENDED);
+        let _start = admission.commit(true).ok_or(HostError::Closed)?;
         let mut child = spawn_child(command).map_err(|error| HostError::Spawn(error.to_string()))?;
         // Held as an owner, not a raw handle: every early return below this
         // point drops it, which closes the job and - through
         // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` - kills descendants that the
         // direct `child.kill()` cannot see.
         #[cfg(windows)]
-        let job = match contain_child(&child, &options.limits) {
-            Ok(value) => value,
+        let job = match create_job_for_child(&child, &options.limits) {
+            Ok(value) => {
+                if let Err(error) = resume_primary_thread(child.id()) {
+                    retain_failed_startup(&spec.plugin, child, None, None, Some(value), retained);
+                    return Err(HostError::Spawn(error));
+                }
+                Some(value)
+            }
             Err(error) => {
-                terminate_and_reap(&mut child);
+                retain_failed_startup(&spec.plugin, child, None, None, None, retained);
                 return Err(HostError::Spawn(error));
             }
         };
+        #[cfg(not(windows))]
+        let job = ();
         let stderr = match child.stderr.take() {
             Some(value) => value,
             None => {
-                terminate_and_reap(&mut child);
+                retain_failed_startup(&spec.plugin, child, None, None, job, retained);
                 return Err(HostError::Spawn("child stderr was not piped".to_owned()));
             }
         };
@@ -625,7 +725,7 @@ impl NativeWorker {
         let stderr_reader = match spawn_stderr_drain(stderr, Arc::clone(&stderr_tail)) {
             Ok(handle) => handle,
             Err(error) => {
-                terminate_and_reap(&mut child);
+                retain_failed_startup(&spec.plugin, child, None, None, job, retained);
                 return Err(HostError::Spawn(format!("stderr drain thread: {error}")));
             }
         };
@@ -644,21 +744,20 @@ impl NativeWorker {
         let page_request = Arc::new(AtomicU64::new(0));
         let view_request = Arc::new(AtomicU64::new(0));
         let writer_pending = Arc::new(AtomicUsize::new(0));
+        let revoked_request = Arc::new(AtomicU64::new(0));
         let (transport, writer, outgoing, writer_thread) = match options.transport {
             TransportKind::Stdio => {
                 let stdin = match child.stdin.take() {
                     Some(value) => value,
                     None => {
-                        terminate_and_reap(&mut child);
-                        join_bounded(stderr_reader, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
+                        retain_failed_startup(&spec.plugin, child, Some(stderr_reader), None, job, retained);
                         return Err(HostError::Spawn("child stdin was not piped".to_owned()));
                     }
                 };
                 let stdout = match child.stdout.take() {
                     Some(value) => value,
                     None => {
-                        terminate_and_reap(&mut child);
-                        join_bounded(stderr_reader, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
+                        retain_failed_startup(&spec.plugin, child, Some(stderr_reader), None, job, retained);
                         return Err(HostError::Spawn("child stdout was not piped".to_owned()));
                     }
                 };
@@ -667,8 +766,21 @@ impl NativeWorker {
                     sender,
                     pending: Arc::clone(&writer_pending),
                 };
-                let writer_thread =
-                    spawn_stdio_writer(stdin, receiver, Arc::clone(&closed), Arc::clone(&writer_pending));
+                let writer_thread = match spawn_stdio_writer(
+                    stdin,
+                    receiver,
+                    Arc::clone(&closed),
+                    Arc::clone(&writer_pending),
+                    admission.clone(),
+                    Arc::clone(&revoked_request),
+                    Arc::clone(&observations),
+                ) {
+                    Ok(worker) => worker,
+                    Err(error) => {
+                        retain_failed_startup(&spec.plugin, child, Some(stderr_reader), None, job, retained);
+                        return Err(HostError::Spawn(format!("native writer thread: {error}")));
+                    }
+                };
                 (
                     Box::new(ChildStdioTransport { stdout }) as Box<dyn Transport>,
                     writer,
@@ -682,8 +794,7 @@ impl NativeWorker {
                 let listener = match listener {
                     Some(value) => value,
                     None => {
-                        terminate_and_reap(&mut child);
-                        join_bounded(stderr_reader, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
+                        retain_failed_startup(&spec.plugin, child, Some(stderr_reader), None, job, retained);
                         return Err(HostError::Spawn("native listener was not created".to_owned()));
                     }
                 };
@@ -691,8 +802,7 @@ impl NativeWorker {
                 {
                     Ok(value) => value,
                     Err(error) => {
-                        terminate_and_reap(&mut child);
-                        join_bounded(stderr_reader, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
+                        retain_failed_startup(&spec.plugin, child, Some(stderr_reader), None, job, retained);
                         return Err(HostError::Handshake(format!("plugin did not connect: {error:?}")));
                     }
                 };
@@ -722,16 +832,6 @@ impl NativeWorker {
             privacy: Arc::clone(&stderr_tail),
             sensitive: Arc::clone(&sensitive),
         };
-        let reader = if let Some(outgoing_receiver) = outgoing {
-            spawn_multiplex_reader(
-                transport,
-                outgoing_receiver,
-                reader_context,
-                Arc::clone(&writer_pending),
-            )
-        } else {
-            spawn_blocking_reader(transport, reader_context)
-        };
         let link = Arc::new(WorkerLink {
             plugin: spec.plugin.clone(),
             writer,
@@ -752,18 +852,51 @@ impl NativeWorker {
             mismatch,
             page_request,
             view_request,
-            reader: Mutex::new(Some(reader)),
+            reader: Mutex::new(None),
             writer_thread: Mutex::new(writer_thread),
             privacy: Arc::clone(&stderr_tail),
             sensitive,
+            admission,
+            revoked_request,
         });
+        let reader = if let Some(outgoing_receiver) = outgoing {
+            spawn_multiplex_reader(
+                transport,
+                outgoing_receiver,
+                reader_context,
+                Arc::clone(&writer_pending),
+                link.admission.clone(),
+                Arc::clone(&link.revoked_request),
+            )
+        } else {
+            spawn_blocking_reader(transport, reader_context)
+        };
+        match reader {
+            Ok(reader) => *lock_unpoisoned(&link.reader) = Some(reader),
+            Err(error) => {
+                retain_failed_startup(
+                    &spec.plugin,
+                    child,
+                    Some(stderr_reader),
+                    Some(Arc::clone(&link)),
+                    job,
+                    retained,
+                );
+                return Err(HostError::Spawn(format!("native reader thread: {error}")));
+            }
+        }
         let handshake = match receive_handshake(&link, &token, &options) {
             Ok(value) => value,
             Err(error) => {
                 link.close();
-                terminate_and_reap(&mut child);
-                join_bounded(stderr_reader, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
-                link.join_reader();
+                retain_failed_startup(
+                    &spec.plugin,
+                    child,
+                    Some(stderr_reader),
+                    Some(Arc::clone(&link)),
+                    job,
+                    retained,
+                );
                 let stderr = lock_unpoisoned(&stderr_tail).text();
                 if stderr.is_empty() {
                     return Err(error);
@@ -794,6 +927,11 @@ impl NativeWorker {
             stderr_reader: Some(stderr_reader),
             exit: None,
             observed_exit: None,
+            process_status: None,
+            tree_signalled: false,
+            thread_failure: None,
+            retirement_kind: None,
+            closing_failure: None,
             diagnostics: StreamDiagnostics::default(),
             sandbox_report,
             next_request_id: 1,
@@ -804,7 +942,7 @@ impl NativeWorker {
             view: None,
             failure_kind: None,
             #[cfg(windows)]
-            job: Some(job),
+            job,
         })
     }
 
@@ -1976,15 +2114,15 @@ impl NativeWorker {
         }
     }
 
-    /// Observes child exit without closing, draining, or joining any channel.
+    /// Observes exit without consuming the PID/PGID identity.
     pub(crate) fn poll_alive(&mut self) -> bool {
-        if self.exit.is_some() || self.observed_exit.is_some() {
+        if self.exit.is_some() || self.process_status.is_some() || self.observed_exit.is_some() {
             return false;
         }
-        match self.child.as_mut().map(Child::try_wait) {
-            Some(Ok(None)) => true,
-            Some(Ok(Some(status))) => {
-                self.observed_exit = Some(Ok(status));
+        match self.child.as_ref().map(child_exited) {
+            Some(Ok(false)) => true,
+            Some(Ok(true)) => {
+                self.observed_exit = Some(Ok(()));
                 false
             }
             Some(Err(_)) => {
@@ -1995,35 +2133,15 @@ impl NativeWorker {
         }
     }
 
-    /// Returns whether the child process is still running, cleaning up on exit.
+    /// Cleans up an observed exit while retaining ownership on a failed reap.
     pub fn is_alive(&mut self) -> bool {
         if self.poll_alive() {
             return true;
         }
-        if self.exit.is_some() {
-            return false;
+        if self.exit.is_none() && self.observed_exit == Some(Ok(())) {
+            let _ = self.finish_teardown(false, None);
         }
-        let status = match self.observed_exit.take() {
-            Some(Ok(status)) => Some(status),
-            Some(Err(())) => {
-                self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::Crash);
-                self.fail_and_reap(ExitKind::Crashed);
-                return false;
-            }
-            None => return false,
-        };
-        match status {
-            Some(status) => {
-                self.release_job();
-                self.join_stderr();
-                let kind = self.sticky_exit_kind(ExitKind::from_status(&status));
-                let exit = self.exit_record(kind, Some(status));
-                self.exit = Some(exit);
-                self.link.close();
-                false
-            }
-            None => true,
-        }
+        false
     }
 
     /// Returns stream diagnostics.
@@ -2035,110 +2153,169 @@ impl NativeWorker {
         diagnostics
     }
 
-    /// Hard-stops and reaps the child.
+    /// Hard-stops and reaps the child. Missing status is not a teardown proof.
     pub fn kill(&mut self) -> ExitRecord {
-        if self.observed_exit.is_some() {
-            self.is_alive();
-        }
-        if let Some(exit) = &self.exit {
-            return exit.clone();
-        }
-        self.link.close();
-        self.terminate_owned_tree();
-        let status = if let Some(child) = self.child.as_mut() {
-            wait_child_after_termination(
-                child,
-                Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS),
-            )
-        } else {
-            None
-        };
-        self.release_job();
-        self.join_stderr();
-        let exit = self.exit_record(self.sticky_exit_kind(ExitKind::Killed), status);
-        self.exit = Some(exit.clone());
-        self.link.join_reader();
-        exit
+        self.finish_teardown(false, Some(ExitKind::Killed))
+            .unwrap_or_else(|_| {
+                self.exit_record(self.sticky_exit_kind(ExitKind::Killed), self.process_status)
+            })
     }
 
-    /// Requests orderly shutdown, hard-killing after its bound.
+    /// Requests orderly shutdown, hard-killing only after its bound.
     pub fn shutdown(mut self) -> ExitRecord {
         self.shutdown_inner()
     }
 
-    fn shutdown_inner(&mut self) -> ExitRecord {
+    /// Retains the child and unfinished pipe threads on failure.
+    pub(crate) fn shutdown_checked(&mut self) -> Result<ExitRecord, HostError> {
         if let Some(exit) = &self.exit {
-            self.link.close();
-            self.link.join_reader();
-            return exit.clone();
+            return match self.closing_failure {
+                Some(error) => Err(self.teardown_error(error)),
+                None => Ok(exit.clone()),
+            };
         }
-        if !self.is_alive() {
-            let exit = self
-                .exit
-                .clone()
-                .unwrap_or_else(|| self.exit_record(ExitKind::Crashed, None));
-            self.link.close();
-            self.link.join_reader();
-            return exit;
+        let exit = self.finish_teardown(true, None)?;
+        if let Some(error) = self.closing_failure {
+            return Err(self.teardown_error(error));
         }
-        let request_id = self.begin_request(0);
-        let _ = self.send_control(Envelope {
-            connection_id: self.link.connection_id,
-            request_id,
-            generation: 0,
-            deadline_ms: self.options.shutdown_timeout_ms,
-            payload: Some(Payload::Shutdown(message::Shutdown {
-                immediate: false,
-                unknown: Default::default(),
-            })),
-            unknown: Default::default(),
-        });
-        let end = deadline(self.options.shutdown_timeout_ms);
-        loop {
-            if Instant::now() >= end {
-                return self.kill();
-            }
-            let remaining = end.saturating_duration_since(Instant::now());
-            match self.link.recv(remaining) {
-                Ok(ReaderEvent::Failure(_))
-                | Err(RecvTimeoutError::Disconnected)
-                | Err(RecvTimeoutError::Timeout) => break,
-                Ok(ReaderEvent::Envelope(_)) => {}
-            }
-            if !self.is_alive() {
-                break;
-            }
+        if matches!(exit.kind, ExitKind::Crashed | ExitKind::ProtocolViolation) {
+            return Err(self.teardown_error("native worker lost control during shutdown"));
         }
-        let status = if let Some(child) = self.child.as_mut() {
-            match wait_child_bounded(child, end) {
-                Some(status) => Some(status),
-                None => return self.kill(),
-            }
-        } else {
-            None
-        };
-        let kind = status
-            .as_ref()
-            .map(ExitKind::from_status)
-            .map(|kind| self.sticky_exit_kind(kind))
-            .unwrap_or_else(|| self.sticky_exit_kind(ExitKind::Clean));
-        self.release_job();
-        self.join_stderr();
-        let exit = self.exit_record(kind, status);
-        self.exit = Some(exit.clone());
-        self.link.close();
-        self.link.join_reader();
-        exit
+        Ok(exit)
+    }
+    pub(crate) fn finish_forced_checked(&mut self) -> Result<ExitRecord, HostError> {
+        self.finish_teardown(false, Some(ExitKind::Killed))
     }
 
-    fn terminate_owned_tree(&mut self) {
-        #[cfg(windows)]
-        if let Some(job) = self.job.as_ref() {
-            job.terminate();
+    fn teardown_error(&self, detail: &'static str) -> HostError {
+        HostError::PluginFailed {
+            plugin: self.spec.plugin.clone(),
+            detail: detail.into(),
         }
-        if let Some(child) = self.child.as_mut() {
-            terminate_child_tree(child);
+    }
+
+    fn finish_teardown(&mut self, graceful: bool, kind: Option<ExitKind>) -> Result<ExitRecord, HostError> {
+        if let Some(exit) = &self.exit {
+            return Ok(exit.clone());
         }
+        if let Some(error) = self.thread_failure {
+            return Err(self.teardown_error(error));
+        }
+        let mut forced = false;
+        if self.process_status.is_none() {
+            let child = self
+                .child
+                .as_ref()
+                .ok_or_else(|| self.teardown_error("native child ownership unavailable"))?;
+            let mut exited =
+                child_exited(child).map_err(|_| self.teardown_error("native exit observation failed"))?;
+            if graceful && exited && !self.tree_signalled && self.link.admission.is_closed() {
+                self.closing_failure = Some("native worker exited before shutdown");
+            }
+            if graceful && !exited && !self.tree_signalled {
+                let request_id = self.begin_request(0);
+                let end = deadline(self.options.shutdown_timeout_ms);
+                // Cleanup control is permitted after callback admission closes.
+                let _ = self.link.send_until(
+                    Envelope {
+                        connection_id: self.link.connection_id,
+                        request_id,
+                        generation: 0,
+                        deadline_ms: self.options.shutdown_timeout_ms,
+                        payload: Some(Payload::Shutdown(message::Shutdown {
+                            immediate: false,
+                            unknown: Default::default(),
+                        })),
+                        unknown: Default::default(),
+                    },
+                    end,
+                );
+                loop {
+                    exited = child_exited(self.child.as_ref().expect("owned child"))
+                        .map_err(|_| self.teardown_error("native exit observation failed"))?;
+                    if exited || Instant::now() >= end {
+                        break;
+                    }
+                    if self
+                        .link
+                        .recv(
+                            end.saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(5)),
+                        )
+                        .is_err()
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                forced = !exited;
+            }
+            if !self.tree_signalled {
+                // The leader remains unreaped here, even after EOF or a clean
+                // graceful exit, so its process-group identity cannot be reused.
+                #[cfg(unix)]
+                let signalled = kill_group_checked(self.child.as_ref().expect("owned child").id());
+                #[cfg(windows)]
+                let signalled = self.job.as_ref().is_some_and(|job| terminate_job_checked(job.0));
+                #[cfg(not(any(unix, windows)))]
+                let signalled = false;
+                if !signalled {
+                    return Err(self.teardown_error("native containment termination failed"));
+                }
+                self.tree_signalled = true;
+            }
+            self.link.close();
+            let end = Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS);
+            let child = self.child.as_mut().expect("owned child");
+            self.process_status = wait_child_after_termination(child, end);
+            if self.process_status.is_none() {
+                return Err(self.teardown_error("native process reap was not confirmed"));
+            }
+        }
+        self.link.close();
+        let status = self.process_status.expect("confirmed native process status");
+        let retirement_kind = kind.or(self.retirement_kind).unwrap_or_else(|| {
+            if forced {
+                ExitKind::Killed
+            } else {
+                ExitKind::from_status(&status)
+            }
+        });
+        self.retirement_kind = Some(retirement_kind);
+        #[cfg(unix)]
+        if !wait_group_absent(self.child.as_ref().expect("owned child").id()) {
+            return Err(self.teardown_error("native process group remains owned"));
+        }
+        let end = Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS);
+        let reader = settle_link_thread(&self.link.reader, end);
+        let writer = settle_link_thread(&self.link.writer_thread, end);
+        let stderr = settle_owned_thread(&mut self.stderr_reader, end);
+        let outcomes = [reader, writer, stderr];
+        if outcomes
+            .iter()
+            .any(|outcome| *outcome == Err("native pipe worker panicked"))
+        {
+            self.thread_failure = Some("native pipe worker panicked");
+        }
+        if let Some(error) = self.thread_failure {
+            return Err(self.teardown_error(error));
+        }
+        for outcome in outcomes {
+            if let Err(error) = outcome {
+                return Err(self.teardown_error(error));
+            }
+        }
+        self.release_job();
+        let exit = self.exit_record(self.sticky_exit_kind(retirement_kind), Some(status));
+        self.exit = Some(exit.clone());
+        Ok(exit)
+    }
+
+    fn shutdown_inner(&mut self) -> ExitRecord {
+        self.shutdown_checked().unwrap_or_else(|_| {
+            self.exit
+                .clone()
+                .unwrap_or_else(|| self.exit_record(ExitKind::Crashed, self.process_status))
+        })
     }
 
     #[cfg(windows)]
@@ -2391,6 +2568,10 @@ impl NativeWorker {
     fn record_log(&mut self, _message: String) {}
 
     fn transport_error(&mut self, failure: ReaderFailure) -> HostError {
+        let revoked = self.link.revoked_request.load(Ordering::Acquire);
+        if revoked != 0 && revoked == self.link.current_request.load(Ordering::Acquire) {
+            return HostError::Closed;
+        }
         let failure = if self.is_sensitive() {
             ReaderFailure {
                 error: ProtocolError::Closed,
@@ -2490,26 +2671,11 @@ impl NativeWorker {
     }
 
     fn fail_and_reap(&mut self, kind: ExitKind) {
-        if self.exit.is_some() {
-            return;
+        if self.link.admission.is_closed() && matches!(kind, ExitKind::Crashed | ExitKind::ProtocolViolation)
+        {
+            self.closing_failure = Some("native worker lost control during shutdown");
         }
-        let kind = self.sticky_exit_kind(kind);
-        self.link.close();
-        // A closed channel is not evidence that the child exited.  Kill
-        // the owned tree before any wait, then bound the reap (spec 24.1).
-        self.terminate_owned_tree();
-        let status = if let Some(child) = self.child.as_mut() {
-            wait_child_after_termination(
-                child,
-                Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS),
-            )
-        } else {
-            None
-        };
-        self.release_job();
-        self.join_stderr();
-        self.exit = Some(self.exit_record(kind, status));
-        self.link.join_reader();
+        let _ = self.finish_teardown(false, Some(kind));
     }
 
     fn exit_record(&self, kind: ExitKind, status: Option<std::process::ExitStatus>) -> ExitRecord {
@@ -2532,11 +2698,6 @@ impl NativeWorker {
             signal,
             stderr_tail,
             failure_kind: self.failure_kind,
-        }
-    }
-    fn join_stderr(&mut self) {
-        if let Some(handle) = self.stderr_reader.take() {
-            join_bounded(handle, Duration::from_millis(CHILD_REAP_TIMEOUT_MS));
         }
     }
 }
@@ -2594,32 +2755,43 @@ fn spawn_stdio_writer(
     receiver: Receiver<Envelope>,
     closed: Arc<AtomicBool>,
     pending: Arc<AtomicUsize>,
-) -> JoinHandle<()> {
-    thread::spawn(move || loop {
-        if closed.load(Ordering::Acquire) {
-            drain_pending(&receiver, &pending);
-            break;
-        }
-        match receiver.recv_timeout(Duration::from_millis(SOCKET_POLL_MS)) {
-            Ok(envelope) => {
-                let mut encoded = envelope.encode();
-                let result = write_frame(&mut stdin, &encoded);
-                if matches!(envelope.payload, Some(Payload::TypedExecuteRequest(_))) {
-                    encoded.fill(0);
+    admission: NativeAdmission,
+    revoked: Arc<AtomicU64>,
+    observations: Arc<Mutex<VecDeque<ProtocolObservation>>>,
+) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("crikey-native-writer".into())
+        .spawn(move || loop {
+            if closed.load(Ordering::Acquire) {
+                drain_pending(&receiver, &pending);
+                break;
+            }
+            match receiver.recv_timeout(Duration::from_millis(SOCKET_POLL_MS)) {
+                Ok(envelope) => {
+                    let Some(_dispatch) = admission.commit(is_callback(&envelope)) else {
+                        revoked.store(envelope.request_id, Ordering::Release);
+                        pending.fetch_sub(1, Ordering::AcqRel);
+                        continue;
+                    };
+                    observe_outbound(&observations, &envelope);
+                    let mut encoded = envelope.encode();
+                    let result = write_frame(&mut stdin, &encoded);
+                    if matches!(envelope.payload, Some(Payload::TypedExecuteRequest(_))) {
+                        encoded.fill(0);
+                    }
+                    pending.fetch_sub(1, Ordering::AcqRel);
+                    if result.is_err() {
+                        drain_pending(&receiver, &pending);
+                        break;
+                    }
                 }
-                pending.fetch_sub(1, Ordering::AcqRel);
-                if result.is_err() {
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
                     drain_pending(&receiver, &pending);
                     break;
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                drain_pending(&receiver, &pending);
-                break;
-            }
-        }
-    })
+        })
 }
 
 fn drain_pending(receiver: &Receiver<Envelope>, pending: &AtomicUsize) {
@@ -2628,136 +2800,45 @@ fn drain_pending(receiver: &Receiver<Envelope>, pending: &AtomicUsize) {
     }
 }
 
-fn spawn_blocking_reader(mut transport: Box<dyn Transport>, context: ReaderContext) -> JoinHandle<()> {
-    thread::spawn(move || loop {
-        if context.closed.load(Ordering::Acquire) {
-            break;
-        }
-        match transport.recv_with_diagnostics(&context.sensitive) {
-            Ok(envelope) => {
-                if !validate_inbound(&envelope, &context) {
-                    context.protocol_violation.store(true, Ordering::Release);
-                    let failure = ReaderEvent::Failure(ReaderFailure {
-                        error: ProtocolError::Malformed("illegal plugin-to-host envelope".to_owned()),
-                        protocol_violation: true,
-                        resource_limit: false,
-                    });
-                    let _ = enqueue_reader_event(&context, failure);
-                    transport.close();
-                    break;
-                }
-                if !accept_credit(&envelope, &context.credits) {
-                    context.protocol_violation.store(true, Ordering::Release);
-                    let failure = ReaderEvent::Failure(ReaderFailure {
-                        error: ProtocolError::Malformed("plugin sent a batch without credit".to_owned()),
-                        protocol_violation: true,
-                        resource_limit: false,
-                    });
-                    let _ = enqueue_reader_event(&context, failure);
-                    transport.close();
-                    break;
-                }
-                if !enqueue_reader_event(&context, ReaderEvent::Envelope(Box::new(envelope))) {
-                    transport.close();
-                    break;
-                }
-            }
-            Err(error) => {
-                let violation = is_protocol_violation_error(&error);
-                if violation {
-                    context.protocol_violation.store(true, Ordering::Release);
-                }
-                let _ = enqueue_reader_event(
-                    &context,
-                    ReaderEvent::Failure(ReaderFailure {
-                        error,
-                        protocol_violation: violation,
-                        resource_limit: context.resource_limit.load(Ordering::Acquire),
-                    }),
-                );
-                break;
-            }
-        }
-    })
-}
-
-fn spawn_multiplex_reader(
+fn spawn_blocking_reader(
     mut transport: Box<dyn Transport>,
-    outgoing: Receiver<Envelope>,
     context: ReaderContext,
-    writer_pending: Arc<AtomicUsize>,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let _ = transport.set_read_timeout(Some(Duration::from_millis(SOCKET_POLL_MS)));
-        loop {
+) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("crikey-native-reader".into())
+        .spawn(move || loop {
             if context.closed.load(Ordering::Acquire) {
-                drain_pending(&outgoing, &writer_pending);
-                transport.close();
                 break;
-            }
-            loop {
-                match outgoing.try_recv() {
-                    Ok(envelope) => {
-                        let result = transport.send(&envelope);
-                        writer_pending.fetch_sub(1, Ordering::AcqRel);
-                        if let Err(error) = result {
-                            drain_pending(&outgoing, &writer_pending);
-                            let _ = enqueue_reader_event(
-                                &context,
-                                ReaderEvent::Failure(ReaderFailure {
-                                    error,
-                                    protocol_violation: false,
-                                    resource_limit: false,
-                                }),
-                            );
-                            transport.close();
-                            return;
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        drain_pending(&outgoing, &writer_pending);
-                        transport.close();
-                        return;
-                    }
-                }
             }
             match transport.recv_with_diagnostics(&context.sensitive) {
                 Ok(envelope) => {
                     if !validate_inbound(&envelope, &context) {
                         context.protocol_violation.store(true, Ordering::Release);
-                        let _ = enqueue_reader_event(
-                            &context,
-                            ReaderEvent::Failure(ReaderFailure {
-                                error: ProtocolError::Malformed("illegal plugin-to-host envelope".to_owned()),
-                                protocol_violation: true,
-                                resource_limit: false,
-                            }),
-                        );
+                        let failure = ReaderEvent::Failure(ReaderFailure {
+                            error: ProtocolError::Malformed("illegal plugin-to-host envelope".to_owned()),
+                            protocol_violation: true,
+                            resource_limit: false,
+                        });
+                        let _ = enqueue_reader_event(&context, failure);
                         transport.close();
-                        return;
+                        break;
                     }
                     if !accept_credit(&envelope, &context.credits) {
                         context.protocol_violation.store(true, Ordering::Release);
-                        let _ = enqueue_reader_event(
-                            &context,
-                            ReaderEvent::Failure(ReaderFailure {
-                                error: ProtocolError::Malformed(
-                                    "plugin sent a batch without credit".to_owned(),
-                                ),
-                                protocol_violation: true,
-                                resource_limit: false,
-                            }),
-                        );
+                        let failure = ReaderEvent::Failure(ReaderFailure {
+                            error: ProtocolError::Malformed("plugin sent a batch without credit".to_owned()),
+                            protocol_violation: true,
+                            resource_limit: false,
+                        });
+                        let _ = enqueue_reader_event(&context, failure);
                         transport.close();
-                        return;
+                        break;
                     }
                     if !enqueue_reader_event(&context, ReaderEvent::Envelope(Box::new(envelope))) {
                         transport.close();
-                        return;
+                        break;
                     }
                 }
-                Err(ProtocolError::Timeout) => {}
                 Err(error) => {
                     let violation = is_protocol_violation_error(&error);
                     if violation {
@@ -2771,11 +2852,119 @@ fn spawn_multiplex_reader(
                             resource_limit: context.resource_limit.load(Ordering::Acquire),
                         }),
                     );
-                    return;
+                    break;
                 }
             }
-        }
-    })
+        })
+}
+
+fn spawn_multiplex_reader(
+    mut transport: Box<dyn Transport>,
+    outgoing: Receiver<Envelope>,
+    context: ReaderContext,
+    writer_pending: Arc<AtomicUsize>,
+    admission: NativeAdmission,
+    revoked: Arc<AtomicU64>,
+) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("crikey-native-transport".into())
+        .spawn(move || {
+            let _ = transport.set_read_timeout(Some(Duration::from_millis(SOCKET_POLL_MS)));
+            loop {
+                if context.closed.load(Ordering::Acquire) {
+                    drain_pending(&outgoing, &writer_pending);
+                    transport.close();
+                    break;
+                }
+                loop {
+                    match outgoing.try_recv() {
+                        Ok(envelope) => {
+                            let Some(_dispatch) = admission.commit(is_callback(&envelope)) else {
+                                revoked.store(envelope.request_id, Ordering::Release);
+                                writer_pending.fetch_sub(1, Ordering::AcqRel);
+                                continue;
+                            };
+                            observe_outbound(&context.observations, &envelope);
+                            let result = transport.send(&envelope);
+                            writer_pending.fetch_sub(1, Ordering::AcqRel);
+                            if let Err(error) = result {
+                                drain_pending(&outgoing, &writer_pending);
+                                let _ = enqueue_reader_event(
+                                    &context,
+                                    ReaderEvent::Failure(ReaderFailure {
+                                        error,
+                                        protocol_violation: false,
+                                        resource_limit: false,
+                                    }),
+                                );
+                                transport.close();
+                                return;
+                            }
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            drain_pending(&outgoing, &writer_pending);
+                            transport.close();
+                            return;
+                        }
+                    }
+                }
+                match transport.recv_with_diagnostics(&context.sensitive) {
+                    Ok(envelope) => {
+                        if !validate_inbound(&envelope, &context) {
+                            context.protocol_violation.store(true, Ordering::Release);
+                            let _ = enqueue_reader_event(
+                                &context,
+                                ReaderEvent::Failure(ReaderFailure {
+                                    error: ProtocolError::Malformed(
+                                        "illegal plugin-to-host envelope".to_owned(),
+                                    ),
+                                    protocol_violation: true,
+                                    resource_limit: false,
+                                }),
+                            );
+                            transport.close();
+                            return;
+                        }
+                        if !accept_credit(&envelope, &context.credits) {
+                            context.protocol_violation.store(true, Ordering::Release);
+                            let _ = enqueue_reader_event(
+                                &context,
+                                ReaderEvent::Failure(ReaderFailure {
+                                    error: ProtocolError::Malformed(
+                                        "plugin sent a batch without credit".to_owned(),
+                                    ),
+                                    protocol_violation: true,
+                                    resource_limit: false,
+                                }),
+                            );
+                            transport.close();
+                            return;
+                        }
+                        if !enqueue_reader_event(&context, ReaderEvent::Envelope(Box::new(envelope))) {
+                            transport.close();
+                            return;
+                        }
+                    }
+                    Err(ProtocolError::Timeout) => {}
+                    Err(error) => {
+                        let violation = is_protocol_violation_error(&error);
+                        if violation {
+                            context.protocol_violation.store(true, Ordering::Release);
+                        }
+                        let _ = enqueue_reader_event(
+                            &context,
+                            ReaderEvent::Failure(ReaderFailure {
+                                error,
+                                protocol_violation: violation,
+                                resource_limit: context.resource_limit.load(Ordering::Acquire),
+                            }),
+                        );
+                        return;
+                    }
+                }
+            }
+        })
 }
 
 /// Strip diagnostic text both on queue admission and again on publication:
@@ -3457,40 +3646,83 @@ fn reader_event_size(event: &ReaderEvent) -> usize {
     }
 }
 
-fn join_bounded(handle: JoinHandle<()>, timeout: Duration) {
-    let end = Instant::now().checked_add(timeout).unwrap_or_else(Instant::now);
-    while !handle.is_finished() && Instant::now() < end {
-        thread::yield_now();
-    }
-    if handle.is_finished() {
-        let _ = handle.join();
-    }
-}
-
-fn wait_child_bounded(child: &mut Child, end: Instant) -> Option<std::process::ExitStatus> {
+fn wait_child_after_termination(child: &mut Child, end: Instant) -> Option<std::process::ExitStatus> {
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
-            Ok(None) if Instant::now() < end => thread::sleep(Duration::from_millis(5)),
-            Ok(None) => return None,
-            Err(_) if Instant::now() < end => thread::sleep(Duration::from_millis(5)),
-            Err(_) => return None,
+        match child_exited(child) {
+            Ok(true) => return child.wait().ok(),
+            Ok(false) if Instant::now() < end => thread::sleep(Duration::from_millis(5)),
+            _ => return None,
         }
     }
 }
-fn wait_child_after_termination(child: &mut Child, end: Instant) -> Option<std::process::ExitStatus> {
-    match wait_child_bounded(child, end) {
-        Some(status) => Some(status),
-        None => child.wait().ok(),
+
+fn settle_link_thread(slot: &Mutex<Option<JoinHandle<()>>>, end: Instant) -> Result<(), &'static str> {
+    loop {
+        let finished = lock_unpoisoned(slot).as_ref().map(JoinHandle::is_finished);
+        match finished {
+            None => return Ok(()),
+            Some(true) => break,
+            Some(false) if Instant::now() < end => thread::sleep(Duration::from_millis(1)),
+            _ => return Err("native pipe worker did not settle"),
+        }
+    }
+    let handle = lock_unpoisoned(slot).take();
+    handle.map_or(Ok(()), |handle| {
+        handle.join().map_err(|_| "native pipe worker panicked")
+    })
+}
+
+fn settle_owned_thread(slot: &mut Option<JoinHandle<()>>, end: Instant) -> Result<(), &'static str> {
+    while slot.as_ref().is_some_and(|handle| !handle.is_finished()) {
+        if Instant::now() >= end {
+            return Err("native pipe worker did not settle");
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    slot.take().map_or(Ok(()), |handle| {
+        handle.join().map_err(|_| "native pipe worker panicked")
+    })
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn child_exited(child: &Child) -> std::io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn child_exited(child: &Child) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+    }
+    match unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } {
+        0 => Ok(true),
+        258 => Ok(false),
+        _ => Err(std::io::Error::last_os_error()),
     }
 }
 
-fn terminate_and_reap(child: &mut Child) {
-    terminate_child_tree(child);
-    let _ = wait_child_after_termination(
-        child,
-        Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS),
-    );
+#[cfg(not(any(unix, windows)))]
+fn child_exited(_: &Child) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native process observation unavailable",
+    ))
 }
 
 /// Sole owner of one Windows job-object handle; `Drop` closes it.
@@ -3507,35 +3739,10 @@ fn terminate_and_reap(child: &mut Child) {
 struct OwnedJob(usize);
 
 #[cfg(windows)]
-impl OwnedJob {
-    /// Kills every process still in the job, without giving up ownership.
-    fn terminate(&self) {
-        terminate_job_handle(self.0);
-    }
-}
-
-#[cfg(windows)]
 impl Drop for OwnedJob {
     fn drop(&mut self) {
         close_job_handle(self.0);
     }
-}
-
-/// Binds a freshly created, still-suspended child to its job and then lets it
-/// run.
-///
-/// The order is the whole point, so it lives in one function rather than in a
-/// sequence of statements a later edit could reorder: the job is created and
-/// the process assigned to it while the child is frozen, and only then is the
-/// primary thread resumed. A child that cannot be resumed is not left frozen -
-/// returning here drops the job owner, whose close fires
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` on the whole tree, and the caller
-/// additionally reaps the direct child.
-#[cfg(windows)]
-fn contain_child(child: &Child, limits: &crate::launch::ResourceLimits) -> Result<OwnedJob, String> {
-    let job = create_job_for_child(child, limits)?;
-    resume_primary_thread(child.id())?;
-    Ok(job)
 }
 
 /// Resumes the threads of a child created with `CREATE_SUSPENDED`.
@@ -3779,17 +3986,6 @@ fn create_job_for_child(child: &Child, limits: &crate::launch::ResourceLimits) -
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn terminate_job_handle(handle: usize) {
-    use std::ffi::c_void;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn TerminateJobObject(job: *mut c_void, code: u32) -> i32;
-    }
-    let _ = unsafe { TerminateJobObject(handle as *mut c_void, 1) };
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
 fn close_job_handle(handle: usize) {
     use std::ffi::c_void;
     #[link(name = "kernel32")]
@@ -3800,33 +3996,86 @@ fn close_job_handle(handle: usize) {
 }
 
 #[cfg(unix)]
-fn terminate_child_tree(child: &mut Child) {
-    kill_process_group(child.id());
-    let _ = child.kill();
-}
-
-#[cfg(not(unix))]
-fn terminate_child_tree(child: &mut Child) {
-    let _ = child.kill();
-}
-
-#[cfg(unix)]
 #[allow(unsafe_code)]
-fn kill_process_group(pid: u32) {
-    // `killpg(0)` signals the CALLER's process group - this launcher, its shell
-    // and its session. Every caller passes a live `Child::id()`, and each kill
-    // precedes its reap so the pid cannot have been recycled, but a misdirected
-    // group kill is unrecoverable: refuse the values that could only ever mean
-    // "myself" or "init".
-    if pid <= 1 {
-        return;
+fn kill_group_checked(pid: u32) -> bool {
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return false;
     }
     unsafe extern "C" {
         fn killpg(pgrp: i32, sig: i32) -> i32;
     }
-    #[allow(unsafe_code)]
-    unsafe {
-        let _ = killpg(pid as i32, 9);
+    (unsafe { killpg(pid as i32, 9) == 0 }) || std::io::Error::last_os_error().raw_os_error() == Some(3)
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn wait_group_absent(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn killpg(pgrp: i32, sig: i32) -> i32;
+    }
+    let end = Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS);
+    loop {
+        if unsafe { killpg(pid as i32, 0) } != 0 {
+            return std::io::Error::last_os_error().raw_os_error() == Some(3);
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn terminate_job_checked(handle: usize) -> bool {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct Accounting {
+        user: i64,
+        kernel: i64,
+        period_user: i64,
+        period_kernel: i64,
+        faults: u32,
+        total: u32,
+        active: u32,
+        terminated: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn TerminateJobObject(job: *mut c_void, code: u32) -> i32;
+        fn QueryInformationJobObject(
+            job: *mut c_void,
+            class: i32,
+            info: *mut c_void,
+            length: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    if unsafe { TerminateJobObject(handle as *mut c_void, 1) } == 0 {
+        return false;
+    }
+    let end = Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS);
+    loop {
+        let mut accounting: Accounting = unsafe { std::mem::zeroed() };
+        if unsafe {
+            QueryInformationJobObject(
+                handle as *mut c_void,
+                1,
+                (&mut accounting as *mut Accounting).cast(),
+                std::mem::size_of::<Accounting>() as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return false;
+        }
+        if accounting.active == 0 {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -4013,7 +4262,7 @@ mod windows_containment {
     use std::process::{Child, Command, ExitStatus, Stdio};
     use std::time::{Duration, Instant};
 
-    use super::{contain_child, CommandExt, CREATE_SUSPENDED};
+    use super::{CommandExt, ContainedChildJob, CREATE_SUSPENDED};
     use crate::launch::ResourceLimits;
 
     /// Creates a frozen child the same way [`super::NativeWorker::spawn_inner`]
@@ -4052,7 +4301,9 @@ mod windows_containment {
             None,
             "a child created suspended must not run before it is contained"
         );
-        let job = contain_child(&child, &ResourceLimits::default()).expect("containment must succeed");
+        let job = ContainedChildJob::assign_suspended(&child, &ResourceLimits::default())
+            .expect("containment must succeed");
+        job.resume(&child).expect("the retained job resumes its child");
         let status =
             wait_bounded(&mut child, Duration::from_secs(10)).expect("a resumed child must reach its exit");
         assert_eq!(
@@ -4070,7 +4321,9 @@ mod windows_containment {
     #[test]
     fn dropping_the_job_owner_kills_the_contained_child() {
         let mut child = suspended(&["/c", "ping", "-n", "60", "127.0.0.1"]);
-        let job = contain_child(&child, &ResourceLimits::default()).expect("containment must succeed");
+        let job = ContainedChildJob::assign_suspended(&child, &ResourceLimits::default())
+            .expect("containment must succeed");
+        job.resume(&child).expect("the retained job resumes its child");
         assert_eq!(
             wait_bounded(&mut child, Duration::from_millis(300)),
             None,
@@ -4220,4 +4473,310 @@ mod view_credit_control {
         assert!(accept_credit(&reply(1), &credits));
         assert_eq!(credits.load(Ordering::Acquire), 0);
     }
+}
+
+/// Owns the same kill-on-close containment used by native workers.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct ContainedChildJob {
+    job: OwnedJob,
+    pid: u32,
+}
+
+#[cfg(windows)]
+impl ContainedChildJob {
+    pub fn prepare(command: &mut Command) {
+        command.creation_flags(CREATE_SUSPENDED);
+    }
+
+    /// Assigns without running guest instructions. Retain this owner before resume.
+    pub fn assign_suspended(child: &Child, limits: &crate::launch::ResourceLimits) -> Result<Self, String> {
+        create_job_for_child(child, limits).map(|job| Self { job, pid: child.id() })
+    }
+
+    pub fn resume(&self, child: &Child) -> Result<(), String> {
+        if child.id() != self.pid {
+            return Err("contained child ownership mismatch".into());
+        }
+        if child_exited(child).map_err(|_| "contained child observation failed".to_owned())? {
+            return Err("contained child exited before resume".into());
+        }
+        resume_primary_thread(self.pid)
+    }
+
+    pub fn terminate_and_wait(&self) -> Result<(), String> {
+        if terminate_job_checked(self.job.0) {
+            Ok(())
+        } else {
+            Err("contained process termination was not confirmed".into())
+        }
+    }
+}
+
+fn is_callback(envelope: &Envelope) -> bool {
+    !matches!(
+        envelope.payload,
+        Some(
+            Payload::HandshakeAck(_)
+                | Payload::Cancel(_)
+                | Payload::Shutdown(_)
+                | Payload::Flow(_)
+                | Payload::ResourceResponse(_)
+        )
+    )
+}
+
+fn observe_outbound(observations: &Mutex<VecDeque<ProtocolObservation>>, envelope: &Envelope) {
+    push_observation(
+        observations,
+        ProtocolObservation {
+            direction: "host->plugin",
+            kind: envelope_kind(envelope),
+            request_id: envelope.request_id,
+            connection_id: envelope.connection_id,
+            generation: envelope.generation,
+        },
+    );
+}
+
+#[cfg(all(test, unix))]
+mod checked_native_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn queued_callback_is_revoked_at_the_real_stdio_writer_but_shutdown_is_sent() {
+        let path = std::env::temp_dir().join(format!(
+            "crikey-native-writer-{}-{}",
+            std::process::id(),
+            ENDPOINT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "cat > \"$1\"", "native-writer-fixture"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let pending = Arc::new(AtomicUsize::new(2));
+        let revoked = Arc::new(AtomicU64::new(0));
+        let admission = NativeAdmission::default();
+        let envelope = |request_id, payload| Envelope {
+            connection_id: 1,
+            request_id,
+            generation: 0,
+            deadline_ms: 100,
+            payload: Some(payload),
+            unknown: Default::default(),
+        };
+        sender
+            .send(envelope(
+                1,
+                Payload::Suggest(message::SuggestRequest {
+                    text: "must-not-dispatch".into(),
+                    ..Default::default()
+                }),
+            ))
+            .unwrap();
+        sender
+            .send(envelope(2, Payload::Shutdown(message::Shutdown::default())))
+            .unwrap();
+        admission.close();
+        let writer = spawn_stdio_writer(
+            stdin,
+            receiver,
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&pending),
+            admission,
+            Arc::clone(&revoked),
+            Arc::new(Mutex::new(VecDeque::new())),
+        )
+        .unwrap();
+        drop(sender);
+        writer.join().unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        while !child_exited(&child).unwrap() {
+            assert!(Instant::now() < end, "the actual writer reader did not finish");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(kill_group_checked(child.id()));
+        assert!(wait_child_after_termination(&mut child, end).is_some());
+        assert_eq!(revoked.load(Ordering::Acquire), 1);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        let bytes = std::fs::read(&path).unwrap();
+        let mut input = std::io::Cursor::new(bytes);
+        let mut frame = Vec::new();
+        read_frame(&mut input, &mut frame).unwrap();
+        assert!(matches!(
+            Envelope::decode(&frame).unwrap().payload,
+            Some(Payload::Shutdown(_))
+        ));
+        assert!(read_frame(&mut input, &mut frame).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unconfirmed_live_exit_returns_without_consuming_child_ownership() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let started = Instant::now();
+        let result = wait_child_after_termination(&mut child, started + Duration::from_millis(20));
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!child_exited(&child).unwrap());
+        assert!(kill_group_checked(child.id()));
+        assert!(wait_child_after_termination(&mut child, Instant::now() + Duration::from_secs(5)).is_some());
+    }
+}
+
+#[cfg(windows)]
+type StartupJob = Option<OwnedJob>;
+#[cfg(not(windows))]
+type StartupJob = ();
+
+/// A child that physically exists even though startup did not yield a worker.
+/// The same supervisor registration retains it until checked settlement succeeds.
+#[derive(Debug)]
+pub(crate) struct NativeStartupOwner {
+    plugin: PluginId,
+    child: Child,
+    stderr: Option<JoinHandle<()>>,
+    link: Option<Arc<WorkerLink>>,
+    #[cfg(windows)]
+    job: StartupJob,
+    signalled: bool,
+    status: Option<std::process::ExitStatus>,
+    exit: Option<ExitRecord>,
+    thread_failure: Option<&'static str>,
+}
+
+impl NativeStartupOwner {
+    pub(crate) fn settle(&mut self) -> Result<ExitRecord, HostError> {
+        if let Some(exit) = &self.exit {
+            return Ok(exit.clone());
+        }
+        let plugin = &self.plugin;
+        let error = |detail: &'static str| HostError::PluginFailed {
+            plugin: plugin.clone(),
+            detail: detail.into(),
+        };
+        if let Some(detail) = self.thread_failure {
+            return Err(error(detail));
+        }
+        if let Some(link) = &self.link {
+            link.close();
+        }
+        if self.status.is_none() {
+            let _exited =
+                child_exited(&self.child).map_err(|_| error("native startup exit observation failed"))?;
+            if !self.signalled {
+                #[cfg(unix)]
+                let signalled = kill_group_checked(self.child.id());
+                #[cfg(windows)]
+                let signalled = match &self.job {
+                    Some(job) => terminate_job_checked(job.0),
+                    // A failed containment handoff never resumed the child.
+                    None => _exited || self.child.kill().is_ok(),
+                };
+                #[cfg(not(any(unix, windows)))]
+                let signalled = false;
+                if !signalled {
+                    return Err(error("native startup termination failed"));
+                }
+                self.signalled = true;
+            }
+            self.status = wait_child_after_termination(
+                &mut self.child,
+                Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS),
+            );
+            if self.status.is_none() {
+                return Err(error("native startup process reap was not confirmed"));
+            }
+        }
+        #[cfg(unix)]
+        if !wait_group_absent(self.child.id()) {
+            return Err(error("native startup process group remains owned"));
+        }
+        let end = Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS);
+        let pipes = if let Some(link) = &self.link {
+            [
+                settle_link_thread(&link.reader, end),
+                settle_link_thread(&link.writer_thread, end),
+            ]
+        } else {
+            [Ok(()), Ok(())]
+        };
+        let stderr = settle_owned_thread(&mut self.stderr, end);
+        let outcomes = [pipes[0], pipes[1], stderr];
+        if outcomes
+            .iter()
+            .any(|outcome| *outcome == Err("native pipe worker panicked"))
+        {
+            self.thread_failure = Some("native pipe worker panicked");
+        }
+        if let Some(detail) = self.thread_failure {
+            return Err(error(detail));
+        }
+        for outcome in outcomes {
+            outcome.map_err(error)?;
+        }
+        let status = self.status.expect("confirmed startup status");
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal = None;
+        let exit = ExitRecord {
+            kind: ExitKind::Crashed,
+            code: status.code(),
+            signal,
+            stderr_tail: String::new(),
+            failure_kind: Some(crikey_plugin_supervisor::FailureKind::Startup),
+        };
+        #[cfg(windows)]
+        self.job.take();
+        self.exit = Some(exit.clone());
+        Ok(exit)
+    }
+}
+
+impl Drop for NativeStartupOwner {
+    fn drop(&mut self) {
+        let _ = self.settle();
+    }
+}
+
+fn retain_failed_startup(
+    plugin: &PluginId,
+    child: Child,
+    stderr: Option<JoinHandle<()>>,
+    link: Option<Arc<WorkerLink>>,
+    _job: StartupJob,
+    retained: &mut Option<NativeStartupOwner>,
+) {
+    let mut owner = NativeStartupOwner {
+        plugin: plugin.clone(),
+        child,
+        stderr,
+        link,
+        #[cfg(windows)]
+        job: _job,
+        signalled: false,
+        status: None,
+        exit: None,
+        thread_failure: None,
+    };
+    let _ = owner.settle();
+    *retained = Some(owner);
 }

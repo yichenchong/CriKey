@@ -1122,6 +1122,25 @@ impl Plugin for ConformancePlugin {
     }
 
     fn stop(&mut self, _context: &dyn PluginContext) -> Result<()> {
+        if let Some(path) = std::env::var_os("CRIKEY_CONFORMANCE_STOP_FILE") {
+            std::fs::write(&path, b"started").expect("stop witness is writable");
+            if let Some(release) = std::env::var_os("CRIKEY_CONFORMANCE_STOP_RELEASE_FILE") {
+                let end = std::time::Instant::now() + Duration::from_secs(15);
+                while !std::path::Path::new(&release).is_file() {
+                    assert!(std::time::Instant::now() < end, "stop release did not arrive");
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+            if let Ok(delay) = std::env::var("CRIKEY_CONFORMANCE_STOP_DELAY_MS") {
+                thread::sleep(Duration::from_millis(
+                    delay.parse().expect("stop delay is numeric"),
+                ));
+            }
+            if std::env::var_os("CRIKEY_CONFORMANCE_CRASH_ON_STOP").is_some() {
+                std::process::exit(17);
+            }
+            std::fs::write(&path, b"finished").expect("stop witness is writable");
+        }
         Ok(())
     }
 }

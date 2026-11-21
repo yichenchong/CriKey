@@ -307,9 +307,12 @@ impl PageClosing {
     /// Waits for the closing notification to finish. Bounded by the child's
     /// own call deadline, and called only when a new page is being opened -
     /// never on the path that services a keystroke.
-    pub(crate) fn settle(mut self) {
-        if let Some(worker) = self.0.take() {
-            let _ = worker.join();
+    pub(crate) fn settle_checked(mut self) -> Result<(), crate::runtime_control::StopError> {
+        match self.0.take() {
+            Some(worker) => worker
+                .join()
+                .map_err(|_| crate::runtime_control::StopError::new("page-worker-panicked")),
+            None => Err(crate::runtime_control::StopError::new("page-worker-missing")),
         }
     }
 }
@@ -706,7 +709,7 @@ mod tests {
         /// production path deliberately does not wait for.
         fn close(&mut self) -> Option<PageUpdate> {
             let (update, closing) = self.session.take().expect("session is open").close();
-            closing.settle();
+            closing.settle_checked().expect("page worker settles");
             update
         }
     }
@@ -868,7 +871,7 @@ mod tests {
         assert_eq!(update.frame.generation, 1);
         // Releasing the reply channel lets the detached thread finish.
         drop(harness.replies);
-        closing.settle();
+        closing.settle_checked().expect("page worker settles");
     }
 
     #[test]

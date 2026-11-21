@@ -2365,3 +2365,74 @@ fn real_native_standard_routes_revoke_exact_revision_and_producer_without_root_f
         "dead route producer must never be reacquired"
     );
 }
+
+#[test]
+fn checked_native_stop_reaps_processes_and_reuses_the_closed_epoch() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("checked-stop");
+    let root = scratch.subdir("plugins");
+    let package = write_eager_native_plugin(&root, "checked", &conformance, "echo");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = NativeProvider::load(&mut pipeline, &[root], &DisabledPlugins::default());
+    let owner = native_plugin("checked");
+    assert!(provider.plugins().contains(&owner));
+    if let Some(present) = process_table_contains_working_dir(&package) {
+        assert!(present);
+    }
+    let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| ()));
+    let control = driver.control();
+    let epoch = std::num::NonZeroU64::new(41).unwrap();
+    let ticket = control.request_stop(epoch).unwrap();
+    assert!(!driver.action_executor().owns_item(&owner, &ItemId("echo".into())));
+    let proof = std::thread::spawn(move || ticket.wait()).join().unwrap().unwrap();
+    assert_eq!(proof.epoch(), epoch);
+    assert!(proof.owners().contains(&owner));
+    assert!(!proof.native_exits().is_empty());
+    assert!(proof
+        .native_exits()
+        .iter()
+        .all(|exit| exit.code.is_some() || exit.signal.is_some()));
+    if process_table_contains_working_dir(&package).is_some() {
+        assert!(wait_for_process_table_absence(&package));
+    }
+    let repeated = control.request_stop(epoch).unwrap().wait().unwrap();
+    assert_eq!(repeated.epoch(), proof.epoch());
+    assert_eq!(repeated.native_exits().len(), proof.native_exits().len());
+    assert!(control
+        .request_stop(std::num::NonZeroU64::new(42).unwrap())
+        .is_err());
+    assert!(driver.command_snapshot(&owner).is_none());
+    assert!(driver.take_outcome().is_none());
+}
+
+#[test]
+fn a_physically_settled_historical_native_crash_does_not_taint_stop() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("checked-crash");
+    let root = scratch.subdir("plugins");
+    let package = write_native_plugin(&root, "checkedcrash", &conformance, "crash-on-suggest");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[root],
+        ROW_DELIVERY_WINDOW,
+        &DisabledPlugins::default(),
+    );
+    let _ = provider.drive_query(&mut pipeline, "crash", 1);
+    let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| ()));
+    let control = driver.control();
+    let epoch = std::num::NonZeroU64::MIN;
+    let proof = control.request_stop(epoch).unwrap().wait().unwrap();
+    assert!(proof
+        .native_exits()
+        .iter()
+        .any(|exit| exit.kind == crikey_native_host::ExitKind::Crashed));
+    assert!(control.request_stop(epoch).unwrap().wait().is_ok());
+    assert!(matches!(
+        control.admission().state(),
+        crikey_app::runtime_control::PluginAdmission::Offline { .. }
+    ));
+    if process_table_contains_working_dir(&package).is_some() {
+        assert!(wait_for_process_table_absence(&package));
+    }
+}

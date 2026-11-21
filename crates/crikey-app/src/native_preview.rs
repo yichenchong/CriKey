@@ -21,6 +21,8 @@ pub(super) struct NativePreviewEndpoint {
     stopped: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     wake: WakeSlot,
+    admission: crate::runtime_control::AdmissionGate,
+    failed: Arc<AtomicBool>,
 }
 impl std::fmt::Debug for NativePreviewEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -32,6 +34,8 @@ impl NativePreviewEndpoint {
         let (sender, receiver) = mpsc::sync_channel::<Job>(1);
         let pending = Arc::new(Mutex::new(Vec::<(PreviewIdentity, Arc<CallControl>)>::new()));
         let stopped = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let thread_failed = Arc::clone(&failed);
         let thread_supervisors = provider.page_supervisors();
         let endpoint_gates = provider.action_gates();
         let gates = endpoint_gates.clone();
@@ -115,18 +119,18 @@ impl NativePreviewEndpoint {
                         }
                         worker.cancel_handle().reset();
                         job.control.install(worker.cancel_handle());
-                        let control = Arc::clone(&job.control);
-                        let watcher = std::thread::Builder::new()
-                            .name("crikey-preview-cancel".into())
-                            .spawn(move || control.watch_cancel())
-                            .map_err(|error| error.to_string())?;
+                        let watcher =
+                            CallWatcher::spawn(Arc::clone(&job.control), "crikey-preview-cancel".into())
+                                .map_err(|error| error.to_string())?;
                         let outcome = worker.preview_with_cancel_latched(
                             &identity.item.0,
                             identity.request,
                             &job.control.requested,
                         );
-                        job.control.finish();
-                        let _ = watcher.join();
+                        if watcher.settle().is_err() {
+                            thread_failed.store(true, Ordering::Release);
+                            return Err("native preview cancellation worker panicked".into());
+                        }
                         refresh_incarnation(&mut supervisor, &identity.plugin, &thread_incarnations);
                         if job.control.requested.load(Ordering::Acquire) {
                             return Ok(PreviewState::Cancelled);
@@ -161,6 +165,7 @@ impl NativePreviewEndpoint {
             });
         if spawned.is_err() {
             stopped.store(true, Ordering::Release);
+            failed.store(true, Ordering::Release);
         }
         Arc::new(Self {
             sender,
@@ -173,13 +178,15 @@ impl NativePreviewEndpoint {
             pending,
             stopped,
             worker: Mutex::new(spawned.ok()),
+            admission: provider.pool.admission.clone(),
+            failed,
             wake: WakeSlot::default(),
         })
     }
     pub(super) fn lifecycle_wake(&self) -> PageWake {
         self.wake.handle()
     }
-    pub(super) fn shutdown(&self) {
+    pub(super) fn request_stop(&self) {
         self.stopped.store(true, Ordering::Release);
         for (_, control) in self
             .pending
@@ -189,14 +196,23 @@ impl NativePreviewEndpoint {
         {
             control.cancel();
         }
-        if let Some(worker) = self
+    }
+    pub(super) fn settle(&self) -> Result<usize, crate::runtime_control::StopError> {
+        let worker = self
             .worker
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            let _ = worker.join();
+            .take();
+        let joined = usize::from(worker.is_some());
+        if let Some(worker) = worker {
+            if worker.join().is_err() {
+                self.failed.store(true, Ordering::Release);
+            }
         }
+        if self.failed.load(Ordering::Acquire) {
+            return Err(crate::runtime_control::StopError::new("preview-worker-failed"));
+        }
+        Ok(joined)
     }
 }
 impl PreviewDispatcher for NativePreviewEndpoint {
@@ -298,6 +314,10 @@ impl PreviewDispatcher for NativePreviewEndpoint {
         self.wake.install(wake);
     }
     fn submit(&self, request: PreviewRequest, publish: PreviewPublish) -> Result<(), String> {
+        let _admission = self
+            .admission
+            .admit()
+            .map_err(|_| "native preview admission closed".to_owned())?;
         let identity = request.identity.clone();
         if self.incarnation(&identity.plugin) != Some(identity.incarnation) {
             return Err("native preview incarnation unavailable".into());
@@ -430,6 +450,8 @@ mod tests {
         incarnations.insert(owner.clone(), source.producer);
         let (sender, receiver) = mpsc::sync_channel(1);
         let endpoint = NativePreviewEndpoint {
+            admission: crate::runtime_control::AdmissionGate::default(),
+            failed: Arc::new(AtomicBool::new(false)),
             sender,
             gates: BTreeMap::from([(
                 owner.clone(),

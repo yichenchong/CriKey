@@ -438,6 +438,7 @@ pub(crate) fn execution(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn enqueue<T>(
     sender: &SyncSender<ForegroundRequest<T>>,
+    admission_gate: &crate::runtime_control::AdmissionGate,
     gates: &BTreeMap<PluginId, Arc<PreviewActionGate>>,
     pending: &Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>,
     in_flight: &AtomicUsize,
@@ -502,7 +503,17 @@ pub(crate) fn enqueue<T>(
         #[cfg(test)]
         before_send: None,
     };
-    if let Err(error) = sender.try_send(ForegroundRequest::View(queued)) {
+    // Return the owned failed message out of the guard scope: its cleanup may
+    // reacquire route authority, whose final-delivery order is authority -> gate.
+    let sent = {
+        match admission_gate.admit() {
+            Ok(_admission) => sender.try_send(ForegroundRequest::View(queued)),
+            Err(_) => Err(std::sync::mpsc::TrySendError::Disconnected(
+                ForegroundRequest::View(queued),
+            )),
+        }
+    };
+    if let Err(error) = sent {
         let queued = match error {
             std::sync::mpsc::TrySendError::Full(v) | std::sync::mpsc::TrySendError::Disconnected(v) => v,
         };

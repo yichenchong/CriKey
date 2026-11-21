@@ -17,6 +17,7 @@ use crikey_platform::IconImage;
 pub mod action_panel;
 mod native;
 pub mod navigation;
+pub mod settings_management;
 pub mod standard_view;
 mod typed_input;
 pub use typed_input::{next_inline_input_revision, InlineArguments, TypedInputSubmission};
@@ -513,6 +514,7 @@ pub struct ViewModel {
 /// Not [`Eq`]: a page input carries pointer coordinates, which are floats.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiCommand {
+    ManageSettings(settings_management::Request),
     StandardSelect {
         context: crikey_core::structured_view::ViewExecutionContext,
         target: crikey_core::structured_arguments::OwnedItem,
@@ -659,6 +661,7 @@ pub const PAGE_SIZE: usize = 8;
 /// Not [`Eq`], for the same reason [`UiCommand`] is not.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiEffect {
+    ManageSettings(settings_management::Request),
     ExecuteStandard {
         owner: PluginId,
         context: crikey_core::structured_view::ViewExecutionContext,
@@ -871,6 +874,7 @@ pub struct LauncherViewModel {
     /// the renderer, which is why this survives `dismiss`.
     settings: Arc<[SettingRow]>,
     setting_edits: Arc<[SettingEditOutcome]>,
+    settings_management: Arc<settings_management::Panel>,
     /// The setting an opening surface should put the keyboard in, by key.
     settings_focus: Option<String>,
     /// The plugin-drawn page the launcher is showing, if any (spec 32).
@@ -967,6 +971,7 @@ impl LauncherViewModel {
             settings_open: false,
             settings: Arc::default(),
             setting_edits: Arc::default(),
+            settings_management: Arc::default(),
             settings_focus: None,
             page: None,
             show_hints: true,
@@ -1447,6 +1452,7 @@ impl LauncherViewModel {
 
     fn navigation_presentation(&self) -> NavigationPresentation {
         NavigationPresentation {
+            settings_management: self.settings_management.clone(),
             standard: self.standard.clone(),
             standard_refresh_pending: self.standard_refresh_pending,
             scopes: self.scope_choices.clone(),
@@ -2310,6 +2316,7 @@ impl LauncherViewModel {
                 self.close_page();
                 Some(UiEffect::ClosePage)
             }
+            UiCommand::ManageSettings(request) => Some(UiEffect::ManageSettings(request)),
             UiCommand::SetSetting {
                 request_id,
                 key,
@@ -2497,6 +2504,14 @@ impl LauncherViewModel {
             edits.push(outcome);
         }
         self.setting_edits = edits.into();
+        self.dirty |= self.visible;
+    }
+
+    pub fn set_settings_management(&mut self, panel: settings_management::Panel) {
+        if self.settings_management.as_ref() == &panel {
+            return;
+        }
+        self.settings_management = Arc::new(panel);
         self.dirty |= self.visible;
     }
 

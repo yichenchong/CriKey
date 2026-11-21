@@ -317,6 +317,7 @@ fn build_launcher_frame_with_transparency(
     editor: &mut crate::typed_input::TypedEditor,
     typed_submissions: &mut Vec<crate::TypedInputSubmission>,
 ) -> NativeUiFrame {
+    crate::settings_management::retire_editors(context, model);
     if !native_web_input
         && model.page.as_ref().is_some_and(|page| {
             page.frame.web.is_some() && page.web_surface_id.is_some_and(|surface_id| surface_id != 0)
@@ -1495,6 +1496,11 @@ where
         let Some(session) = self.active_session else {
             return;
         };
+        if matches!(&command, UiCommand::Quit) {
+            if let Some(graphics) = &self.graphics {
+                crate::settings_management::clear_editors(&graphics.egui_context);
+            }
+        }
         if matches!(
             &command,
             UiCommand::Dismiss
@@ -1508,6 +1514,11 @@ where
         (self.on_event)(NativeLauncherEvent::Command { session, command });
         if self.accept_latest_frame(session, false) {
             self.request_redraw();
+        }
+        if self.frame.as_ref().is_none_or(|frame| !frame.settings_open) {
+            if let Some(graphics) = &self.graphics {
+                crate::settings_management::clear_editors(&graphics.egui_context);
+            }
         }
         event_loop.set_control_flow(ControlFlow::Wait);
     }
@@ -2674,6 +2685,7 @@ impl GraphicsState {
 
     fn hide(&mut self) {
         self.typed_editor.clear();
+        crate::settings_management::clear_editors(&self.egui_context);
         self.window.set_ime_allowed(false);
         self.window.set_visible(false);
         for id in release_launcher_textures(&self.egui_context) {
@@ -5561,6 +5573,13 @@ fn draw_settings(
                 });
             });
             ui.add_space(theme::SPACE_2);
+            crate::settings_management::draw(
+                ui,
+                &model.navigation.settings_management,
+                &model.setting_edits,
+                model.settings_focus.as_deref(),
+                commands,
+            );
             if ui.button("Clear query history").clicked() {
                 commands.push(UiCommand::ClearQueryHistory);
             }
@@ -5621,7 +5640,11 @@ fn draw_settings(
                         .color(colors.text_muted),
                 );
             }
-            for row in model.settings.iter() {
+            for row in model
+                .settings
+                .iter()
+                .filter(|_| model.navigation.settings_management.schema == 0)
+            {
                 draw_setting_row(
                     ui,
                     row,

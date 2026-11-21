@@ -308,7 +308,14 @@ pub(crate) fn test_legacy_compat(args: &[String]) -> ExitCode {
         mut checks,
         obsolete_callback,
         undocumented,
+        mut retained_worker,
     } = run_conformance(&package, &interpreter);
+    if let Some(worker) = retained_worker.as_mut() {
+        if worker.shutdown().is_err() {
+            eprintln!("crikey: dev {command}: legacy-worker-teardown-failed");
+            return ExitCode::from(EX_SOFTWARE);
+        }
+    }
     classify_portability(&mut checks, dependency.as_deref());
 
     // The verdict is folded out of the very results the report prints, so the
@@ -425,8 +432,11 @@ pub(crate) fn inspect_catalog(args: &[String]) -> ExitCode {
 
     let items = match publish_catalog(&package, &interpreter) {
         Ok(items) => items,
-        Err(message) => {
-            eprintln!("crikey: dev {command}: `{package_path}`: {message}");
+        Err(mut failure) => {
+            if let Some(worker) = failure.worker.as_mut() {
+                let _ = worker.shutdown();
+            }
+            eprintln!("crikey: dev {command}: {}", failure.message);
             return ExitCode::from(EX_SOFTWARE);
         }
     };
@@ -750,19 +760,34 @@ fn published_items(outcome: &LegacyOutcome) -> Option<&[Item]> {
 
 /// Starts the plugin in a child interpreter and returns the catalog it
 /// publishes.
-fn publish_catalog(package: &LegacyPackage, interpreter: &Interpreter) -> Result<Vec<Item>, String> {
+#[derive(Debug)]
+struct CatalogFailure {
+    message: &'static str,
+    worker: Option<LegacyWorker>,
+}
+
+fn publish_catalog(package: &LegacyPackage, interpreter: &Interpreter) -> Result<Vec<Item>, CatalogFailure> {
     let plugin = plugin_of(package);
-    let mut worker = LegacyWorker::spawn(interpreter, package, worker_options(&plugin)?)
-        .map_err(|error| format!("the legacy worker did not start: {error}"))?;
-
+    let options = worker_options(&plugin).map_err(|_| CatalogFailure {
+        message: "legacy-worker-options-unavailable",
+        worker: None,
+    })?;
+    let mut worker =
+        LegacyWorker::spawn(interpreter, package, options).map_err(|failure| CatalogFailure {
+            message: "legacy-worker-startup-failed",
+            worker: failure.worker,
+        })?;
     let collected = catalog_of(&mut worker, &plugin);
-
-    if let Err(error) = worker.shutdown() {
-        // Reported, never fatal: the catalog is already in hand, and a package
-        // whose teardown is untidy still has a catalog worth showing.
-        eprintln!("crikey: dev inspect-catalog: worker shutdown: {error}");
+    if worker.shutdown().is_err() {
+        return Err(CatalogFailure {
+            message: "legacy-worker-teardown-failed",
+            worker: Some(worker),
+        });
     }
-    collected
+    collected.map_err(|_| CatalogFailure {
+        message: "legacy-catalog-callback-failed",
+        worker: None,
+    })
 }
 
 /// Runs the two callbacks a catalog needs, in the only order that is correct.
@@ -1163,14 +1188,16 @@ impl LegacyWorkerHandle for SuiteWorker {
     }
 
     fn stop(&mut self, _at_ms: Millis, _budget_ms: Millis) -> Result<(), WorkerError> {
-        if let Some(worker) = self.worker.take() {
+        if let Some(worker) = self.worker.as_mut() {
             if let Err(error) = worker.shutdown() {
                 self.log
                     .borrow_mut()
                     .errors
-                    .push(format!("worker shutdown failed: {error}"));
+                    .push("legacy-worker-teardown-failed".to_owned());
+                return Err(error);
             }
         }
+        self.worker = None;
         Ok(())
     }
 }
@@ -1191,6 +1218,7 @@ struct ConformanceRun {
     obsolete_callback: Option<CallbackObservation>,
     /// Undocumented-API reaches the shim attributed to the plugin (spec 14.12).
     undocumented: Vec<(String, String)>,
+    retained_worker: Option<LegacyWorker>,
 }
 
 impl ConformanceRun {
@@ -1200,6 +1228,7 @@ impl ConformanceRun {
             checks,
             obsolete_callback: None,
             undocumented: Vec::new(),
+            retained_worker: None,
         }
     }
 }
@@ -1256,11 +1285,10 @@ fn run_conformance(package: &LegacyPackage, interpreter: &Interpreter) -> Confor
     };
     let worker = match LegacyWorker::spawn(interpreter, package, options) {
         Ok(worker) => worker,
-        Err(error) => {
-            return ConformanceRun::only_checks(unrunnable(
-                checks,
-                &format!("the legacy worker did not start: {error}"),
-            ))
+        Err(failure) => {
+            let mut run = ConformanceRun::only_checks(unrunnable(checks, "legacy-worker-startup-failed"));
+            run.retained_worker = failure.worker;
+            return run;
         }
     };
 
@@ -1299,13 +1327,14 @@ fn run_conformance(package: &LegacyPackage, interpreter: &Interpreter) -> Confor
     let booted = runtime.tick(T_BOOT).len();
     let boot_deliveries = driver.settle(&mut runtime, T_BOOT).len();
     if booted == 0 || boot_deliveries == 0 {
-        // The child is reaped even on the path that gives up, so a developer
-        // command can never leave an orphaned interpreter behind (spec 24.3).
+        // Retain failed physical cleanup through the developer command root.
         let _ = runtime.shutdown(T_BOOT);
-        return ConformanceRun::only_checks(unrunnable(
+        let mut run = ConformanceRun::only_checks(unrunnable(
             checks,
             "the plugin's one-time on_start never crossed the worker boundary",
         ));
+        run.retained_worker = runtime.worker_mut().worker.take();
+        return run;
     }
 
     // -- repeated on_catalog (spec 14.8) -----------------------------------
@@ -1682,6 +1711,7 @@ fn run_conformance(package: &LegacyPackage, interpreter: &Interpreter) -> Confor
         checks,
         obsolete_callback,
         undocumented,
+        retained_worker: runtime.worker_mut().worker.take(),
     }
 }
 

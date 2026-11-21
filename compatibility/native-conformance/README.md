@@ -37,6 +37,14 @@ Mode selection is identical in both binaries: `CRIKEY_CONFORMANCE_MODE`, then
 |  | `bad-token` | Handshakes with a deliberately wrong session token. |
 |  | `hang` | Completes the handshake and then never answers requests. |
 
+Shutdown tests may set `CRIKEY_CONFORMANCE_STOP_FILE` to a private witness path.
+The real SDK stop callback writes `started`, then `finished`; optional
+`CRIKEY_CONFORMANCE_STOP_DELAY_MS` delays completion,
+`CRIKEY_CONFORMANCE_STOP_RELEASE_FILE` holds the callback until a release file exists, and
+`CRIKEY_CONFORMANCE_CRASH_ON_STOP` exits from that callback. These witnesses
+distinguish graceful finalization, bounded forced cleanup, and loss of control
+during checked shutdown.
+
 The acceptance helper builds this workspace with:
 
 ```text

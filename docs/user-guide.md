@@ -63,9 +63,21 @@ crikey settings
 crikey settings set launcher.activation-hotkey Ctrl+Alt+K
 ```
 
-Both write the user-global layer, so the panel and the command line always
-agree. A hotkey the desktop refuses leaves the previous one working and says
-so rather than leaving the launcher unreachable.
+Launcher-setting edits write the user-global layer. A hotkey the desktop
+refuses leaves the previous one working and reports the refusal.
+
+Settings search matches launcher and schema-backed plugin metadata, not stored
+values, defaults or secret declarations. Browse a plugin to edit its declared
+fields; plugin edits target its own user-plugin file rather than copying
+effective profile or session values into the global file. Legacy plugins retain
+their own configuration mechanism.
+
+Rows distinguish the effective value, its source and restart requirements.
+Higher-priority layers can shadow a saved edit. External changes or changed
+schemas invalidate stale drafts: refresh and explicitly retry rather than
+overwriting another edit. A saved value whose effective reload failed is
+reported separately from a write that never persisted. Secret inputs are
+masked and retired on save, discard or leaving their editor.
 
 With results visible, the footer shows the current primary action and
 **Actions**; result navigation remains Up/Down, Tab to complete and Escape to
@@ -641,6 +653,19 @@ manifest, runtime, scheduling, concurrency, and legacy compatibility findings;
 exit status 1 means a degraded plugin. An indexed install checks the published
 package digest and signer policy. A package without a compatible platform
 entrypoint is reported unavailable rather than loaded.
+
+Settings also provides package inspection and background operations. Install
+and remove require confirmation and stop **all third-party runtimes** before
+changing packages, including unrelated plugins. They remain offline until the
+next launcher start; built-in search, Settings and activation remain available.
+Failure to confirm physical teardown refuses the mutation and keeps plugin
+admission closed. Closing Settings does not cancel a running operation.
+
+Cancellation is a request, not rollback: an operation already committing may no
+longer be cancellable. Its terminal result reports the actual package/config
+state and whether another launch is required. Enable/disable is a serialized
+configuration change for the next launch, not live activation. Quit waits for
+running jobs and owned runtime teardown before releasing the launcher lock.
 
 For package authors and operators, package operations are explicit:
 

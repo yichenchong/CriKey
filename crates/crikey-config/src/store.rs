@@ -155,6 +155,8 @@ pub struct ConfigStore {
     /// Registered `[configuration]` schemas, by plugin id. The only thing that
     /// knows which keys hold secrets.
     schemas: BTreeMap<String, ConfigurationSection>,
+    /// Exact discovered owners authorized to edit their own user documents.
+    discovered_schemas: BTreeMap<String, crate::DiscoveredSchema>,
     /// Whether a plugin key with no registered schema must be treated as secret.
     ///
     /// Set by [`Self::redact_unregistered_plugins`] when schema discovery was
@@ -234,6 +236,7 @@ impl ConfigStore {
             config_path: config_path.clone(),
             sources: Vec::new(),
             schemas: BTreeMap::new(),
+            discovered_schemas: BTreeMap::new(),
             redact_unregistered: false,
             revision: Default::default(),
             directories: directories.clone(),
@@ -541,6 +544,66 @@ impl ConfigStore {
         self.revision.session = self.layers[ConfigLayer::SessionOverride.index()].clone();
     }
 
+    /// Compares exact discovered declaration/owner identities, not values or sources.
+    pub fn same_discovered_schemas(&self, other: &Self) -> bool {
+        self.revision.schema_owners == other.revision.schema_owners
+    }
+
+    /// Replace discovery as one complete snapshot, removing vanished owners.
+    /// Returns structured validation failures; callers must redact diagnostics.
+    pub fn replace_discovered_schemas(&mut self, owners: &[crate::DiscoveredSchema]) -> Vec<ConfigError> {
+        self.schemas.clear();
+        self.discovered_schemas.clear();
+        self.revision.schema_owners.clear();
+        self.layers[ConfigLayer::PluginDefaults.index()].clear();
+        self.redact_unregistered = true;
+        owners
+            .iter()
+            .flat_map(|owner| self.register_discovered_schema(owner))
+            .collect()
+    }
+    /// Registers an exact discovered owner for plugin-user transactions.
+    /// Section-only registration deliberately does not authorize file edits.
+    pub fn register_discovered_schema(&mut self, owner: &crate::DiscoveredSchema) -> Vec<ConfigError> {
+        let signature = match toml::to_string(&owner.section) {
+            Ok(signature) => signature,
+            Err(source) => {
+                return vec![ConfigError::Serialize {
+                    path: owner.package.join("crikey.toml"),
+                    source,
+                }]
+            }
+        };
+        let manifest = owner.package.join("crikey.toml");
+        match crate::persistence::SourceState::read(&manifest) {
+            Ok(source) => {
+                if let Some(bytes) = source.bytes.as_deref() {
+                    let actual = std::str::from_utf8(bytes)
+                        .ok()
+                        .and_then(|text| crikey_plugin_model::Manifest::parse(text).ok());
+                    let matches = actual.is_some_and(|manifest| {
+                        toml::to_string(&manifest.configuration).ok().as_deref() == Some(signature.as_str())
+                    });
+                    if !matches {
+                        return vec![ConfigError::Conflict];
+                    }
+                }
+                self.revision.sources.insert(manifest.clone(), source);
+                if !self.sources.contains(&manifest) {
+                    self.sources.push(manifest);
+                }
+            }
+            Err(error) => return vec![error],
+        }
+        let problems = self.register_plugin_schema(&owner.plugin, &owner.section);
+        self.revision
+            .schema_owners
+            .insert(owner.plugin.0.clone(), (owner.package.clone(), signature));
+        self.discovered_schemas
+            .insert(owner.plugin.0.clone(), owner.clone());
+        problems
+    }
+
     /// Installs `section`'s defaults and validates the values already loaded
     /// against it (spec 21.3), for the platform this process runs on.
     pub fn register_plugin_schema(
@@ -572,6 +635,8 @@ impl ConfigStore {
         section: &ConfigurationSection,
         os: &str,
     ) -> Vec<ConfigError> {
+        self.discovered_schemas.remove(&plugin.0);
+        self.revision.schema_owners.remove(&plugin.0);
         let mut problems = Vec::new();
         let prefix = format!("{PLUGINS_PREFIX}{}{SETTINGS_MARKER}", plugin.0);
 
@@ -735,7 +800,11 @@ impl ConfigStore {
     /// Prefer `commit_user_global` when editing a published store: setters stage
     /// drafts immediately, whereas that method publishes only after success.
     pub fn save(&mut self) -> Result<(), ConfigError> {
-        let lock = crate::persistence::writer_lock(&self.config_path)?;
+        let _lock = crate::persistence::writer_lock(&self.config_path)?;
+        self.save_locked()
+    }
+
+    fn save_locked(&mut self) -> Result<(), ConfigError> {
         self.revision.check()?;
         // Freshly load retained layers while holding the writer lock.
         let mut validation = self.reload()?;
@@ -800,8 +869,30 @@ impl ConfigStore {
         crate::persistence::atomic_write(&self.config_path, text.as_bytes(), &validation.revision)?;
         let reloaded = self.reload().map_err(|_| ConfigError::PersistedReload)?;
         *self = reloaded;
-        drop(lock);
         Ok(())
+    }
+
+    /// Fresh read/change/save/effective reload under the existing writer lock.
+    /// The resident configuration worker is the sole caller/publication owner.
+    pub fn commit_plugin_enabled(&mut self, plugin: &PluginId, enabled: bool) -> Result<(), ConfigError> {
+        let _lock = crate::persistence::writer_lock(&self.config_path)?;
+        let mut fresh = self.reload()?;
+        fresh.set_user_global(
+            &format!("plugins.{}.enabled", plugin.0),
+            if enabled { "true" } else { "false" },
+        );
+        fresh.save_locked()?;
+        *self = fresh;
+        Ok(())
+    }
+
+    /// Fresh retained-input read before replacing the complete discovered schema set.
+    pub fn reload_unregistered(&self) -> Result<Self, ConfigError> {
+        let overrides: Vec<_> = self.layers[ConfigLayer::SessionOverride.index()]
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        Self::load_with_overrides(&self.directories, self.policy.as_deref(), &overrides)
     }
 
     /// Reloads retained directories, policy, session values and plugin schemas.
@@ -839,6 +930,13 @@ impl ConfigStore {
         let mut store = Self::load_with_overrides(&self.directories, self.policy.as_deref(), overrides)?;
         for (plugin, schema) in &self.schemas {
             store.register_plugin_schema(&PluginId(plugin.clone()), schema);
+        }
+        for owner in self.discovered_schemas.values() {
+            let path = owner.package.join("crikey.toml");
+            if self.revision.sources.get(&path) != Some(&crate::persistence::SourceState::read(&path)?) {
+                return Err(ConfigError::Conflict);
+            }
+            let _ = store.register_discovered_schema(owner);
         }
         store.redact_unregistered = self.redact_unregistered;
         Ok(store)
@@ -882,6 +980,155 @@ impl ConfigStore {
         candidate.set_user_global(key, value);
         candidate.save()?;
         *self = candidate;
+        Ok(())
+    }
+
+    /// Commits one declared field to `plugins/<namespaced-id>.toml` (UserPlugin),
+    /// not the weaker global layer. `field` is the schema-relative field name.
+    ///
+    /// Call only on the serialized configuration worker: takes the same blocking
+    /// cross-process lock as `save`, with no independent store or polling owner.
+    /// The caller must retain the exact discovered owner with its draft and
+    /// re-register discovery replacements before admission. Unregistered owners
+    /// are unavailable; changed owner/schema or source revisions are conflicts.
+    /// Success publishes a full retained-input reload. `PersistedReload` means
+    /// disk was committed but this store remains unchanged; reload before retry.
+    /// External editors racing the final check/rename cannot be excluded.
+    pub fn commit_plugin_user(
+        &mut self,
+        owner: &crate::DiscoveredSchema,
+        field: &str,
+        value: &str,
+        expected: &crate::ConfigRevision,
+    ) -> Result<(), ConfigError> {
+        self.commit_plugin_user_with_reload(owner, field, value, expected, Self::reload)
+    }
+
+    fn commit_plugin_user_with_reload(
+        &mut self,
+        owner: &crate::DiscoveredSchema,
+        field: &str,
+        value: &str,
+        expected: &crate::ConfigRevision,
+        reload: impl FnOnce(&Self) -> Result<Self, ConfigError>,
+    ) -> Result<(), ConfigError> {
+        let unavailable = || ConfigError::Setting {
+            key: format!("plugins.{}.settings.{field}", owner.plugin.0),
+            reason: "configuration field or discovered owner is unavailable",
+        };
+        if &self.revision != expected {
+            return Err(ConfigError::Conflict);
+        }
+        let registered = self
+            .discovered_schemas
+            .get(&owner.plugin.0)
+            .ok_or_else(unavailable)?;
+        let path = self
+            .directories
+            .config_dir()
+            .join(PLUGIN_DIRECTORY)
+            .join(format!("{}.toml", owner.plugin.0));
+        let signature = toml::to_string(&owner.section).map_err(|source| ConfigError::Serialize {
+            path: path.clone(),
+            source,
+        })?;
+        if registered.package != owner.package
+            || self
+                .revision
+                .schema_owners
+                .get(&owner.plugin.0)
+                .is_none_or(|(_, registered)| registered != &signature)
+        {
+            return Err(ConfigError::Conflict);
+        }
+        // Portable single-component spelling; rejects separators, drive names,
+        // traversal, alternate streams and trailing-dot aliases on Windows.
+        let namespace = owner.plugin.0.split('.').next().unwrap_or_default();
+        const RESERVED: &[&str] = &[
+            "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+            "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+        ];
+        if !owner.plugin.0.contains('.')
+            || owner.plugin.0.split('.').any(|part| {
+                part.is_empty()
+                    || !part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            })
+            || RESERVED
+                .iter()
+                .any(|reserved| namespace.eq_ignore_ascii_case(reserved))
+        {
+            return Err(unavailable());
+        }
+        let declaration = registered
+            .section
+            .field(field)
+            .filter(|declaration| declaration.applies_to(std::env::consts::OS))
+            .ok_or_else(unavailable)?;
+        declaration
+            .validate(value)
+            .map_err(|violation| ConfigError::Schema {
+                plugin: owner.plugin.0.clone(),
+                violation,
+            })?;
+        let _lock = crate::persistence::writer_lock(&self.config_path)?;
+        self.revision.check()?;
+        let directory = path.parent().expect("plugin document has a parent");
+        crate::persistence::check_plugin_path(directory, true)?;
+        crate::persistence::check_plugin_path(&path, false)?;
+        // Read the actual raw document, not the schema-filtered effective map:
+        // invalid/unknown unrelated fields must survive this single-field edit.
+        let mut flat = BTreeMap::new();
+        if let Some(bytes) = self
+            .revision
+            .sources
+            .get(&path)
+            .and_then(|state| state.bytes.as_deref())
+        {
+            let text = std::str::from_utf8(bytes).map_err(|_| ConfigError::Read {
+                path: path.clone(),
+                source: std::io::Error::other("configuration is not UTF-8"),
+            })?;
+            let table: toml::Table = text
+                .parse()
+                .map_err(|source: toml::de::Error| ConfigError::parse(&path, text, &source))?;
+            tomlmap::flatten(&table, "", &path, &mut flat)?;
+        }
+        flat.insert(format!("settings.{field}"), value.to_owned());
+        let nested = tomlmap::nest(&flat, &path)?;
+        let text = toml::to_string_pretty(&nested).map_err(|source| ConfigError::Serialize {
+            path: path.clone(),
+            source,
+        })?;
+        self.revision.check()?;
+        let mut persistence_revision = self.revision.clone();
+        if !directory.exists() {
+            std::fs::create_dir(directory).map_err(|source| ConfigError::Write {
+                path: directory.to_path_buf(),
+                source,
+            })?;
+            let state = crate::persistence::SourceState::read(directory)?;
+            if !state.is_directory || !state.entries.is_empty() {
+                return Err(ConfigError::Conflict);
+            }
+            persistence_revision
+                .sources
+                .insert(directory.to_path_buf(), state);
+        }
+        crate::persistence::check_plugin_path(directory, true)?;
+        crate::persistence::check_plugin_path(&path, false)?;
+        // Stage outside the watched plugin directory: creating the temporary
+        // file there would itself invalidate its exact directory revision.
+        crate::persistence::atomic_write_in(
+            &path,
+            text.as_bytes(),
+            &persistence_revision,
+            self.directories.config_dir(),
+            true,
+        )?;
+        let reloaded = reload(self).map_err(|_| ConfigError::PersistedReload)?;
+        *self = reloaded;
         Ok(())
     }
 }
@@ -972,6 +1219,53 @@ fn valid_profile_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_persisted_reload_failure_keeps_publication_but_not_the_old_disk() {
+        use crikey_platform::DirectoryEnvironment;
+        let root = tempfile::tempdir().unwrap();
+        let environment = [
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "CRIKEY_CONFIG_DIR",
+            "CRIKEY_DATA_DIR",
+            "CRIKEY_CACHE_DIR",
+            "CRIKEY_STATE_DIR",
+        ]
+        .into_iter()
+        .fold(DirectoryEnvironment::new(), |environment, key| {
+            environment.set(key, root.path().as_os_str())
+        });
+        let directories = StandardDirectories::resolve(DirectoryConvention::current(), &environment).unwrap();
+        let mut store = ConfigStore::load_with_policy(&directories, None).unwrap();
+        let owner = crate::DiscoveredSchema {
+            plugin: PluginId("modern.example".into()),
+            package: root.path().join("package"),
+            section: toml::from_str("[[field]]\nname = \"value\"\ndefault = \"old\"\n").unwrap(),
+        };
+        assert!(store.register_discovered_schema(&owner).is_empty());
+        let expected = store.revision();
+        let result = store.commit_plugin_user_with_reload(&owner, "value", "new", &expected, |store| {
+            assert!(store
+                .directories
+                .config_dir()
+                .join("plugins/modern.example.toml")
+                .is_file());
+            std::fs::write(store.config_path(), "[launcher]\nvalue = [invalid\n").unwrap();
+            store.reload()
+        });
+        assert!(matches!(result, Err(ConfigError::PersistedReload)));
+        assert_eq!(store.revision(), expected);
+        assert_eq!(store.get("plugins.modern.example.settings.value"), Some("old"));
+        std::fs::remove_file(store.config_path()).unwrap();
+        let consumer = store.reload().unwrap();
+        assert_eq!(consumer.get("plugins.modern.example.settings.value"), Some("new"));
+        assert_eq!(
+            consumer.layer_of("plugins.modern.example.settings.value"),
+            Some(ConfigLayer::UserPlugin)
+        );
+    }
 
     #[test]
     fn the_wire_spelling_matches_the_manifest_models_serde_spelling() {

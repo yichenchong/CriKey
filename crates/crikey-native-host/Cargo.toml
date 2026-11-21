@@ -21,3 +21,6 @@ crikey-sandbox.workspace = true
 # Session tokens and endpoint names come from the workspace's one CSPRNG; see
 # the `getrandom` note in the root manifest.
 getrandom.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
