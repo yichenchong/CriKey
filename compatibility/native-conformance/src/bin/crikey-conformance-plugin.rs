@@ -56,6 +56,7 @@ enum Mode {
     Sequence,
     Icon,
     IconSlow,
+    IconGated,
     IconSilent,
     /// Publishes the interactive demo page and nothing else, so the surface a
     /// host draws is attributable to exactly one item.
@@ -98,6 +99,7 @@ fn parse_mode(spec: &str) -> Mode {
         "sequence" => Mode::Sequence,
         "icon" => Mode::Icon,
         "icon-slow" => Mode::IconSlow,
+        "icon-gated" => Mode::IconGated,
         "icon-silent" => Mode::IconSilent,
         "page" => Mode::Page,
         "typed" => Mode::Typed { changed: false },
@@ -1067,6 +1069,7 @@ impl Plugin for ConformancePlugin {
             Mode::Sequence => Err(invalid("sequence mode must be resolved before serving")),
             Mode::Icon => emit_final(sink, icon_items()),
             Mode::IconSlow => emit_final(sink, vec![icon_item("icon-after-window", ICON_AFTER_WINDOW)]),
+            Mode::IconGated => emit_final(sink, vec![icon_item("icon-gated", ICON_SERVED)]),
             Mode::IconSilent => emit_final(sink, vec![icon_item("icon-never", ICON_NEVER)]),
             Mode::Page => emit_final(sink, vec![page_item()]),
             Mode::Typed { .. } | Mode::TypedPrivacy | Mode::TypedInvalidFailure => emit_final(
@@ -1136,7 +1139,10 @@ impl Plugin for ConformancePlugin {
         reference: &str,
         _context: &dyn PluginContext,
     ) -> Result<Option<PluginResource>> {
-        if !matches!(self.mode, Mode::Icon | Mode::IconSlow | Mode::IconSilent) || kind != ResourceKind::Icon
+        if !matches!(
+            self.mode,
+            Mode::Icon | Mode::IconSlow | Mode::IconGated | Mode::IconSilent
+        ) || kind != ResourceKind::Icon
         {
             return Ok(None);
         }
@@ -1157,6 +1163,11 @@ impl Plugin for ConformancePlugin {
             }
             _ => return Ok(None),
         };
+        if matches!(self.mode, Mode::IconGated) {
+            let path = fs::read_to_string("icon-startup-gate").expect("resource gate is configured");
+            fs::write(PathBuf::from(path).join("served"), std::process::id().to_string())
+                .expect("resource server witness is writable");
+        }
         Ok(Some(PluginResource {
             content,
             media_type: "image/svg+xml".to_owned(),
@@ -1192,6 +1203,31 @@ fn run() -> Result<(), SdkError> {
         Mode::Sequence => sequence_stage(),
         mode => mode,
     };
+    if matches!(mode, Mode::IconGated) {
+        // Installed only after the eager query child is running. Thus the
+        // resource child's cold startup holds its real supervisor mutex,
+        // without spending the subsequent resource-request deadline.
+        if let Ok(path) = fs::read_to_string("icon-startup-gate") {
+            let gate = PathBuf::from(path);
+            let pid = std::process::id().to_string();
+            let release = gate.join("release");
+            let probe = gate.join("probe");
+            let mut witnessed_hold = false;
+            fs::write(gate.join("entering"), &pid).expect("resource startup witness is writable");
+            fs::rename(gate.join("entering"), gate.join("entered"))
+                .expect("complete resource startup witness is publishable");
+            while !release.is_file() {
+                if !witnessed_hold && probe.is_file() {
+                    fs::write(gate.join("held"), &pid).expect("resource hold witness is writable");
+                    witnessed_hold = true;
+                }
+                // The existing supervisor startup deadline bounds this real
+                // child even if its test owner exits before releasing it.
+                thread::sleep(Duration::from_millis(1));
+            }
+            fs::write(gate.join("released"), &pid).expect("resource release witness is writable");
+        }
+    }
     let configured_id = if matches!(mode, Mode::SameId) {
         SHARED_PLUGIN_ID
     } else {

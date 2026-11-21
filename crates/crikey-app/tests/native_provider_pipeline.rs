@@ -44,10 +44,9 @@ const ROW_DELIVERY_WINDOW: Duration = Duration::from_secs(5);
 /// Windows and did not on macOS, which is the whole reason this is its own
 /// number.
 ///
-/// Its value asserts nothing. The latency contract is
-/// [`ICON_ISOLATION_WINDOW`] and [`BATCH_PUBLICATION_SLACK`], measured
-/// separately and deliberately tight; this only decides how long a genuinely
-/// stuck run takes to say so, and a passing run never waits it out.
+/// Its value asserts nothing. Resource isolation is proved by holding a real
+/// resource child behind a gate until the next query row has been published;
+/// this ceiling only decides when a genuinely stuck run reports failure.
 const RESOURCE_DELIVERY_WINDOW: Duration = Duration::from_secs(60);
 
 /// Liveness ceiling for an answer that is *deliberately* late, from a plugin
@@ -1100,15 +1099,9 @@ fn native_healthy_worker_survives_repeated_queries() {
 
 /// Collection window for the icon-isolation tests.
 ///
-/// Deliberately shorter than the fixture's 150 ms icon answer. The subject is
-/// that an outstanding icon fetch costs the NEXT query nothing, and that is
-/// only observable while the window is narrow enough that a fetch which had
-/// consumed it would show up as a query with no rows at all.
-///
-/// Both packages start eagerly, so no measured QUERY pays child startup. That
-/// says nothing about the icon: eager startup covers a package's query
-/// supervisor, while the resource child behind an icon is spawned on first
-/// use. Waits that include that spawn use [`RESOURCE_DELIVERY_WINDOW`].
+/// Kept at 60 ms even when the real resource child is blocked. The isolation
+/// witness asserts publication while that child remains held, rather than
+/// conflating the collection budget with driver/OS scheduling latency.
 const ICON_ISOLATION_WINDOW: Duration = Duration::from_millis(60);
 
 /// How far past the collection window a batch may still be called on time.
@@ -1225,19 +1218,32 @@ fn await_condition(ceiling: Duration, expectation: &str, mut ready: impl FnMut()
     }
 }
 
-/// A slow icon must not be paid for out of a query's collection window.
+/// A blocked resource worker must not prevent the next query's publication.
 ///
-/// The fetch used to run on the same supervisor lock the query dispatcher
-/// takes, so a plugin that spent its resource deadline answering an icon made
-/// the next query time out with no rows at all — the plugin vanished because
-/// one of its pictures was slow. The icon itself is decoration and is expected
-/// late: a later refresh republishes the same generation once it lands.
+/// The resource child's startup is gated while its real supervisor mutex is
+/// held. A second-generation row must reach the public sink before release;
+/// a later refresh must decorate that same generation after release.
 #[test]
 fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
+    struct ReleaseResourceOnDrop(Option<PathBuf>);
+    impl ReleaseResourceOnDrop {
+        fn release(mut self) {
+            fs::write(self.0.as_ref().unwrap(), b"continue").expect("resource release is writable");
+            self.0 = None;
+        }
+    }
+    impl Drop for ReleaseResourceOnDrop {
+        fn drop(&mut self) {
+            if let Some(path) = self.0.take() {
+                let _ = fs::write(path, b"continue");
+            }
+        }
+    }
+
     let (conformance, _) = conformance_binaries();
     let scratch = Scratch::new("icon-slow");
     let plugins_root = scratch.subdir("plugins");
-    let package = write_eager_native_plugin(&plugins_root, "slowicon", &conformance, "icon-slow");
+    let package = write_eager_native_plugin(&plugins_root, "slowicon", &conformance, "icon-gated");
     let owner = native_plugin("slowicon");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
@@ -1248,11 +1254,17 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
         &DisabledPlugins::default(),
     );
     assert!(provider.plugins().contains(&owner));
+    let gate = scratch.subdir("resource-gate");
+    // The eager query process has already started, so only the resource
+    // process launched on the first icon fetch reads this startup gate.
+    fs::write(package.join("icon-startup-gate"), gate.to_str().unwrap())
+        .expect("resource startup gate is writable");
     let (driver, published) = spawn_icon_timing_driver(provider, pipeline, owner);
+    // Declared after the driver so panic unwinding releases its child before
+    // driver teardown joins the supervised resource work.
+    let release = ReleaseResourceOnDrop(Some(gate.join("release")));
 
-    // The first query is what puts the icon reference on a row, and the row is
-    // what starts the fetch. Everything measured below happens while that
-    // fetch is still outstanding.
+    // The first row starts the lazy, separately supervised resource child.
     driver.submit(Generation::from_raw(1), "icon one", 17, Vec::new(), false, 0);
     let opening = await_publication(
         &published,
@@ -1265,7 +1277,14 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
         "the batch that first names the icon cannot already carry it"
     );
 
-    let submitted = Instant::now();
+    await_condition(
+        RESOURCE_DELIVERY_WINDOW,
+        "the resource child entering its startup gate",
+        || gate.join("entered").is_file(),
+    );
+    let resource_pid = fs::read_to_string(gate.join("entered")).expect("resource child named its PID");
+    assert!(!resource_pid.is_empty());
+    assert!(!gate.join("released").exists());
     driver.submit(Generation::from_raw(2), "icon two", 200, Vec::new(), false, 0);
     let batch = await_publication(
         &published,
@@ -1273,20 +1292,30 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
         "a second-generation row",
         |(_, generation, row, _)| *generation == Generation::from_raw(2) && *row,
     );
-    let batch_delay = batch.0.duration_since(submitted);
     assert!(
-        batch_delay <= ICON_ISOLATION_WINDOW + BATCH_PUBLICATION_SLACK,
-        "the batch waited {batch_delay:?} for a {ICON_ISOLATION_WINDOW:?} collection window"
+        !gate.join("released").exists(),
+        "the batch arrived before resource release"
     );
     assert!(
         !batch.3,
-        "the on-time batch is published without the icon that has not arrived"
+        "the batch is published without the icon while the resource child is held"
     );
+
+    // A post-publication challenge proves the same real child is still alive
+    // and blocked: a timed-out/killed child or a replacement cannot satisfy
+    // the PID-scoped witness. No wall-clock slack stands in for this ordering.
+    fs::write(gate.join("probe"), b"still held?").expect("resource probe is writable");
+    await_condition(
+        ROW_DELIVERY_WINDOW,
+        "the held resource child's reply to the probe",
+        || fs::read_to_string(gate.join("held")).is_ok_and(|pid| pid == resource_pid),
+    );
+    assert!(!gate.join("released").exists());
+    release.release();
 
     let decorated = await_publication(
         &published,
-        // The only wait here that can include the resource child's first
-        // spawn, because this is the first icon of the run.
+        // Retains the existing resource liveness bound, including startup.
         RESOURCE_DELIVERY_WINDOW,
         "a second-generation row carrying its icon",
         |(_, generation, _, icon)| *generation == Generation::from_raw(2) && *icon,
@@ -1295,10 +1324,41 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
         decorated.0 > batch.0,
         "the icon reaches the same generation by a later refresh, not by holding the batch"
     );
-    let icon_delay = decorated.0.duration_since(submitted);
-    assert!(
-        icon_delay > ICON_ISOLATION_WINDOW,
-        "the icon genuinely arrived after the collection window closed, not inside it"
+    assert_eq!(
+        fs::read_to_string(gate.join("released")).expect("resource startup was released"),
+        resource_pid,
+        "the same isolated child was released before its icon decorated generation two"
+    );
+    assert_eq!(
+        fs::read_to_string(gate.join("served")).expect("the icon server named its PID"),
+        resource_pid,
+        "the first resource owner, not a replacement, supplied the decoded icon"
+    );
+
+    let proof = driver
+        .control()
+        .request_stop(std::num::NonZeroU64::MIN)
+        .unwrap()
+        .wait()
+        .expect("both real children must be physically settled");
+    assert_eq!(
+        proof.native_exits().len(),
+        2,
+        "exactly the eager query child and first resource child ran; no retry/replacement"
+    );
+    assert!(proof
+        .native_exits()
+        .iter()
+        .all(|exit| exit.code.is_some() || exit.signal.is_some()));
+    assert_eq!(
+        proof.retirement().resource_calls,
+        1,
+        "the first fetch must succeed without a same-worker timeout/retry"
+    );
+    assert_eq!(
+        proof.retirement().resource_threads,
+        1,
+        "exactly one fetch thread must serve the single icon reference"
     );
 
     // The icon arriving proves a resource child ran; teardown owes the same
