@@ -966,7 +966,7 @@ impl ModernCatalogDispatcher {
             // completion ensures an older task that retires later remains
             // explicitly obsolete.
 
-            let mut result = match result {
+            let result = match result {
                 CatalogBuildResult::Complete(build)
                     if self.latest.get(&build.plugin).is_some_and(|latest| *latest != id) =>
                 {
@@ -982,8 +982,11 @@ impl ModernCatalogDispatcher {
                 .accepted_commands
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if let CatalogBuildResult::Complete(build) = &result {
-                let admitted = self
+            // Declaration retirement revokes sidecar authority, not an
+            // otherwise successful ordinary catalog. The accepted-source lock
+            // above serializes this decision with source invalidation.
+            let admitted = match &result {
+                CatalogBuildResult::Complete(build) => self
                     .commands
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -991,36 +994,35 @@ impl ModernCatalogDispatcher {
                     .get(&build.plugin)
                     .is_some_and(|source| {
                         source.request_id == id && source.status == ModernCommandStatus::Pending
-                    });
-                if !admitted {
-                    result = CatalogBuildResult::Obsolete(ObsoleteCatalogBuild {
-                        plugin: build.plugin.clone(),
+                    }),
+                _ => false,
+            };
+            if admitted {
+                if let CatalogBuildResult::Complete(build) = &result {
+                    let source = RootSource::Catalog(crate::plugin_action::DeclaredCommandSource {
+                        publication: id,
                         instance: build.instance,
                         generation: build.generation,
+                        producer: commands.incarnation,
                     });
-                }
-            }
-            if let CatalogBuildResult::Complete(build) = &result {
-                let source = RootSource::Catalog(crate::plugin_action::DeclaredCommandSource {
-                    publication: id,
-                    instance: build.instance,
-                    generation: build.generation,
-                    producer: commands.incarnation,
-                });
-                let publication = self
-                    .root
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .publish(build.plugin.clone(), source, &build.items, presentation);
-                if publication.is_err() {
-                    commands.status = ModernCommandStatus::Failed("invalid catalog presentation".into());
-                    commands.declarations.clear();
-                    result = CatalogBuildResult::Failed {
-                        plugin: build.plugin.clone(),
-                        instance: build.instance,
-                        generation: build.generation,
-                        reason: "invalid modern catalog presentation".into(),
-                    };
+                    let mut root = self.root.lock().unwrap_or_else(|error| error.into_inner());
+                    if root
+                        .publish(build.plugin.clone(), source, &build.items, presentation)
+                        .is_err()
+                    {
+                        root.invalidate(&build.plugin);
+                        // Presentation/executable rejection must not discard
+                        // ordinary items or overwrite an existing declaration
+                        // validation diagnostic (for example duplicate actions).
+                        if matches!(
+                            commands.status,
+                            ModernCommandStatus::Ready | ModernCommandStatus::Unsupported
+                        ) {
+                            commands.status =
+                                ModernCommandStatus::Invalid("invalid catalog presentation".into());
+                        }
+                        commands.declarations.clear();
+                    }
                 }
             }
             if let CatalogBuildResult::Complete(build) = &result {
@@ -5122,7 +5124,7 @@ class Receipt(Plugin):
     def commands(self):
         return [Command("default", "Default callback", "actionless")]
     def execute(self, item, action_id, argument):
-        with Path(__file__).with_name("executed").open("a", encoding="utf-8") as stream:
+        with Path(__file__).with_name("executed").open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(item.label + (" default" if action_id is None else "") + "\n")
 "#).unwrap();
         let mut pipeline = QueryPipeline::new(crate::PipelineConfig::default());
@@ -5584,7 +5586,7 @@ class Typed(Plugin):
     def execute_typed(self, item, action_id, values):
         assert action_id is None
         assert "provider-private-value" not in repr(values)
-        with Path(__file__).with_name("executed").open("a", encoding="utf-8") as stream:
+        with Path(__file__).with_name("executed").open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(item.label + "\n")
         if Path(__file__).with_name("fail").exists():
             print("provider-private-value", file=sys.stderr)
@@ -5825,7 +5827,15 @@ class Typed(Plugin):
             assert!(Instant::now() < deadline, "retired catalog never completed");
             thread::sleep(Duration::from_millis(2));
         };
-        assert!(matches!(result, CatalogBuildResult::Obsolete(_)));
+        let CatalogBuildResult::Complete(retired_catalog) = result else {
+            panic!("retiring command authority must preserve the ordinary catalog");
+        };
+        let retained_item = retired_catalog
+            .items
+            .iter()
+            .find(|item| item.plugin_id == owner && item.stable_id == executable.target.item)
+            .expect("the ordinary catalog still contains its exact owned item");
+        assert_eq!(retained_item.label, "Frozen typed item");
         assert!(endpoint.root_binding(&executable, None).is_none());
         assert!(!endpoint
             .root_presentations()
