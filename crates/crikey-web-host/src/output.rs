@@ -178,14 +178,16 @@ mod tests {
         let output = OutputBuffer::new();
         output.push(caret(1));
         output.push(frame(1, 6));
-        let failed = envelope(Payload::LoadState(LoadState {
-            surface_id: 1,
-            state: WebLoadCode::Failed,
-            url: "https://example.test/broken".to_owned(),
-            failure: "controlled network failure".to_owned(),
-            ..Default::default()
-        }));
-        output.push(failed.clone());
+        let failed = || {
+            envelope(Payload::LoadState(LoadState {
+                surface_id: 1,
+                state: WebLoadCode::Failed,
+                url: "https://example.test/broken".to_owned(),
+                failure: "controlled network failure".to_owned(),
+                ..Default::default()
+            }))
+        };
+        output.push(failed());
 
         // A second navigation can start on the engine thread while the writer
         // has not yet drained the genuine failure from the preceding load.
@@ -201,20 +203,22 @@ mod tests {
         output.push(caret(1));
         output.close();
 
-        assert_eq!(output.pop(), Some(failed));
+        assert_eq!(output.pop(), Some(failed()));
         assert_eq!(output.pop(), None, "shutdown drains the fatal diagnostic");
     }
 
     #[test]
     fn failed_load_fences_shutdown_without_losing_its_specific_diagnostic() {
         let output = OutputBuffer::new();
-        let failed = envelope(Payload::LoadState(LoadState {
-            surface_id: 1,
-            state: WebLoadCode::Failed,
-            failure: "controlled network failure".to_owned(),
-            ..Default::default()
-        }));
-        output.push(failed.clone());
+        let failed = || {
+            envelope(Payload::LoadState(LoadState {
+                surface_id: 1,
+                state: WebLoadCode::Failed,
+                failure: "controlled network failure".to_owned(),
+                ..Default::default()
+            }))
+        };
+        output.push(failed());
         assert_eq!(output.push(frame(2, 9)), Some(vec![9; 4]));
         output.push(envelope(Payload::Gone(Gone {
             surface_id: 1,
@@ -223,7 +227,7 @@ mod tests {
             ..Default::default()
         })));
 
-        assert_eq!(output.pop(), Some(failed));
+        assert_eq!(output.pop(), Some(failed()));
         assert_eq!(output.pop(), None, "the fatal diagnostic ends the stream");
     }
 

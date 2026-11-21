@@ -31,8 +31,10 @@ import queue
 import sys
 import threading
 import traceback
+import logging
 
 from crikey_sdk import Action, Command, Item, Query, WorkerContext, Plugin, Preview
+from crikey_sdk import ResultPresentation, TypedValues, TypedValue, TypedOutcome
 
 
 def _pin_text_stream(stream, name, newline):
@@ -62,9 +64,54 @@ _REAL_STDERR = sys.stderr
 _pin_text_stream(sys.stdin, "stdin", None)
 _pin_text_stream(_PROTOCOL, "stdout", "\n")
 _pin_text_stream(_REAL_STDERR, "stderr", "\n")
+_SENSITIVE = False
+_DIAGNOSTIC_LOCK = threading.RLock()
+
+def _latch_sensitive():
+    global _SENSITIVE
+    with _CAPTURE._lock, _DIAGNOSTIC_LOCK:
+        _SENSITIVE = True
+        _CAPTURE.reset()
+        logging.disable(sys.maxsize)
+
+def _plugin_error(error):
+    with _CAPTURE._lock, _DIAGNOSTIC_LOCK:
+        if _SENSITIVE:
+            return {"message": "plugin callback failed", "traceback": ""}
+        return {"message": str(error), "traceback": traceback.format_exc()}
+
+def _report_exception(label, error):
+    with _CAPTURE._lock, _DIAGNOSTIC_LOCK:
+        if not _SENSITIVE:
+            _stderr("{}: {}\n{}".format(label, error, traceback.format_exc()))
+
+_ORIGINAL_EXCEPTHOOK = sys.excepthook
+_ORIGINAL_THREAD_EXCEPTHOOK = threading.excepthook
+_ORIGINAL_UNRAISABLEHOOK = sys.unraisablehook
+def _uncaught_exception(*args):
+    with _CAPTURE._lock, _DIAGNOSTIC_LOCK:
+        if not _SENSITIVE:
+            _ORIGINAL_EXCEPTHOOK(*args)
+def _uncaught_thread_exception(args):
+    with _CAPTURE._lock, _DIAGNOSTIC_LOCK:
+        if not _SENSITIVE:
+            _ORIGINAL_THREAD_EXCEPTHOOK(args)
+def _uncaught_unraisable(args):
+    with _CAPTURE._lock, _DIAGNOSTIC_LOCK:
+        if not _SENSITIVE:
+            _ORIGINAL_UNRAISABLEHOOK(args)
+def _loop_exception(loop, context):
+    with _CAPTURE._lock, _DIAGNOSTIC_LOCK:
+        if not _SENSITIVE:
+            loop.default_exception_handler(context)
+sys.excepthook = _uncaught_exception
+threading.excepthook = _uncaught_thread_exception
+sys.unraisablehook = _uncaught_unraisable
 
 def _stderr(message):
     """Writes diagnostic text without letting non-UTF-8 data kill the worker."""
+    if _SENSITIVE:
+        return
     if not isinstance(message, str):
         message = str(message)
     safe = message.encode("utf-8", "backslashreplace").decode("utf-8")
@@ -100,6 +147,22 @@ _LOG_TRUNCATION_MARKER = " \u2026[log line truncated]"
 _FLUSH_THRESHOLD = 32
 _CAPTURE_ACTIVE = contextvars.ContextVar("crikey_capture_active", default=True)
 _OVERSIZED = object()
+_TYPED_REQUEST_KEYS = frozenset(("id", "kind", "item", "action_id",
+                               "schema_fingerprint", "values", "argument",
+                               "field_id", "value"))
+
+class _WireObject(dict):
+    """Preserve legacy last-wins semantics, flag only new typed known members."""
+    __slots__ = ("typed_duplicate", "typed_tag")
+    def __init__(self, pairs):
+        self.typed_duplicate = False
+        self.typed_tag = False
+        for key, value in pairs:
+            if key in self and key in _TYPED_REQUEST_KEYS:
+                self.typed_duplicate = True
+            if key == "kind" and value == "typed_execute":
+                self.typed_tag = True
+            self[key] = value
 
 ENV_PLUGIN_ID = "CRIKEY_MODERN_PLUGIN_ID"
 ENV_ENTRYPOINT = "CRIKEY_MODERN_ENTRYPOINT"
@@ -158,10 +221,12 @@ class _LogCapture:
 
     # -- stream protocol ---------------------------------------------------
     def write(self, text):
-        with self._lock:
+        with self._lock, _DIAGNOSTIC_LOCK:
             return self._write_unlocked(text)
 
     def _write_unlocked(self, text):
+        if _SENSITIVE:
+            return len(text) if isinstance(text, str) else 0
         if not isinstance(text, str):
             text = str(text)
         self._mirror_unlocked(text)
@@ -178,6 +243,8 @@ class _LogCapture:
             start = newline + 1
         return len(text)
     def _mirror_unlocked(self, text):
+        if _SENSITIVE:
+            return
         """Mirrors a bounded prefix without allowing stderr to grow forever."""
         room = _MAX_MIRROR_BYTES - self._mirror_bytes
         if room <= 0 or not text:
@@ -263,8 +330,12 @@ class _LogCapture:
             self._dropped += 1
 
     def line(self, message):
-        """Records ``message`` as its own log line (used by ``context.log``)."""
-        self.write(message if message.endswith("\n") else message + "\n")
+        """Records one message; suppress before conversion or concatenation."""
+        with self._lock, _DIAGNOSTIC_LOCK:
+            if _SENSITIVE:
+                return
+            message = str(message)
+            self._write_unlocked(message if message.endswith("\n") else message + "\n")
 
     def reset(self):
         """Starts a fresh per-request record, discarding anything pending."""
@@ -284,6 +355,8 @@ class _LogCapture:
         wants to see, and holding it back would attribute it to a later request.
         """
         with self._lock:
+            if _SENSITIVE:
+                return []
             if self._partial:
                 self._commit()
             lines = self._lines
@@ -304,6 +377,16 @@ sys.stdout = _CAPTURE
 sys.stderr = _CAPTURE
 sys.__stdout__ = _CAPTURE
 sys.__stderr__ = _CAPTURE
+
+# QueueListener and already queued LogRecords must not reach Handler.format
+# after sensitivity changes, regardless of contextvars or logger admission.
+_ORIGINAL_LOG_HANDLE = logging.Handler.handle
+def _diagnostic_log_handle(handler, record):
+    with _CAPTURE._lock, _DIAGNOSTIC_LOCK:
+        if _SENSITIVE:
+            return False
+        return _ORIGINAL_LOG_HANDLE(handler, record)
+logging.Handler.handle = _diagnostic_log_handle
 
 
 # --------------------------------------------------------------------------
@@ -427,38 +510,99 @@ def _generation_from_wire(frame):
 _EMIT_LOCK = threading.Lock()
 
 
+class _FrameTooLarge(ValueError):
+    pass
+
+
+class _PublicationFailed(Exception):
+    """A fixed terminal has already been sent; stop the producing callback."""
+
+
+def _frame_size(frame):
+    """Count the complete ensure_ascii JSON line before allocating its encoding."""
+    total = 1  # terminating newline
+    def charge(size):
+        nonlocal total
+        total += size
+        if total > _MAX_FRAME_BYTES:
+            raise _FrameTooLarge("protocol frame exceeds bound")
+    def visit(value, depth=0):
+        if depth > 64:
+            raise ValueError("protocol frame exceeds depth bound")
+        if isinstance(value, str):
+            charge(2)
+            for char in str.__iter__(value):
+                code = ord(char)
+                charge(2 if char in '"\\\b\f\n\r\t' else 6 if code < 32 or 127 <= code <= 65535 else 12 if code > 65535 else 1)
+        elif value is None:
+            charge(4)
+        elif isinstance(value, bool):
+            charge(4 if value else 5)
+        elif isinstance(value, int):
+            charge(len(int.__repr__(value)))
+        elif isinstance(value, float):
+            charge(len(json.dumps(value)))
+        elif isinstance(value, dict):
+            charge(2 + max(0, len(value) - 1))
+            for key, entry in value.items():
+                if not isinstance(key, str):
+                    raise TypeError("protocol object keys must be strings")
+                visit(key, depth + 1)
+                charge(1)
+                visit(entry, depth + 1)
+        elif isinstance(value, (list, tuple)):
+            charge(2 + max(0, len(value) - 1))
+            for entry in value:
+                visit(entry, depth + 1)
+        else:
+            raise TypeError("unsupported protocol member")
+    visit(frame)
+    return total
+
+
+def _publication_failure(frame):
+    error = {"message": "publication exceeds protocol bounds", "traceback": ""}
+    kind = frame.get("kind")
+    if kind == "catalog_batch":
+        return dict(id=frame.get("id"), kind=kind, items=[], done=True, log=[], error=error)
+    if kind == "result_batch":
+        return dict(id=frame.get("id"), kind=kind, generation=frame.get("generation"),
+                    state="failed", items=[], log=[], error=error)
+    if kind == "typed_execute_result":
+        return dict(id=frame.get("id"), kind=kind, status="failed", code="failed")
+    if kind == KIND_BACKGROUND_COMPLETE:
+        return dict(kind=kind, task_id=frame.get("task_id"), status="failed", error=error)
+    return dict(id=frame.get("id"), kind=kind, status="failed", log=[], error=error)
+
+
 def _encode(frame):
     """One frame as its wire line.
 
     ``ensure_ascii=True`` keeps every frame representable on the strict UTF-8
     protocol stream, including plugin strings containing lone surrogates.
     JSON escaping makes a label containing a newline safe on a line-delimited
-    channel. ``default=repr`` guards a plugin that put an unserialisable object
-    in metadata from costing the request its only response.
+    channel. A bounded grammar/size pass precedes allocation of the complete
+    encoded line; unsupported members produce a fixed terminal failure.
     """
-    return json.dumps(frame, ensure_ascii=True, separators=(",", ":"), default=repr) + "\n"
+    if _SENSITIVE:
+        frame = {key: ([] if key == "log" else {"message": "plugin callback failed", "traceback": ""} if key == "error" and value is not None else "plugin callback failed" if key == "detail" else value) for key, value in frame.items()}
+    _frame_size(frame)
+    return json.dumps(frame, ensure_ascii=True, separators=(",", ":")) + "\n"
 
 
 def _emit(frame):
     """Writes exactly one line to the protocol channel.
 
-    A frame that cannot be serialised is downgraded (items dropped, a marker
-    added to the log) so a worker-side bug does not desync the stream. A frame
-    that exceeds the §1 byte bound is NOT downgraded: it is written as-is and
-    the host refuses the over-long line as a protocol error and stops the worker
-    (contract §1). Legitimate large output stays under the bound by streaming
-    many small result batches, never one oversized frame.
+    A malformed or oversized publication produces one bounded fixed failure,
+    never a success with dropped rows or an oversized line that kills the host.
+    Return whether the original frame was actually published successfully.
     """
     try:
         line = _encode(frame)
-    except Exception as error:
-        trimmed = dict(frame)
-        trimmed["items"] = []
-        trimmed["log"] = list(trimmed.get("log") or []) + [
-            "[err][crikey] a reply frame could not be serialised: {}".format(error)
-        ]
-        line = _encode(trimmed)
-    _emit_line(line)
+    except Exception:
+        _emit_line(_encode(_publication_failure(frame)))
+        return False
+    return _emit_line(line)
 
 
 def _emit_line(line):
@@ -467,9 +611,10 @@ def _emit_line(line):
         try:
             _PROTOCOL.write(line)
             _PROTOCOL.flush()
+            return True
         except (BrokenPipeError, OSError, ValueError):
             # The host can close stdout first during orderly shutdown.
-            return
+            return False
 
 
 # --------------------------------------------------------------------------
@@ -548,10 +693,16 @@ class _Worker:
 
     def __init__(self, plugin):
         self._plugin = plugin
+        self._catalog_schemas = {}
+        self._query_schemas = {}
+        self._pending_presentation = None
+        self._pending_schemas = None
+        self._legacy_typed_targets = set()
         # The cancel flag is set/cleared ONLY by the control-reader thread on a
         # `set_cancel` frame and read LIVE by SuggestContext.cancelled.
         self._cancel = threading.Event()
         self._loop = asyncio.new_event_loop()
+        self._loop.set_exception_handler(_loop_exception)
         asyncio.set_event_loop(self._loop)
 
         # Background coroutines run on a continuously serviced loop in a
@@ -559,6 +710,7 @@ class _Worker:
         # for a slow admitted task, while registration/admission remains on the
         # same process boundary as the callback that requested it.
         self._background_loop = asyncio.new_event_loop()
+        self._background_loop.set_exception_handler(_loop_exception)
         self._background_tasks = {}
         self._background_lock = threading.Lock()
         self._next_background_id = 0
@@ -713,7 +865,7 @@ class _Worker:
             status = "cancelled"
         except Exception as caught:  # noqa: BLE001 -- plugin task boundary
             status = "failed"
-            error = {"message": str(caught), "traceback": traceback.format_exc()}
+            error = _plugin_error(caught)
         finally:
             with self._background_lock:
                 managed = {
@@ -754,11 +906,7 @@ class _Worker:
             if callable(callback):
                 self.run_lifecycle(callback)
         except Exception as error:  # noqa: BLE001 -- shutdown is best effort
-            _stderr(
-                "[err][crikey] modern plugin stop failed: {}\n{}".format(
-                    error, traceback.format_exc()
-                )
-            )
+            _report_exception("[err][crikey] modern plugin stop failed", error)
         finally:
             self.stop_background()
             self._loop.close()
@@ -777,6 +925,8 @@ class _Worker:
             self._commands(frame)
         elif kind == "execute":
             self._execute(frame)
+        elif kind == "typed_execute":
+            self._typed_execute(frame)
         elif kind == "preview":
             self._preview(frame)
         elif kind == _KIND_CONFIGURATION:
@@ -796,9 +946,198 @@ class _Worker:
                     "suggest", "build_catalog", "execute",
                     "background-tasks", "configuration",
                 ] + (["preview_v1"] if self._supports_preview() else [])
-                  + (["commands_v1"] if self._supports_commands() else []),
+                  + (["commands_v1"] if self._supports_commands() else [])
+                  + (["typed_arguments_v1"] if self._supports_typed() else [])
+                  + (["result_presentation_v1"] if self._supports_presentation() else []),
             }
         )
+
+    def _supports_typed(self):
+        callback = getattr(type(self._plugin), "execute_typed", None)
+        return callable(callback) and callback is not Plugin.execute_typed
+
+    def _supports_presentation(self):
+        callback = getattr(self._plugin, "supports_result_presentation", None)
+        return callable(callback) and callback() is True
+
+    def _begin_publication(self, catalog):
+        if catalog:
+            self._catalog_schemas = {}
+        else:
+            self._query_schemas = {}
+        self._pending_presentation = None
+        self._pending_schemas = None
+
+    def _finish_publication(self, catalog, successful):
+        if successful and self._pending_schemas is not None:
+            if catalog:
+                self._catalog_schemas = self._pending_schemas
+            else:
+                self._query_schemas = self._pending_schemas
+        self._pending_presentation = None
+        self._pending_schemas = None
+
+    def _prepare_presentation(self, query):
+        self._pending_presentation = None
+        callback = getattr(self._plugin, "catalog_presentation" if query is None else "suggestion_presentation", None)
+        if not callable(callback):
+            return
+        result = callback() if query is None else callback(query)
+        if inspect.isawaitable(result):
+            result = self._loop.run_until_complete(result)
+        if not isinstance(result, ResultPresentation):
+            raise TypeError("metadata callback must return ResultPresentation")
+        if (len(result.sections) > 128 or len(result.scopes) > 128
+            or len(result.items) > 4096 or len(result.schemas) > 4096):
+            raise ValueError("presentation exceeds bounds")
+        if not (result.sections or result.scopes or result.items or result.schemas):
+            return
+        wire_bytes = 128
+        def admit(value):
+            nonlocal wire_bytes
+            for chunk in json.JSONEncoder(ensure_ascii=True, separators=(",", ":")).iterencode(value):
+                wire_bytes += len(chunk)
+                if wire_bytes > _MAX_FRAME_BYTES:
+                    raise ValueError("presentation exceeds frame allocation bound")
+            return value
+        from crikey_sdk.arguments import _text
+        def declarations(entries):
+            seen, out = set(), []
+            for entry in entries:
+                _text(entry.id, 256, True); _text(entry.label)
+                if entry.id in seen:
+                    raise ValueError("duplicate presentation identity")
+                seen.add(entry.id)
+                out.append(admit(dict(id=entry.id, label=entry.label)))
+            return out
+        sections, scopes = declarations(result.sections), declarations(result.scopes)
+        section_ids = {s["id"] for s in sections}
+        scope_ids = {s["id"] for s in scopes}
+        memberships, seen = [], set()
+        for entry in result.items:
+            _text(entry.item_id, 256, True)
+            if entry.item_id in seen or entry.section is not None and entry.section not in section_ids:
+                raise ValueError("invalid item membership")
+            if len(entry.scopes) > 128 or len(set(entry.scopes)) != len(entry.scopes) or not set(entry.scopes) <= scope_ids:
+                raise ValueError("invalid scope membership")
+            seen.add(entry.item_id)
+            memberships.append(admit(dict(item_id=entry.item_id, section=entry.section, scopes=list(entry.scopes))))
+        schemas, bindings = [], {}
+        for binding in result.schemas:
+            _text(binding.item_id, 256, True)
+            if binding.action_id is not None:
+                _text(binding.action_id, 256, True)
+            key = (binding.item_id, binding.action_id)
+            if key in bindings:
+                raise ValueError("duplicate executable schema")
+            wire = binding.schema.to_wire()
+            fingerprint = binding.schema.fingerprint()
+            bindings[key] = (binding.schema, fingerprint)
+            schemas.append(admit(dict(item_id=binding.item_id, action_id=binding.action_id, schema=wire)))
+        other = self._query_schemas if query is None else self._catalog_schemas
+        if len(other) + len(bindings) > 4096:
+            raise ValueError("schema registry exceeds bound")
+        new_targets = set(bindings).difference(self._legacy_typed_targets)
+        if len(self._legacy_typed_targets) + len(new_targets) > 4096:
+            raise ValueError("legacy typed refusal registry exceeds bound")
+        self._legacy_typed_targets.update(new_targets)
+        self._pending_schemas = bindings
+        self._pending_presentation = dict(sections=sections, scopes=scopes,
+                                          items=memberships, schemas=schemas)
+
+    def _typed_execute(self, frame):
+        _latch_sensitive()
+        reply = dict(id=frame.get("id"), kind="typed_execute_result",
+                     status="failed", code="failed")
+        values = TypedValues({})
+        try:
+            if getattr(frame, "typed_duplicate", False):
+                pass
+            elif not self._supports_typed():
+                reply["code"] = "unsupported"
+            elif "argument" in frame:
+                pass
+            else:
+                item = _item_from_wire(frame.get("item"))
+                action = frame.get("action_id")
+                if action is not None and not isinstance(action, str):
+                    raise ValueError("invalid action")
+                expected = frame.get("schema_fingerprint")
+                if (not isinstance(expected, str) or len(expected) != 64
+                    or any(c not in "0123456789abcdef" for c in expected)):
+                    raise ValueError("invalid fingerprint")
+                binding = None
+                key = (item.stable_id, action)
+                for registry in (self._query_schemas, self._catalog_schemas):
+                    candidate = registry.get(key)
+                    if candidate is not None and candidate[1] == expected and candidate[0].fingerprint() == expected:
+                        binding = candidate
+                        break
+                if binding is None:
+                    reply["code"] = "unavailable"
+                else:
+                    schema = binding[0]
+                    entries = frame.get("values")
+                    if not isinstance(entries, list) or len(entries) > 64:
+                        raise ValueError("invalid typed values")
+                    declared = {field["id"]: field for field in schema.to_wire()["fields"]}
+                    mapped = {}
+                    for entry in entries:
+                        if not isinstance(entry, dict) or getattr(entry, "typed_duplicate", False) or set(entry) != {"field_id", "kind", "value"}:
+                            raise ValueError("invalid typed value")
+                        field_id, kind, text = entry["field_id"], entry["kind"], entry["value"]
+                        field = declared.get(field_id)
+                        if field is None or field_id in mapped or kind != field["kind"] or not isinstance(text, str):
+                            raise ValueError("unknown, duplicate or mismatched field")
+                        size = len(text.encode("utf-8", "strict"))
+                        if size > 8192:
+                            raise ValueError("oversized typed value")
+                        if kind == "dropdown":
+                            if text not in {option["id"] for option in field["options"]}:
+                                raise ValueError("invalid selection")
+                        elif not field["min_bytes"] <= size <= field["max_bytes"]:
+                            raise ValueError("invalid length")
+                        if field["required"] and not text:
+                            raise ValueError("required value")
+                        mapped[field_id] = TypedValue(field_id, kind, text)
+                    if any(field["required"] and field["id"] not in mapped for field in declared.values()):
+                        raise ValueError("missing required field")
+                    values = TypedValues(mapped)
+                    result = (TypedOutcome(code="cancelled") if self._cancel.is_set()
+                              else self._plugin.execute_typed(item, action, values))
+                    if inspect.isawaitable(result):
+                        context = WorkerContext(self._cancel.is_set, lambda _item: None,
+                                                _CAPTURE.line, self._loop, self._register_background)
+                        result = self._loop.run_until_complete(self._drain(context, result))
+                    if self._cancel.is_set():
+                        reply["code"] = "cancelled"
+                    elif result is None:
+                        reply = dict(id=frame.get("id"), kind="typed_execute_result", status="completed")
+                    elif isinstance(result, TypedOutcome):
+                        if result.code is not None:
+                            if result.code not in ("unavailable", "denied", "cancelled", "timeout", "unsupported", "failed") or result.failures:
+                                raise ValueError("invalid typed failure")
+                            reply["code"] = result.code
+                        elif result.failures:
+                            if len(result.failures) > 64:
+                                raise ValueError("too many field failures")
+                            seen, failures = set(), []
+                            for failure in result.failures:
+                                if failure.field_id not in declared or failure.field_id in seen or failure.code not in ("required", "too_short", "too_long", "invalid_selection", "rejected"):
+                                    raise ValueError("invalid field failure")
+                                seen.add(failure.field_id)
+                                failures.append(dict(field_id=failure.field_id, code=failure.code))
+                            reply = dict(id=frame.get("id"), kind="typed_execute_result", status="field_failures", failures=failures)
+                        else:
+                            reply = dict(id=frame.get("id"), kind="typed_execute_result", status="completed")
+                    else:
+                        raise TypeError("invalid typed outcome")
+        except BaseException:
+            reply = dict(id=frame.get("id"), kind="typed_execute_result", status="failed", code="failed")
+        finally:
+            values.clear()
+            frame.pop("values", None)
+        _emit(reply)
 
     def _supports_commands(self):
         callback = getattr(type(self._plugin), "commands", None)
@@ -945,19 +1284,20 @@ class _Worker:
             reply["log"] = _CAPTURE.take()
             # Metadata nodes are bounded above by the 128-value limit. Markdown
             # nodes remain the host parser's responsibility; do not parse twice.
-            # Check the actual escaped wire size, including logs, before sending.
+            # Preflight the complete escaped frame before allocating its encoding.
             line = _encode(reply)
-            if len(line) > _MAX_FRAME_BYTES:
-                raise ValueError("preview frame exceeds 8 MiB after JSON escaping")
         except Exception as error:
             reply.pop("content", None)
-            detail = str(error)[:1024].encode("utf-8", "replace").decode("utf-8")
+            detail = ("preview frame exceeds 8 MiB after JSON escaping"
+                      if isinstance(error, _FrameTooLarge) and not _SENSITIVE
+                      else _plugin_error(error)["message"][:1024])
             reply.update(status="failed", detail=detail)
             reply.setdefault("log", _CAPTURE.take())
-            line = _encode(reply)
-            if len(line) > _MAX_FRAME_BYTES:
-                # Logs, unlike preview content, may already have been clipped.
-                # Explicitly diagnose their omission rather than kill the worker.
+            try:
+                line = _encode(reply)
+            except _FrameTooLarge:
+                # The failed content has already gone, but escaped captured
+                # logs can still exceed the line cap. Omit them explicitly.
                 reply.update(log=[], detail=detail + " (oversized captured log omitted)")
                 line = _encode(reply)
         _emit_line(line)
@@ -988,11 +1328,7 @@ class _Worker:
         try:
             self.run_lifecycle(lambda: callback(dict(values)))
         except Exception as error:  # noqa: BLE001 -- a plugin bug is not ours
-            _stderr(
-                "[err][crikey] on_configuration raised: {}\n{}".format(
-                    error, traceback.format_exc()
-                )
-            )
+            _report_exception("[err][crikey] on_configuration raised", error)
         finally:
             for line in _CAPTURE.take():
                 _stderr("{}\n".format(line))
@@ -1050,6 +1386,7 @@ class _Worker:
 
     def _suggest(self, frame):
         request_id = frame.get("id")
+        self._begin_publication(False)
         _CAPTURE.reset()
         generation = 0
         buffer = []
@@ -1065,7 +1402,10 @@ class _Worker:
                     return
                 buffer.append(_item_to_wire(item))
                 if len(buffer) >= _FLUSH_THRESHOLD:
-                    self._emit_batch(request_id, generation, "partial", buffer, [])
+                    if not self._emit_batch(request_id, generation, "partial", buffer, []):
+                        active.clear()
+                        buffer.clear()
+                        raise _PublicationFailed()
                     buffer.clear()
 
         try:
@@ -1074,6 +1414,7 @@ class _Worker:
                 text=frame.get("text", "") or "",
                 normalized=frame.get("normalized", "") or "",
                 generation=generation,
+                selected_scope_id=frame.get("scope_id"),
             )
             context = WorkerContext(
                 self._cancel.is_set,
@@ -1082,14 +1423,22 @@ class _Worker:
                 self._loop,
                 self._register_background,
             )
+            self._prepare_presentation(query)
             result = self._plugin.suggest(query, context)
             self._run_callback(context, result)
+        except _PublicationFailed:
+            active.clear()
+            return
         except Exception as error:  # noqa: BLE001 -- a plugin bug is not ours
             # Flush anything already streamed, then a terminal failed frame.
             with sink_lock:
+                if not active.is_set():
+                    return
                 active.clear()
                 if buffer:
-                    self._emit_batch(request_id, generation, "partial", buffer, [])
+                    if not self._emit_batch(request_id, generation, "partial", buffer, []):
+                        buffer.clear()
+                        return
                     buffer.clear()
                 self._emit_batch(
                     request_id,
@@ -1097,10 +1446,12 @@ class _Worker:
                     "failed",
                     [],
                     _CAPTURE.take(),
-                    error={"message": str(error), "traceback": traceback.format_exc()},
+                    error=_plugin_error(error),
                 )
             return
 
+        if not active.is_set():
+            return
         with sink_lock:
             active.clear()
             state = "cancelled" if self._cancel.is_set() else "final"
@@ -1109,21 +1460,23 @@ class _Worker:
             self._emit_batch(request_id, generation, state, items, _CAPTURE.take())
 
     def _emit_batch(self, request_id, generation, state, items, log, error=None):
-        _emit(
-            {
-                "id": request_id,
-                "kind": "result_batch",
-                "generation": generation,
-                "state": state,
-                "items": list(items),
-                "log": list(log),
-                "error": error,
-            }
-        )
+        if state == "final" and self._cancel.is_set():
+            state = "cancelled"
+        presentation = self._pending_presentation if state == "final" else None
+        sent = _emit({
+            "id": request_id, "kind": "result_batch", "generation": generation,
+            "state": state, "items": list(items),
+            "log": [] if _SENSITIVE else list(log), "error": error,
+            **({"presentation": presentation} if presentation is not None else {}),
+        })
+        if state != "partial" or not sent:
+            self._finish_publication(False, sent and state == "final")
+        return sent
 
 
     def _build_catalog(self, frame):
         request_id = frame.get("id")
+        self._begin_publication(True)
         _CAPTURE.reset()
         buffer = []
         context = WorkerContext(
@@ -1135,6 +1488,7 @@ class _Worker:
         )
 
         try:
+            self._prepare_presentation(None)
             produced = self._plugin.build_catalog()
             if inspect.isawaitable(produced):
                 produced = self._loop.run_until_complete(
@@ -1146,7 +1500,8 @@ class _Worker:
                 for item in produced:
                     buffer.append(_item_to_wire(item))
                     if len(buffer) >= _FLUSH_THRESHOLD:
-                        self._emit_catalog(request_id, buffer, False, [])
+                        if not self._emit_catalog(request_id, buffer, False, []):
+                            return
                         buffer.clear()
         except Exception as error:  # noqa: BLE001
             # A raise during catalog load is NOT an empty catalog: surface a
@@ -1158,28 +1513,26 @@ class _Worker:
                 [],
                 True,
                 _CAPTURE.take(),
-                error={"message": str(error), "traceback": traceback.format_exc()},
+                error=_plugin_error(error),
             )
-            _stderr(
-                "[err][crikey] build_catalog raised: {}\n{}".format(
-                    error, traceback.format_exc()
-                )
-            )
+            _report_exception("[err][crikey] build_catalog raised", error)
             return
 
         self._emit_catalog(request_id, buffer, True, _CAPTURE.take())
 
     def _emit_catalog(self, request_id, items, done, log, error=None):
         frame = {
-            "id": request_id,
-            "kind": "catalog_batch",
-            "items": list(items),
-            "done": done,
-            "log": list(log),
+            "id": request_id, "kind": "catalog_batch", "items": list(items),
+            "done": done, "log": [] if _SENSITIVE else list(log),
         }
+        if done and error is None and self._pending_presentation is not None:
+            frame["presentation"] = self._pending_presentation
         if error is not None:
             frame["error"] = error
-        _emit(frame)
+        sent = _emit(frame)
+        if done or not sent:
+            self._finish_publication(True, sent and done and error is None)
+        return sent
 
     def _execute(self, frame):
         request_id = frame.get("id")
@@ -1188,6 +1541,9 @@ class _Worker:
         argument = frame.get("argument")
         try:
             item = _item_from_wire(frame.get("item") or {})
+            key = (item.stable_id, action_id)
+            if key in self._legacy_typed_targets or (action_id is None and any(k[0] == item.stable_id for k in self._legacy_typed_targets)):
+                raise ValueError("typed target refuses legacy execution")
             context = WorkerContext(
                 self._cancel.is_set,
                 lambda _item: None,
@@ -1204,7 +1560,7 @@ class _Worker:
                     "kind": "execute_result",
                     "status": "failed",
                     "log": _CAPTURE.take(),
-                    "error": {"message": str(error), "traceback": traceback.format_exc()},
+                    "error": _plugin_error(error),
                 }
             )
             return
@@ -1275,13 +1631,16 @@ def _read_stdin(stream, pending, worker):
             continue
 
         try:
-            frame = json.loads(payload.decode("utf-8", "strict"))
+            frame = json.loads(payload.decode("utf-8", "strict"), object_pairs_hook=_WireObject)
         except (UnicodeDecodeError, ValueError):
             _stderr("[err][crikey] undecodable request line ignored\n")
             continue
         if not isinstance(frame, dict):
             _stderr("[err][crikey] request line was not an object; ignored\n")
             continue
+        if frame.get("kind") == "typed_execute" or getattr(frame, "typed_tag", False):
+            _latch_sensitive()
+            frame["kind"] = "typed_execute"
 
         if frame.get("kind") == _KIND_SET_CANCEL:
             cancelled = frame.get("cancelled")

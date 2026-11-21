@@ -705,6 +705,7 @@ version = "0.1.19"
 dependencies = [
  "pulldown-cmark",
  "regex",
+ "sha2",
  "thiserror 2.0.19",
 ]
 

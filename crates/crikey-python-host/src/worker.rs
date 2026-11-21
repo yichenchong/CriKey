@@ -46,6 +46,11 @@ use crikey_core::command::{
     PluginCommandDeclaration, PluginCommands, COMMANDS_CAPABILITY, MAX_COMMANDS, MAX_COMMAND_BYTES,
     MAX_COMMAND_ID_BYTES, MAX_COMMAND_LABEL_BYTES,
 };
+use crikey_core::result_presentation::ResultPresentation;
+use crikey_core::structured_arguments::{
+    ArgumentSchema, ArgumentValues, ExecutableKey, NonSecretValue, OwnedItem, StructuredValue,
+    SubmissionFailureCode, SubmissionOutcome,
+};
 use crikey_core::{Item, PluginId};
 use crikey_package_manager::ImportPath;
 use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
@@ -267,6 +272,8 @@ pub enum BatchState {
 pub struct Suggestions {
     /// Every item the plugin emitted, in emission order across batches.
     pub items: Vec<Item>,
+    /// Sidecar admitted against this exact complete result set.
+    pub presentation: ResultPresentation,
     /// How the batch terminated.
     pub state: BatchState,
     /// What the plugin logged/printed while suggesting, bounded per contract §1.
@@ -414,12 +421,33 @@ impl WorkerOptions {
 // ---------------------------------------------------------------------------
 
 /// A serialized request for the dedicated stdin writer.
-#[derive(Debug)]
 struct StdinRequest {
     bytes: Vec<u8>,
     completion: SyncSender<Result<(), String>>,
 }
+impl Drop for StdinRequest {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+    }
+}
 
+struct PipeBytes(Vec<u8>);
+impl std::ops::Deref for PipeBytes {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for PipeBytes {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.0
+    }
+}
+impl Drop for PipeBytes {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
 /// The parts of a worker that outlive the thread that owns it.
 ///
 /// Frames are handed to a dedicated writer thread. The mutex protects only
@@ -429,6 +457,7 @@ struct WorkerLink {
     next_id: AtomicU64,
     stdin: Mutex<Option<SyncSender<StdinRequest>>>,
     stdin_thread: Mutex<Option<JoinHandle<()>>>,
+    sensitive: AtomicBool,
 }
 
 fn spawn_stdin_writer(mut stdin: ChildStdin, receiver: Receiver<StdinRequest>) -> JoinHandle<()> {
@@ -457,23 +486,30 @@ impl WorkerLink {
     fn enqueue_frame(&self, frame: &Value) -> io::Result<Receiver<Result<(), String>>> {
         let mut encoded = serde_json::to_vec(frame).expect("a frame built from owned JSON values serialises");
         encoded.push(b'\n');
+        self.enqueue_bytes(encoded)
+    }
+
+    fn enqueue_bytes(&self, mut encoded: Vec<u8>) -> io::Result<Receiver<Result<(), String>>> {
         let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
         let sender = {
             let guard = self.stdin.lock().unwrap_or_else(|error| error.into_inner());
             guard.clone()
         };
         let Some(sender) = sender else {
+            encoded.fill(0);
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "the modern worker's standard input is already closed",
             ));
         };
         sender
-            .send(StdinRequest {
+            .try_send(StdinRequest {
                 bytes: encoded,
                 completion: completion_sender,
             })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "the stdin writer stopped"))?;
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "the stdin writer queue is unavailable")
+            })?;
         Ok(completion_receiver)
     }
 
@@ -729,7 +765,7 @@ impl CancelHandle {
 #[derive(Debug)]
 enum StdoutEvent {
     /// One complete protocol line, newline stripped.
-    Frame(String),
+    Frame(Arc<Map<String, Value>>, bool),
     /// A line reached [`MAX_FRAME_BYTES`]. The reader stops afterwards: a peer
     /// that emitted it has lost framing, and guessing where the next frame
     /// starts would invent data.
@@ -806,19 +842,29 @@ fn spawn_stdout_reader(
 ) {
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        let mut line: Vec<u8> = Vec::new();
+        let mut line = PipeBytes(Vec::new());
         loop {
+            if link.sensitive.load(Ordering::Acquire) {
+                line.fill(0);
+            }
             line.clear();
             let event = match read_frame_line(&mut reader, &mut line) {
                 Ok(LineRead::Frame) => {
                     let bytes = strip_carriage_return(&line);
                     match std::str::from_utf8(bytes) {
                         Ok(text) => {
-                            let text = text.to_owned();
-                            match handle_background_frame(&text, &link, &background) {
-                                Ok(true) => continue,
-                                Ok(false) => StdoutEvent::Frame(text),
-                                Err(error) => StdoutEvent::Protocol(error),
+                            let sensitive = link.sensitive.load(Ordering::Acquire);
+                            match crate::bounded_json::decode(text, sensitive) {
+                                Some(frame) => match handle_background_frame(&frame, &link, &background) {
+                                    Ok(true) => continue,
+                                    Ok(false) => StdoutEvent::Frame(Arc::new(frame), sensitive),
+                                    Err(error) => StdoutEvent::Protocol(error),
+                                },
+                                None => StdoutEvent::Protocol(if link.sensitive.load(Ordering::Acquire) {
+                                    "invalid bounded JSON frame".into()
+                                } else {
+                                    bounded_excerpt(text)
+                                }),
                             }
                         }
                         Err(_) => StdoutEvent::Protocol("the modern worker emitted invalid UTF-8".to_owned()),
@@ -826,13 +872,17 @@ fn spawn_stdout_reader(
                 }
                 Ok(LineRead::Eof) => return,
                 Ok(LineRead::Oversized(bytes)) => StdoutEvent::Oversized {
-                    excerpt: excerpt(&line),
+                    excerpt: if link.sensitive.load(Ordering::Acquire) {
+                        String::new()
+                    } else {
+                        excerpt(&line)
+                    },
                     bytes,
                 },
                 Err(error) => StdoutEvent::Failed(error.to_string()),
             };
 
-            let fatal = !matches!(event, StdoutEvent::Frame(_));
+            let fatal = !matches!(event, StdoutEvent::Frame(..));
             if sender.send(event).is_err() || fatal {
                 return;
             }
@@ -845,13 +895,10 @@ fn spawn_stdout_reader(
 /// worker is idle and lets registration receive an admission immediately while
 /// a synchronous callback is still running.
 fn handle_background_frame(
-    line: &str,
+    frame: &Map<String, Value>,
     link: &WorkerLink,
     background: &BackgroundState,
 ) -> Result<bool, String> {
-    let Some(frame) = parse_object(line) else {
-        return Ok(false);
-    };
     match frame.get("kind").and_then(Value::as_str) {
         Some(KIND_BACKGROUND_REGISTER) => {
             let Some(task_id) = frame.get("task_id").and_then(Value::as_u64) else {
@@ -870,7 +917,7 @@ fn handle_background_frame(
                 return Err("background_complete missing status".to_owned());
             };
             if !matches!(status, "ok" | "cancelled" | "failed" | "refused") {
-                return Err(format!("background_complete has unknown status {status:?}"));
+                return Err("background_complete has invalid status".into());
             }
             background.complete(task_id, status);
             Ok(true)
@@ -902,10 +949,14 @@ fn excerpt(line: &[u8]) -> String {
 struct StderrTail {
     lines: std::collections::VecDeque<String>,
     bytes: usize,
+    sensitive: bool,
 }
 
 impl StderrTail {
     fn push(&mut self, mut line: String) {
+        if self.sensitive {
+            return;
+        }
         const MARKER: &str = "[crikey: stderr line truncated] ";
         let line_limit = MAX_STDERR_TAIL_BYTES.saturating_sub(1);
         if line.len() > line_limit {
@@ -931,6 +982,9 @@ impl StderrTail {
     }
 
     fn render(&self) -> String {
+        if self.sensitive {
+            return String::new();
+        }
         let mut rendered = String::with_capacity(self.bytes);
         for line in &self.lines {
             if !rendered.is_empty() {
@@ -969,26 +1023,41 @@ fn add_restricted_environment(command: &mut Command) {
 fn spawn_stderr_drain(stderr: ChildStderr, tail: Arc<Mutex<StderrTail>>) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
-        let mut line: Vec<u8> = Vec::new();
+        let mut line = PipeBytes(Vec::new());
         loop {
-            line.clear();
-            match read_frame_line(&mut reader, &mut line) {
-                Ok(LineRead::Frame) => {
-                    let text = String::from_utf8_lossy(strip_carriage_return(&line)).into_owned();
-                    tail.lock().unwrap_or_else(|error| error.into_inner()).push(text);
+            let available = match reader.fill_buf() {
+                Ok([]) => {
+                    let mut tail = tail.lock().unwrap_or_else(|error| error.into_inner());
+                    if !tail.sensitive && !line.is_empty() {
+                        tail.push(String::from_utf8_lossy(strip_carriage_return(&line)).into_owned());
+                    }
+                    return;
                 }
-                Ok(LineRead::Oversized(_)) => {
-                    tail.lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .push("[crikey: stderr line exceeded the frame limit and was truncated]".to_owned());
-                    // `read_frame_line` consumed through the oversized line's
-                    // newline, so the next iteration is still frame-aligned.
+                Err(_) => return,
+                Ok(bytes) => bytes,
+            };
+            let count = available
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(available.len(), |n| n + 1);
+            {
+                let mut tail = tail.lock().unwrap_or_else(|error| error.into_inner());
+                if tail.sensitive {
+                    line.fill(0);
+                    line.clear();
+                } else {
+                    let room = MAX_FRAME_BYTES.saturating_sub(line.len());
+                    line.extend_from_slice(&available[..count.min(room)]);
+                    if available[count - 1] == b'\n' {
+                        if line.last() == Some(&b'\n') {
+                            line.pop();
+                        }
+                        tail.push(String::from_utf8_lossy(strip_carriage_return(&line)).into_owned());
+                        line.clear();
+                    }
                 }
-                // Nothing more will arrive, or the log channel itself is broken.
-                // Either way the tail stops growing and the thread ends rather
-                // than spinning on a dead pipe.
-                Ok(LineRead::Eof) | Err(_) => return,
             }
+            reader.consume(count);
         }
     })
 }
@@ -1020,6 +1089,11 @@ pub struct ModernWorker {
     hard_stopped: bool,
     preview_supported: bool,
     commands_supported: bool,
+    typed_supported: bool,
+    presentation_supported: bool,
+    presentation: ResultPresentation,
+    catalog_schemas: BTreeMap<ExecutableKey, Arc<ArgumentSchema>>,
+    query_schemas: BTreeMap<ExecutableKey, Arc<ArgumentSchema>>,
     alive: bool,
 }
 
@@ -1109,13 +1183,16 @@ impl ModernWorker {
         let stdout = child.stdout.take().expect("worker stdout is piped");
         let stderr = child.stderr.take().expect("worker stderr is piped");
 
-        let (sender, frames) = mpsc::sync_channel(128);
+        // Projected frames are larger than their JSON source. Keep only one
+        // prefetched foreground frame; pipe backpressure bounds decoded memory.
+        let (sender, frames) = mpsc::sync_channel(1);
         let (stdin_sender, stdin_requests) = mpsc::sync_channel(128);
         let stdin_thread = spawn_stdin_writer(stdin, stdin_requests);
         let link = Arc::new(WorkerLink {
             next_id: AtomicU64::new(0),
             stdin: Mutex::new(Some(stdin_sender)),
             stdin_thread: Mutex::new(Some(stdin_thread)),
+            sensitive: AtomicBool::new(false),
         });
         let background = Arc::new(BackgroundState::new(
             options.shared_budget.clone(),
@@ -1140,6 +1217,11 @@ impl ModernWorker {
             hard_stopped: false,
             preview_supported: false,
             commands_supported: false,
+            typed_supported: false,
+            presentation_supported: false,
+            presentation: ResultPresentation::default(),
+            catalog_schemas: BTreeMap::new(),
+            query_schemas: BTreeMap::new(),
             alive: true,
         };
 
@@ -1246,7 +1328,10 @@ impl ModernWorker {
         {
             return Err(self.protocol_error(&line));
         }
-        Ok(Value::Object(frame))
+        drop(line);
+        Ok(Value::Object(
+            Arc::try_unwrap(frame).expect("single foreground frame owner"),
+        ))
     }
 
     /// Explicit SDK override negotiated by this worker, not inferred from items.
@@ -1355,6 +1440,7 @@ impl ModernWorker {
         if !self.alive {
             return Err(self.crashed());
         }
+        self.catalog_schemas.clear();
 
         let id = self.link.next_id();
         if self.link.write_frame(&encode_build_catalog(id)).is_err() {
@@ -1369,9 +1455,24 @@ impl ModernWorker {
         let deadline = deadline_after_millis(timeout_ms);
         let mut items = Vec::new();
         let mut log_bytes = 0usize;
+        let mut presentation = ResultPresentation::default();
+        let mut presentation_bytes = 0;
+        self.presentation = ResultPresentation::default();
         loop {
             let line = self.recv_frame_until(deadline)?;
             let frame = self.expect_frame(&line, id, KIND_CATALOG_BATCH)?;
+            if crate::typed::append(
+                &self.plugin,
+                &frame,
+                &mut presentation,
+                self.typed_supported,
+                self.presentation_supported,
+                &mut presentation_bytes,
+            )
+            .is_none()
+            {
+                return Err(self.protocol_error("invalid sidecar"));
+            }
 
             let Some(done) = frame.get("done").and_then(Value::as_bool) else {
                 return Err(self.protocol_error(&line));
@@ -1416,6 +1517,11 @@ impl ModernWorker {
             }
 
             if done {
+                if crate::typed::validate(&self.plugin, &presentation, &items).is_none() {
+                    return Err(self.protocol_error("invalid sidecar"));
+                }
+                self.record_schemas(&presentation, true)?;
+                self.presentation = presentation;
                 return Ok(items);
             }
         }
@@ -1427,7 +1533,7 @@ impl ModernWorker {
     /// A plugin that raises or cooperatively cancels is the `Ok` path: the
     /// transport is healthy. Only a transport fault is an `Err`.
     pub fn suggest(&mut self, request: &SuggestRequest) -> Result<Suggestions, HostError> {
-        self.suggest_inner(request, true)
+        self.suggest_inner(request, true, None)
     }
 
     /// Runs a request against a cancellation flag deliberately latched by the
@@ -1436,17 +1542,240 @@ impl ModernWorker {
         &mut self,
         request: &SuggestRequest,
     ) -> Result<Suggestions, HostError> {
-        self.suggest_inner(request, false)
+        self.suggest_inner(request, false, None)
+    }
+
+    pub fn supports_typed_arguments(&self) -> bool {
+        self.typed_supported
+    }
+    pub fn supports_result_presentation(&self) -> bool {
+        self.presentation_supported
+    }
+    pub fn presentation(&self) -> &ResultPresentation {
+        &self.presentation
+    }
+    /// Preserves the supervisor's already installed cancellation latch.
+    pub fn suggest_scoped(
+        &mut self,
+        request: &SuggestRequest,
+        scope: Option<&str>,
+    ) -> Result<Suggestions, HostError> {
+        self.suggest_inner(request, false, scope)
+    }
+    fn record_schemas(&mut self, presentation: &ResultPresentation, catalog: bool) -> Result<(), HostError> {
+        let other = if catalog {
+            self.query_schemas.len()
+        } else {
+            self.catalog_schemas.len()
+        };
+        if other.saturating_add(presentation.schemas.len()) > 4096 {
+            return Err(self.protocol_error("schema registry bound"));
+        }
+        let registry = if catalog {
+            &mut self.catalog_schemas
+        } else {
+            &mut self.query_schemas
+        };
+        registry.clear();
+        for binding in &presentation.schemas {
+            registry.insert(binding.executable.clone(), Arc::clone(&binding.schema));
+        }
+        Ok(())
+    }
+    fn admit_suggestions(
+        &mut self,
+        presentation: &ResultPresentation,
+        items: &[Item],
+    ) -> Result<ResultPresentation, HostError> {
+        if crate::typed::validate(&self.plugin, presentation, items).is_none() {
+            return Err(self.protocol_error("invalid sidecar"));
+        }
+        self.record_schemas(presentation, false)?;
+        Ok(presentation.clone())
+    }
+    pub fn confirm_typed_schema(
+        &mut self,
+        item: &Item,
+        action_id: Option<&str>,
+        schema: &ArgumentSchema,
+    ) -> Result<bool, HostError> {
+        let key = ExecutableKey {
+            target: OwnedItem {
+                owner: self.plugin.clone(),
+                item: item.stable_id.clone(),
+            },
+            action: action_id.map(|a| crikey_core::ActionId(a.to_owned())),
+        };
+        if !self.typed_supported || !self.alive {
+            return Ok(false);
+        }
+        let Some(expected) = crate::typed::fingerprint(schema) else {
+            return Ok(false);
+        };
+        let matches = |worker: &Self| {
+            [&worker.query_schemas, &worker.catalog_schemas]
+                .into_iter()
+                .filter_map(|registry| registry.get(&key))
+                .any(|binding| crate::typed::fingerprint(binding).as_deref() == Some(expected.as_str()))
+        };
+        if matches(self) {
+            return Ok(true);
+        }
+        if !self.catalog_schemas.contains_key(&key) {
+            self.build_catalog()?;
+        }
+        Ok(matches(self))
+    }
+
+    /// Latch diagnostics before any plaintext encoding or writer queue admission.
+    /// Cancellation remains latched; use the existing cancel_handle watcher.
+    pub fn typed_execute(
+        &mut self,
+        item: &Item,
+        action_id: Option<&str>,
+        schema: &ArgumentSchema,
+        values: ArgumentValues,
+    ) -> Result<SubmissionOutcome, HostError> {
+        self.typed_execute_with_admission(item, action_id, schema, values, |send| send())
+    }
+
+    /// Run `admission(send)` after confirmation/encoding. The caller holds its
+    /// exact source gate only across `send`, which enqueues without waiting on I/O.
+    pub fn typed_execute_with_admission(
+        &mut self,
+        item: &Item,
+        action_id: Option<&str>,
+        schema: &ArgumentSchema,
+        values: ArgumentValues,
+        admission: impl FnOnce(&mut dyn FnMut() -> bool) -> bool,
+    ) -> Result<SubmissionOutcome, HostError> {
+        if !self.typed_supported {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported));
+        }
+        if item.plugin_id != self.plugin {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable));
+        }
+        if !self.alive {
+            return Err(self.crashed());
+        }
+        if !self.confirm_typed_schema(item, action_id, schema)? {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable));
+        }
+        if schema.validate_values(&values).is_err() {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Failed));
+        }
+        {
+            let mut tail = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
+            self.link.sensitive.store(true, Ordering::Release);
+            tail.sensitive = true;
+            for line in &mut tail.lines {
+                let mut bytes = std::mem::take(line).into_bytes();
+                bytes.fill(0);
+            }
+            tail.lines.clear();
+            tail.bytes = 0;
+        }
+        let id = self
+            .link
+            .next_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
+            .map_err(|_| HostError::Protocol("typed request counter exhausted".into()))?
+            .checked_add(1)
+            .ok_or_else(|| HostError::Protocol("typed request counter exhausted".into()))?;
+        let mut bytes = Vec::with_capacity(1024);
+        bytes.extend_from_slice(b"{\"kind\":\"typed_execute\",\"id\":");
+        serde_json::to_writer(&mut bytes, &id).expect("integer");
+        bytes.extend_from_slice(b",\"item\":");
+        serde_json::to_writer(&mut bytes, &protocol::encode_item(item)).expect("item");
+        bytes.extend_from_slice(b",\"action_id\":");
+        serde_json::to_writer(&mut bytes, &action_id).expect("action");
+        bytes.extend_from_slice(b",\"schema_fingerprint\":");
+        serde_json::to_writer(
+            &mut bytes,
+            &crate::typed::fingerprint(schema).expect("validated schema"),
+        )
+        .expect("fingerprint");
+        bytes.extend_from_slice(b",\"values\":[");
+        let value_capacity: usize = values
+            .0
+            .iter()
+            .map(|(field, value)| {
+                let length = match value {
+                    StructuredValue::NonSecret(NonSecretValue::Text(text)) => text.len(),
+                    StructuredValue::NonSecret(NonSecretValue::Dropdown(option)) => option.0.len(),
+                    StructuredValue::Password(password) => password.expose_plaintext().len(),
+                };
+                6 * (field.0.len() + length) + 128
+            })
+            .sum();
+        bytes.reserve_exact(value_capacity + 4);
+        for (index, (field, value)) in values.0.into_iter().enumerate() {
+            if index != 0 {
+                bytes.push(b',');
+            }
+            bytes.extend_from_slice(b"{\"field_id\":");
+            serde_json::to_writer(&mut bytes, &field.0).expect("field");
+            let (kind, text) = match &value {
+                StructuredValue::NonSecret(NonSecretValue::Text(text)) => ("text", text.as_str()),
+                StructuredValue::NonSecret(NonSecretValue::Dropdown(option)) => {
+                    ("dropdown", option.0.as_str())
+                }
+                StructuredValue::Password(password) => ("password", password.expose_plaintext()),
+            };
+            bytes.extend_from_slice(b",\"kind\":");
+            serde_json::to_writer(&mut bytes, kind).expect("kind");
+            bytes.extend_from_slice(b",\"value\":");
+            serde_json::to_writer(&mut bytes, text).expect("value");
+            bytes.push(b'}');
+        }
+        bytes.extend_from_slice(b"]}\n");
+        let mut bytes = Some(PipeBytes(bytes));
+        let mut queued = None;
+        let deadline = deadline_after_millis(self.options.call_timeout_ms);
+        let admitted = admission(&mut || {
+            let Some(mut buffer) = bytes.take() else {
+                return false;
+            };
+            let result = self.link.enqueue_bytes(std::mem::take(&mut buffer.0));
+            let ok = result.is_ok();
+            queued = Some(result);
+            ok
+        });
+        if !admitted && queued.is_none() {
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable));
+        }
+        let Some(completion) = queued.and_then(Result::ok) else {
+            self.fail_and_reap();
+            return Err(self.crashed());
+        };
+        match completion.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(())) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                self.fail_and_reap();
+                return Err(HostError::Timeout);
+            }
+            _ => {
+                self.fail_and_reap();
+                return Err(self.crashed());
+            }
+        }
+        let line = self.recv_frame_until(deadline)?;
+        let frame = self.expect_frame(&line, id, "typed_execute_result")?;
+        crate::typed::outcome(&frame, schema).ok_or_else(|| self.protocol_error("invalid typed outcome"))
     }
 
     fn suggest_inner(
         &mut self,
         request: &SuggestRequest,
         reset_cancel: bool,
+        scope: Option<&str>,
     ) -> Result<Suggestions, HostError> {
         if !self.alive {
             return Err(self.crashed());
         }
+        // A replacement query retires its predecessor before any callback or
+        // transport failure can leave stale executable bindings behind.
+        self.query_schemas.clear();
 
         // Lower any cancel flag a PRIOR call raised before this one begins, so a
         // worker reused after a cooperative cancellation is not permanently
@@ -1458,7 +1787,15 @@ impl ModernWorker {
         }
 
         let id = self.link.next_id();
-        if self.link.write_frame(&encode_suggest(id, request)).is_err() {
+        let mut outgoing = encode_suggest(id, request);
+        if self.presentation_supported {
+            if let Some(scope) = scope {
+                outgoing["scope_id"] = Value::String(scope.to_owned());
+            }
+        } else if scope.is_some() {
+            return Err(HostError::Protocol("scope unsupported".into()));
+        }
+        if self.link.write_frame(&outgoing).is_err() {
             self.fail_and_reap();
             return Err(self.crashed());
         }
@@ -1471,9 +1808,23 @@ impl ModernWorker {
         let mut items = Vec::new();
         let mut log = Vec::new();
         let mut log_bytes = 0usize;
+        let mut presentation = ResultPresentation::default();
+        let mut presentation_bytes = 0;
         loop {
             let line = self.recv_frame_until(deadline)?;
             let frame = self.expect_frame(&line, id, KIND_RESULT_BATCH)?;
+            if crate::typed::append(
+                &self.plugin,
+                &frame,
+                &mut presentation,
+                self.typed_supported,
+                self.presentation_supported,
+                &mut presentation_bytes,
+            )
+            .is_none()
+            {
+                return Err(self.protocol_error("invalid sidecar"));
+            }
             let Some(generation) = frame.get("generation").and_then(Value::as_u64) else {
                 return Err(self.protocol_error(&line));
             };
@@ -1518,6 +1869,7 @@ impl ModernWorker {
                         return Err(self.protocol_error(&line));
                     }
                     return Ok(Suggestions {
+                        presentation: self.admit_suggestions(&presentation, &items)?,
                         items,
                         state: BatchState::Final,
                         log,
@@ -1529,6 +1881,7 @@ impl ModernWorker {
                         return Err(self.protocol_error(&line));
                     }
                     return Ok(Suggestions {
+                        presentation: ResultPresentation::default(),
                         items,
                         state: BatchState::Cancelled,
                         log,
@@ -1540,6 +1893,7 @@ impl ModernWorker {
                         return Err(self.protocol_error(&line));
                     };
                     return Ok(Suggestions {
+                        presentation: ResultPresentation::default(),
                         items,
                         state: BatchState::Failed,
                         log,
@@ -1563,6 +1917,20 @@ impl ModernWorker {
     ) -> Result<ExecuteOutcome, HostError> {
         if !self.alive {
             return Err(self.crashed());
+        }
+        if self
+            .catalog_schemas
+            .keys()
+            .chain(self.query_schemas.keys())
+            .any(|key| {
+                key.target.item == item.stable_id
+                    && (action_id.is_none() || key.action.as_ref().map(|a| a.0.as_str()) == action_id)
+            })
+        {
+            return Ok(ExecuteOutcome::Failed(PluginError {
+                message: "typed target requires typed execution".into(),
+                traceback: String::new(),
+            }));
         }
 
         let id = self.link.next_id();
@@ -1614,15 +1982,18 @@ impl ModernWorker {
         }
 
         let line = self.recv_frame(self.options.startup_timeout_ms)?;
-        let Some(frame) = parse_object(&line) else {
-            return Err(self.protocol_error(&line));
-        };
+        let frame = &line;
 
         let acknowledged = frame.get("id").and_then(Value::as_u64) == Some(id)
             && frame.get("kind").and_then(Value::as_str) == Some(KIND_HANDSHAKE_ACK)
             && frame.get("protocol_version").and_then(Value::as_u64) == Some(u64::from(PROTOCOL_VERSION));
 
         if acknowledged {
+            let capabilities = frame.get("capabilities").and_then(Value::as_array);
+            self.typed_supported =
+                capabilities.is_some_and(|c| c.iter().any(|v| v.as_str() == Some("typed_arguments_v1")));
+            self.presentation_supported =
+                capabilities.is_some_and(|c| c.iter().any(|v| v.as_str() == Some("result_presentation_v1")));
             self.preview_supported = frame
                 .get("capabilities")
                 .and_then(Value::as_array)
@@ -1644,20 +2015,23 @@ impl ModernWorker {
 
     /// Parses a reply line and checks it echoes `id` and is `kind`, or turns it
     /// into the protocol failure it is (stopping the worker).
-    fn expect_frame(&mut self, line: &str, id: u64, kind: &str) -> Result<Map<String, Value>, HostError> {
-        let Some(frame) = parse_object(line) else {
-            return Err(self.protocol_error(line));
-        };
+    fn expect_frame(
+        &mut self,
+        line: &Arc<Map<String, Value>>,
+        id: u64,
+        kind: &str,
+    ) -> Result<Arc<Map<String, Value>>, HostError> {
+        let frame = line;
         if frame.get("id").and_then(Value::as_u64) != Some(id)
             || frame.get("kind").and_then(Value::as_str) != Some(kind)
         {
             return Err(self.protocol_error(line));
         }
-        Ok(frame)
+        Ok(Arc::clone(frame))
     }
 
     /// Waits up to `budget_ms` for one protocol line.
-    fn recv_frame(&mut self, budget_ms: u64) -> Result<String, HostError> {
+    fn recv_frame(&mut self, budget_ms: u64) -> Result<Arc<Map<String, Value>>, HostError> {
         self.recv_frame_until(deadline_after_millis(budget_ms))
     }
 
@@ -1665,7 +2039,7 @@ impl ModernWorker {
     /// the channel break, stops the child so a stuck plugin cannot hold the
     /// host. A single `deadline` shared across every frame of one call is what
     /// makes a whole `suggest`/`build_catalog` bounded, not just each frame.
-    fn recv_frame_until(&mut self, deadline: Instant) -> Result<String, HostError> {
+    fn recv_frame_until(&mut self, deadline: Instant) -> Result<Arc<Map<String, Value>>, HostError> {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1674,8 +2048,31 @@ impl ModernWorker {
             }
 
             match self.frames.recv_timeout(remaining) {
-                Ok(StdoutEvent::Frame(line)) => return Ok(line),
+                Ok(StdoutEvent::Frame(mut line, sanitized)) => {
+                    if !sanitized && self.link.sensitive.load(Ordering::Acquire) {
+                        let frame = Arc::get_mut(&mut line).expect("reader transfers exclusive frame");
+                        for key in ["log", "error", "detail"] {
+                            if let Some(value) = frame.remove(key) {
+                                let replacement = match (key, value.is_null()) {
+                                    ("log", _) => serde_json::json!([]),
+                                    ("error", true) => Value::Null,
+                                    ("error", false) => {
+                                        serde_json::json!({"message":"plugin callback failed","traceback":""})
+                                    }
+                                    _ => Value::String("plugin callback failed".into()),
+                                };
+                                frame.insert(key.into(), replacement);
+                            }
+                        }
+                    }
+                    return Ok(line);
+                }
                 Ok(StdoutEvent::Oversized { excerpt, bytes }) => {
+                    let excerpt = if self.link.sensitive.load(Ordering::Acquire) {
+                        String::new()
+                    } else {
+                        excerpt
+                    };
                     // Framing is lost, so the channel cannot be resynchronised.
                     self.fail_and_reap();
                     return Err(HostError::Protocol(format!(
@@ -1684,6 +2081,13 @@ impl ModernWorker {
                     )));
                 }
                 Ok(StdoutEvent::Protocol(message)) => {
+                    let message = if self.link.sensitive.load(Ordering::Acquire) {
+                        let mut bytes = message.into_bytes();
+                        bytes.fill(0);
+                        "invalid modern protocol frame".to_owned()
+                    } else {
+                        message
+                    };
                     self.fail_and_reap();
                     return Err(HostError::Protocol(message));
                 }
@@ -1712,9 +2116,9 @@ impl ModernWorker {
 
     /// Turns one malformed reply line into a bounded protocol failure and stops
     /// the worker: a desynchronised channel cannot be trusted.
-    fn protocol_error(&mut self, line: &str) -> HostError {
+    fn protocol_error(&mut self, _line: impl std::fmt::Debug) -> HostError {
         self.fail_and_reap();
-        HostError::Protocol(bounded_excerpt(line))
+        HostError::Protocol("invalid modern protocol frame".into())
     }
 
     /// Marks the worker dead and reaps its child, then lets the stderr tail
@@ -1748,6 +2152,12 @@ impl ModernWorker {
     }
 
     fn crashed_with(&self, detail: Option<String>) -> HostError {
+        if self.link.sensitive.load(Ordering::Acquire) {
+            return HostError::Crashed {
+                plugin: self.plugin.clone(),
+                detail: "sensitive worker unavailable".into(),
+            };
+        }
         let mut tail = self
             .stderr
             .lock()
@@ -1900,13 +2310,6 @@ impl Drop for ModernWorker {
 // ---------------------------------------------------------------------------
 // Decoding helpers
 // ---------------------------------------------------------------------------
-
-fn parse_object(line: &str) -> Option<Map<String, Value>> {
-    match serde_json::from_str::<Value>(line) {
-        Ok(Value::Object(map)) => Some(map),
-        _ => None,
-    }
-}
 
 fn bounded_excerpt(line: &str) -> String {
     if line.is_empty() {
@@ -2155,5 +2558,59 @@ mod tests {
             Ok(LineRead::Frame)
         ));
         assert_eq!(line, br#"{"kind":"final"}"#);
+    }
+
+    #[test]
+    fn queued_protocol_excerpt_is_rechecked_by_the_actual_receive_path() {
+        use crikey_package_manager::{EnvironmentId, MaterializedEnvironment};
+        const MARKER: &str = "QUEUED_BEFORE_TYPED_LATCH_PRIVATE_DIAGNOSTIC";
+        for sensitive in [false, true] {
+            let owner = PluginId("queued-protocol".into());
+            let env = MaterializedEnvironment {
+                id: EnvironmentId("queued-protocol-env".into()),
+                site_dir: ".".into(),
+            };
+            let path = std::path::Path::new(".");
+            let options = WorkerOptions::new(
+                owner.clone(),
+                "unused:Unused",
+                ImportPath::assemble(path, &[], &env, path),
+            );
+            let (sender, frames) = mpsc::sync_channel(1);
+            // Exactly the event the stdout reader queued before sensitivity.
+            sender.send(StdoutEvent::Protocol(MARKER.to_owned())).unwrap();
+            let link = Arc::new(WorkerLink {
+                next_id: AtomicU64::new(0),
+                stdin: Mutex::new(None),
+                stdin_thread: Mutex::new(None),
+                sensitive: AtomicBool::new(false),
+            });
+            let mut worker = ModernWorker {
+                plugin: owner,
+                options,
+                link: Arc::clone(&link),
+                frames,
+                background: Arc::new(BackgroundState::new(None, false)),
+                stderr: Arc::new(Mutex::new(StderrTail::default())),
+                stderr_thread: None,
+                child: None,
+                process_id: 0,
+                incarnation: 1,
+                reaped: None,
+                hard_stopped: false,
+                preview_supported: false,
+                commands_supported: false,
+                typed_supported: true,
+                presentation_supported: false,
+                presentation: ResultPresentation::default(),
+                catalog_schemas: BTreeMap::new(),
+                query_schemas: BTreeMap::new(),
+                alive: true,
+            };
+            link.sensitive.store(sensitive, Ordering::Release);
+            let error = worker.recv_frame(1000).unwrap_err();
+            assert!(matches!(error, HostError::Protocol(_)));
+            assert_eq!(format!("{error:?}").contains(MARKER), !sensitive);
+        }
     }
 }

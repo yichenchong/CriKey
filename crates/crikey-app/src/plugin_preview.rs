@@ -35,6 +35,7 @@ pub struct PreviewUpdate {
     pub state: PreviewState,
 }
 pub(crate) type PreviewPublish = Arc<dyn Fn(PreviewUpdate) + Send + Sync>;
+pub(crate) type PendingPreviews<C> = Arc<std::sync::Mutex<Vec<(PreviewIdentity, Arc<C>)>>>;
 pub(crate) trait PreviewDispatcher: Send + Sync {
     /// Returns the item and its immutable producing worker identity together.
     fn lookup(
@@ -874,7 +875,7 @@ mod tests {
             );
             assert!(model
                 .apply(UiCommand::OpenPreviewLink {
-                    target,
+                    target: Box::new(target),
                     url: "https://example.com/preview".into(),
                 })
                 .is_none());

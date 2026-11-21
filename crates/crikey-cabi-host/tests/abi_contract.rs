@@ -352,6 +352,7 @@ fn query(text: &str) -> Query {
         deadline_ms: Some(400),
         generation: 3,
         selected_item_id: None,
+        selected_scope_id: None,
     }
 }
 

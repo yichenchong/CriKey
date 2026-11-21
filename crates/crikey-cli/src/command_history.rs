@@ -9,6 +9,7 @@ use std::{
 pub(crate) enum Learning {
     Command(crikey_app::CommandLearning, u64),
     Ordinary(crikey_app::SelectionLearning, u64),
+    ItemSelection(crikey_core::Item, u64),
     Host(CommandRef, u64),
 }
 impl Learning {
@@ -21,6 +22,11 @@ impl Learning {
             Self::Ordinary(evidence, time) => {
                 search.set_history_time(time);
                 search.record_selection_learning(evidence);
+                Ok(())
+            }
+            Self::ItemSelection(item, time) => {
+                search.set_history_time(time);
+                search.record_item_learning(item);
                 Ok(())
             }
             Self::Host(reference, time) => {
@@ -137,5 +143,42 @@ impl Drop for HistoryWorker {
             while self.receiver.recv().is_ok() {}
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_frozen_item_credit_records_no_query_or_command_affinity() {
+        let mut search = SearchService::new(crikey_app::App::new());
+        let item = crikey_core::Item {
+            stable_id: ItemId("actionless".into()),
+            plugin_id: PluginId("typed.owner".into()),
+            category: crikey_core::Category::Command,
+            label: "Frozen admitted typed item".into(),
+            description: String::new(),
+            target: String::new(),
+            search_terms: Vec::new(),
+            icon_reference: None,
+            argument_policy: crikey_core::ArgumentPolicy::Forbidden,
+            hit_policy: crikey_core::HitPolicy::Ignored,
+            score_hint: 0,
+            metadata: Default::default(),
+            actions: Vec::new(),
+        };
+        Learning::ItemSelection(item.clone(), 7)
+            .publish(&mut search)
+            .unwrap();
+        Learning::ItemSelection(item, 8).publish(&mut search).unwrap();
+        let snapshot = search.selection_history_snapshot();
+        assert_eq!(snapshot.selections.len(), 1);
+        assert_eq!(snapshot.selections[0].plugin.0, "typed.owner");
+        assert_eq!(snapshot.selections[0].item.0, "actionless");
+        assert_eq!(snapshot.selections[0].frequency, 2);
+        assert_eq!(snapshot.selections[0].last_selected_secs, Some(8));
+        assert!(snapshot.query_affinities.is_empty());
+        assert!(snapshot.commands.is_empty());
     }
 }

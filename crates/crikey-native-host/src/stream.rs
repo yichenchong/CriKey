@@ -61,6 +61,7 @@ pub struct PluginError {
 #[derive(Debug, Clone)]
 pub struct Suggestions {
     pub items: Vec<Item>,
+    pub presentation: Option<crikey_core::result_presentation::ResultPresentation>,
     pub state: BatchState,
     pub log: Vec<String>,
     /// Present exactly when [`state`](Self::state) is [`BatchState::Failed`].
@@ -116,6 +117,7 @@ pub struct NativeSuggestRequest {
     pub text: String,
     pub normalized: String,
     pub selected_item_id: Option<String>,
+    pub selected_scope_id: Option<String>,
 }
 
 /// One host-to-plugin request for the next frame of an open page (spec 32.3).

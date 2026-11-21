@@ -46,15 +46,21 @@ pub struct LogicalScroll {
 /// payload; a scope is a logical identifier, never arbitrary editor contents.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NavigationRestoration {
+    pub inline_arguments: Option<crate::InlineArguments>,
     pub query: String,
     pub selected: Option<crate::ActionTarget>,
     pub fallback_index: usize,
     pub navigated: bool,
-    pub scope: Option<String>,
+    pub scope: Option<crate::ScopeIdentity>,
     pub scroll: LogicalScroll,
 }
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NavigationPresentation {
+    pub inline_arguments: Option<crate::InlineArguments>,
+    pub scopes: Arc<[crate::ScopeChoice]>,
+    pub selected_scope: Option<crate::ScopeIdentity>,
+    pub section_headers: Arc<[crate::SectionHeader]>,
+    pub actionless_targets: Arc<[crikey_core::structured_arguments::OwnedItem]>,
     pub title: Arc<str>,
     pub can_go_back: bool,
     pub scroll: LogicalScroll,
@@ -76,11 +82,78 @@ pub(crate) struct Entry {
 // Count immutable result and icon allocations once even if several entries share them.
 pub(crate) fn retained_bytes<'a>(entries: impl Iterator<Item = &'a Entry>) -> usize {
     let mut allocations = std::collections::HashSet::new();
+    let mut typed = crikey_core::content_accounting::ContentFootprint::new(MAX_NAVIGATION_BYTES, 0);
+    let mut renderer_bytes = 0usize;
     // The fixed entry pool includes the current logical entry/suspended slot.
     let mut bytes = MAX_NAVIGATION_ENTRIES * std::mem::size_of::<Entry>();
     for entry in entries {
+        renderer_bytes = 0;
+        if let Some(input) = &entry.state.inline_arguments {
+            if typed.include_schema(&input.schema).is_err() {
+                return usize::MAX;
+            }
+            // Logical snapshots share the explicit nonsecret draft allocation.
+            let map_bytes = input
+                .draft
+                .values
+                .iter()
+                .map(|(id, value)| {
+                    id.0.capacity()
+                        + std::mem::size_of_val(value)
+                        + 6 * std::mem::size_of::<usize>()
+                        + match value {
+                            crikey_core::structured_arguments::NonSecretValue::Text(text) => text.capacity(),
+                            crikey_core::structured_arguments::NonSecretValue::Dropdown(option) => {
+                                option.0.capacity()
+                            }
+                        }
+                })
+                .sum::<usize>();
+            let key_bytes = input.executable.target.owner.0.capacity()
+                + input.executable.target.item.0.capacity()
+                + input
+                    .executable
+                    .action
+                    .as_ref()
+                    .map_or(0, |action| action.0.capacity());
+            let draft_bytes = map_bytes
+                + key_bytes
+                + std::mem::size_of_val(input.draft.as_ref())
+                + 2 * std::mem::size_of::<usize>();
+            if typed.charge_shared(&input.draft, draft_bytes, 0).is_err() {
+                return usize::MAX;
+            }
+            bytes = bytes.saturating_add(key_bytes);
+            if let Some((reference, _)) = &input.command {
+                bytes += reference.provider_id.0.capacity() + reference.command_id.capacity();
+            }
+            // Reserve the bounded live editor separately without recording
+            // password lengths. Only the current entry has a renderer editor.
+            renderer_bytes = input
+                .schema
+                .fields
+                .iter()
+                .map(|field| {
+                    field.id.0.capacity()
+                        + 6 * std::mem::size_of::<usize>()
+                        + match field.kind {
+                            crikey_core::structured_arguments::FieldKind::Text { .. } => {
+                                crikey_core::structured_arguments::MAX_TEXT_BYTES
+                            }
+                            crikey_core::structured_arguments::FieldKind::Password { .. } => {
+                                crikey_core::structured_arguments::MAX_TEXT_BYTES
+                            }
+                            crikey_core::structured_arguments::FieldKind::Dropdown { .. } => {
+                                crikey_core::structured_arguments::MAX_ID_BYTES
+                            }
+                        }
+                })
+                .sum();
+        }
         bytes = bytes.saturating_add(entry.state.query.capacity());
-        bytes += entry.state.scope.as_ref().map_or(0, String::capacity);
+        bytes += entry.state.scope.as_ref().map_or(0, |scope| {
+            scope.owner.0.capacity() + scope.id.0.capacity() + std::mem::size_of_val(scope)
+        });
         if let Some(selected) = &entry.state.selected {
             bytes += selected.retained_bytes();
         }
@@ -139,4 +212,6 @@ pub(crate) fn retained_bytes<'a>(entries: impl Iterator<Item = &'a Entry>) -> us
         }
     }
     bytes
+        .saturating_add(typed.resources().bytes)
+        .saturating_add(renderer_bytes)
 }

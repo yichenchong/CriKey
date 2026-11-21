@@ -95,3 +95,53 @@ source; command availability does not promise a live preview producer. Only
 `OpenSettings` is declared as a host command. Command-specific alias/global
 shortcut controls and structured multi-field arguments are not supplied by
 this capability.
+
+## Root typed arguments and presentation
+
+Protocol version 1 adds independent optional `typed_arguments_v1` and
+`result_presentation_v1` capabilities. Envelope tags 47/48 were checked against
+the complete existing 10–46 assignment set before allocation. Catalog/result
+field 5 carries bounded presentation sidecars; suggest field 6 carries an
+optional selected scope ID. No standard routes or navigation outcomes are
+introduced.
+
+Sidecars declare sections/scopes, per-item memberships and one schema per exact
+item/optional-action executable. Endpoint ownership is host-supplied. Absence
+of the action field is genuine actionless execution; a present empty ID is
+invalid. Metadata accumulates with the complete catalog or exact suggestion
+generation and grants no authority until all references and duplicates pass
+transactional validation. Presentation-only negotiation cannot authorize typed
+execution; typed-only negotiation can carry schemas without visual metadata.
+
+Schemas allow text, password and dropdown fields, with at most 64 fields,
+256 options per dropdown, 256-byte IDs, 8 KiB UTF-8 strings/values and a 256 KiB
+schema allocation footprint. Password defaults are forbidden. Optional strings
+preserve absent versus present-empty; omitted limits normalize to min 0/max
+8192. Decoders share the existing frame allocation budget, tighten it for each
+schema before allocation and accumulate nested fragments/counts/unknown bytes.
+Producer preflight accounts for sidecars and rows before serialization.
+
+Typed requests contain item ID, explicit optional-action presence, exactly
+32 fingerprint bytes and typed field values, never a legacy argument.
+The fingerprint is Core's canonical v1 SHA-256 structural binding, including
+ordered fields/options and all properties but excluding unknown wire fields.
+The host confirms that binding against the actual physical worker's complete
+metadata before values enter its writer queue. A fresh static worker bootstraps
+bounded catalog discovery; dynamic suggestion authority is never regenerated.
+The SDK independently checks its current binding. Mismatches are fixed
+refusals, not fallback to legacy execution.
+
+Responses are Completed, unique current-field failures with fixed codes, or a
+fixed failure code. They carry no callback error message or navigation outcome.
+Legacy SDK dispatch refuses schema-only targets even when an older host cannot
+consume their metadata. Existing catalog/suggestion callbacks remain compatible
+through optional metadata callbacks.
+
+Every typed submission makes its physical incarnation diagnostically sensitive
+before writer admission. The transition clears retained diagnostics; later
+plugin logs, stderr, callback errors, panic payloads and raw diagnostic excerpts
+are suppressed for that process's remaining lifetime, including background
+callbacks. Diagnostic-aware decoding validates/budgets discarded text without
+copying it. Fixed lifecycle/error codes still reach the host. This is not a
+sandbox against deliberate plugin I/O, nor a cryptographic memory-erasure
+guarantee. Live values are move-only and are not query history or snapshots.

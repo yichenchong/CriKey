@@ -33,6 +33,24 @@ pub use crikey_core::{
 pub use crikey_native_protocol as protocol;
 pub use serve::{serve, serve_on, HandshakeInfo, ServeConfig};
 
+pub use crikey_core::result_presentation::ResultPresentation;
+pub use crikey_core::structured_arguments::{ArgumentValues, SubmissionFailureCode, SubmissionOutcome};
+
+/// Typed input is move-only and never forwarded to legacy execution.
+pub struct TypedExecuteRequest {
+    pub request: RequestId,
+    pub item: crikey_core::ItemId,
+    pub action: Option<crikey_core::ActionId>,
+    pub expected_fingerprint: [u8; 32],
+    pub values: ArgumentValues,
+}
+
+impl std::fmt::Debug for TypedExecuteRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TypedExecuteRequest { [REDACTED] }")
+    }
+}
+
 /// Errors raised by the SDK boundary (spec 16.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SdkError {
@@ -85,6 +103,8 @@ pub struct Query {
     pub generation: u64,
     /// Item selected by the user, for argument suggestions.
     pub selected_item_id: Option<String>,
+    /// Exact declared scope, or All when absent.
+    pub selected_scope_id: Option<String>,
 }
 
 /// Cooperative cancellation handed to every request (spec 9.4, 16.7).
@@ -275,6 +295,35 @@ pub struct PluginResource {
 
 /// The trait a native plugin implements (spec 16.7).
 pub trait Plugin {
+    /// Typed execution and visual presentation negotiate independently.
+    fn supports_typed_arguments(&self) -> bool {
+        false
+    }
+    fn supports_result_presentation(&self) -> bool {
+        false
+    }
+
+    /// Called before catalog construction, including for older hosts.
+    fn catalog_presentation(&mut self, _context: &dyn PluginContext) -> Result<ResultPresentation> {
+        Ok(ResultPresentation::default())
+    }
+
+    /// Called before suggestions for the exact query generation.
+    fn suggestion_presentation(
+        &mut self,
+        _query: &Query,
+        _context: &dyn PluginContext,
+    ) -> Result<ResultPresentation> {
+        Ok(ResultPresentation::default())
+    }
+
+    fn execute_typed(
+        &mut self,
+        _request: TypedExecuteRequest,
+        _context: &dyn PluginContext,
+    ) -> Result<SubmissionOutcome> {
+        Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported))
+    }
     /// Opt in only with an explicit implementation. Adapters without a command
     /// callback (including WASM/C ABI) must retain this false default.
     fn supports_commands(&self) -> bool {

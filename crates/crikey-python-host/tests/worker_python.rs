@@ -58,6 +58,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::thread::{sleep, yield_now};
 use std::time::{Duration, Instant};
 
@@ -1288,5 +1289,590 @@ fn commands_without_override_are_explicitly_unsupported_not_metadata_inferred() 
         PluginCommands::Unsupported
     );
     assert!(worker.poll_alive());
+    worker.shutdown();
+}
+
+fn typed_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility/test-plugins/modern-typed")
+}
+
+fn typed_values(name: &str, password: &str) -> crikey_core::structured_arguments::ArgumentValues {
+    use crikey_core::structured_arguments::*;
+    ArgumentValues(BTreeMap::from([
+        (
+            FieldId("name".into()),
+            StructuredValue::NonSecret(NonSecretValue::Text(name.into())),
+        ),
+        (
+            FieldId("password".into()),
+            StructuredValue::Password(Password::new(password.into()).unwrap()),
+        ),
+        (
+            FieldId("region".into()),
+            StructuredValue::NonSecret(NonSecretValue::Dropdown(OptionId("local".into()))),
+        ),
+    ]))
+}
+
+#[test]
+fn typed_real_worker_actionless_async_fixed_outcomes_and_healthy_reacquire() {
+    require_host_interpreter!();
+    use crikey_core::structured_arguments::SubmissionOutcome;
+    let scratch = Scratch::new("typed-real");
+    let site = scratch.subdir("site");
+    let mut worker = spawn_worker(
+        "typed-fixture",
+        "typed_plugin:TypedPlugin",
+        &typed_fixture(),
+        &site,
+    );
+    assert!(worker.supports_typed_arguments());
+    assert!(worker.supports_result_presentation());
+    let catalog = worker.build_catalog().expect("typed catalog");
+    let schema = Arc::clone(&worker.presentation().schemas[0].schema);
+    assert!(matches!(
+        worker
+            .typed_execute(
+                &catalog[0],
+                None,
+                &schema,
+                typed_values("valid", "typed-password")
+            )
+            .unwrap(),
+        SubmissionOutcome::Completed
+    ));
+    assert!(matches!(
+        worker
+            .typed_execute(
+                &catalog[0],
+                None,
+                &schema,
+                typed_values("reject", "typed-password")
+            )
+            .unwrap(),
+        SubmissionOutcome::InvalidFields(_)
+    ));
+    let action_schema = Arc::clone(&worker.presentation().schemas[1].schema);
+    assert!(matches!(
+        worker
+            .typed_execute(
+                &catalog[1],
+                Some("submit"),
+                &action_schema,
+                typed_values("valid", "action-password")
+            )
+            .unwrap(),
+        SubmissionOutcome::Completed
+    ));
+    let incarnation = worker.incarnation();
+    worker.shutdown();
+    let mut replacement = spawn_worker(
+        "typed-fixture",
+        "typed_plugin:TypedPlugin",
+        &typed_fixture(),
+        &site,
+    );
+    assert_ne!(replacement.incarnation(), incarnation);
+    assert!(replacement
+        .confirm_typed_schema(&catalog[0], None, &schema)
+        .unwrap());
+    assert!(matches!(
+        replacement
+            .typed_execute(&catalog[0], None, &schema, typed_values("valid", "new-password"))
+            .unwrap(),
+        SubmissionOutcome::Completed
+    ));
+    let mut changed = (*schema).clone();
+    changed.fields[0].label.push_str(" changed");
+    assert!(!replacement
+        .confirm_typed_schema(&catalog[0], None, &changed)
+        .unwrap());
+    replacement.shutdown();
+}
+
+#[test]
+fn every_typed_submission_suppresses_remaining_incarnation_diagnostics() {
+    require_host_interpreter!();
+    use crikey_core::structured_arguments::SubmissionOutcome;
+    let scratch = Scratch::new("typed-privacy");
+    let site = scratch.subdir("site");
+    let mut worker = spawn_worker(
+        "typed-fixture",
+        "typed_plugin:TypedPlugin",
+        &typed_fixture(),
+        &site,
+    );
+    let catalog = worker.build_catalog().unwrap();
+    let schema = Arc::clone(&worker.presentation().schemas[0].schema);
+    let password = "PASSWORD_MUST_NOT_REACH_DIAGNOSTICS_47";
+    let result = worker
+        .typed_execute(&catalog[0], None, &schema, typed_values("leak", password))
+        .unwrap();
+    assert!(matches!(result, SubmissionOutcome::Failed(_)));
+    assert!(!format!("{result:?}").contains(password));
+    let later = suggest(&mut worker, "typed-leak-after");
+    assert!(later.log.is_empty());
+    assert!(!format!("{later:?}").contains(password));
+    worker.send_configuration(&BTreeMap::new(), true).unwrap();
+    assert!(!format!("{worker:?}").contains(password));
+    let crash = worker
+        .suggest(&SuggestRequest {
+            generation: 2,
+            text: "typed-crash-after".into(),
+            normalized: "typed-crash-after".into(),
+            selected_item_id: None,
+        })
+        .unwrap_err();
+    assert!(!format!("{crash:?}").contains(password));
+    worker.shutdown();
+}
+
+#[test]
+fn typed_scopes_are_explicit_and_preserve_query_generation() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("typed-scopes");
+    let site = scratch.subdir("site");
+    let mut worker = spawn_worker(
+        "typed-fixture",
+        "typed_plugin:TypedPlugin",
+        &typed_fixture(),
+        &site,
+    );
+    for (generation, scope, item) in [(41, "local", "typed-actionless"), (42, "remote", "typed-action")] {
+        let reply = worker
+            .suggest_scoped(
+                &SuggestRequest {
+                    generation,
+                    text: "typed".into(),
+                    normalized: "typed".into(),
+                    selected_item_id: None,
+                },
+                Some(scope),
+            )
+            .unwrap();
+        assert_eq!(reply.state, BatchState::Final);
+        assert_eq!(reply.items.len(), 1);
+        assert_eq!(reply.items[0].stable_id.0, item);
+        assert_eq!(reply.presentation.schemas.len(), 1);
+    }
+    worker.shutdown();
+}
+
+#[test]
+fn typed_sync_callback_and_sdk_independent_fingerprint_refusal() {
+    require_host_interpreter!();
+    use crikey_core::structured_arguments::*;
+    let scratch = Scratch::new("typed-sdk-binding");
+    let src = scratch.subdir("source");
+    write_file(
+        &src.join("binding.py"),
+        r#"
+from crikey_sdk import Plugin, Item, ArgumentSchema, TextField, SchemaBinding, ResultPresentation
+SCHEMA = ArgumentSchema((TextField(id="text", label="Text", required=True),))
+class Sync(Plugin):
+    drift = False
+    def catalog_presentation(self):
+        return ResultPresentation(schemas=(SchemaBinding("sync", SCHEMA),))
+    def build_catalog(self):
+        if self.drift:
+            object.__setattr__(SCHEMA.fields[0], "label", "Changed after publication")
+        return [Item("sync", "Sync typed", "sync")]
+    def execute_typed(self, item, action_id, values):
+        assert values.get("text").value == "sentinel"
+        return None
+    def execute(self, *args):
+        raise AssertionError("legacy callback must not run")
+class Drift(Sync):
+    drift = True
+"#,
+    );
+    let site = scratch.subdir("site");
+    for (class, expected) in [
+        ("Sync", SubmissionOutcome::Completed),
+        (
+            "Drift",
+            SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable),
+        ),
+    ] {
+        let mut worker = spawn_worker("binding", &format!("binding:{class}"), &src, &site);
+        let items = worker.build_catalog().unwrap();
+        let schema = Arc::clone(&worker.presentation().schemas[0].schema);
+        if class == "Sync" {
+            let mut suggestion_first = spawn_worker("binding", "binding:Sync", &src, &site);
+            let empty = suggest(&mut suggestion_first, "schema-free-suggestion");
+            assert!(empty.presentation.schemas.is_empty());
+            assert!(suggestion_first
+                .confirm_typed_schema(&items[0], None, &schema)
+                .unwrap());
+            suggestion_first.shutdown();
+        }
+        let values = ArgumentValues(BTreeMap::from([(
+            FieldId("text".into()),
+            StructuredValue::NonSecret(NonSecretValue::Text("sentinel".into())),
+        )]));
+        assert_eq!(
+            worker.typed_execute(&items[0], None, &schema, values).unwrap(),
+            expected
+        );
+        worker.shutdown();
+    }
+}
+
+#[test]
+fn real_worker_malformed_typed_metadata_fails_before_admission() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("typed-malformed");
+    let site = scratch.subdir("site");
+    let cases = [
+        serde_json::json!({"fields": (0..65).map(|n| serde_json::json!({"id":format!("f{n}"),"label":"Field","kind":"text"})).collect::<Vec<_>>()}),
+        serde_json::json!({"fields":[{"id":"p","label":"Password","kind":"password","default":null}]}),
+        serde_json::json!({"fields":[{"id":"x","label":"First","kind":"text"},{"id":"x","label":"Duplicate","kind":"text"}]}),
+        serde_json::json!({"fields":[{"id":"x".repeat(257),"label":"Long ID","kind":"text"}]}),
+        serde_json::json!({"fields":[{"id":"x","label":"x".repeat(8193),"kind":"text"}]}),
+        serde_json::json!({"fields":[{"id":"x","label":"Options","kind":"dropdown","options":(0..257).map(|n| serde_json::json!({"id":format!("o{n}"),"label":"Option"})).collect::<Vec<_>>()}]}),
+    ];
+    for (n, schema) in cases.into_iter().enumerate() {
+        let src = scratch.subdir(&format!("case-{n}"));
+        let frame = serde_json::json!({"id":2,"kind":"result_batch","generation":1,"state":"final","items":[],"log":[],"presentation":{"schemas":[{"item_id":"x","action_id":null,"schema":schema}]}});
+        let encoded = serde_json::to_string(&frame).unwrap() + "\n";
+        let literal = serde_json::to_string(&encoded).unwrap();
+        write_file(&src.join("malformed.py"), &format!("import __main__,json\nfrom crikey_sdk import Plugin\nclass Impl(Plugin):\n def suggest(self,q,c):\n  __main__._PROTOCOL.write({literal})\n  __main__._PROTOCOL.flush()\n"));
+        let mut worker = spawn_worker("malformed", "malformed:Impl", &src, &site);
+        let result = worker.suggest(&SuggestRequest {
+            generation: 1,
+            text: "x".into(),
+            normalized: "x".into(),
+            selected_item_id: None,
+        });
+        assert!(matches!(result, Err(crikey_python_host::HostError::Protocol(_))));
+        assert!(!worker.is_alive());
+        worker.shutdown();
+    }
+}
+
+#[test]
+fn retired_source_gate_never_sends_typed_callback_and_worker_remains_usable() {
+    require_host_interpreter!();
+    use crikey_core::structured_arguments::*;
+    let scratch = Scratch::new("typed-admission");
+    let site = scratch.subdir("site");
+    let mut worker = spawn_worker(
+        "typed-fixture",
+        "typed_plugin:TypedPlugin",
+        &typed_fixture(),
+        &site,
+    );
+    let items = worker.build_catalog().unwrap();
+    let schema = Arc::clone(&worker.presentation().schemas[0].schema);
+    assert_eq!(
+        worker
+            .typed_execute_with_admission(
+                &items[0],
+                None,
+                &schema,
+                typed_values("leak", "retired-secret"),
+                |_send| false
+            )
+            .unwrap(),
+        SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable)
+    );
+    assert!(worker.is_alive());
+    assert!(matches!(
+        worker
+            .typed_execute(&items[0], None, &schema, typed_values("valid", "new-secret"))
+            .unwrap(),
+        SubmissionOutcome::Completed
+    ));
+    worker.shutdown();
+}
+
+#[test]
+fn sdk_process_latch_blocks_mirroring_formatting_threads_and_queued_logs() {
+    require_host_interpreter!();
+    use crikey_core::structured_arguments::*;
+    let scratch = Scratch::new("typed-sdk-privacy");
+    let src = scratch.subdir("source");
+    let site = scratch.subdir("site");
+    write_file(
+        &src.join("privacy.py"),
+        r#"
+import __main__, logging, sys, threading
+from crikey_sdk import Plugin, Item, ArgumentSchema, TextField, SchemaBinding, ResultPresentation
+formats = 0
+mirrors = 0
+SCHEMA = ArgumentSchema((TextField(id="text", label="Text"),))
+class Probe:
+    def __str__(self):
+        global formats
+        formats += 1
+        return "SECRET_FORMAT_PROBE"
+class ProbeException(RuntimeError):
+    def __str__(self):
+        global formats
+        formats += 1
+        return "SECRET_EXCEPTION_PROBE"
+class Mirror:
+    encoding = "utf-8"
+    errors = "strict"
+    def write(self, text):
+        global mirrors
+        mirrors += 1
+        return len(text)
+    def flush(self):
+        pass
+class Impl(Plugin):
+    def build_catalog(self):
+        return [Item("typed", "Typed", "typed")]
+    def catalog_presentation(self):
+        return ResultPresentation(schemas=(SchemaBinding("typed", SCHEMA),))
+    def execute_typed(self, item, action, values):
+        __main__._CAPTURE._mirror = Mirror()
+        sys.stdout.write(Probe())
+        __main__._CAPTURE.line(Probe())
+        handler = logging.StreamHandler(sys.stderr)
+        handler.handle(logging.LogRecord("probe", logging.ERROR, "probe.py", 1, Probe(), (), None))
+        def fail():
+            raise ProbeException()
+        thread = threading.Thread(target=fail)
+        thread.start()
+        thread.join()
+        class BrokenFinalizer:
+            def __del__(self):
+                raise ProbeException()
+        finalizer = BrokenFinalizer()
+        del finalizer
+        return None
+    def suggest(self, query, context):
+        if query.text == "report":
+            context.emit(Item("report", "Report", "report", metadata={"formats": str(formats), "mirrors": str(mirrors)}))
+        else:
+            raise ProbeException()
+    def on_configuration(self, values):
+        raise ProbeException()
+    def stop(self):
+        raise ProbeException()
+"#,
+    );
+    let mut worker = spawn_worker("privacy", "privacy:Impl", &src, &site);
+    let items = worker.build_catalog().unwrap();
+    assert!(worker.supports_typed_arguments());
+    assert!(!worker.supports_result_presentation());
+    let schema = Arc::clone(&worker.presentation().schemas[0].schema);
+    let values = ArgumentValues(BTreeMap::from([(
+        FieldId("text".into()),
+        StructuredValue::NonSecret(NonSecretValue::Text("not-a-password-field".into())),
+    )]));
+    assert_eq!(
+        worker.typed_execute(&items[0], None, &schema, values).unwrap(),
+        SubmissionOutcome::Completed
+    );
+    let failed = suggest(&mut worker, "fail");
+    assert_eq!(failed.state, BatchState::Failed);
+    assert!(failed.log.is_empty());
+    worker.send_configuration(&BTreeMap::new(), true).unwrap();
+    let report = suggest(&mut worker, "report");
+    assert_eq!(meta(&report.items[0], "formats"), "0");
+    assert_eq!(meta(&report.items[0], "mirrors"), "0");
+    worker.shutdown();
+}
+
+#[test]
+fn old_scope_cancel_race_cannot_reset_the_next_scoped_request() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("typed-scope-race");
+    let site = scratch.subdir("site");
+    let mut worker = spawn_worker(
+        "typed-fixture",
+        "typed_plugin:TypedPlugin",
+        &typed_fixture(),
+        &site,
+    );
+    let cancel = worker.cancel_handle();
+    let old = std::thread::spawn(move || {
+        let reply = worker.suggest_scoped(
+            &SuggestRequest {
+                generation: 61,
+                text: "typed-scope-wait".into(),
+                normalized: "typed-scope-wait".into(),
+                selected_item_id: None,
+            },
+            Some("local"),
+        );
+        (worker, reply)
+    });
+    cancel.cancel();
+    let (mut worker, old) = old.join().unwrap();
+    let old = old.unwrap();
+    assert_eq!(old.state, BatchState::Cancelled);
+    assert!(old.presentation.schemas.is_empty());
+    cancel.reset();
+    let current = worker
+        .suggest_scoped(
+            &SuggestRequest {
+                generation: 62,
+                text: "typed".into(),
+                normalized: "typed".into(),
+                selected_item_id: None,
+            },
+            Some("remote"),
+        )
+        .unwrap();
+    assert_eq!(current.state, BatchState::Final);
+    assert_eq!(current.items.len(), 1);
+    assert_eq!(current.items[0].stable_id.0, "typed-action");
+    worker.shutdown();
+}
+
+#[test]
+fn presentation_only_negotiation_grants_no_typed_execution() {
+    require_host_interpreter!();
+    use crikey_core::structured_arguments::*;
+    let scratch = Scratch::new("presentation-only");
+    let src = scratch.subdir("source");
+    let site = scratch.subdir("site");
+    write_file(
+        &src.join("visual.py"),
+        r#"
+from crikey_sdk import Plugin, Item, ResultPresentation, Section, Scope, ItemPresentation
+class Impl(Plugin):
+    def supports_result_presentation(self):
+        return True
+    def build_catalog(self):
+        return [Item("ordinary", "Ordinary", "ordinary")]
+    def catalog_presentation(self):
+        return ResultPresentation(sections=(Section("group", "Group"),),
+                                  scopes=(Scope("scope", "Scope"),),
+                                  items=(ItemPresentation("ordinary", "group", ("scope",)),))
+"#,
+    );
+    let mut worker = spawn_worker("visual", "visual:Impl", &src, &site);
+    assert!(!worker.supports_typed_arguments());
+    assert!(worker.supports_result_presentation());
+    let items = worker.build_catalog().unwrap();
+    assert_eq!(worker.presentation().sections.len(), 1);
+    assert!(worker.presentation().schemas.is_empty());
+    assert_eq!(
+        worker
+            .typed_execute(
+                &items[0],
+                None,
+                &ArgumentSchema::default(),
+                ArgumentValues::default()
+            )
+            .unwrap(),
+        SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported)
+    );
+    assert!(matches!(
+        worker.execute(&items[0], None, None).unwrap(),
+        crikey_python_host::ExecuteOutcome::Ok
+    ));
+    worker.shutdown();
+}
+
+#[test]
+fn failed_and_cancelled_queries_retire_previous_schema_authority() {
+    require_host_interpreter!();
+    use crikey_core::structured_arguments::*;
+    let scratch = Scratch::new("query-schema-retirement");
+    let src = scratch.subdir("source");
+    let site = scratch.subdir("site");
+    write_file(
+        &src.join("retirement.py"),
+        r#"
+from crikey_sdk import Plugin, Item, ArgumentSchema, TextField, SchemaBinding, ResultPresentation, TypedOutcome
+SCHEMA = ArgumentSchema((TextField(id="text", label="Text"),))
+class Impl(Plugin):
+    def build_catalog(self):
+        return []
+    def suggestion_presentation(self, query):
+        return ResultPresentation(schemas=(SchemaBinding("dynamic", SCHEMA),))
+    def suggest(self, query, context):
+        if query.text == "fail":
+            raise RuntimeError("fixed fixture failure")
+        if query.text == "cancel":
+            context._is_cancelled.__self__.set()
+            return
+        context.emit(Item("dynamic", "Dynamic", "dynamic"))
+    def execute_typed(self, item, action, values):
+        return TypedOutcome(code="denied")
+    def execute(self, *args):
+        return None
+"#,
+    );
+    let mut worker = spawn_worker("retirement", "retirement:Impl", &src, &site);
+    for (mode, state) in [("fail", BatchState::Failed), ("cancel", BatchState::Cancelled)] {
+        let ready = suggest(&mut worker, "ready");
+        let schema = Arc::clone(&ready.presentation.schemas[0].schema);
+        assert!(worker
+            .confirm_typed_schema(&ready.items[0], None, &schema)
+            .unwrap());
+        assert_eq!(suggest(&mut worker, mode).state, state);
+        worker.cancel_handle().reset();
+        assert!(!worker
+            .confirm_typed_schema(&ready.items[0], None, &schema)
+            .unwrap());
+        let values = ArgumentValues(BTreeMap::from([(
+            FieldId("text".into()),
+            StructuredValue::NonSecret(NonSecretValue::Text("sentinel".into())),
+        )]));
+        assert_eq!(
+            worker
+                .typed_execute(&ready.items[0], None, &schema, values)
+                .unwrap(),
+            SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable)
+        );
+        // Retiring execution authority must not turn an old schema-only target
+        // into a legacy callback under hosts that cannot consume its sidecar.
+        assert!(matches!(
+            worker.execute(&ready.items[0], None, None).unwrap(),
+            crikey_python_host::ExecuteOutcome::Failed(_)
+        ));
+    }
+    worker.shutdown();
+}
+
+#[test]
+fn complete_escaped_catalog_frame_is_refused_without_killing_the_worker() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("complete-presentation-frame");
+    let src = scratch.subdir("source");
+    let site = scratch.subdir("site");
+    write_file(
+        &src.join("complete_frame.py"),
+        r#"
+from crikey_sdk import Plugin, Item, ResultPresentation, Section, Scope, ItemPresentation
+LABEL = "\u0080" * 4096
+SCOPES = tuple("scope" + str(n) for n in range(128))
+class Impl(Plugin):
+    def __init__(self):
+        self.large = True
+    def supports_result_presentation(self):
+        return True
+    def catalog_presentation(self):
+        if not self.large:
+            return ResultPresentation()
+        return ResultPresentation(
+            sections=tuple(Section("s" + str(n), LABEL) for n in range(128)),
+            scopes=tuple(Scope(id, LABEL) for id in SCOPES),
+            items=tuple(ItemPresentation("item" + str(n), "s0", SCOPES) for n in range(1024)))
+    def build_catalog(self):
+        if not self.large:
+            return [Item("recovered", "Recovered", "recovered")]
+        self.large = False
+        for _ in range(512):
+            print("L" * 4096)
+        return [Item("item" + str(n), "Item", "item") for n in range(1024)]
+"#,
+    );
+    let mut worker = spawn_worker("complete-frame", "complete_frame:Impl", &src, &site);
+    let incarnation = worker.incarnation();
+    assert!(matches!(
+        worker.build_catalog(),
+        Err(crikey_python_host::HostError::PluginFailed { .. })
+    ));
+    assert!(worker.poll_alive());
+    let recovered = worker.build_catalog().unwrap();
+    assert_eq!(worker.incarnation(), incarnation);
+    assert_eq!(recovered[0].stable_id.0, "recovered");
     worker.shutdown();
 }

@@ -520,15 +520,22 @@ class Fixture(Plugin):
         context.emit(Item(stable_id="ok", label="ok", target="ok"))
 "#;
 
-/// Emits a single suggestion whose label is far larger than one protocol frame
-/// may carry, forcing an over-`MAX_FRAME_BYTES` line onto the channel.
+/// Deliberately bypasses the SDK producer and writes an oversized raw JSON
+/// protocol line. This tests the host's hostile-peer framing boundary.
 const OVERSIZED_FRAME: &str = r#"
-from crikey_sdk.plugin import Plugin, Item
+import json
+import os
+from crikey_sdk.plugin import Plugin
 
 
 class Fixture(Plugin):
     def suggest(self, query, context):
-        context.emit(Item(stable_id="big", label="X" * __N__, target="t"))
+        frame = {"id": 2, "kind": "result_batch", "generation": query.generation,
+                 "state": "final", "log": [],
+                 "items": [{"stable_id": "big", "label": "X" * __N__, "target": "t"}]}
+        raw = memoryview((json.dumps(frame, separators=(",", ":")) + "\n").encode("utf-8"))
+        while raw:
+            raw = raw[os.write(1, raw):]
 "#;
 
 /// Logs a single line far longer than one retained log line may be, then emits
@@ -1316,6 +1323,10 @@ fn an_oversized_frame_from_the_plugin_is_a_bounded_protocol_error_that_stops_the
                 "a protocol error carries a bounded excerpt, not the whole oversized line ({} bytes)",
                 message.len()
             );
+            assert!(
+                message.contains("frame limit"),
+                "the raw peer must hit the framing boundary: {message}"
+            );
         }
         other => panic!("an over-long line is HostError::Protocol, got {other:?}"),
     }
@@ -1324,6 +1335,40 @@ fn an_oversized_frame_from_the_plugin_is_a_bounded_protocol_error_that_stops_the
         "a desynchronised channel stops the worker rather than leaving it wedged"
     );
 
+    worker.shutdown();
+}
+
+#[test]
+fn oversized_sdk_suggestion_is_a_fixed_failure_and_preserves_its_worker() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("oversized-sdk-suggestion");
+    let source = format!(
+        r#"
+import os
+from crikey_sdk.plugin import Plugin, Item
+class Fixture(Plugin):
+    def suggest(self, query, context):
+        if query.text == "big":
+            context.emit(Item(stable_id="big", label="X" * {}, target="t"))
+        else:
+            context.emit(Item(stable_id="ok", label="Recovered", target="t",
+                              metadata={{"pid": str(os.getpid())}}))
+"#,
+        MAX_FRAME_BYTES + 1024 * 1024
+    );
+    let mut worker = spawn(&scratch, "modern.sdk-frame", &source);
+    let first = worker.suggest(&suggest_request("ready")).unwrap();
+    let pid = first.items[0].metadata["pid"].clone();
+    let failed = worker
+        .suggest(&suggest_request("big"))
+        .expect("the SDK emits a bounded terminal");
+    assert_eq!(failed.state, BatchState::Failed);
+    assert!(failed.error.is_some(), "oversized content is a visible failure");
+    assert!(failed.items.is_empty(), "no truncated success may be published");
+    assert!(worker.poll_alive());
+    let recovered = worker.suggest(&suggest_request("recovered")).unwrap();
+    assert_eq!(recovered.state, BatchState::Final);
+    assert_eq!(recovered.items[0].metadata["pid"], pid);
     worker.shutdown();
 }
 

@@ -3318,7 +3318,7 @@ fn formatted_preview_link_click_reports_host_intent_without_browser_output() {
     );
     assert!(clicked.output.platform_output.open_url.is_none());
     assert!(clicked.commands.contains(&UiCommand::OpenPreviewLink {
-        target,
+        target: Box::new(target),
         url: "https://example.org/".into()
     }));
 }
@@ -4202,7 +4202,7 @@ fn command_management_preserves_membership_controls_and_submits_exact_shortcut_e
                 let point = origin + egui::vec2(4.0, 4.0);
                 clipped.clip_rect.contains(point).then_some(point)
             })
-            .last()
+            .next_back()
             .expect("the editable value is visible inside the management scroll area");
         let _ = build_launcher_frame(&context, launcher_input(click_at(editor)), &view);
         let crikey_ui::ActionTarget::Command(reference) = &target else {
@@ -4816,4 +4816,86 @@ fn changing_a_pending_draft_back_to_submitted_text_still_requires_a_new_save() {
         context.data(|data| data.get_temp::<String>(draft_id)).as_deref(),
         Some("recent")
     );
+}
+
+#[test]
+fn typed_root_section_headers_are_painted_but_never_executable_rows() {
+    let context = create_launcher_context();
+    let mut view = scrollable_model(2, 1);
+    view.navigation.section_headers = vec![
+        crikey_ui::SectionHeader {
+            row: 0,
+            owner: PluginId("renderer-fixture".into()),
+            id: crikey_core::result_presentation::SectionId("first".into()),
+            label: "First section".into(),
+        },
+        crikey_ui::SectionHeader {
+            row: 1,
+            owner: PluginId("renderer-fixture".into()),
+            id: crikey_core::result_presentation::SectionId("second".into()),
+            label: "Second section".into(),
+        },
+    ]
+    .into();
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(painted(&frame, "First section"));
+    assert!(painted(&frame, "Second section"));
+    let position = position_of(&frame, "First section");
+    let clicked = build_launcher_frame(&context, launcher_input(click_at(position)), &view);
+    assert!(!clicked.commands.iter().any(|command| matches!(
+        command,
+        UiCommand::ActivateAction { .. }
+            | UiCommand::ActivateActionless { .. }
+            | UiCommand::InvokeCommand { .. }
+            | UiCommand::ExecuteDefault
+    )));
+    assert_eq!(view.rows.len(), 2);
+    assert_eq!(view.selected, 1);
+}
+
+#[test]
+fn actionless_typed_root_control_keeps_none_instead_of_inventing_an_action_id() {
+    let context = create_launcher_context();
+    let mut view = scrollable_model(1, 0);
+    view.navigation.actionless_targets = vec![crikey_core::structured_arguments::OwnedItem {
+        owner: PluginId("renderer-fixture".into()),
+        item: ItemId("item-0".into()),
+    }]
+    .into();
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let position = position_of(&frame, "Run  Enter");
+    let clicked = build_launcher_frame(&context, launcher_input(click_at(position)), &view);
+    assert!(clicked.commands.iter().any(|command| matches!(command, UiCommand::ActivateActionless { target: crikey_ui::ActionTarget::Result { owner, item } } if owner.0 == "renderer-fixture" && item.0 == "item-0")));
+    assert!(!clicked
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::ActivateAction { .. })));
+}
+
+#[test]
+fn an_unavailable_restored_scope_requires_explicit_all_selection() {
+    let context = create_launcher_context();
+    let mut view = model("scope");
+    view.navigation.selected_scope = Some(crikey_ui::ScopeIdentity {
+        owner: PluginId("gone".into()),
+        id: crikey_core::result_presentation::ScopeId("private".into()),
+        source: crikey_ui::PublicationIdentity::Suggestion {
+            generation: Generation::from_raw(1),
+            producer: 1,
+        },
+    });
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(painted(&frame, "Unavailable scope"));
+    assert!(!frame
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetScope(None))));
+    let position = position_of(&frame, "Unavailable scope");
+    let opened = build_launcher_frame(&context, launcher_input(click_at(position)), &view);
+    let position = position_of(&opened, "All");
+    let chosen = build_launcher_frame(&context, launcher_input(click_at(position)), &view);
+    assert!(chosen
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetScope(None))));
 }

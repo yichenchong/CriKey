@@ -1817,6 +1817,27 @@ impl LegacyDriver {
         drop(slot);
         cvar.notify_one();
     }
+    /// Retire ordinary suggestion authority when this runtime is nonapplicable.
+    /// No sentinel query or new Legacy callback is introduced.
+    pub fn retire_query(&self, generation: Generation) {
+        if generation.get() < self.current.fetch_max(generation.get(), Ordering::AcqRel) {
+            return;
+        }
+        self.cancellation.signal_suggestions();
+        let (lock, _) = &*self.mailbox;
+        let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
+        slot.job = None;
+        *self.outcome.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        *self
+            .search_summary
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(crate::query_pipeline::OrdinarySearchSummary {
+                view: 0,
+                generation,
+                providers: Vec::new(),
+            });
+    }
 
     /// Takes the latest merged frame the supervisor produced, if any, for the
     /// UI thread to fold into its retained view model so later navigation keeps

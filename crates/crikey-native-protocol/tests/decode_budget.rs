@@ -64,6 +64,7 @@ fn envelope(items: Vec<Item>) -> Envelope {
             done: false,
             sequence: 1,
             error: None,
+            presentation: None,
             unknown: UnknownFields::default(),
         })),
         unknown: UnknownFields::default(),

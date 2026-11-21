@@ -397,6 +397,7 @@ pub(crate) fn residency(effect: &UiEffect) -> Option<Residency> {
         | UiEffect::WebIme(_)
         | UiEffect::ResizePage { .. }
         | UiEffect::ClosePage => None,
+        UiEffect::ExecuteActionless { .. } => None,
     }
 }
 

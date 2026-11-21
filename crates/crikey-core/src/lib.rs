@@ -6,12 +6,15 @@
 pub mod action;
 pub mod activation;
 pub mod command;
+pub mod content_accounting;
 pub mod error;
 pub mod generation;
 pub mod item;
 pub mod page;
 pub mod path;
 pub mod preview;
+pub mod result_presentation;
+pub mod structured_arguments;
 
 pub use action::{Action, ActionId, ExecutionPolicy};
 pub use activation::{ActivationPattern, ActivationPatternError, COMPILED_SIZE_LIMIT, MAX_PATTERN_BYTES};

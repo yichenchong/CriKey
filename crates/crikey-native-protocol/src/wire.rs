@@ -96,17 +96,54 @@ pub fn map_entry_charge() -> usize {
 }
 
 #[derive(Debug)]
-pub(crate) struct DecodeBudget {
+pub(crate) struct DecodeBudget<'a> {
     remaining: usize,
     depth: usize,
+    diagnostic_latch: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
-impl DecodeBudget {
+impl<'a> DecodeBudget<'a> {
     pub(crate) fn new() -> Self {
         Self {
             remaining: DECODE_ALLOCATION_BUDGET,
             depth: 0,
+            diagnostic_latch: None,
         }
+    }
+
+    pub(crate) fn with_diagnostics(latch: &'a std::sync::atomic::AtomicBool) -> Self {
+        Self {
+            remaining: DECODE_ALLOCATION_BUDGET,
+            depth: 0,
+            diagnostic_latch: Some(latch),
+        }
+    }
+
+    pub(crate) fn suppress_diagnostics(&self) -> bool {
+        self.diagnostic_latch
+            .is_some_and(|latch| latch.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    pub(crate) fn charge_discarded(&mut self, bytes: usize) -> Result<(), ProtocolError> {
+        self.charge(bytes)
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    /// A nested content ceiling shares (and can only tighten) the frame budget.
+    pub(crate) fn with_limit<T>(
+        &mut self,
+        limit: usize,
+        decode: impl FnOnce(&mut Self) -> Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        let parent = self.remaining;
+        let local = parent.min(limit);
+        self.remaining = local;
+        let result = decode(self);
+        self.remaining = parent - (local - self.remaining);
+        result
     }
 
     pub(crate) fn enter_nested(&mut self) -> Result<(), ProtocolError> {
@@ -302,7 +339,7 @@ impl UnknownFields {
                 .ok_or_else(|| ProtocolError::Malformed("unknown fields are too large".to_owned()))?;
             budget.charge(growth)?;
             self.0
-                .try_reserve_exact(growth)
+                .try_reserve_exact(target - self.0.len())
                 .map_err(|_| ProtocolError::Malformed("message decode allocation failed".to_owned()))?;
         }
         self.0.extend_from_slice(bytes);
@@ -420,6 +457,8 @@ pub(crate) fn decode_string(field: Field<'_>, budget: &mut DecodeBudget) -> Resu
             "expected length-delimited string".to_owned(),
         ));
     }
+    std::str::from_utf8(field.value)
+        .map_err(|_| ProtocolError::Malformed("protobuf string is not UTF-8".to_owned()))?;
     budget.charge(field.value.len())?;
     let mut bytes = Vec::new();
     bytes

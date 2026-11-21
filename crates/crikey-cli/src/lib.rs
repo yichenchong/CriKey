@@ -27,9 +27,9 @@ use calculator::Calculator;
 use crikey_app::{
     admitted_plugin_roots, ActionEffect, ActionSubmission, AliasTable, App, BatchState,
     DefaultCatalogFetcher, DisabledPlugins, LegacyDriver, LegacyProvider, ModernDriver, ModernProvider,
-    NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, QueryPipeline, RemoteCatalogService,
-    RemoteSource, ResultBatch, SearchService, SelectionHistoryStore, StartupJournal, StartupMode,
-    StartupStage,
+    NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, ProviderQueryContext, QueryPipeline,
+    RemoteCatalogService, RemoteSource, ResultBatch, SearchService, SelectionHistoryStore, StartupJournal,
+    StartupMode, StartupStage,
 };
 use crikey_benchmarks::{
     run_catalog_benchmark, BenchmarkConfig, BenchmarkReport, PrefixLatency, STRESS_CATALOG_SIZE,
@@ -822,6 +822,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     let mut web_page = WebPageRuntime::new();
     let mut retained = RetainedRows::default();
     let mut action_origins = std::collections::BTreeMap::new();
+    let mut typed_revision = 0u64;
+    let mut typed_requests = std::collections::BTreeMap::new();
     let mut command_projection_dirty = true;
     let mut active_root_query = String::new();
     let mut pending_command_learning: std::collections::BTreeMap<
@@ -829,6 +831,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         crikey_app::CommandLearning,
     > = std::collections::BTreeMap::new();
     let mut pending_ordinary_learning = std::collections::BTreeMap::new();
+    let mut pending_typed_items = std::collections::BTreeMap::new();
     let mut ranking_reset_pending = false;
     let mut quit_after_history_reset = false;
     let mut deferred_learning = Vec::new();
@@ -943,13 +946,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             // change on its next event — which is before it answers the query
             // the user is about to type, because the provider drivers take a
             // configuration publication ahead of a queued query.
-            if configuration.is_none() && configuration_retry.elapsed() >= Duration::from_millis(500) {
-                if preference_worker
+            if configuration.is_none()
+                && configuration_retry.elapsed() >= Duration::from_millis(500)
+                && preference_worker
                     .submit(command_preferences::Request::Poll)
                     .is_ok()
-                {
-                    configuration_retry = Instant::now();
-                }
+            {
+                configuration_retry = Instant::now();
             }
             if let Some(configuration) = configuration.as_mut() {
                 if let Some(state) = configuration.poll(Instant::now(), &preference_worker) {
@@ -989,9 +992,55 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             }
             // Fold any legacy rows the supervisor produced since the last turn
             for completion in search.poll_action_completions() {
+                if let Some((revision, draft_revision, view, generation)) =
+                    typed_requests.remove(&completion.request_id)
+                {
+                    let outcome = match completion.outcome {
+                        Ok(ActionEffect::Typed(outcome)) => outcome,
+                        _ => crikey_core::structured_arguments::SubmissionOutcome::Failed(
+                            crikey_core::structured_arguments::SubmissionFailureCode::Failed,
+                        ),
+                    };
+                    let command_learning = pending_command_learning.remove(&completion.request_id);
+                    let item_learning = pending_typed_items.remove(&completion.request_id);
+                    if matches!(
+                        &outcome,
+                        crikey_core::structured_arguments::SubmissionOutcome::Completed
+                    ) {
+                        let time = history_clock.advance();
+                        let learning = command_learning
+                            .map(|learning| command_history::Learning::Command(learning, time))
+                            .or_else(|| {
+                                item_learning.map(|item| command_history::Learning::ItemSelection(item, time))
+                            });
+                        if let Some(learning) = learning {
+                            command_projection_dirty = true;
+                            if let Err(message) = publish_learning(
+                                learning,
+                                &mut search,
+                                &history_writer,
+                                ranking_reset_pending,
+                                &mut deferred_learning,
+                            ) {
+                                view_model.set_navigation_notice(message);
+                            }
+                        }
+                    }
+                    if view_model.accepts_typed_draft(revision, draft_revision, view, generation) {
+                        view_model.inline_arguments_completed(revision, draft_revision, outcome);
+                    }
+                    continue;
+                }
                 let command_learning = pending_command_learning.remove(&completion.request_id);
                 let ordinary_learning = pending_ordinary_learning.remove(&completion.request_id);
-                if completion.outcome.is_ok() {
+                if matches!(
+                    &completion.outcome,
+                    Ok(ActionEffect::Completed
+                        | ActionEffect::ShowPage { .. }
+                        | ActionEffect::Typed(
+                            crikey_core::structured_arguments::SubmissionOutcome::Completed
+                        ))
+                ) {
                     let time = history_clock.advance();
                     let learning = command_learning
                         .map(|evidence| command_history::Learning::Command(evidence, time))
@@ -1049,6 +1098,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     continue;
                 }
                 let message = match completion.outcome {
+                    Ok(ActionEffect::Typed(_)) => "Typed command finished".into(),
                     Ok(ActionEffect::Completed) => format!(
                         "Action completed: {} / {}",
                         completion.plugin.0,
@@ -1182,7 +1232,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     &outcome.rows,
                     outcome.pending_plugins,
                 );
-                view_model.publish(outcome.generation, retained.merged(), retained.pending());
+                publish_projected_rows(&search, &retained, &mut view_model, outcome.generation);
                 command_projection_dirty = true;
             }
             // Each supervisor returns only its own suggestions. The host keeps
@@ -1194,7 +1244,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     &outcome.rows,
                     outcome.pending_plugins,
                 );
-                view_model.publish(outcome.generation, retained.merged(), retained.pending());
+                publish_projected_rows(&search, &retained, &mut view_model, outcome.generation);
                 command_projection_dirty = true;
             }
             // Native rows are folded independently, preserving both existing
@@ -1206,7 +1256,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     &outcome.rows,
                     outcome.pending_plugins,
                 );
-                view_model.publish(outcome.generation, retained.merged(), retained.pending());
+                publish_projected_rows(&search, &retained, &mut view_model, outcome.generation);
                 command_projection_dirty = true;
             }
             // File items are ranked in, not appended: the search ran on the
@@ -1221,7 +1271,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             if let Some(outcome) = file_driver.take_outcome(file_now) {
                 let generation = outcome.generation;
                 absorb_file_items(&mut search, &mut retained, &file_owner, outcome);
-                view_model.publish(generation, retained.merged(), retained.pending());
+                publish_projected_rows(&search, &retained, &mut view_model, generation);
                 command_projection_dirty = true;
             }
             // Catalog outcomes use the same SearchService instance/owner
@@ -1276,6 +1326,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     if disabled.blocks(&owner) {
                         for request in pending_command_learning
                             .keys()
+                            .chain(pending_typed_items.keys())
                             .filter(|request| request.plugin == owner)
                         {
                             search.cancel_action(request);
@@ -1348,6 +1399,12 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 hotkey_report = report;
                 command_management_revision = None;
             }
+            if view_model
+                .inline_arguments()
+                .is_some_and(|input| search.root_inline_binding(input).is_none())
+            {
+                view_model.retire_unavailable_inline_arguments();
+            }
             let mut shortcut_root_query = None;
             for receipt in hotkey_receipts {
                 let Some(dispatch) = hotkeys.resolve_event(&receipt, &registry, &preferences) else {
@@ -1360,6 +1417,41 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
                 retained.explicit_input = None;
                 shortcut_root_query = None;
+                let typed_reference = match &dispatch {
+                    crikey_app::HotkeyDispatch::OpenInput { reference }
+                    | crikey_app::HotkeyDispatch::Execute { reference } => Some(reference),
+                    crikey_app::HotkeyDispatch::Launcher => None,
+                };
+                if let Some(reference) = typed_reference {
+                    if let Ok(Some(binding)) = search.root_command_binding(reference, registry.revision) {
+                        let hidden = !render_handle.is_visible();
+                        if !view_model.open_root_input() {
+                            continue;
+                        }
+                        web_page.close("shortcut opened typed input");
+                        search.close_page();
+                        if hidden && render_handle.request_activation().is_ok() {
+                            prepared_activation = true;
+                        }
+                        if let Some(row) = search
+                            .command_management_rows()
+                            .into_iter()
+                            .find(|row| row.target == crikey_ui::ActionTarget::Command(reference.clone()))
+                        {
+                            let query = row.label.clone();
+                            view_model.apply(crikey_ui::UiCommand::SetQuery(query.clone()));
+                            retained.explicit_input = Some(row);
+                            shortcut_root_query = Some(query);
+                            open_typed_input(
+                                &mut view_model,
+                                &mut typed_revision,
+                                &binding,
+                                Some((reference.clone(), registry.revision)),
+                            );
+                        }
+                        continue;
+                    }
+                }
                 match dispatch {
                     crikey_app::HotkeyDispatch::Launcher => {
                         let _ = render_handle.request_toggle();
@@ -1476,6 +1568,70 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         apply_native_command(&mut view_model, &mut retained, &mut hotkey_intent, command);
                     (Some(session), effect)
                 }
+                NativeLauncherEvent::TypedInput { session, submission } => {
+                    if render_handle.is_visible_session(session)
+                        && view_model.accepts_typed_draft(
+                            submission.revision,
+                            submission.draft_revision,
+                            submission.view,
+                            submission.generation,
+                        )
+                    {
+                        if let Some(binding) = view_model
+                            .inline_arguments()
+                            .and_then(|input| search.root_inline_binding(input))
+                        {
+                            let command = view_model.inline_arguments().and_then(|input| {
+                                input.command.as_ref().map(|(reference, _)| reference.clone())
+                            });
+                            match search.submit_root_typed(&binding, submission.values) {
+                                Ok(crikey_app::TypedActionReceipt { receipt, item }) => {
+                                    if let Some(reference) = command {
+                                        pending_command_learning.insert(
+                                            receipt.request_id.clone(),
+                                            crikey_app::CommandLearning {
+                                                reference,
+                                                item,
+                                                query: None,
+                                            },
+                                        );
+                                    } else {
+                                        pending_typed_items.insert(receipt.request_id.clone(), item);
+                                    }
+                                    typed_requests.insert(
+                                        receipt.request_id,
+                                        (
+                                            submission.revision,
+                                            submission.draft_revision,
+                                            submission.view,
+                                            submission.generation,
+                                        ),
+                                    );
+                                    previews.retire_for_foreground(
+                                        &mut view_model,
+                                        &binding.executable.target.owner,
+                                    );
+                                }
+                                Err(_) => view_model.inline_arguments_completed(
+                                    submission.revision,
+                                    submission.draft_revision,
+                                    crikey_core::structured_arguments::SubmissionOutcome::Failed(
+                                        crikey_core::structured_arguments::SubmissionFailureCode::Unavailable,
+                                    ),
+                                ),
+                            }
+                        } else {
+                            view_model.inline_arguments_completed(
+                                submission.revision,
+                                submission.draft_revision,
+                                crikey_core::structured_arguments::SubmissionOutcome::Failed(
+                                    crikey_core::structured_arguments::SubmissionFailureCode::Unavailable,
+                                ),
+                            );
+                        }
+                    }
+                    (Some(session), None)
+                }
                 // The wake that brought this turn about. Everything it asks
                 // for — draining the drivers and republishing — happened
                 // above, before the match, exactly as it does for every other
@@ -1546,15 +1702,32 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             // Never feed canonical catalog rows back through a
                             // provider outcome: catalog ownership overlaps with
                             // suggestion ownership, but these are distinct inputs.
-                            let legacy_outstanding = legacy_driver.has_plugins();
-                            legacy_driver.submit(generation, &raw, now, Vec::new(), false, 0);
-                            let modern_outstanding = modern_driver.has_plugins();
-                            modern_driver.submit(generation, &raw, now, Vec::new(), false, 0);
-                            let native_outstanding = native_driver.has_plugins();
-                            native_driver.submit(generation, &raw, now, Vec::new(), false, 0);
-                            // Only an accepted file submission owes an answer.
-                            let files_outstanding =
-                                !raw.trim().is_empty() && file_driver.submit(generation, &raw, now);
+                            let scope = view_model
+                                .selected_scope()
+                                .map(crikey_app::root_scope_from_identity);
+                            let legacy_outstanding = scope.is_none() && legacy_driver.has_plugins();
+                            if scope.is_none() {
+                                legacy_driver.submit(generation, &raw, now, Vec::new(), false, 0);
+                            } else {
+                                legacy_driver.retire_query(generation);
+                            }
+                            let provider_query = ProviderQueryContext {
+                                generation,
+                                text: &raw,
+                                now,
+                                selected: 0,
+                            };
+                            let modern_outstanding = modern_driver.has_plugins()
+                                && modern_driver
+                                    .submit_scoped(provider_query, Vec::new(), false, scope.clone())
+                                    .is_ok();
+                            let native_outstanding = native_driver.has_plugins()
+                                && native_driver
+                                    .submit_scoped(provider_query, Vec::new(), false, scope.clone())
+                                    .is_ok();
+                            let files_outstanding = scope.is_none()
+                                && !raw.trim().is_empty()
+                                && file_driver.submit(generation, &raw, now);
                             retained.mark_pending(generation, RowSource::Legacy, legacy_outstanding);
                             retained.mark_pending(generation, RowSource::Native, native_outstanding);
                             retained.mark_pending(generation, RowSource::Modern, modern_outstanding);
@@ -1596,12 +1769,35 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             );
                         }
                     }
-                    Some(UiEffect::Execute { .. }) | Some(UiEffect::InvokeCommand { .. })
+                    Some(UiEffect::Execute { .. })
+                    | Some(UiEffect::ExecuteActionless { .. })
+                    | Some(UiEffect::InvokeCommand { .. })
                         if ranking_reset_pending =>
                     {
                         view_model.set_navigation_notice(
                             "Ranking reset is pending; invoke again after it finishes".into(),
                         );
+                    }
+                    Some(UiEffect::ExecuteActionless {
+                        owner,
+                        item,
+                        view,
+                        generation,
+                    }) => {
+                        if view_model.view() == Some((view, crikey_ui::ViewKind::RootList))
+                            && retained.generation() == Some(generation)
+                        {
+                            if let Some(binding) = search.root_result_binding(
+                                &owner,
+                                &item,
+                                None,
+                                view_model
+                                    .selected_preview_row()
+                                    .and_then(|row| row.source.as_ref()),
+                            ) {
+                                open_typed_input(&mut view_model, &mut typed_revision, &binding, None);
+                            }
+                        }
                     }
                     Some(UiEffect::InvokeCommand {
                         reference,
@@ -1617,6 +1813,21 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         {
                             view_model
                                 .set_navigation_notice("Command selection changed; refresh and retry".into());
+                        } else if let Ok(Some(binding)) =
+                            search.root_command_binding(&reference, registry_revision)
+                        {
+                            if argument.is_some() {
+                                view_model.set_navigation_notice(
+                                    "Structured commands do not accept literal arguments".into(),
+                                );
+                            } else {
+                                open_typed_input(
+                                    &mut view_model,
+                                    &mut typed_revision,
+                                    &binding,
+                                    Some((reference.clone(), registry_revision)),
+                                );
+                            }
                         } else {
                             match search.invoke_command(&reference, argument.as_deref(), registry_revision) {
                                 Ok(crikey_app::CommandSubmission::Host(
@@ -1708,23 +1919,37 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             edit: edit.clone(),
                             status: crikey_ui::SettingEditStatus::Failed,
                         };
-                        let result =
-                            if snapshot.revision != expected_revision {
-                                Err("Command preferences changed; refresh and retry this edit".to_owned())
-                            } else {
-                                configuration
+                        let result = if snapshot.revision != expected_revision {
+                            Err("Command preferences changed; refresh and retry this edit".to_owned())
+                        } else if matches!(edit, crikey_ui::CommandPreferenceEdit::Fallback(true))
+                            && search
+                                .root_command_binding(&reference, search.command_snapshot().revision)
+                                .ok()
+                                .flatten()
+                                .is_some()
+                        {
+                            Err("Typed commands cannot be enrolled as literal text fallbacks".to_owned())
+                        } else {
+                            configuration
                                 .as_ref()
                                 .ok_or_else(|| {
                                     "Configuration authority unavailable; command preferences were not saved"
                                         .to_owned()
                                 })
                                 .and_then(|configuration| {
-                                    preference_worker.submit_mutation(
-                                        request_id, configuration.store.clone(), search.command_snapshot(),
-                                        expected_revision, reference, edit, false,
-                                    ).map_err(|(_, message)| message)
+                                    preference_worker
+                                        .submit_mutation(command_preferences::MutationRequest {
+                                            request_id,
+                                            config: configuration.store.clone(),
+                                            registry: search.command_snapshot(),
+                                            expected_revision,
+                                            reference,
+                                            edit,
+                                            session: false,
+                                        })
+                                        .map_err(|(_, message)| message)
                                 })
-                            };
+                        };
                         if let Err(message) = result {
                             view_model.command_edit_completed(failed);
                             view_model.set_navigation_notice(message);
@@ -1752,7 +1977,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                 deferred_learning.reserve(
                                     pending_command_learning
                                         .len()
-                                        .saturating_add(pending_ordinary_learning.len()),
+                                        .saturating_add(pending_ordinary_learning.len())
+                                        .saturating_add(pending_typed_items.len()),
                                 );
                                 ranking_reset_pending = true;
                                 search.set_history_reset_pending(true);
@@ -1860,7 +2086,16 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             })
                             .and_then(|generation| calculator.resolve(generation, &item))
                             .map(str::to_owned);
-                        if let Some(text) = calculated {
+                        if let Some(binding) = search.root_result_binding(
+                            &owner,
+                            &item,
+                            Some(&action),
+                            view_model
+                                .selected_preview_row()
+                                .and_then(|row| row.source.as_ref()),
+                        ) {
+                            open_typed_input(&mut view_model, &mut typed_revision, &binding, None);
+                        } else if let Some(text) = calculated {
                             match calculator.copy(&text) {
                                 Ok(()) => {
                                     view_model.dismiss();
@@ -2268,6 +2503,26 @@ impl WebPageRuntime {
 
     #[cfg(not(target_os = "linux"))]
     fn close(&mut self, _reason: &str) {}
+}
+
+fn open_typed_input(
+    model: &mut LauncherViewModel,
+    sequence: &mut u64,
+    binding: &crikey_app::RootExecutableBinding,
+    command: Option<(crikey_core::CommandRef, u64)>,
+) -> bool {
+    let Some(revision) = sequence.checked_add(1) else {
+        model.set_navigation_notice("Command input identity limit reached; restart the launcher.".into());
+        return false;
+    };
+    *sequence = revision;
+    model.open_inline_arguments(
+        revision,
+        binding.executable.clone(),
+        binding.schema.clone(),
+        crikey_app::root_publication_identity(&binding.source),
+        command,
+    )
 }
 
 fn activate_launcher_session(
@@ -3272,7 +3527,21 @@ impl RetainedRows {
     /// Calculated rows lead and supersede every exact-owner/id copy. Ranked
     /// catalog-only rows follow, then suggestions in provider publication order.
     /// An exact-owner/id suggestion supersedes its catalog copy and payload.
-    fn merged(&self) -> Vec<crikey_ui::ResultRow> {
+    fn project_rows(
+        &self,
+        search: &SearchService,
+        scope: Option<&crikey_ui::ScopeIdentity>,
+    ) -> (Vec<crikey_ui::ResultRow>, Vec<crikey_ui::SectionHeader>) {
+        // Explicit input is not discovery: its captured target survives a zero
+        // result cap until the user's next actual query/selection replacement.
+        let limit = if self.explicit_input.is_some() {
+            None
+        } else {
+            self.max_results
+        };
+        search.project_root_rows(self.merge_rows(), scope, limit)
+    }
+    fn merge_rows(&self) -> Vec<crikey_ui::ResultRow> {
         if let Some(row) = &self.explicit_input {
             return vec![row.clone()];
         }
@@ -3339,7 +3608,6 @@ impl RetainedRows {
                 })
                 .cloned(),
         );
-        rows.truncate(self.max_results.unwrap_or(usize::MAX));
         rows
     }
 
@@ -3413,7 +3681,23 @@ fn admit_root_query(
     let generation = search.submit_query(query).map_err(|error| error.to_string())?;
     model.begin_generation(generation);
     retained.begin(generation);
-    let catalog = prepare_catalog_rows(search, pipeline, owner, query, generation, now, retained);
+    let catalog = if let Some(scope) = model.selected_scope() {
+        let scoped_generation =
+            pipeline.keystroke_scoped(query, now, Some(crikey_app::root_scope_from_identity(scope)));
+        let tick = pipeline.tick(now);
+        for cancellation in tick.cancellations {
+            let _ = pipeline.complete(&cancellation.plugin, cancellation.generation, now);
+        }
+        retained.set_builtin(generation, search.result_rows());
+        retained.mark_pending(generation, RowSource::Builtin, false);
+        if scoped_generation == generation {
+            Ok(())
+        } else {
+            Err("pipeline and search generations differ".into())
+        }
+    } else {
+        prepare_catalog_rows(search, pipeline, owner, query, generation, now, retained)
+    };
     Ok((generation, catalog))
 }
 
@@ -3800,6 +4084,164 @@ fn measurement_failure(config: &BenchmarkConfig, report: &BenchmarkReport) -> Op
         return Some("the queries matched nothing, so the query phase timed an empty index".to_owned());
     }
     None
+}
+
+fn publish_learning(
+    learning: command_history::Learning,
+    search: &mut SearchService,
+    writer: &command_history::HistoryWorker,
+    reset_pending: bool,
+    deferred: &mut Vec<command_history::Learning>,
+) -> Result<(), String> {
+    if reset_pending {
+        deferred.push(learning);
+        return Ok(());
+    }
+    learning.publish(search).map_err(str::to_owned)?;
+    writer.save(search.selection_history_snapshot())
+}
+
+fn compose_fallback_search(
+    query: &str,
+    view: crikey_ui::ViewId,
+    generation: Generation,
+    catalog: crikey_app::OrdinaryProviderState,
+    summaries: &[Option<crikey_app::OrdinarySearchSummary>],
+) -> Option<crikey_app::FallbackSearch> {
+    let mut states = vec![catalog];
+    for summary in summaries {
+        match summary {
+            Some(summary) if summary.view == view.get() && summary.generation == generation => {
+                states.extend(summary.providers.iter().map(|provider| provider.state));
+            }
+            _ => states.push(crikey_app::OrdinaryProviderState::Pending),
+        }
+    }
+    let mut search = crikey_app::FallbackSearch::new(query.to_owned(), states.len()).ok()?;
+    for (index, state) in states.into_iter().enumerate() {
+        search.update(index, state).ok()?;
+    }
+    Some(search)
+}
+
+fn publish_root_rows(
+    search: &SearchService,
+    configuration: Option<&ConfigStore>,
+    retained: &mut RetainedRows,
+    model: &mut LauncherViewModel,
+    generation: Generation,
+    query: &str,
+    fallback: Option<&crikey_app::FallbackSearch>,
+) {
+    if let Some(target) = retained.explicit_input.as_ref().map(|row| row.target.clone()) {
+        // Refresh presentation from the registry, but never run discovery or cap
+        // an explicitly requested input target (including hidden declarations).
+        retained.explicit_input = search
+            .command_management_rows()
+            .into_iter()
+            .find(|row| row.target == target);
+    }
+    let home = configuration
+        .and_then(|store| store.get("launcher.command-home"))
+        .unwrap_or("compact");
+    let mut context = crikey_app::CommandCompositionContext::root(generation, query);
+    context.compact = home == "compact";
+    context.include_favorites = matches!(home, "favorites" | "favorites-and-recent");
+    context.include_recent = matches!(home, "recent" | "favorites-and-recent");
+    context.fallback = if model.selected_scope().is_none() {
+        fallback
+    } else {
+        None
+    };
+    retained.set_commands(generation, search.compose_command_rows(context));
+    retained.alias_query = query.trim().to_lowercase();
+    publish_projected_rows(search, retained, model, generation);
+}
+
+fn publish_projected_rows(
+    search: &SearchService,
+    retained: &RetainedRows,
+    model: &mut LauncherViewModel,
+    generation: Generation,
+) {
+    if !model.admits_root_generation(generation) || retained.generation() != Some(generation) {
+        return;
+    }
+    let mut choices = search.root_scope_choices();
+    let scope = model.selected_scope().cloned();
+    if let Some(scope) = &scope {
+        if search.resolve_root_scope(scope).is_none() {
+            model.set_navigation_notice(
+                "Selected scope is unavailable. Choose All or another scope explicitly.".into(),
+            );
+        } else {
+            // A dynamic declaration lease survives executable-generation retirement.
+            // Fresh memberships may advance generation, never owner or producer.
+            for choice in &mut choices {
+                if choice.identity.owner == scope.owner
+                    && choice.identity.id == scope.id
+                    && matches!((&scope.source, &choice.identity.source),
+                        (crikey_ui::PublicationIdentity::Suggestion { producer: selected, .. },
+                         crikey_ui::PublicationIdentity::Suggestion { producer: current, .. }) if selected == current)
+                {
+                    choice.identity = scope.clone();
+                }
+            }
+            if !choices.iter().any(|choice| &choice.identity == scope) {
+                let label = model.selected_scope_choice().map_or_else(
+                    || format!("{} — {}", scope.owner.0, scope.id.0),
+                    |choice| choice.label.clone(),
+                );
+                choices.push(crikey_ui::ScopeChoice {
+                    identity: scope.clone(),
+                    label,
+                });
+            }
+        }
+    }
+    let (rows, headers) = retained.project_rows(search, scope.as_ref());
+    let actionless = rows
+        .iter()
+        .filter_map(|row| {
+            let crikey_ui::ActionTarget::Result { owner, item } = &row.target else {
+                return None;
+            };
+            (row.default_action.is_none()
+                && row.alternate_actions.is_empty()
+                && search
+                    .root_result_binding(owner, item, None, row.source.as_ref())
+                    .is_some())
+            .then(|| crikey_core::structured_arguments::OwnedItem {
+                owner: owner.clone(),
+                item: item.clone(),
+            })
+        })
+        .collect();
+    model.set_root_presentation(generation, choices, headers, actionless);
+    model.publish(generation, rows, retained.pending());
+}
+
+/// Apply the current native intent after draining queued shortcuts. A newly
+/// admitted shortcut cannot borrow authority from before this command executes.
+fn apply_native_command(
+    model: &mut LauncherViewModel,
+    retained: &mut RetainedRows,
+    hotkey_intent: &mut u64,
+    command: crikey_ui::UiCommand,
+) -> Option<UiEffect> {
+    *hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
+    if matches!(
+        &command,
+        crikey_ui::UiCommand::SetQuery(_)
+            | crikey_ui::UiCommand::Cancel
+            | crikey_ui::UiCommand::Back
+            | crikey_ui::UiCommand::Dismiss
+            | crikey_ui::UiCommand::OpenSettings
+            | crikey_ui::UiCommand::CloseSettings
+    ) {
+        retained.explicit_input = None;
+    }
+    model.apply(command)
 }
 
 #[cfg(test)]
@@ -4796,7 +5238,7 @@ mod tests {
             view_model.activate();
             view_model.apply(crikey_ui::UiCommand::SetQuery("preview".to_owned()));
             view_model.begin_generation(generation);
-            view_model.publish(generation, retained.merged(), retained.pending());
+            publish_projected_rows(&search, &retained, &mut view_model, generation);
             let frame = view_model.frame().unwrap();
             assert_eq!(
                 frame
@@ -5016,7 +5458,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                retained.merged().len(),
+                retained.project_rows(&search, None).0.len(),
                 8,
                 "catalog rows publish before worker completion"
             );
@@ -5034,7 +5476,7 @@ mod tests {
                 &outcome.rows,
                 outcome.pending_plugins,
             );
-            let merged = retained.merged();
+            let merged = retained.project_rows(&search, None).0;
             assert_eq!(
                 merged.len(),
                 8,
@@ -5063,7 +5505,7 @@ mod tests {
             assert!(merged.iter().all(|row| result_identity(row).0 == &plugin));
             retained.absorb(Generation::ZERO, RowSource::Native, &[], false);
             assert_eq!(
-                retained.merged().len(),
+                retained.project_rows(&search, None).0.len(),
                 8,
                 "stale completion cannot restore old rows"
             );
@@ -5072,6 +5514,7 @@ mod tests {
 
     #[test]
     fn retained_rows_merge_ranked_legacy_and_modern_by_source() {
+        let search = SearchService::new(App::new());
         let generation = Generation::from_raw(7);
         let mut retained = RetainedRows::default();
 
@@ -5101,7 +5544,12 @@ mod tests {
         // outcome must not replace the host's newer ranked file answer.
         retained.absorb(generation, RowSource::Modern, &[row("modern.web", "web")], false);
 
-        let sources: Vec<String> = retained.merged().iter().map(|r| r.plugin_name.clone()).collect();
+        let sources: Vec<String> = retained
+            .project_rows(&search, None)
+            .0
+            .iter()
+            .map(|r| r.plugin_name.clone())
+            .collect();
         // Kills two mutations at once: "each supervisor's publish clobbers the
         // other" would leave only the ranked group + `modern.web`, and
         // "rebuild the ranked group from the provider's frame" would lose the
@@ -5192,7 +5640,12 @@ mod tests {
             !retained.pending(),
             "a generation the file source took on must settle, even with no answer from the backend"
         );
-        let sources: Vec<String> = retained.merged().iter().map(|r| r.plugin_name.clone()).collect();
+        let sources: Vec<String> = retained
+            .project_rows(&search_service, None)
+            .0
+            .iter()
+            .map(|r| r.plugin_name.clone())
+            .collect();
         assert_eq!(
             sources,
             ["builtin.app"],
@@ -5202,6 +5655,7 @@ mod tests {
 
     #[test]
     fn pinned_calculator_identity_wins_without_hiding_foreign_same_id() {
+        let search = SearchService::new(App::new());
         let generation = Generation::from_raw(3);
         let mut calculator = Calculator::new(None);
         let calculated = calculator.rows(generation, "2+2");
@@ -5218,7 +5672,7 @@ mod tests {
         retained.set_calculated(generation, calculated.clone());
         retained.set_builtin(generation, vec![echoed.clone(), foreign.clone()]);
         retained.absorb(generation, RowSource::Native, &[echoed], false);
-        let merged = retained.merged();
+        let merged = retained.project_rows(&search, None).0;
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].target, calculated[0].target);
         assert_eq!(merged[0].description, calculated[0].description);
@@ -5228,6 +5682,7 @@ mod tests {
 
     #[test]
     fn a_calculated_row_leads_the_frame_and_survives_an_asynchronous_fold() {
+        let search = SearchService::new(App::new());
         let generation = Generation::from_raw(3);
         let mut calculator = Calculator::new(None);
         // Exactly what the query arm builds: the calculator's answer in its own
@@ -5242,11 +5697,11 @@ mod tests {
         // to classify the calculated row correctly to keep it; keeping those
         // groups out of the fold entirely is what makes that impossible to get
         // wrong.
-        let mut published = retained.merged();
+        let mut published = retained.project_rows(&search, None).0;
         published.push(row("legacy.files", "file"));
         retained.absorb(generation, RowSource::Legacy, &published, false);
 
-        let merged = retained.merged();
+        let merged = retained.project_rows(&search, None).0;
         let labels: Vec<&str> = merged.iter().map(|row| row.label.as_str()).collect();
         assert_eq!(
             labels,
@@ -5262,6 +5717,7 @@ mod tests {
 
     #[test]
     fn retained_rows_drop_a_superseded_generation() {
+        let search = SearchService::new(App::new());
         let old = Generation::from_raw(1);
         let new = Generation::from_raw(2);
         let mut retained = RetainedRows::default();
@@ -5272,7 +5728,12 @@ mod tests {
         // retained rows across generations" mutation.
         retained.absorb(new, RowSource::Modern, &[row("modern.new", "y")], false);
 
-        let sources: Vec<String> = retained.merged().iter().map(|r| r.plugin_name.clone()).collect();
+        let sources: Vec<String> = retained
+            .project_rows(&search, None)
+            .0
+            .iter()
+            .map(|r| r.plugin_name.clone())
+            .collect();
         assert_eq!(
             sources,
             vec!["modern.new"],
@@ -5334,8 +5795,10 @@ mod tests {
         pipeline
             .register_plugin(owner.clone(), application_provider_policy())
             .unwrap();
-        let mut retained = RetainedRows::default();
-        retained.max_results = Some(1);
+        let mut retained = RetainedRows {
+            max_results: Some(1),
+            ..RetainedRows::default()
+        };
         let mut model = LauncherViewModel::new();
         model.activate();
         for (index, query) in ["a", "am", "amb", "a", "", "am", "no-match-at-all", "a"]
@@ -5411,7 +5874,8 @@ mod tests {
         retained.mark_pending(generation, RowSource::Files, true);
         assert_eq!(
             retained
-                .merged()
+                .project_rows(&search, None)
+                .0
                 .iter()
                 .map(|row| row.label.clone())
                 .collect::<Vec<String>>(),
@@ -5431,7 +5895,12 @@ mod tests {
             },
         );
 
-        let labels: Vec<String> = retained.merged().iter().map(|row| row.label.clone()).collect();
+        let labels: Vec<String> = retained
+            .project_rows(&search, None)
+            .0
+            .iter()
+            .map(|row| row.label.clone())
+            .collect();
         assert_eq!(
             labels,
             ["Mortgage Analysis.pdf", "Memory Diagnostics Tool"],
@@ -5514,7 +5983,12 @@ mod tests {
             },
         );
 
-        let labels: Vec<String> = retained.merged().iter().map(|row| row.label.clone()).collect();
+        let labels: Vec<String> = retained
+            .project_rows(&search, None)
+            .0
+            .iter()
+            .map(|row| row.label.clone())
+            .collect();
         assert_eq!(
             labels,
             ["Mortgage Analysis.pdf", "Memory Diagnostics Tool"],
@@ -5545,7 +6019,7 @@ mod tests {
         let mut retained = RetainedRows::default();
         retained.set_builtin(generation, search.result_rows());
         retained.mark_pending(generation, RowSource::Files, true);
-        view_model.publish(generation, retained.merged(), retained.pending());
+        publish_projected_rows(&search, &retained, &mut view_model, generation);
 
         // The user moves off the first row while the file search is still out.
         // Row 1 is the substring match, which the merge will push down a place.
@@ -5567,7 +6041,7 @@ mod tests {
                 state: crikey_app::OrdinaryProviderState::Matches,
             },
         );
-        view_model.publish(generation, retained.merged(), retained.pending());
+        publish_projected_rows(&search, &retained, &mut view_model, generation);
 
         let frame = view_model.frame().expect("the merged answer is a new frame");
         assert_eq!(
@@ -5708,9 +6182,8 @@ mod tests {
             StartupMode::Normal,
             "a renderer that reached its event loop clears the failure run",
         );
-        assert_eq!(
-            *seen.borrow(),
-            vec![NativeLauncherEvent::Activated],
+        assert!(
+            matches!(seen.borrow().as_slice(), [NativeLauncherEvent::Activated]),
             "the readiness wrapper still delivers the event it observed",
         );
     }
@@ -5794,6 +6267,7 @@ mod tests {
 
     #[test]
     fn declared_rows_keep_reference_identity_without_superseding_ordinary_sources() {
+        let search = SearchService::new(App::new());
         let generation = Generation::from_raw(1);
         let ordinary = row("native.owner", "same item");
         let mut first = ordinary.clone();
@@ -5809,19 +6283,20 @@ mod tests {
         let mut retained = RetainedRows::default();
         retained.set_builtin(generation, vec![ordinary.clone()]);
         retained.set_commands(generation, vec![second.clone(), first.clone(), second.clone()]);
-        let merged = retained.merged();
+        let merged = retained.project_rows(&search, None).0;
         assert_eq!(
             merged.iter().map(|row| &row.target).collect::<Vec<_>>(),
             vec![&ordinary.target, &second.target, &first.target]
         );
         retained.max_results = Some(2);
-        assert_eq!(retained.merged().len(), 2);
+        assert_eq!(retained.project_rows(&search, None).0.len(), 2);
         retained.begin(Generation::from_raw(2));
         assert_eq!(retained.max_results, Some(2));
     }
 
     #[test]
     fn aliases_precede_ordinary_rows_before_one_result_cap_and_deduplication() {
+        let search = SearchService::new(App::new());
         let generation = Generation::from_raw(1);
         let ordinary = row("owner", "ordinary");
         let mut alias = row("owner", "canonical");
@@ -5850,10 +6325,10 @@ mod tests {
         retained.set_commands(generation, vec![alias.clone(), alias.clone()]);
         retained.alias_query = "go".into();
         retained.max_results = Some(1);
-        assert_eq!(retained.merged()[0].target, alias.target);
+        assert_eq!(retained.project_rows(&search, None).0[0].target, alias.target);
         retained.max_results = None;
         assert_eq!(
-            retained.merged().len(),
+            retained.project_rows(&search, None).0.len(),
             2,
             "alias is not repeated in the ordinary command group"
         );
@@ -6219,8 +6694,10 @@ mod tests {
             .unwrap();
         let mut model = LauncherViewModel::new();
         model.activate();
-        let mut retained = RetainedRows::default();
-        retained.max_results = Some(0);
+        let mut retained = RetainedRows {
+            max_results: Some(0),
+            ..RetainedRows::default()
+        };
         let application_owner = PluginId(APPLICATION_CATALOG_PLUGIN.into());
         let mut catalog_pipeline = QueryPipeline::new(PipelineConfig::default());
         catalog_pipeline
@@ -6335,95 +6812,253 @@ mod tests {
         catalog.expect("next ordinary query still shares the catalog pipeline generation");
         assert!(next > refreshed);
     }
-}
 
-fn publish_learning(
-    learning: command_history::Learning,
-    search: &mut SearchService,
-    writer: &command_history::HistoryWorker,
-    reset_pending: bool,
-    deferred: &mut Vec<command_history::Learning>,
-) -> Result<(), String> {
-    if reset_pending {
-        deferred.push(learning);
-        return Ok(());
-    }
-    learning.publish(search).map_err(str::to_owned)?;
-    writer.save(search.selection_history_snapshot())
-}
+    #[test]
+    fn real_dynamic_scope_survives_retirement_and_reconciles_fresh_rows_until_owner_death() {
+        use crikey_core::structured_arguments::{ExecutableKey, OwnedItem};
+        use std::path::PathBuf;
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Mutex,
+        };
 
-fn compose_fallback_search(
-    query: &str,
-    view: crikey_ui::ViewId,
-    generation: Generation,
-    catalog: crikey_app::OrdinaryProviderState,
-    summaries: &[Option<crikey_app::OrdinarySearchSummary>],
-) -> Option<crikey_app::FallbackSearch> {
-    let mut states = vec![catalog];
-    for summary in summaries {
-        match summary {
-            Some(summary) if summary.view == view.get() && summary.generation == generation => {
-                states.extend(summary.providers.iter().map(|provider| provider.state));
+        fn wait_for<T>(stage: &str, mut observe: impl FnMut() -> Option<T>) -> T {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Some(value) = observe() {
+                    return value;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native scope consumer timed out: {stage}"
+                );
+                std::thread::sleep(Duration::from_millis(2));
             }
-            _ => states.push(crikey_app::OrdinaryProviderState::Pending),
         }
-    }
-    let mut search = crikey_app::FallbackSearch::new(query.to_owned(), states.len()).ok()?;
-    for (index, state) in states.into_iter().enumerate() {
-        search.update(index, state).ok()?;
-    }
-    Some(search)
-}
+        struct Package(PathBuf);
+        impl Drop for Package {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(release) = self.0.take() {
+                    let _ = release.send(());
+                }
+            }
+        }
 
-fn publish_root_rows(
-    search: &SearchService,
-    configuration: Option<&ConfigStore>,
-    retained: &mut RetainedRows,
-    model: &mut LauncherViewModel,
-    generation: Generation,
-    query: &str,
-    fallback: Option<&crikey_app::FallbackSearch>,
-) {
-    if let Some(target) = retained.explicit_input.as_ref().map(|row| row.target.clone()) {
-        // Refresh presentation from the registry, but never run discovery or cap
-        // an explicitly requested input target (including hidden declarations).
-        retained.explicit_input = search
-            .command_management_rows()
+        // The same real SDK conformance worker used by provider admission tests.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let target = root.join("target/native-conformance");
+        let output = std::process::Command::new("cargo")
+            .args(["build", "--bin", "crikey-conformance-plugin", "--manifest-path"])
+            .arg(root.join("compatibility/native-conformance/Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&target)
+            .output()
+            .expect("build native scope worker");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let executable = target
+            .join("debug")
+            .join(if cfg!(windows) {
+                "crikey-conformance-plugin.exe"
+            } else {
+                "crikey-conformance-plugin"
+            })
+            .canonicalize()
+            .unwrap();
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let package_root = Package(std::env::temp_dir().join(format!(
+            "crikey-cli-scope-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+        let package = package_root.0.join("typed-scope-consumer");
+        std::fs::create_dir_all(&package).unwrap();
+        let executable = executable
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        std::fs::write(package.join("crikey.toml"), format!(
+            "manifest-version = 1\n[plugin]\nid = \"typed-scope-consumer\"\nname = \"Scope consumer\"\nversion = \"0.1.0\"\nruntime = \"native\"\nentrypoint = \"{executable}\"\n"
+        )).unwrap();
+        std::fs::write(package.join("conformance-mode"), "typed").unwrap();
+        let mut provider_pipeline = QueryPipeline::new(PipelineConfig::default());
+        let provider = NativeProvider::load(
+            &mut provider_pipeline,
+            &[package_root.0.clone()],
+            &DisabledPlugins::default(),
+        );
+        assert_eq!(provider.plugins().len(), 1, "{:?}", provider.unavailable());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut held = false;
+        let publication_gate = Mutex::new(move |frame: &ViewModel| {
+            if frame.generation == Generation::from_raw(1) && !frame.pending_plugins && !held {
+                held = true;
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(60));
+            }
+        });
+        let driver = NativeDriver::spawn(
+            provider,
+            provider_pipeline,
+            Box::new(move |frame| publication_gate.lock().unwrap()(frame)),
+        );
+        let mut release = ReleaseOnDrop(Some(release_tx));
+        let executor = driver.action_executor();
+        let owner = driver.plugins().into_iter().next().unwrap();
+        let mut router = PluginActionRouter::default();
+        router
+            .register_with_permissions(driver.permissions(), executor.clone())
+            .unwrap();
+        let mut search = ranked_service(&[]);
+        search.set_plugin_action_router(Arc::new(router));
+        let application_owner = PluginId(APPLICATION_CATALOG_PLUGIN.into());
+        let mut catalog_pipeline = QueryPipeline::new(PipelineConfig::default());
+        catalog_pipeline
+            .register_plugin(application_owner.clone(), application_provider_policy())
+            .unwrap();
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        model.apply(crikey_ui::UiCommand::SetQuery("typed".into()));
+        let mut retained = RetainedRows::default();
+        let (first, catalog) = admit_root_query(
+            &mut search,
+            &mut catalog_pipeline,
+            &application_owner,
+            &mut model,
+            &mut retained,
+            "typed",
+            0,
+        )
+        .unwrap();
+        catalog.unwrap();
+        driver.submit(first, "typed", 0, Vec::new(), false, 0);
+        let key = ExecutableKey {
+            target: OwnedItem {
+                owner: owner.clone(),
+                item: ItemId("typed-suggestion".into()),
+            },
+            action: None,
+        };
+        let original = wait_for("first declaration", || executor.root_binding(&key, None));
+        entered_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("provider held after complete publication");
+        let selected = search
+            .root_scope_choices()
             .into_iter()
-            .find(|row| row.target == target);
-    }
-    let home = configuration
-        .and_then(|store| store.get("launcher.command-home"))
-        .unwrap_or("compact");
-    let mut context = crikey_app::CommandCompositionContext::root(generation, query);
-    context.compact = home == "compact";
-    context.include_favorites = matches!(home, "favorites" | "favorites-and-recent");
-    context.include_recent = matches!(home, "recent" | "favorites-and-recent");
-    context.fallback = fallback;
-    retained.set_commands(generation, search.compose_command_rows(context));
-    retained.alias_query = query.trim().to_lowercase();
-    model.publish(generation, retained.merged(), retained.pending());
-}
+            .find(|choice| {
+                choice.identity.owner == owner
+                    && choice.identity.id.0 == "secure"
+                    && matches!(
+                        choice.identity.source,
+                        crikey_ui::PublicationIdentity::Suggestion { .. }
+                    )
+            })
+            .expect("suggestion-only scope");
+        publish_projected_rows(&search, &retained, &mut model, first);
+        let Some(UiEffect::Query(query)) =
+            model.apply(crikey_ui::UiCommand::SetScope(Some(selected.identity.clone())))
+        else {
+            panic!("scope selection must request a new admitted query");
+        };
+        let scope = crikey_app::root_scope_from_identity(&selected.identity);
+        let (next, catalog) = admit_root_query(
+            &mut search,
+            &mut catalog_pipeline,
+            &application_owner,
+            &mut model,
+            &mut retained,
+            &query,
+            1,
+        )
+        .unwrap();
+        catalog.unwrap();
+        driver
+            .submit_scoped(
+                ProviderQueryContext {
+                    generation: next,
+                    text: &query,
+                    now: 1,
+                    selected: 0,
+                },
+                Vec::new(),
+                false,
+                Some(scope.clone()),
+            )
+            .unwrap();
+        retained.mark_pending(next, RowSource::Native, true);
+        assert!(
+            executor.root_binding(&key, None).is_none(),
+            "old executable admission must retire"
+        );
+        publish_projected_rows(&search, &retained, &mut model, next);
+        let pending = model.frame().unwrap();
+        assert_eq!(
+            pending.navigation.selected_scope.as_ref(),
+            Some(&selected.identity)
+        );
+        assert!(pending.navigation.unavailable.is_none());
+        assert!(pending
+            .navigation
+            .scopes
+            .iter()
+            .any(|choice| choice.identity == selected.identity));
+        assert!(pending.rows.is_empty());
 
-/// Apply the current native intent after draining queued shortcuts. A newly
-/// admitted shortcut cannot borrow authority from before this command executes.
-fn apply_native_command(
-    model: &mut LauncherViewModel,
-    retained: &mut RetainedRows,
-    hotkey_intent: &mut u64,
-    command: crikey_ui::UiCommand,
-) -> Option<UiEffect> {
-    *hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
-    if matches!(
-        &command,
-        crikey_ui::UiCommand::SetQuery(_)
-            | crikey_ui::UiCommand::Cancel
-            | crikey_ui::UiCommand::Back
-            | crikey_ui::UiCommand::Dismiss
-            | crikey_ui::UiCommand::OpenSettings
-            | crikey_ui::UiCommand::CloseSettings
-    ) {
-        retained.explicit_input = None;
+        release.0.take().unwrap().send(()).unwrap();
+        let outcome = wait_for("fresh scoped rows", || {
+            driver
+                .take_outcome()
+                .filter(|frame| frame.generation == next && !frame.pending_plugins)
+        });
+        let fresh = executor
+            .root_binding(&key, None)
+            .expect("fresh executable admission");
+        assert_ne!(fresh.source, original.source);
+        retained.absorb(next, RowSource::Native, &outcome.rows, outcome.pending_plugins);
+        publish_projected_rows(&search, &retained, &mut model, next);
+        let current = model.frame().unwrap();
+        assert_eq!(
+            current.navigation.selected_scope.as_ref(),
+            Some(&selected.identity)
+        );
+        assert!(current.navigation.unavailable.is_none());
+        assert!(current
+            .navigation
+            .scopes
+            .iter()
+            .any(|choice| choice.identity == selected.identity));
+        assert!(current.rows.iter().any(|row| matches!(&row.target,
+            crikey_ui::ActionTarget::Result { owner: row_owner, item } if row_owner == &owner && item.0 == "typed-suggestion")));
+
+        drop(driver);
+        assert!(!executor.root_scope_current(&scope));
+        publish_projected_rows(&search, &retained, &mut model, next);
+        let retired = model.frame().unwrap();
+        assert_eq!(
+            retired.navigation.selected_scope.as_ref(),
+            Some(&selected.identity)
+        );
+        assert!(retired
+            .navigation
+            .unavailable
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Selected scope is unavailable")));
+        assert!(retired.rows.is_empty());
+        assert!(!retired
+            .navigation
+            .scopes
+            .iter()
+            .any(|choice| choice.identity == selected.identity));
     }
-    model.apply(command)
 }

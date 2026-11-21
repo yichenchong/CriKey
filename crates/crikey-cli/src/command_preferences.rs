@@ -10,17 +10,19 @@ use crikey_platform::StandardDirectories;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+pub(crate) struct MutationRequest {
+    pub request_id: u64,
+    pub config: ConfigStore,
+    pub registry: Arc<CommandRegistrySnapshot>,
+    pub expected_revision: u64,
+    pub reference: crikey_core::CommandRef,
+    pub edit: crikey_ui::CommandPreferenceEdit,
+    pub session: bool,
+}
+
 pub(crate) enum Request {
     Poll,
-    Mutate {
-        request_id: u64,
-        config: ConfigStore,
-        registry: Arc<CommandRegistrySnapshot>,
-        expected_revision: u64,
-        reference: crikey_core::CommandRef,
-        edit: crikey_ui::CommandPreferenceEdit,
-        session: bool,
-    },
+    Mutate(MutationRequest),
     Setting {
         config: ConfigStore,
         request_id: u64,
@@ -83,7 +85,7 @@ impl PreferenceWorker {
                             }
                             state.reload(&store)
                         }
-                        Request::Mutate {
+                        Request::Mutate(MutationRequest {
                             request_id,
                             mut config,
                             registry,
@@ -91,7 +93,7 @@ impl PreferenceWorker {
                             reference,
                             edit,
                             session,
-                        } => {
+                        }) => {
                             let based_on = state.revision();
                             let mut saved = false;
                             let submitted_reference = reference.clone();
@@ -257,36 +259,21 @@ impl PreferenceWorker {
     }
     pub fn submit_mutation(
         &self,
-        request_id: u64,
-        config: ConfigStore,
-        registry: Arc<CommandRegistrySnapshot>,
-        expected_revision: u64,
-        reference: crikey_core::CommandRef,
-        edit: crikey_ui::CommandPreferenceEdit,
-        session: bool,
+        request: MutationRequest,
     ) -> Result<(), (crikey_ui::CommandPreferenceEditOutcome, String)> {
-        self.try_submit(Request::Mutate {
-            request_id,
-            config,
-            registry,
-            expected_revision,
-            reference,
-            edit,
-            session,
-        })
-        .map_err(|error| {
+        self.try_submit(Request::Mutate(request)).map_err(|error| {
             let (request, message) = match error {
                 mpsc::TrySendError::Full(request) => {
                     (request, "Configuration edit queue is busy; retry this edit")
                 }
                 mpsc::TrySendError::Disconnected(request) => (request, "Configuration edits are closed"),
             };
-            let Request::Mutate {
+            let Request::Mutate(MutationRequest {
                 request_id,
                 reference,
                 edit,
                 ..
-            } = request
+            }) = request
             else {
                 unreachable!()
             };
@@ -1122,15 +1109,15 @@ mod authority_tests {
                 PreferenceWorker::spawn(store, Some(config), directories.clone(), Vec::new(), || {}).unwrap();
             let initial = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
             worker
-                .submit_mutation(
-                    61,
-                    initial.config.unwrap(),
-                    Arc::new(CommandRegistrySnapshot::default()),
-                    initial.preferences.unwrap().revision,
+                .submit_mutation(MutationRequest {
+                    request_id: 61,
+                    config: initial.config.unwrap(),
+                    registry: Arc::new(CommandRegistrySnapshot::default()),
+                    expected_revision: initial.preferences.unwrap().revision,
                     reference,
-                    CommandPreferenceEdit::SetHotkey(Some("Ctrl+Shift+G".into())),
-                    false,
-                )
+                    edit: CommandPreferenceEdit::SetHotkey(Some("Ctrl+Shift+G".into())),
+                    session: false,
+                })
                 .unwrap();
             let completion = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
             let expected = if profile_shadows_commands {
@@ -1259,7 +1246,7 @@ mod layer_consumer_tests {
                 unreachable!();
             };
             worker
-                .submit(Request::Mutate {
+                .submit_mutation(MutationRequest {
                     request_id,
                     config: current.config.take().unwrap(),
                     registry: Arc::clone(&registry),
@@ -1325,7 +1312,7 @@ mod layer_consumer_tests {
         .enumerate()
         {
             worker
-                .submit(Request::Mutate {
+                .submit_mutation(MutationRequest {
                     request_id: 100 + index as u64,
                     config: current.config.as_ref().unwrap().clone(),
                     registry: Arc::clone(&registry),

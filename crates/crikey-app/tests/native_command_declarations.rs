@@ -158,19 +158,59 @@ fn unsupported_invalid_and_terminal_callback_outcomes_preserve_ordinary_catalogs
 }
 
 #[test]
-fn undrained_reply_from_a_replaced_worker_cannot_publish_declarations() {
-    let (_scratch, mut pipeline, mut provider, owner) = setup("action");
+fn undrained_healthy_released_catalog_command_executes_with_its_original_source() {
+    let (scratch, mut pipeline, mut provider, owner) = setup("action");
     provider
         .request_catalog_build(&owner, 1, Generation::from_raw(1))
         .unwrap();
     await_catalog_retirement(&pipeline, &owner);
-    // Retirement proves the first source replied and released before this query
-    // starts a replacement; no scheduler timing assumption or source-text test.
-    provider.drive_query(&mut pipeline, "replacement", 1).unwrap();
-    assert_catalog(complete(&mut provider));
+    // Retirement proves the catalog replied and released before this query
+    // starts a replacement; publication still waits in the catalog mailbox.
+    let replacement = provider.drive_query(&mut pipeline, "replacement", 1).unwrap();
+    let catalog_pid = assert_catalog(complete(&mut provider));
+    assert!(
+        replacement.rows.iter().any(|row| row.label != catalog_pid),
+        "the query must have used a different physical worker"
+    );
     let commands = snapshot(&provider, &owner);
-    assert_eq!(commands.status, NativeCommandStatus::Stale);
-    assert!(commands.declarations.is_empty());
+    let [declaration] = commands.declarations.as_ref() else {
+        panic!("the released catalog must retain its one declared command");
+    };
+    assert_eq!(
+        declaration.label, catalog_pid,
+        "replacement queries cannot lend their producer to the frozen declaration"
+    );
+    assert_eq!(declaration.reference.provider_id, owner);
+    let ExecutableTarget::Item { item_id, action_id } = &declaration.executable_target else {
+        panic!("the plugin command must retain its catalog item target");
+    };
+    assert_eq!(item_id.0, "installed");
+    assert_eq!(action_id.as_ref().unwrap().0, "alternate");
+    let source = crikey_app::DeclaredCommandSource {
+        instance: commands.instance,
+        generation: commands.generation,
+        producer: commands.producer,
+        publication: commands.revision,
+    };
+    let driver = crikey_app::NativeDriver::spawn(provider, pipeline, Box::new(|_| {}));
+    let endpoint = driver.action_executor();
+    let receipt = endpoint
+        .submit_declared_command_with_receipt(declaration, &source, None)
+        .unwrap();
+    let completion = wait_for(|| endpoint.poll_plugin_actions().into_iter().next());
+    assert_eq!(completion.request_id, receipt.request_id);
+    assert_eq!(completion.plugin, owner);
+    assert_eq!(completion.item_id, *item_id);
+    assert_eq!(completion.action_id, *action_id);
+    assert_eq!(completion.outcome.unwrap(), crikey_app::ActionEffect::Completed);
+    assert_eq!(
+        fs::read_to_string(scratch.0.join("commands/executed")).unwrap(),
+        "installed:alternate"
+    );
+    assert!(
+        endpoint.poll_plugin_actions().is_empty(),
+        "one terminal completion"
+    );
 }
 
 #[test]

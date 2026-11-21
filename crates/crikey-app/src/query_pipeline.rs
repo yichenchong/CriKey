@@ -25,6 +25,25 @@ use crikey_ui::{ResultRow, ViewModel};
 use crate::command_preferences::OrdinaryProviderState;
 use crate::plugin_icons::PluginIconResolver;
 
+/// Borrowed query and selection identity captured by provider admission.
+#[derive(Clone, Copy)]
+pub struct ProviderQueryContext<'a> {
+    pub generation: Generation,
+    pub text: &'a str,
+    pub now: Millis,
+    pub selected: usize,
+}
+
+impl std::fmt::Debug for ProviderQueryContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderQueryContext")
+            .field("generation", &self.generation)
+            .field("now", &self.now)
+            .field("selected", &self.selected)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Completion evidence for one applicable owner, before presentation filtering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrdinarySearchProvider {
@@ -235,6 +254,7 @@ pub struct QueryPipeline {
     dropped_errors: u64,
     query: String,
     generation: Generation,
+    scope: Option<crate::plugin_action::RootScope>,
     rows: Arc<[ResultRow]>,
     visible_generation: Option<Generation>,
     presented_pending: Option<bool>,
@@ -286,6 +306,7 @@ impl QueryPipeline {
             dropped_errors: 0,
             query: String::new(),
             generation: Generation::ZERO,
+            scope: None,
             rows: Arc::from(Vec::<ResultRow>::new()),
             visible_generation: None,
             presented_pending: None,
@@ -566,13 +587,27 @@ impl QueryPipeline {
     /// responsibility of [`Self::tick`]. Rows from the preceding generation
     /// are cleared synchronously, before any worker can answer.
     pub fn keystroke(&mut self, text: &str, now: Millis) -> Generation {
+        self.keystroke_scoped(text, now, None)
+    }
+
+    /// Capture scope before scheduler admission. Nonowners are never dispatched;
+    /// they supply no ordinary evidence and receive no changed callback contract.
+    pub fn keystroke_scoped(
+        &mut self,
+        text: &str,
+        now: Millis,
+        scope: Option<crate::plugin_action::RootScope>,
+    ) -> Generation {
+        self.scope = scope;
         let generation = self.scheduler.submit_query(text, now);
         self.query.clear();
         self.query.push_str(text);
         self.generation = generation;
         self.ordinary.clear();
         for plugin in &self.registered {
-            if self.scheduler.query_applicable(plugin, text) {
+            if self.scope.as_ref().is_none_or(|scope| scope.owner == *plugin)
+                && self.scheduler.query_applicable(plugin, text)
+            {
                 self.ordinary.insert(
                     plugin.clone(),
                     OrdinaryEvidence {
@@ -614,6 +649,10 @@ impl QueryPipeline {
         generation
     }
 
+    pub fn scope(&self) -> Option<&crate::plugin_action::RootScope> {
+        self.scope.as_ref()
+    }
+
     pub fn tick(&mut self, now: Millis) -> PipelineTick {
         let (drain_report, mut errors) = self.drain_intake(now);
         errors.splice(0..0, self.pending_errors.drain(..));
@@ -623,6 +662,22 @@ impl QueryPipeline {
         // The refusal is counted and the request is retired here, so the
         // scheduler is not left holding an in-flight entry nobody will answer.
         let mut dispatches = self.scheduler.tick(now);
+        let mut nonapplicable = Vec::new();
+        dispatches.retain(|dispatch| {
+            if self
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.owner != dispatch.plugin)
+            {
+                nonapplicable.push((dispatch.plugin.clone(), dispatch.generation));
+                false
+            } else {
+                true
+            }
+        });
+        for (plugin, generation) in nonapplicable {
+            let _ = self.finish_completion(&plugin, generation, now);
+        }
         let mut refused = Vec::new();
         dispatches.retain(|dispatch| {
             let Some(budget) = self.budgets.get(&dispatch.plugin) else {
@@ -683,6 +738,13 @@ impl QueryPipeline {
         let generation = batch.generation;
         let state = batch.state;
         let item_count = batch.items.len();
+        if self.scope.as_ref().is_some_and(|scope| scope.owner != plugin) {
+            return Err(PipelineError::QueueRejected {
+                plugin,
+                generation,
+                reason: QueueReject::StaleGeneration,
+            });
+        }
 
         if generation == self.generation {
             if let Some(evidence) = self.ordinary.get_mut(&plugin) {
@@ -1494,6 +1556,54 @@ mod ordinary_evidence_tests {
         let summary = pipeline.ordinary_search_summary(7);
         assert_eq!(summary.view, 7);
         summary.providers[0].state
+    }
+
+    #[test]
+    fn scoped_generation_admits_only_exact_owner_and_retires_old_work() {
+        use crate::plugin_action::{RootScope, RootSource};
+        use crikey_core::result_presentation::ScopeId;
+        let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+        let owner = PluginId("native.scoped".into());
+        let legacy = PluginId("legacy.unchanged".into());
+        for plugin in [&owner, &legacy] {
+            pipeline
+                .register_plugin(plugin.clone(), PluginPolicy::legacy_strict())
+                .unwrap();
+        }
+        let old = pipeline.keystroke("ordinary", 0);
+        assert_eq!(pipeline.tick(0).dispatches.len(), 2);
+        let scoped = pipeline.keystroke_scoped(
+            "ordinary",
+            1,
+            Some(RootScope {
+                owner: owner.clone(),
+                id: ScopeId("projects".into()),
+                source: RootSource::Suggestion {
+                    generation: old,
+                    producer: 1,
+                },
+            }),
+        );
+        let tick = pipeline.tick(1);
+        assert!(tick.dispatches.iter().all(|request| request.plugin == owner));
+        assert!(tick.cancellations.iter().any(|request| request.plugin == legacy));
+        let summary = pipeline.ordinary_search_summary(7);
+        assert_eq!(summary.providers.len(), 1);
+        assert_eq!(summary.providers[0].plugin, owner);
+        assert!(pipeline
+            .deliver(
+                ResultBatch {
+                    plugin: legacy,
+                    generation: scoped,
+                    state: BatchState::Final,
+                    items: Vec::new(),
+                },
+                1
+            )
+            .is_err());
+        assert!(pipeline.rows().is_empty());
+        pipeline.keystroke("ordinary", 2);
+        assert!(pipeline.scope().is_none());
     }
 
     #[test]

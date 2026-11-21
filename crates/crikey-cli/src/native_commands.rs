@@ -405,6 +405,7 @@ fn inspect(options: Options) -> Result<Report, String> {
             text: query.clone(),
             normalized: query.to_lowercase(),
             selected_item_id: None,
+            selected_scope_id: None,
         };
         if options.cancel && ordinal == 0 {
             cancel_handle.cancel();

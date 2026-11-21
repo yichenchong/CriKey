@@ -66,6 +66,29 @@ struct StartupProbe {
 }
 
 impl Plugin for StartupProbe {
+    fn supports_typed_arguments(&self) -> bool {
+        self.plugin.supports_typed_arguments()
+    }
+    fn supports_result_presentation(&self) -> bool {
+        self.plugin.supports_result_presentation()
+    }
+    fn catalog_presentation(&mut self, context: &dyn PluginContext) -> Result<crate::ResultPresentation> {
+        self.plugin.catalog_presentation(context)
+    }
+    fn suggestion_presentation(
+        &mut self,
+        query: &Query,
+        context: &dyn PluginContext,
+    ) -> Result<crate::ResultPresentation> {
+        self.plugin.suggestion_presentation(query, context)
+    }
+    fn execute_typed(
+        &mut self,
+        request: crate::TypedExecuteRequest,
+        context: &dyn PluginContext,
+    ) -> Result<crate::SubmissionOutcome> {
+        self.plugin.execute_typed(request, context)
+    }
     fn start(&mut self, context: &dyn PluginContext) -> Result<()> {
         let result = match catch_unwind(AssertUnwindSafe(|| self.plugin.start(context))) {
             Ok(result) => result,
@@ -644,6 +667,7 @@ impl TestHarness {
                 text: text.to_owned(),
                 normalized_text: text.trim().to_lowercase(),
                 selected_item_id: String::new(),
+                selected_scope_id: None,
                 max_items: HARNESS_MAX_ITEMS_PER_QUERY as u64,
                 max_batches: HARNESS_MAX_BATCHES_PER_QUERY as u64,
                 unknown: Default::default(),
