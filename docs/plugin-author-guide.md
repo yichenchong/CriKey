@@ -1424,6 +1424,13 @@ crikey dev run --plugin DIR --query text
 crikey dev inspect-protocol --plugin EXE
 ```
 
+Native inspection reports individual defensive checks as well as an overall
+verdict. An oversized frame length is rejected before payload allocation and
+fails `frame-bounds`, even when the worker retires before catalog/query
+admission. Later requests preserve that first terminal diagnosis rather than
+replacing it with a generic closed-connection error; they do not revive the
+worker. Diagnostically sensitive failures remain redacted.
+
 If a plugin is absent, verify the relevant `CRIKEY_MODERN_PLUGIN_ROOTS` or
 `CRIKEY_NATIVE_PLUGIN_ROOTS` path and that `crikey.toml` is readable. Confirm
 `runtime`, entrypoint, API range, platform/architecture, and Python dependency
