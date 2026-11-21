@@ -1783,10 +1783,29 @@ impl LegacyWorker {
                 self.hard_stopped = true;
             }
         }
+        #[cfg(unix)]
+        let mut apple_zombie_reap = false;
         let tree_signalled = if identity_owned {
             #[cfg(unix)]
             {
-                kill_process_group(self.process_id)
+                match kill_process_group(self.process_id) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        // XNU skips zombies when delivering a group signal and
+                        // returns EPERM for an owned zombie-only group. This is
+                        // permission to reap only our still-held exited leader,
+                        // never evidence that the process group is absent.
+                        if cfg!(target_vendor = "apple")
+                            && error.raw_os_error() == Some(libc::EPERM)
+                            && matches!(child_exited(&child), Ok(true))
+                        {
+                            apple_zombie_reap = true;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
             }
             #[cfg(windows)]
             {
@@ -1813,7 +1832,13 @@ impl LegacyWorker {
             return self.reaped;
         }
         match child.wait() {
-            Ok(status) => self.reaped = Some(status),
+            Ok(status) => {
+                self.reaped = Some(status);
+                #[cfg(unix)]
+                if apple_zombie_reap && process_group_exists(self.process_id) {
+                    self.reap_failed = true;
+                }
+            }
             Err(_) => {
                 self.reap_failed = true;
                 self.child = Some(child);
@@ -1937,14 +1962,17 @@ impl Drop for LegacyWorker {
 /// The caller must still own an unreaped leader, reserving this process group
 /// identity. No signal is permitted after that ownership has been lost.
 #[cfg(unix)]
-fn kill_process_group(pgid: u32) -> bool {
+fn kill_process_group(pgid: u32) -> io::Result<()> {
     // `killpg(0)` signals the CALLER's process group - this launcher, its shell
     // and its session. Callers pass a live `Child::id()`, and each kill precedes
     // its reap so the pid cannot have been recycled, but a misdirected group
     // kill is unrecoverable: refuse the values that could only mean "myself" or
     // "init".
     if pgid <= 1 || pgid > i32::MAX as u32 {
-        return false;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid owned process group",
+        ));
     }
     // `int killpg(int pgrp, int sig)` — POSIX. SIGKILL is 9 on Linux and macOS.
     extern "C" {
@@ -1956,7 +1984,16 @@ fn kill_process_group(pgid: u32) -> bool {
         reason = "no safe std API kills a process group; args are a validated pgid and a constant signal (spec 24.3)"
     )]
     let result = unsafe { killpg(pgid as i32, SIGKILL) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
 }
 
 #[cfg(unix)]

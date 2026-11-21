@@ -2609,15 +2609,24 @@ impl ModernWorker {
         if let Some(child) = self.child.as_mut() {
             let exited = child_exited(child).unwrap_or(false);
             #[cfg(unix)]
-            let signalled = kill_process_group(self.process_id);
+            let may_reap = match kill_process_group(self.process_id) {
+                Ok(()) => true,
+                // XNU killpg1 filters SZOMB members before counting permitted
+                // targets, so a held, exited leader alone yields EPERM. Reap
+                // only that observed leader, then require actual group absence
+                // below; EPERM itself never proves that descendants are gone.
+                Err(error) => {
+                    cfg!(target_vendor = "apple") && exited && error.raw_os_error() == Some(libc::EPERM)
+                }
+            };
             #[cfg(windows)]
-            let signalled = match &self.job {
+            let may_reap = match &self.job {
                 Some(job) => job.terminate_and_wait().is_ok(),
                 None => exited || child.kill().is_ok(), // failed containment, never resumed
             };
             #[cfg(not(any(unix, windows)))]
-            let signalled = false;
-            if !signalled {
+            let may_reap = false;
+            if !may_reap {
                 self.cleanup_failed = true;
                 return self.reaped;
             }
@@ -2762,13 +2771,24 @@ fn log_byte_len(frame: &Map<String, Value>) -> usize {
 
 /// Signals the whole owned group while its leader PID is still unreaped.
 #[cfg(unix)]
-fn kill_process_group(pgid: u32) -> bool {
+fn kill_process_group(pgid: u32) -> io::Result<()> {
     if pgid <= 1 || pgid > i32::MAX as u32 {
-        return false;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid owned process group",
+        ));
     }
     #[allow(unsafe_code)]
     let result = unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 #[cfg(unix)]
