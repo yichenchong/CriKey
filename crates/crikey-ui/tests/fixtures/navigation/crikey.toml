@@ -1,0 +1,8 @@
+manifest-version = 1
+
+[plugin]
+id = "navigation-fixture"
+name = "Navigation Fixture"
+version = "0.1.0"
+runtime = "native"
+entrypoint = "target/debug/crikey-navigation-fixture"

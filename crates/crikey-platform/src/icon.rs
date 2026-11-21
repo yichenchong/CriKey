@@ -141,6 +141,12 @@ impl IconImage {
         &self.rgba
     }
 
+    /// Host-retained bytes, including overallocated pixel capacity.
+    /// An owner sharing this value through `Arc` must count it only once.
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.rgba.capacity()
+    }
+
     /// A content-derived identity, stable across processes and across a cache
     /// round trip.
     ///

@@ -818,6 +818,7 @@ impl QueryPipeline {
             rounded_corners: true,
             page: None,
             preview: Default::default(),
+            navigation: Default::default(),
         })
     }
 

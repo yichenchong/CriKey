@@ -87,6 +87,95 @@ pub enum ActionSubmission {
     Pending(ActionRequestId),
 }
 
+/// Admission-time privacy evidence from the exact frozen execution snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginActionReceipt {
+    pub request_id: ActionRequestId,
+    pub query_history_allowed: bool,
+}
+
+/// A successful host/provider admission and its query-collection authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionReceipt {
+    pub submission: ActionSubmission,
+    pub query_history_allowed: bool,
+}
+
+/// Validate the item that will actually be queued, not a previously displayed row.
+pub(crate) fn validate_action_item<'a>(
+    item: &'a Item,
+    action_id: &ActionId,
+    argument: Option<&str>,
+) -> CoreResult<(&'a crikey_core::Action, bool)> {
+    let action = item
+        .actions
+        .iter()
+        .find(|action| &action.action_id == action_id)
+        .ok_or_else(|| CoreError::Invalid("selected action is no longer available".into()))?;
+    if !action.applicable_categories.is_empty() && !action.applicable_categories.contains(&item.category) {
+        return Err(CoreError::Invalid(format!(
+            "action `{}` is not applicable to item category `{}`",
+            action.action_id.0,
+            item.category.as_str()
+        )));
+    }
+    match item.argument_policy {
+        crikey_core::ArgumentPolicy::Forbidden if argument.is_some() => {
+            return Err(CoreError::Invalid("this item does not accept an argument".into()))
+        }
+        crikey_core::ArgumentPolicy::Required if argument.is_none_or(str::is_empty) => {
+            return Err(CoreError::Invalid("this item requires an argument".into()))
+        }
+        _ => {}
+    }
+    let primary = item.actions.iter().find(|action| {
+        action.applicable_categories.is_empty() || action.applicable_categories.contains(&item.category)
+    });
+    Ok((
+        action,
+        item.argument_policy == crikey_core::ArgumentPolicy::Forbidden
+            && argument.is_none()
+            && primary.is_some_and(|action| &action.action_id == action_id),
+    ))
+}
+
+/// A live suggestion overrides its canonical catalog entry. Released static
+/// catalogs remain executable without borrowing a preview/query incarnation.
+pub(crate) fn resolve_action_item(
+    plugin: &PluginId,
+    item_id: &ItemId,
+    live_origin: Option<u64>,
+    suggestions: &Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>,
+    catalog: &Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>,
+    static_catalog: &Mutex<BTreeMap<(PluginId, ItemId), Item>>,
+) -> Option<(Item, Option<u64>)> {
+    let key = (plugin.clone(), item_id.clone());
+    {
+        let suggestions = suggestions.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((item, origin)) = suggestions.get(&key) {
+            if *origin != 0 && Some(*origin) == live_origin {
+                return Some((item.clone(), Some(*origin)));
+            }
+            // Its presence identifies the selected dynamic target. Losing that
+            // origin must refuse admission, not silently retarget the same ID
+            // to canonical content with a different policy/action.
+            return None;
+        }
+    }
+    if let Some((item, _)) = catalog
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&key)
+    {
+        return Some((item.clone(), None));
+    }
+    static_catalog
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&key)
+        .map(|item| (item.clone(), None))
+}
+
 /// Runtime entry point for one provider's plugin-owned actions.
 ///
 /// Implementations own the worker and the shared per-plugin budget. Submission
@@ -103,6 +192,36 @@ pub trait PluginActionExecutor: Send + Sync {
         action_id: &ActionId,
         argument: Option<&str>,
     ) -> CoreResult<ActionRequestId>;
+
+    /// Older/legacy adapters cannot prove that free-form execution text is
+    /// nonsecret. They remain executable but do not authorize query collection.
+    fn submit_plugin_action_with_receipt(
+        &self,
+        plugin: &PluginId,
+        item: &Item,
+        action_id: &ActionId,
+        argument: Option<&str>,
+    ) -> CoreResult<PluginActionReceipt> {
+        self.submit_plugin_action(plugin, item, action_id, argument)
+            .map(|request_id| PluginActionReceipt {
+                request_id,
+                query_history_allowed: false,
+            })
+    }
+
+    fn submit_plugin_action_by_id_with_receipt(
+        &self,
+        plugin: &PluginId,
+        item_id: &ItemId,
+        action_id: &ActionId,
+        argument: Option<&str>,
+    ) -> CoreResult<PluginActionReceipt> {
+        self.submit_plugin_action_by_id(plugin, item_id, action_id, argument)
+            .map(|request_id| PluginActionReceipt {
+                request_id,
+                query_history_allowed: false,
+            })
+    }
 
     /// Drains terminal outcomes without waiting for plugin work.
     fn poll_plugin_actions(&self) -> Vec<PluginActionCompletion> {
@@ -398,14 +517,14 @@ impl PluginActionRouter {
         })
     }
 
-    /// Admits an action only to the endpoint registered for `plugin`.
+    /// Dispatches and obtains privacy evidence from the same accepted snapshot.
     pub fn submit(
         &self,
         plugin: &PluginId,
         item: &Item,
         action_id: &ActionId,
         argument: Option<&str>,
-    ) -> CoreResult<ActionRequestId> {
+    ) -> CoreResult<PluginActionReceipt> {
         if item.plugin_id != *plugin {
             return Err(CoreError::Invalid(format!(
                 "plugin action item is owned by `{}`, not `{}`",
@@ -415,23 +534,22 @@ impl PluginActionRouter {
         self.providers
             .get(plugin)
             .ok_or_else(|| CoreError::Invalid(format!("no action runtime owns plugin `{}`", plugin.0)))?
-            .submit_plugin_action(plugin, item, action_id, argument)
+            .submit_plugin_action_with_receipt(plugin, item, action_id, argument)
     }
 
-    /// Resolves only the requested owner's current provider snapshot.
+    /// Resolves exactly one owner and returns its admission-time privacy evidence.
     pub fn submit_owned_item(
         &self,
         plugin: &PluginId,
         item_id: &ItemId,
         action_id: &ActionId,
         argument: Option<&str>,
-    ) -> CoreResult<ActionRequestId> {
-        let executor = self
-            .providers
+    ) -> CoreResult<PluginActionReceipt> {
+        self.providers
             .get(plugin)
             .filter(|executor| executor.owns_item(plugin, item_id))
-            .ok_or_else(|| CoreError::Invalid("selected owner's result is no longer current".into()))?;
-        executor.submit_plugin_action_by_id(plugin, item_id, action_id, argument)
+            .ok_or_else(|| CoreError::Invalid("selected owner's result is no longer current".into()))?
+            .submit_plugin_action_by_id_with_receipt(plugin, item_id, action_id, argument)
     }
 
     /// Drains all terminal action outcomes without waiting for a plugin.
@@ -571,6 +689,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retired_dynamic_override_refuses_admission_even_with_canonical_same_owner_and_id() {
+        let owner = PluginId("native.override".into());
+        let mut dynamic = item(&owner.0);
+        dynamic.target = "selected dynamic target".into();
+        let key = (owner.clone(), dynamic.stable_id.clone());
+        let mut canonical = dynamic.clone();
+        canonical.target = "canonical replacement target".into();
+        canonical.argument_policy = ArgumentPolicy::Required;
+
+        // Cover both retained-producer and released-static canonical sources.
+        for released_static in [false, true] {
+            let suggestions = Mutex::new(BTreeMap::from([(key.clone(), (dynamic.clone(), 11))]));
+            let catalog = Mutex::new(if released_static {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([(key.clone(), (canonical.clone(), 9))])
+            });
+            let static_catalog = Mutex::new(if released_static {
+                BTreeMap::from([(key.clone(), canonical.clone())])
+            } else {
+                BTreeMap::new()
+            });
+
+            // Retirement/replacement happened before admission, not after enqueue.
+            for live_origin in [None, Some(12), Some(0)] {
+                assert!(
+                    super::resolve_action_item(
+                        &owner,
+                        &dynamic.stable_id,
+                        live_origin,
+                        &suggestions,
+                        &catalog,
+                        &static_catalog,
+                    )
+                    .is_none(),
+                    "a stale dynamic selection cannot become a canonical command"
+                );
+            }
+            let (live, origin) = super::resolve_action_item(
+                &owner,
+                &dynamic.stable_id,
+                Some(11),
+                &suggestions,
+                &catalog,
+                &static_catalog,
+            )
+            .unwrap();
+            assert_eq!(live.target, "selected dynamic target");
+            assert_eq!(origin, Some(11));
+
+            // Only removal of the override permits a fresh canonical admission.
+            suggestions.lock().unwrap().clear();
+            let (resolved, origin) = super::resolve_action_item(
+                &owner,
+                &dynamic.stable_id,
+                None,
+                &suggestions,
+                &catalog,
+                &static_catalog,
+            )
+            .unwrap();
+            assert_eq!(resolved.target, "canonical replacement target");
+            assert_eq!(resolved.argument_policy, ArgumentPolicy::Required);
+            assert_eq!(origin, None);
+        }
+    }
+
     #[derive(Debug, Default)]
     struct RecordingExecutor {
         calls: Mutex<Vec<PluginId>>,
@@ -597,6 +783,24 @@ mod tests {
     }
 
     #[test]
+    fn unattested_legacy_or_custom_adapters_never_authorize_query_collection() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let owner = PluginId("legacy.freeform".into());
+        let mut router = PluginActionRouter::default();
+        router.register([owner.clone()], executor.clone()).unwrap();
+        let receipt = router
+            .submit(
+                &owner,
+                &item(&owner.0),
+                &ActionId("run".into()),
+                Some("free-form value"),
+            )
+            .unwrap();
+        assert!(!receipt.query_history_allowed);
+        assert_eq!(executor.calls.lock().unwrap().as_slice(), [owner]);
+    }
+
+    #[test]
     fn routes_only_to_exact_registered_owner() {
         let executor = Arc::new(RecordingExecutor::default());
         let mut router = PluginActionRouter::default();
@@ -612,7 +816,8 @@ mod tests {
                 &ActionId("run".to_owned()),
                 None,
             )
-            .unwrap();
+            .unwrap()
+            .request_id;
         assert_eq!(request.plugin, PluginId("modern.alpha".to_owned()));
         let error = router
             .submit(
@@ -951,7 +1156,8 @@ mod tests {
                 &ActionId("slow".to_owned()),
                 None,
             )
-            .unwrap();
+            .unwrap()
+            .request_id;
         // A second event/submission is accepted while the first action is
         // deliberately held before completion.
         let second_request = router
@@ -961,7 +1167,8 @@ mod tests {
                 &ActionId("second".to_owned()),
                 None,
             )
-            .unwrap();
+            .unwrap()
+            .request_id;
         assert_ne!(second_request, request);
         assert!(router.poll().is_empty());
 

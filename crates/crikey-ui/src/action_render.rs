@@ -29,13 +29,17 @@ pub(super) fn keyboard(context: &egui::Context, model: &ViewModel, commands: &mu
                         || (*key == egui::Key::Enter && modifiers.matches_logically(egui::Modifiers::ALT));
                     let command = if discovery {
                         Some(UiCommand::ShowActions)
-                    } else if model.action_panel.is_some() && plain {
+                    } else if (model.action_panel.is_some() || !model.navigation.recall.is_empty()) && plain {
                         match key {
                             egui::Key::ArrowDown => Some(UiCommand::SelectNext),
                             egui::Key::ArrowUp => Some(UiCommand::SelectPrevious),
                             egui::Key::PageDown => Some(UiCommand::PageDown),
                             egui::Key::PageUp => Some(UiCommand::PageUp),
-                            egui::Key::Escape => Some(UiCommand::ActionBack),
+                            egui::Key::Escape => Some(if model.action_panel.is_some() {
+                                UiCommand::ActionBack
+                            } else {
+                                UiCommand::Cancel
+                            }),
                             _ => None,
                         }
                     } else {
@@ -46,7 +50,10 @@ pub(super) fn keyboard(context: &egui::Context, model: &ViewModel, commands: &mu
                     if composing && (command.is_some() || (*key == egui::Key::Enter && plain)) {
                         return false;
                     }
-                    if model.action_panel.is_some() && *key == egui::Key::Enter && plain {
+                    if (model.action_panel.is_some() || !model.navigation.recall.is_empty())
+                        && *key == egui::Key::Enter
+                        && plain
+                    {
                         // The focused editor processes the prefix in event order
                         // and stops at Return. Do not move trailing host keys
                         // ahead of that submission either.
