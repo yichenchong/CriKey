@@ -60,16 +60,25 @@ pub(crate) struct TypedEditor {
 }
 
 /// egui indexes characters; the schema and retained-value budget bound UTF-8 bytes.
-struct BoundedTextBuffer<'a> {
+pub(crate) struct BoundedTextBuffer<'a> {
     text: &'a mut String,
     max_bytes: usize,
+    rejected: bool,
 }
 
 impl<'a> BoundedTextBuffer<'a> {
-    fn new(text: &'a mut String, max_bytes: usize) -> Self {
-        let mut buffer = Self { text, max_bytes };
+    pub(crate) fn new(text: &'a mut String, max_bytes: usize) -> Self {
+        let mut buffer = Self {
+            text,
+            max_bytes,
+            rejected: false,
+        };
         buffer.compact();
         buffer
+    }
+
+    pub(crate) fn rejected(&self) -> bool {
+        self.rejected
     }
 
     fn compact(&mut self) {
@@ -103,6 +112,7 @@ impl egui::TextBuffer for BoundedTextBuffer<'_> {
             .checked_add(text.len())
             .filter(|bytes| *bytes <= self.max_bytes)
         else {
+            self.rejected = true;
             return 0;
         };
         let at = self.byte_index(character);
@@ -186,10 +196,11 @@ impl TypedEditor {
             && !ime_batch
             && ui.input_mut(|state| state.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
         for (index, field) in input.schema.fields.iter().enumerate() {
-            ui.label(if field.required {
-                format!("{} *", field.label)
-            } else {
-                field.label.clone()
+            ui.horizontal_wrapped(|ui| {
+                ui.label(&field.label);
+                if field.required {
+                    ui.weak("*");
+                }
             });
             match &field.kind {
                 FieldKind::Text {
@@ -211,8 +222,11 @@ impl TypedEditor {
                             ui.memory_mut(|memory| memory.request_focus(id));
                         }
                         let enter = ui.input(|state| state.key_pressed(egui::Key::Enter));
-                        let response =
-                            ui.add(edit.id(id).hint_text(field.placeholder.as_deref().unwrap_or("")));
+                        let response = ui.add(
+                            edit.id(id)
+                                .desired_width(ui.available_width())
+                                .hint_text(field.placeholder.as_deref().unwrap_or("")),
+                        );
                         changed |= response.changed();
                         enter_submit |= !*multiline && response.lost_focus() && enter;
                     }

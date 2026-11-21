@@ -648,7 +648,7 @@ fn reveal_action_text(
         clock: context.input(|input| input.time),
     };
     let initial = frames.settle(view);
-    let back = position_of(&initial, "Back / Esc");
+    let back = position_of(&initial, "Back");
     let pointer = back + egui::vec2(4.0, 100.0);
     let wheel = |delta| {
         vec![
@@ -800,27 +800,25 @@ fn the_footer_offers_the_settings_surface_to_a_user_who_knows_no_shortcut() {
 /// the setting does on screen.
 #[test]
 fn the_footer_hides_its_hint_line_when_the_setting_says_so() {
-    const HINTS: &str = "Up/Down navigate   Tab complete   Esc cancel";
     let context = create_launcher_context();
-
     let shown = build_launcher_frame(&context, launcher_input(Vec::new()), &model(""));
-    assert!(
-        painted(&shown, HINTS),
-        "the launcher shows the hints by default, or this tests nothing"
-    );
-
     let mut hidden_view = model("");
     hidden_view.show_hints = false;
     let hidden = build_launcher_frame(&context, launcher_input(Vec::new()), &hidden_view);
-    assert!(
-        !painted(&hidden, HINTS),
-        "a user who turned the hints off must not be shown them anyway"
-    );
+    for hint in ["Down", "Tab", "Escape", "navigate", "complete", "cancel"] {
+        assert!(
+            painted(&shown, hint),
+            "default applied hint {hint} must be painted"
+        );
+        assert!(
+            !painted(&hidden, hint),
+            "disabled hint {hint} must not be painted"
+        );
+    }
 }
-
 /// The one thing hiding the hints must never hide.
 ///
-/// `Settings  Ctrl+,` sits in the same footer row and is the only mouse route
+/// `Settings` sits in the same footer row and is the only mouse route
 /// into the settings surface: if it went with the hints, the setting that hid
 /// them could only be undone from a terminal, by a user who no longer has
 /// anything on screen telling them the surface exists.
@@ -831,7 +829,7 @@ fn the_settings_control_survives_a_footer_with_no_hints() {
     view.show_hints = false;
 
     let located = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
-    assert!(painted(&located, "Settings  Ctrl+,"));
+    assert!(painted(&located, "Settings"));
     // And it is still the control, not just still painted: it answers a click
     // exactly as it does with the hints beside it.
     let affordance = position_of(&located, "Settings");
@@ -845,7 +843,7 @@ fn the_settings_control_survives_a_footer_with_no_hints() {
     // The same assertion with the hints shown, so a change that broke only one
     // of the two cases cannot pass by looking like the other.
     let with_hints = build_launcher_frame(&context, launcher_input(Vec::new()), &model(""));
-    assert!(painted(&with_hints, "Settings  Ctrl+,"));
+    assert!(painted(&with_hints, "Settings"));
 }
 
 /// Set as text, the settings control has no button frame to say it can be
@@ -1139,7 +1137,8 @@ fn metadata_categories_select_fields_and_keep_history_clear_in_privacy() {
         source: "user-global".into(),
         restart: false,
         secret: false,
-        toggle: None,
+        control: SettingControl::Text,
+        max_bytes: 4096,
         value_available: true,
     };
     let mut panel = Panel {
@@ -1238,14 +1237,62 @@ fn long_security_reports_wrap_without_moving_the_fixed_settings_quit_control() {
             ));
             input
         };
-        let initial = build_launcher_frame(&context, input(Vec::new()), &view);
-        let package_header = position_of(&initial, "Plugins / Background jobs");
-        let _ = build_launcher_frame(
+        let mut current = build_launcher_frame(&context, input(Vec::new()), &view);
+        let quit_anchor = position_of(&current, "Quit CriKey");
+        let body_pointer = egui::pos2(width / 2.0, quit_anchor.y - 24.0);
+        let mut package_header = None;
+        for _ in 0..32 {
+            package_header = current.output.shapes.iter().find_map(|shape| {
+                text_origin(&shape.shape, "Plugins / Background jobs")
+                    .map(|position| position + egui::vec2(4.0, 4.0))
+                    .filter(|position| shape.clip_rect.contains(*position))
+            });
+            if package_header.is_some() {
+                break;
+            }
+            current = build_launcher_frame(
+                &context,
+                input(vec![
+                    egui::Event::PointerMoved(body_pointer),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -80.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]),
+                &view,
+            );
+        }
+        build_launcher_frame(
             &context,
-            input(click_at(package_header + egui::vec2(4.0, 4.0))),
+            input(click_at(
+                package_header.expect("real jobs disclosure is reachable by body scrolling"),
+            )),
             &view,
         );
-        let expanded = build_launcher_frame(&context, input(Vec::new()), &view);
+        let mut expanded = build_launcher_frame(&context, input(Vec::new()), &view);
+        for _ in 0..32 {
+            if expanded
+                .output
+                .shapes
+                .iter()
+                .any(|shape| report_geometry(&shape.shape, &report).is_some())
+            {
+                break;
+            }
+            expanded = build_launcher_frame(
+                &context,
+                input(vec![
+                    egui::Event::PointerMoved(body_pointer),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -80.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]),
+                &view,
+            );
+        }
         let (report_rect, rows) = expanded
             .output
             .shapes
@@ -1265,7 +1312,7 @@ fn long_security_reports_wrap_without_moving_the_fixed_settings_quit_control() {
         let scrolled = build_launcher_frame(
             &context,
             input(vec![
-                egui::Event::PointerMoved(report_rect.min + egui::vec2(4.0, 4.0)),
+                egui::Event::PointerMoved(body_pointer),
                 egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, -10000.0),
@@ -1438,12 +1485,32 @@ fn a_boolean_setting_is_a_switch_that_commits_when_it_moves() {
         "a switch commits when it moves, so a Save beside it would say the click had not counted"
     );
 
-    // The switch sits at the right of its row, where the editor used to be.
-    let label = position_of(&drawn, "Show keyboard hints");
-    let switch = egui::pos2(
-        NativeLauncherConfig::default().width as f32 - theme_margin() - 8.0,
-        label.y + 8.0,
-    );
+    fn switch_position(frame: &crikey_ui::NativeUiFrame) -> egui::Pos2 {
+        fn tracks(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(rect)
+                    if (rect.rect.width() - 2.0 * rect.rect.height()).abs() < 0.1
+                        && (rect.rounding.nw - rect.rect.height() / 2.0).abs() < 0.1
+                        && rect.fill != egui::Color32::TRANSPARENT =>
+                {
+                    out.push(rect.rect)
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        tracks(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut rendered = Vec::new();
+        for shape in &frame.output.shapes {
+            tracks(&shape.shape, &mut rendered);
+        }
+        assert_eq!(rendered.len(), 1, "the actual switch track is unique");
+        rendered[0].center()
+    }
+    let switch = switch_position(&drawn);
     let clicked = build_launcher_frame(&context, launcher_input(click_at(switch)), &view);
 
     let committed = clicked
@@ -1463,11 +1530,7 @@ fn a_boolean_setting_is_a_switch_that_commits_when_it_moves() {
     // And back, from the other position.
     let off = boolean_model(false);
     let drawn_off = build_launcher_frame(&context, launcher_input(Vec::new()), &off);
-    let label_off = position_of(&drawn_off, "Show keyboard hints");
-    let switch_off = egui::pos2(
-        NativeLauncherConfig::default().width as f32 - theme_margin() - 8.0,
-        label_off.y + 8.0,
-    );
+    let switch_off = switch_position(&drawn_off);
     let clicked_off = build_launcher_frame(&context, launcher_input(click_at(switch_off)), &off);
     let committed_off = clicked_off
         .commands
@@ -1482,78 +1545,6 @@ fn a_boolean_setting_is_a_switch_that_commits_when_it_moves() {
         ("launcher.show-hints", "true"),
         "an off switch turns on"
     );
-}
-
-/// The panel's own margin plus the sheet's, which is where the right-hand
-/// controls of a settings row end up. Written here rather than exported from
-/// the theme, because a test that reached into the theme for it would agree
-/// with the renderer by construction.
-fn theme_margin() -> f32 {
-    12.0 + 12.0
-}
-
-/// The sheet's legend tells the truth about both controls it draws.
-///
-/// The switch and the text field commit differently, so the footer that used
-/// to read "Enter or Save commits an edit" was telling a user of a switch to
-/// press a key that does nothing. Asserted on the rendered sheet rather than
-/// on the sentence alone, because a legend nothing paints is not a legend.
-#[test]
-fn the_settings_sheet_says_how_each_control_commits() {
-    fn sheet(controls: &[SettingControl]) -> ViewModel {
-        let mut view = model("");
-        view.settings_open = true;
-        view.settings = Arc::from(
-            controls
-                .iter()
-                .enumerate()
-                .map(|(index, control)| SettingRow {
-                    key: format!("launcher.thing-{index}"),
-                    label: format!("Thing {index}"),
-                    value: "value".to_owned(),
-                    source: "default".to_owned(),
-                    control: *control,
-                })
-                .collect::<Vec<_>>(),
-        );
-        view
-    }
-
-    let context = create_launcher_context();
-
-    let switches = build_launcher_frame(
-        &context,
-        launcher_input(Vec::new()),
-        &sheet(&[SettingControl::Toggle { on: true }]),
-    );
-    assert!(painted(&switches, "Switches apply at once"), "switches say so");
-    assert!(
-        !painted(&switches, "Enter or Save"),
-        "a sheet with no text field must not send the user after Enter"
-    );
-
-    let editors = build_launcher_frame(
-        &context,
-        launcher_input(Vec::new()),
-        &sheet(&[SettingControl::Text]),
-    );
-    assert!(painted(&editors, "Enter or Save"), "editors say so");
-    assert!(
-        !painted(&editors, "Switches"),
-        "a sheet with no switch must not explain switches"
-    );
-
-    // What the shipped launcher actually presents.
-    let both = build_launcher_frame(
-        &context,
-        launcher_input(Vec::new()),
-        &sheet(&[SettingControl::Text, SettingControl::Toggle { on: false }]),
-    );
-    assert!(
-        painted(&both, "Switches apply at once"),
-        "a mixed sheet says both"
-    );
-    assert!(painted(&both, "Enter or Save"), "a mixed sheet says both");
 }
 
 /// A switch has to look like a control in *both* positions.
@@ -1644,9 +1635,9 @@ fn a_switch_is_visible_in_both_positions() {
 /// exactly that colour pass, which is the whole defect.
 fn sheet_colours() -> [egui::Color32; 2] {
     [
-        // `theme::palette().surface`
+        // the default appearance surface
         egui::Color32::from_rgb(34, 38, 45),
-        // `theme::palette().canvas`
+        // the default appearance canvas
         egui::Color32::from_rgb(20, 22, 26),
     ]
 }
@@ -3823,8 +3814,23 @@ fn preview_divider_drag_reports_one_bounded_remembered_ratio() {
     view.preview.status = Some(crikey_ui::PreviewStatus::Loading);
     let mut frames = Frames::new();
     let initial = frames.settle(&view);
-    let detail = position_of(&initial, "Detail");
-    let divider = egui::pos2(detail.x - 5.0, detail.y + 40.0);
+    fn divider_position(shape: &egui::Shape) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::LineSegment { points, .. }
+                if (points[0].x - points[1].x).abs() < 0.1 && (points[0].y - points[1].y).abs() > 40.0 =>
+            {
+                Some(egui::pos2(points[0].x, (points[0].y + points[1].y) / 2.0))
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(divider_position),
+            _ => None,
+        }
+    }
+    let divider = initial
+        .output
+        .shapes
+        .iter()
+        .find_map(|shape| divider_position(&shape.shape))
+        .expect("the real preview divider is painted");
     let pressed = frames.draw(
         &view,
         vec![
@@ -4371,7 +4377,7 @@ fn navigation_settings_back_and_history_clear_are_visible_host_controls() {
     let clear = position_of(&drawn, "Clear query history") + egui::vec2(4.0, 4.0);
     let cleared = frames.draw(&view, click_at(clear));
     assert!(cleared.commands.contains(&UiCommand::ClearQueryHistory));
-    let back = position_of(&drawn, "Back  Esc") + egui::vec2(4.0, 4.0);
+    let back = position_of(&drawn, "Back") + egui::vec2(4.0, 4.0);
     let returned = frames.draw(&view, click_at(back));
     assert!(returned.commands.contains(&UiCommand::CloseSettings));
 }
@@ -5267,7 +5273,7 @@ fn actionless_typed_root_control_keeps_none_instead_of_inventing_an_action_id() 
     }]
     .into();
     let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
-    let position = position_of(&frame, "Run  Enter");
+    let position = position_of(&frame, "Run");
     let clicked = build_launcher_frame(&context, launcher_input(click_at(position)), &view);
     assert!(clicked.commands.iter().any(|command| matches!(command, UiCommand::ActivateActionless { target: crikey_ui::ActionTarget::Result { owner, item } } if owner.0 == "renderer-fixture" && item.0 == "item-0")));
     assert!(!clicked
@@ -5302,4 +5308,532 @@ fn an_unavailable_restored_scope_requires_explicit_all_selection() {
         .commands
         .iter()
         .any(|command| matches!(command, UiCommand::SetScope(None))));
+}
+#[test]
+fn remapped_activation_admits_only_its_text_prefix_and_runs_once() {
+    use crikey_ui::navigation::{CompiledNavigation, NavigationStyle};
+    let mut frames = Frames::new();
+    crikey_ui::set_launcher_navigation(
+        &frames.context,
+        Arc::new(
+            CompiledNavigation::compile(
+                NavigationStyle::Default,
+                r#"{"activate":["F8"],"next":["Alt+J"],"cancel":["F9"]}"#,
+            )
+            .unwrap(),
+        ),
+    );
+    let view = model("a");
+    let initial = frames.settle(&view);
+    assert!(painted(&initial, "Alt+J"));
+    assert!(painted(&initial, "F9"));
+    assert!(!painted(&initial, "Escape"));
+    let frame = frames.draw(
+        &view,
+        vec![
+            egui::Event::Text("b".into()),
+            egui::Event::Key {
+                key: egui::Key::F8,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Text("trailing".into()),
+        ],
+    );
+    let query = frame
+        .commands
+        .iter()
+        .position(|command| matches!(command, UiCommand::SetQuery(text) if text == "ab"))
+        .expect("text prefix admitted");
+    let execute = frame
+        .commands
+        .iter()
+        .position(|command| matches!(command, UiCommand::ExecuteDefault))
+        .expect("remapped activation executes");
+    assert!(query < execute);
+    assert_eq!(
+        frame
+            .commands
+            .iter()
+            .filter(|command| matches!(command, UiCommand::ExecuteDefault))
+            .count(),
+        1
+    );
+    assert!(!frame
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetQuery(text) if text.contains("trailing"))));
+    let unbound = frames.draw(
+        &view,
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert!(!unbound.commands.contains(&UiCommand::ExecuteDefault));
+}
+
+#[test]
+fn closed_theme_choice_is_graphically_selectable_at_minimum_width() {
+    use crikey_ui::settings_management::{Field, Panel, Request};
+    let context = create_launcher_context();
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::OpenSettings);
+    model.set_settings_management(Panel {
+        view: model.view().map(|(id, _)| id),
+        config: 42,
+        schema: 7,
+        projection_config: 42,
+        projection_schema: 7,
+        authoritative: true,
+        fields: vec![Field {
+            key: "launcher.theme".into(),
+            label:
+                "Theme with a deliberately long descriptive label that must wrap without hiding its selector"
+                    .into(),
+            description: "Closed choices share the authoritative settings transaction".into(),
+            category: "Appearance".into(),
+            plugin: None,
+            value: "system".into(),
+            source: "session".into(),
+            restart: false,
+            secret: false,
+            control: SettingControl::Choice {
+                options: &[("system", "System"), ("light", "Light"), ("dark", "Dark")],
+            },
+            max_bytes: 4096,
+            value_available: true,
+        }]
+        .into(),
+        ..Default::default()
+    });
+    let view = model.frame().unwrap();
+    let draw = |events| {
+        let mut input = launcher_input(events);
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(480.0, 520.0),
+        ));
+        build_launcher_frame(&context, input, &view)
+    };
+    fn visible_control(frame: &crikey_ui::NativeUiFrame, label: &str) -> Option<egui::Pos2> {
+        frame.output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == label => {
+                let center = text.pos + text.galley.size() / 2.0;
+                shape
+                    .clip_rect
+                    .contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                    .then_some(center)
+            }
+            _ => None,
+        })
+    }
+    draw(Vec::new());
+    let mut initial = draw(Vec::new());
+    assert!(painted(&initial, "Quit CriKey"));
+    let body_pointer = position_of(&initial, "Quit CriKey") - egui::vec2(40.0, 24.0);
+    for _ in 0..32 {
+        if visible_control(&initial, "System").is_some() {
+            break;
+        }
+        initial = draw(vec![
+            egui::Event::PointerMoved(body_pointer),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -80.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+    }
+    // Let ordinary smooth scrolling finish before pressing the moving control.
+    for _ in 0..32 {
+        initial = draw(Vec::new());
+    }
+    let selector =
+        visible_control(&initial, "System").expect("the actual selector is reachable by body scrolling");
+    assert!(selector.x < 480.0 && selector.y < 520.0);
+    draw(click_at(selector));
+    assert!(
+        context.memory(|memory| memory.any_popup_open()),
+        "the graphical selector opens a real popup"
+    );
+    let opened = draw(Vec::new());
+    let selected = draw(click_at(
+        visible_control(&opened, "Light").expect("real Light option is visible"),
+    ));
+    assert!(
+        !selected.commands.iter().any(|command| matches!(
+            command,
+            UiCommand::ManageSettings(Request::Edit { .. }) | UiCommand::SetSetting { .. }
+        )),
+        "a choice is a retained draft until Save"
+    );
+    let mut selected = selected;
+    for _ in 0..32 {
+        selected = draw(Vec::new());
+    }
+    assert!(!context.memory(|memory| memory.any_popup_open()));
+    assert!(
+        visible_control(&selected, "Light").is_some(),
+        "the retained choice actually changed"
+    );
+    for _ in 0..32 {
+        if visible_control(&selected, "Save").is_some() {
+            break;
+        }
+        selected = draw(vec![
+            egui::Event::PointerMoved(body_pointer),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -80.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+    }
+    for _ in 0..32 {
+        selected = draw(Vec::new());
+    }
+    let save = visible_control(&selected, "Save").expect("actual managed Save button is reachable");
+    let saved = draw(click_at(save));
+    assert!(saved.commands.iter().any(|command| matches!(command, UiCommand::ManageSettings(Request::Edit { key, plugin: None, draft, config: 42, schema: 7, .. }) if key == "launcher.theme" && draft == "light")));
+    assert!(
+        !saved
+            .commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::SetSetting { .. })),
+        "authoritative forms never bypass revision-guarded management"
+    );
+    assert_eq!(
+        view.navigation.settings_management.fields[0].value, "system",
+        "selection cannot promote the effective session value before persistence"
+    );
+}
+
+#[test]
+fn advanced_navigation_editor_preserves_the_full_advertised_byte_bound() {
+    use crikey_ui::settings_management::{Field, Panel, Request};
+    let mut frames = Frames::new();
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::OpenSettings);
+    model.set_settings_management(Panel {
+        view: model.view().map(|(id, _)| id),
+        config: 42,
+        schema: 7,
+        projection_config: 42,
+        projection_schema: 7,
+        authoritative: true,
+        fields: vec![Field {
+            key: "launcher.navigation-bindings".into(),
+            label: "Navigation bindings (JSON object)".into(),
+            description: String::new(),
+            category: "Keyboard".into(),
+            plugin: None,
+            value: "{}".into(),
+            source: "default".into(),
+            restart: false,
+            secret: false,
+            control: SettingControl::Text,
+            max_bytes: 8192,
+            value_available: true,
+        }]
+        .into(),
+        ..Default::default()
+    });
+    let mut view = model.frame().unwrap();
+    view.settings_focus = Some("launcher.navigation-bindings".into());
+    frames.settle(&view);
+    let mut value = r#"{"next":["Alt+J"]}"#.to_owned();
+    value.extend(std::iter::repeat_n(' ', 8192 - value.len()));
+    let frame = frames.draw(
+        &view,
+        vec![
+            key_press(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Paste(value.clone()),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ],
+    );
+    assert!(frame.commands.iter().any(|command| matches!(command, UiCommand::ManageSettings(Request::Edit { key, draft, config: 42, schema: 7, .. }) if key == "launcher.navigation-bindings" && draft == &value)));
+    assert!(!frame
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetSetting { .. })));
+}
+
+#[test]
+fn focused_preview_returns_through_the_applied_toggle_binding() {
+    use crikey_ui::navigation::{CompiledNavigation, NavigationStyle};
+    let mut frames = Frames::new();
+    let mut view = scrollable_model(1, 0);
+    view.preview.status = Some(crikey_ui::PreviewStatus::Loading);
+    view.preview.focused = true;
+    crikey_ui::set_launcher_navigation(
+        &frames.context,
+        Arc::new(
+            CompiledNavigation::compile(NavigationStyle::Default, r#"{"toggle-preview":["F8"]}"#).unwrap(),
+        ),
+    );
+    frames.settle(&view);
+    let key = |key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    assert!(!frames
+        .draw(&view, vec![key(egui::Key::F6)])
+        .commands
+        .contains(&UiCommand::LeavePreview));
+    assert!(frames
+        .draw(&view, vec![key(egui::Key::F8)])
+        .commands
+        .contains(&UiCommand::LeavePreview));
+    crikey_ui::set_launcher_navigation(&frames.context, Arc::new(CompiledNavigation::default()));
+    assert!(frames
+        .draw(&view, vec![key(egui::Key::F6)])
+        .commands
+        .contains(&UiCommand::LeavePreview));
+}
+
+#[test]
+fn applied_size_and_density_change_real_row_layout_without_changing_os_dpi() {
+    use crikey_ui::appearance::{
+        AppearanceCache, AppearancePreferences, InterfaceSize, ResultDensity, SystemTheme,
+    };
+    let mut frames = Frames::new();
+    let view = scrollable_model(10, 0);
+    let default = frames.settle(&view);
+    let baseline = position_of(&default, "row-1").y - position_of(&default, "row-0").y;
+    let dpi = frames.context.pixels_per_point();
+    let cache = AppearanceCache::new(
+        AppearancePreferences {
+            interface_size: InterfaceSize::Large,
+            result_density: ResultDensity::Comfortable,
+            ..Default::default()
+        },
+        SystemTheme::Dark,
+    )
+    .unwrap();
+    crikey_ui::set_launcher_appearance(&frames.context, cache.resolved());
+    let large = frames.settle(&view);
+    let spacing = position_of(&large, "row-1").y - position_of(&large, "row-0").y;
+    assert!(
+        spacing > baseline,
+        "actual row geometry must respond to both applied preferences"
+    );
+    assert_eq!(
+        frames.context.pixels_per_point(),
+        dpi,
+        "interface size is not an OS DPI override"
+    );
+    assert!(painted(&large, "Settings"));
+}
+#[test]
+fn long_applied_remaps_keep_minimum_width_footer_controls_visible_and_clickable() {
+    use crikey_ui::appearance::{
+        AppearanceCache, AppearancePreferences, InterfaceSize, ResultDensity, SystemTheme, ThemePreference,
+    };
+    use crikey_ui::navigation::{CompiledNavigation, NavigationStyle};
+    for size in [InterfaceSize::Default, InterfaceSize::Large] {
+        let context = create_launcher_context();
+        let appearance = AppearanceCache::new(
+            AppearancePreferences {
+                interface_size: size,
+                result_density: ResultDensity::Comfortable,
+                theme: ThemePreference::Light,
+                ..Default::default()
+            },
+            SystemTheme::Dark,
+        )
+        .unwrap();
+        crikey_ui::set_launcher_appearance(&context, appearance.resolved());
+        crikey_ui::set_launcher_navigation(&context, Arc::new(CompiledNavigation::compile(NavigationStyle::Default,
+            r#"{"show-actions":["Ctrl+Alt+Shift+Meta+PageDown"],"activate":["Ctrl+Alt+Shift+Meta+PageUp"]}"#).unwrap()));
+        let mut view = scrollable_model(1, 0);
+        let mut row = result_row(0);
+        row.default_action = Some(crikey_core::Action {
+            action_id: crikey_core::ActionId("primary-action".into()),
+            label: "PrimaryAction with a deliberately long guest label that must visibly ellipsize".into(),
+            description: String::new(),
+            applicable_categories: vec![],
+            icon_reference: None,
+            execution_policy: crikey_core::ExecutionPolicy::Plugin,
+        });
+        view.rows = Arc::from([row]);
+        let draw = |events| {
+            let mut input = launcher_input(events);
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(480.0, 520.0),
+            ));
+            build_launcher_frame(&context, input, &view)
+        };
+        draw(vec![]);
+        let frame = draw(vec![]);
+        for label in [
+            "Settings",
+            "Actions",
+            "PrimaryAction with a deliberately long guest label that must visibly ellipsize",
+        ] {
+            let (rect, clip, elided) = frame
+                .output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => Some((
+                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                        shape.clip_rect,
+                        text.galley.elided,
+                    )),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("mandatory control {label} must be painted"));
+            assert!(
+                rect.left() >= 0.0 && rect.right() <= 480.0 && rect.top() >= 0.0 && rect.bottom() <= 520.0,
+                "mandatory control {label} exceeded the window: {rect:?}"
+            );
+            assert!(
+                clip.contains_rect(rect),
+                "mandatory control {label} was clipped: size={size:?} rect={rect:?} clip={clip:?}"
+            );
+            if label.starts_with("PrimaryAction") {
+                assert!(elided, "the long primary control must visibly ellipsize");
+            }
+            let clicked = draw(click_at(rect.center()));
+            match label {
+                "Settings" => assert!(clicked.commands.contains(&UiCommand::OpenSettings)),
+                "Actions" => assert!(clicked.commands.contains(&UiCommand::ShowActions), "size={size:?} painted={rect:?} clip={clip:?} commands={:?}", clicked.commands),
+                _ => assert!(clicked.commands.iter().any(|command| matches!(command, UiCommand::ActivateAction {
+                    target: crikey_ui::ActionTarget::Result { owner, item }, identity: crikey_ui::ActionIdentity::Plugin(action)
+                } if owner.0 == "renderer-fixture" && item.0 == "item-0" && action.0 == "primary-action"))),
+            }
+        }
+    }
+}
+
+#[test]
+fn expanded_applied_navigation_uses_readable_columns_at_real_launcher_width() {
+    let context = create_launcher_context();
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::OpenSettings);
+    let view = model.frame().unwrap();
+    let draw = |events| {
+        let mut input = launcher_input(events);
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(720.0, 960.0),
+        ));
+        build_launcher_frame(&context, input, &view)
+    };
+    draw(vec![]);
+    let initial = draw(vec![]);
+    let header = position_of(&initial, "Applied navigation shortcuts") + egui::vec2(8.0, 6.0);
+    draw(click_at(header));
+    let mut expanded = draw(vec![]);
+    for _ in 0..32 {
+        expanded = draw(vec![]);
+    }
+    let text = |label: &str| {
+        expanded
+            .output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => Some((shape, text)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("actual applied binding {label} is visible"))
+    };
+    let next = text("next");
+    let down = text("Down");
+    let previous = text("previous");
+    for (shape, text) in [next, down, previous] {
+        assert_eq!(
+            text.galley.rows.len(),
+            1,
+            "binding cells must not split ordinary words"
+        );
+        assert!(!text.galley.elided);
+        assert!(shape
+            .clip_rect
+            .contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size())));
+    }
+    assert!(
+        down.1.pos.x - next.1.pos.x >= 160.0,
+        "the table uses its real available width"
+    );
+}
+
+#[test]
+fn custom_page_footer_at_two_x_dpi_keeps_both_identity_labels_and_settings_separate() {
+    let context = create_launcher_context();
+    let mut view = page_view(vec![]);
+    let title = "Custom page with a deliberately long title that must ellipsize within its footer slot";
+    let provider = "Provider with another deliberately long readable identity";
+    let page = view.page.as_mut().unwrap();
+    Arc::make_mut(&mut page.frame).title = title.into();
+    page.plugin_name = provider.into();
+    let draw = |events| {
+        let mut input = launcher_input(events);
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(480.0, 520.0),
+        ));
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .native_pixels_per_point = Some(2.0);
+        build_launcher_frame(&context, input, &view)
+    };
+    draw(vec![]);
+    let frame = draw(vec![]);
+    assert_eq!(context.pixels_per_point(), 2.0);
+    let painted = |label: &str| {
+        frame
+            .output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => Some((shape, text)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("footer identity/control {label} is painted"))
+    };
+    let title = painted(title);
+    let provider = painted(provider);
+    let settings = painted("Settings");
+    let bounds = |text: &egui::epaint::TextShape| egui::Rect::from_min_size(text.pos, text.galley.size());
+    for (shape, text) in [title, provider, settings] {
+        let rect = bounds(text);
+        assert!(
+            shape.clip_rect.contains_rect(rect),
+            "text={:?} rect={rect:?} clip={:?}",
+            text.galley.text(),
+            shape.clip_rect
+        );
+        assert!(rect.left() >= 0.0 && rect.right() <= 480.0 && rect.bottom() <= 520.0);
+    }
+    assert!(title.1.galley.elided && provider.1.galley.elided);
+    assert!(bounds(title.1).right() < bounds(provider.1).left());
+    assert!(bounds(provider.1).right() < bounds(settings.1).left());
+    for shape in &frame.output.shapes {
+        if let egui::Shape::Text(text) = &shape.shape {
+            assert!(
+                !matches!(text.galley.text(), "navigate" | "complete" | "cancel"),
+                "page ownership cannot advertise root bindings"
+            );
+        }
+    }
+    let clicked = draw(click_at(bounds(settings.1).center()));
+    assert!(clicked.commands.contains(&UiCommand::OpenSettings));
+    assert!(page_inputs(&clicked).is_empty());
 }

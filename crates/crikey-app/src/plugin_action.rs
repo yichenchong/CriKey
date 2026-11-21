@@ -947,6 +947,22 @@ pub trait PluginActionExecutor: Send + Sync {
     /// Tells the open page the viewport changed.
     fn resize_plugin_page(&self, _width: u32, _height: u32) {}
 
+    /// Identity of the current page opening, if this runtime supports updates.
+    fn plugin_page_session_id(&self) -> Option<crate::PageSessionId> {
+        None
+    }
+
+    /// Updates only the identified live page; never opens or restarts a guest.
+    fn update_plugin_page_palette(
+        &self,
+        _session: crate::PageSessionId,
+        _palette: crikey_core::PagePalette,
+    ) -> CoreResult<()> {
+        Err(CoreError::Invalid(
+            "no matching live plugin page is open".to_owned(),
+        ))
+    }
+
     /// Closes the open page, telling its plugin the surface is gone.
     fn close_plugin_page(&self) {}
 
@@ -1452,6 +1468,24 @@ impl PluginActionRouter {
         if let Some(executor) = self.providers.get(plugin) {
             executor.resize_plugin_page(width, height);
         }
+    }
+
+    /// Identity of the page opening on the exact owning runtime.
+    pub fn page_session_id(&self, plugin: &PluginId) -> Option<crate::PageSessionId> {
+        self.providers.get(plugin)?.plugin_page_session_id()
+    }
+
+    /// Queues a palette update only for the identified live session.
+    pub fn update_page_palette(
+        &self,
+        plugin: &PluginId,
+        session: crate::PageSessionId,
+        palette: crikey_core::PagePalette,
+    ) -> CoreResult<()> {
+        self.providers
+            .get(plugin)
+            .ok_or_else(|| CoreError::Invalid(format!("no action runtime owns plugin `{}`", plugin.0)))?
+            .update_plugin_page_palette(session, palette)
     }
 
     /// Closes the page `plugin` has open.

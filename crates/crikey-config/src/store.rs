@@ -82,6 +82,14 @@ pub const KEY_ROUNDED_CORNERS: &str = "launcher.rounded-corners";
 /// Remembered preview divider proportion; CLI validation enforces finite 0.3..=0.7.
 pub const KEY_PREVIEW_SPLIT: &str = "launcher.preview-split";
 
+/// Live launcher appearance and semantic navigation preferences.
+pub const KEY_THEME: &str = "launcher.theme";
+pub const KEY_INTERFACE_SIZE: &str = "launcher.interface-size";
+pub const KEY_RESULT_DENSITY: &str = "launcher.result-density";
+pub const KEY_THEME_OVERRIDES: &str = "launcher.theme-overrides";
+pub const KEY_NAVIGATION_STYLE: &str = "launcher.navigation-style";
+pub const KEY_NAVIGATION_BINDINGS: &str = "launcher.navigation-bindings";
+
 /// The values the host itself supplies, forming [`ConfigLayer::BuiltInDefaults`].
 ///
 /// Only keys whose default this crate genuinely owns. A key defaulted by another
@@ -96,6 +104,12 @@ pub const BUILT_IN_DEFAULTS: &[(&str, &str)] = &[
     (KEY_PREVIEW_SPLIT, "0.55"),
     // The settings/UI declaration validates the four supported home modes.
     ("launcher.command-home", "compact"),
+    (KEY_THEME, "system"),
+    (KEY_INTERFACE_SIZE, "default"),
+    (KEY_RESULT_DENSITY, "default"),
+    (KEY_THEME_OVERRIDES, "{}"),
+    (KEY_NAVIGATION_STYLE, "default"),
+    (KEY_NAVIGATION_BINDINGS, "{}"),
 ];
 /// Keys under this prefix are operator-pinned: a user may supply a source
 /// declaration, but cannot redirect one an administrator has specified.
@@ -801,10 +815,13 @@ impl ConfigStore {
     /// drafts immediately, whereas that method publishes only after success.
     pub fn save(&mut self) -> Result<(), ConfigError> {
         let _lock = crate::persistence::writer_lock(&self.config_path)?;
-        self.save_locked()
+        self.save_locked(&[])
     }
 
-    fn save_locked(&mut self) -> Result<(), ConfigError> {
+    fn save_locked(&mut self, validated_sources: &[crate::ConfigRevision]) -> Result<(), ConfigError> {
+        for revision in validated_sources {
+            revision.check()?;
+        }
         self.revision.check()?;
         // Freshly load retained layers while holding the writer lock.
         let mut validation = self.reload()?;
@@ -866,6 +883,11 @@ impl ConfigStore {
         // validation, immediately before replacement; never overwrite a change
         // observed while preparing the candidate.
         self.revision.check()?;
+        for revision in validated_sources {
+            revision.check()?;
+            // Retain prospective sources in atomic_write's post-staging check.
+            validation.revision.sources.extend(revision.sources.clone());
+        }
         crate::persistence::atomic_write(&self.config_path, text.as_bytes(), &validation.revision)?;
         let reloaded = self.reload().map_err(|_| ConfigError::PersistedReload)?;
         *self = reloaded;
@@ -881,7 +903,7 @@ impl ConfigStore {
             &format!("plugins.{}.enabled", plugin.0),
             if enabled { "true" } else { "false" },
         );
-        fresh.save_locked()?;
+        fresh.save_locked(&[])?;
         *self = fresh;
         Ok(())
     }
@@ -923,6 +945,28 @@ impl ConfigStore {
         current.set_user_global(key, value);
         let mut retained = self.reload_without_session_overrides()?;
         retained.set_user_global(key, value);
+        if key == KEY_PROFILE {
+            // Changing the selector must validate the new profile's values,
+            // not the profile layer retained from the old snapshot.
+            for candidate in [&mut current, &mut retained] {
+                candidate.layers[ConfigLayer::Profile.index()].clear();
+                if let Some(profile) = candidate.get(KEY_PROFILE).map(str::to_owned) {
+                    let directory = candidate.directories.config_dir().join(PROFILE_DIRECTORY);
+                    if !valid_profile_name(&profile) {
+                        return Err(ConfigError::Profile {
+                            path: directory,
+                            name: profile,
+                            reason: "must be one safe path component",
+                        });
+                    }
+                    candidate.read_file_into(
+                        ConfigLayer::Profile,
+                        &directory.join(format!("{profile}.toml")),
+                        "",
+                    )?;
+                }
+            }
+        }
         Ok((current, retained))
     }
 
@@ -948,6 +992,21 @@ impl ConfigStore {
         self.revision.clone()
     }
 
+    /// Sources read by a projection but absent from its original store.
+    /// Existing sources remain protected by the original revision.
+    pub fn additional_source_revision(&self, original: &Self) -> crate::ConfigRevision {
+        crate::ConfigRevision {
+            sources: self
+                .revision
+                .sources
+                .iter()
+                .filter(|(path, _)| !original.revision.sources.contains_key(*path))
+                .map(|(path, state)| (path.clone(), state.clone()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
     /// Validates and persists one edit without changing this published store on
     /// failure. Blocking filesystem/lock operations must run off the UI thread.
     pub fn commit_user_global(
@@ -955,6 +1014,18 @@ impl ConfigStore {
         key: &str,
         value: &str,
         expected: &crate::ConfigRevision,
+    ) -> Result<(), ConfigError> {
+        self.commit_user_global_checked(key, value, expected, &[])
+    }
+
+    /// Retains source snapshots read by semantic validation through the same
+    /// writer lock and the final atomic replacement check.
+    pub fn commit_user_global_checked(
+        &mut self,
+        key: &str,
+        value: &str,
+        expected: &crate::ConfigRevision,
+        validated_sources: &[crate::ConfigRevision],
     ) -> Result<(), ConfigError> {
         if &self.revision != expected {
             return Err(ConfigError::Conflict);
@@ -978,7 +1049,8 @@ impl ConfigStore {
         }
         let mut candidate = self.clone();
         candidate.set_user_global(key, value);
-        candidate.save()?;
+        let _lock = crate::persistence::writer_lock(&candidate.config_path)?;
+        candidate.save_locked(validated_sources)?;
         *self = candidate;
         Ok(())
     }

@@ -248,8 +248,8 @@ impl ActionTree {
     }
 
     /// Preserves flat plugin order and appends only explicitly supplied host entries.
-    /// Core Action has no shortcut/destructive declaration; only the primary
-    /// Enter label is supplied by the host here.
+    /// Core Action supplies no shortcut/destructive declaration. Applied host
+    /// navigation hints are projected by the renderer, not baked into this tree.
     pub fn from_flat(
         row: &ResultRow,
         host_entries: Vec<ActionEntry>,
@@ -275,14 +275,7 @@ impl ActionTree {
                     label: action.label.clone(),
                     description: action.description.clone(),
                     icon_reference: action.icon_reference.clone(),
-                    shortcut: row
-                        .default_action
-                        .as_ref()
-                        .filter(|primary| {
-                            matches!(row.target, ActionTarget::Result { .. })
-                                && primary.action_id == action.action_id
-                        })
-                        .map(|_| "Enter".into()),
+                    shortcut: None,
                     destructive: false,
                 },
             })
@@ -293,7 +286,7 @@ impl ActionTree {
                 ActionEntry::Command {
                     presentation: ActionPresentation {
                         label: "Invoke Command".into(),
-                        shortcut: Some("Enter".into()),
+                        shortcut: None,
                         ..Default::default()
                     },
                 },

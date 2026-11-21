@@ -22,6 +22,8 @@ egui = { workspace = true, features = ["default_fonts"] }
 egui-wgpu.workspace = true
 egui-winit = { workspace = true, features = ["clipboard"] }
 pollster.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 wgpu = { workspace = true, features = ["dx12", "metal", "wgsl"] }
 winit = { workspace = true, features = ["rwh_06", "wayland", "wayland-dlopen", "x11"] }

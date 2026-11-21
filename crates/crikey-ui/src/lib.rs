@@ -15,6 +15,7 @@ use crikey_core::{Action, ActionId, Generation, ItemId, PageFrame, PageInput, Pl
 use crikey_platform::IconImage;
 
 pub mod action_panel;
+pub mod appearance;
 mod native;
 pub mod navigation;
 pub mod settings_management;
@@ -53,10 +54,10 @@ pub mod window_shape;
 
 pub use egui;
 pub use native::{
-    build_launcher_frame, create_launcher_context, initial_page_viewport, page_palette,
-    release_launcher_textures, ActivationLatencySnapshot, ActivationLatencyTracker, NativeLauncher,
-    NativeLauncherConfig, NativeLauncherEvent, NativeLauncherHandle, NativeUiFrame, RendererError,
-    ACTIVATION_SAMPLE_CAPACITY,
+    build_launcher_frame, create_launcher_context, initial_page_viewport, release_launcher_textures,
+    set_launcher_appearance, set_launcher_navigation, ActivationLatencySnapshot, ActivationLatencyTracker,
+    NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, NativeLauncherHandle, NativeUiFrame,
+    RendererError, ACTIVATION_SAMPLE_CAPACITY,
 };
 /// Re-exported so a caller can name [`NativeLauncherConfig::present_mode`]
 /// without taking its own `wgpu` dependency and risking a version skew with
@@ -266,6 +267,10 @@ pub enum SettingControl {
     /// reads it to decide its own behaviour, which is what keeps the switch
     /// and the thing it switches from disagreeing.
     Toggle { on: bool },
+    /// A schema-owned closed set displayed graphically within the owning edit workflow.
+    Choice {
+        options: &'static [(&'static str, &'static str)],
+    },
 }
 
 /// One complete engine-painted web surface frame.
@@ -913,6 +918,7 @@ pub struct LauncherViewModel {
     navigation_unavailable: Option<String>,
     navigation_notice_revision: u64,
     navigation_notice_token: Option<NavigationNoticeToken>,
+    interface_diagnostics: Arc<[Option<Arc<str>>; 2]>,
     page_reopen: Option<NavigationRoute>,
     reopening: bool,
     resume_delay: std::time::Duration,
@@ -988,6 +994,7 @@ impl LauncherViewModel {
             navigation_unavailable: None,
             navigation_notice_revision: 0,
             navigation_notice_token: None,
+            interface_diagnostics: Arc::new([None, None]),
             page_reopen: None,
             reopening: false,
             resume_delay: std::time::Duration::ZERO,
@@ -1203,16 +1210,12 @@ impl LauncherViewModel {
         });
         rows.dedup_by(|left, right| left.target == right.target);
         self.command_management = rows.into();
-        if self.standard.is_some() {
-            self.dirty |= self.visible;
-            return;
-        }
+        let replacement = self
+            .action_panel
+            .as_ref()
+            .and_then(|panel| self.rows.iter().find(|row| panel.tree().target().matches(row)))
+            .and_then(|row| self.action_tree_for_row(row).ok());
         if let Some(panel) = &mut self.action_panel {
-            let replacement = self
-                .rows
-                .iter()
-                .find(|row| panel.tree().target().matches(row))
-                .and_then(|row| action_tree(row, &self.command_management).ok());
             let _ = Arc::make_mut(panel).reconcile(replacement);
         }
         self.dirty |= self.visible;
@@ -1453,6 +1456,7 @@ impl LauncherViewModel {
     fn navigation_presentation(&self) -> NavigationPresentation {
         NavigationPresentation {
             settings_management: self.settings_management.clone(),
+            interface_diagnostics: self.interface_diagnostics.clone(),
             standard: self.standard.clone(),
             standard_refresh_pending: self.standard_refresh_pending,
             scopes: self.scope_choices.clone(),
@@ -1474,6 +1478,7 @@ impl LauncherViewModel {
             can_go_back: !self.navigation_stack.is_empty(),
             scroll: self.navigation_scroll.clone(),
             restoration: self.navigation_restore,
+            focus_lifetime: Some(self.view_id),
             preserve_scroll: self.preserve_scroll,
             unavailable: self.navigation_unavailable.clone(),
             recall: self.recall.clone(),
@@ -1505,6 +1510,31 @@ impl LauncherViewModel {
             .into();
         self.recall_selected = 0;
         self.dirty = true;
+    }
+
+    /// Updates one nonfatal applied-interface warning without changing route authority.
+    pub fn set_interface_diagnostic(&mut self, source: InterfaceDiagnosticSource, message: Option<String>) {
+        let index = match source {
+            InterfaceDiagnosticSource::Preferences => 0,
+            InterfaceDiagnosticSource::Shortcuts => 1,
+        };
+        let message = message.map(|mut message| {
+            let mut end = message.len().min(action_panel::MAX_ACTION_TEXT_BYTES);
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message
+        });
+        if self.interface_diagnostics[index].as_deref() == message.as_deref() {
+            return;
+        }
+        Arc::make_mut(&mut self.interface_diagnostics)[index] = message.map(Arc::from);
+        self.dirty |= self.visible;
+    }
+
+    pub fn interface_diagnostics(&self) -> &[Option<Arc<str>>; 2] {
+        &self.interface_diagnostics
     }
 
     pub fn set_navigation_notice(&mut self, message: String) {
@@ -2957,6 +2987,25 @@ impl LauncherViewModel {
         true
     }
 
+    fn action_tree_for_row(
+        &self,
+        row: &ResultRow,
+    ) -> Result<Arc<ActionTree>, action_panel::ActionPanelRefusal> {
+        let Some(surface) = &self.standard else {
+            return action_tree(row, &self.command_management);
+        };
+        let tree = standard_view::action_tree(surface, row)?;
+        if matches!(
+            surface.descriptor.view,
+            crikey_core::structured_view::StandardView::List(_)
+                | crikey_core::structured_view::StandardView::Grid(_)
+        ) {
+            Ok(ActionTree::with_management(tree, row, &self.command_management))
+        } else {
+            Ok(tree)
+        }
+    }
+
     fn open_actions(&mut self) {
         if self.action_panel.is_some() {
             return;
@@ -2964,10 +3013,7 @@ impl LauncherViewModel {
         let Some(row) = self.current_action_row() else {
             return;
         };
-        match self.standard.as_ref().map_or_else(
-            || action_tree(row, &self.command_management),
-            |surface| standard_view::action_tree(surface, row),
-        ) {
+        match self.action_tree_for_row(row) {
             Ok(tree) => {
                 self.action_panel = Some(Arc::new(ActionPanel::new(tree)));
                 if !self.within_navigation_budget() {
@@ -3038,14 +3084,7 @@ impl LauncherViewModel {
             }
             return self.activate_panel();
         }
-        let tree = self
-            .standard
-            .as_ref()
-            .map_or_else(
-                || action_tree(row, &self.command_management),
-                |surface| standard_view::action_tree(surface, row),
-            )
-            .ok()?;
+        let tree = self.action_tree_for_row(row).ok()?;
         let execution = tree.execution(identity, row).ok().flatten()?;
         self.execute_action(execution)
     }
@@ -3227,3 +3266,10 @@ fn action_tree(
 /// Opaque authority to retire one host notice, never a newer unrelated notice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NavigationNoticeToken(u64);
+
+/// Independent nonfatal diagnostic sources; neither invalidates an admitted route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterfaceDiagnosticSource {
+    Preferences,
+    Shortcuts,
+}

@@ -74,49 +74,27 @@ fn image_texture(context: &egui::Context, content: &Arc<crikey_core::PreviewCont
     id
 }
 
-pub(super) fn keyboard(context: &egui::Context, model: &ViewModel, commands: &mut Vec<UiCommand>) {
-    if model.action_panel.is_some()
-        || model.page.is_some()
-        || model.settings_open
-        || model.preview.status.is_none()
-    {
-        return;
-    }
-    if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F6)) {
-        commands.push(if model.preview.focused {
-            UiCommand::LeavePreview
-        } else {
-            UiCommand::FocusPreview
-        });
-    }
-    if model.preview.focused
-        && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
-    {
-        commands.push(UiCommand::LeavePreview);
-    }
-}
-
 pub(super) fn draw_results_and_preview(
     ui: &mut egui::Ui,
     model: &ViewModel,
     commands: &mut Vec<UiCommand>,
-    colors: theme::Palette,
+    colors: &theme::Palette,
 ) {
     if model.preview.status.is_none() {
         release_texture(ui.ctx());
         draw_results(ui, model, commands, colors, None);
         return;
     }
-    let narrow = ui.available_width() < 600.0;
+    let narrow = ui.available_width() < colors.metrics.scaled(600.0);
     if narrow {
         if model.preview.detail || model.preview.focused {
-            if ui.button("Back to results  Esc").clicked() {
+            if ui.button("Back to results").clicked() {
                 commands.push(UiCommand::LeavePreview);
             }
             draw_preview(ui, model, commands, colors, true);
         } else {
             release_texture(ui.ctx());
-            if ui.button("Show detail  F6").clicked() {
+            if ui.button("Show detail").clicked() {
                 commands.push(UiCommand::ShowPreviewDetail);
             }
             draw_results(ui, model, commands, colors, None);
@@ -125,18 +103,26 @@ pub(super) fn draw_results_and_preview(
     }
     let available = ui.available_rect_before_wrap();
     let overlay = if model.action_panel.is_some() {
-        BLOCK_GAP + actions_overlay_height()
+        (colors.metrics.item_spacing_y + colors.metrics.space_3)
+            + colors.metrics.scaled(actions_overlay_height())
     } else {
         0.0
     };
-    let height = (available.height() - BLOCK_GAP - STATUS_BLOCK_HEIGHT - overlay).max(0.0);
+    let height = (available.height()
+        - (colors.metrics.item_spacing_y + colors.metrics.space_3)
+        - colors.metrics.footer_height
+        - overlay)
+        .max(0.0);
     let width = available.width();
     let id = ui.id().with("preview-divider");
     let ratio = ui
         .data(|data| data.get_temp::<f32>(id))
         .unwrap_or(model.preview.ratio);
-    let left = (width - 10.0) * ratio;
-    let divider = egui::Rect::from_min_size(available.min + vec2(left, 0.0), vec2(10.0, height));
+    let left = (width - colors.metrics.scaled(10.0)) * ratio;
+    let divider = egui::Rect::from_min_size(
+        available.min + vec2(left, 0.0),
+        vec2(colors.metrics.scaled(10.0), height),
+    );
     let response = ui.interact(divider, id, egui::Sense::drag());
     ui.painter().line_segment(
         [divider.center_top(), divider.center_bottom()],
@@ -147,7 +133,7 @@ pub(super) fn draw_results_and_preview(
             ui.data_mut(|data| {
                 data.insert_temp(
                     id,
-                    ((pointer.x - available.min.x) / (width - 10.0)).clamp(0.3, 0.7),
+                    ((pointer.x - available.min.x) / (width - colors.metrics.scaled(10.0))).clamp(0.3, 0.7),
                 )
             });
             ui.ctx().request_repaint();
@@ -173,7 +159,7 @@ fn draw_preview(
     ui: &mut egui::Ui,
     model: &ViewModel,
     commands: &mut Vec<UiCommand>,
-    colors: theme::Palette,
+    colors: &theme::Palette,
     reserve_footer: bool,
 ) {
     let Some(status) = &model.preview.status else {
@@ -184,12 +170,9 @@ fn draw_preview(
     }
     ui.push_id("typed-preview", |ui| {
         ui.horizontal(|ui| {
+            draw_navigation_hint(ui, model, crate::navigation::NavigationAction::TogglePreview);
             ui.strong("Detail");
-            let response = ui.button(if model.preview.focused {
-                "Search  F6"
-            } else {
-                "Focus  F6"
-            });
+            let response = ui.button(if model.preview.focused { "Search" } else { "Focus" });
             let focus_id = ui.id().with("preview-had-focus");
             let was_focused = ui.data(|data| data.get_temp::<bool>(focus_id)).unwrap_or(false);
             if model.preview.focused && !was_focused {
@@ -206,7 +189,7 @@ fn draw_preview(
         });
         let height = (ui.available_height()
             - if reserve_footer {
-                BLOCK_GAP + STATUS_BLOCK_HEIGHT
+                (colors.metrics.item_spacing_y + colors.metrics.space_3) + colors.metrics.footer_height
             } else {
                 0.0
             })
@@ -216,8 +199,8 @@ fn draw_preview(
         if model.preview.focused {
             ui.input_mut(|input| {
                 for (key, distance) in [
-                    (egui::Key::ArrowDown, 40.0),
-                    (egui::Key::ArrowUp, -40.0),
+                    (egui::Key::ArrowDown, colors.metrics.scaled(40.0)),
+                    (egui::Key::ArrowUp, -colors.metrics.scaled(40.0)),
                     (egui::Key::PageDown, height * 0.8),
                     (egui::Key::PageUp, -height * 0.8),
                 ] {
@@ -256,6 +239,7 @@ fn draw_preview(
                             prepared,
                             model.preview.link_target.as_ref().map(LinkTarget::Preview),
                             commands,
+                            &colors.metrics,
                         );
                     }
                 }
@@ -276,6 +260,7 @@ pub(super) fn draw_standard_detail(
     detail: &crikey_core::structured_view::DetailView,
     commands: &mut Vec<UiCommand>,
     height: f32,
+    metrics: &theme::Metrics,
 ) {
     let prepared = crate::PreparedPreview {
         content: detail.content().clone(),
@@ -286,7 +271,13 @@ pub(super) fn draw_standard_detail(
         .max_height(height)
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            draw_prepared(ui, &prepared, Some(LinkTarget::Standard(surface)), commands);
+            draw_prepared(
+                ui,
+                &prepared,
+                Some(LinkTarget::Standard(surface)),
+                commands,
+                metrics,
+            );
         });
 }
 
@@ -295,13 +286,14 @@ fn draw_prepared(
     prepared: &crate::PreparedPreview,
     target: Option<LinkTarget<'_>>,
     commands: &mut Vec<UiCommand>,
+    metrics: &theme::Metrics,
 ) {
     let content = &prepared.content;
     if let Some(crikey_core::PreviewText::Plain(text)) = &content.text {
         ui.add(egui::Label::new(text).wrap());
     }
     for block in prepared.blocks.iter() {
-        draw_markdown_block(ui, block, target, commands);
+        draw_markdown_block(ui, block, target, commands, metrics);
     }
     if let Some(image) = &content.image {
         let texture = image_texture(ui.ctx(), content);
@@ -324,6 +316,7 @@ fn draw_markdown_block(
     block: &crate::PreviewBlock,
     target: Option<LinkTarget<'_>>,
     commands: &mut Vec<UiCommand>,
+    metrics: &theme::Metrics,
 ) {
     use crate::PreviewBlockKind;
     if block.kind == PreviewBlockKind::Rule {
@@ -338,7 +331,9 @@ fn draw_markdown_block(
         for span in &block.spans {
             let mut text = RichText::new(&span.text);
             if let PreviewBlockKind::Heading(level) = block.kind {
-                text = text.size((25.0 - f32::from(level) * 2.0).max(15.0)).strong();
+                text = text
+                    .size(metrics.scaled((25.0 - f32::from(level) * 2.0).max(15.0)))
+                    .strong();
             }
             if span.strong {
                 text = text.strong();
@@ -356,7 +351,7 @@ fn draw_markdown_block(
             }
         }
     });
-    ui.add_space(4.0);
+    ui.add_space(metrics.space_1);
 }
 
 fn preview_link(

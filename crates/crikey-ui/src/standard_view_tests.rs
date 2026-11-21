@@ -779,6 +779,7 @@ fn standard_action_search_and_arrows_precede_same_frame_enter() {
             _ => vec![press(egui::Key::Enter), egui::Event::Text("Beta".into())],
         };
         let frame = build_launcher_frame(&renderer, input_events(events), &view);
+        let observed_commands = format!("{:?}", frame.commands);
         let effects: Vec<_> = frame
             .commands
             .into_iter()
@@ -793,7 +794,8 @@ fn standard_action_search_and_arrows_precede_same_frame_enter() {
                     target: target(0),
                     action: Some(ActionId(if case == 2 { "alpha" } else { "beta" }.into())),
                 },
-            }]
+            }],
+            "ordered case {case}; commands: {observed_commands}"
         );
     }
 }
@@ -1522,4 +1524,527 @@ fn retired_explicit_scope_stays_unavailable_after_otherwise_valid_reply() {
     assert!(model.apply(UiCommand::ExecuteDefault).is_none());
     model.apply(UiCommand::OpenSettings);
     assert!(model.is_settings_open());
+}
+#[test]
+fn actual_collection_renderer_preserves_type_to_search_caret_and_ordered_spatial_return() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let mut reply_context = open(&mut model, "focus-grid", descriptor(6));
+    let mut view = model.frame().unwrap();
+    let lifetime = view.navigation.focus_lifetime;
+    let context = crate::create_launcher_context();
+    let mut time = 0.0;
+    let mut draw = |view: &crate::ViewModel, events| {
+        time += 0.05;
+        crate::build_launcher_frame(
+            &context,
+            egui::RawInput {
+                focused: true,
+                time: Some(time),
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(720.0, 520.0),
+                )),
+                ..Default::default()
+            },
+            view,
+        )
+    };
+    let key = |key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    draw(&view, vec![]);
+    draw(&view, vec![]);
+    let spatial = draw(&view, vec![key(egui::Key::ArrowRight), key(egui::Key::ArrowDown)]);
+    assert_eq!(
+        spatial
+            .commands
+            .iter()
+            .filter(|command| matches!(command, UiCommand::StandardHorizontal(_) | UiCommand::SelectNext))
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![UiCommand::StandardHorizontal(true), UiCommand::SelectNext]
+    );
+    let typed = draw(&view, vec![egui::Event::Text("ab".into())]);
+    assert!(typed.commands.contains(&UiCommand::SetQuery("ab".into())));
+    for command in typed.commands {
+        model.apply(command);
+    }
+    let pending = model.frame().unwrap();
+    assert!(pending.navigation.standard_refresh_pending);
+    assert!(
+        pending.navigation.standard.is_some(),
+        "the real refresh retains the admitted surface"
+    );
+    let request = model.standard_refresh_request(ViewRefreshReason::Query).unwrap();
+    assert_eq!(request.mode, ViewRequestMode::Refresh);
+    assert_eq!(request.query, "ab");
+    assert_eq!(request.session, reply_context.session);
+    draw(&pending, vec![]);
+    reply_context.revision = NonZeroU64::new(12).unwrap();
+    assert!(model.publish_standard_view(
+        owner(),
+        7,
+        ViewReply {
+            context: reply_context.clone(),
+            descriptor: descriptor(6),
+        }
+    ));
+    view = model.frame().unwrap();
+    assert_eq!(view.navigation.focus_lifetime, lifetime);
+    assert_ne!(view.navigation.restoration, pending.navigation.restoration);
+    let caret = draw(&view, vec![key(egui::Key::ArrowLeft)]);
+    assert!(!caret
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::StandardHorizontal(_))));
+    let typed = draw(&view, vec![egui::Event::Text("Z".into())]);
+    assert!(typed.commands.contains(&UiCommand::SetQuery("aZb".into())));
+    for command in typed.commands {
+        model.apply(command);
+    }
+    view = model.frame().unwrap();
+    let returned = draw(&view, vec![key(egui::Key::ArrowDown), key(egui::Key::ArrowRight)]);
+    assert_eq!(
+        returned
+            .commands
+            .iter()
+            .filter(|command| matches!(command, UiCommand::StandardHorizontal(_) | UiCommand::SelectNext))
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![UiCommand::SelectNext, UiCommand::StandardHorizontal(true)]
+    );
+    let typed = draw(&view, vec![egui::Event::Text("!".into())]);
+    for command in typed.commands {
+        model.apply(command);
+    }
+    model.apply(UiCommand::OpenSettings);
+    model.apply(UiCommand::CloseSettings);
+    let Some(NavigationRoute::Standard {
+        owner: plugin,
+        producer,
+        route,
+        ..
+    }) = model.take_page_reopen()
+    else {
+        panic!("the covered collection has a real history reopen request");
+    };
+    let request = model
+        .open_standard_route(plugin, producer, StructuredRouteOutcome::Replace(route))
+        .unwrap();
+    let restored_context = ViewExecutionContext {
+        route: request.route,
+        session: request.session,
+        revision: NonZeroU64::new(11).unwrap(),
+    };
+    assert!(model.publish_standard_view(
+        owner(),
+        7,
+        ViewReply {
+            context: restored_context.clone(),
+            descriptor: descriptor(6),
+        }
+    ));
+    assert_eq!(
+        restored_context.session.logical_view,
+        reply_context.session.logical_view
+    );
+    let restored = model.frame().unwrap();
+    assert_ne!(restored.navigation.focus_lifetime, lifetime);
+    draw(&restored, vec![]);
+    let restored = draw(&restored, vec![key(egui::Key::ArrowRight)]);
+    assert!(restored.commands.contains(&UiCommand::StandardHorizontal(true)));
+}
+#[test]
+fn collection_action_command_editor_enter_never_executes_the_selected_action() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    open(&mut model, "managed-grid", descriptor(6));
+    let mut command = model.frame().unwrap().rows[0].clone();
+    let reference = crikey_core::CommandRef {
+        provider_id: owner(),
+        command_id: "managed-command".into(),
+    };
+    command.target = crate::ActionTarget::Command(reference.clone());
+    command.label = "Managed command".into();
+    command.command_state = Some(crate::CommandRowState {
+        registry_revision: 4,
+        preference_revision: 7,
+        available: true,
+        unavailable_reason: None,
+        favorite: None,
+        favorite_count: 0,
+        hidden: false,
+        fallback: None,
+        fallback_count: 0,
+        aliases: vec!["saved alias".into()],
+        hotkey: None,
+        argument_policy: ArgumentPolicy::Forbidden,
+        argument: None,
+        ranking_reset_available: true,
+    });
+    model.set_command_management_rows(vec![command]);
+    model.apply(UiCommand::ShowActions);
+    let view = model.frame().unwrap();
+    assert!(view.action_panel.is_some() && view.navigation.standard.is_some());
+    let context = crate::create_launcher_context();
+    let mut time = 0.0;
+    let mut draw = |events| {
+        time += 0.2;
+        crate::build_launcher_frame(
+            &context,
+            egui::RawInput {
+                focused: true,
+                time: Some(time),
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(720.0, 720.0),
+                )),
+                ..Default::default()
+            },
+            &view,
+        )
+    };
+    fn position(frame: &crate::NativeUiFrame, needle: &str) -> Option<egui::Pos2> {
+        fn text(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text().contains(needle) => {
+                    Some(text.pos + egui::vec2(3.0, 3.0))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| text(shape, needle)),
+                _ => None,
+            }
+        }
+        frame.output.shapes.iter().find_map(|shape| {
+            text(&shape.shape, needle).filter(|position| shape.clip_rect.contains(*position))
+        })
+    }
+    let click = |pos| {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+    let mut frame = draw(vec![]);
+    let heading = position(&frame, "Managed command").expect("real action-sheet command group");
+    frame = draw(click(heading));
+    let pointer = position(&frame, "Search actions").expect("real action filter") + egui::vec2(30.0, 64.0);
+    let mut alias = position(&frame, "saved alias");
+    for _ in 0..32 {
+        if alias.is_some() {
+            break;
+        }
+        frame = draw(vec![
+            egui::Event::PointerMoved(pointer),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        alias = position(&frame, "saved alias");
+    }
+    draw(click(alias.expect(
+        "real alias editor is reachable by action-sheet scrolling",
+    )));
+    let key = crate::command_edit_key(&reference, false);
+    let editor = egui::Id::new(("crikey-setting-draft", key.as_str())).with("editor");
+    assert_eq!(context.memory(|memory| memory.focused()), Some(editor));
+    let press = |key, modifiers| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    };
+    draw(vec![
+        press(egui::Key::A, egui::Modifiers::COMMAND),
+        egui::Event::Text("edited-alias".into()),
+    ]);
+    let submitted = draw(vec![press(egui::Key::Enter, egui::Modifiers::NONE)]);
+    assert!(submitted.commands.iter().any(|command| matches!(command, UiCommand::EditCommandShortcut { edit: crate::CommandPreferenceEdit::SetAlias(Some(alias)), .. } if alias == "edited-alias")));
+    assert!(!submitted.commands.iter().any(|command| matches!(
+        command,
+        UiCommand::ActivateSelectedAction
+            | UiCommand::ActivateAction { .. }
+            | UiCommand::ActivateActionless { .. }
+            | UiCommand::StandardActivate { .. }
+            | UiCommand::ExecuteDefault
+            | UiCommand::InvokeCommand { .. }
+    )));
+}
+
+#[test]
+fn actual_standard_controls_use_applied_hints_and_long_action_labels_ellipsis() {
+    use crate::appearance::{
+        AppearanceCache, AppearancePreferences, InterfaceSize, ResultDensity, SystemTheme, ThemePreference,
+    };
+    use crate::navigation::{CompiledNavigation, NavigationStyle};
+    let mut definition = (*descriptor(1)).clone();
+    let label = "A deliberately very long guest action label which must remain readable through an ellipsis rather than running beyond the launcher window";
+    let entry = &mut Arc::make_mut(&mut definition.definitions)[0];
+    entry.item.actions = vec![crikey_core::Action {
+        action_id: crikey_core::ActionId("long-action".into()),
+        label: label.into(),
+        description: String::new(),
+        applicable_categories: vec![],
+        icon_reference: None,
+        execution_policy: ExecutionPolicy::Plugin,
+    }];
+    let ActionMenuEntry::Action(binding) = &mut entry.action_sections[0].entries[0] else {
+        unreachable!()
+    };
+    binding.action = Some(crikey_core::ActionId("long-action".into()));
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    open(&mut model, "long-actions", Arc::new(definition));
+    let context = create_launcher_context();
+    let appearance = AppearanceCache::new(
+        AppearancePreferences {
+            theme: ThemePreference::Light,
+            interface_size: InterfaceSize::Large,
+            result_density: ResultDensity::Comfortable,
+            ..Default::default()
+        },
+        SystemTheme::Unknown,
+    )
+    .unwrap();
+    set_launcher_appearance(&context, appearance.resolved());
+    let navigation = CompiledNavigation::compile(
+        NavigationStyle::Default,
+        r#"{"show-actions":["Alt+Q"],"activate":["F8"]}"#,
+    )
+    .unwrap();
+    set_launcher_navigation(&context, Arc::new(navigation.clone()));
+    let draw = |view: &ViewModel, events| {
+        build_launcher_frame(
+            &context,
+            egui::RawInput {
+                focused: true,
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(480.0, 720.0),
+                )),
+                ..Default::default()
+            },
+            view,
+        )
+    };
+    let view = model.frame().unwrap();
+    draw(&view, vec![]);
+    let controls = draw(&view, vec![]);
+    let hints = controls
+        .output
+        .shapes
+        .iter()
+        .filter(|shape| {
+            matches!(&shape.shape,
+        egui::Shape::Text(text) if text.galley.text() == "Alt+Q")
+        })
+        .count();
+    assert!(
+        hints >= 2,
+        "both the actual standard Actions button and footer use the applied chord"
+    );
+    model.apply(UiCommand::ShowActions);
+    let view = model.frame().unwrap();
+    draw(&view, vec![]);
+    let opened = draw(&view, vec![]);
+    let action = opened
+        .output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == label => Some((shape, text)),
+            _ => None,
+        })
+        .expect("the real guest action is rendered");
+    assert!(
+        action.1.galley.elided,
+        "long action labels use actual ellipsis layout"
+    );
+    let text_bounds = egui::Rect::from_min_size(action.1.pos, action.1.galley.size());
+    assert!(action.0.clip_rect.contains_rect(text_bounds));
+    assert!(text_bounds.right() < 480.0);
+    assert!(opened.output.shapes.iter().any(|shape| matches!(&shape.shape,
+        egui::Shape::Text(text) if text.galley.text() == "F8")));
+    let filtered = navigation.without_chords(&[
+        crikey_platform::Accelerator::parse("Alt+Q").unwrap(),
+        crikey_platform::Accelerator::parse("F8").unwrap(),
+    ]);
+    set_launcher_navigation(&context, Arc::new(filtered));
+    let unavailable = draw(&view, vec![press(egui::Key::Enter)]);
+    assert!(!unavailable
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::ActivateSelectedAction)));
+    for shape in &unavailable.output.shapes {
+        if let egui::Shape::Text(text) = &shape.shape {
+            assert!(!matches!(
+                text.galley.text(),
+                "Alt+Q" | "F8" | "Enter" | "Ctrl+K" | "Meta+K"
+            ));
+        }
+    }
+}
+
+#[test]
+fn nonfatal_applied_diagnostics_keep_live_collection_input_and_never_clear_route_failure() {
+    use crate::navigation::{CompiledNavigation, NavigationAction};
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    open(&mut model, "warning-grid", descriptor(6));
+    model.set_interface_diagnostic(
+        InterfaceDiagnosticSource::Preferences,
+        Some("Invalid desired preference; last-good appearance retained".into()),
+    );
+    model.set_interface_diagnostic(
+        InterfaceDiagnosticSource::Shortcuts,
+        Some("One shortcut unavailable: actually-held OS grab".into()),
+    );
+    let navigation = CompiledNavigation::default();
+    let held = navigation
+        .bindings()
+        .iter()
+        .find(|binding| binding.action == NavigationAction::ShowActions)
+        .unwrap()
+        .chord;
+    let context = create_launcher_context();
+    set_launcher_navigation(&context, Arc::new(navigation.without_chords(&[held])));
+    let mut time = 0.0;
+    let mut draw = |view: &ViewModel, events| {
+        time += 0.05;
+        build_launcher_frame(
+            &context,
+            egui::RawInput {
+                focused: true,
+                events,
+                time: Some(time),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(720.0, 640.0),
+                )),
+                ..Default::default()
+            },
+            view,
+        )
+    };
+    let key = |key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let view = model.frame().unwrap();
+    assert!(view.navigation.can_go_back);
+    assert!(view.navigation.unavailable.is_none());
+    assert_eq!(view.navigation.interface_diagnostics.iter().flatten().count(), 2);
+    draw(&view, vec![]);
+    draw(&view, vec![]);
+    let typed = draw(&view, vec![egui::Event::Text("jk".into())]);
+    assert!(typed.commands.contains(&UiCommand::SetQuery("jk".into())));
+    for command in typed.commands {
+        model.apply(command);
+    }
+    let view = model.frame().unwrap();
+    let edited = draw(
+        &view,
+        vec![key(egui::Key::ArrowLeft), egui::Event::Text("x".into())],
+    );
+    assert!(edited.commands.contains(&UiCommand::SetQuery("jxk".into())));
+    for command in edited.commands {
+        model.apply(command);
+    }
+    let view = model.frame().unwrap();
+    let navigated = draw(&view, vec![key(egui::Key::ArrowDown), key(egui::Key::ArrowRight)]);
+    assert!(navigated.commands.contains(&UiCommand::SelectNext));
+    assert!(navigated.commands.contains(&UiCommand::StandardHorizontal(true)));
+    let modifiers = held.modifiers();
+    let filtered = draw(
+        &view,
+        vec![egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: modifiers.ctrl,
+                alt: modifiers.alt,
+                shift: modifiers.shift,
+                mac_cmd: modifiers.meta,
+                command: modifiers.ctrl || modifiers.meta,
+            },
+        }],
+    );
+    assert!(!filtered.commands.contains(&UiCommand::ShowActions));
+    model.apply(UiCommand::OpenSettings);
+    model.set_interface_diagnostic(
+        InterfaceDiagnosticSource::Shortcuts,
+        Some("A newer actual OS grab warning".into()),
+    );
+    model.set_interface_diagnostic(InterfaceDiagnosticSource::Preferences, None);
+    model.apply(UiCommand::CloseSettings);
+    assert!(model.interface_diagnostics()[0].is_none());
+    assert_eq!(
+        model.interface_diagnostics()[1].as_deref(),
+        Some("A newer actual OS grab warning")
+    );
+    let Some(NavigationRoute::Standard {
+        owner: plugin,
+        producer,
+        route,
+        ..
+    }) = model.take_page_reopen()
+    else {
+        panic!("restored collection");
+    };
+    let request = model
+        .open_standard_route(plugin, producer, StructuredRouteOutcome::Replace(route))
+        .unwrap();
+    assert!(model.publish_standard_view(
+        owner(),
+        7,
+        ViewReply {
+            context: ViewExecutionContext {
+                route: request.route,
+                session: request.session,
+                revision: NonZeroU64::new(11).unwrap()
+            },
+            descriptor: descriptor(6),
+        }
+    ));
+    model.standard_unavailable();
+    model.set_interface_diagnostic(InterfaceDiagnosticSource::Shortcuts, None);
+    let unavailable = model.frame().unwrap();
+    assert!(unavailable.navigation.can_go_back);
+    assert!(unavailable.navigation.unavailable.is_some());
+    assert!(unavailable
+        .navigation
+        .interface_diagnostics
+        .iter()
+        .all(Option::is_none));
+    let refused = draw(&unavailable, vec![egui::Event::Text("must-not-edit".into())]);
+    assert!(!refused
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetQuery(_))));
 }

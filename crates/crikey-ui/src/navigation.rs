@@ -77,9 +77,15 @@ pub struct NavigationPresentation {
     pub can_go_back: bool,
     pub scroll: LogicalScroll,
     pub restoration: u64,
+    /// Existing logical view lifetime; unlike scroll restoration, routine
+    /// publications do not retire query/editor focus ownership.
+    pub focus_lifetime: Option<crate::ViewId>,
     /// Publication must not pull an offscreen selection back over a restored anchor.
     pub preserve_scroll: bool,
     pub unavailable: Option<String>,
+    /// Independent preference and shortcut diagnostics; neither invalidates
+    /// the current route or disables its query/editor input.
+    pub interface_diagnostics: Arc<[Option<Arc<str>>; 2]>,
     /// Transient picker snapshot from the application's sole history store.
     pub recall: Arc<[String]>,
     pub recall_selected: usize,
@@ -381,4 +387,457 @@ pub(crate) fn transient_pixels(
         }
     }
     pixels
+}
+
+/// Maximum UTF-8 size of the atomic navigation override object.
+pub const MAX_NAVIGATION_BINDINGS_BYTES: usize = 8192;
+pub const MAX_BINDINGS_PER_ACTION: usize = 4;
+pub const MAX_NAVIGATION_CHORD_BYTES: usize = 64;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NavigationStyle {
+    #[default]
+    Default,
+    Emacs,
+    Vim,
+}
+
+impl NavigationStyle {
+    pub fn parse(value: &str) -> Result<Self, NavigationError> {
+        match value {
+            "default" => Ok(Self::Default),
+            "emacs" => Ok(Self::Emacs),
+            "vim" => Ok(Self::Vim),
+            _ => Err(NavigationError::InvalidStyle),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavigationAction {
+    Next,
+    Previous,
+    PageDown,
+    PageUp,
+    Complete,
+    Activate,
+    Cancel,
+    ShowActions,
+    TogglePreview,
+    Left,
+    Right,
+}
+
+impl NavigationAction {
+    pub const ALL: [Self; 11] = [
+        Self::Next,
+        Self::Previous,
+        Self::PageDown,
+        Self::PageUp,
+        Self::Complete,
+        Self::Activate,
+        Self::Cancel,
+        Self::ShowActions,
+        Self::TogglePreview,
+        Self::Left,
+        Self::Right,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Next => "next",
+            Self::Previous => "previous",
+            Self::PageDown => "page-down",
+            Self::PageUp => "page-up",
+            Self::Complete => "complete",
+            Self::Activate => "activate",
+            Self::Cancel => "cancel",
+            Self::ShowActions => "show-actions",
+            Self::TogglePreview => "toggle-preview",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    fn admits(self, scope: NavigationScope) -> bool {
+        use NavigationScope as S;
+        match self {
+            Self::Cancel => true,
+            Self::Next | Self::Previous | Self::PageDown | Self::PageUp | Self::Activate => {
+                matches!(scope, S::Results | S::Actions | S::Recall | S::Standard)
+            }
+            Self::Complete => scope == S::Results,
+            Self::ShowActions => matches!(scope, S::Results | S::Actions | S::Recall | S::Standard),
+            Self::TogglePreview => matches!(scope, S::Results | S::Standard | S::Preview),
+            Self::Left | Self::Right => scope == S::Standard,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavigationScope {
+    Results,
+    Actions,
+    Recall,
+    Standard,
+    Preview,
+    Settings,
+    Page,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavigationOwner {
+    Host,
+    /// Launcher query, action filter or query recall; not an arbitrary editor.
+    Query,
+    Editor,
+    Password,
+    Popup,
+    Document,
+    Web,
+    ShortcutCapture,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NavigationContext {
+    pub scope: NavigationScope,
+    pub owner: NavigationOwner,
+    pub composing: bool,
+}
+
+impl NavigationContext {
+    fn admits(self) -> bool {
+        !self.composing && matches!(self.owner, NavigationOwner::Host | NavigationOwner::Query)
+    }
+
+    fn admits_chord(self, action: NavigationAction, chord: crikey_platform::Accelerator) -> bool {
+        self.admits() && (self.owner != NavigationOwner::Query || !query_editing_chord(action, chord))
+    }
+}
+
+/// Query TextEdit retains caret/selection, clipboard and deletion ownership.
+/// Existing host discovery (Ctrl+K for ShowActions) and explicit Emacs N/P
+/// navigation remain reserved; other editor chords cannot be reassigned away.
+fn query_editing_chord(action: NavigationAction, chord: crikey_platform::Accelerator) -> bool {
+    if matches!(
+        chord.key(),
+        "Left" | "Right" | "Home" | "End" | "Backspace" | "Delete" | "Insert"
+    ) {
+        return true;
+    }
+    let modifiers = chord.modifiers();
+    let command = if cfg!(target_os = "macos") {
+        modifiers.meta
+    } else {
+        modifiers.ctrl
+    };
+    if command && matches!(chord.key(), "A" | "C" | "V" | "X" | "Z" | "Y") {
+        return true;
+    }
+    if modifiers.ctrl {
+        if matches!(chord.key(), "H" | "U" | "W")
+            || (chord.key() == "K" && action != NavigationAction::ShowActions)
+        {
+            return true;
+        }
+        if cfg!(target_os = "macos") && matches!(chord.key(), "A" | "B" | "E" | "F") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Origin stays explicit: a failed OS replacement can leave an applied chord
+/// held even though the desired preference has changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutSource {
+    DesiredActivation,
+    SavedCommand,
+    AppliedActivation,
+    AppliedCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NavigationConflict {
+    pub action: NavigationAction,
+    pub chord: crikey_platform::Accelerator,
+    pub source: ShortcutSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NavigationError {
+    #[error("navigation style must be default, emacs or vim")]
+    InvalidStyle,
+    #[error("navigation bindings exceed their byte, action or chord limit")]
+    Limit,
+    #[error("navigation bindings must be an object of known, unique actions and chord arrays")]
+    InvalidOverrides,
+    #[error("invalid navigation chord: use known modifiers and exactly one known key")]
+    InvalidChord,
+    #[error("navigation bindings cannot capture unmodified text")]
+    TextChord,
+    #[error("navigation actions {first:?} and {second:?} overlap on {chord}")]
+    Overlap {
+        first: NavigationAction,
+        second: NavigationAction,
+        chord: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavigationBinding {
+    pub action: NavigationAction,
+    pub chord: crikey_platform::Accelerator,
+    /// Cached canonical rendering for dynamic hints; never format per frame.
+    pub hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledNavigation {
+    bindings: Vec<NavigationBinding>,
+}
+
+struct NavigationOverrides(Vec<(NavigationAction, Vec<String>)>);
+
+impl<'de> serde::Deserialize<'de> for NavigationOverrides {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct OverridesVisitor;
+        impl<'de> serde::de::Visitor<'de> for OverridesVisitor {
+            type Value = NavigationOverrides;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object of unique known actions and bounded chord arrays")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                use serde::de::Error;
+                let mut entries = Vec::new();
+                while let Some((key, chords)) = map.next_entry::<String, Vec<String>>()? {
+                    let action = NavigationAction::ALL
+                        .into_iter()
+                        .find(|action| action.name() == key)
+                        .ok_or_else(|| M::Error::custom("unknown navigation action"))?;
+                    if entries.iter().any(|(existing, _)| *existing == action)
+                        || chords.len() > MAX_BINDINGS_PER_ACTION
+                        || chords
+                            .iter()
+                            .any(|chord| chord.len() > MAX_NAVIGATION_CHORD_BYTES)
+                    {
+                        return Err(M::Error::custom("duplicate action or navigation override limit"));
+                    }
+                    entries.push((action, chords));
+                }
+                Ok(NavigationOverrides(entries))
+            }
+        }
+        deserializer.deserialize_map(OverridesVisitor)
+    }
+}
+
+impl NavigationOverrides {
+    fn parse(json: &str) -> Result<Self, NavigationError> {
+        if json.len() > MAX_NAVIGATION_BINDINGS_BYTES {
+            return Err(NavigationError::Limit);
+        }
+        serde_json::from_str(if json.is_empty() { "{}" } else { json })
+            .map_err(|_| NavigationError::InvalidOverrides)
+    }
+}
+
+/// Profile-independent scalar validation. Cross-action overlap with retained
+/// profile defaults is checked only by `CompiledNavigation::compile`.
+pub fn validate_bindings_json(json: &str) -> Result<(), NavigationError> {
+    let overrides = NavigationOverrides::parse(json)?;
+    for (_, chords) in overrides.0 {
+        for chord in chords {
+            parse_navigation_chord(&chord)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_navigation_chord(text: &str) -> Result<crikey_platform::Accelerator, NavigationError> {
+    let chord = crikey_platform::Accelerator::parse(text).map_err(|_| NavigationError::InvalidChord)?;
+    let modifiers = chord.modifiers();
+    if !modifiers.ctrl
+        && !modifiers.alt
+        && !modifiers.meta
+        && (chord.key().len() == 1 || chord.key() == "Space")
+    {
+        return Err(NavigationError::TextChord);
+    }
+    Ok(chord)
+}
+
+impl CompiledNavigation {
+    /// Compile once on preference changes. Failure is atomic: callers retain
+    /// their last-good resolver (or explicitly compile the default on startup).
+    /// Each object entry replaces all chords for that action; [] disables it.
+    pub fn compile(style: NavigationStyle, overrides_json: &str) -> Result<Self, NavigationError> {
+        let overrides = NavigationOverrides::parse(overrides_json)?;
+        let mut compiled = Self { bindings: Vec::new() };
+        for (action, chord) in [
+            (NavigationAction::Next, "Down"),
+            (NavigationAction::Previous, "Up"),
+            (NavigationAction::PageDown, "PageDown"),
+            (NavigationAction::PageUp, "PageUp"),
+            (NavigationAction::Complete, "Tab"),
+            (NavigationAction::Activate, "Enter"),
+            (NavigationAction::Cancel, "Escape"),
+            (NavigationAction::ShowActions, "Alt+Enter"),
+            (
+                NavigationAction::ShowActions,
+                if cfg!(target_os = "macos") {
+                    "Meta+K"
+                } else {
+                    "Ctrl+K"
+                },
+            ),
+            (NavigationAction::TogglePreview, "F6"),
+            (NavigationAction::Left, "Left"),
+            (NavigationAction::Right, "Right"),
+        ] {
+            compiled.push(action, chord)?;
+        }
+        let additions: &[(NavigationAction, &str)] = match style {
+            NavigationStyle::Default => &[],
+            NavigationStyle::Emacs => &[
+                (NavigationAction::Next, "Ctrl+N"),
+                (NavigationAction::Previous, "Ctrl+P"),
+                (NavigationAction::PageDown, "Ctrl+Alt+N"),
+                (NavigationAction::PageUp, "Ctrl+Alt+P"),
+            ],
+            NavigationStyle::Vim => &[
+                (NavigationAction::Next, "Alt+J"),
+                (NavigationAction::Previous, "Alt+K"),
+                (NavigationAction::PageDown, "Alt+D"),
+                (NavigationAction::PageUp, "Alt+U"),
+            ],
+        };
+        for &(action, chord) in additions {
+            compiled.push(action, chord)?;
+        }
+        // Remove every replaced action first, permitting atomic swaps.
+        compiled
+            .bindings
+            .retain(|binding| !overrides.0.iter().any(|(action, _)| *action == binding.action));
+        for (action, chords) in overrides.0 {
+            for chord in chords {
+                compiled.push(action, &chord)?;
+            }
+        }
+        for (index, first) in compiled.bindings.iter().enumerate() {
+            for second in &compiled.bindings[index + 1..] {
+                if first.chord == second.chord
+                    && (first.action == second.action
+                        || [
+                            NavigationScope::Results,
+                            NavigationScope::Actions,
+                            NavigationScope::Recall,
+                            NavigationScope::Standard,
+                            NavigationScope::Preview,
+                            NavigationScope::Settings,
+                            NavigationScope::Page,
+                        ]
+                        .into_iter()
+                        .any(|scope| first.action.admits(scope) && second.action.admits(scope)))
+                {
+                    return Err(NavigationError::Overlap {
+                        first: first.action,
+                        second: second.action,
+                        chord: first.hint.clone(),
+                    });
+                }
+            }
+        }
+        Ok(compiled)
+    }
+
+    fn push(&mut self, action: NavigationAction, text: &str) -> Result<(), NavigationError> {
+        let chord = parse_navigation_chord(text)?;
+        self.bindings.push(NavigationBinding {
+            action,
+            chord,
+            hint: chord.canonical(),
+        });
+        Ok(())
+    }
+
+    pub fn bindings(&self) -> &[NavigationBinding] {
+        &self.bindings
+    }
+
+    /// Derives the runtime map from a retained desired map and actually-held
+    /// OS grabs, including cleanup failures after a partial replacement.
+    /// Removes every matching binding and hint without changing preferences or
+    /// registering shortcuts. Re-derive from the desired map when grabs change.
+    pub fn without_chords(&self, unavailable: &[crikey_platform::Accelerator]) -> Self {
+        Self {
+            bindings: self
+                .bindings
+                .iter()
+                .filter(|binding| !unavailable.contains(&binding.chord))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Exact canonical modifier matching: additional modifiers never silently
+    /// execute another command. Call in event order, after web/editor ownership.
+    /// Admit queued query text before executing Activate; do not pre-scan keys.
+    pub fn resolve(
+        &self,
+        chord: crikey_platform::Accelerator,
+        context: NavigationContext,
+    ) -> Option<NavigationAction> {
+        if !context.admits() {
+            return None;
+        }
+        self.bindings
+            .iter()
+            .find(|binding| {
+                binding.chord == chord
+                    && context.admits_chord(binding.action, chord)
+                    && binding.action.admits(context.scope)
+            })
+            .map(|binding| binding.action)
+    }
+
+    pub fn hints(&self, action: NavigationAction, context: NavigationContext) -> impl Iterator<Item = &str> {
+        self.bindings
+            .iter()
+            .filter(move |binding| {
+                context.admits_chord(binding.action, binding.chord)
+                    && binding.action == action
+                    && action.admits(context.scope)
+            })
+            .map(|binding| binding.hint.as_str())
+    }
+
+    /// Reuses the same parsed chords as runtime. The caller owns preference
+    /// revisions, command identities, OS receipts and registration policy.
+    pub fn conflict(
+        &self,
+        chord: crikey_platform::Accelerator,
+        source: ShortcutSource,
+    ) -> Option<NavigationConflict> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.chord == chord)
+            .map(|binding| NavigationConflict {
+                action: binding.action,
+                chord,
+                source,
+            })
+    }
+}
+
+#[cfg(test)]
+#[path = "navigation_binding_tests.rs"]
+mod binding_tests;
+
+impl Default for CompiledNavigation {
+    fn default() -> Self {
+        Self::compile(NavigationStyle::Default, "{}").expect("built-in navigation bindings are valid")
+    }
 }

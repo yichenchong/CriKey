@@ -5,62 +5,81 @@ use crate::action_panel::{ActionIdentity, ActionPanelInvalidation};
 pub(super) const HEIGHT: f32 = 244.0;
 
 pub(super) fn keyboard(context: &egui::Context, model: &ViewModel, commands: &mut Vec<UiCommand>) {
-    if model.settings_open || model.page.is_some() {
+    context.data_mut(|data| data.insert_temp(egui::Id::new("crikey-navigation-activate"), false));
+    if model.settings_open || model.page.is_some() || model.navigation.inline_arguments.is_some() {
         return;
     }
+    use crate::navigation::NavigationAction;
     let id = egui::Id::new("crikey-action-ime");
+    let activate_id = egui::Id::new("crikey-navigation-activate");
+    context.data_mut(|data| data.insert_temp(activate_id, false));
+    let navigation = context
+        .data(|data| data.get_temp::<Arc<crate::navigation::CompiledNavigation>>(navigation_id()))
+        .expect("launcher context owns its compiled navigation");
+    let focused = context
+        .data(|data| data.get_temp::<Option<egui::Id>>(input_focus_id()))
+        .unwrap_or_else(|| context.memory(|memory| memory.focused()));
+    let initial_owner = navigation_owner_for_focus(context, Some(model), focused);
+    // egui folds arrow/Enter focus traversal before widget paint. Preserve the
+    // actual batch-start search owner while its canonical navigation is handled.
+    if initial_owner == crate::navigation::NavigationOwner::Query {
+        if let Some(id) = focused {
+            context.memory_mut(|memory| memory.request_focus(id));
+        }
+    }
+    let query_focused = focused == Some(query_edit_id());
+    let collection_id = query_edit_id().with("collection-navigation");
+    let collection_scope = is_standard_collection(model) && model.action_panel.is_none();
+    let mut collection = is_standard_collection(model)
+        && context.data(|data| data.get_temp::<bool>(collection_id).unwrap_or(true));
     let mut composing = context.data(|data| data.get_temp::<bool>(id).unwrap_or(false));
     let mut submitted = false;
     context.input_mut(|input| {
-        input.events.retain(|event| {
+        let altgr_text = input.events.iter().any(|event| matches!(event, egui::Event::Text(text) if text.chars().any(|character| !character.is_control())));
+        input.events.retain_mut(|event| {
+            if collection_scope && !submitted && matches!(event, egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Ime(_)) {
+                collection = false;
+            }
             match event {
                 egui::Event::Ime(egui::ImeEvent::Enabled) => composing = true,
                 egui::Event::Ime(egui::ImeEvent::Preedit(text)) => composing |= !text.is_empty(),
                 egui::Event::Ime(egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled) => composing = false,
-                egui::Event::Key {
-                    key,
-                    modifiers,
-                    pressed: true,
-                    ..
-                } if !submitted => {
-                    let plain = modifiers.matches_logically(egui::Modifiers::NONE);
-                    let discovery = (*key == egui::Key::K
-                        && modifiers.matches_logically(egui::Modifiers::COMMAND))
-                        || (*key == egui::Key::Enter && modifiers.matches_logically(egui::Modifiers::ALT));
-                    let command = if discovery {
-                        Some(UiCommand::ShowActions)
-                    } else if (model.action_panel.is_some() || !model.navigation.recall.is_empty()) && plain {
-                        match key {
-                            egui::Key::ArrowDown => Some(UiCommand::SelectNext),
-                            egui::Key::ArrowUp => Some(UiCommand::SelectPrevious),
-                            egui::Key::PageDown => Some(UiCommand::PageDown),
-                            egui::Key::PageUp => Some(UiCommand::PageUp),
-                            egui::Key::Escape => Some(if model.action_panel.is_some() {
-                                UiCommand::ActionBack
-                            } else {
-                                UiCommand::Cancel
-                            }),
-                            _ => None,
-                        }
-                    } else {
-                        None
+                egui::Event::Key { key, modifiers, pressed: true, .. } if !submitted => {
+                    if modifiers.ctrl && modifiers.alt && altgr_text { return true; }
+                    let key_name = match *key {
+                        egui::Key::ArrowUp => "Up",
+                        egui::Key::ArrowDown => "Down",
+                        egui::Key::ArrowLeft => "Left",
+                        egui::Key::ArrowRight => "Right",
+                        other => other.name(),
                     };
-                    // A commit-owned key must not reach TextEdit's return path,
-                    // even when a later Commit ends composition in this batch.
-                    if composing && (command.is_some() || (*key == egui::Key::Enter && plain)) {
+                    let platform_modifiers = crikey_platform::Modifiers {
+                        ctrl: modifiers.ctrl || (modifiers.command && !modifiers.mac_cmd),
+                        alt: modifiers.alt, shift: modifiers.shift, meta: modifiers.mac_cmd,
+                    };
+                    let chord = navigation_chord(&navigation, key_name, platform_modifiers);
+                    let owner = if collection_scope && query_focused && matches!(initial_owner, crate::navigation::NavigationOwner::Host | crate::navigation::NavigationOwner::Query) {
+                        if collection { crate::navigation::NavigationOwner::Host } else { crate::navigation::NavigationOwner::Query }
+                    } else { initial_owner };
+                    let route = navigation_context(model, owner, false);
+                    let action = chord.and_then(|chord| navigation.resolve(chord, route));
+                    if composing && (action.is_some() || *key == egui::Key::Enter) {
                         return false;
                     }
-                    if (model.action_panel.is_some() || !model.navigation.recall.is_empty())
-                        && *key == egui::Key::Enter
-                        && plain
-                    {
-                        // The focused editor processes the prefix in event order
-                        // and stops at Return. Do not move trailing host keys
-                        // ahead of that submission either.
-                        submitted = true;
-                    } else if let Some(command) = command {
-                        commands.push(command);
-                        return false;
+                    if let Some(action) = action {
+                        if action == NavigationAction::Activate {
+                            // Let the focused single-line editor admit the text prefix
+                            // and stop at this key, including a remapped activation.
+                            *key = egui::Key::Enter;
+                            *modifiers = egui::Modifiers::NONE;
+                            submitted = true;
+                        } else if let Some(command) = navigation_command(action, model) {
+                            if collection_scope && matches!(action, NavigationAction::Next | NavigationAction::Previous | NavigationAction::PageDown | NavigationAction::PageUp | NavigationAction::Left | NavigationAction::Right) {
+                                collection = true;
+                            }
+                            commands.push(command);
+                            return false;
+                        }
                     }
                 }
                 _ => {}
@@ -68,13 +87,19 @@ pub(super) fn keyboard(context: &egui::Context, model: &ViewModel, commands: &mu
             true
         });
     });
-    context.data_mut(|data| data.insert_temp(id, composing));
+    context.data_mut(|data| {
+        data.insert_temp(id, composing);
+        data.insert_temp(activate_id, submitted);
+        if collection_scope {
+            data.insert_temp(collection_id, collection);
+        }
+    });
 }
 pub(super) fn draw(
     ui: &mut egui::Ui,
     model: &ViewModel,
     commands: &mut Vec<UiCommand>,
-    colors: theme::Palette,
+    colors: &theme::Palette,
 ) {
     let Some(panel) = &model.action_panel else {
         return;
@@ -83,16 +108,17 @@ pub(super) fn draw(
     let row = model.rows.iter().find(|row| target.matches(row));
     Frame::default()
         .fill(colors.surface)
-        .rounding(Rounding::same(theme::RADIUS_MEDIUM))
-        .inner_margin(Margin::same(theme::SPACE_3))
+        .rounding(Rounding::same(colors.metrics.radius_medium))
+        .inner_margin(Margin::same(colors.metrics.space_3))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.set_height(HEIGHT - 2.0 * theme::SPACE_3);
+            ui.set_height(colors.metrics.scaled(HEIGHT) - 2.0 * colors.metrics.space_3);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Actions").strong());
-                if ui.small_button("Back / Esc").clicked() {
+                if ui.small_button("Back").clicked() {
                     commands.push(UiCommand::ActionBack);
                 }
+                draw_navigation_hint(ui, model, crate::navigation::NavigationAction::Cancel);
                 for identity in panel.path() {
                     if let Some(presentation) = panel.tree().presentation(identity) {
                         ui.add(egui::Label::new(&presentation.label).truncate());
@@ -123,18 +149,18 @@ pub(super) fn draw(
                         && state.argument.is_none()
                 })
             });
+            if initial_focus && !argument_editor {
+                ui.memory_mut(|memory| memory.request_focus(action_search_id()));
+            }
             let response = ui.add_sized(
-                [ui.available_width(), theme::CONTROL_HEIGHT],
+                [ui.available_width(), colors.metrics.control_height],
                 TextEdit::singleline(&mut query)
-                    .id(egui::Id::new("crikey-action-search"))
+                    .id(action_search_id())
                     .hint_text("Search actions")
                     .char_limit(crate::action_panel::MAX_ACTION_QUERY_BYTES)
                     .lock_focus(true),
             );
-            let submitted = response.lost_focus();
-            if initial_focus && !argument_editor {
-                response.request_focus();
-            }
+
             ui.ctx()
                 .data_mut(|data| data.insert_temp(focus_id, panel.focus_token()));
             if response.changed() {
@@ -142,15 +168,10 @@ pub(super) fn draw(
             }
             // Single-line TextEdit stops at Return, so this query includes text
             // before the key but never text that arrived after submission.
-            if submitted
-                && ui.input(|input| {
-                    input.events.iter().any(|event| {
-                        matches!(event, egui::Event::Key {
-                        key: egui::Key::Enter, pressed: true, modifiers, ..
-                    } if modifiers.matches_logically(egui::Modifiers::NONE))
-                    })
-                })
-            {
+            if ui.ctx().data(|data| {
+                data.get_temp::<bool>(egui::Id::new("crikey-navigation-activate"))
+                    .unwrap_or(false)
+            }) {
                 commands.push(UiCommand::ActivateSelectedAction);
             }
             let scroll_id = egui::Id::new("crikey-action-scroll-selection");
@@ -194,7 +215,14 @@ pub(super) fn draw(
                         }
                     }
                     if let Some(row) = row {
-                        draw_command_controls(ui, row, model, commands, initial_focus && argument_editor);
+                        draw_command_controls(
+                            ui,
+                            row,
+                            model,
+                            commands,
+                            initial_focus && argument_editor,
+                            colors,
+                        );
                     }
                     for command in panel.tree().management_rows() {
                         let crate::ActionTarget::Command(reference) = &command.target else {
@@ -206,10 +234,14 @@ pub(super) fn draw(
                         ))
                         .id_salt(("command-management", &command.target))
                         .show(ui, |ui| {
-                            draw_command_controls(ui, command, model, commands, false)
+                            draw_command_controls(ui, command, model, commands, false, colors)
                         });
                     }
                     let mut section = "";
+                    let icon_size = colors.metrics.scaled(16.0);
+                    let row_height = (colors.metrics.control_height
+                        + 2.0 * (colors.metrics.row_pad_y - theme::ROW_PAD_Y * colors.metrics.scale))
+                        .max(ui.text_style_height(&TextStyle::Button));
                     for entry in panel.visible_entries() {
                         if entry.identity
                             == &ActionIdentity::Host(crate::action_panel::HostAction::ConfigureCommand)
@@ -227,7 +259,7 @@ pub(super) fn draw(
                         }
                         let presentation = entry.presentation;
                         let color = if presentation.destructive {
-                            egui::Color32::from_rgb(230, 90, 90)
+                            colors.error
                         } else {
                             colors.text
                         };
@@ -240,10 +272,12 @@ pub(super) fn draw(
                                     .and_then(|row| row.icon.as_deref());
                                 if let Some(icon) = icon {
                                     let texture = icon_texture(ui.ctx(), icon);
-                                    ui.image((texture.id(), vec2(16.0, 16.0)));
+                                    ui.image((texture.id(), vec2(icon_size, icon_size)));
                                 } else {
-                                    let (rect, _) =
-                                        ui.allocate_exact_size(vec2(16.0, 16.0), egui::Sense::hover());
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        vec2(icon_size, icon_size),
+                                        egui::Sense::hover(),
+                                    );
                                     let painter = ui.painter();
                                     if matches!(
                                         entry.identity,
@@ -274,24 +308,60 @@ pub(super) fn draw(
                                         );
                                     }
                                 }
+                                let available = ui.available_width().max(0.0);
+                                let label_width = available * 0.68;
+                                let text =
+                                    egui::WidgetText::from(RichText::new(&presentation.label).color(color))
+                                        .into_galley(
+                                            ui,
+                                            Some(egui::TextWrapMode::Truncate),
+                                            (label_width - 2.0 * ui.spacing().button_padding.x).max(0.0),
+                                            TextStyle::Button,
+                                        );
                                 let response = ui
-                                    .selectable_label(
-                                        entry.selected,
-                                        RichText::new(&presentation.label).color(color),
+                                    .add_sized(
+                                        [label_width, row_height],
+                                        egui::SelectableLabel::new(entry.selected, text),
                                     )
-                                    .on_hover_text(&presentation.description);
+                                    .on_hover_ui(|ui| {
+                                        ui.label(&presentation.label);
+                                        if !presentation.description.is_empty() {
+                                            ui.label(&presentation.description);
+                                        }
+                                    });
                                 if entry.submenu {
                                     ui.label(">");
                                 }
                                 if let Some(shortcut) = &presentation.shortcut {
-                                    ui.label(RichText::new(shortcut).small().color(colors.text_muted));
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(shortcut).small().color(colors.text_muted),
+                                        )
+                                        .truncate(),
+                                    );
                                 }
                                 if presentation.destructive {
-                                    ui.label(RichText::new("Destructive").small().color(color));
+                                    ui.add(
+                                        egui::Label::new(RichText::new("Destructive").small().color(color))
+                                            .truncate(),
+                                    );
+                                }
+                                if entry.selected
+                                    && !entry.submenu
+                                    && ui.available_width() >= colors.metrics.scaled(20.0)
+                                {
+                                    draw_navigation_hint(
+                                        ui,
+                                        model,
+                                        crate::navigation::NavigationAction::Activate,
+                                    );
                                 }
                                 if panel.is_searching() {
-                                    ui.label(
-                                        RichText::new(entry.breadcrumb).small().color(colors.text_muted),
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(entry.breadcrumb).small().color(colors.text_muted),
+                                        )
+                                        .truncate(),
                                     );
                                 }
                                 response
@@ -328,6 +398,7 @@ pub(super) fn draw_command_controls(
     model: &ViewModel,
     commands: &mut Vec<UiCommand>,
     focus_argument: bool,
+    colors: &theme::Palette,
 ) {
     let (crate::ActionTarget::Command(reference), Some(state)) = (&row.target, &row.command_state) else {
         return;
@@ -418,7 +489,7 @@ pub(super) fn draw_command_controls(
             &model.setting_edits,
             model.settings_focus.as_deref(),
             commands,
-            theme::palette(),
+            colors,
         );
         for command in &mut commands[start..] {
             if let UiCommand::SetSetting {

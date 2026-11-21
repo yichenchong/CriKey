@@ -78,7 +78,7 @@ pub use plugin_action::{
 pub use plugin_icons::{
     IconFetch, PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
 };
-pub use plugin_page::PageUpdate;
+pub use plugin_page::{PageSessionId, PageUpdate};
 pub use plugin_preview::{PreviewIdentity, PreviewRequest, PreviewService, PreviewState, PreviewUpdate};
 pub use query_pipeline::{
     OrdinarySearchProvider, OrdinarySearchSummary, PipelineConfig, PipelineError, PipelineTick,
@@ -2074,6 +2074,29 @@ impl SearchService {
             return;
         };
         router.resize_page(plugin, width, height);
+    }
+
+    /// Identity of this page opening. Cache at the page transition, not per frame.
+    pub fn page_session_id(&self) -> Option<PageSessionId> {
+        let (plugin, _) = self.page.as_ref()?;
+        self.plugin_actions.as_ref()?.page_session_id(plugin)
+    }
+
+    /// Updates a live page without resizing or reopening it.
+    /// A stale opening identity is refused by the current owning runtime.
+    pub fn update_page_palette(
+        &mut self,
+        session: PageSessionId,
+        palette: crikey_core::PagePalette,
+    ) -> CoreResult<()> {
+        let (plugin, _) = self
+            .page
+            .as_ref()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("no plugin page is open".to_owned()))?;
+        self.plugin_actions
+            .as_ref()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("plugin page runtime is unavailable".to_owned()))?
+            .update_page_palette(plugin, session, palette)
     }
 
     /// Closes the open page, telling its plugin the surface is gone.

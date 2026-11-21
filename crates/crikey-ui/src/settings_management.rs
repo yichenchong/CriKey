@@ -157,7 +157,8 @@ pub struct Field {
     pub source: String,
     pub restart: bool,
     pub secret: bool,
-    pub toggle: Option<bool>,
+    pub control: crate::SettingControl,
+    pub max_bytes: usize,
     pub value_available: bool,
 }
 impl std::fmt::Debug for Field {
@@ -193,6 +194,8 @@ struct Draft {
     schema: u64,
     schema_refusal: u64,
     changed: bool,
+    rejected: bool,
+    capacity_blocked: bool,
     revision: u64,
     pending: Option<(u64, u64)>,
     focused: bool,
@@ -301,17 +304,40 @@ fn draw_input(
     id: egui::Id,
     secret: bool,
     text: &mut String,
-) -> (egui::Response, bool, bool) {
+    max_bytes: usize,
+) -> (egui::Response, bool, bool, bool) {
     let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
     if !secret {
+        let incoming = ui.input(|input| {
+            input.events.iter().fold(0_usize, |bytes, event| {
+                bytes.saturating_add(match event {
+                    egui::Event::Text(value)
+                    | egui::Event::Paste(value)
+                    | egui::Event::Ime(egui::ImeEvent::Commit(value)) => value.len(),
+                    _ => 0,
+                })
+            })
+        });
+        let original =
+            (incoming > 0 && text.len().saturating_add(incoming) > max_bytes).then(|| text.clone());
+        let mut buffer = crate::typed_input::BoundedTextBuffer::new(text, max_bytes);
         let response = ui.add(
-            egui::TextEdit::singleline(text)
+            egui::TextEdit::singleline(&mut buffer)
                 .id(id.with("text"))
-                .char_limit(4096),
+                .desired_width(ui.available_width()),
         );
         let changed = response.changed();
         let commit = enter && response.lost_focus();
-        return (response, changed, commit);
+        let rejected = buffer.rejected();
+        if rejected {
+            if let Some(original) = original {
+                text.clear();
+                text.push_str(&original);
+            }
+            ui.data_mut(|data| data.remove::<egui::text_edit::TextEditState>(id.with("text")));
+            response.request_focus();
+        }
+        return (response, changed && !rejected, commit && !rejected, rejected);
     }
     // As in the structured editor, plaintext never enters TextEdit/undo state.
     ui.data_mut(|data| data.remove::<egui::text_edit::TextEditState>(id.with("text")));
@@ -332,6 +358,7 @@ fn draw_input(
         response.request_focus();
     }
     let mut changed = false;
+    let mut rejected = false;
     if response.has_focus() {
         ui.ctx().output_mut(|output| {
             output.ime = Some(egui::output::IMEOutput {
@@ -347,10 +374,12 @@ fn draw_input(
                     if text
                         .len()
                         .checked_add(value.len())
-                        .is_some_and(|bytes| bytes <= 4096)
+                        .is_some_and(|bytes| bytes <= max_bytes)
                     {
                         text.push_str(value);
                         changed |= !value.is_empty();
+                    } else {
+                        rejected = true;
                     }
                     false
                 }
@@ -368,7 +397,7 @@ fn draw_input(
         });
     }
     let commit = enter && response.has_focus();
-    (response, changed, commit)
+    (response, changed, commit, rejected)
 }
 pub(crate) fn draw_categories(ui: &mut egui::Ui, panel: &Panel, commands: &mut Vec<UiCommand>) {
     ui.horizontal_wrapped(|ui| {
@@ -403,6 +432,75 @@ fn draw_job(ui: &mut egui::Ui, job: &Job, commands: &mut Vec<UiCommand>) {
         ui.add(egui::Label::new(text).wrap().selectable(true));
     });
 }
+
+fn draw_closed_control(
+    ui: &mut egui::Ui,
+    field: &Field,
+    panel: &Panel,
+    projection_ready: bool,
+    draft: &mut String,
+    commands: &mut Vec<UiCommand>,
+) -> Option<(egui::Response, bool)> {
+    if field.secret {
+        return None;
+    }
+    let enabled = !panel.loading && projection_ready;
+    let submit = |value: String, commands: &mut Vec<UiCommand>| {
+        commands.push(UiCommand::ManageSettings(Request::Edit {
+            request_id: crate::next_setting_edit_id(),
+            key: field.key.clone(),
+            plugin: field.plugin.clone(),
+            draft: value,
+            config: panel.config,
+            schema: panel.schema,
+        }));
+    };
+    Some(match field.control {
+        crate::SettingControl::Text => return None,
+        crate::SettingControl::Toggle { on } => {
+            let mut value = on;
+            let response = ui.add_enabled(enabled, egui::Checkbox::new(&mut value, "Enabled"));
+            if response.changed() {
+                submit(value.to_string(), commands);
+            }
+            (response, false)
+        }
+        crate::SettingControl::Choice { options } => {
+            let selected = options
+                .iter()
+                .find(|(value, _)| *value == draft.as_str())
+                .map_or(field.value.as_str(), |(_, label)| *label);
+            let mut changed = false;
+            let response = ui
+                .add_enabled_ui(enabled, |ui| {
+                    egui::ComboBox::from_id_salt(("managed-choice", panel.view.map(ViewId::get), &field.key))
+                        .selected_text(selected)
+                        .width(ui.available_width().min(200.0))
+                        .show_ui(ui, |ui| {
+                            for &(value, label) in options {
+                                if ui.selectable_label(draft.as_str() == value, label).clicked()
+                                    && draft.as_str() != value
+                                {
+                                    draft.clear();
+                                    draft.push_str(value);
+                                    ui.close_menu();
+                                    changed = true;
+                                }
+                            }
+                        })
+                        .response
+                })
+                .inner;
+            if !options.iter().any(|(value, _)| *value == field.value) {
+                ui.label("Saved value is unsupported and not applied. Choose a supported value and Save; the previous applied value is retained.");
+            }
+            (response, changed)
+        }
+    })
+}
+
+const MAX_SETTING_EDITOR_BYTES: usize = 8192;
+const MAX_RETAINED_EDITOR_BYTES: usize = 128 * 4096;
 
 pub(crate) fn draw(
     ui: &mut egui::Ui,
@@ -462,11 +560,31 @@ pub(crate) fn draw(
             );
         }
     }
+    if panel
+        .fields
+        .iter()
+        .any(|field| matches!(field.control, crate::SettingControl::Choice { .. }))
+    {
+        ui.small("Choose a value, then Save. Discard draft cancels unsaved changes.");
+    }
+    let registry = egui::Id::new("managed-settings-editor-registry");
+    let mut retained_bytes = ui.data_mut(|data| {
+        let editors = data.remove_temp::<Editors>(registry).unwrap_or_default();
+        let mut bytes = 0_usize;
+        for editor in &editors.entries {
+            if let Some(draft) = data.remove_temp::<Draft>(editor.id) {
+                bytes = bytes.saturating_add(draft.text.len());
+                data.insert_temp(editor.id, draft);
+            }
+        }
+        data.insert_temp(registry, editors);
+        bytes
+    });
     let projection_ready = panel.authoritative
         && panel.projection_config == panel.config
         && panel.projection_schema == panel.schema;
     let projection_ready = projection_ready && !panel.schema_rejected;
-    egui::ScrollArea::vertical().id_salt("settings-fields").max_height(320.0).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("settings-fields").max_height(ui.spacing().interact_size.y * (320.0 / crate::theme::CONTROL_HEIGHT)).show(ui, |ui| {
         for field in panel.fields.iter().filter(|field| panel.category.includes(&field.category)) {
             let id = editor_id(panel.view, &field.key, field.secret);
             if field.secret && panel.schema_rejected {
@@ -478,6 +596,7 @@ pub(crate) fn draw(
                 continue;
             }
             let registry = egui::Id::new("managed-settings-editor-registry");
+            let mut retired_bytes = 0;
             let admitted = ui.data_mut(|data| {
                 let mut editors = data.remove_temp::<Editors>(registry).unwrap_or_default();
                 if !editors.entries.iter().any(|editor| editor.id == id) {
@@ -489,7 +608,7 @@ pub(crate) fn draw(
                             !dirty
                         }) else { data.insert_temp(registry, editors); return false; };
                         let retired = editors.entries.remove(clean).id;
-                        data.remove::<Draft>(retired);
+                        if let Some(draft) = data.remove_temp::<Draft>(retired) { retired_bytes = draft.text.len(); }
                         data.remove::<egui::text_edit::TextEditState>(retired.with("text"));
                         data.remove::<egui::Id>(retired.with("private-focus"));
                     }
@@ -498,21 +617,35 @@ pub(crate) fn draw(
                 data.insert_temp(registry, editors);
                 true
             });
+            retained_bytes = retained_bytes.saturating_sub(retired_bytes);
             if !admitted {
                 ui.label(format!("{} — editor capacity reached; finish/discard a draft or close Settings", field.label));
                 continue;
             }
-            let mut draft = ui.data_mut(|data| data.remove_temp::<Draft>(id)).unwrap_or_else(|| Draft { text: if field.secret { String::new() } else { field.value.clone() }, config: panel.config, schema: panel.schema, schema_refusal: panel.schema_refusal, ..Default::default() });
+            let stored = ui.data_mut(|data| data.remove_temp::<Draft>(id));
+            if let Some(draft) = &stored { retained_bytes = retained_bytes.saturating_sub(draft.text.len()); }
+            let retained_limit = MAX_RETAINED_EDITOR_BYTES.saturating_sub(retained_bytes);
+            let field_limit = field.max_bytes.min(MAX_SETTING_EDITOR_BYTES);
+            if stored.is_none() && !field.secret && field.value.len() > retained_limit {
+                ui.label("Retained editor byte capacity reached; finish/discard a draft or close Settings.");
+                continue;
+            }
+            let mut draft = stored.unwrap_or_else(|| Draft { text: if field.secret { String::new() } else { field.value.clone() }, config: panel.config, schema: panel.schema, schema_refusal: panel.schema_refusal, ..Default::default() });
+
             // Reuse the existing recorder's consumed-receipt identity across
             // bootstrap and searchable forms; discarding a draft cannot replay it.
             let capture_id = egui::Id::new(("crikey-setting-draft", field.key.as_str())).with("state").with("capture");
             let captured_before = ui.data(|data| data.get_temp::<u64>(capture_id)).unwrap_or(0);
             if let Some(captured) = outcomes.iter().find(|outcome| outcome.key.strip_prefix("capture:") == Some(field.key.as_str()) && outcome.request_id > captured_before) {
-                draft.text.clone_from(&captured.value);
-                ui.data_mut(|data| data.insert_temp(capture_id, captured.request_id));
-                draft.changed = true;
-                draft.focused = false;
-                draft.revision = draft.revision.checked_add(1).expect("setting draft revision exhausted");
+                if captured.value.len() <= retained_limit {
+                    draft.text.clone_from(&captured.value);
+                    ui.data_mut(|data| data.insert_temp(capture_id, captured.request_id));
+                    draft.changed = true;
+                    draft.focused = false;
+                    draft.revision = draft.revision.checked_add(1).expect("setting draft revision exhausted");
+                } else {
+                    draft.capacity_blocked = true;
+                }
             }
             if let (Some((key, acknowledged)), Some((pending, revision))) = (&panel.acknowledged, draft.pending) {
                 if key == &field.key && *acknowledged == pending {
@@ -521,7 +654,18 @@ pub(crate) fn draw(
                     draft.pending = None;
                 }
             }
-            if !draft.changed && (draft.config != panel.config || draft.schema != panel.schema || draft.schema_refusal != panel.schema_refusal) { draft.config = panel.config; draft.schema = panel.schema; draft.schema_refusal = panel.schema_refusal; if !field.secret { draft.text.clone_from(&field.value); } }
+            if !draft.changed && (draft.config != panel.config || draft.schema != panel.schema || draft.schema_refusal != panel.schema_refusal) {
+                if field.secret || field.value.len() <= retained_limit {
+                    draft.config = panel.config;
+                    draft.schema = panel.schema;
+                    draft.schema_refusal = panel.schema_refusal;
+                    if !field.secret { draft.text.clone_from(&field.value); }
+                    draft.capacity_blocked = false;
+                } else {
+                    draft.capacity_blocked = true;
+                }
+            }
+            let max_bytes = field_limit.min(retained_limit);
             ui.group(|ui| {
                 ui.label(&field.label);
                 ui.small(&field.description);
@@ -530,17 +674,27 @@ pub(crate) fn draw(
                     ui.label("Effective value exceeds the display limit. This field is not editable in the graphical form.");
                     return;
                 }
-                if let Some(on) = field.toggle {
-                    let mut value = on;
-                    if ui.add_enabled(!panel.loading && projection_ready, egui::Checkbox::new(&mut value, "Enabled")).changed() {
-                        send(Request::Edit { request_id: crate::next_setting_edit_id(), key: field.key.clone(), plugin: field.plugin.clone(), draft: value.to_string(), config: panel.config, schema: panel.schema }, commands);
+                let closed = draw_closed_control(ui, field, panel, projection_ready, &mut draft.text, commands);
+                if let Some((response, _)) = closed.as_ref().filter(|_| matches!(field.control, crate::SettingControl::Toggle { .. })) {
+                    if focus == Some(field.key.as_str()) && !draft.focused {
+                        response.request_focus();
+                        draft.focused = true;
                     }
                     return;
                 }
                 if field.key == "launcher.activation-hotkey" && ui.button("Record shortcut").clicked() {
                     commands.push(UiCommand::BeginShortcutCapture(field.key.clone()));
                 }
-                let (response, changed, commit) = ui.add_enabled_ui(!panel.schema_rejected, |ui| draw_input(ui, id, field.secret, &mut draft.text)).inner;
+                let (response, changed, commit, rejected) = if let Some((response, changed)) = closed {
+                    (response, changed, false, false)
+                } else {
+                    ui.add_enabled_ui(!panel.schema_rejected, |ui| draw_input(ui, id, field.secret, &mut draft.text, max_bytes)).inner
+                };
+                if rejected {
+                    if max_bytes < field_limit { draft.capacity_blocked = true; } else { draft.rejected = true; }
+                } else if changed { draft.rejected = false; draft.capacity_blocked = false; }
+                if draft.capacity_blocked { ui.label("Retained editor byte budget exceeded; the existing draft is kept. Finish/discard another draft or close Settings before retrying."); }
+                if draft.rejected || draft.text.len() > max_bytes { ui.label("Edit exceeds this field's byte limit; shorten it or discard the draft."); }
                 if focus == Some(field.key.as_str()) && !draft.focused {
                     response.request_focus();
                     draft.focused = true;
@@ -552,7 +706,7 @@ pub(crate) fn draw(
                 let conflict = draft.changed && (draft.config != panel.config || draft.schema != panel.schema || draft.schema_refusal != panel.schema_refusal);
                 if conflict { ui.label("Configuration changed. Your draft is retained; explicitly rebase before saving."); }
                 ui.horizontal(|ui| {
-                    let can_save = draft.changed && !conflict && !panel.loading && projection_ready;
+                    let can_save = draft.changed && !draft.rejected && !draft.capacity_blocked && draft.text.len() <= max_bytes && !conflict && !panel.loading && projection_ready;
                     if (ui.add_enabled(can_save, egui::Button::new("Save")).clicked() || commit) && can_save {
                         retire_text_state(ui.ctx(), id);
                         let request_id = crate::next_setting_edit_id();
@@ -560,12 +714,26 @@ pub(crate) fn draw(
                         send(Request::Edit { request_id, key: field.key.clone(), plugin: field.plugin.clone(), draft: draft.text.clone(), config: draft.config, schema: draft.schema }, commands);
                     }
                     if conflict && ui.add_enabled(projection_ready, egui::Button::new("Rebase draft")).clicked() { draft.config = panel.config; draft.schema = panel.schema; draft.schema_refusal = panel.schema_refusal; }
-                    if draft.changed && ui.button("Discard draft").clicked() {
-                        retire_text_state(ui.ctx(), id);
-                        draft = Draft { text: if field.secret { String::new() } else { field.value.clone() }, config: panel.config, schema: panel.schema, schema_refusal: panel.schema_refusal, ..Default::default() };
+                    if (draft.changed || draft.rejected || draft.capacity_blocked) && ui.button("Discard draft").clicked() {
+                        if field.secret || field.value.len() <= retained_limit {
+                            retire_text_state(ui.ctx(), id);
+                            draft.text.clear();
+                            if !field.secret { draft.text.push_str(&field.value); }
+                            draft.config = panel.config;
+                            draft.schema = panel.schema;
+                            draft.schema_refusal = panel.schema_refusal;
+                            draft.changed = false;
+                            draft.rejected = false;
+                            draft.capacity_blocked = false;
+                            draft.pending = None;
+                            draft.focused = false;
+                        } else {
+                            draft.capacity_blocked = true;
+                        }
                     }
                 });
             });
+            retained_bytes = retained_bytes.saturating_add(draft.text.len());
             ui.data_mut(|data| data.insert_temp(id, draft));
         }
     });
@@ -628,7 +796,7 @@ pub(crate) fn draw(
             ui.data_mut(|data| data.insert_temp(source_id, source));
             egui::ScrollArea::vertical()
                 .id_salt("package-inventory")
-                .max_height(240.0)
+                .max_height(ui.spacing().interact_size.y * (240.0 / crate::theme::CONTROL_HEIGHT))
                 .show(ui, |ui| {
                     for package in panel.packages.iter() {
                         ui.group(|ui| {
@@ -825,7 +993,8 @@ mod tests {
             source: "user-plugin".into(),
             restart: false,
             secret: false,
-            toggle: None,
+            control: crate::SettingControl::Text,
+            max_bytes: 4096,
             value_available: true,
         };
         let mut panel = Panel {
@@ -921,7 +1090,8 @@ mod tests {
             source: "user-plugin".into(),
             restart: false,
             secret: true,
-            toggle: None,
+            control: crate::SettingControl::Text,
+            max_bytes: 4096,
             value_available: true,
         };
         let mut public_field = private_field.clone();
@@ -1092,7 +1262,8 @@ mod tests {
                 source: "user-plugin".into(),
                 restart: false,
                 secret: true,
-                toggle: None,
+                control: crate::SettingControl::Text,
+                max_bytes: 4096,
                 value_available: true,
             }]),
             ..Default::default()
@@ -1182,7 +1353,8 @@ mod tests {
                 source: "user-plugin".into(),
                 restart: false,
                 secret: true,
-                toggle: None,
+                control: crate::SettingControl::Text,
+                max_bytes: 4096,
                 value_available: true,
             }]),
             ..Default::default()
@@ -1205,6 +1377,8 @@ mod tests {
                 schema: 1,
                 schema_refusal: 0,
                 changed: true,
+                rejected: false,
+                capacity_blocked: false,
                 revision: 2,
                 pending: Some((7, 1)),
                 focused: false,
@@ -1226,6 +1400,8 @@ mod tests {
                 schema: 1,
                 schema_refusal: 0,
                 changed: true,
+                rejected: false,
+                capacity_blocked: false,
                 revision: 1,
                 pending: Some((7, 1)),
                 focused: false,
@@ -1235,5 +1411,246 @@ mod tests {
         assert!(!draft.changed);
         assert!(draft.pending.is_none());
         assert_eq!(draft.config, 2);
+    }
+    fn managed_field(key: &str, value: &str, max_bytes: usize) -> Field {
+        Field {
+            key: key.into(),
+            label: key.into(),
+            description: String::new(),
+            category: "Appearance".into(),
+            plugin: None,
+            value: value.into(),
+            source: "profile".into(),
+            restart: false,
+            secret: false,
+            control: crate::SettingControl::Text,
+            max_bytes,
+            value_available: true,
+        }
+    }
+    fn managed_panel(field: Field) -> Panel {
+        Panel {
+            view: Some(ViewId(77)),
+            config: 1,
+            schema: 1,
+            projection_config: 1,
+            projection_schema: 1,
+            authoritative: true,
+            fields: Arc::from([field]),
+            ..Default::default()
+        }
+    }
+    fn managed_text_position(output: &egui::FullOutput, needle: &str) -> egui::Pos2 {
+        fn find(shape: &egui::Shape, needle: &str, exact: bool) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text)
+                    if text.galley.text() == needle || !exact && text.galley.text().contains(needle) =>
+                {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, needle, exact)),
+                _ => None,
+            }
+        }
+        [true, false]
+            .into_iter()
+            .find_map(|exact| {
+                output.shapes.iter().find_map(|shape| {
+                    find(&shape.shape, needle, exact).filter(|position| shape.clip_rect.contains(*position))
+                })
+            })
+            .unwrap_or_else(|| panic!("visible control missing: {needle}"))
+    }
+    fn managed_click(position: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+    fn managed_key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn authoritative_choice_retains_conflicted_selection_until_explicit_rebase_and_save() {
+        let context = egui::Context::default();
+        let mut field = managed_field("launcher.theme", "system", 4096);
+        field.control = crate::SettingControl::Choice {
+            options: &[("system", "System"), ("light", "Light"), ("dark", "Dark")],
+        };
+        let mut panel = managed_panel(field.clone());
+        paint(&context, &panel, vec![], 0.0);
+        let initial = paint(&context, &panel, vec![], 0.1);
+        let _ = paint(
+            &context,
+            &panel,
+            managed_click(managed_text_position(&initial, "System")),
+            1.0,
+        );
+        assert!(
+            context.memory(|memory| memory.any_popup_open()),
+            "clicking the actual selector opens its popup"
+        );
+        let opened = paint(&context, &panel, vec![], 1.1);
+        let (_, selected) = paint_commands(
+            &context,
+            &panel,
+            managed_click(managed_text_position(&opened, "Light")),
+            2.0,
+        );
+        assert!(!selected.iter().any(|command| matches!(
+            command,
+            UiCommand::ManageSettings(Request::Edit { .. }) | UiCommand::SetSetting { .. }
+        )));
+        panel.config = 2;
+        panel.projection_config = 2;
+        field.value = "dark".into();
+        field.source = "session".into();
+        panel.fields = Arc::from([field]);
+        let conflicted = paint(&context, &panel, vec![], 3.0);
+        let id = editor_id(panel.view, "launcher.theme", false);
+        let draft = context.data(|data| data.get_temp::<Draft>(id)).unwrap();
+        assert_eq!(draft.text, "light");
+        assert_eq!(draft.config, 1);
+        let (_, blocked) = paint_commands(
+            &context,
+            &panel,
+            managed_click(managed_text_position(&conflicted, "Save")),
+            4.0,
+        );
+        assert!(!blocked
+            .iter()
+            .any(|command| matches!(command, UiCommand::ManageSettings(Request::Edit { .. }))));
+        paint(
+            &context,
+            &panel,
+            managed_click(managed_text_position(&conflicted, "Rebase draft")),
+            5.0,
+        );
+        let rebased = paint(&context, &panel, vec![], 5.5);
+        let (_, saved) = paint_commands(
+            &context,
+            &panel,
+            managed_click(managed_text_position(&rebased, "Save")),
+            6.0,
+        );
+        assert!(saved.iter().any(|command| matches!(command, UiCommand::ManageSettings(Request::Edit { key, draft, config: 2, schema: 1, .. }) if key == "launcher.theme" && draft == "light")));
+    }
+
+    #[test]
+    fn managed_utf8_overflow_keeps_the_prior_value_and_blocks_submission() {
+        let context = egui::Context::default();
+        let panel = managed_panel(managed_field("launcher.theme-overrides", "{}", 4096));
+        paint(&context, &panel, vec![], 0.0);
+        let (_, commands) = paint_commands(
+            &context,
+            &panel,
+            vec![
+                managed_key(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Paste("é".repeat(2049)),
+                managed_key(egui::Key::Enter, egui::Modifiers::NONE),
+            ],
+            1.0,
+        );
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::ManageSettings(Request::Edit { .. }))));
+        let draft = context
+            .data(|data| data.get_temp::<Draft>(editor_id(panel.view, "launcher.theme-overrides", false)))
+            .unwrap();
+        assert_eq!(draft.text, "{}");
+        assert!(draft.rejected);
+    }
+
+    #[test]
+    fn discard_at_the_retained_byte_cap_preserves_dirty_conflicting_drafts_and_allocation() {
+        let context = egui::Context::default();
+        let mut panel = managed_panel(managed_field("launcher.navigation-bindings", "{}", 8192));
+        let text = "x".repeat(4096);
+        for index in 0..128 {
+            let key = if index == 127 {
+                "launcher.navigation-bindings".to_owned()
+            } else {
+                format!("plugins.sample.field-{index}")
+            };
+            panel.fields = Arc::from([managed_field(&key, "{}", if index == 127 { 8192 } else { 4096 })]);
+            paint(&context, &panel, vec![], f64::from(index * 2));
+            paint(
+                &context,
+                &panel,
+                vec![
+                    managed_key(egui::Key::A, egui::Modifiers::COMMAND),
+                    egui::Event::Paste(text.clone()),
+                ],
+                f64::from(index * 2 + 1),
+            );
+        }
+        let id = editor_id(panel.view, "launcher.navigation-bindings", false);
+        let allocation = context.data_mut(|data| {
+            let draft = data.remove_temp::<Draft>(id).unwrap();
+            let pointer = draft.text.as_ptr();
+            assert_eq!(draft.text, text);
+            data.insert_temp(id, draft);
+            pointer
+        });
+        let mut external = managed_field("launcher.navigation-bindings", "{}", 8192);
+        external.value = format!("{{}}{}", " ".repeat(8190));
+        panel.fields = Arc::from([external]);
+        panel.config = 2;
+        panel.schema = 2;
+        panel.projection_config = 2;
+        panel.projection_schema = 2;
+        let conflicted = paint(&context, &panel, vec![], 260.0);
+        let (_, commands) = paint_commands(
+            &context,
+            &panel,
+            managed_click(managed_text_position(&conflicted, "Discard draft")),
+            261.0,
+        );
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::ManageSettings(Request::Edit { .. }))));
+        let retained = paint(&context, &panel, vec![], 262.0);
+        managed_text_position(&retained, "existing draft is kept");
+        context.data_mut(|data| {
+            let editors = data
+                .remove_temp::<Editors>(egui::Id::new("managed-settings-editor-registry"))
+                .unwrap();
+            let mut bytes = 0;
+            for editor in &editors.entries {
+                let draft = data
+                    .remove_temp::<Draft>(editor.id)
+                    .expect("no dirty draft may disappear");
+                assert!(draft.changed);
+                assert_eq!((draft.config, draft.schema), (1, 1));
+                assert_eq!(draft.text, text);
+                bytes += draft.text.len();
+                if editor.id == id {
+                    assert!(draft.capacity_blocked);
+                    assert_eq!(draft.text.as_ptr(), allocation);
+                }
+                data.insert_temp(editor.id, draft);
+            }
+            assert_eq!(bytes, 512 * 1024);
+            assert_eq!(editors.entries.len(), 128);
+            data.insert_temp(egui::Id::new("managed-settings-editor-registry"), editors);
+        });
     }
 }
