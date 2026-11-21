@@ -4,7 +4,7 @@ The JSON bridge uses ``typed_execute`` with a frozen item object, nullable
 ``action_id``, lowercase 64-hex ``schema_fingerprint`` and ``values`` entries
 ``{field_id,kind,value}``. No legacy argument member is permitted. Its correlated
 ``typed_execute_result`` is completed, field_failures (field_id/fixed code), or
-failed (fixed host code); callbacks cannot return diagnostic text or navigation.
+failed (fixed host code); negotiated structured_view_v1 also permits Push/Replace.
 """
 from dataclasses import dataclass
 import hashlib
@@ -186,6 +186,8 @@ class ItemPresentation:
     item_id: str
     section: str | None = None
     scopes: tuple[str, ...] = ()
+    # Standard-route collections only; root sidecars do not publish raster content.
+    image: object | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +225,6 @@ class FieldFailure:
 
 @dataclass(frozen=True)
 class TypedOutcome:
-    """Fixed outcomes only; None is also completed. No messages or routes."""
+    """Fixed submission outcomes; None is completed. Push/Replace are separate outcomes."""
     failures: tuple[FieldFailure, ...] = ()
     code: str | None = None

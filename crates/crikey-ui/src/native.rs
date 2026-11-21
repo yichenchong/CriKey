@@ -374,6 +374,30 @@ fn build_launcher_frame_with_transparency(
             }
         }
     });
+    if let Some(surface) = &model.navigation.standard {
+        for command in &mut commands {
+            let action = match command {
+                UiCommand::ActivateAction {
+                    target: crate::ActionTarget::Result { owner, item },
+                    identity: crate::ActionIdentity::Plugin(action),
+                } => Some((owner.clone(), item.clone(), Some(action.clone()))),
+                UiCommand::ActivateAction {
+                    target: crate::ActionTarget::Result { owner, item },
+                    identity: crate::ActionIdentity::Actionless,
+                } => Some((owner.clone(), item.clone(), None)),
+                _ => None,
+            };
+            if let Some((owner, item, action)) = action {
+                *command = UiCommand::StandardActivate {
+                    context: surface.context.clone(),
+                    executable: crikey_core::structured_arguments::ExecutableKey {
+                        target: crikey_core::structured_arguments::OwnedItem { owner, item },
+                        action,
+                    },
+                };
+            }
+        }
+    }
     NativeUiFrame { output, commands }
 }
 
@@ -529,7 +553,7 @@ fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
         mailbox.retired_generation = None;
     }
     mailbox.host_generation = Some(model.generation);
-    if model.settings_open || model.page.is_some() {
+    if model.settings_open || model.page.is_some() || model.navigation.standard_route {
         mailbox.retired_generation = Some(
             mailbox
                 .retired_generation
@@ -560,6 +584,7 @@ fn admits_results(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> bo
         && mailbox.host_generation == Some(model.generation)
         && !mailbox.overlay.settings_open
         && mailbox.overlay.page.is_none()
+        && !mailbox.overlay.navigation.standard_route
         && mailbox
             .retired_generation
             .is_none_or(|floor| model.generation > floor)
@@ -1957,9 +1982,17 @@ where
                     event,
                     is_synthetic: false,
                     ..
-                } if self.active_session.is_some() && !self.ime.composing => {
-                    translate_keyboard(event, self.modifiers, self.frame.as_ref())
-                }
+                } if self.active_session.is_some() && !self.ime.composing => translate_keyboard(
+                    event.logical_key.as_ref(),
+                    event.state,
+                    self.modifiers,
+                    self.frame.as_ref(),
+                    matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
+                        && self
+                            .graphics
+                            .as_ref()
+                            .is_some_and(|graphics| egui_popup_open(&graphics.egui_context)),
+                ),
                 _ => None,
             };
         }
@@ -2215,6 +2248,7 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     // the compact window would have almost no room to draw in.
     if model.settings_open
         || model.page.is_some()
+        || model.navigation.standard.is_some()
         || model.preview.status.is_some()
         || model.navigation.can_go_back
         || model.navigation.unavailable.is_some()
@@ -3136,22 +3170,38 @@ fn byte_offset_to_char_index(text: &str, byte: usize) -> u32 {
     offset
 }
 
+fn egui_popup_open(context: &egui::Context) -> bool {
+    context.memory(|memory| {
+        memory.any_popup_open()
+            || memory
+                .layer_ids()
+                .any(|layer| layer.order == egui::Order::Foreground && memory.areas().is_visible(&layer))
+    })
+}
+
 fn translate_keyboard(
-    event: &KeyEvent,
+    logical_key: Key<&str>,
+    state: ElementState,
     modifiers: ModifiersState,
     model: Option<&ViewModel>,
+    popup_open: bool,
 ) -> Option<UiCommand> {
-    if event.state != ElementState::Pressed {
+    if state != ElementState::Pressed {
+        return None;
+    }
+    // Native menus and combo popups own Escape before host Back/Settings.
+    // Read egui's existing popup/layer ownership, never a navigation mirror.
+    if popup_open && matches!(logical_key, Key::Named(NamedKey::Escape)) {
         return None;
     }
     if let Some(key) = model
         .and_then(|model| model.settings_focus.as_deref())
         .and_then(|focus| focus.strip_prefix("record:"))
     {
-        if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
+        if matches!(logical_key, Key::Named(NamedKey::Escape)) {
             return Some(UiCommand::CancelShortcutCapture);
         }
-        let key_name = match event.logical_key.as_ref() {
+        let key_name = match logical_key {
             Key::Character(text) => text.to_uppercase(),
             Key::Named(NamedKey::ArrowUp) => "Up".into(),
             Key::Named(NamedKey::ArrowDown) => "Down".into(),
@@ -3188,22 +3238,22 @@ fn translate_keyboard(
     // `None` -- so the page never sees the key that closes it and a plugin
     // cannot trap the user inside its own surface.
     if model.is_some_and(|model| model.page.is_some()) {
-        return matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
-            .then_some(UiCommand::ClosePage);
+        return matches!(logical_key, Key::Named(NamedKey::Escape)).then_some(UiCommand::ClosePage);
     }
     // While the settings surface is open its editors own the keyboard: Enter
     // commits an edit and Tab walks between rows, so neither may still run a
     // result. Escape is the exception, because closing the surface is what it
     // means there.
     if model.is_some_and(|model| model.settings_open) {
-        return matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
-            .then_some(UiCommand::Cancel);
+        return matches!(logical_key, Key::Named(NamedKey::Escape)).then_some(UiCommand::Cancel);
     }
-    if model.is_some_and(|model| model.navigation.inline_arguments.is_some()) {
+    if model.is_some_and(|model| {
+        model.navigation.inline_arguments.is_some() && !model.navigation.standard_refresh_pending
+    }) {
         return None;
     }
-    if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Enter)) && modifiers.alt_key()
-        || matches!(event.logical_key.as_ref(), Key::Character(text) if text.eq_ignore_ascii_case("k"))
+    if matches!(logical_key, Key::Named(NamedKey::Enter)) && modifiers.alt_key()
+        || matches!(logical_key, Key::Character(text) if text.eq_ignore_ascii_case("k"))
             && (modifiers.control_key() || modifiers.super_key())
             && !modifiers.alt_key()
     {
@@ -3215,7 +3265,7 @@ fn translate_keyboard(
         return None;
     }
     if model.is_some_and(|model| model.preview.status.is_some()) {
-        if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::F6)) {
+        if matches!(logical_key, Key::Named(NamedKey::F6)) {
             return Some(if model.is_some_and(|model| model.preview.focused) {
                 UiCommand::LeavePreview
             } else {
@@ -3223,11 +3273,21 @@ fn translate_keyboard(
             });
         }
         if model.is_some_and(|model| model.preview.focused) {
-            return matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
-                .then_some(UiCommand::LeavePreview);
+            return matches!(logical_key, Key::Named(NamedKey::Escape)).then_some(UiCommand::LeavePreview);
         }
     }
-    match event.logical_key.as_ref() {
+    if matches!(logical_key, Key::Named(NamedKey::Enter)) {
+        if let Some(model) = model.filter(|model| model.navigation.standard.is_some()) {
+            return standard_render::primary_command(model);
+        }
+    }
+    match logical_key {
+        Key::Named(NamedKey::ArrowLeft) if model.is_some_and(|m| m.navigation.standard.is_some()) => {
+            Some(UiCommand::StandardHorizontal(false))
+        }
+        Key::Named(NamedKey::ArrowRight) if model.is_some_and(|m| m.navigation.standard.is_some()) => {
+            Some(UiCommand::StandardHorizontal(true))
+        }
         Key::Named(NamedKey::ArrowDown) => Some(UiCommand::SelectNext),
         Key::Named(NamedKey::ArrowUp)
             if model.is_some_and(|model| {
@@ -3285,13 +3345,13 @@ fn draw_launcher(
     native_web_input: bool,
 ) {
     let colors = theme::palette();
-    if model.page.is_some() || model.settings_open || !shows_results(model) {
+    if !preview_render::retains_image(model) {
         preview_render::release_texture(context);
     }
     if model.navigation.inline_arguments.is_none() {
         preview_render::keyboard(context, model, commands);
-        action_render::keyboard(context, model, commands);
     }
+    action_render::keyboard(context, model, commands);
     let recall_composing = context.data(|data| {
         data.get_temp::<bool>(egui::Id::new("crikey-action-ime"))
             .unwrap_or(false)
@@ -3326,7 +3386,15 @@ fn draw_launcher(
     // Page rasters and an engine frame belong only to the page that supplied
     // them. A closed page has no draw call in which the live-frame caches can
     // evict their old handles, so release both caches here.
-    if model.page.is_none() {
+    if model.page.is_none()
+        && model.navigation.standard.as_ref().is_none_or(|s| {
+            model.navigation.standard_refresh_pending
+                || !matches!(
+                    s.descriptor.view,
+                    crikey_core::structured_view::StandardView::Grid(_)
+                )
+        })
+    {
         release_page_textures(context);
         release_web_texture(context);
         clear_web_page_geometry(context);
@@ -3398,7 +3466,11 @@ fn draw_launcher(
                         });
                 });
             }
-            if !model.settings_open && model.page.is_none() && model.navigation.inline_arguments.is_some() {
+            if !model.settings_open
+                && model.page.is_none()
+                && model.navigation.inline_arguments.is_some()
+                && !model.navigation.standard_refresh_pending
+            {
                 egui::ScrollArea::vertical()
                     .id_salt("inline-input")
                     .max_height(240.0)
@@ -3462,6 +3534,8 @@ fn draw_launcher(
                     .max_height((ui.available_height() - theme::FOOTER_HEIGHT - theme::SPACE_3).max(0.0))
                     .auto_shrink([false, true])
                     .show(ui, |ui| draw_settings(ui, model, commands, colors));
+            } else if model.navigation.standard_route {
+                standard_render::draw(ui, model, commands, colors);
             } else if shows_results(model)
                 && !(model.navigation.can_go_back && model.navigation.unavailable.is_some())
             {
@@ -3734,6 +3808,9 @@ fn draw_results(
 #[path = "preview_render.rs"]
 mod preview_render;
 
+#[path = "standard_render.rs"]
+mod standard_render;
+
 /// Draws one result row and hands back the response covering it, which is what
 /// [`draw_results`] needs to decide whether the list should follow the
 /// selection. The row itself never scrolls: only the list knows whether the
@@ -3742,6 +3819,14 @@ fn actionless_primary(row: &ResultRow, model: &ViewModel) -> bool {
     let crate::ActionTarget::Result { owner, item } = &row.target else {
         return false;
     };
+    if let Some(surface) = &model.navigation.standard {
+        return surface.descriptor.definitions.iter().any(|definition| {
+            &definition.item.plugin_id == owner
+                && &definition.item.stable_id == item
+                && definition.item.actions.is_empty()
+                && definition.actionless_policy.is_some()
+        });
+    }
     model
         .navigation
         .actionless_targets
@@ -3750,6 +3835,9 @@ fn actionless_primary(row: &ResultRow, model: &ViewModel) -> bool {
 }
 
 fn root_primary_command(row: &ResultRow, model: &ViewModel) -> Option<UiCommand> {
+    if model.navigation.standard.is_some() {
+        return standard_render::primary_command(model);
+    }
     row.primary_command(model.generation, &model.query).or_else(|| {
         actionless_primary(row, model).then(|| UiCommand::ActivateActionless {
             target: row.target.clone(),
@@ -8828,5 +8916,129 @@ mod preview_admission_tests {
         assert!(Arc::ptr_eq(&admitted.rows, &provider.rows));
         provider.generation = crikey_core::Generation::from_raw(2);
         assert!(with_overlay(&mailbox, 1, &provider).preview.status.is_none());
+    }
+}
+
+#[cfg(test)]
+mod popup_keyboard_tests {
+    use super::*;
+    use crikey_core::structured_view::*;
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn native_menu_escape_closes_popup_before_back_and_right_stays_on_route() {
+        let mut model = crate::LauncherViewModel::new();
+        model.activate();
+        let descriptor = crate::standard_view::tests::descriptor(6);
+        let owner = descriptor.definitions[0].item.plugin_id.clone();
+        let request = model
+            .open_standard_route(
+                owner.clone(),
+                7,
+                StructuredRouteOutcome::Push(RouteId("grid".into())),
+            )
+            .unwrap();
+        assert!(model.publish_standard_view(
+            owner,
+            7,
+            ViewReply {
+                context: ViewExecutionContext {
+                    route: request.route,
+                    session: request.session,
+                    revision: NonZeroU64::new(11).unwrap()
+                },
+                descriptor,
+            }
+        ));
+        let logical = model.standard_surface().unwrap().context.session.logical_view;
+        let renderer = create_launcher_context();
+        let frame = model.frame().unwrap();
+        let raw = |events| egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(720.0, 640.0),
+            )),
+            ..Default::default()
+        };
+        let first = build_launcher_frame(&renderer, raw(vec![]), &frame);
+        let position = first
+            .output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                let egui::epaint::Shape::Text(text) = &shape.shape else {
+                    return None;
+                };
+                (text.galley.text() == "Actions  Ctrl+K")
+                    .then(|| text.galley.rect.translate(text.pos.to_vec2()).center())
+            })
+            .expect("route actions menu");
+        build_launcher_frame(
+            &renderer,
+            raw(vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            &frame,
+        );
+        assert!(egui_popup_open(&renderer));
+        assert!(translate_keyboard(
+            Key::Named(NamedKey::Escape),
+            ElementState::Pressed,
+            ModifiersState::empty(),
+            Some(&frame),
+            egui_popup_open(&renderer)
+        )
+        .is_none());
+        let closed = build_launcher_frame(
+            &renderer,
+            raw(vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]),
+            &frame,
+        );
+        assert!(!closed
+            .commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::Cancel | UiCommand::Back)));
+        for command in closed.commands {
+            model.apply(command);
+        }
+        // Finish the popup's close/repaint lifetime before the next native key.
+        build_launcher_frame(&renderer, raw(vec![]), &frame);
+        assert!(
+            !egui_popup_open(&renderer),
+            "Escape closes the native menu, not its route"
+        );
+        let right = translate_keyboard(
+            Key::Named(NamedKey::ArrowRight),
+            ElementState::Pressed,
+            ModifiersState::empty(),
+            Some(&frame),
+            egui_popup_open(&renderer),
+        )
+        .unwrap();
+        model.apply(right);
+        assert_eq!(
+            model.standard_surface().unwrap().context.session.logical_view,
+            logical
+        );
+        assert_eq!(model.standard_host_state().selected.unwrap().item.0, "item-1");
     }
 }

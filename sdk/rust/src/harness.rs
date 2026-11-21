@@ -66,6 +66,30 @@ struct StartupProbe {
 }
 
 impl Plugin for StartupProbe {
+    fn supports_structured_views(&self) -> bool {
+        self.plugin.supports_structured_views()
+    }
+    fn structured_view(
+        &mut self,
+        request: &crate::ViewRequest,
+        context: &dyn PluginContext,
+    ) -> Result<crate::ViewDescriptor> {
+        self.plugin.structured_view(request, context)
+    }
+    fn execute_view(
+        &mut self,
+        request: crate::ViewExecuteRequest,
+        context: &dyn PluginContext,
+    ) -> Result<ExecuteOutcome> {
+        self.plugin.execute_view(request, context)
+    }
+    fn execute_view_typed(
+        &mut self,
+        request: crate::ViewTypedExecuteRequest,
+        context: &dyn PluginContext,
+    ) -> Result<crate::TypedExecutionOutcome> {
+        self.plugin.execute_view_typed(request, context)
+    }
     fn supports_typed_arguments(&self) -> bool {
         self.plugin.supports_typed_arguments()
     }
@@ -86,7 +110,7 @@ impl Plugin for StartupProbe {
         &mut self,
         request: crate::TypedExecuteRequest,
         context: &dyn PluginContext,
-    ) -> Result<crate::SubmissionOutcome> {
+    ) -> Result<crate::TypedExecutionOutcome> {
         self.plugin.execute_typed(request, context)
     }
     fn start(&mut self, context: &dyn PluginContext) -> Result<()> {
@@ -268,6 +292,9 @@ impl TestHarness {
                     "cancellation".to_owned(),
                     crikey_core::PREVIEW_CAPABILITY.to_owned(),
                     crikey_core::command::COMMANDS_CAPABILITY.to_owned(),
+                    "typed_arguments_v1".to_owned(),
+                    "result_presentation_v1".to_owned(),
+                    crate::STRUCTURED_VIEW_CAPABILITY.to_owned(),
                 ],
                 host_version: "sdk-test-harness".to_owned(),
                 accepted: true,
@@ -462,6 +489,9 @@ impl TestHarness {
             ExecuteOutcome::ShowPage { page_id } => Err(SdkError::Protocol(format!(
                 "action opened page {page_id} instead of completing"
             ))),
+            ExecuteOutcome::Navigate(_) => Err(SdkError::Protocol(
+                "action navigated instead of completing".into(),
+            )),
         }
     }
 
@@ -484,6 +514,7 @@ impl TestHarness {
                 item_id: item.to_owned(),
                 action_id: action.unwrap_or_default().to_owned(),
                 argument: argument.unwrap_or_default().to_owned(),
+                view: None,
                 unknown: Default::default(),
             })),
             unknown: Default::default(),
@@ -503,6 +534,15 @@ impl TestHarness {
                         ));
                     }
                     return Ok(ExecuteOutcome::show_page(result.page_id));
+                }
+                Some(Payload::ExecuteResult(result)) if result.outcome.as_i32() == 5 => {
+                    let navigation = result
+                        .navigation
+                        .ok_or_else(|| SdkError::Protocol("action navigated without a route".into()))?;
+                    return Ok(ExecuteOutcome::Navigate(
+                        crikey_native_protocol::structured_view::from_navigation(navigation)
+                            .map_err(SdkError::from)?,
+                    ));
                 }
                 Some(Payload::ExecuteResult(result)) => {
                     let detail = result

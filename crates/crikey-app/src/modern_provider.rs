@@ -2202,6 +2202,111 @@ impl ModernProvider {
             .collect()
     }
 
+    fn execute_view_request(
+        &mut self,
+        queued: &mut crate::standard_view::QueuedView,
+    ) -> crikey_core::Result<crate::ActionEffect> {
+        let _guard = queued
+            .admission
+            .take()
+            .ok_or(crikey_core::CoreError::Cancelled)?
+            .acquire(queued.deadline, &queued.cancelled)?;
+        if !queued.current() {
+            return Err(crikey_core::CoreError::Cancelled);
+        }
+        let key = self
+            .loaded
+            .iter()
+            .find(|loaded| loaded.plugin == queued.owner)
+            .map(|loaded| loaded.key.clone())
+            .ok_or_else(|| crikey_core::CoreError::Invalid("view owner unavailable".into()))?;
+        // Never reacquire a different physical producer for a route.
+        let worker = self
+            .pool
+            .live_mut(&key)
+            .ok_or_else(|| crikey_core::CoreError::Invalid("view producer unavailable".into()))?;
+        if worker.incarnation() != queued.producer || !worker.is_alive() {
+            return Err(crikey_core::CoreError::Invalid(
+                "view producer unavailable".into(),
+            ));
+        }
+        let values = match &mut queued.operation {
+            crate::standard_view::ViewOperation::Execute { values, .. } => values.take(),
+            _ => None,
+        };
+        let cancel = worker.cancel_handle();
+        cancel.reset();
+        match &queued.operation {
+            crate::standard_view::ViewOperation::Request(request) => {
+                let reply = crate::standard_view::with_cancellation(
+                    queued,
+                    || cancel.cancel(),
+                    || worker.structured_view_with_admission(request, |send| queued.deliver(send)),
+                )
+                .map_err(|_| crikey_core::CoreError::Invalid("standard view request failed".into()))?;
+                // Publication retires pending-request identity only after the
+                // physical callback watcher has stopped and joined.
+                queued
+                    .authority
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .publish(queued, request, reply)
+            }
+            crate::standard_view::ViewOperation::Execute {
+                context,
+                executable,
+                item,
+                schema,
+                argument,
+                ..
+            } => crate::standard_view::with_cancellation(
+                queued,
+                || cancel.cancel(),
+                || {
+                    if !queued.current() {
+                        return Err(crikey_core::CoreError::Cancelled);
+                    }
+                    let action = executable.action.as_ref().map(|id| id.0.as_str());
+                    if let Some(schema) = schema {
+                        let outcome = worker
+                            .typed_execute_with_admission(
+                                item,
+                                action,
+                                schema,
+                                values.ok_or(crikey_core::CoreError::Cancelled)?,
+                                Some(context),
+                                |send| queued.deliver(send),
+                            )
+                            .map_err(|_| {
+                                crikey_core::CoreError::Invalid("typed view execution failed".into())
+                            })?;
+                        Ok(crate::standard_view::typed_effect(outcome, queued.producer))
+                    } else {
+                        match worker
+                            .execute_with_admission(
+                                item,
+                                action,
+                                argument.as_deref(),
+                                Some(context),
+                                |send| queued.deliver(send),
+                            )
+                            .map_err(|_| crikey_core::CoreError::Invalid("view execution failed".into()))?
+                        {
+                            ExecuteOutcome::Ok => Ok(crate::ActionEffect::Completed),
+                            ExecuteOutcome::Navigate(outcome) => Ok(crate::ActionEffect::Navigate {
+                                outcome,
+                                producer: queued.producer,
+                            }),
+                            ExecuteOutcome::Failed(_) => {
+                                Err(crikey_core::CoreError::Invalid("view execution refused".into()))
+                            }
+                        }
+                    }
+                },
+            ),
+        }
+    }
+
     /// Validates and executes one admitted plugin action on its owning worker.
     ///
     /// The request owns the action guard. Keeping it in this function until
@@ -2305,7 +2410,12 @@ impl ModernProvider {
             request
                 .work
                 .validate(&current_item, request.argument.as_deref())?;
-        } else if request.origin.is_some() {
+        } else if request.origin.is_some()
+            && !matches!(
+                &request.work,
+                crate::plugin_action::AdmittedPluginWork::Actionless { .. }
+            )
+        {
             // Static ordinary actions carry their accepted canonical item.
             // Healthy lazy release must not replace its frozen policy with a
             // later catalog row. Dynamic actions still require a live origin.
@@ -2405,6 +2515,7 @@ impl ModernProvider {
             }
         }
 
+        let physical_producer = worker.incarnation();
         if let Some(binding) = request.work.typed_binding().cloned() {
             let action = binding.executable.action.as_ref().map(|id| id.0.as_str());
             if !worker
@@ -2453,7 +2564,7 @@ impl ModernProvider {
                 });
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
                     worker
-                        .typed_execute_with_admission(item, action, &binding.schema, values, |send| {
+                        .typed_execute_with_admission(item, action, &binding.schema, values, None, |send| {
                             let root = root.lock().unwrap_or_else(|error| error.into_inner());
                             cancellation.source_current(&binding.source)
                                 && root.frozen_item(&binding).is_some()
@@ -2469,22 +2580,45 @@ impl ModernProvider {
                 outcome
             });
             return match outcome {
-                Ok(Ok(outcome)) => Ok(crate::ActionEffect::Typed(outcome)),
+                Ok(Ok(outcome)) => Ok(crate::standard_view::typed_effect(outcome, physical_producer)),
                 Ok(Err(error)) => Err(error),
                 _ => Err(crikey_core::CoreError::Invalid(
                     "typed modern execution failed".into(),
                 )),
             };
         }
+        // The previous speculative callback may have cooperatively cancelled
+        // on this same physical worker. Its terminal has released the lease;
+        // clear that call's Event before dispatching this admitted Root call.
+        // The current request flag/deadline are still checked by the writer gate.
+        worker.cancel_handle().reset();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            worker.execute(
+            worker.execute_with_admission(
                 item,
                 request.work.action_id().map(|id| id.0.as_str()),
                 request.argument.as_deref(),
+                None,
+                |send| {
+                    if request.cancelled.load(Ordering::Acquire) || Instant::now() >= request.deadline {
+                        return false;
+                    }
+                    if let crate::plugin_action::AdmittedPluginWork::Actionless { source } = &request.work {
+                        let root = self.catalog.root.lock().unwrap_or_else(|e| e.into_inner());
+                        self.cancellation.source_current(source)
+                            && root.actionless_item(&plugin, &item.stable_id, source).is_some()
+                            && send()
+                    } else {
+                        send()
+                    }
+                },
             )
         }));
         match outcome {
             Ok(Ok(ExecuteOutcome::Ok)) => Ok(crate::ActionEffect::Completed),
+            Ok(Ok(ExecuteOutcome::Navigate(outcome))) => Ok(crate::ActionEffect::Navigate {
+                outcome,
+                producer: physical_producer,
+            }),
             Ok(Ok(ExecuteOutcome::Failed(error))) => {
                 let reason = format!("modern plugin action failed: {}", error.message);
                 self.pool.record_dispatch_failure(plugin.clone(), reason.clone());
@@ -3033,6 +3167,7 @@ struct ModernActionRequest {
 enum ModernWork {
     Query(ModernJob),
     Action(Box<ModernActionRequest>),
+    View(crate::standard_view::QueuedView),
     Preview(ModernPreviewJob),
     Refresh,
     /// Publish this complete configuration state to every loaded plugin.
@@ -3042,7 +3177,7 @@ enum ModernWork {
 /// Bounded action endpoint retained by the live modern driver.
 #[derive(Debug)]
 struct ModernActionEndpoint {
-    sender: SyncSender<ModernActionRequest>,
+    sender: SyncSender<crate::standard_view::ForegroundRequest<ModernActionRequest>>,
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
     action_wake: crate::plugin_action::CompletionWake,
     gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
@@ -3052,6 +3187,7 @@ struct ModernActionEndpoint {
     static_catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     accepted_commands: ModernAcceptedCommands,
     root: Arc<Mutex<RootSourceLedger>>,
+    views: Arc<Mutex<crate::standard_view::ViewAuthority>>,
     cancellation: Arc<ModernCancellation>,
     incarnations: Arc<Mutex<BTreeMap<PluginId, u64>>>,
     pending: Arc<Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>>,
@@ -3061,6 +3197,43 @@ struct ModernActionEndpoint {
 }
 
 impl ModernActionEndpoint {
+    fn view_producer(&self, owner: &PluginId) -> Option<u64> {
+        self.incarnations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(owner)
+            .copied()
+    }
+    fn enqueue_view(
+        &self,
+        owner: &PluginId,
+        producer: u64,
+        operation: crate::standard_view::ViewOperation,
+    ) -> crikey_core::Result<ActionRequestId> {
+        for (_, cancelled) in self
+            .preview_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            cancelled.store(true, Ordering::Release);
+        }
+        let request_id = crate::standard_view::enqueue(
+            &self.sender,
+            &self.gates,
+            &self.pending,
+            &self.in_flight,
+            &self.next_id,
+            &self.views,
+            owner,
+            producer,
+            operation,
+            ACTION_IN_FLIGHT_CAPACITY,
+            ACTION_TIMEOUT_MS,
+        )?;
+        self.mailbox.1.notify_one();
+        Ok(request_id)
+    }
     fn enqueue(
         &self,
         plugin: &PluginId,
@@ -3078,6 +3251,7 @@ impl ModernActionEndpoint {
             action: work.action_id().cloned(),
         };
         if work.typed_binding().is_none()
+            && !matches!(&work, crate::plugin_action::AdmittedPluginWork::Actionless { .. })
             && self
                 .root
                 .lock()
@@ -3153,7 +3327,10 @@ impl ModernActionEndpoint {
             deadline: Instant::now() + Duration::from_millis(ACTION_TIMEOUT_MS),
             cancelled,
         };
-        if let Err(error) = self.sender.try_send(request) {
+        if let Err(error) = self
+            .sender
+            .try_send(crate::standard_view::ForegroundRequest::Action(request))
+        {
             self.pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3179,6 +3356,162 @@ impl ModernActionEndpoint {
 }
 
 impl crate::PluginActionExecutor for ModernActionEndpoint {
+    fn root_actionless_source(
+        &self,
+        owner: &PluginId,
+        item: &ItemId,
+        canonical: Option<&crate::plugin_action::DeclaredCommandSource>,
+    ) -> Option<RootSource> {
+        let source = self
+            .root
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .actionless_source(owner, item, canonical)?;
+        (self.cancellation.source_current(&source)
+            && match &source {
+                RootSource::Catalog(_) => true,
+                RootSource::Suggestion { producer, .. } => {
+                    self.incarnations
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(owner)
+                        == Some(producer)
+                }
+            })
+        .then_some(source)
+    }
+    fn submit_actionless(
+        &self,
+        owner: &PluginId,
+        item: &ItemId,
+        source: &RootSource,
+    ) -> crikey_core::Result<ActionRequestId> {
+        let canonical = match source {
+            RootSource::Catalog(source) => Some(source),
+            _ => None,
+        };
+        if self.root_actionless_source(owner, item, canonical).as_ref() != Some(source) {
+            return Err(crikey_core::CoreError::Invalid(
+                "actionless root source retired".into(),
+            ));
+        }
+        let item = self
+            .root
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .actionless_item(owner, item, source)
+            .cloned()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("actionless root source retired".into()))?;
+        let origin = match source {
+            RootSource::Catalog(_) => None,
+            RootSource::Suggestion { producer, .. } => Some(*producer),
+        };
+        self.enqueue(
+            owner,
+            item,
+            origin,
+            crate::plugin_action::AdmittedPluginWork::Actionless {
+                source: source.clone(),
+            },
+            None,
+            false,
+        )
+        .map(|receipt| receipt.request_id)
+    }
+    fn request_view(
+        &self,
+        owner: &PluginId,
+        producer: u64,
+        request: crikey_core::structured_view::ViewRequest,
+    ) -> crikey_core::Result<ActionRequestId> {
+        if self.view_producer(owner) != Some(producer) {
+            return Err(crikey_core::CoreError::Invalid(
+                "view producer unavailable".into(),
+            ));
+        }
+        self.enqueue_view(
+            owner,
+            producer,
+            crate::standard_view::ViewOperation::Request(request),
+        )
+    }
+    fn submit_view_action(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+        state: &crikey_core::structured_view::HostViewState,
+        executable: &crikey_core::structured_arguments::ExecutableKey,
+        argument: Option<&str>,
+    ) -> crikey_core::Result<ActionRequestId> {
+        let producer = self
+            .view_producer(owner)
+            .ok_or_else(|| crikey_core::CoreError::Invalid("view producer unavailable".into()))?;
+        let operation = crate::standard_view::execution(
+            &self.views,
+            owner,
+            producer,
+            crate::standard_view::ViewEventContext { context, state },
+            executable,
+            None,
+            argument,
+        )?;
+        self.enqueue_view(owner, producer, operation)
+    }
+    fn submit_view_typed(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+        state: &crikey_core::structured_view::HostViewState,
+        executable: &crikey_core::structured_arguments::ExecutableKey,
+        values: crikey_core::structured_arguments::ArgumentValues,
+    ) -> crikey_core::Result<ActionRequestId> {
+        let producer = self
+            .view_producer(owner)
+            .ok_or_else(|| crikey_core::CoreError::Invalid("view producer unavailable".into()))?;
+        let operation = crate::standard_view::execution(
+            &self.views,
+            owner,
+            producer,
+            crate::standard_view::ViewEventContext { context, state },
+            executable,
+            Some(values),
+            None,
+        )?;
+        self.enqueue_view(owner, producer, operation)
+    }
+    fn retire_view(&self, owner: &PluginId, session: crikey_core::structured_view::ViewSessionIdentity) {
+        self.views
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retire(owner, session);
+    }
+    fn view_current(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+    ) -> bool {
+        let producer = self.view_producer(owner);
+        let mut authority = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        if producer.is_none() {
+            authority.retire(owner, context.session);
+        }
+        producer.is_some_and(|producer| authority.current(owner, context, producer))
+    }
+    fn validate_view_link(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+        state: &crikey_core::structured_view::HostViewState,
+        url: &str,
+    ) -> crikey_core::Result<()> {
+        let producer = self
+            .view_producer(owner)
+            .ok_or_else(|| crikey_core::CoreError::Invalid("view producer unavailable".into()))?;
+        self.views
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .validate_link(owner, context, state, producer, url)
+    }
     fn root_binding(
         &self,
         key: &ExecutableKey,
@@ -3580,6 +3913,7 @@ impl ModernDriver {
             static_catalog_items: Arc::clone(&provider.catalog.static_items),
             accepted_commands: Arc::clone(&provider.catalog.accepted_commands),
             root: Arc::clone(&provider.catalog.root),
+            views: Arc::new(Mutex::new(crate::standard_view::ViewAuthority::default())),
             cancellation: Arc::clone(&provider.cancellation),
             incarnations: Arc::clone(&preview_endpoint.incarnations),
             pending: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3598,6 +3932,7 @@ impl ModernDriver {
         let thread_current = Arc::clone(&current);
         let thread_completion_mailbox = Arc::clone(&completion_mailbox);
         let thread_action_wake = action_endpoint.action_wake.clone();
+        let thread_views = Arc::clone(&action_endpoint.views);
         let thread_preview_endpoint = Arc::clone(&preview_endpoint);
         let spawned = std::thread::Builder::new()
             .name("crikey-modern".to_owned())
@@ -3608,6 +3943,27 @@ impl ModernDriver {
                 loop {
                     let catalog_results = provider.take_catalog_results();
                     thread_preview_endpoint.refresh_liveness(&mut provider);
+                    {
+                        let live = thread_preview_endpoint
+                            .incarnations
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        thread_views
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .retain_source(|owner| live.get(owner).copied());
+                        for loaded in &provider.loaded {
+                            if let Some(worker) = provider.pool.live_mut(&loaded.key) {
+                                if !thread_views
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .owns_source(&loaded.plugin, worker.incarnation())
+                                {
+                                    worker.retire_view();
+                                }
+                            }
+                        }
+                    }
                     for result in catalog_results {
                         thread_catalog_results
                             .lock()
@@ -3620,6 +3976,17 @@ impl ModernDriver {
                         loop {
                             if slot.stop {
                                 while let Ok(request) = action_receiver.try_recv() {
+                                    let request = match request {
+                                        crate::standard_view::ForegroundRequest::Action(request) => request,
+                                        crate::standard_view::ForegroundRequest::View(request) => {
+                                            enqueue_modern_completion(
+                                                &thread_completion_mailbox,
+                                                &thread_action_wake,
+                                                request.completion(Err(crikey_core::CoreError::Cancelled)),
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     let completion = PluginActionCompletion {
                                         request_id: request.request_id.clone(),
                                         plugin: request.plugin.clone(),
@@ -3644,7 +4011,14 @@ impl ModernDriver {
                                 return;
                             }
                             if let Ok(request) = action_receiver.try_recv() {
-                                break ModernWork::Action(Box::new(request));
+                                break match request {
+                                    crate::standard_view::ForegroundRequest::Action(request) => {
+                                        ModernWork::Action(Box::new(request))
+                                    }
+                                    crate::standard_view::ForegroundRequest::View(request) => {
+                                        ModernWork::View(request)
+                                    }
+                                };
                             }
                             // Ahead of a query: a plugin about to answer should
                             // answer under the configuration the user just
@@ -3684,6 +4058,24 @@ impl ModernDriver {
                     };
 
                     let job = match work {
+                        ModernWork::View(mut request) => {
+                            let result = catch_unwind(AssertUnwindSafe(|| {
+                                provider.execute_view_request(&mut request)
+                            }))
+                            .unwrap_or_else(|_| {
+                                Err(crikey_core::CoreError::Invalid(
+                                    "standard view worker failed".into(),
+                                ))
+                            });
+                            let result = request.finish(result);
+                            thread_preview_endpoint.refresh_liveness(&mut provider);
+                            enqueue_modern_completion(
+                                &thread_completion_mailbox,
+                                &thread_action_wake,
+                                request.completion(result),
+                            );
+                            continue;
+                        }
                         ModernWork::Refresh => continue,
                         ModernWork::Preview(request) => {
                             thread_preview_endpoint.execute(&mut provider, request);
@@ -3731,12 +4123,12 @@ impl ModernDriver {
                                 action_id,
                                 outcome: result,
                             };
+                            thread_preview_endpoint.refresh_liveness(&mut provider);
                             enqueue_modern_completion(
                                 &thread_completion_mailbox,
                                 &thread_action_wake,
                                 completion,
                             );
-                            thread_preview_endpoint.refresh_liveness(&mut provider);
                             *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
                                 pipeline.plugin_health_report();
                             continue;
@@ -4520,6 +4912,19 @@ mod preview_origin_tests {
             assert_eq!(completions[0].outcome.is_ok(), mode == "execute");
             wait_for(|| preview_state.lock().unwrap().is_some());
             assert_eq!(*preview_state.lock().unwrap(), Some(PreviewState::Cancelled));
+            assert_eq!(
+                driver.action_endpoint.gates[&plugin]
+                    .budget()
+                    .in_flight(crikey_plugin_supervisor::BudgetKind::Action),
+                0,
+                "only the physical preview/action terminals release the shared slot"
+            );
+            assert!(!driver.action_endpoint.gates[&plugin].has_foreground());
+            assert_eq!(
+                driver.preview_endpoint.incarnations.lock().unwrap().get(&plugin),
+                Some(&source.producer),
+                "handoff must retain the same physical canonical producer"
+            );
             if mode == "execute" {
                 let executions = fs::read_to_string(root.join("executions")).unwrap();
                 assert_eq!(executions.lines().count(), 1);
@@ -4927,7 +5332,12 @@ mod query_history_receipt_tests {
         );
     }
 
-    fn endpoint(item: Item) -> (ModernActionEndpoint, mpsc::Receiver<ModernActionRequest>) {
+    fn endpoint(
+        item: Item,
+    ) -> (
+        ModernActionEndpoint,
+        crate::standard_view::ActionReceiver<ModernActionRequest>,
+    ) {
         let (sender, receiver) = mpsc::sync_channel(1);
         let owner = item.plugin_id.clone();
         (
@@ -4951,6 +5361,7 @@ mod query_history_receipt_tests {
                 static_catalog_items: Arc::default(),
                 accepted_commands: Arc::default(),
                 root: Arc::default(),
+                views: Arc::default(),
                 cancellation: Arc::default(),
                 pending: Arc::default(),
                 in_flight: Arc::default(),
@@ -4964,7 +5375,7 @@ mod query_history_receipt_tests {
                     Condvar::new(),
                 )),
             },
-            receiver,
+            crate::standard_view::ActionReceiver(receiver),
         )
     }
 
@@ -5096,6 +5507,130 @@ mod query_history_receipt_tests {
     impl Drop for ProcessFixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn real_modern_open_and_refresh_retirement_fences_the_final_writer_queue() {
+        use crikey_core::structured_view::*;
+        use std::num::NonZeroU64;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for refresh in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "crikey-modern-route-writer-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            let fixture = ProcessFixture(root);
+            let package = fixture.0.join("plugins/views");
+            fs::create_dir_all(&package).unwrap();
+            fs::write(package.join("crikey.toml"), "manifest-version = 1\n[plugin]\nid = \"views\"\nname = \"Views\"\nversion = \"1.0.0\"\nruntime = \"python\"\nentrypoint = \"views_plugin:ViewsPlugin\"\n[python]\nrequires-python = \">=3.12\"\n").unwrap();
+            fs::write(
+                package.join("views_plugin.py"),
+                include_str!("../../../compatibility/test-plugins/modern-views/views_plugin.py"),
+            )
+            .unwrap();
+            let mut pipeline = QueryPipeline::new(crate::PipelineConfig::default());
+            let mut provider = ModernProvider::load(
+                &mut pipeline,
+                &[fixture.0.join("plugins")],
+                None,
+                fixture.0.join("cache"),
+                &DisabledPlugins::default(),
+            );
+            assert_eq!(provider.loaded.len(), 1, "{:?}", provider.unavailable());
+            let owner = provider.loaded[0].plugin.clone();
+            let key = provider.loaded[0].key.clone();
+            let gates = BTreeMap::from([(
+                owner.clone(),
+                PreviewActionGate::new(Arc::clone(&provider.loaded[0].budget)),
+            )]);
+            provider.ensure_worker(&owner, &key).unwrap();
+            let producer = provider.pool.live_mut(&key).unwrap().incarnation();
+            let authority = Arc::new(Mutex::new(crate::standard_view::ViewAuthority::default()));
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let pending = Mutex::new(BTreeMap::new());
+            let in_flight = AtomicUsize::new(0);
+            let next_id = AtomicU64::new(0);
+            let enqueue = |request| {
+                crate::standard_view::enqueue::<ModernActionRequest>(
+                    &sender,
+                    &gates,
+                    &pending,
+                    &in_flight,
+                    &next_id,
+                    &authority,
+                    &owner,
+                    producer,
+                    crate::standard_view::ViewOperation::Request(request),
+                    ACTION_IN_FLIGHT_CAPACITY,
+                    ACTION_TIMEOUT_MS,
+                )
+                .unwrap();
+                match receiver.recv().unwrap() {
+                    crate::standard_view::ForegroundRequest::View(queued) => queued,
+                    _ => panic!("the route must use the existing foreground queue"),
+                }
+            };
+            let session = ViewSessionIdentity {
+                logical_view: NonZeroU64::new(1).unwrap(),
+                surface: NonZeroU64::new(1).unwrap(),
+            };
+            let request = ViewRequest {
+                mode: ViewRequestMode::Open,
+                route: RouteId("gallery".into()),
+                session,
+                previous_revision: None,
+                state: None,
+                query: String::new(),
+                scroll: None,
+                reason: ViewRefreshReason::Explicit,
+            };
+            let mut seed = enqueue(request);
+            let effect = provider.execute_view_request(&mut seed);
+            let crate::ActionEffect::View(reply) = seed.finish(effect).unwrap() else {
+                panic!("seed Open must publish");
+            };
+            let crate::standard_view::ViewOperation::Request(mut request) = seed.operation else {
+                panic!("seed owns its request");
+            };
+            if refresh {
+                request.mode = ViewRequestMode::Refresh;
+                request.previous_revision = Some(reply.context.revision);
+                let admission = RouteAdmission::worker(
+                    RouteIdentity {
+                        owner: owner.clone(),
+                        route: request.route.clone(),
+                        incarnation: NonZeroU64::new(producer).unwrap(),
+                    },
+                    reply.context.surface(),
+                )
+                .unwrap();
+                request.state = Some(reply.descriptor.initial_state(&admission).unwrap());
+            } else {
+                request.session.surface = NonZeroU64::new(2).unwrap();
+            }
+            request.query = "delay".into();
+            let session = request.session;
+            let mut queued = enqueue(request);
+            let (ready, at_writer) = mpsc::sync_channel(1);
+            let (release, released) = mpsc::sync_channel(1);
+            queued.before_send = Some((ready, Mutex::new(released)));
+            let result = thread::scope(|scope| {
+                let callback = scope.spawn(|| provider.execute_view_request(&mut queued));
+                at_writer
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the real consumer must reach final writer admission");
+                authority.lock().unwrap().retire(&owner, session);
+                release.send(()).unwrap();
+                callback.join().unwrap()
+            });
+            assert!(queued.finish(result).is_err());
+            assert!(
+                !package.join("route-running").exists(),
+                "retired Open/Refresh must never invoke the real Python callback"
+            );
         }
     }
 

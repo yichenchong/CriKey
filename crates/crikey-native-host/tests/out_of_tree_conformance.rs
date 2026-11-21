@@ -17,6 +17,7 @@ use crikey_core::structured_arguments::{
     ArgumentValues, FieldId, NonSecretValue, OptionId, Password, StructuredValue, SubmissionFailureCode,
     SubmissionFieldCode, SubmissionFieldFailure, SubmissionOutcome,
 };
+use crikey_core::structured_view::TypedExecutionOutcome;
 use crikey_core::PluginId;
 use crikey_core::{ActionId, ItemId};
 use crikey_native_host::{
@@ -368,7 +369,7 @@ fn real_typed_worker_authenticates_actionless_and_declared_actions() {
                     typed_values("conformance-secret"),
                 )
                 .unwrap(),
-            SubmissionOutcome::Completed
+            TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
         );
         assert_eq!(
             worker
@@ -379,7 +380,9 @@ fn real_typed_worker_authenticates_actionless_and_declared_actions() {
                     typed_values("conformance-secret"),
                 )
                 .unwrap(),
-            SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch)
+            TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(
+                SubmissionFailureCode::SchemaMismatch
+            ))
         );
         assert_eq!(
             worker
@@ -390,7 +393,7 @@ fn real_typed_worker_authenticates_actionless_and_declared_actions() {
                     typed_values("conformance-secret"),
                 )
                 .unwrap(),
-            SubmissionOutcome::Completed
+            TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
         );
         assert_eq!(
             worker
@@ -401,10 +404,12 @@ fn real_typed_worker_authenticates_actionless_and_declared_actions() {
                     typed_values("wrong-password"),
                 )
                 .unwrap(),
-            SubmissionOutcome::InvalidFields(vec![SubmissionFieldFailure {
-                field: FieldId("password".into()),
-                code: SubmissionFieldCode::Rejected,
-            }])
+            TypedExecutionOutcome::Submission(SubmissionOutcome::InvalidFields(vec![
+                SubmissionFieldFailure {
+                    field: FieldId("password".into()),
+                    code: SubmissionFieldCode::Rejected,
+                }
+            ]))
         );
         assert!(worker.shutdown().stderr_tail.is_empty());
     }
@@ -433,7 +438,7 @@ fn real_scoped_suggestions_retire_dynamic_schema_authority() {
                 typed_values("conformance-secret"),
             )
             .unwrap(),
-        SubmissionOutcome::Completed
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
     );
     let TypedPreparation::Ready(confirmed) = worker
         .prepare_typed_execution(&ItemId("typed-suggestion".into()), None, fingerprint)
@@ -453,7 +458,7 @@ fn real_scoped_suggestions_retire_dynamic_schema_authority() {
         worker
             .execute_typed_confirmed(confirmed, typed_values("conformance-secret"))
             .unwrap(),
-        SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch)
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch))
     );
     worker.shutdown();
 
@@ -529,13 +534,13 @@ fn healthy_suggestion_first_worker_bootstraps_static_schema_without_regenerating
         worker
             .execute_typed_confirmed(confirmed, typed_values("conformance-secret"))
             .unwrap(),
-        SubmissionOutcome::Completed
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
     );
     assert_eq!(
         worker
             .execute_typed_confirmed(dynamic_confirmed, typed_values("conformance-secret"))
             .unwrap(),
-        SubmissionOutcome::Completed,
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Completed),
         "static discovery must preserve the existing dynamic binding"
     );
 
@@ -578,7 +583,7 @@ fn released_worker_bootstraps_static_schema_but_refuses_stale_confirmation_and_f
         worker
             .execute_typed_confirmed(confirmed, typed_values("conformance-secret"))
             .unwrap(),
-        SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch)
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch))
     );
     assert!(
         worker.catalog_presentation().is_none(),
@@ -593,7 +598,7 @@ fn released_worker_bootstraps_static_schema_but_refuses_stale_confirmation_and_f
                 typed_values("conformance-secret"),
             )
             .unwrap(),
-        SubmissionOutcome::Completed
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
     );
     assert!(
         worker.catalog_presentation().is_some(),
@@ -612,7 +617,7 @@ fn released_worker_bootstraps_static_schema_but_refuses_stale_confirmation_and_f
                 typed_values("conformance-secret"),
             )
             .unwrap(),
-        SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch)
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch))
     );
     assert_ne!(
         changed.catalog_presentation().unwrap().schemas[0]
@@ -644,7 +649,7 @@ fn real_worker_privacy_survives_background_panics_and_later_callbacks() {
                     typed_values("private-incarnation-marker"),
                 )
                 .unwrap(),
-            SubmissionOutcome::Failed(SubmissionFailureCode::Failed)
+            TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(SubmissionFailureCode::Failed))
         );
         for generation in 1..=2 {
             let response = worker
@@ -684,8 +689,269 @@ fn real_worker_hostile_field_failures_become_fixed_global_refusals() {
                 typed_values("conformance-secret"),
             )
             .unwrap(),
-        SubmissionOutcome::Failed(SubmissionFailureCode::Failed)
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(SubmissionFailureCode::Failed))
     );
     assert!(worker.is_alive());
     assert!(worker.shutdown().stderr_tail.is_empty());
+}
+
+fn view_request(route: &str, surface: u64) -> crikey_core::structured_view::ViewRequest {
+    use crikey_core::structured_view::*;
+    use std::num::NonZeroU64;
+    ViewRequest {
+        route: RouteId(route.into()),
+        session: ViewSessionIdentity {
+            logical_view: NonZeroU64::new(1).unwrap(),
+            surface: NonZeroU64::new(surface).unwrap(),
+        },
+        mode: ViewRequestMode::Open,
+        previous_revision: None,
+        state: None,
+        query: String::new(),
+        scroll: None,
+        reason: ViewRefreshReason::Explicit,
+    }
+}
+
+fn view_values(password: &str, destination: &str) -> ArgumentValues {
+    ArgumentValues(std::collections::BTreeMap::from([
+        (
+            FieldId("username".into()),
+            StructuredValue::NonSecret(NonSecretValue::Text("alice".into())),
+        ),
+        (
+            FieldId("password".into()),
+            StructuredValue::Password(Password::new(password.into()).unwrap()),
+        ),
+        (
+            FieldId("destination".into()),
+            StructuredValue::NonSecret(NonSecretValue::Dropdown(OptionId(destination.into()))),
+        ),
+    ]))
+}
+
+#[test]
+fn real_standard_views_traverse_refresh_and_keep_colliding_root_schema_separate() {
+    use crikey_core::structured_arguments::{ExecutableKey, OwnedItem};
+    use crikey_core::structured_view::*;
+    use crikey_native_host::ExecuteOutcome;
+    let (conformance, _) = conformance_binaries();
+    let executable =
+        conformance.with_file_name(format!("structured-view-fixture{}", std::env::consts::EXE_SUFFIX));
+    for transport in [TransportKind::default(), TransportKind::Stdio] {
+        let mut worker = NativeWorker::spawn(
+            launch_spec(&executable, ""),
+            WorkerOptions::new().with_transport(transport),
+        )
+        .unwrap();
+        assert!(worker.handshake().structured_view);
+        let item = ItemId("shared-item".into());
+        let action = ActionId("open".into());
+        let root_hash = catalog_fingerprint(&mut worker, &item.0, Some(&action.0));
+        assert_eq!(
+            worker
+                .execute(&ItemId("launch".into()), Some(&action), None)
+                .unwrap(),
+            ExecuteOutcome::Navigate(StructuredRouteOutcome::Push(RouteId("grid".into())))
+        );
+        let mut request = view_request("grid", 1);
+        let grid = worker.structured_view(&request).unwrap();
+        assert!(matches!(grid.descriptor.view, StandardView::Grid(_)));
+        assert!(grid.descriptor.definitions[0].item.label.ends_with("opened"));
+        // Refresh replaces definitions and authority under a new correlated revision.
+        request.mode = ViewRequestMode::Refresh;
+        request.previous_revision = Some(grid.context.revision);
+        request.state = Some(HostViewState {
+            selected: Some(OwnedItem {
+                owner: worker.plugin().clone(),
+                item: item.clone(),
+            }),
+            ..Default::default()
+        });
+        let refreshed = worker.structured_view(&request).unwrap();
+        assert_ne!(grid.context.revision, refreshed.context.revision);
+        assert!(refreshed.descriptor.definitions[0]
+            .item
+            .label
+            .ends_with("refreshed"));
+        assert_eq!(
+            worker.execute_view(&grid.context, &item, None, None).unwrap(),
+            ExecuteOutcome::Unsupported
+        );
+        assert_eq!(
+            worker
+                .execute_view(&refreshed.context, &item, Some(&action), None)
+                .unwrap(),
+            ExecuteOutcome::Unsupported
+        );
+        assert_eq!(
+            worker
+                .execute_view(&refreshed.context, &item, None, None)
+                .unwrap(),
+            ExecuteOutcome::Navigate(StructuredRouteOutcome::Push(RouteId("detail".into())))
+        );
+        // The host may refuse navigation retention. Merely returning Navigate
+        // must not discard the producer's still-current descriptor revision.
+        request.previous_revision = Some(refreshed.context.revision);
+        let retained = worker.structured_view(&request).unwrap();
+        assert_ne!(retained.context.revision, refreshed.context.revision);
+        let detail = worker.structured_view(&view_request("detail", 2)).unwrap();
+        assert!(matches!(detail.descriptor.view, StandardView::Detail(_)));
+        assert_eq!(
+            worker.execute_view(&detail.context, &item, None, None).unwrap(),
+            ExecuteOutcome::Unsupported
+        );
+        assert_eq!(
+            worker
+                .execute_view(&detail.context, &item, Some(&action), None)
+                .unwrap(),
+            ExecuteOutcome::Navigate(StructuredRouteOutcome::Replace(RouteId("list".into())))
+        );
+        let list = worker.structured_view(&view_request("list", 3)).unwrap();
+        assert!(matches!(list.descriptor.view, StandardView::List(_)));
+        assert_eq!(
+            worker
+                .execute_view(&list.context, &item, Some(&action), None)
+                .unwrap(),
+            ExecuteOutcome::Navigate(StructuredRouteOutcome::Push(RouteId("form".into())))
+        );
+        let form = worker.structured_view(&view_request("form", 4)).unwrap();
+        assert!(matches!(form.descriptor.view, StandardView::Form(_)));
+        let key = ExecutableKey {
+            target: OwnedItem {
+                owner: worker.plugin().clone(),
+                item: item.clone(),
+            },
+            action: Some(action.clone()),
+        };
+        let route_schema = form
+            .descriptor
+            .definition(&key.target)
+            .unwrap()
+            .presentation(key.action.as_ref())
+            .unwrap()
+            .schema
+            .as_ref()
+            .unwrap();
+        assert_eq!(route_schema.fields.len(), 3);
+        let route_hash = route_schema.fingerprint().unwrap();
+        assert_ne!(route_hash, root_hash);
+        assert!(matches!(
+            worker
+                .prepare_view_typed_execution(&form.context, &item, Some(&action), root_hash)
+                .unwrap(),
+            TypedPreparation::Refused(SubmissionFailureCode::SchemaMismatch)
+        ));
+        assert!(matches!(
+            worker
+                .prepare_typed_execution(&item, Some(&action), route_hash)
+                .unwrap(),
+            TypedPreparation::Refused(SubmissionFailureCode::SchemaMismatch)
+        ));
+        for (password, destination, expected) in [
+            (
+                "wrong",
+                "complete",
+                TypedExecutionOutcome::Submission(SubmissionOutcome::InvalidFields(vec![
+                    SubmissionFieldFailure {
+                        field: FieldId("password".into()),
+                        code: SubmissionFieldCode::Rejected,
+                    },
+                ])),
+            ),
+            (
+                "view-secret",
+                "complete",
+                TypedExecutionOutcome::Submission(SubmissionOutcome::Completed),
+            ),
+            (
+                "view-secret",
+                "navigate",
+                TypedExecutionOutcome::Navigate(StructuredRouteOutcome::Replace(RouteId("grid".into()))),
+            ),
+        ] {
+            let TypedPreparation::Ready(confirmed) = worker
+                .prepare_view_typed_execution(&form.context, &item, Some(&action), route_hash)
+                .unwrap()
+            else {
+                panic!("exact form executable must prepare");
+            };
+            assert_eq!(
+                worker
+                    .execute_typed_confirmed(confirmed, view_values(password, destination))
+                    .unwrap(),
+                expected
+            );
+        }
+        let TypedPreparation::Ready(stale) = worker
+            .prepare_view_typed_execution(&form.context, &item, Some(&action), route_hash)
+            .unwrap()
+        else {
+            panic!("prepare before refresh");
+        };
+        let mut request = view_request("form", 4);
+        request.mode = ViewRequestMode::Refresh;
+        request.previous_revision = Some(form.context.revision);
+        request.state = Some(HostViewState {
+            selected: Some(key.target.clone()),
+            input: Some(key),
+            scope: None,
+        });
+        let replacement = worker.structured_view(&request).unwrap();
+        assert_ne!(replacement.context.revision, form.context.revision);
+        assert_eq!(
+            worker
+                .execute_typed_confirmed(stale, view_values("view-secret", "complete"))
+                .unwrap(),
+            TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(
+                SubmissionFailureCode::SchemaMismatch
+            ))
+        );
+        // Back/resume is a fresh Open, not a replay of the launching action.
+        let resumed = worker.structured_view(&view_request("list", 5)).unwrap();
+        assert!(matches!(resumed.descriptor.view, StandardView::List(_)));
+        assert_ne!(resumed.context.session.surface, list.context.session.surface);
+        assert!(worker.shutdown().stderr_tail.is_empty());
+    }
+}
+
+#[test]
+fn real_standard_view_shared_image_refusal_keeps_worker_alive() {
+    use crikey_core::structured_view::StandardView;
+    let (conformance, _) = conformance_binaries();
+    let executable =
+        conformance.with_file_name(format!("structured-view-fixture{}", std::env::consts::EXE_SUFFIX));
+    for transport in [TransportKind::default(), TransportKind::Stdio] {
+        let mut worker = NativeWorker::spawn(
+            launch_spec(&executable, ""),
+            WorkerOptions::new().with_transport(transport),
+        )
+        .unwrap();
+        let incarnation = worker.incarnation();
+        let mut request = view_request("grid", 1);
+        request.query = "oversized-shared-images".into();
+        let error = worker.structured_view(&request).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crikey_native_host::HostError::PluginFailed { ref detail, .. }
+                    if detail == "structured_view_failed"
+            ),
+            "oversized shared images must be a bounded Failed reply: {error:?}"
+        );
+        let opened = worker.structured_view(&view_request("grid", 2)).unwrap();
+        assert!(matches!(opened.descriptor.view, StandardView::Grid(_)));
+        assert!(opened.descriptor.definitions[0].item.label.ends_with("opened"));
+        assert_eq!(worker.incarnation(), incarnation);
+        assert!(worker.shutdown().stderr_tail.is_empty());
+    }
+}
+
+#[test]
+fn old_worker_explicitly_refuses_standard_views() {
+    let (executable, _) = conformance_binaries();
+    let mut worker = NativeWorker::spawn(launch_spec(&executable, "echo"), WorkerOptions::new()).unwrap();
+    assert!(!worker.handshake().structured_view);
+    assert!(worker.structured_view(&view_request("grid", 1)).is_err());
+    worker.shutdown();
 }

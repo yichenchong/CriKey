@@ -56,6 +56,7 @@ pub enum HostAction {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ActionIdentity {
     InvokeCommand,
+    Actionless,
     Plugin(ActionId),
     Host(HostAction),
     Submenu(String),
@@ -73,6 +74,9 @@ pub struct ActionPresentation {
 
 #[derive(Debug, Clone)]
 pub enum ActionEntry {
+    Actionless {
+        presentation: ActionPresentation,
+    },
     Command {
         presentation: ActionPresentation,
     },
@@ -101,6 +105,7 @@ pub struct ActionSection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionPanelRefusal {
     TooManyEntries,
+    InvalidActionlessTarget,
     TooDeep,
     TextTooLong(&'static str),
     TotalTextTooLong,
@@ -118,6 +123,9 @@ impl fmt::Display for ActionPanelRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TooManyEntries => write!(f, "Action panel exceeds {MAX_ACTION_ENTRIES} entries"),
+            Self::InvalidActionlessTarget => {
+                f.write_str("Actionless execution requires an actionless result")
+            }
             Self::TooDeep => write!(f, "Action panel exceeds depth {MAX_ACTION_DEPTH}"),
             Self::TextTooLong(field) => write!(f, "Action panel {field} exceeds its text limit"),
             Self::TotalTextTooLong => f.write_str("Action panel exceeds its total text limit"),
@@ -218,6 +226,12 @@ impl ActionTree {
                 let child = tree.prepare(entry, index, None, 1, &available, &mut identities, &mut budget)?;
                 tree.sections[index].children.push(child);
             }
+        }
+        if tree.index(&ActionIdentity::Actionless).is_some() {
+            if !matches!(row.target, ActionTarget::Result { .. }) || !available.is_empty() {
+                return Err(ActionPanelRefusal::InvalidActionlessTarget);
+            }
+            tree.primary = Some(ActionIdentity::Actionless);
         }
         if matches!(row.target, ActionTarget::Command(_)) {
             if tree.index(&ActionIdentity::InvokeCommand).is_some() {
@@ -374,6 +388,18 @@ impl ActionTree {
             return Err(ActionPanelInvalidation::ActionUnavailable);
         }
         match identity {
+            ActionIdentity::Actionless => {
+                let ActionTarget::Result { owner, item } = &current.target else {
+                    return Err(ActionPanelInvalidation::ActionUnavailable);
+                };
+                if current.default_action.is_some() || !current.alternate_actions.is_empty() {
+                    return Err(ActionPanelInvalidation::ActionUnavailable);
+                }
+                Ok(Some(ActionExecution::Actionless {
+                    owner: owner.clone(),
+                    item: item.clone(),
+                }))
+            }
             ActionIdentity::InvokeCommand => {
                 let ActionTarget::Command(reference) = &current.target else {
                     return Err(ActionPanelInvalidation::ActionUnavailable);
@@ -441,6 +467,9 @@ impl ActionTree {
             return Err(ActionPanelRefusal::TooManyEntries);
         }
         let (identity, presentation, children) = match entry {
+            ActionEntry::Actionless { presentation } => {
+                (ActionIdentity::Actionless, presentation, Vec::new())
+            }
             ActionEntry::Command { presentation } => {
                 (ActionIdentity::InvokeCommand, presentation, Vec::new())
             }
@@ -569,6 +598,10 @@ pub struct VisibleAction<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionExecution {
+    Actionless {
+        owner: PluginId,
+        item: ItemId,
+    },
     Command {
         reference: crikey_core::CommandRef,
     },
@@ -612,6 +645,54 @@ pub struct ActionPanel {
 }
 
 impl ActionPanel {
+    pub(crate) fn retained_bytes(&self, shared: &mut HashSet<usize>) -> usize {
+        use std::mem::size_of;
+        fn identity_bytes(identity: &ActionIdentity) -> usize {
+            match identity {
+                ActionIdentity::Plugin(id) => id.0.capacity(),
+                ActionIdentity::Submenu(id) => id.capacity(),
+                _ => 0,
+            }
+        }
+        let mut bytes = size_of::<Self>()
+            + 2 * size_of::<usize>()
+            + self.query.capacity()
+            + self.path.capacity() * size_of::<ActionIdentity>()
+            + self.visible.capacity() * size_of::<usize>();
+        bytes += self.path.iter().map(identity_bytes).sum::<usize>()
+            + self.selected.as_ref().map_or(0, identity_bytes)
+            + self.browse_selection.as_ref().map_or(0, identity_bytes);
+        if shared.insert(Arc::as_ptr(&self.tree) as usize) {
+            let tree = &self.tree;
+            bytes += size_of::<ActionTree>()
+                + 2 * size_of::<usize>()
+                + tree.target.retained_bytes()
+                + tree.sections.capacity() * size_of::<PreparedSection>()
+                + tree.entries.capacity() * size_of::<PreparedEntry>()
+                + tree.management.capacity() * size_of::<ResultRow>()
+                + tree.primary.as_ref().map_or(0, identity_bytes);
+            for section in &tree.sections {
+                bytes += section.id.capacity()
+                    + section.label.capacity()
+                    + section.children.capacity() * size_of::<usize>();
+            }
+            for entry in &tree.entries {
+                let presentation = &entry.presentation;
+                bytes += identity_bytes(&entry.identity)
+                    + presentation.label.capacity()
+                    + presentation.description.capacity()
+                    + presentation.icon_reference.as_ref().map_or(0, String::capacity)
+                    + presentation.shortcut.as_ref().map_or(0, String::capacity)
+                    + entry.children.capacity() * size_of::<usize>()
+                    + entry.breadcrumb.capacity()
+                    + entry.search.capacity();
+            }
+            for row in &tree.management {
+                bytes += crate::navigation::row_retained_bytes(row, shared);
+            }
+        }
+        bytes
+    }
     pub fn new(tree: Arc<ActionTree>) -> Self {
         let mut panel = Self {
             focus_token: NEXT_PANEL_FOCUS

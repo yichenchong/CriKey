@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crikey_core::result_presentation::{ExecutableSchemaBinding, ResultPresentation};
 use crikey_core::structured_arguments::*;
+use crikey_core::structured_view::TypedExecutionOutcome;
 use crikey_core::{CoreError, ItemId, Result};
 use crikey_native_protocol::message::{Envelope, Payload};
 use crikey_native_protocol::transport::Transport;
@@ -147,9 +148,13 @@ impl Plugin for Worker {
     fn execute(&mut self, _: ExecuteRequest, _: &dyn PluginContext) -> Result<()> {
         Ok(())
     }
-    fn execute_typed(&mut self, _: TypedExecuteRequest, _: &dyn PluginContext) -> Result<SubmissionOutcome> {
+    fn execute_typed(
+        &mut self,
+        _: TypedExecuteRequest,
+        _: &dyn PluginContext,
+    ) -> Result<TypedExecutionOutcome> {
         std::fs::write("typed-executed", b"executed").unwrap();
-        Ok(SubmissionOutcome::Completed)
+        Ok(SubmissionOutcome::Completed.into())
     }
 }
 fn main() {

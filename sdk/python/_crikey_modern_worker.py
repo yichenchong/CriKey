@@ -35,6 +35,9 @@ import logging
 
 from crikey_sdk import Action, Command, Item, Query, WorkerContext, Plugin, Preview
 from crikey_sdk import ResultPresentation, TypedValues, TypedValue, TypedOutcome
+from crikey_sdk import Push, Replace
+from crikey_sdk.views import _request as _view_request, _descriptor as _view_descriptor
+from crikey_sdk.views import _navigation, _session as _view_session, _identity as _view_identity
 
 
 def _pin_text_stream(stream, name, newline):
@@ -149,7 +152,10 @@ _CAPTURE_ACTIVE = contextvars.ContextVar("crikey_capture_active", default=True)
 _OVERSIZED = object()
 _TYPED_REQUEST_KEYS = frozenset(("id", "kind", "item", "action_id",
                                "schema_fingerprint", "values", "argument",
-                               "field_id", "value"))
+                               "field_id", "value", "view_context", "route", "session",
+                               "logical_view", "surface", "revision", "mode",
+                               "previous_revision", "reason", "state", "query", "anchor",
+                               "selected_item_id", "scope_id", "input_item_id", "input_action_id"))
 
 class _WireObject(dict):
     """Preserve legacy last-wins semantics, flag only new typed known members."""
@@ -394,6 +400,60 @@ logging.Handler.handle = _diagnostic_log_handle
 # --------------------------------------------------------------------------
 
 
+def _preview_to_wire(result):
+    if not isinstance(result, Preview) or type(result.markdown) is not bool:
+        raise TypeError("invalid preview content")
+    total = 0 if result.text is None else len(result.text.encode("utf-8", "strict"))
+    if total > 256 * 1024:
+        raise ValueError("preview aggregate text exceeds 256 KiB")
+    if len(result.values) > 128:
+        raise ValueError("preview exceeds metadata bound")
+    values = []
+    for value in result.values:
+        if value.kind not in ("text", "link", "tag"):
+            raise ValueError("invalid preview value kind")
+        label_bytes = len(value.label.encode("utf-8", "strict"))
+        value_bytes = len(value.value.encode("utf-8", "strict"))
+        if max(label_bytes, value_bytes) > 8192:
+            raise ValueError("preview value exceeds bound")
+        total += label_bytes + value_bytes
+        if total > 256 * 1024:
+            raise ValueError("preview aggregate text exceeds 256 KiB")
+        if value.kind == "link" and (not value.value.startswith(("https://", "http://"))
+                or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value.value)):
+            raise ValueError("invalid preview link")
+        values.append(dict(label=value.label, value=value.value, kind=value.kind))
+    image = None
+    if result.image is not None:
+        img = result.image
+        if (not isinstance(img.rgba, bytes) or type(img.width) is not int or type(img.height) is not int
+                or not 0 < img.width <= 1024 or not 0 < img.height <= 1024
+                or img.width * img.height * 4 > 1024 * 1024
+                or len(img.rgba) != img.width * img.height * 4):
+            raise ValueError("invalid preview image")
+        # Keep pixels compact until complete escaped-frame producer preflight.
+        image = dict(width=img.width, height=img.height, rgba=img.rgba)
+    return dict(text=result.text, markdown=result.markdown, image=image, values=values)
+
+
+def _canonical_category(tag):
+    """Exactly Category::from_wire_tag(tag).wire_tag(), with no normalization."""
+    if tag.startswith("plugin-defined:") or tag in (
+            "application", "file", "directory", "url", "command", "expression",
+            "keyword", "contact", "clipboard-item"):
+        return tag
+    return "plugin-defined:" + tag
+
+
+def _route_item_to_wire(item):
+    frozen = _item_to_wire(item)
+    frozen["category"] = _canonical_category(frozen["category"])
+    for action in frozen["actions"]:
+        action["applicable_categories"] = [
+            _canonical_category(category) for category in action["applicable_categories"]]
+    return frozen
+
+
 def _item_to_wire(item):
     """One :class:`crikey_sdk.Item` as a §2 JSON-ready dict.
 
@@ -550,7 +610,7 @@ def _frame_size(frame):
                 visit(key, depth + 1)
                 charge(1)
                 visit(entry, depth + 1)
-        elif isinstance(value, (list, tuple)):
+        elif isinstance(value, (list, tuple, bytes)):
             charge(2 + max(0, len(value) - 1))
             for entry in value:
                 visit(entry, depth + 1)
@@ -570,6 +630,9 @@ def _publication_failure(frame):
                     state="failed", items=[], log=[], error=error)
     if kind == "typed_execute_result":
         return dict(id=frame.get("id"), kind=kind, status="failed", code="failed")
+    if kind == "structured_view_result":
+        return dict(id=frame.get("id"), kind=kind, route=frame.get("route"),
+                    session=frame.get("session"), status="failed", code="failed")
     if kind == KIND_BACKGROUND_COMPLETE:
         return dict(kind=kind, task_id=frame.get("task_id"), status="failed", error=error)
     return dict(id=frame.get("id"), kind=kind, status="failed", log=[], error=error)
@@ -587,7 +650,7 @@ def _encode(frame):
     if _SENSITIVE:
         frame = {key: ([] if key == "log" else {"message": "plugin callback failed", "traceback": ""} if key == "error" and value is not None else "plugin callback failed" if key == "detail" else value) for key, value in frame.items()}
     _frame_size(frame)
-    return json.dumps(frame, ensure_ascii=True, separators=(",", ":")) + "\n"
+    return json.dumps(frame, ensure_ascii=True, separators=(",", ":"), default=lambda value: list(value) if isinstance(value, bytes) else None) + "\n"
 
 
 def _emit(frame):
@@ -698,6 +761,8 @@ class _Worker:
         self._pending_presentation = None
         self._pending_schemas = None
         self._legacy_typed_targets = set()
+        self._view = None
+        self._host_structured = False
         # The cancel flag is set/cleared ONLY by the control-reader thread on a
         # `set_cancel` frame and read LIVE by SuggestContext.cancelled.
         self._cancel = threading.Event()
@@ -927,6 +992,8 @@ class _Worker:
             self._execute(frame)
         elif kind == "typed_execute":
             self._typed_execute(frame)
+        elif kind == "structured_view":
+            self._structured_view(frame)
         elif kind == "preview":
             self._preview(frame)
         elif kind == _KIND_CONFIGURATION:
@@ -937,6 +1004,7 @@ class _Worker:
             _stderr("[err][crikey] ignored unknown frame kind {!r}\n".format(kind))
 
     def _handshake(self, frame):
+        self._host_structured = "structured_view_v1" in frame.get("capabilities", ())
         _emit(
             {
                 "id": frame.get("id"),
@@ -948,13 +1016,81 @@ class _Worker:
                 ] + (["preview_v1"] if self._supports_preview() else [])
                   + (["commands_v1"] if self._supports_commands() else [])
                   + (["typed_arguments_v1"] if self._supports_typed() else [])
-                  + (["result_presentation_v1"] if self._supports_presentation() else []),
+                  + (["result_presentation_v1"] if self._supports_presentation() else [])
+                  + (["structured_view_v1"] if self._supports_views() else []),
             }
         )
 
+    def _supports_views(self):
+        callback = getattr(type(self._plugin), "structured_view", None)
+        return self._host_structured and callable(callback) and callback is not Plugin.structured_view
+
+    def _structured_view(self, frame):
+        reply = dict(id=frame.get("id"), kind="structured_view_result",
+                     route=frame.get("route"), session=frame.get("session"),
+                     status="failed", code="failed")
+        _CAPTURE.reset()
+        try:
+            if not self._supports_views():
+                reply["code"] = "unsupported"
+            else:
+                request = _view_request(frame)
+                old = self._view
+                if request.mode == "refresh" and (old is None or old[0] != request.route or old[1] != request.session or old[2] != request.previous_revision):
+                    reply["code"] = "unavailable"
+                else:
+                    # A replacement request retires the preceding namespace even
+                    # when production or host retention subsequently fails.
+                    self._view = None
+                    context = WorkerContext(self._cancel.is_set, lambda _item: None,
+                                            _CAPTURE.line, self._loop, self._register_background)
+                    if self._cancel.is_set():
+                        reply["code"] = "cancelled"
+                        _emit(reply)
+                        return
+                    descriptor = self._run_callback(context, self._plugin.structured_view(request, context))
+                    wire, registry = _view_descriptor(descriptor, _route_item_to_wire, _preview_to_wire, _frame_size)
+                    if self._cancel.is_set():
+                        reply["code"] = "cancelled"
+                    else:
+                        reply.update(status="content", descriptor=wire)
+                        reply.pop("code", None)
+                        if _emit(reply):
+                            self._view = (request.route, request.session, frame["id"], registry)
+                        return
+        except NotImplementedError:
+            reply["code"] = "unsupported"
+        except BaseException:
+            pass
+        _emit(reply)
+
+    def _route_binding(self, frame, item, action):
+        context = frame.get("view_context")
+        if context is None:
+            return None
+        if not self._supports_views() or not isinstance(context, dict) or getattr(context, "typed_duplicate", False):
+            raise ValueError("route capability unavailable")
+        route = _view_identity(context.get("route"))
+        session = _view_session(context.get("session"))
+        revision = context.get("revision")
+        current = self._view
+        if type(revision) is not int or current is None or (route, session, revision) != current[:3]:
+            raise ValueError("stale route definition")
+        definition = current[3].get(item.stable_id)
+        if definition is None or definition[0] != _route_item_to_wire(item) or action not in definition[1]:
+            raise ValueError("route executable unavailable")
+        return route, definition[1][action]
+
+    def _navigation_reply(self, result):
+        if not self._supports_views():
+            raise NotImplementedError("structured_view_v1 is unavailable")
+        return _navigation(result)
+
     def _supports_typed(self):
         callback = getattr(type(self._plugin), "execute_typed", None)
-        return callable(callback) and callback is not Plugin.execute_typed
+        route_callback = getattr(type(self._plugin), "execute_view_typed", None)
+        return ((callable(callback) and callback is not Plugin.execute_typed)
+                or (callable(route_callback) and route_callback is not Plugin.execute_view_typed))
 
     def _supports_presentation(self):
         callback = getattr(self._plugin, "supports_result_presentation", None)
@@ -1015,6 +1151,8 @@ class _Worker:
         scope_ids = {s["id"] for s in scopes}
         memberships, seen = [], set()
         for entry in result.items:
+            if entry.image is not None:
+                raise ValueError("root presentation images require a standard route")
             _text(entry.item_id, 256, True)
             if entry.item_id in seen or entry.section is not None and entry.section not in section_ids:
                 raise ValueError("invalid item membership")
@@ -1068,11 +1206,17 @@ class _Worker:
                     raise ValueError("invalid fingerprint")
                 binding = None
                 key = (item.stable_id, action)
-                for registry in (self._query_schemas, self._catalog_schemas):
-                    candidate = registry.get(key)
-                    if candidate is not None and candidate[1] == expected and candidate[0].fingerprint() == expected:
+                route_binding = self._route_binding(frame, item, action)
+                if route_binding is not None:
+                    candidate = route_binding[1]
+                    if candidate[0] is not None and candidate[1] == expected and candidate[0].fingerprint() == expected:
                         binding = candidate
-                        break
+                else:
+                    for registry in (self._query_schemas, self._catalog_schemas):
+                        candidate = registry.get(key)
+                        if candidate is not None and candidate[1] == expected and candidate[0].fingerprint() == expected:
+                            binding = candidate
+                            break
                 if binding is None:
                     reply["code"] = "unavailable"
                 else:
@@ -1104,7 +1248,8 @@ class _Worker:
                         raise ValueError("missing required field")
                     values = TypedValues(mapped)
                     result = (TypedOutcome(code="cancelled") if self._cancel.is_set()
-                              else self._plugin.execute_typed(item, action, values))
+                              else self._plugin.execute_view_typed(route_binding[0], item, action, values)
+                              if route_binding is not None else self._plugin.execute_typed(item, action, values))
                     if inspect.isawaitable(result):
                         context = WorkerContext(self._cancel.is_set, lambda _item: None,
                                                 _CAPTURE.line, self._loop, self._register_background)
@@ -1113,6 +1258,9 @@ class _Worker:
                         reply["code"] = "cancelled"
                     elif result is None:
                         reply = dict(id=frame.get("id"), kind="typed_execute_result", status="completed")
+                    elif isinstance(result, (Push, Replace)):
+                        reply = dict(id=frame.get("id"), kind="typed_execute_result",
+                                     status="navigate", navigation=self._navigation_reply(result))
                     elif isinstance(result, TypedOutcome):
                         if result.code is not None:
                             if result.code not in ("unavailable", "denied", "cancelled", "timeout", "unsupported", "failed") or result.failures:
@@ -1132,6 +1280,8 @@ class _Worker:
                             reply = dict(id=frame.get("id"), kind="typed_execute_result", status="completed")
                     else:
                         raise TypeError("invalid typed outcome")
+        except NotImplementedError:
+            reply = dict(id=frame.get("id"), kind="typed_execute_result", status="failed", code="unsupported")
         except BaseException:
             reply = dict(id=frame.get("id"), kind="typed_execute_result", status="failed", code="failed")
         finally:
@@ -1241,46 +1391,7 @@ class _Worker:
                 if self._cancel.is_set():
                     reply["status"] = "cancelled"
                 elif result is not None:
-                    if not isinstance(result, Preview):
-                        raise TypeError("preview must return Preview or None")
-                    total_bytes = 0 if result.text is None else len(result.text.encode("utf-8"))
-                    if total_bytes > 256 * 1024:
-                        raise ValueError("preview aggregate text exceeds 256 KiB")
-                    if type(result.markdown) is not bool:
-                        raise TypeError("preview markdown must be a boolean")
-                    if len(result.values) > 128:
-                        raise ValueError("preview exceeds 128 values")
-                    values = []
-                    for value in result.values:
-                        if value.kind not in ("text", "link", "tag"):
-                            raise ValueError("invalid preview value kind")
-                        label_bytes = len(value.label.encode("utf-8"))
-                        value_bytes = len(value.value.encode("utf-8"))
-                        if max(label_bytes, value_bytes) > 8192:
-                            raise ValueError("preview value exceeds 8 KiB")
-                        total_bytes += label_bytes + value_bytes
-                        if total_bytes > 256 * 1024:
-                            raise ValueError("preview aggregate text exceeds 256 KiB")
-                        if value.kind == "link" and (
-                            not value.value.startswith(("https://", "http://"))
-                            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value.value)
-                        ):
-                            raise ValueError("invalid preview link")
-                        values.append({"label": value.label, "value": value.value, "kind": value.kind})
-                    image = None
-                    if result.image is not None:
-                        img = result.image
-                        if (not isinstance(img.rgba, bytes)
-                            or type(img.width) is not int or type(img.height) is not int
-                            or not 0 < img.width <= 1024 or not 0 < img.height <= 1024
-                            or img.width * img.height * 4 > 1024 * 1024
-                            or len(img.rgba) != img.width * img.height * 4):
-                            raise ValueError("invalid or oversized preview RGBA image")
-                        image = {"width": img.width, "height": img.height, "rgba": list(img.rgba)}
-                    reply.update(status="content", content={
-                        "text": result.text, "markdown": result.markdown,
-                        "image": image, "values": values,
-                    })
+                    reply.update(status="content", content=_preview_to_wire(result))
             reply["log"] = _CAPTURE.take()
             # Metadata nodes are bounded above by the 128-value limit. Markdown
             # nodes remain the host parser's responsibility; do not parse twice.
@@ -1340,8 +1451,8 @@ class _Worker:
             # (no running loop at call time); drive them now for completeness.
             if context.registered_tasks:
                 self._loop.run_until_complete(self._drain(context, None))
-            return
-        self._loop.run_until_complete(self._drain(context, result))
+            return result
+        return self._loop.run_until_complete(self._drain(context, result))
 
     def run_lifecycle(self, callback):
         """Runs a lifecycle callback and supports both sync and async methods."""
@@ -1542,7 +1653,8 @@ class _Worker:
         try:
             item = _item_from_wire(frame.get("item") or {})
             key = (item.stable_id, action_id)
-            if key in self._legacy_typed_targets or (action_id is None and any(k[0] == item.stable_id for k in self._legacy_typed_targets)):
+            route_binding = self._route_binding(frame, item, action_id)
+            if route_binding is None and (key in self._legacy_typed_targets or (action_id is None and any(k[0] == item.stable_id for k in self._legacy_typed_targets))):
                 raise ValueError("typed target refuses legacy execution")
             context = WorkerContext(
                 self._cancel.is_set,
@@ -1551,8 +1663,18 @@ class _Worker:
                 self._loop,
                 self._register_background,
             )
-            result = self._plugin.execute(item, action_id, argument)
-            self._run_callback(context, result)
+            if route_binding is not None and route_binding[1][0] is not None:
+                raise ValueError("typed route target refuses legacy execution")
+            if self._cancel.is_set():
+                raise RuntimeError("action cancelled")
+            result = (self._plugin.execute(item, action_id, argument) if route_binding is None
+                      else self._plugin.execute_view(route_binding[0], item, action_id, argument))
+            result = self._run_callback(context, result)
+            if self._cancel.is_set():
+                raise RuntimeError("action cancelled")
+            if result is not None and not isinstance(result, (Push, Replace)):
+                raise TypeError("invalid execute outcome")
+            navigation = None if result is None else self._navigation_reply(result)
         except Exception as error:  # noqa: BLE001
             _emit(
                 {
@@ -1569,7 +1691,8 @@ class _Worker:
             {
                 "id": request_id,
                 "kind": "execute_result",
-                "status": "ok",
+                "status": "ok" if navigation is None else "navigate",
+                **({"navigation": navigation} if navigation is not None else {}),
                 "log": _CAPTURE.take(),
                 "error": None,
             }

@@ -1336,10 +1336,11 @@ fn typed_real_worker_actionless_async_fixed_outcomes_and_healthy_reacquire() {
                 &catalog[0],
                 None,
                 &schema,
-                typed_values("valid", "typed-password")
+                typed_values("valid", "typed-password"),
+                None,
             )
             .unwrap(),
-        SubmissionOutcome::Completed
+        crikey_core::structured_view::TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
     ));
     assert!(matches!(
         worker
@@ -1347,10 +1348,11 @@ fn typed_real_worker_actionless_async_fixed_outcomes_and_healthy_reacquire() {
                 &catalog[0],
                 None,
                 &schema,
-                typed_values("reject", "typed-password")
+                typed_values("reject", "typed-password"),
+                None,
             )
             .unwrap(),
-        SubmissionOutcome::InvalidFields(_)
+        crikey_core::structured_view::TypedExecutionOutcome::Submission(SubmissionOutcome::InvalidFields(_))
     ));
     let action_schema = Arc::clone(&worker.presentation().schemas[1].schema);
     assert!(matches!(
@@ -1359,10 +1361,11 @@ fn typed_real_worker_actionless_async_fixed_outcomes_and_healthy_reacquire() {
                 &catalog[1],
                 Some("submit"),
                 &action_schema,
-                typed_values("valid", "action-password")
+                typed_values("valid", "action-password"),
+                None,
             )
             .unwrap(),
-        SubmissionOutcome::Completed
+        crikey_core::structured_view::TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
     ));
     let incarnation = worker.incarnation();
     worker.shutdown();
@@ -1378,9 +1381,15 @@ fn typed_real_worker_actionless_async_fixed_outcomes_and_healthy_reacquire() {
         .unwrap());
     assert!(matches!(
         replacement
-            .typed_execute(&catalog[0], None, &schema, typed_values("valid", "new-password"))
+            .typed_execute(
+                &catalog[0],
+                None,
+                &schema,
+                typed_values("valid", "new-password"),
+                None
+            )
             .unwrap(),
-        SubmissionOutcome::Completed
+        crikey_core::structured_view::TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
     ));
     let mut changed = (*schema).clone();
     changed.fields[0].label.push_str(" changed");
@@ -1406,9 +1415,12 @@ fn every_typed_submission_suppresses_remaining_incarnation_diagnostics() {
     let schema = Arc::clone(&worker.presentation().schemas[0].schema);
     let password = "PASSWORD_MUST_NOT_REACH_DIAGNOSTICS_47";
     let result = worker
-        .typed_execute(&catalog[0], None, &schema, typed_values("leak", password))
+        .typed_execute(&catalog[0], None, &schema, typed_values("leak", password), None)
         .unwrap();
-    assert!(matches!(result, SubmissionOutcome::Failed(_)));
+    assert!(matches!(
+        result,
+        crikey_core::structured_view::TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(_))
+    ));
     assert!(!format!("{result:?}").contains(password));
     let later = suggest(&mut worker, "typed-leak-after");
     assert!(later.log.is_empty());
@@ -1511,8 +1523,10 @@ class Drift(Sync):
             StructuredValue::NonSecret(NonSecretValue::Text("sentinel".into())),
         )]));
         assert_eq!(
-            worker.typed_execute(&items[0], None, &schema, values).unwrap(),
-            expected
+            worker
+                .typed_execute(&items[0], None, &schema, values, None)
+                .unwrap(),
+            crikey_core::structured_view::TypedExecutionOutcome::Submission(expected)
         );
         worker.shutdown();
     }
@@ -1571,17 +1585,26 @@ fn retired_source_gate_never_sends_typed_callback_and_worker_remains_usable() {
                 None,
                 &schema,
                 typed_values("leak", "retired-secret"),
+                None,
                 |_send| false
             )
             .unwrap(),
-        SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable)
+        crikey_core::structured_view::TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(
+            SubmissionFailureCode::Unavailable
+        ))
     );
     assert!(worker.is_alive());
     assert!(matches!(
         worker
-            .typed_execute(&items[0], None, &schema, typed_values("valid", "new-secret"))
+            .typed_execute(
+                &items[0],
+                None,
+                &schema,
+                typed_values("valid", "new-secret"),
+                None
+            )
             .unwrap(),
-        SubmissionOutcome::Completed
+        crikey_core::structured_view::TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
     ));
     worker.shutdown();
 }
@@ -1663,8 +1686,10 @@ class Impl(Plugin):
         StructuredValue::NonSecret(NonSecretValue::Text("not-a-password-field".into())),
     )]));
     assert_eq!(
-        worker.typed_execute(&items[0], None, &schema, values).unwrap(),
-        SubmissionOutcome::Completed
+        worker
+            .typed_execute(&items[0], None, &schema, values, None)
+            .unwrap(),
+        crikey_core::structured_view::TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
     );
     let failed = suggest(&mut worker, "fail");
     assert_eq!(failed.state, BatchState::Failed);
@@ -1757,13 +1782,16 @@ class Impl(Plugin):
                 &items[0],
                 None,
                 &ArgumentSchema::default(),
-                ArgumentValues::default()
+                ArgumentValues::default(),
+                None,
             )
             .unwrap(),
-        SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported)
+        crikey_core::structured_view::TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(
+            SubmissionFailureCode::Unsupported
+        ))
     );
     assert!(matches!(
-        worker.execute(&items[0], None, None).unwrap(),
+        worker.execute(&items[0], None, None, None).unwrap(),
         crikey_python_host::ExecuteOutcome::Ok
     ));
     worker.shutdown();
@@ -1817,14 +1845,16 @@ class Impl(Plugin):
         )]));
         assert_eq!(
             worker
-                .typed_execute(&ready.items[0], None, &schema, values)
+                .typed_execute(&ready.items[0], None, &schema, values, None)
                 .unwrap(),
-            SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable)
+            crikey_core::structured_view::TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(
+                SubmissionFailureCode::Unavailable
+            ))
         );
         // Retiring execution authority must not turn an old schema-only target
         // into a legacy callback under hosts that cannot consume its sidecar.
         assert!(matches!(
-            worker.execute(&ready.items[0], None, None).unwrap(),
+            worker.execute(&ready.items[0], None, None, None).unwrap(),
             crikey_python_host::ExecuteOutcome::Failed(_)
         ));
     }
@@ -1874,5 +1904,500 @@ class Impl(Plugin):
     let recovered = worker.build_catalog().unwrap();
     assert_eq!(worker.incarnation(), incarnation);
     assert_eq!(recovered[0].stable_id.0, "recovered");
+    worker.shutdown();
+}
+
+#[test]
+fn standard_routes_preserve_navigation_frozen_definitions_and_typed_outcomes() {
+    require_host_interpreter!();
+    use crikey_core::structured_arguments::SubmissionOutcome;
+    use crikey_core::structured_view::*;
+    use std::num::NonZeroU64;
+    let scratch = Scratch::new("standard-views");
+    let site = scratch.subdir("site");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility/test-plugins/modern-views");
+    let mut worker = spawn_worker("views-fixture", "views_plugin:ViewsPlugin", &fixture, &site);
+    assert!(worker.supports_structured_views());
+    assert!(worker.supports_typed_arguments());
+    assert!(!worker.supports_result_presentation());
+    let root = worker.build_catalog().unwrap();
+    assert!(matches!(worker.execute(&root[0], None, None, None).unwrap(),
+        crikey_python_host::ExecuteOutcome::Navigate(StructuredRouteOutcome::Push(RouteId(route))) if route=="gallery"));
+    let root_schema = Arc::clone(&worker.presentation().schemas[0].schema);
+    assert!(
+        matches!(worker.typed_execute(&root[1],None,&root_schema,typed_values("valid","root-secret"),None).unwrap(),
+        TypedExecutionOutcome::Navigate(StructuredRouteOutcome::Push(RouteId(route))) if route=="gallery")
+    );
+    let session = ViewSessionIdentity {
+        logical_view: NonZeroU64::new(1).unwrap(),
+        surface: NonZeroU64::new(2).unwrap(),
+    };
+    let mut request = ViewRequest {
+        route: RouteId("gallery".into()),
+        session,
+        mode: ViewRequestMode::Open,
+        previous_revision: None,
+        state: None,
+        query: String::new(),
+        scroll: None,
+        reason: ViewRefreshReason::Explicit,
+    };
+    let gallery = worker.structured_view(&request).unwrap();
+    assert!(matches!(gallery.descriptor.view, StandardView::Grid(_)));
+    let item = &gallery.descriptor.definitions[0].item;
+    assert!(matches!(
+        worker
+            .execute(&root[0], Some("open"), None, Some(&gallery.context))
+            .unwrap(),
+        crikey_python_host::ExecuteOutcome::Failed(_)
+    ));
+    assert!(
+        matches!(worker.execute(item,Some("open"),None,Some(&gallery.context)).unwrap(),
+        crikey_python_host::ExecuteOutcome::Navigate(StructuredRouteOutcome::Push(RouteId(route))) if route=="detail")
+    );
+    request.mode = ViewRequestMode::Refresh;
+    request.previous_revision = Some(gallery.context.revision);
+    let admission = RouteAdmission::worker(
+        RouteIdentity {
+            owner: item.plugin_id.clone(),
+            route: gallery.context.route.clone(),
+            incarnation: NonZeroU64::new(worker.incarnation()).unwrap(),
+        },
+        gallery.context.surface(),
+    )
+    .unwrap();
+    request.state = Some(gallery.descriptor.initial_state(&admission).unwrap());
+    let refreshed = worker.structured_view(&request).unwrap();
+    assert_ne!(gallery.context.revision, refreshed.context.revision);
+    assert!(matches!(
+        worker
+            .execute(item, Some("open"), None, Some(&gallery.context))
+            .unwrap(),
+        crikey_python_host::ExecuteOutcome::Failed(_)
+    ));
+    request.route = RouteId("form".into());
+    request.mode = ViewRequestMode::Open;
+    request.previous_revision = None;
+    request.state = None;
+    let form = worker.structured_view(&request).unwrap();
+    let item = &form.descriptor.definitions[0].item;
+    let StandardView::Form(view) = &form.descriptor.view else {
+        panic!("form descriptor")
+    };
+    let schema = form.descriptor.schema_for(&view.submit).unwrap();
+    assert!(matches!(
+        worker
+            .typed_execute(
+                item,
+                None,
+                schema,
+                typed_values("reject", "route-password"),
+                Some(&form.context)
+            )
+            .unwrap(),
+        TypedExecutionOutcome::Submission(SubmissionOutcome::InvalidFields(_))
+    ));
+    assert!(
+        matches!(worker.typed_execute(item,None,schema,typed_values("valid","route-password"),Some(&form.context)).unwrap(),
+        TypedExecutionOutcome::Navigate(StructuredRouteOutcome::Replace(RouteId(route))) if route=="done")
+    );
+    worker.retire_view();
+    assert!(matches!(
+        worker.execute(item, None, None, Some(&form.context)).unwrap(),
+        crikey_python_host::ExecuteOutcome::Failed(_)
+    ));
+    worker.shutdown();
+}
+
+const VIEW_ADMISSION_SOURCE: &str = r#"
+import __main__ as worker
+import copy
+from crikey_sdk import (
+    Plugin, Item, Action, Push, Replace, ViewDescriptor, RouteItemDefinition,
+    ActionSection, ActionSubmenu, ExecutablePresentation, ListView, DetailView,
+    Preview, ItemPresentation, Section, Scope, ArgumentSchema, TextField,
+)
+SCHEMA = ArgumentSchema((TextField(id="name", label="Name", required=True),))
+METADATA = {"tag": "application", "prefix": "plugin-defined:application"}
+class Impl(Plugin):
+    def __init__(self):
+        self.corruption = None
+        original = worker._emit
+        def emit(frame):
+            if frame.get("kind") == "structured_view_result" and frame.get("status") == "content" and frame["descriptor"]["definitions"]:
+                descriptor = frame["descriptor"]
+                view = descriptor["view"]
+                definition = descriptor["definitions"][0]
+                mode = self.corruption
+                if mode == "duplicate-definitions":
+                    descriptor["definitions"].append(copy.deepcopy(definition))
+                elif mode == "duplicate-memberships":
+                    view["items"].append(copy.deepcopy(view["items"][0]))
+                elif mode == "duplicate-sections":
+                    view["sections"].append(copy.deepcopy(view["sections"][0]))
+                elif mode == "duplicate-scopes":
+                    view["scopes"].append(copy.deepcopy(view["scopes"][0]))
+                elif mode == "duplicate-item-scopes":
+                    view["items"][0]["scopes"].append("scope")
+                elif mode == "duplicate-actions":
+                    definition["item"]["actions"].append(copy.deepcopy(definition["item"]["actions"][0]))
+                elif mode == "duplicate-action-sections":
+                    definition["action_sections"].append(dict(id="main", label="Other", entries=[]))
+                elif mode == "duplicate-submenus":
+                    definition["action_sections"].append(dict(id="other", label="Other",
+                        entries=[dict(kind="submenu", id="menu", label="Other", entries=[])]))
+                elif mode == "duplicate-menu-actions":
+                    entries = definition["action_sections"][0]["entries"][0]["entries"]
+                    entries.append(copy.deepcopy(entries[0]))
+                elif mode in ("image-product", "image-u8", "image-float", "image-negative"):
+                    pixels = ([0] * (1024 * 1024) if mode == "image-product" else
+                              [256, 0, 0, 0] if mode == "image-u8" else
+                              [0.0, 0, 0, 0] if mode == "image-float" else [-1, 0, 0, 0])
+                    # Dimensions deliberately follow pixels, as JSON order grants no authority.
+                    view["items"][0]["image"] = dict(rgba=pixels, height=1, width=1)
+            return original(frame)
+        worker._emit = emit
+    def structured_view(self, request, context):
+        if request.route == "unsafe":
+            return ViewDescriptor("Unsafe", (), DetailView(
+                Preview(text="[bad](javascript:alert(1))", markdown=True)))
+        self.corruption = request.route
+        category = {"shadow": "plugin-defined:application", "builtin": "application",
+                    "custom": "custom"}.get(request.route, "plugin-defined")
+        kwargs = {} if request.route == "default" else {"category": category}
+        if request.query == "remove-selected":
+            assert request.mode == "refresh" and request.state.selected_item_id == "same"
+            assert request.anchor.item_id == "same" and request.anchor.row_offset == 7
+        item_id = "replacement" if request.query == "remove-selected" else "same"
+        item = Item(item_id, "Local", request.route, metadata=dict(METADATA),
+            actions=[Action("ordinary", "Ordinary", applicable_categories=(category, "application", "plugin-defined:application"), execution_policy="plugin"),
+                     Action("typed", "Typed", applicable_categories=(category, "application", "plugin-defined:application"), execution_policy="plugin")],
+            **kwargs)
+        definition = RouteItemDefinition(item, action_sections=(
+            ActionSection("main", "Main", (ActionSubmenu("menu", "Menu", (
+                ExecutablePresentation("ordinary"), ExecutablePresentation("typed", SCHEMA))),)),),
+            primary_action="ordinary")
+        return ViewDescriptor("Valid", (definition,), ListView(
+            items=(ItemPresentation(item_id, "entries", () if request.query == "remove-scope" else ("scope",)),),
+            sections=(Section("entries", "Entries"),),
+            scopes=() if request.query == "remove-scope" else (Scope("scope", "Scope"),),
+            initial_selection=item_id))
+    def check(self, route, item):
+        canonical = {"shadow": "plugin-defined:application", "builtin": "application",
+                     "custom": "plugin-defined:custom"}.get(route, "plugin-defined:plugin-defined")
+        assert item.target == route and item.category == canonical
+        assert item.metadata == METADATA
+        for action in item.actions:
+            assert action.applicable_categories == (canonical, "application", "plugin-defined:application")
+    def execute_view(self, route, item, action, argument):
+        self.check(route, item)
+        assert action == "ordinary" and argument is None
+        return Push("done")
+    async def execute_view_typed(self, route, item, action, values):
+        self.check(route, item)
+        assert action == "typed" and values.get("name").value == "typed"
+        return Replace("done")
+"#;
+
+fn view_admission_source(scratch: &Scratch) -> PathBuf {
+    let src = scratch.subdir("src");
+    write_file(&src.join("admission.py"), VIEW_ADMISSION_SOURCE);
+    src
+}
+
+fn view_admission_request(route: &str) -> crikey_core::structured_view::ViewRequest {
+    use crikey_core::structured_view::*;
+    use std::num::NonZeroU64;
+    ViewRequest {
+        mode: ViewRequestMode::Open,
+        route: RouteId(route.into()),
+        session: ViewSessionIdentity {
+            logical_view: NonZeroU64::new(7).unwrap(),
+            surface: NonZeroU64::new(9).unwrap(),
+        },
+        previous_revision: None,
+        state: None,
+        query: String::new(),
+        scroll: None,
+        reason: ViewRefreshReason::Explicit,
+    }
+}
+
+#[test]
+fn route_categories_round_trip_real_rust_host_for_ordinary_and_typed_callbacks() {
+    require_host_interpreter!();
+    use crikey_core::structured_arguments::*;
+    use crikey_core::structured_view::*;
+    use crikey_core::{ActionId, Category};
+    let scratch = Scratch::new("view-category-roundtrip");
+    let src = view_admission_source(&scratch);
+    let site = scratch.subdir("site");
+    let mut worker = spawn_worker("admission", "admission:Impl", &src, &site);
+    for (route, expected) in [
+        ("default", Category::PluginDefined("plugin-defined".into())),
+        ("shadow", Category::PluginDefined("application".into())),
+        ("builtin", Category::Application),
+        ("custom", Category::PluginDefined("custom".into())),
+    ] {
+        let reply = worker.structured_view(&view_admission_request(route)).unwrap();
+        let item = &reply.descriptor.definitions[0].item;
+        assert_eq!(item.category, expected);
+        assert_eq!(
+            item.actions[0].applicable_categories,
+            vec![
+                expected,
+                Category::Application,
+                Category::PluginDefined("application".into())
+            ]
+        );
+        assert_eq!(item.metadata.get("tag").map(String::as_str), Some("application"));
+        assert!(
+            matches!(worker.execute(item,Some("ordinary"),None,Some(&reply.context)).unwrap(),
+            crikey_python_host::ExecuteOutcome::Navigate(StructuredRouteOutcome::Push(RouteId(route))) if route=="done")
+        );
+        let schema = reply.descriptor.definitions[0]
+            .presentation(Some(&ActionId("typed".into())))
+            .unwrap()
+            .schema
+            .as_ref()
+            .unwrap();
+        let values = ArgumentValues(BTreeMap::from([(
+            FieldId("name".into()),
+            StructuredValue::NonSecret(NonSecretValue::Text("typed".into())),
+        )]));
+        assert!(
+            matches!(worker.typed_execute(item,Some("typed"),schema,values,Some(&reply.context)).unwrap(),
+            TypedExecutionOutcome::Navigate(StructuredRouteOutcome::Replace(RouteId(route))) if route=="done")
+        );
+    }
+    worker.shutdown();
+}
+
+#[test]
+fn unsafe_public_sdk_detail_is_refused_without_killing_producer_or_retaining_old_authority() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("view-safe-content-refusal");
+    let src = view_admission_source(&scratch);
+    let site = scratch.subdir("site");
+    let mut worker = spawn_worker("admission", "admission:Impl", &src, &site);
+    let old = worker
+        .structured_view(&view_admission_request("default"))
+        .unwrap();
+    let incarnation = worker.incarnation();
+    let error = worker
+        .structured_view(&view_admission_request("unsafe"))
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("structured view content rejected"));
+    assert!(worker.poll_alive());
+    assert_eq!(worker.incarnation(), incarnation);
+    assert!(matches!(
+        worker
+            .execute(
+                &old.descriptor.definitions[0].item,
+                Some("ordinary"),
+                None,
+                Some(&old.context)
+            )
+            .unwrap(),
+        crikey_python_host::ExecuteOutcome::Failed(_)
+    ));
+    let fresh = worker
+        .structured_view(&view_admission_request("default"))
+        .unwrap();
+    assert!(matches!(
+        worker
+            .execute(
+                &fresh.descriptor.definitions[0].item,
+                Some("ordinary"),
+                None,
+                Some(&fresh.context)
+            )
+            .unwrap(),
+        crikey_python_host::ExecuteOutcome::Navigate(_)
+    ));
+    worker.shutdown();
+}
+
+#[test]
+fn malformed_route_images_and_namespace_duplicates_fail_at_real_host_boundary() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("view-preflight-consumer");
+    let src = view_admission_source(&scratch);
+    let site = scratch.subdir("site");
+    for route in [
+        "image-product",
+        "image-u8",
+        "image-float",
+        "image-negative",
+        "duplicate-definitions",
+        "duplicate-memberships",
+        "duplicate-sections",
+        "duplicate-scopes",
+        "duplicate-item-scopes",
+        "duplicate-actions",
+        "duplicate-action-sections",
+        "duplicate-submenus",
+        "duplicate-menu-actions",
+    ] {
+        let mut worker = spawn_worker("admission", "admission:Impl", &src, &site);
+        assert!(
+            worker.structured_view(&view_admission_request(route)).is_err(),
+            "{route}"
+        );
+        assert!(
+            !worker.is_alive(),
+            "{route} must fail allocation-free wire preflight"
+        );
+    }
+}
+
+#[test]
+fn retired_view_writer_admission_never_calls_the_structured_callback() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("view-final-writer-gate");
+    let site = scratch.subdir("site");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility/test-plugins/modern-views");
+    let mut worker = spawn_worker("views-fixture", "views_plugin:ViewsPlugin", &fixture, &site);
+    let mut request = view_admission_request("gallery");
+    // A callback that would terminate the physical source must never run.
+    request.query = "source-death".into();
+    assert!(worker
+        .structured_view_with_admission(&request, |_send| false)
+        .is_err());
+    assert!(worker.poll_alive());
+    request.query.clear();
+    assert!(worker.structured_view(&request).is_ok());
+    worker.shutdown();
+}
+
+#[test]
+fn query_refresh_treats_old_selection_input_and_scroll_as_intent_not_new_authority() {
+    require_host_interpreter!();
+    use crikey_core::result_presentation::ScopeId;
+    use crikey_core::structured_arguments::*;
+    use crikey_core::structured_view::*;
+    use crikey_core::ActionId;
+    use std::num::NonZeroU64;
+    let scratch = Scratch::new("view-refresh-retired-selection");
+    let src = view_admission_source(&scratch);
+    let site = scratch.subdir("site");
+    let mut worker = spawn_worker("admission", "admission:Impl", &src, &site);
+    let old = worker
+        .structured_view(&view_admission_request("default"))
+        .unwrap();
+    let old_item = &old.descriptor.definitions[0].item;
+    let target = OwnedItem {
+        owner: old_item.plugin_id.clone(),
+        item: old_item.stable_id.clone(),
+    };
+    let executable = ExecutableKey {
+        target: target.clone(),
+        action: Some(ActionId("typed".into())),
+    };
+    let old_schema = old.descriptor.schema_for(&executable).unwrap();
+    let mut request = view_admission_request("default");
+    request.mode = ViewRequestMode::Refresh;
+    request.previous_revision = Some(old.context.revision);
+    request.reason = ViewRefreshReason::Query;
+    request.query = "remove-selected".into();
+    request.state = Some(HostViewState {
+        selected: Some(target.clone()),
+        scope: Some(ScopeId("scope".into())),
+        input: Some(executable),
+    });
+    request.scroll = Some(ScrollAnchor {
+        item: target.clone(),
+        row_offset: 7,
+    });
+    let refreshed = worker.structured_view(&request).unwrap();
+    let admission = RouteAdmission::worker(
+        RouteIdentity {
+            owner: target.owner.clone(),
+            route: request.route.clone(),
+            incarnation: NonZeroU64::new(worker.incarnation()).unwrap(),
+        },
+        refreshed.context.surface(),
+    )
+    .unwrap();
+    refreshed
+        .validate(&request, refreshed.context.revision, &admission)
+        .unwrap();
+    assert!(refreshed.descriptor.definition(&target).is_none());
+    assert!(matches!(
+        worker
+            .execute(old_item, Some("ordinary"), None, Some(&old.context))
+            .unwrap(),
+        crikey_python_host::ExecuteOutcome::Failed(_)
+    ));
+    let values = ArgumentValues(BTreeMap::from([(
+        FieldId("name".into()),
+        StructuredValue::NonSecret(NonSecretValue::Text("typed".into())),
+    )]));
+    assert!(matches!(
+        worker
+            .typed_execute(old_item, Some("typed"), old_schema, values, Some(&old.context))
+            .unwrap(),
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable))
+    ));
+    // P3 can retain the same bounded selection/input/anchor intent across a
+    // second query even though the intermediate descriptor removed that item.
+    let previous_revision = refreshed.context.revision;
+    request.previous_revision = Some(previous_revision);
+    let refreshed = worker.structured_view(&request).unwrap();
+    assert_ne!(refreshed.context.revision, previous_revision);
+    assert!(refreshed.descriptor.definition(&target).is_none());
+    let item = &refreshed.descriptor.definitions[0].item;
+    assert_eq!(item.stable_id.0, "replacement");
+    assert!(matches!(
+        worker
+            .execute(item, Some("ordinary"), None, Some(&refreshed.context))
+            .unwrap(),
+        crikey_python_host::ExecuteOutcome::Navigate(_)
+    ));
+
+    // A removed scope is explicit descriptor state, not a transport rewrite to All.
+    request.previous_revision = Some(refreshed.context.revision);
+    request.query = "remove-scope".into();
+    let selected = OwnedItem {
+        owner: item.plugin_id.clone(),
+        item: item.stable_id.clone(),
+    };
+    request.state = Some(HostViewState {
+        selected: Some(selected.clone()),
+        scope: Some(ScopeId("scope".into())),
+        input: None,
+    });
+    request.scroll = Some(ScrollAnchor {
+        item: selected,
+        row_offset: 3,
+    });
+    let no_scope = worker.structured_view(&request).unwrap();
+    let admission = RouteAdmission::worker(
+        RouteIdentity {
+            owner: target.owner,
+            route: request.route.clone(),
+            incarnation: NonZeroU64::new(worker.incarnation()).unwrap(),
+        },
+        no_scope.context.surface(),
+    )
+    .unwrap();
+    no_scope
+        .validate(&request, no_scope.context.revision, &admission)
+        .unwrap();
+    let StandardView::List(collection) = &no_scope.descriptor.view else {
+        panic!("list response")
+    };
+    assert!(collection.scopes.is_empty());
+    assert!(collection.items.iter().all(|item| item.scopes.is_empty()));
+    assert_eq!(
+        request.state.as_ref().unwrap().scope,
+        Some(ScopeId("scope".into()))
+    );
+    assert!(matches!(
+        worker
+            .execute(item, Some("ordinary"), None, Some(&refreshed.context))
+            .unwrap(),
+        crikey_python_host::ExecuteOutcome::Failed(_)
+    ));
     worker.shutdown();
 }

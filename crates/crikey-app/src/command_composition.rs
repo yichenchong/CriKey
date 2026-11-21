@@ -175,6 +175,9 @@ impl SearchService {
         &self,
         input: &crikey_ui::InlineArguments,
     ) -> Option<crate::RootExecutableBinding> {
+        if input.view_context.is_some() {
+            return None;
+        }
         let binding = if let Some((reference, revision)) = &input.command {
             self.check_command_revision(*revision).ok()?;
             let command = self.command_registry.resolve(reference)?;
@@ -255,6 +258,7 @@ impl SearchService {
                     Some(self.declared_catalog_source(&source.owner, epoch)?)
                 }
                 ResultSourceKind::Ordinary => None,
+                ResultSourceKind::Standard { .. } => return None,
             };
             snapshots
                 .iter()
@@ -383,12 +387,46 @@ impl SearchService {
             action: action.cloned(),
         };
         let canonical = match source.map(|source| source.kind) {
+            Some(ResultSourceKind::Standard { .. }) => return None,
             Some(ResultSourceKind::DeclaredCatalog { epoch }) => {
                 Some(self.declared_catalog_source(owner, epoch)?)
             }
             _ => None,
         };
         self.plugin_actions.as_ref()?.root_binding(&key, canonical)
+    }
+    pub fn root_actionless_source(
+        &self,
+        owner: &PluginId,
+        item: &ItemId,
+        source: Option<&ResultSource>,
+    ) -> Option<crate::RootSource> {
+        let canonical = match source.map(|source| source.kind) {
+            Some(ResultSourceKind::Standard { .. }) => return None,
+            Some(ResultSourceKind::DeclaredCatalog { epoch }) => {
+                Some(self.declared_catalog_source(owner, epoch)?)
+            }
+            _ => None,
+        };
+        self.plugin_actions
+            .as_ref()?
+            .root_actionless_source(owner, item, canonical)
+    }
+    pub fn submit_root_actionless(
+        &self,
+        owner: &PluginId,
+        item: &ItemId,
+        source: &crate::RootSource,
+    ) -> crikey_core::Result<crate::ActionRequestId> {
+        if self.command_admission_paused {
+            return Err(crikey_core::CoreError::Invalid(
+                "action admission unavailable".into(),
+            ));
+        }
+        self.plugin_actions
+            .as_ref()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("action admission unavailable".into()))?
+            .submit_actionless(owner, item, source)
     }
     pub fn submit_root_typed(
         &self,

@@ -142,6 +142,8 @@ pub mod convert;
 pub mod frame;
 pub mod message;
 pub mod preview;
+pub mod structured_view;
 pub mod transport;
 pub mod typed;
+mod view_budget;
 pub mod wire;

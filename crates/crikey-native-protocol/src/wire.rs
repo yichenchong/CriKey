@@ -177,6 +177,10 @@ impl<'a> DecodeBudget<'a> {
     pub(crate) fn charge_map_entry(&mut self) -> Result<(), ProtocolError> {
         self.charge(map_entry_charge())
     }
+
+    pub(crate) fn charge_box<T>(&mut self) -> Result<(), ProtocolError> {
+        self.charge(std::mem::size_of::<T>())
+    }
 }
 
 /// Appends one decoded repeated value without allowing a hostile count to

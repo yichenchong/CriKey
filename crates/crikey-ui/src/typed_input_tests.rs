@@ -363,6 +363,12 @@ fn mixed_p3_budget_charges_shared_drafts_once_and_native_editor_separately() {
         .map(|_| crate::navigation::Entry {
             route: crate::NavigationRoute::Root,
             rows: Arc::default(),
+            descriptor: None,
+            admitted_descriptor: None,
+            transient_bytes: 0,
+            transient_pixels: 0,
+            panel: None,
+            render_standard: false,
             state: state.clone(),
         })
         .collect();

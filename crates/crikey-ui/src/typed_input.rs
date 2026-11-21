@@ -4,6 +4,18 @@ use crikey_core::structured_arguments::{
     SubmissionOutcome,
 };
 use std::sync::Arc;
+static NEXT_INPUT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// UI editor identity only; descriptor authority remains the exact view context.
+pub fn next_inline_input_revision() -> Option<u64> {
+    NEXT_INPUT_REVISION
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |revision| revision.checked_add(1),
+        )
+        .ok()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineArguments {
@@ -18,6 +30,7 @@ pub struct InlineArguments {
     pub fingerprint: [u8; 32],
     pub view: crate::ViewId,
     pub generation: crikey_core::Generation,
+    pub view_context: Option<crikey_core::structured_view::ViewExecutionContext>,
     pub command: Option<(crikey_core::CommandRef, u64)>,
 }
 
@@ -168,6 +181,10 @@ impl TypedEditor {
             && ui.input_mut(|state| state.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         ui.separator();
         let mut changed = false;
+        let mut enter_submit = admit_input
+            && !self.composing
+            && !ime_batch
+            && ui.input_mut(|state| state.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
         for (index, field) in input.schema.fields.iter().enumerate() {
             ui.label(if field.required {
                 format!("{} *", field.label)
@@ -193,9 +210,11 @@ impl TypedEditor {
                         if fresh && index == 0 {
                             ui.memory_mut(|memory| memory.request_focus(id));
                         }
-                        changed |= ui
-                            .add(edit.id(id).hint_text(field.placeholder.as_deref().unwrap_or("")))
-                            .changed();
+                        let enter = ui.input(|state| state.key_pressed(egui::Key::Enter));
+                        let response =
+                            ui.add(edit.id(id).hint_text(field.placeholder.as_deref().unwrap_or("")));
+                        changed |= response.changed();
+                        enter_submit |= !*multiline && response.lost_focus() && enter;
                     }
                 }
                 FieldKind::Password { .. } => {
@@ -205,6 +224,7 @@ impl TypedEditor {
                     if let StructuredValue::Password(password) = entry {
                         // A fixed mask is the only password text ever painted. Editing is
                         // append/backspace native text input, not a cloneable egui buffer.
+                        let enter = ui.input(|state| state.key_pressed(egui::Key::Enter));
                         let response = ui.add(
                             egui::Button::new(if password.is_empty() {
                                 "Enter password"
@@ -216,6 +236,7 @@ impl TypedEditor {
                         if response.clicked() || fresh && index == 0 {
                             response.request_focus();
                         }
+                        enter_submit |= enter && response.has_focus();
                         if response.has_focus() {
                             ui.ctx().output_mut(|output| {
                                 output.ime = Some(egui::output::IMEOutput {
@@ -314,7 +335,11 @@ impl TypedEditor {
         if matches!(input.outcome, Some(SubmissionOutcome::Completed)) {
             ui.label("Command completed");
         }
-        if ui.button("Run command").clicked() && admit_input {
+        if (ui.button("Run command").clicked() || enter_submit)
+            && admit_input
+            && !self.composing
+            && !ime_batch
+        {
             match input.schema.validate_values(&self.values) {
                 Ok(()) => {
                     let draft = input.schema.snapshot_values(&self.values).unwrap_or_default();

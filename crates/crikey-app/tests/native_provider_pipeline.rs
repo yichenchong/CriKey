@@ -1934,3 +1934,434 @@ fn real_native_typed_suggestions_retire_execution_but_retain_the_selected_scope(
         "producer shutdown revokes even a captured token"
     );
 }
+
+fn wait_native_action(
+    executor: &dyn crikey_app::PluginActionExecutor,
+    expected: &crikey_app::ActionRequestId,
+) -> crikey_core::Result<crikey_app::ActionEffect> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(completion) = executor.poll_plugin_actions().into_iter().next() {
+            assert_eq!(&completion.request_id, expected);
+            return completion.outcome;
+        }
+        assert!(Instant::now() < deadline, "foreground callback did not terminate");
+        sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn real_native_standard_routes_revoke_exact_revision_and_producer_without_root_fallback() {
+    use crikey_app::ActionEffect;
+    use crikey_core::structured_arguments::*;
+    use crikey_core::structured_view::*;
+    use std::num::NonZeroU64;
+    let scratch = Scratch::new("standard-routes");
+    let (ordinary_binary, _) = conformance_binaries();
+    let binary = ordinary_binary.parent().unwrap().join(format!(
+        "structured-view-fixture{}",
+        if cfg!(windows) { ".exe" } else { "" }
+    ));
+    assert!(
+        binary.is_file(),
+        "standard fixture must be built with the real SDK"
+    );
+    write_native_manifest(&scratch.path, "views", Some(&binary), None, None);
+    let owner = native_plugin("views");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load(
+        &mut pipeline,
+        &[scratch.path.clone()],
+        &DisabledPlugins::default(),
+    );
+    assert!(provider.unavailable().is_empty(), "{:?}", provider.unavailable());
+    provider
+        .request_catalog_build(&owner, 1, Generation::ZERO)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(result) = provider.take_catalog_results().into_iter().next() {
+            assert!(
+                matches!(result, crikey_app::CatalogBuildResult::Complete(_)),
+                "{result:?}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        sleep(Duration::from_millis(2));
+    }
+    let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| {}));
+    let executor = driver.action_executor();
+    let launch = executor
+        .submit_plugin_action_by_id(&owner, &ItemId("launch".into()), &ActionId("open".into()), None)
+        .unwrap();
+    let producer = match wait_native_action(executor.as_ref(), &launch).unwrap() {
+        ActionEffect::Navigate {
+            outcome: StructuredRouteOutcome::Push(route),
+            producer,
+        } => {
+            assert_eq!(route.0, "grid");
+            producer
+        }
+        effect => panic!("root callback lost navigation: {effect:?}"),
+    };
+    let request = |route: &str, surface: u64| ViewRequest {
+        mode: ViewRequestMode::Open,
+        route: RouteId(route.into()),
+        session: ViewSessionIdentity {
+            logical_view: NonZeroU64::new(surface).unwrap(),
+            surface: NonZeroU64::new(surface).unwrap(),
+        },
+        previous_revision: None,
+        state: None,
+        query: String::new(),
+        scroll: None,
+        reason: ViewRefreshReason::Explicit,
+    };
+    let open = |request: ViewRequest| {
+        let id = executor.request_view(&owner, producer, request).unwrap();
+        match wait_native_action(executor.as_ref(), &id).unwrap() {
+            ActionEffect::View(reply) => reply,
+            effect => panic!("not a descriptor: {effect:?}"),
+        }
+    };
+    let key = |action: Option<&str>| ExecutableKey {
+        target: OwnedItem {
+            owner: owner.clone(),
+            item: ItemId("shared-item".into()),
+        },
+        action: action.map(|action| ActionId(action.into())),
+    };
+    let host_state = |reply: &ViewReply| HostViewState {
+        selected: Some(key(None).target),
+        scope: None,
+        input: match &reply.descriptor.view {
+            StandardView::Form(form) => Some(form.submit.clone()),
+            _ => None,
+        },
+    };
+    let grid = open(request("grid", 1));
+    assert!(matches!(grid.descriptor.view, StandardView::Grid(_)));
+    let mut refresh = request("grid", 1);
+    refresh.mode = ViewRequestMode::Refresh;
+    refresh.previous_revision = Some(grid.context.revision);
+    refresh.state = Some(host_state(&grid));
+    refresh.query = "coalesce".into();
+    struct ReleaseCoalescingCallback(PathBuf);
+    impl Drop for ReleaseCoalescingCallback {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, b"release");
+        }
+    }
+    let release = ReleaseCoalescingCallback(scratch.path.join("views/route-coalesce-release"));
+    let pending_refresh = executor.request_view(&owner, producer, refresh).unwrap();
+    let running = scratch.path.join("views/route-coalesce-running");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !running.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "delayed Refresh never entered the actual worker"
+        );
+        sleep(Duration::from_millis(2));
+    }
+    // New host intent changes only the existing P3 query/state, not the
+    // outstanding callback. Only the latest intent is dispatched after terminal.
+    let mut latest_query = String::new();
+    for intent in ["coalesced-a", "coalesced-b", "coalesced-latest"] {
+        latest_query.clear();
+        latest_query.push_str(intent);
+    }
+    fs::write(&release.0, b"release").unwrap();
+    let refreshed = match wait_native_action(executor.as_ref(), &pending_refresh).unwrap() {
+        ActionEffect::View(reply) => reply,
+        effect => panic!("uncancelled Refresh lost its actual revision: {effect:?}"),
+    };
+    assert_eq!(refreshed.context.session, grid.context.session);
+    let previous = refreshed.context.revision;
+    let mut latest = request("grid", 1);
+    latest.mode = ViewRequestMode::Refresh;
+    latest.previous_revision = Some(previous);
+    latest.state = Some(host_state(&refreshed));
+    latest.scroll = Some(ScrollAnchor {
+        item: key(None).target,
+        row_offset: 7,
+    });
+    latest.query = latest_query;
+    latest.reason = ViewRefreshReason::Query;
+    let refreshed = open(latest);
+    assert_eq!(refreshed.context.session, grid.context.session);
+    assert_ne!(refreshed.context.revision, previous);
+    assert!(refreshed.descriptor.title.contains("coalesced-latest"));
+    assert!(!refreshed.descriptor.title.contains("coalesced-a"));
+    fs::remove_file(running).unwrap();
+    let mut removal = request("grid", 1);
+    removal.mode = ViewRequestMode::Refresh;
+    removal.previous_revision = Some(refreshed.context.revision);
+    removal.state = Some(host_state(&refreshed));
+    removal.scroll = Some(ScrollAnchor {
+        item: key(None).target,
+        row_offset: 7,
+    });
+    removal.query = "remove-selected".into();
+    removal.reason = ViewRefreshReason::Query;
+    let removed = open(removal);
+    assert_eq!(removed.context.session, refreshed.context.session);
+    assert!(
+        removed.descriptor.definitions.is_empty(),
+        "filter replacement must actually remove the selected executable"
+    );
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &refreshed.context,
+                &host_state(&refreshed),
+                &key(None),
+                None
+            )
+            .is_err(),
+        "old revision cannot execute a removed target"
+    );
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &removed.context,
+                &host_state(&refreshed),
+                &key(None),
+                None
+            )
+            .is_err(),
+        "restore intent never authorizes a target absent from the current descriptor"
+    );
+    let mut restore = request("grid", 1);
+    restore.mode = ViewRequestMode::Refresh;
+    restore.previous_revision = Some(removed.context.revision);
+    restore.state = Some(host_state(&refreshed));
+    restore.scroll = Some(ScrollAnchor {
+        item: key(None).target,
+        row_offset: 7,
+    });
+    restore.query = "coalesced-latest".into();
+    restore.reason = ViewRefreshReason::Query;
+    let refreshed = open(restore);
+    assert_ne!(refreshed.context.revision, removed.context.revision);
+    assert_eq!(refreshed.context.session, removed.context.session);
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &removed.context,
+                &host_state(&refreshed),
+                &key(None),
+                None
+            )
+            .is_err(),
+        "removed-descriptor events cannot borrow the restored definitions"
+    );
+    let mut unselected = host_state(&refreshed);
+    unselected.selected = None;
+    assert!(
+        executor
+            .submit_view_action(&owner, &refreshed.context, &unselected, &key(None), None)
+            .is_err(),
+        "descriptor membership is not selected-event authority"
+    );
+    assert_ne!(grid.context.revision, refreshed.context.revision);
+    assert!(!executor.view_current(&owner, &grid.context));
+    assert!(
+        executor.view_current(&owner, &refreshed.context),
+        "stale validation must not retire the replacement"
+    );
+    assert!(executor
+        .submit_view_action(&owner, &grid.context, &host_state(&grid), &key(None), None)
+        .is_err());
+    assert!(
+        executor
+            .submit_view_action(
+                &owner,
+                &refreshed.context,
+                &host_state(&refreshed),
+                &key(Some("open")),
+                None
+            )
+            .is_err(),
+        "colliding root action must not resolve in actionless grid"
+    );
+    let id = executor
+        .submit_view_action(
+            &owner,
+            &refreshed.context,
+            &host_state(&refreshed),
+            &key(None),
+            None,
+        )
+        .unwrap();
+    assert!(
+        matches!(wait_native_action(executor.as_ref(), &id).unwrap(), ActionEffect::Navigate { outcome: StructuredRouteOutcome::Push(RouteId(route)), producer: actual } if route == "detail" && actual == producer)
+    );
+    let detail = open(request("detail", 2));
+    executor
+        .validate_view_link(
+            &owner,
+            &detail.context,
+            &host_state(&detail),
+            "https://example.com/",
+        )
+        .unwrap();
+    assert!(executor
+        .validate_view_link(
+            &owner,
+            &detail.context,
+            &host_state(&detail),
+            "https://example.com/not-admitted"
+        )
+        .is_err());
+    let id = executor
+        .submit_view_action(
+            &owner,
+            &detail.context,
+            &host_state(&detail),
+            &key(Some("open")),
+            None,
+        )
+        .unwrap();
+    assert!(
+        matches!(wait_native_action(executor.as_ref(), &id).unwrap(), ActionEffect::Navigate { outcome: StructuredRouteOutcome::Replace(RouteId(route)), .. } if route == "list")
+    );
+    let list = open(request("list", 3));
+    let id = executor
+        .submit_view_action(
+            &owner,
+            &list.context,
+            &host_state(&list),
+            &key(Some("open")),
+            None,
+        )
+        .unwrap();
+    assert!(
+        matches!(wait_native_action(executor.as_ref(), &id).unwrap(), ActionEffect::Navigate { outcome: StructuredRouteOutcome::Push(RouteId(route)), .. } if route == "form")
+    );
+    let form = open(request("form", 4));
+    let mut unfocused = host_state(&form);
+    unfocused.input = None;
+    assert!(
+        executor
+            .submit_view_action(&owner, &form.context, &unfocused, &key(Some("open")), None)
+            .is_err(),
+        "typed route targets cannot bypass their input schema"
+    );
+    let values = |password: &str, destination: &str| {
+        ArgumentValues(std::collections::BTreeMap::from([
+            (
+                FieldId("username".into()),
+                StructuredValue::NonSecret(NonSecretValue::Text("operator".into())),
+            ),
+            (
+                FieldId("password".into()),
+                StructuredValue::Password(Password::new(password.to_owned()).unwrap()),
+            ),
+            (
+                FieldId("destination".into()),
+                StructuredValue::NonSecret(NonSecretValue::Dropdown(OptionId(destination.into()))),
+            ),
+        ]))
+    };
+    assert!(
+        executor
+            .submit_view_typed(
+                &owner,
+                &form.context,
+                &unfocused,
+                &key(Some("open")),
+                values("view-secret", "complete")
+            )
+            .is_err(),
+        "typed submission requires the current P3 input target"
+    );
+    let id = executor
+        .submit_view_typed(
+            &owner,
+            &form.context,
+            &host_state(&form),
+            &key(Some("open")),
+            values("wrong", "complete"),
+        )
+        .unwrap();
+    assert!(matches!(
+        wait_native_action(executor.as_ref(), &id).unwrap(),
+        ActionEffect::Typed(SubmissionOutcome::InvalidFields(_))
+    ));
+    let id = executor
+        .submit_view_typed(
+            &owner,
+            &form.context,
+            &host_state(&form),
+            &key(Some("open")),
+            values("view-secret", "complete"),
+        )
+        .unwrap();
+    assert!(matches!(
+        wait_native_action(executor.as_ref(), &id).unwrap(),
+        ActionEffect::Typed(SubmissionOutcome::Completed)
+    ));
+    let id = executor
+        .submit_view_typed(
+            &owner,
+            &form.context,
+            &host_state(&form),
+            &key(Some("open")),
+            values("view-secret", "navigate"),
+        )
+        .unwrap();
+    assert!(
+        matches!(wait_native_action(executor.as_ref(), &id).unwrap(), ActionEffect::Navigate { outcome: StructuredRouteOutcome::Replace(RouteId(route)), producer: actual } if route == "grid" && actual == producer)
+    );
+    executor.retire_view(&owner, form.context.session);
+    assert!(!executor.view_current(&owner, &form.context));
+    assert!(executor
+        .submit_view_typed(
+            &owner,
+            &form.context,
+            &host_state(&form),
+            &key(Some("open")),
+            values("view-secret", "complete")
+        )
+        .is_err());
+    // Back opens the route directly with a fresh surface; no action is replayed.
+    let restored = open(request("list", 5));
+    assert_eq!(restored.context.route.0, "list");
+    executor.retire_view(&owner, restored.context.session);
+    let mut delayed = request("grid", 6);
+    delayed.query = "delay".into();
+    let id = executor.request_view(&owner, producer, delayed).unwrap();
+    let running = scratch.path.join("views").join("route-running");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !running.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "the real structured callback never entered"
+        );
+        sleep(Duration::from_millis(2));
+    }
+    assert!(executor.cancel_plugin_action(&id));
+    assert!(wait_native_action(executor.as_ref(), &id).is_err());
+    // No intervening view/preview operation may reset the physical latch.
+    // The same live worker must accept a new Root call after cooperative cancel.
+    let root = executor
+        .submit_plugin_action_by_id(&owner, &ItemId("launch".into()), &ActionId("open".into()), None)
+        .unwrap();
+    assert!(
+        matches!(wait_native_action(executor.as_ref(), &root).unwrap(), ActionEffect::Navigate { producer: actual, .. } if actual == producer)
+    );
+    let mut death = request("grid", 7);
+    death.query = "source-death".into();
+    let id = executor.request_view(&owner, producer, death).unwrap();
+    assert!(wait_native_action(executor.as_ref(), &id).is_err());
+    assert!(
+        executor
+            .request_view(&owner, producer, request("grid", 8))
+            .is_err(),
+        "dead route producer must never be reacquired"
+    );
+}

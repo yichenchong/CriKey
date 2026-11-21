@@ -35,6 +35,41 @@ pub use serve::{serve, serve_on, HandshakeInfo, ServeConfig};
 
 pub use crikey_core::result_presentation::ResultPresentation;
 pub use crikey_core::structured_arguments::{ArgumentValues, SubmissionFailureCode, SubmissionOutcome};
+pub use crikey_core::structured_view::{
+    HostViewState, RouteId, StructuredRouteOutcome, TypedExecutionOutcome, ViewDescriptor,
+    ViewExecutionContext, ViewReply, ViewRequest, STRUCTURED_VIEW_CAPABILITY,
+};
+
+/// Ordinary execution of an exact frozen route-local item.
+pub struct ViewExecuteRequest {
+    pub request: RequestId,
+    pub view: ViewExecutionContext,
+    pub item: Item,
+    pub action: Option<crikey_core::ActionId>,
+    pub argument: Option<String>,
+}
+
+/// Move-only typed execution of an exact frozen route-local item.
+pub struct ViewTypedExecuteRequest {
+    pub request: RequestId,
+    pub view: ViewExecutionContext,
+    pub item: Item,
+    pub action: Option<crikey_core::ActionId>,
+    pub expected_fingerprint: [u8; 32],
+    pub values: ArgumentValues,
+}
+
+impl std::fmt::Debug for ViewExecuteRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ViewExecuteRequest { [REDACTED] }")
+    }
+}
+
+impl std::fmt::Debug for ViewTypedExecuteRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ViewTypedExecuteRequest { [REDACTED] }")
+    }
+}
 
 /// Typed input is move-only and never forwarded to legacy execution.
 pub struct TypedExecuteRequest {
@@ -202,6 +237,8 @@ pub enum ExecuteOutcome {
         /// back in every [`PageRequest`], so one plugin can own several.
         page_id: String,
     },
+    /// Requests host-owned standard-route navigation.
+    Navigate(StructuredRouteOutcome),
 }
 
 impl ExecuteOutcome {
@@ -295,6 +332,39 @@ pub struct PluginResource {
 
 /// The trait a native plugin implements (spec 16.7).
 pub trait Plugin {
+    /// Standard views negotiate independently from typed input and presentation.
+    fn supports_structured_views(&self) -> bool {
+        false
+    }
+
+    fn structured_view(
+        &mut self,
+        _request: &ViewRequest,
+        _context: &dyn PluginContext,
+    ) -> Result<ViewDescriptor> {
+        Err(crikey_core::CoreError::Invalid(
+            "structured views unsupported".into(),
+        ))
+    }
+
+    fn execute_view(
+        &mut self,
+        _request: ViewExecuteRequest,
+        _context: &dyn PluginContext,
+    ) -> Result<ExecuteOutcome> {
+        Err(crikey_core::CoreError::Invalid(
+            "route execution unsupported".into(),
+        ))
+    }
+
+    fn execute_view_typed(
+        &mut self,
+        _request: ViewTypedExecuteRequest,
+        _context: &dyn PluginContext,
+    ) -> Result<TypedExecutionOutcome> {
+        Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported).into())
+    }
+
     /// Typed execution and visual presentation negotiate independently.
     fn supports_typed_arguments(&self) -> bool {
         false
@@ -321,8 +391,8 @@ pub trait Plugin {
         &mut self,
         _request: TypedExecuteRequest,
         _context: &dyn PluginContext,
-    ) -> Result<SubmissionOutcome> {
-        Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported))
+    ) -> Result<TypedExecutionOutcome> {
+        Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported).into())
     }
     /// Opt in only with an explicit implementation. Adapters without a command
     /// callback (including WASM/C ABI) must retain this false default.

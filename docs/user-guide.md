@@ -143,11 +143,10 @@ commands. Removed or unavailable commands cannot execute through queued receipts
 Optional free-form commands execute without an argument; Required free-form
 commands open fresh input. Commands with a typed schema open that same inline
 typed editor instead: aliases and shortcuts do not invent positional values.
-Hidden direct actions remain hidden unless their still-current
-deliberate shortcut result opens a page. Native command `ShowPage` outcomes support
-this presentation; Modern Python execution currently discards returned outcomes,
-so Modern command shortcuts do not open result pages. New input or dismissal
-supersedes the Native presentation intent.
+Hidden direct actions remain hidden unless a still-current deliberate shortcut
+result requests presentation. Native page outcomes and independently negotiated
+Native/Modern standard-route outcomes support this flow. New input or dismissal
+supersedes that presentation intent; stale results cannot reopen the launcher.
 
 Global registration uses X11, the Wayland GlobalShortcuts portal, or Windows'
 native service. Desktop policy can refuse a chord; macOS global registration is
@@ -296,8 +295,9 @@ Every typed submission makes its worker diagnostically sensitive for that
 process's remaining lifetime: plugin logs, captured output, exception text,
 tracebacks and stderr tails are suppressed. Fixed host codes still report
 refusal, timeout, cancellation and transport failure. Cancellation does not
-undo effects. Inline fields do not add standard grid, detail, form or
-structured routes; existing previews and custom pages remain separate.
+undo effects. Standard list/grid/detail/form routes additionally require their
+own capability; inline fields alone do not grant it. Existing previews and
+custom pages remain separate surfaces.
 
 ### Result groups and scopes
 
@@ -351,6 +351,79 @@ user profile.
    or revive a dismissed view. This checks diagnostic boundaries, not secure
    erasure or protection against deliberate plugin I/O.
 
+### Standard plugin views
+
+Capable Native and Modern Python plugins can open host-rendered **List**,
+**Grid**, **Detail** or **Form** routes. These are not web documents or custom
+display-list pages. A list presents ordinary rows and Actions; a grid presents
+bounded image tiles; detail uses the existing safe text/markdown/image/link
+renderer; a form edits the same executable schema used by typed arguments.
+
+Lists use ordinary row navigation and `Ctrl/Cmd+K` or `Alt+Enter` for Actions.
+In a grid, Left/Right move within a row and Up/Down move spatially between rows;
+Page Up/Down move by pages of rows. Section headers never take selection.
+Forms reuse the native typed editor: use **Run command**, Enter in a
+single-line/password field, or Ctrl/Cmd+Enter for multiline input. Required fields
+and fixed field failures follow the inline-input rules above.
+
+A plugin can **Push** a route onto the existing navigation stack or **Replace**
+the current entry. Back reopens the saved owner/route with a fresh surface and
+current definitions; it never executes the opening action again. The host
+retains logical query, selection, scope, scroll anchor and eligible nonsecret
+drafts, not plugin processes or rendered snapshots. Refresh replaces content
+and executable definitions together; late clicks/results from an older
+revision cannot invoke replacement definitions, even when item labels/IDs match.
+Rapid query, selection and scope changes are coalesced while a refresh is
+pending; the latest intent wins without restoring an earlier input state.
+If the selected item disappears, the host does not execute a replacement item.
+Drafts whose executable or schema no longer matches are discarded.
+
+Route actions belong to that exact owner, worker, route, session and revision.
+They cannot borrow a root result or another route's identically named item.
+Losing the producing worker makes the active route unavailable rather than
+silently attaching it to a replacement process. Back and Settings remain
+reachable on unavailable routes. Cancellation retires presentation immediately,
+but a busy worker slot remains occupied until its callback finishes or is reaped.
+
+Covering a form with Settings/another view, Back, hiding or losing its source
+retires live password storage. Returning can restore only nonsecret drafts
+whose exact executable and schema fingerprint still match; passwords require
+re-entry. Forms and all later callbacks retain the typed diagnostic-suppression
+boundary. This is not a promise of secure erasure or a plugin sandbox.
+
+Standard routes share the existing 16-entry/8 MiB mixed navigation budget with
+root, Settings and custom pages; they do not get another stack or allowance.
+Descriptors allow up to 4,096 items/definitions, 128 sections/scopes, 256 actions
+per target and menu depth four. Grid columns range from 1 to 16. Existing
+schema, preview, image and transport limits still apply; oversized content is
+refused rather than partially executable.
+
+`structured_view_v1` is independent of typed arguments, root presentation,
+previews and command declarations. Older workers keep ordinary behavior but
+cannot service standard routes without negotiation. Legacy Python, WASM and
+restricted C ABI have no standard-route callback; metadata does not fabricate
+one. Standard views do not add another web surface or fetch image URLs.
+
+#### Proposed standard-view acceptance procedure
+
+This is a procedure proposal, not runtime acceptance evidence. Stage private
+copies of the [Native and Modern fixtures](plugin-author-guide.md#standard-list-grid-detail-and-form-routes)
+with synthetic passwords and isolated configuration/state/data/cache paths:
+
+1. Traverse root → grid → detail/list → form in both real workers. Exercise
+   Push and Replace, actionless and explicit actions, successful and fixed-field
+   failed submissions, and a typed root outcome that opens a route.
+2. Return with Back and delayed resume; verify fresh opening without action
+   replay, spatial grid selection, scroll anchoring and matching nonsecret draft
+   restoration. Passwords, including Undo state, must not return.
+3. Refresh after query/selection/scope changes while delayed work is pending.
+   Old descriptor events must not resolve against new definitions or root
+   items sharing the same ID. Test source death/replacement and confirm a
+   recoverable unavailable view, not borrowed execution authority.
+4. Exercise descriptor/image/mixed-stack limits, independent capability absence,
+   cancellation while a callback occupies its worker slot, permission-denied
+   detail links and secret-canary diagnostic/history/config exclusion.
+
 ### Action refresh and failures
 
 An admitted provider refresh preserves action search and focus for the exact
@@ -360,9 +433,10 @@ new selection. Actions are bounded to 256 entries, depth four, 8 KiB per text
 field and 256 KiB total prepared text; excessive input is refused visibly.
 Icons use already prepared result pixels or host vector symbols, never
 paint-time file/network loading. Primary and host shortcuts are host labels;
-the current plugin action contract does not declare arbitrary shortcuts or
-destructive flags. Explicit destructive presentation, where supplied by a host
-declaration, is styling only: it does not grant permission or confirm an action.
+the root plugin action contract does not declare arbitrary shortcuts or
+destructive flags. Standard-route presentation can include shortcut labels and
+destructive styling; neither registers a global shortcut, grants permission nor
+confirms an action.
 
 Action failures replace the selected row's secondary metadata so that long
 descriptions cannot hide them. Hover the diagnostic to read its complete
@@ -415,9 +489,10 @@ scrolls itself to follow a selection you moved.
 
 ### Navigation, logical resume, and query recall
 
-Settings and custom pages have a title and **Back**. Escape returns one level:
-preview focus/detail, an open action search/submenu/panel, the previous view,
-then root-query clearing and dismissal. The host retains the root query,
+Settings, custom pages and standard views have a title and **Back**. Escape
+first leaves focused preview/typed editing or an action search/submenu/panel,
+then returns to the previous view, then clears/dismisses root as applicable.
+The host retains the root query,
 owner-qualified selection, logical scope and list scroll anchor. Returning
 issues a fresh search, reconciles the exact owner/item, and clamps safely if
 it disappeared. Navigation is bounded to 16 entries including the current view
@@ -429,8 +504,8 @@ surface opens. Back opens its saved owner/page route with fresh request and
 surface identities; it does not execute the original action again. Arbitrary
 web-document state, display lists and engine pixels are not snapshots. A missing
 owner yields **Page unavailable** with a working Back rather than an endless
-loading surface. Logical resume applies to Settings and custom pages; arbitrary
-web-document state is not restored.
+loading surface. Logical resume applies to Settings, custom pages and standard
+routes; arbitrary web-document state is not restored.
 
 `launcher.resume-delay-ms` defaults to `0`: dismissal immediately resets to root.
 A positive millisecond value resumes the logical view only if reopened strictly
