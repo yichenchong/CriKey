@@ -2175,7 +2175,11 @@ where
                 let response = graphics
                     .egui_state
                     .on_window_event(graphics.window.as_ref(), &event);
-                if response.repaint && self.active_session.is_some() {
+                // RedrawRequested is serviced below, not another redraw request.
+                if response.repaint
+                    && !matches!(&event, WindowEvent::RedrawRequested)
+                    && self.active_session.is_some()
+                {
                     graphics.window.request_redraw();
                 }
             }
@@ -6065,9 +6069,10 @@ fn draw_settings(
                                     )
                                 })
                                 .expect("launcher context owns compiled navigation");
-                            let viewport_width = ui.available_width();
+                            let viewport_width = ui.available_width().min(ui.clip_rect().width()).max(0.0);
+                            let action_width = (viewport_width * 0.42)
+                                .clamp(colors.metrics.scaled(140.0), colors.metrics.scaled(200.0));
                             let table_width = viewport_width.max(620.0 * colors.metrics.scale);
-                            let action_width = table_width * 0.4;
                             let chord_width = table_width - action_width - ui.spacing().item_spacing.x;
                             let row_height = ui.spacing().interact_size.y;
                             egui::ScrollArea::horizontal()
@@ -6078,15 +6083,25 @@ fn draw_settings(
                                     ui.set_width(table_width);
                                     for binding in navigation.bindings() {
                                         ui.horizontal(|ui| {
-                                            ui.add_sized(
-                                                [action_width, row_height],
-                                                egui::Label::new(binding.action.name()).truncate(),
+                                            ui.allocate_ui_with_layout(
+                                                vec2(action_width, row_height),
+                                                Layout::left_to_right(Align::Center),
+                                                |ui| {
+                                                    ui.set_min_size(vec2(action_width, row_height));
+                                                    ui.add(egui::Label::new(binding.action.name()).truncate())
+                                                },
                                             )
+                                            .inner
                                             .on_hover_text(binding.action.name());
-                                            ui.add_sized(
-                                                [chord_width, row_height],
-                                                egui::Label::new(binding.hint.as_str()).truncate(),
+                                            ui.allocate_ui_with_layout(
+                                                vec2(chord_width, row_height),
+                                                Layout::left_to_right(Align::Center),
+                                                |ui| {
+                                                    ui.set_min_size(vec2(chord_width, row_height));
+                                                    ui.add(egui::Label::new(binding.hint.as_str()).truncate())
+                                                },
                                             )
+                                            .inner
                                             .on_hover_text(binding.hint.as_str());
                                         });
                                     }

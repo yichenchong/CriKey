@@ -4,6 +4,18 @@ use crate::action_panel::{ActionIdentity, ActionPanelInvalidation};
 
 pub(super) const HEIGHT: f32 = 244.0;
 
+fn egui_navigation_modifiers(modifiers: egui::Modifiers) -> crikey_platform::Modifiers {
+    // COMMAND is an abstract shortcut modifier. Physical Ctrl/mac_cmd fields
+    // remain exact, including combinations containing both.
+    let abstract_command = modifiers.command && !modifiers.ctrl && !modifiers.mac_cmd;
+    crikey_platform::Modifiers {
+        ctrl: modifiers.ctrl || (abstract_command && !cfg!(target_os = "macos")),
+        alt: modifiers.alt,
+        shift: modifiers.shift,
+        meta: modifiers.mac_cmd || (abstract_command && cfg!(target_os = "macos")),
+    }
+}
+
 pub(super) fn keyboard(context: &egui::Context, model: &ViewModel, commands: &mut Vec<UiCommand>) {
     context.data_mut(|data| data.insert_temp(egui::Id::new("crikey-navigation-activate"), false));
     if model.settings_open || model.page.is_some() || model.navigation.inline_arguments.is_some() {
@@ -45,17 +57,14 @@ pub(super) fn keyboard(context: &egui::Context, model: &ViewModel, commands: &mu
                 egui::Event::Ime(egui::ImeEvent::Preedit(text)) => composing |= !text.is_empty(),
                 egui::Event::Ime(egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled) => composing = false,
                 egui::Event::Key { key, modifiers, pressed: true, .. } if !submitted => {
-                    if modifiers.ctrl && modifiers.alt && altgr_text { return true; }
+                    let platform_modifiers = egui_navigation_modifiers(*modifiers);
+                    if platform_modifiers.ctrl && platform_modifiers.alt && altgr_text { return true; }
                     let key_name = match *key {
                         egui::Key::ArrowUp => "Up",
                         egui::Key::ArrowDown => "Down",
                         egui::Key::ArrowLeft => "Left",
                         egui::Key::ArrowRight => "Right",
                         other => other.name(),
-                    };
-                    let platform_modifiers = crikey_platform::Modifiers {
-                        ctrl: modifiers.ctrl || (modifiers.command && !modifiers.mac_cmd),
-                        alt: modifiers.alt, shift: modifiers.shift, meta: modifiers.mac_cmd,
                     };
                     let chord = navigation_chord(&navigation, key_name, platform_modifiers);
                     let owner = if collection_scope && query_focused && matches!(initial_owner, crate::navigation::NavigationOwner::Host | crate::navigation::NavigationOwner::Query) {
@@ -591,4 +600,28 @@ pub(super) fn draw_command_controls(
         });
     }
     ui.separator();
+}
+
+#[cfg(test)]
+mod modifier_tests {
+    use super::egui_navigation_modifiers;
+
+    #[test]
+    fn abstract_command_uses_native_platform_without_changing_physical_modifiers() {
+        let abstract_command = egui_navigation_modifiers(egui::Modifiers::COMMAND);
+        assert_eq!(abstract_command.ctrl, !cfg!(target_os = "macos"));
+        assert_eq!(abstract_command.meta, cfg!(target_os = "macos"));
+        for (ctrl, meta) in [(true, false), (false, true), (true, true)] {
+            let converted = egui_navigation_modifiers(egui::Modifiers {
+                ctrl,
+                mac_cmd: meta,
+                command: true,
+                alt: true,
+                shift: true,
+            });
+            assert_eq!(converted.ctrl, ctrl);
+            assert_eq!(converted.meta, meta);
+            assert!(converted.alt && converted.shift);
+        }
+    }
 }

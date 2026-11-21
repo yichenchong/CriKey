@@ -1833,12 +1833,15 @@ fn actual_standard_controls_use_applied_hints_and_long_action_labels_ellipsis() 
     )
     .unwrap();
     set_launcher_navigation(&context, Arc::new(navigation.clone()));
-    let draw = |view: &ViewModel, events| {
+    let mut time = 0.0;
+    let mut draw = |view: &ViewModel, events| {
+        time += 0.6;
         build_launcher_frame(
             &context,
             egui::RawInput {
                 focused: true,
                 events,
+                time: Some(time),
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(480.0, 720.0),
@@ -1886,6 +1889,33 @@ fn actual_standard_controls_use_applied_hints_and_long_action_labels_ellipsis() 
     assert!(text_bounds.right() < 480.0);
     assert!(opened.output.shapes.iter().any(|shape| matches!(&shape.shape,
         egui::Shape::Text(text) if text.galley.text() == "F8")));
+    let hovering = draw(&view, vec![egui::Event::PointerMoved(text_bounds.center())]);
+    let tooltip = draw(&view, vec![]);
+    let tooltip = if tooltip.output.shapes.iter().any(|shape| {
+        matches!(&shape.shape,
+        egui::Shape::Text(text) if text.galley.text() == label && !text.galley.elided)
+    }) {
+        tooltip
+    } else {
+        draw(&view, vec![])
+    };
+    assert!(
+        tooltip.output.shapes.iter().any(|shape| matches!(&shape.shape,
+        egui::Shape::Text(text) if text.galley.text() == label && !text.galley.elided)),
+        "the real elided action exposes its full title after hover delay; popup={} repaint={:?}",
+        context.memory(|memory| memory.any_popup_open()),
+        hovering
+            .output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.repaint_delay)
+    );
+    assert!(!tooltip.commands.iter().any(|command| matches!(
+        command,
+        UiCommand::ActivateSelectedAction
+            | UiCommand::StandardActivate { .. }
+            | UiCommand::ActivateAction { .. }
+    )));
     let filtered = navigation.without_chords(&[
         crikey_platform::Accelerator::parse("Alt+Q").unwrap(),
         crikey_platform::Accelerator::parse("F8").unwrap(),

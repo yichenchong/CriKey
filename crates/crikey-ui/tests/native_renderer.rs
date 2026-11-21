@@ -5755,7 +5755,8 @@ fn expanded_applied_navigation_uses_readable_columns_at_real_launcher_width() {
     let next = text("next");
     let down = text("Down");
     let previous = text("previous");
-    for (shape, text) in [next, down, previous] {
+    let longest_name = text(crikey_ui::navigation::NavigationAction::TogglePreview.name());
+    for (shape, text) in [next, down, previous, longest_name] {
         assert_eq!(
             text.galley.rows.len(),
             1,
@@ -5766,9 +5767,11 @@ fn expanded_applied_navigation_uses_readable_columns_at_real_launcher_width() {
             .clip_rect
             .contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size())));
     }
+    let name_bounds = [next, previous, longest_name]
+        .map(|(_, text)| egui::Rect::from_min_size(text.pos, text.galley.size()));
     assert!(
-        down.1.pos.x - next.1.pos.x >= 160.0,
-        "the table uses its real available width"
+        name_bounds.iter().all(|rect| rect.right() < down.1.pos.x),
+        "binding values must start beyond every fully readable name, without column overlap"
     );
 }
 
@@ -5836,4 +5839,123 @@ fn custom_page_footer_at_two_x_dpi_keeps_both_identity_labels_and_settings_separ
     let clicked = draw(click_at(bounds(settings.1).center()));
     assert!(clicked.commands.contains(&UiCommand::OpenSettings));
     assert!(page_inputs(&clicked).is_empty());
+}
+
+#[test]
+fn narrow_large_applied_map_keeps_names_and_long_bindings_visible_and_really_scrolls() {
+    use crikey_ui::appearance::{AppearanceCache, AppearancePreferences, InterfaceSize, SystemTheme};
+    use crikey_ui::navigation::{CompiledNavigation, NavigationAction, NavigationStyle};
+    let context = create_launcher_context();
+    let appearance = AppearanceCache::new(
+        AppearancePreferences {
+            interface_size: InterfaceSize::Large,
+            ..Default::default()
+        },
+        SystemTheme::Light,
+    )
+    .unwrap();
+    crikey_ui::set_launcher_appearance(&context, appearance.resolved());
+    let navigation = CompiledNavigation::compile(
+        NavigationStyle::Default,
+        r#"{"next":["Ctrl+Alt+Shift+Meta+PageDown"],"previous":["Ctrl+Alt+Shift+Meta+PageUp"]}"#,
+    )
+    .unwrap();
+    let next = navigation
+        .bindings()
+        .iter()
+        .find(|binding| binding.action == NavigationAction::Next)
+        .unwrap()
+        .hint
+        .clone();
+    let previous = navigation
+        .bindings()
+        .iter()
+        .find(|binding| binding.action == NavigationAction::Previous)
+        .unwrap()
+        .hint
+        .clone();
+    crikey_ui::set_launcher_navigation(&context, Arc::new(navigation));
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::OpenSettings);
+    let view = model.frame().unwrap();
+    let mut time = 0.0;
+    let mut draw = |events| {
+        time += 0.1;
+        let mut input = launcher_input(events);
+        input.time = Some(time);
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(480.0, 960.0),
+        ));
+        build_launcher_frame(&context, input, &view)
+    };
+    draw(vec![]);
+    let initial = draw(vec![]);
+    let header = position_of(&initial, "Applied navigation shortcuts") + egui::vec2(8.0, 6.0);
+    draw(click_at(header));
+    let mut expanded = draw(vec![]);
+    for _ in 0..12 {
+        expanded = draw(vec![]);
+    }
+    fn cell<'a>(
+        frame: &'a crikey_ui::NativeUiFrame,
+        label: &str,
+    ) -> (&'a egui::epaint::ClippedShape, &'a egui::epaint::TextShape) {
+        frame
+            .output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => Some((shape, text)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("actual applied name/binding {label} is painted"))
+    }
+    for label in ["next", "previous", next.as_str(), previous.as_str()] {
+        let (shape, text) = cell(&expanded, label);
+        let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+        assert_eq!(text.galley.rows.len(), 1);
+        assert!(!text.galley.elided);
+        if matches!(label, "next" | "previous") {
+            assert!(
+                shape.clip_rect.contains_rect(rect),
+                "the whole action name must be visible: {label} {rect:?} clip={:?}",
+                shape.clip_rect
+            );
+        } else {
+            assert!(
+                shape.clip_rect.intersect(rect).width() >= 36.0,
+                "a real portion of each binding must be visible before scrolling: {label} {rect:?} clip={:?}",
+                shape.clip_rect
+            );
+        }
+    }
+    let (shape, text) = cell(&expanded, &next);
+    let before = egui::Rect::from_min_size(text.pos, text.galley.size());
+    let pointer = shape.clip_rect.intersect(before).center();
+    let mut scrolled = draw(vec![
+        egui::Event::PointerMoved(pointer),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(-100.0, 0.0),
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]);
+    for _ in 0..12 {
+        scrolled = draw(vec![]);
+    }
+    for label in [next.as_str(), previous.as_str()] {
+        let (shape, text) = cell(&scrolled, label);
+        let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+        assert!(
+            shape.clip_rect.contains_rect(rect),
+            "the complete chord is reachable: {label} {rect:?} clip={:?}",
+            shape.clip_rect
+        );
+        assert!(
+            rect.left() < before.left() - 1.0,
+            "real horizontal input moves the binding column"
+        );
+    }
 }

@@ -1596,7 +1596,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             status.requested, status.active
                         );
                         eprintln!("crikey: {message}");
-                        view_model.set_navigation_notice(message);
                         if *owner == crikey_app::BindingOwner::Launcher && status.active.is_none() {
                             let diagnostic = settings::surface_hotkey_failure(
                                 &mut view_model,
@@ -1608,12 +1607,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             }
                         }
                     }
-                }
-                for failure in &report.cleanup_failures {
-                    view_model.set_navigation_notice(format!(
-                        "Shortcut cleanup {}: {}",
-                        failure.accelerator, failure.error
-                    ));
                 }
                 let mut rows = crikey_app::launcher_settings::rows(configuration.as_ref().map(|config| &config.store));
                 if let Some(row) = rows
@@ -1638,28 +1631,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             }
             if navigation_dirty {
                 navigation_dirty = false;
-                let mut unavailable = Vec::new();
-                let mut diagnostics = Vec::new();
-                for (owner, status) in &hotkey_report.bindings {
-                    if let Some(chord) = status.active.as_deref().and_then(|text| crikey_platform::Accelerator::parse(text).ok()) {
-                        unavailable.push(chord);
-                        let source = if *owner == crikey_app::BindingOwner::Launcher {
-                            crikey_ui::navigation::ShortcutSource::AppliedActivation
-                        } else { crikey_ui::navigation::ShortcutSource::AppliedCommand };
-                        if let Some(conflict) = applied_navigation.conflict(chord, source) {
-                            diagnostics.push(format!("Navigation shortcut {} unavailable: actually-held OS shortcut ({:?}); desired configuration is separate", chord.canonical(), conflict.source));
-                        }
-                    }
-                }
-                for failure in &hotkey_report.cleanup_failures {
-                    if let Ok(chord) = crikey_platform::Accelerator::parse(&failure.accelerator) {
-                        unavailable.push(chord);
-                        if applied_navigation.conflict(chord, crikey_ui::navigation::ShortcutSource::AppliedCommand).is_some() {
-                            diagnostics.push(format!("Navigation shortcut {} unavailable: OS grab cleanup failed; the previous grab may still be held", failure.accelerator));
-                        }
-                    }
-                }
-                let applied = Arc::new(applied_navigation.without_chords(&unavailable));
+                let (applied, mut diagnostics) = project_applied_navigation(&hotkey_report, &applied_navigation);
                 if let Err(error) = render_handle.set_navigation(applied) {
                     diagnostics.push(format!("Navigation retained: {error}"));
                 }
@@ -2983,6 +2955,63 @@ fn close_failed_web_page(
     search.close_page();
     view_model.close_page();
     format!("Page closed: {message}")
+}
+
+fn project_applied_navigation(
+    hotkey_report: &crikey_app::ReconcileReport,
+    applied_navigation: &crikey_ui::navigation::CompiledNavigation,
+) -> (Arc<crikey_ui::navigation::CompiledNavigation>, Vec<String>) {
+    let mut unavailable = Vec::new();
+    let mut diagnostics = hotkey_report
+        .bindings
+        .iter()
+        .filter_map(|(owner, status)| {
+            status.problem.as_ref().map(|problem| {
+                format!(
+                    "Shortcut {owner:?}: desired {:?}, active {:?}: {problem:?}",
+                    status.requested, status.active
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    diagnostics.extend(
+        hotkey_report
+            .cleanup_failures
+            .iter()
+            .map(|failure| format!("Shortcut cleanup {}: {}", failure.accelerator, failure.error)),
+    );
+    for (owner, status) in &hotkey_report.bindings {
+        if let Some(chord) = status
+            .active
+            .as_deref()
+            .and_then(|text| crikey_platform::Accelerator::parse(text).ok())
+        {
+            unavailable.push(chord);
+            let source = if *owner == crikey_app::BindingOwner::Launcher {
+                crikey_ui::navigation::ShortcutSource::AppliedActivation
+            } else {
+                crikey_ui::navigation::ShortcutSource::AppliedCommand
+            };
+            if let Some(conflict) = applied_navigation.conflict(chord, source) {
+                diagnostics.push(format!("Navigation shortcut {} unavailable: actually-held OS shortcut ({:?}); desired configuration is separate", chord.canonical(), conflict.source));
+            }
+        }
+    }
+    for failure in &hotkey_report.cleanup_failures {
+        if let Ok(chord) = crikey_platform::Accelerator::parse(&failure.accelerator) {
+            unavailable.push(chord);
+            if applied_navigation
+                .conflict(chord, crikey_ui::navigation::ShortcutSource::AppliedCommand)
+                .is_some()
+            {
+                diagnostics.push(format!("Navigation shortcut {} unavailable: OS grab cleanup failed; the previous grab may still be held", failure.accelerator));
+            }
+        }
+    }
+    (
+        Arc::new(applied_navigation.without_chords(&unavailable)),
+        diagnostics,
+    )
 }
 
 fn apply_interface_preferences(
@@ -7801,5 +7830,96 @@ mod standard_route_resume_tests {
                 .get(&FieldId("username".into())),
             Some(&NonSecretValue::Text("native-route-user".into()))
         );
+    }
+}
+
+#[cfg(test)]
+mod applied_navigation_report_tests {
+    use super::*;
+
+    #[test]
+    fn current_registration_recovery_clears_only_current_shortcut_diagnostics() {
+        use crikey_app::{BindingOwner, BindingStatus, HotkeyFailure, HotkeyProblem, ReconcileReport};
+        use crikey_ui::navigation::{CompiledNavigation, NavigationAction, NavigationStyle};
+        use crikey_ui::InterfaceDiagnosticSource;
+        let mut report = ReconcileReport {
+            publication: 1,
+            ..Default::default()
+        };
+        report.bindings.insert(
+            BindingOwner::Launcher,
+            BindingStatus {
+                requested: Some("Ctrl+Alt+Y".into()),
+                active: Some("Ctrl+Alt+Space".into()),
+                problem: Some(HotkeyProblem::Backend(vec![HotkeyFailure {
+                    accelerator: "Ctrl+Alt+Y".into(),
+                    operation: "register",
+                    error: "already held".into(),
+                }])),
+            },
+        );
+        let navigation =
+            CompiledNavigation::compile(NavigationStyle::Default, r#"{"next":["Ctrl+Alt+Space"]}"#).unwrap();
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        model.set_interface_diagnostic(
+            InterfaceDiagnosticSource::Preferences,
+            Some("Invalid desired appearance; last-good appearance retained".into()),
+        );
+        let (applied, problems) = project_applied_navigation(&report, &navigation);
+        assert!(!applied
+            .bindings()
+            .iter()
+            .any(|binding| binding.action == NavigationAction::Next));
+        assert!(problems.iter().any(|problem| problem.contains("Ctrl+Alt+Y")));
+        model.set_interface_diagnostic(InterfaceDiagnosticSource::Shortcuts, Some(problems.join("; ")));
+        assert!(model.frame().unwrap().navigation.unavailable.is_none());
+
+        report.publication = 2;
+        report.bindings.insert(
+            BindingOwner::Launcher,
+            BindingStatus {
+                requested: Some("Ctrl+Alt+Space".into()),
+                active: Some("Ctrl+Alt+Space".into()),
+                problem: None,
+            },
+        );
+        let (applied, problems) = project_applied_navigation(&report, &navigation);
+        assert!(
+            !problems.is_empty(),
+            "the still-held navigation collision is independent of registration recovery"
+        );
+        assert!(
+            !problems.iter().any(|problem| problem.contains("Ctrl+Alt+Y")),
+            "a successful current report cannot retain the previous failed desired shortcut"
+        );
+        assert!(!applied
+            .bindings()
+            .iter()
+            .any(|binding| binding.action == NavigationAction::Next));
+        model.set_interface_diagnostic(InterfaceDiagnosticSource::Shortcuts, Some(problems.join("; ")));
+        assert!(!model.interface_diagnostics()[1]
+            .as_deref()
+            .unwrap()
+            .contains("Ctrl+Alt+Y"));
+
+        let (applied, problems) = project_applied_navigation(&report, &CompiledNavigation::default());
+        assert!(
+            problems.is_empty(),
+            "a recovered report and nonconflicting map have no current shortcut warning"
+        );
+        assert!(applied
+            .bindings()
+            .iter()
+            .any(|binding| binding.action == NavigationAction::Next));
+        model.set_interface_diagnostic(InterfaceDiagnosticSource::Shortcuts, None);
+        assert!(model.interface_diagnostics()[1].is_none());
+        assert_eq!(
+            model.interface_diagnostics()[0].as_deref(),
+            Some("Invalid desired appearance; last-good appearance retained")
+        );
+        let frame = model.frame().unwrap();
+        assert!(frame.navigation.unavailable.is_none());
+        assert!(!frame.navigation.can_go_back);
     }
 }
