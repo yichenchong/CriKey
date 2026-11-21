@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crikey_app::{
     DisabledPlugins, NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, ProviderQueryContext,
-    QueryPipeline, PLUGIN_ICON_DEADLINE,
+    QueryPipeline,
 };
 use crikey_core::{ActionId, Generation, ItemId, PluginId};
 use crikey_ui::ViewModel;
@@ -1104,13 +1104,6 @@ fn native_healthy_worker_survives_repeated_queries() {
 /// conflating the collection budget with driver/OS scheduling latency.
 const ICON_ISOLATION_WINDOW: Duration = Duration::from_millis(60);
 
-/// How far past the collection window a batch may still be called on time.
-///
-/// Covers driver wake-up, one warm pipe round trip and frame assembly on a
-/// loaded machine. It stays well below the fixture's 150 ms icon answer, so a
-/// batch that waited for the icon can never pass for a batch that did not.
-const BATCH_PUBLICATION_SLACK: Duration = Duration::from_millis(60);
-
 /// Writes a native package whose worker is started at load time.
 ///
 /// The icon-isolation tests measure one query against a short collection
@@ -1375,17 +1368,40 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
     }
 }
 
-/// A plugin that never answers a resource request must cost queries nothing.
+/// An unanswered resource must not displace current query rows.
 ///
-/// Silence is bounded by the host's own icon deadline and by nothing the
-/// plugin does, so the queries either side of it are published on time and the
-/// abandoned request leaves nothing behind for a later query to queue behind.
+/// Wire receipt of a distinct retry proves that the serialized first host
+/// fetch has returned without an answer. The original guest callback stays
+/// unanswered until admission closes; this does not claim its original host
+/// wait is still pending. Checked stop proves final physical settlement,
+/// including any latest retry that was active when admission closed.
 #[test]
 fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
+    struct ReleaseSilentOnDrop(PathBuf);
+    impl Drop for ReleaseSilentOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, b"return through SDK shutdown");
+        }
+    }
+
+    fn request_witness(gate: &Path, attempt: usize, ceiling: Duration) -> (u32, u64) {
+        let path = gate.join(format!("request-{attempt}"));
+        await_condition(ceiling, "a real inbound resource request", || path.is_file());
+        let record = fs::read_to_string(path).expect("complete request witness was published");
+        let fields: Vec<_> = record.split_whitespace().collect();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[2], "never.svg", "every attempt serves the same icon key");
+        let pid = fields[0].parse::<u32>().expect("physical PID is numeric");
+        let request = fields[1].parse::<u64>().expect("request ID is numeric");
+        assert_ne!(pid, 0);
+        assert_ne!(request, 0);
+        (pid, request)
+    }
+
     let (conformance, _) = conformance_binaries();
     let scratch = Scratch::new("icon-silent");
     let plugins_root = scratch.subdir("plugins");
-    write_eager_native_plugin(&plugins_root, "silenticon", &conformance, "icon-silent");
+    let package = write_eager_native_plugin(&plugins_root, "silenticon", &conformance, "icon-silent");
     let owner = native_plugin("silenticon");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
@@ -1396,8 +1412,33 @@ fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
         &DisabledPlugins::default(),
     );
     assert!(provider.plugins().contains(&owner));
-    let (driver, published) = spawn_icon_timing_driver(provider, pipeline, owner);
-
+    let gate = scratch.subdir("silent-resource");
+    fs::write(package.join("icon-silent-gate"), gate.to_str().unwrap())
+        .expect("silent resource witness is configured after eager query startup");
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&published);
+    let driver = NativeDriver::spawn(
+        provider,
+        pipeline,
+        Box::new(move |frame| {
+            let row = frame.rows.iter().find(|row| row.plugin_name == owner.0);
+            if let Some(row) = row {
+                assert_eq!(
+                    row.label,
+                    format!("icon-never-{}", frame.generation.get()),
+                    "a current generation must never publish an earlier query's item"
+                );
+            }
+            sink.lock().unwrap().push((
+                Instant::now(),
+                frame.generation,
+                row.is_some(),
+                row.is_some_and(|row| row.icon.is_some()),
+            ));
+        }),
+    );
+    // Release the callback before driver teardown even when an assertion panics.
+    let release = ReleaseSilentOnDrop(gate.join("release"));
     driver.submit(Generation::from_raw(1), "icon one", 17, Vec::new(), false, 0);
     await_publication(
         &published,
@@ -1405,47 +1446,101 @@ fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
         "a first-generation row",
         |(_, generation, row, _)| *generation == Generation::from_raw(1) && *row,
     );
-
-    let submitted = Instant::now();
+    let first = request_witness(&gate, 1, RESOURCE_DELIVERY_WINDOW);
+    let resource_pid = first.0.to_string();
+    let held = gate.join("held");
     driver.submit(Generation::from_raw(2), "icon two", 200, Vec::new(), false, 0);
     let during = await_publication(
         &published,
         ROW_DELIVERY_WINDOW,
-        "a second-generation row",
+        "a current second-generation row while the resource is unanswered",
         |(_, generation, row, _)| *generation == Generation::from_raw(2) && *row,
     );
-    let during_delay = during.0.duration_since(submitted);
-    assert!(
-        during_delay <= ICON_ISOLATION_WINDOW + BATCH_PUBLICATION_SLACK,
-        "a query issued while the request is unanswered waited {during_delay:?}"
+    assert!(!during.3);
+    fs::write(gate.join("probe"), b"still unanswered?").expect("silent callback probe is writable");
+    await_condition(
+        ROW_DELIVERY_WINDOW,
+        "the original unanswered callback's probe",
+        || fs::read_to_string(&held).is_ok_and(|pid| pid == resource_pid),
     );
+    assert!(!gate.join("answered").exists());
 
-    // Past the host's own deadline the request is abandoned. Nothing may
-    // remain of it that a later query could be made to queue behind.
-    sleep(PLUGIN_ICON_DEADLINE + BATCH_PUBLICATION_SLACK);
-    let resubmitted = Instant::now();
+    // The resource supervisor serializes requests: receipt of request two
+    // proves fetch one abandoned its unanswered wait, without a test sleep.
+    let second = request_witness(&gate, 2, ROW_DELIVERY_WINDOW);
+    let third = request_witness(&gate, 3, ROW_DELIVERY_WINDOW);
+    assert_eq!(first.0, second.0, "silence must not respawn the resource child");
+    assert_eq!(first.0, third.0, "all bounded attempts use the original child");
+    assert_ne!(first.1, second.1);
+    assert_ne!(first.1, third.1);
+    assert_ne!(second.1, third.1);
     driver.submit(Generation::from_raw(3), "icon three", 900, Vec::new(), false, 0);
     let after = await_publication(
         &published,
         ROW_DELIVERY_WINDOW,
-        "a third-generation row",
+        "a current third-generation row after the first fetch was abandoned",
         |(_, generation, row, _)| *generation == Generation::from_raw(3) && *row,
     );
-    let after_delay = after.0.duration_since(resubmitted);
+    assert!(!after.3);
+    assert!(!gate.join("request-4").exists());
+    assert!(!gate.join("answered").exists());
     assert!(
-        after_delay <= ICON_ISOLATION_WINDOW + BATCH_PUBLICATION_SLACK,
-        "a query issued after the abandoned request waited {after_delay:?}"
+        published.lock().unwrap().iter().all(|(_, _, _, icon)| !*icon),
+        "an icon the guest never answers must never decorate any generation"
     );
 
-    assert!(
-        published
-            .lock()
-            .expect("the publish sink is not poisoned")
-            .iter()
-            .all(|(_, _, _, icon)| !*icon),
-        "a reference the plugin never answers stays undecorated"
+    // Close admission before releasing the callback into the real SDK. Only
+    // then may missing-resource replies drain before its normal Shutdown.
+    let ticket = driver.control().request_stop(std::num::NonZeroU64::MIN).unwrap();
+    drop(release);
+    assert!(gate.join("release").is_file());
+    let proof = ticket
+        .wait()
+        .expect("silent resources and both children must settle");
+    assert_eq!(
+        proof.retirement().resource_calls,
+        3,
+        "exactly the bounded three attempts ran"
     );
+    assert_eq!(
+        proof.retirement().resource_threads,
+        3,
+        "every admitted fetch thread was joined"
+    );
+    assert_eq!(
+        proof.native_exits().len(),
+        2,
+        "only the query child and original resource child ran"
+    );
+    assert!(proof
+        .native_exits()
+        .iter()
+        .all(|exit| exit.code.is_some() || exit.signal.is_some()));
+    assert!(!gate.join("request-4").exists());
+    assert!(
+        gate.join("answered").is_file(),
+        "release must return through the SDK's real missing-resource response"
+    );
+    assert_eq!(
+        fs::read_to_string(gate.join("shutdown")).expect("resource child received real Shutdown"),
+        resource_pid
+    );
+    assert_eq!(
+        fs::read_to_string(gate.join("stopped")).expect("resource child ran the SDK stop callback"),
+        resource_pid
+    );
+    assert!(
+        published.lock().unwrap().iter().all(|(_, _, _, icon)| !*icon),
+        "responses after admission closes cannot decorate a retired generation"
+    );
+    let observable = process_table_contains_working_dir(&package).is_some();
     drop(driver);
+    if observable {
+        assert!(
+            wait_for_process_table_absence(&package),
+            "both real children must be reaped"
+        );
+    }
 }
 
 /// A plugin that answers after the collection window still gets its rows shown.
