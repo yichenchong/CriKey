@@ -113,7 +113,8 @@ proto_enum!(
     Ok = 1,
     Failed = 2,
     Unsupported = 3,
-    ShowPage = 4
+    ShowPage = 4,
+    Navigate = 5
 );
 proto_enum!(
     PageInputCode,
@@ -451,6 +452,8 @@ pub enum Payload {
     CommandsResponse(CommandsResponse),
     TypedExecuteRequest(TypedExecuteRequest),
     TypedExecuteResponse(TypedExecuteResponse),
+    StructuredViewRequest(StructuredViewRequest),
+    StructuredViewResponse(StructuredViewResponse),
     // Host-to-host web surface traffic. Never sent to or by a plugin.
     OpenSurface(OpenSurface),
     RawInput(RawInput),
@@ -496,6 +499,8 @@ impl Payload {
             Self::CommandsResponse(_) => "commands_response",
             Self::TypedExecuteRequest(_) => "typed_execute_request",
             Self::TypedExecuteResponse(_) => "typed_execute_response",
+            Self::StructuredViewRequest(_) => "structured_view_request",
+            Self::StructuredViewResponse(_) => "structured_view_response",
             Self::OpenSurface(_) => "open_surface",
             Self::RawInput(_) => "raw_input",
             Self::ImeEvent(_) => "ime_event",
@@ -588,6 +593,8 @@ impl Message for Envelope {
                     value.encode_into(&mut out);
                 }
                 Payload::TypedExecuteResponse(value) => put_message(48, value, &mut out),
+                Payload::StructuredViewRequest(value) => put_message(49, value, &mut out),
+                Payload::StructuredViewResponse(value) => put_message(50, value, &mut out),
             }
         }
         finish(out, &self.unknown)
@@ -676,6 +683,8 @@ impl DecodeWithBudget for Envelope {
                 46 => merge_web_payload!(&mut value.payload, CommandsResponse, field, budget),
                 47 => merge_web_payload!(&mut value.payload, TypedExecuteRequest, field, budget),
                 48 => merge_web_payload!(&mut value.payload, TypedExecuteResponse, field, budget),
+                49 => merge_web_payload!(&mut value.payload, StructuredViewRequest, field, budget),
+                50 => merge_web_payload!(&mut value.payload, StructuredViewResponse, field, budget),
                 31 => value.payload = Some(Payload::PageRequest(nested(field, budget)?)),
                 // PageFrame carries the plugin's web declaration, so merge
                 // both its envelope occurrences and its nested `web` fields.
@@ -787,6 +796,7 @@ macro_rules! impl_simple_impl {
 }
 
 include!("typed_wire.rs");
+include!("view_wire.rs");
 
 impl_simple!(Handshake {
     protocol_version: u32 = 0,
@@ -1279,29 +1289,35 @@ impl_simple!(Cancel {
 impl_simple!(ExecuteRequest {
     item_id: String = String::new(),
     action_id: String = String::new(),
-    argument: String = String::new()
+    argument: String = String::new(),
+    view: Option<ViewExecutionContext> = None
 } repeated [] encode(this, out) {
     if !this.item_id.is_empty() { put_string(1, &this.item_id, &mut out); }
     if !this.action_id.is_empty() { put_string(2, &this.action_id, &mut out); }
     if !this.argument.is_empty() { put_string(3, &this.argument, &mut out); }
+    if let Some(value) = &this.view { put_message(4, value, &mut out); }
 } decode(value, field, budget) {
     1 => value.item_id = decode_string(field, budget)?,
     2 => value.action_id = decode_string(field, budget)?,
     3 => value.argument = decode_string(field, budget)?,
+    4 => merge_optional(&mut value.view, field, budget)?,
 });
 
 impl_simple!(ExecuteResult {
     outcome: ExecuteOutcomeCode = ExecuteOutcomeCode::OutcomeUnspecified,
     error: Option<StructuredError> = None,
-    page_id: String = String::new()
+    page_id: String = String::new(),
+    navigation: Option<RouteNavigation> = None
 } repeated [] encode(this, out) {
     if this.outcome.as_i32() != 0 { encode_enum(1, this.outcome.as_i32(), &mut out); }
     if let Some(error) = &this.error { put_message(2, error, &mut out); }
     if !this.page_id.is_empty() { put_string(3, &this.page_id, &mut out); }
+    if let Some(value) = &this.navigation { put_message(4, value, &mut out); }
 } decode(value, field, budget) {
     1 => value.outcome = ExecuteOutcomeCode::from_i32(decode_i32(field)?),
     2 => value.error = Some(nested(field, budget)?),
     3 => value.page_id = decode_string(field, budget)?,
+    4 => merge_optional(&mut value.navigation, field, budget)?,
 });
 
 impl_simple!(inexact; PageInput {

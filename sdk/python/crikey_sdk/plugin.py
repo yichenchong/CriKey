@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Coroutine, Iterable, Protocol
 from .arguments import ArgumentSchema, ResultPresentation, TypedValues, TypedOutcome
+from .views import Push, Replace, ViewRequest, ViewDescriptor
 
 __all__ = [
     "Action",
@@ -193,7 +194,7 @@ class Plugin:
 
     def execute(
         self, item: Item, action_id: str | None, argument: str | None
-    ) -> None | Awaitable[None]:
+    ) -> None | Push | Replace | Awaitable[None | Push | Replace]:
         return None
 
     def supports_result_presentation(self) -> bool:
@@ -208,9 +209,21 @@ class Plugin:
         """Optional metadata for the exact query generation."""
         return ResultPresentation()
 
-    def execute_typed(self, item: Item, action_id: str | None, values: TypedValues) -> TypedOutcome | None | Awaitable[TypedOutcome | None]:
+    def execute_typed(self, item: Item, action_id: str | None, values: TypedValues) -> TypedOutcome | Push | Replace | None | Awaitable[TypedOutcome | Push | Replace | None]:
         """Independent typed_arguments_v1 opt-in; never forwarded to execute."""
         raise NotImplementedError("typed_arguments_v1 is unavailable")
+
+    def structured_view(self, request: ViewRequest, context: PreviewContext) -> ViewDescriptor | Awaitable[ViewDescriptor]:
+        """Independent structured_view_v1 opt-in; Open and Refresh share this callback."""
+        raise NotImplementedError("structured_view_v1 is unavailable")
+
+    def execute_view(self, route: str, item: Item, action_id: str | None, argument: str | None):
+        """Execute the exact frozen route definition, never a root lookup."""
+        raise NotImplementedError("route execution is unavailable")
+
+    def execute_view_typed(self, route: str, item: Item, action_id: str | None, values: TypedValues):
+        """Typed route execution; None/TypedOutcome or Push/Replace, never root fallback."""
+        raise NotImplementedError("typed route execution is unavailable")
 
     def preview(
         self, item: Item, context: PreviewContext

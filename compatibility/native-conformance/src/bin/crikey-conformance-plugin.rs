@@ -19,6 +19,7 @@ use crikey_core::structured_arguments::{
     ArgumentField, ArgumentSchema, DropdownOption, ExecutableKey, FieldId, FieldKind, NonSecretValue,
     OptionId, OwnedItem, StructuredValue, SubmissionFieldCode, SubmissionFieldFailure,
 };
+use crikey_core::structured_view::TypedExecutionOutcome;
 use crikey_core::{CoreError, PageColor, PageFrame, PageInput, PageInputKind, Result};
 use crikey_plugin_sdk::{
     serve, ActionBuilder, CatalogSink, ExecuteOutcome, ExecuteRequest, ItemBuilder, PageBuilder, PageCanvas,
@@ -869,12 +870,12 @@ impl Plugin for ConformancePlugin {
         &mut self,
         mut request: TypedExecuteRequest,
         context: &dyn PluginContext,
-    ) -> Result<SubmissionOutcome> {
+    ) -> Result<TypedExecutionOutcome> {
         if !self.supports_typed_arguments() {
-            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported));
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported).into());
         }
         if context.cancellation().is_cancelled() {
-            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled));
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled).into());
         }
         let valid_target = match request.item.0.as_str() {
             "typed-login" | "typed-suggestion" => request.action.is_none(),
@@ -882,15 +883,13 @@ impl Plugin for ConformancePlugin {
             _ => false,
         };
         if !valid_target {
-            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable));
+            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable).into());
         }
         if matches!(self.mode, Mode::TypedPrivacy) {
             let Some(StructuredValue::Password(secret)) =
                 request.values.0.remove(&FieldId("password".into()))
             else {
-                return Ok(SubmissionOutcome::Failed(
-                    SubmissionFailureCode::ProtocolViolation,
-                ));
+                return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::ProtocolViolation).into());
             };
             hostile_private_diagnostics(context, &secret);
             self.diagnostic_secret = Some(secret);
@@ -902,15 +901,12 @@ impl Plugin for ConformancePlugin {
             return Ok(SubmissionOutcome::InvalidFields(vec![SubmissionFieldFailure {
                 field: FieldId("hostile-unknown-field".into()),
                 code: SubmissionFieldCode::Rejected,
-            }]));
+            }])
+            .into());
         }
         let username = match request.values.0.get(&FieldId("username".into())) {
             Some(StructuredValue::NonSecret(NonSecretValue::Text(value))) => value,
-            _ => {
-                return Ok(SubmissionOutcome::Failed(
-                    SubmissionFailureCode::ProtocolViolation,
-                ))
-            }
+            _ => return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::ProtocolViolation).into()),
         };
         let region = match request.values.0.get(&FieldId("region".into())) {
             Some(StructuredValue::NonSecret(NonSecretValue::Dropdown(value)))
@@ -918,11 +914,7 @@ impl Plugin for ConformancePlugin {
             {
                 value
             }
-            _ => {
-                return Ok(SubmissionOutcome::Failed(
-                    SubmissionFailureCode::ProtocolViolation,
-                ))
-            }
+            _ => return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::ProtocolViolation).into()),
         };
         let accepted = matches!(request.values.0.get(&FieldId("password".into())),
             Some(StructuredValue::Password(value)) if value.expose_plaintext() == "conformance-secret");
@@ -930,12 +922,13 @@ impl Plugin for ConformancePlugin {
             return Ok(SubmissionOutcome::InvalidFields(vec![SubmissionFieldFailure {
                 field: FieldId("password".into()),
                 code: SubmissionFieldCode::Rejected,
-            }]));
+            }])
+            .into());
         }
         // Real session state changes only after authentication, without retaining a password.
         self.page.note = format!("{username}@{}", region.0);
         self.page.counter += 1;
-        Ok(SubmissionOutcome::Completed)
+        Ok(SubmissionOutcome::Completed.into())
     }
     fn supports_commands(&self) -> bool {
         matches!(self.mode, Mode::Acceptance) || self.supports_typed_arguments()
@@ -1201,7 +1194,7 @@ mod tests {
             plugin
                 .execute_typed(make_request("wrong", false), &context)
                 .unwrap(),
-            SubmissionOutcome::InvalidFields(_)
+            TypedExecutionOutcome::Submission(SubmissionOutcome::InvalidFields(_))
         ));
         assert_eq!(plugin.page.counter, 0);
         assert!(plugin.page.note.is_empty());
@@ -1209,7 +1202,7 @@ mod tests {
             plugin
                 .execute_typed(make_request("conformance-secret", false), &context)
                 .unwrap(),
-            SubmissionOutcome::Completed
+            TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
         );
         assert_eq!(plugin.page.counter, 1);
         assert_eq!(plugin.page.note, "alice@remote");
@@ -1217,7 +1210,7 @@ mod tests {
             plugin
                 .execute_typed(make_request("conformance-secret", true), &context)
                 .unwrap(),
-            SubmissionOutcome::Completed
+            TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
         );
         assert_eq!(plugin.page.counter, 2);
         assert_ne!(

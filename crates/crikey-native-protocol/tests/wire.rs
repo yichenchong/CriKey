@@ -252,12 +252,14 @@ fn proto3_defaults_elide_and_decode_from_empty() {
         item_id: String::new(),
         action_id: String::new(),
         argument: String::new(),
+        view: None,
         unknown: unknown(),
     });
     assert_default_encoding(message::ExecuteResult {
         outcome: message::ExecuteOutcomeCode::from_i32(0),
         error: None,
         page_id: String::new(),
+        navigation: None,
         unknown: unknown(),
     });
     assert_default_encoding(message::ConfigurationChange {
@@ -402,12 +404,14 @@ fn every_message_round_trips_all_non_default_fields() {
         item_id: "plugin:item:1".to_owned(),
         action_id: "open".to_owned(),
         argument: "--verbose".to_owned(),
+        view: None,
         unknown: unknown(),
     });
     assert_round_trip(message::ExecuteResult {
         outcome: message::ExecuteOutcomeCode::from_i32(1),
         error: Some(error.clone()),
         page_id: String::new(),
+        navigation: None,
         unknown: unknown(),
     });
     assert_round_trip(message::ConfigurationChange {
@@ -616,6 +620,7 @@ fn minimal_messages_pin_frozen_field_numbers() {
             item_id: "x".to_owned(),
             action_id: String::new(),
             argument: String::new(),
+            view: None,
             unknown: unknown(),
         },
         0x0a
@@ -625,6 +630,7 @@ fn minimal_messages_pin_frozen_field_numbers() {
             outcome: message::ExecuteOutcomeCode::from_i32(1),
             error: None,
             page_id: String::new(),
+            navigation: None,
             unknown: unknown(),
         },
         0x08
@@ -794,6 +800,7 @@ fn envelope_oneof_tags_are_frozen() {
                 item_id: "x".to_owned(),
                 action_id: String::new(),
                 argument: String::new(),
+                view: None,
                 unknown: unknown(),
             }),
             vec![0x92, 0x01],
@@ -803,6 +810,7 @@ fn envelope_oneof_tags_are_frozen() {
                 outcome: message::ExecuteOutcomeCode::from_i32(1),
                 error: None,
                 page_id: String::new(),
+                navigation: None,
                 unknown: unknown(),
             }),
             vec![0x9a, 0x01],
@@ -2668,4 +2676,51 @@ fn fragmented_page_frames_share_one_decode_allocation_budget() {
         message::Envelope::decode(&bytes),
         Err(ProtocolError::DecodeBudgetExceeded { .. })
     ));
+}
+
+#[test]
+fn execute_route_extensions_round_trip_and_restore_legacy_encoding_when_absent() {
+    let mut request = message::ExecuteRequest {
+        item_id: "item".into(),
+        action_id: "open".into(),
+        argument: "nonsecret".into(),
+        view: None,
+        unknown: unknown(),
+    };
+    let legacy_request = request.encode();
+    request.view = Some(message::ViewExecutionContext {
+        route_id: "grid".into(),
+        logical_view: 3,
+        surface: 7,
+        revision: 11,
+        ..Default::default()
+    });
+    let mut decoded = message::ExecuteRequest::decode(&request.encode()).unwrap();
+    assert_eq!(decoded, request);
+    assert!(decoded.view.is_some());
+    decoded.view = None;
+    assert_eq!(decoded.encode(), legacy_request);
+
+    let mut result = message::ExecuteResult {
+        outcome: message::ExecuteOutcomeCode::Ok,
+        error: None,
+        page_id: String::new(),
+        navigation: None,
+        unknown: unknown(),
+    };
+    let legacy_result = result.encode();
+    for kind in [1, 2] {
+        result.outcome = message::ExecuteOutcomeCode::Navigate;
+        result.navigation = Some(message::RouteNavigation {
+            kind,
+            route_id: "detail".into(),
+            ..Default::default()
+        });
+        let mut decoded = message::ExecuteResult::decode(&result.encode()).unwrap();
+        assert_eq!(decoded, result);
+        assert!(decoded.navigation.is_some());
+        decoded.outcome = message::ExecuteOutcomeCode::Ok;
+        decoded.navigation = None;
+        assert_eq!(decoded.encode(), legacy_result);
+    }
 }

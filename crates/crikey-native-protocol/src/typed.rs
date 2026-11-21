@@ -250,8 +250,17 @@ pub fn to_request(
 pub fn from_response(
     response: m::TypedExecuteResponse,
     schema: &a::ArgumentSchema,
-) -> Result<a::SubmissionOutcome, ProtocolError> {
+) -> Result<crikey_core::structured_view::TypedExecutionOutcome, ProtocolError> {
     use a::{SubmissionFailureCode as F, SubmissionFieldCode as C, SubmissionOutcome as O};
+    use crikey_core::structured_view::TypedExecutionOutcome;
+    if let Some(navigation) = response.navigation {
+        if response.status != 0 || !response.failures.is_empty() || response.failure_code != 0 {
+            return Err(invalid());
+        }
+        return Ok(TypedExecutionOutcome::Navigate(
+            crate::structured_view::from_navigation(navigation)?,
+        ));
+    }
     if response.failures.len() > 64 {
         return Err(invalid());
     }
@@ -290,13 +299,22 @@ pub fn from_response(
         _ => return Err(invalid()),
     };
     outcome.validate(Some(schema)).map_err(|_| invalid())?;
-    Ok(outcome)
+    Ok(TypedExecutionOutcome::Submission(outcome))
 }
 pub fn to_response(
-    outcome: a::SubmissionOutcome,
+    outcome: crikey_core::structured_view::TypedExecutionOutcome,
     schema: &a::ArgumentSchema,
 ) -> Result<m::TypedExecuteResponse, ProtocolError> {
     use a::{SubmissionFailureCode as F, SubmissionFieldCode as C, SubmissionOutcome as O};
+    let outcome = match outcome {
+        crikey_core::structured_view::TypedExecutionOutcome::Submission(outcome) => outcome,
+        crikey_core::structured_view::TypedExecutionOutcome::Navigate(navigation) => {
+            return Ok(m::TypedExecuteResponse {
+                navigation: Some(crate::structured_view::to_navigation(&navigation)?),
+                ..Default::default()
+            })
+        }
+    };
     outcome.validate(Some(schema)).map_err(|_| invalid())?;
     let mut response = m::TypedExecuteResponse::default();
     match outcome {
@@ -514,6 +532,11 @@ pub fn request_charge(value: &m::TypedExecuteRequest) -> usize {
         .saturating_add(optional(&value.action_id))
         .saturating_add(value.expected_fingerprint.len())
         .saturating_add(unknown(&value.unknown));
+    if let Some(view) = &value.view {
+        n = n
+            .saturating_add(view.route_id.len())
+            .saturating_add(unknown(&view.unknown));
+    }
     for (id, v) in &value.values.0 {
         let length = match v {
             a::StructuredValue::Password(p) => p.expose_plaintext().len(),
@@ -535,6 +558,9 @@ pub fn request_charge(value: &m::TypedExecuteRequest) -> usize {
 }
 pub fn check_request(value: &m::TypedExecuteRequest) -> Result<(), ProtocolError> {
     id(&value.item_id)?;
+    if let Some(view) = &value.view {
+        crate::structured_view::check_context(view)?;
+    }
     if let Some(a) = &value.action_id {
         id(a)?;
     }

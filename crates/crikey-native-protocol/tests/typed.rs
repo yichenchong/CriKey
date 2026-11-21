@@ -274,8 +274,12 @@ fn field_failures_are_only_unique_current_ids_and_fixed_codes() {
         code: a::SubmissionFieldCode::Rejected,
     }]);
     assert_eq!(
-        typed::from_response(typed::to_response(outcome.clone(), &schema).unwrap(), &schema).unwrap(),
-        outcome
+        typed::from_response(
+            typed::to_response(outcome.clone().into(), &schema).unwrap(),
+            &schema
+        )
+        .unwrap(),
+        outcome.into()
     );
     let response = m::TypedExecuteResponse {
         status: 2,
@@ -306,8 +310,12 @@ fn field_failures_are_only_unique_current_ids_and_fixed_codes() {
     ] {
         let outcome = a::SubmissionOutcome::Failed(code);
         assert_eq!(
-            typed::from_response(typed::to_response(outcome.clone(), &schema).unwrap(), &schema).unwrap(),
-            outcome
+            typed::from_response(
+                typed::to_response(outcome.clone().into(), &schema).unwrap(),
+                &schema
+            )
+            .unwrap(),
+            outcome.into()
         );
     }
 }
@@ -451,4 +459,37 @@ fn legacy_execute_preflight_preserves_the_exact_frame_allowance() {
         m::validate_outbound(&envelope),
         Err(ProtocolError::FrameTooLarge(_))
     ));
+}
+
+#[test]
+fn typed_navigation_round_trips_without_submission_status_or_field_results() {
+    use crikey_core::structured_view::{RouteId, StructuredRouteOutcome, TypedExecutionOutcome};
+    for route in [
+        StructuredRouteOutcome::Push(RouteId("grid".into())),
+        StructuredRouteOutcome::Replace(RouteId("form".into())),
+    ] {
+        let outcome = TypedExecutionOutcome::Navigate(route);
+        let response = typed::to_response(outcome.clone(), &schema()).unwrap();
+        assert!(response.navigation.is_some());
+        assert_eq!(response.status, 0);
+        assert_eq!(response.failure_code, 0);
+        assert!(response.failures.is_empty());
+        assert_eq!(
+            typed::from_response(response.clone(), &schema()).unwrap(),
+            outcome
+        );
+        let mut mixed = response.clone();
+        mixed.status = 1;
+        assert!(typed::from_response(mixed, &schema()).is_err());
+        let mut mixed = response.clone();
+        mixed.failure_code = 1;
+        assert!(typed::from_response(mixed, &schema()).is_err());
+        let mut mixed = response;
+        mixed.failures.push(m::TypedFieldFailure {
+            field_id: "text".into(),
+            code: 5,
+            ..Default::default()
+        });
+        assert!(typed::from_response(mixed, &schema()).is_err());
+    }
 }

@@ -15,6 +15,7 @@ mod host;
 mod interpreter;
 mod protocol;
 mod typed;
+mod views;
 mod worker;
 
 pub use host::WorkerPool;

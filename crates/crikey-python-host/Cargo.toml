@@ -18,5 +18,6 @@ crikey-plugin-model.workspace = true
 crikey-plugin-supervisor.workspace = true
 crikey-sandbox.workspace = true
 crikey-package-manager.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

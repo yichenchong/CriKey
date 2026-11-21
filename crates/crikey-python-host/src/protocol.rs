@@ -40,6 +40,16 @@
 //! and aggregate/intermediate allocations before controlled projection. Unknown
 //! additive content is traversed/charged, not retained. No secret-bearing JSON
 //! Value is constructed for outgoing typed input.
+//! PR8 independently negotiates `structured_view_v1`. `structured_view` carries
+//! route, session `{logical_view,surface}`, Open/Refresh mode, previous revision,
+//! refresh reason, optional host state, query and anchor. A correlated
+//! `structured_view_result` echoes route/session and returns content/descriptor
+//! or failed/fixed code; its successful request ID is the descriptor revision.
+//! Existing execute/typed_execute accept optional `view_context` containing exact
+//! route/session/revision. Such requests resolve only that frozen namespace.
+//! Both result kinds may return `status:navigate,navigation:{kind:push|replace,
+//! route}` only under structured-view negotiation. Otherwise navigation is a real
+//! refusal. Protocol version and the complete-frame ceiling remain unchanged.
 
 use std::collections::BTreeMap;
 
@@ -50,6 +60,69 @@ use crikey_core::{
 };
 
 use crate::worker::SuggestRequest;
+
+/// Exact bounded producer sizing, before allocating an encoded frame.
+#[derive(Default)]
+pub(crate) struct FrameSize(pub usize);
+impl std::io::Write for FrameSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|n| *n <= MAX_FRAME_BYTES)
+            .ok_or_else(|| std::io::Error::other("frame bound"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn write_typed(
+    bytes: &mut impl std::io::Write,
+    id: u64,
+    item: &Value,
+    action: Option<&str>,
+    fingerprint: &str,
+    values: &crikey_core::structured_arguments::ArgumentValues,
+    view: Option<&Value>,
+) -> std::io::Result<()> {
+    use crikey_core::structured_arguments::{NonSecretValue, StructuredValue};
+    fn json(w: &mut impl std::io::Write, v: &impl serde::Serialize) -> std::io::Result<()> {
+        serde_json::to_writer(w, v).map_err(std::io::Error::other)
+    }
+    bytes.write_all(b"{\"kind\":\"typed_execute\",\"id\":")?;
+    json(bytes, &id)?;
+    bytes.write_all(b",\"item\":")?;
+    json(bytes, item)?;
+    bytes.write_all(b",\"action_id\":")?;
+    json(bytes, &action)?;
+    if let Some(view) = view {
+        bytes.write_all(b",\"view_context\":")?;
+        json(bytes, view)?;
+    }
+    bytes.write_all(b",\"schema_fingerprint\":")?;
+    json(bytes, &fingerprint)?;
+    bytes.write_all(b",\"values\":[")?;
+    for (index, (field, value)) in values.0.iter().enumerate() {
+        if index != 0 {
+            bytes.write_all(b",")?;
+        }
+        bytes.write_all(b"{\"field_id\":")?;
+        json(bytes, &field.0)?;
+        let (kind, text) = match value {
+            StructuredValue::NonSecret(NonSecretValue::Text(v)) => ("text", v.as_str()),
+            StructuredValue::NonSecret(NonSecretValue::Dropdown(v)) => ("dropdown", v.0.as_str()),
+            StructuredValue::Password(v) => ("password", v.expose_plaintext()),
+        };
+        bytes.write_all(b",\"kind\":")?;
+        json(bytes, &kind)?;
+        bytes.write_all(b",\"value\":")?;
+        json(bytes, &text)?;
+        bytes.write_all(b"}")?;
+    }
+    bytes.write_all(b"]}\n")
+}
 
 /// The frame schema this host speaks. Echoed by the child's handshake.
 ///
@@ -149,7 +222,8 @@ pub(crate) const KIND_EXECUTE_RESULT: &str = "execute_result";
 
 /// `{"id","kind":"handshake","protocol_version":1}`
 pub(crate) fn encode_handshake(id: u64) -> Value {
-    json!({ "id": id, "kind": KIND_HANDSHAKE, "protocol_version": PROTOCOL_VERSION })
+    json!({ "id": id, "kind": KIND_HANDSHAKE, "protocol_version": PROTOCOL_VERSION,
+        "capabilities": ["structured_view_v1"] })
 }
 
 /// `{"id","kind":"build_catalog"}`

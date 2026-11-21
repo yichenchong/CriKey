@@ -1,6 +1,20 @@
 //! Typed preview layout; all producer work is complete before paint.
 use super::*;
 
+pub(super) fn retains_image(model: &ViewModel) -> bool {
+    if model.navigation.standard_refresh_pending {
+        return false;
+    }
+    if model.settings_open || model.page.is_some() {
+        return false;
+    }
+    if let Some(surface) = &model.navigation.standard {
+        return matches!(&surface.descriptor.view, crikey_core::structured_view::StandardView::Detail(detail) if detail.content().image.is_some());
+    }
+    shows_results(model)
+        && matches!(&model.preview.status, Some(crate::PreviewStatus::Content(prepared)) if prepared.content.image.is_some())
+}
+
 /// One image per context, independent of the split/narrow widget hierarchy.
 /// A weak identity never keeps the producer's CPU pixels alive.
 struct PreviewTexture {
@@ -236,39 +250,13 @@ fn draw_preview(
                         ui.colored_label(colors.warning, "Preview failed");
                         ui.label(reason);
                     }
-                    crate::PreviewStatus::Content(content) => {
-                        let prepared = content;
-                        let content = &prepared.content;
-                        if let Some(crikey_core::PreviewText::Plain(text)) = &content.text {
-                            ui.add(egui::Label::new(text).wrap());
-                        }
-                        for block in prepared.blocks.iter() {
-                            draw_markdown_block(ui, block, model.preview.link_target.as_ref(), commands);
-                        }
-                        if let Some(image) = &content.image {
-                            let texture = image_texture(ui.ctx(), content);
-                            ui.add(
-                                egui::Image::new((texture, vec2(image.width as f32, image.height as f32)))
-                                    .max_width(ui.available_width()),
-                            );
-                        }
-                        for value in &content.values {
-                            ui.label(RichText::new(&value.label).strong());
-                            match value.kind {
-                                crikey_core::PreviewValueKind::Link => {
-                                    preview_link(
-                                        ui,
-                                        RichText::new(&value.value),
-                                        &value.value,
-                                        model.preview.link_target.as_ref(),
-                                        commands,
-                                    );
-                                }
-                                _ => {
-                                    ui.add(egui::Label::new(&value.value).wrap());
-                                }
-                            }
-                        }
+                    crate::PreviewStatus::Content(prepared) => {
+                        draw_prepared(
+                            ui,
+                            prepared,
+                            model.preview.link_target.as_ref().map(LinkTarget::Preview),
+                            commands,
+                        );
                     }
                 }
             });
@@ -276,10 +264,65 @@ fn draw_preview(
     });
 }
 
+#[derive(Clone, Copy)]
+enum LinkTarget<'a> {
+    Preview(&'a crate::PreviewLinkTarget),
+    Standard(&'a crate::standard_view::StandardSurface),
+}
+
+pub(super) fn draw_standard_detail(
+    ui: &mut egui::Ui,
+    surface: &crate::standard_view::StandardSurface,
+    detail: &crikey_core::structured_view::DetailView,
+    commands: &mut Vec<UiCommand>,
+    height: f32,
+) {
+    let prepared = crate::PreparedPreview {
+        content: detail.content().clone(),
+        blocks: detail.blocks().clone(),
+    };
+    egui::ScrollArea::vertical()
+        .id_salt("standard-detail")
+        .max_height(height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            draw_prepared(ui, &prepared, Some(LinkTarget::Standard(surface)), commands);
+        });
+}
+
+fn draw_prepared(
+    ui: &mut egui::Ui,
+    prepared: &crate::PreparedPreview,
+    target: Option<LinkTarget<'_>>,
+    commands: &mut Vec<UiCommand>,
+) {
+    let content = &prepared.content;
+    if let Some(crikey_core::PreviewText::Plain(text)) = &content.text {
+        ui.add(egui::Label::new(text).wrap());
+    }
+    for block in prepared.blocks.iter() {
+        draw_markdown_block(ui, block, target, commands);
+    }
+    if let Some(image) = &content.image {
+        let texture = image_texture(ui.ctx(), content);
+        ui.add(
+            egui::Image::new((texture, vec2(image.width as f32, image.height as f32)))
+                .max_width(ui.available_width()),
+        );
+    }
+    for value in &content.values {
+        ui.label(RichText::new(&value.label).strong());
+        if value.kind == crikey_core::PreviewValueKind::Link {
+            preview_link(ui, RichText::new(&value.value), &value.value, target, commands);
+        } else {
+            ui.add(egui::Label::new(&value.value).wrap());
+        }
+    }
+}
 fn draw_markdown_block(
     ui: &mut egui::Ui,
     block: &crate::PreviewBlock,
-    target: Option<&crate::PreviewLinkTarget>,
+    target: Option<LinkTarget<'_>>,
     commands: &mut Vec<UiCommand>,
 ) {
     use crate::PreviewBlockKind;
@@ -320,7 +363,7 @@ fn preview_link(
     ui: &mut egui::Ui,
     text: RichText,
     url: &str,
-    target: Option<&crate::PreviewLinkTarget>,
+    target: Option<LinkTarget<'_>>,
     commands: &mut Vec<UiCommand>,
 ) {
     let text = text.color(ui.visuals().hyperlink_color).underline();
@@ -329,11 +372,16 @@ fn preview_link(
         .on_hover_text(url)
         .clicked()
     {
-        if let Some(target) = target {
-            commands.push(UiCommand::OpenPreviewLink {
+        match target {
+            Some(LinkTarget::Preview(target)) => commands.push(UiCommand::OpenPreviewLink {
                 target: Box::new(target.clone()),
                 url: url.to_owned(),
-            });
+            }),
+            Some(LinkTarget::Standard(surface)) => commands.push(UiCommand::StandardLink {
+                context: surface.context.clone(),
+                url: url.to_owned(),
+            }),
+            None => {}
         }
     }
 }

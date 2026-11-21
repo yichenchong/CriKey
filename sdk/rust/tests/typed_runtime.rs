@@ -1,6 +1,7 @@
 //! Typed submissions retain exact authority and permanently redact diagnostics.
 use crikey_core::result_presentation::{ExecutableSchemaBinding, ResultPresentation};
 use crikey_core::structured_arguments::*;
+use crikey_core::structured_view::TypedExecutionOutcome;
 use crikey_core::{CoreError, ItemId, Result};
 use crikey_plugin_sdk::{
     protocol::{
@@ -80,7 +81,7 @@ impl Plugin for Fixture {
         &mut self,
         request: TypedExecuteRequest,
         context: &dyn PluginContext,
-    ) -> Result<SubmissionOutcome> {
+    ) -> Result<TypedExecutionOutcome> {
         self.typed.fetch_add(1, Ordering::SeqCst);
         assert!(request.action.is_none());
         context.log(LogLevel::Error, "private-password");
@@ -90,7 +91,8 @@ impl Plugin for Fixture {
                 Ok(SubmissionOutcome::InvalidFields(vec![SubmissionFieldFailure {
                     field: FieldId("attacker-field".into()),
                     code: SubmissionFieldCode::Rejected,
-                }]))
+                }])
+                .into())
             }
             _ => Err(CoreError::Invalid("private-password".into())),
         }
@@ -177,7 +179,7 @@ fn typed_request(password: &str, fingerprint: [u8; 32]) -> message::TypedExecute
     );
     protocol::typed::to_request(&ItemId("login".into()), None, fingerprint, values).unwrap()
 }
-fn outcome(host: &mut dyn Transport, request: message::TypedExecuteRequest) -> SubmissionOutcome {
+fn outcome(host: &mut dyn Transport, request: message::TypedExecuteRequest) -> TypedExecutionOutcome {
     host.send(&frame(3, Payload::TypedExecuteRequest(request)))
         .unwrap();
     let response = host.recv().unwrap();
@@ -223,7 +225,7 @@ fn typed_authority_fingerprint_hostility_and_process_lifetime_privacy() {
     stale[0] ^= 1;
     assert_eq!(
         outcome(&mut *host, typed_request("private-password", stale)),
-        SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch)
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch))
     );
     assert_eq!(typed.load(Ordering::SeqCst), 0);
     let mut hostile = typed_request("private-password", hash);
@@ -233,16 +235,18 @@ fn typed_authority_fingerprint_hostility_and_process_lifetime_privacy() {
     );
     assert_eq!(
         outcome(&mut *host, hostile),
-        SubmissionOutcome::Failed(SubmissionFailureCode::ProtocolViolation)
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(
+            SubmissionFailureCode::ProtocolViolation
+        ))
     );
     assert_eq!(typed.load(Ordering::SeqCst), 0);
     assert_eq!(
         outcome(&mut *host, typed_request("private-password", hash)),
-        SubmissionOutcome::Failed(SubmissionFailureCode::Failed)
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(SubmissionFailureCode::Failed))
     );
     assert_eq!(
         outcome(&mut *host, typed_request("reject", hash)),
-        SubmissionOutcome::Failed(SubmissionFailureCode::Failed)
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(SubmissionFailureCode::Failed))
     );
     assert_eq!(typed.load(Ordering::SeqCst), 2);
     // A later unrelated callback cannot leak through log/error/panic diagnostics.
@@ -265,7 +269,7 @@ fn typed_authority_fingerprint_hostility_and_process_lifetime_privacy() {
     assert!(catalog(&mut *host).unwrap().schemas.is_empty());
     assert_eq!(
         outcome(&mut *host, typed_request("private-password", hash)),
-        SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported)
+        TypedExecutionOutcome::Submission(SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported))
     );
     assert_eq!(typed.load(Ordering::SeqCst), 0);
     stop(&mut *host, worker);
@@ -352,8 +356,12 @@ impl Plugin for BoundaryFixture {
     fn execute(&mut self, _: ExecuteRequest, _: &dyn PluginContext) -> Result<()> {
         Ok(())
     }
-    fn execute_typed(&mut self, _: TypedExecuteRequest, _: &dyn PluginContext) -> Result<SubmissionOutcome> {
-        Ok(SubmissionOutcome::Completed)
+    fn execute_typed(
+        &mut self,
+        _: TypedExecuteRequest,
+        _: &dyn PluginContext,
+    ) -> Result<TypedExecutionOutcome> {
+        Ok(SubmissionOutcome::Completed.into())
     }
 }
 
@@ -480,7 +488,7 @@ fn large_rows_and_presentation_use_independent_decodable_frames() {
                 &mut *host,
                 typed_request("valid", schema().fingerprint().unwrap())
             ),
-            SubmissionOutcome::Completed,
+            TypedExecutionOutcome::Submission(SubmissionOutcome::Completed),
             "successful terminal publication installs exact typed authority"
         );
         stop(&mut *host, worker);

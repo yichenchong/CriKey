@@ -509,6 +509,7 @@ fn catalog_source<'a>(
     }
     match selection.source.kind {
         crikey_ui::ResultSourceKind::Ordinary => Ok(None),
+        crikey_ui::ResultSourceKind::Standard { .. } => Err(()),
         crikey_ui::ResultSourceKind::DeclaredCatalog { epoch } => search
             .declared_catalog_source(&selection.plugin, epoch)
             .map(Some)

@@ -34,6 +34,12 @@ use crate::{
 };
 use crikey_core::result_presentation::ResultPresentation;
 use crikey_core::structured_arguments::{ArgumentSchema, SubmissionFailureCode, SubmissionOutcome};
+use crikey_core::structured_arguments::{ExecutableKey, OwnedItem};
+use crikey_core::structured_view::{
+    RouteAdmission, RouteIdentity, TypedExecutionOutcome, ViewDescriptor, ViewExecutionContext, ViewReply,
+    ViewRequestMode, STRUCTURED_VIEW_CAPABILITY,
+};
+use std::num::NonZeroU64;
 
 static SENSITIVE: AtomicBool = AtomicBool::new(false);
 static DIAGNOSTICS: Mutex<()> = Mutex::new(());
@@ -80,8 +86,61 @@ struct SchemaRegistry {
     suggestions: ResultPresentation,
     catalog_primary: std::collections::BTreeMap<ItemId, ActionId>,
     suggestion_primary: std::collections::BTreeMap<ItemId, ActionId>,
+    route: Option<FrozenRoute>,
 }
 
+#[derive(Debug)]
+struct FrozenRoute {
+    context: ViewExecutionContext,
+    descriptor: Arc<ViewDescriptor>,
+}
+
+impl FrozenRoute {
+    fn resolve(
+        &self,
+        view: &ViewExecutionContext,
+        owner: &PluginId,
+        item: &str,
+        action: Option<&str>,
+    ) -> Result<(Item, Option<Arc<ArgumentSchema>>)> {
+        let key = ExecutableKey {
+            target: OwnedItem {
+                owner: owner.clone(),
+                item: ItemId(item.into()),
+            },
+            action: action.map(|a| ActionId(a.into())),
+        };
+        if &self.context != view {
+            return Err(CoreError::Invalid("stale route descriptor".into()));
+        }
+        if matches!(&self.descriptor.view, crikey_core::structured_view::StandardView::Form(f) if f.submit != key)
+        {
+            return Err(CoreError::Invalid("route target is not selected".into()));
+        }
+        let (_, presentation) = self
+            .descriptor
+            .executable(&key)
+            .ok_or_else(|| CoreError::Invalid("route executable unavailable".into()))?;
+        let definition = self
+            .descriptor
+            .definition(&key.target)
+            .ok_or_else(|| CoreError::Invalid("route item unavailable".into()))?;
+        Ok((definition.item.clone(), presentation.schema.clone()))
+    }
+}
+
+// SDK-only shape validation: this synthetic identity never establishes host authority.
+fn local_admission(owner: &PluginId, view: &ViewExecutionContext) -> Result<RouteAdmission> {
+    RouteAdmission::worker(
+        RouteIdentity {
+            owner: owner.clone(),
+            route: view.route.clone(),
+            incarnation: NonZeroU64::MIN,
+        },
+        view.surface(),
+    )
+    .map_err(|_| CoreError::Invalid("invalid route admission".into()))
+}
 struct Publication {
     metadata: ResultPresentation,
     owner: PluginId,
@@ -376,15 +435,14 @@ pub fn serve_on(
         })?,
     };
     let mut transport = transport;
-    let (ack, connection_id) = handshake(
-        &mut *transport,
-        &config,
-        &session_token,
-        plugin.supports_preview(),
-        plugin.supports_commands(),
-        plugin.supports_typed_arguments(),
-        plugin.supports_result_presentation(),
-    )?;
+    let optional_capabilities = OptionalCapabilities {
+        preview: plugin.supports_preview(),
+        commands: plugin.supports_commands(),
+        typed_arguments: plugin.supports_typed_arguments(),
+        result_presentation: plugin.supports_result_presentation(),
+        structured_views: plugin.supports_structured_views(),
+    };
+    let (ack, connection_id) = handshake(&mut *transport, &config, &session_token, &optional_capabilities)?;
     let reader_transport = transport.try_clone_handle().ok();
     let transport = Arc::new(Mutex::new(transport));
     let metrics = Arc::new(RuntimeMetrics::default());
@@ -400,7 +458,7 @@ pub fn serve_on(
         Arc::clone(&metrics),
     );
     let mut input = RuntimeInput::new(reader_rx, Arc::clone(&metrics));
-    let context = RuntimeContext::new(
+    let mut context = RuntimeContext::new(
         PluginId(config.plugin_id.clone()),
         Arc::clone(&cancellation),
         Arc::clone(&transport),
@@ -408,6 +466,11 @@ pub fn serve_on(
         0,
         0,
     );
+    context.structured_views = plugin.supports_structured_views()
+        && ack
+            .host_capabilities
+            .iter()
+            .any(|s| s == STRUCTURED_VIEW_CAPABILITY);
 
     match invoke_callback(|| plugin.start(&context)) {
         Ok(Ok(())) => {}
@@ -467,14 +530,19 @@ pub fn serve_on(
     result
 }
 
+struct OptionalCapabilities {
+    preview: bool,
+    commands: bool,
+    typed_arguments: bool,
+    result_presentation: bool,
+    structured_views: bool,
+}
+
 fn handshake(
     transport: &mut dyn Transport,
     config: &ServeConfig,
     session_token: &str,
-    preview: bool,
-    commands: bool,
-    typed: bool,
-    presentation: bool,
+    optional: &OptionalCapabilities,
 ) -> Result<(message::HandshakeAck, u64), SdkError> {
     let handshake = message::Handshake {
         protocol_version: PROTOCOL_VERSION,
@@ -482,17 +550,20 @@ fn handshake(
         plugin_version: config.plugin_version.clone(),
         capabilities: {
             let mut names = capability_names(&config.capabilities);
-            if preview {
+            if optional.preview {
                 names.push(crikey_core::PREVIEW_CAPABILITY.to_owned());
             }
-            if commands {
+            if optional.commands {
                 names.push(crikey_core::command::COMMANDS_CAPABILITY.to_owned());
             }
-            if typed {
+            if optional.typed_arguments {
                 names.push("typed_arguments_v1".to_owned());
             }
-            if presentation {
+            if optional.result_presentation {
                 names.push("result_presentation_v1".to_owned());
+            }
+            if optional.structured_views {
+                names.push(STRUCTURED_VIEW_CAPABILITY.to_owned());
             }
             names
         },
@@ -789,6 +860,24 @@ impl RuntimeInput {
         self.next_raw()
     }
 
+    fn next_raw_until(&mut self, deadline: Instant) -> Result<Option<Envelope>, SdkError> {
+        match self
+            .receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(ReadEvent::Envelope(envelope)) => {
+                self.metrics.queued.fetch_sub(1, Ordering::AcqRel);
+                Ok(Some(*envelope))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Ok(ReadEvent::Failed(error)) => Err(*error),
+            Ok(ReadEvent::Closed) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.closed = true;
+                Err(SdkError::Transport("connection closed".into()))
+            }
+        }
+    }
+
     fn next_raw(&mut self) -> Result<Envelope, SdkError> {
         match self.receiver.recv() {
             Ok(ReadEvent::Envelope(envelope)) => {
@@ -942,6 +1031,7 @@ struct RuntimeContext {
     generation: u64,
     log_state: Arc<Mutex<LogState>>,
     schemas: Arc<Mutex<SchemaRegistry>>,
+    structured_views: bool,
 }
 
 impl RuntimeContext {
@@ -962,6 +1052,7 @@ impl RuntimeContext {
             generation,
             log_state: Arc::new(Mutex::new(LogState::default())),
             schemas: Arc::new(Mutex::new(SchemaRegistry::default())),
+            structured_views: false,
         }
     }
 
@@ -975,6 +1066,7 @@ impl RuntimeContext {
             generation,
             log_state: Arc::new(Mutex::new(LogState::default())),
             schemas: Arc::clone(&self.schemas),
+            structured_views: self.structured_views,
         }
     }
 
@@ -1118,6 +1210,19 @@ fn serve_requests(
             Payload::Cancel(_) => {
                 cancellation.cancel((request_id, generation));
             }
+            Payload::StructuredViewRequest(request) => {
+                let mut runtime = RequestRuntime {
+                    transport,
+                    input,
+                    cancellation,
+                    credits,
+                    context: &request_context,
+                    metrics,
+                    typed_negotiated,
+                    presentation_negotiated,
+                };
+                handle_structured_view(plugin, request, deadline_ms, &mut runtime)?;
+            }
             Payload::CommandsRequest(_) => {
                 cancellation.begin(CancellationKey {
                     request_id,
@@ -1243,18 +1348,27 @@ fn serve_requests(
                 }
             }
             Payload::TypedExecuteRequest(request) => {
-                handle_typed_execute(plugin, request, &request_context, metrics, typed_negotiated)?;
-            }
-            Payload::Execute(request) => {
-                handle_execute(
-                    plugin,
-                    request,
+                cancellation.begin(CancellationKey {
                     request_id,
                     generation,
-                    transport,
+                });
+                handle_typed_execute(
+                    plugin,
+                    request,
                     &request_context,
                     metrics,
+                    typed_negotiated,
+                    deadline_ms,
                 )?;
+                cancellation.end();
+            }
+            Payload::Execute(request) => {
+                cancellation.begin(CancellationKey {
+                    request_id,
+                    generation,
+                });
+                handle_execute(plugin, request, &request_context, metrics, deadline_ms)?;
+                cancellation.end();
                 if let Some(error) = request_context.take_log_error() {
                     return Err(error);
                 }
@@ -1325,6 +1439,13 @@ fn serve_requests(
                 }
             }
             Payload::Lifecycle(lifecycle) => {
+                if matches!(lifecycle.kind.as_i32(), 2 | 4) {
+                    context
+                        .schemas
+                        .lock()
+                        .map_err(|_| SdkError::Protocol("route registry unavailable".into()))?
+                        .route = None;
+                }
                 let callback = {
                     let _in_flight = metrics.enter();
                     invoke_callback(|| match lifecycle.kind.as_i32() {
@@ -1711,49 +1832,253 @@ fn handle_catalog(
     }
 }
 
+fn handle_structured_view(
+    plugin: &mut dyn Plugin,
+    request: message::StructuredViewRequest,
+    deadline_ms: u64,
+    runtime: &mut RequestRuntime<'_>,
+) -> Result<(), SdkError> {
+    let context = runtime.context;
+    // Refusal control replies echo the route, so never copy an unbounded
+    // malformed identity into that credit-exempt response.
+    if request.route_id.len() > 256 {
+        return send_error(
+            runtime.transport,
+            context.connection_id,
+            context.request_id,
+            context.generation,
+            "invalid view request",
+        );
+    }
+    let started = Instant::now();
+    runtime.cancellation.begin(CancellationKey {
+        request_id: context.request_id,
+        generation: context.generation,
+    });
+    let mut response = message::StructuredViewResponse {
+        route_id: request.route_id.clone(),
+        logical_view: request.logical_view,
+        surface: request.surface,
+        status: 4,
+        ..Default::default()
+    };
+    let mut frozen = None;
+    let prepared = (|| -> Result<()> {
+        if !context.structured_views {
+            response.status = 2;
+            return Ok(());
+        }
+        let request = crikey_native_protocol::structured_view::from_request(request, &context.plugin_id)
+            .map_err(|_| CoreError::Invalid("invalid view request".into()))?;
+        let revision = NonZeroU64::new(context.request_id)
+            .ok_or_else(|| CoreError::Invalid("invalid view revision".into()))?;
+        let mut registry = context
+            .schemas
+            .lock()
+            .map_err(|_| CoreError::Invalid("route registry unavailable".into()))?;
+        if request.mode == ViewRequestMode::Refresh
+            && !registry.route.as_ref().is_some_and(|r| {
+                r.context.route == request.route
+                    && r.context.session == request.session
+                    && Some(r.context.revision) == request.previous_revision
+            })
+        {
+            return Err(CoreError::Invalid("stale view refresh".into()));
+        }
+        if request.mode == ViewRequestMode::Open {
+            registry.route = None;
+        }
+        drop(registry);
+        if context.cancellation().is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+        let descriptor = {
+            let _in_flight = runtime.metrics.enter();
+            match invoke_callback(|| plugin.structured_view(&request, context)) {
+                Ok(result) => result?,
+                Err(_) => return Err(CoreError::Invalid("view callback failed".into())),
+            }
+        };
+        let view = ViewExecutionContext {
+            route: request.route.clone(),
+            session: request.session,
+            revision,
+        };
+        let admission = local_admission(&context.plugin_id, &view)?;
+        let descriptor = Arc::new(descriptor);
+        ViewReply {
+            context: view.clone(),
+            descriptor: Arc::clone(&descriptor),
+        }
+        .validate(&request, revision, &admission)
+        .map_err(|_| CoreError::Invalid("invalid view descriptor".into()))?;
+        response.descriptor = Some(Box::new(
+            crikey_native_protocol::structured_view::to_descriptor(&descriptor, &admission)
+                .map_err(|_| CoreError::Invalid("invalid view descriptor".into()))?,
+        ));
+        response.status = 1;
+        frozen = Some(FrozenRoute {
+            context: view,
+            descriptor,
+        });
+        Ok(())
+    })();
+    if prepared.is_err() {
+        response.status = 4;
+        response.descriptor = None;
+        frozen = None;
+    }
+    let mut envelope = Envelope {
+        connection_id: context.connection_id,
+        request_id: context.request_id,
+        generation: context.generation,
+        deadline_ms: 0,
+        payload: Some(Payload::StructuredViewResponse(response)),
+        unknown: Default::default(),
+    };
+    // Preflight the complete envelope before waiting for credit or publishing
+    // authority. A valid Core descriptor can still exceed the wire budget.
+    if message::validate_outbound(&envelope).is_err() {
+        if let Some(Payload::StructuredViewResponse(response)) = envelope.payload.as_mut() {
+            response.status = 4;
+            response.descriptor = None;
+        }
+        frozen = None;
+    }
+    let Some(Payload::StructuredViewResponse(response)) = envelope.payload.as_mut() else {
+        unreachable!("structured view response envelope");
+    };
+    let mut sink = SuggestionSinkImpl::new(
+        context.connection_id,
+        context.request_id,
+        context.generation,
+        runtime.transport,
+        runtime.input,
+        runtime.cancellation,
+        runtime.credits,
+    );
+    let deadline = (deadline_ms != 0).then(|| started + Duration::from_millis(deadline_ms));
+    // Descriptor-free terminal refusals are bounded control replies. Only a
+    // successful descriptor waits for and consumes an ordinary producer credit.
+    if response.status == 1 && sink.wait_for_credit_until(deadline, true).is_err() {
+        if let Some(error) = sink.take_transport_error() {
+            return Err(error);
+        }
+        response.status = 3;
+    }
+    if context.cancellation().is_cancelled() {
+        response.status = 3;
+    } else if deadline_ms != 0 && started.elapsed().as_millis() >= u128::from(deadline_ms) {
+        response.status = 5;
+    }
+    if response.status != 1 {
+        response.descriptor = None;
+        frozen = None;
+    }
+    let consumes_credit = response.status == 1;
+    send_envelope(runtime.transport, envelope)?;
+    if consumes_credit {
+        sink.credits.remaining -= 1;
+    }
+    if let Some(frozen) = frozen {
+        context
+            .schemas
+            .lock()
+            .map_err(|_| SdkError::Protocol("route registry unavailable".into()))?
+            .route = Some(frozen);
+    }
+    runtime.cancellation.end();
+    if let Some(error) = context.take_log_error() {
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn handle_typed_execute(
     plugin: &mut dyn Plugin,
     request: message::TypedExecuteRequest,
     context: &RuntimeContext,
     metrics: &RuntimeMetrics,
     negotiated: bool,
+    deadline_ms: u64,
 ) -> Result<(), SdkError> {
     let request_id = context.request_id;
     let generation = context.generation;
     let transport = &context.transport;
     mark_sensitive();
+    let started = Instant::now();
+    let view = request
+        .view
+        .clone()
+        .map(crikey_native_protocol::structured_view::from_context)
+        .transpose();
+    let route = match &view {
+        Ok(Some(view)) if context.structured_views => context.schemas.lock().ok().and_then(|registry| {
+            registry.route.as_ref().and_then(|r| {
+                r.resolve(
+                    view,
+                    &context.plugin_id,
+                    &request.item_id,
+                    request.action_id.as_deref(),
+                )
+                .ok()
+            })
+        }),
+        _ => None,
+    };
     let schema = {
         let registry = context
             .schemas
             .lock()
             .map_err(|_| SdkError::Protocol("schema registry unavailable".into()))?;
-        registry
-            .suggestions
-            .schemas
-            .iter()
-            .chain(&registry.catalog.schemas)
-            .find(|binding| {
-                binding.executable.target.owner == context.plugin_id
-                    && binding.executable.target.item.0 == request.item_id
-                    && binding.executable.action.as_ref().map(|a| &a.0) == request.action_id.as_ref()
-            })
-            .map(|binding| Arc::clone(&binding.schema))
+        if request.view.is_some() {
+            route.as_ref().and_then(|(_, schema)| schema.clone())
+        } else {
+            registry
+                .suggestions
+                .schemas
+                .iter()
+                .chain(&registry.catalog.schemas)
+                .find(|binding| {
+                    binding.executable.target.owner == context.plugin_id
+                        && binding.executable.target.item.0 == request.item_id
+                        && binding.executable.action.as_ref().map(|a| &a.0) == request.action_id.as_ref()
+                })
+                .map(|binding| Arc::clone(&binding.schema))
+        }
     };
     let empty = ArgumentSchema::default();
-    let outcome = if !negotiated || !plugin.supports_typed_arguments() {
-        SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported)
+    let failed = |code| TypedExecutionOutcome::from(SubmissionOutcome::Failed(code));
+    let mut outcome = if !negotiated
+        || !plugin.supports_typed_arguments()
+        || (request.view.is_some() && !context.structured_views)
+    {
+        failed(SubmissionFailureCode::Unsupported)
+    } else if context.cancellation().is_cancelled() {
+        failed(SubmissionFailureCode::Cancelled)
     } else if let Some(schema) = schema.as_deref() {
         let fingerprint = schema.fingerprint().ok();
         if fingerprint.as_ref().map(|v| v.as_slice()) != Some(request.expected_fingerprint.as_slice()) {
-            SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch)
+            failed(SubmissionFailureCode::SchemaMismatch)
         } else if schema.validate_values(&request.values).is_err() {
-            SubmissionOutcome::Failed(SubmissionFailureCode::ProtocolViolation)
+            failed(SubmissionFailureCode::ProtocolViolation)
         } else {
             let expected_fingerprint =
                 fingerprint.ok_or_else(|| SdkError::Protocol("invalid schema".into()))?;
             let _in_flight = metrics.enter();
-            match invoke_callback(|| {
-                plugin.execute_typed(
+            match invoke_callback(|| match (view, route) {
+                (Ok(Some(view)), Some((item, _))) => plugin.execute_view_typed(
+                    crate::ViewTypedExecuteRequest {
+                        request: RequestId(request_id),
+                        view,
+                        item,
+                        action: request.action_id.map(ActionId),
+                        expected_fingerprint,
+                        values: request.values,
+                    },
+                    context,
+                ),
+                (Ok(None), _) => plugin.execute_typed(
                     crate::TypedExecuteRequest {
                         request: RequestId(request_id),
                         item: ItemId(request.item_id),
@@ -1762,15 +2087,26 @@ fn handle_typed_execute(
                         values: request.values,
                     },
                     context,
-                )
+                ),
+                _ => Err(CoreError::Invalid("route unavailable".into())),
             }) {
                 Ok(Ok(outcome)) if outcome.validate(Some(schema)).is_ok() => outcome,
-                _ => SubmissionOutcome::Failed(SubmissionFailureCode::Failed),
+                _ => failed(SubmissionFailureCode::Failed),
             }
         }
     } else {
-        SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable)
+        failed(SubmissionFailureCode::Unavailable)
     };
+    if matches!(outcome, TypedExecutionOutcome::Navigate(_)) && !context.structured_views {
+        outcome = failed(SubmissionFailureCode::Unsupported);
+    }
+    if context.cancellation().is_cancelled() {
+        outcome = failed(SubmissionFailureCode::Cancelled);
+    } else if deadline_ms != 0 && started.elapsed().as_millis() >= u128::from(deadline_ms) {
+        outcome = failed(SubmissionFailureCode::Timeout);
+    }
+    // Navigation is a proposal, not host publication. Retain the exact current
+    // descriptor until a subsequent admitted Open/Refresh replaces it.
     let response = crikey_native_protocol::typed::to_response(outcome, schema.as_deref().unwrap_or(&empty))
         .map_err(SdkError::from)?;
     send_envelope(
@@ -1789,12 +2125,18 @@ fn handle_typed_execute(
 fn handle_execute(
     plugin: &mut dyn Plugin,
     request: message::ExecuteRequest,
-    request_id: u64,
-    generation: u64,
-    transport: &Arc<Mutex<Box<dyn Transport>>>,
     context: &RuntimeContext,
     metrics: &RuntimeMetrics,
+    deadline_ms: u64,
 ) -> Result<(), SdkError> {
+    let request_id = context.request_id;
+    let generation = context.generation;
+    let transport = &context.transport;
+    let started = Instant::now();
+    let view = request
+        .view
+        .map(crikey_native_protocol::structured_view::from_context)
+        .transpose();
     let plugin_request = ExecuteRequest {
         request: RequestId(request_id),
         item: ItemId(request.item_id),
@@ -1809,33 +2151,93 @@ fn handle_execute(
             Some(request.argument)
         },
     };
-    let callback = {
+    let mut callback = {
         let _in_flight = metrics.enter();
-        let guarded = context
-            .schemas
-            .lock()
-            .map_err(|_| CoreError::Invalid("schema registry unavailable".into()))
-            .map(|registry| {
-                let resolved = plugin_request
-                    .action
-                    .as_ref()
-                    .or_else(|| registry.suggestion_primary.get(&plugin_request.item))
-                    .or_else(|| registry.catalog_primary.get(&plugin_request.item));
-                registry
-                    .catalog
-                    .schemas
-                    .iter()
-                    .chain(&registry.suggestions.schemas)
-                    .any(|binding| {
-                        binding.executable.target.item == plugin_request.item
-                            && binding.executable.action.as_ref() == resolved
-                    })
-            });
-        match guarded {
-            Ok(false) => invoke_callback(|| plugin.execute_outcome(plugin_request, context)),
-            _ => Ok(Err(CoreError::Invalid("typed arguments required".into()))),
+        if context.cancellation().is_cancelled() {
+            Ok(Err(CoreError::Cancelled))
+        } else {
+            match view {
+                Ok(Some(view)) if context.structured_views => {
+                    let resolved = context.schemas.lock().ok().and_then(|registry| {
+                        registry.route.as_ref().and_then(|route| {
+                            route
+                                .resolve(
+                                    &view,
+                                    &context.plugin_id,
+                                    &plugin_request.item.0,
+                                    plugin_request.action.as_ref().map(|a| a.0.as_str()),
+                                )
+                                .ok()
+                        })
+                    });
+                    match resolved {
+                        Some((item, None))
+                            if match item.argument_policy {
+                                crikey_core::item::ArgumentPolicy::Forbidden => {
+                                    plugin_request.argument.is_none()
+                                }
+                                crikey_core::item::ArgumentPolicy::Required => {
+                                    plugin_request.argument.as_ref().is_some_and(|v| !v.is_empty())
+                                }
+                                crikey_core::item::ArgumentPolicy::Optional => true,
+                            } =>
+                        {
+                            invoke_callback(|| {
+                                plugin.execute_view(
+                                    crate::ViewExecuteRequest {
+                                        request: plugin_request.request,
+                                        view,
+                                        item,
+                                        action: plugin_request.action,
+                                        argument: plugin_request.argument,
+                                    },
+                                    context,
+                                )
+                            })
+                        }
+                        _ => Ok(Err(CoreError::Invalid(
+                            "route execution unavailable or requires typed input".into(),
+                        ))),
+                    }
+                }
+                Ok(None) => {
+                    let guarded = context
+                        .schemas
+                        .lock()
+                        .map_err(|_| CoreError::Invalid("schema registry unavailable".into()))
+                        .map(|registry| {
+                            let resolved = plugin_request
+                                .action
+                                .as_ref()
+                                .or_else(|| registry.suggestion_primary.get(&plugin_request.item))
+                                .or_else(|| registry.catalog_primary.get(&plugin_request.item));
+                            registry
+                                .catalog
+                                .schemas
+                                .iter()
+                                .chain(&registry.suggestions.schemas)
+                                .any(|binding| {
+                                    binding.executable.target.item == plugin_request.item
+                                        && binding.executable.action.as_ref() == resolved
+                                })
+                        });
+                    match guarded {
+                        Ok(false) => invoke_callback(|| plugin.execute_outcome(plugin_request, context)),
+                        _ => Ok(Err(CoreError::Invalid("typed arguments required".into()))),
+                    }
+                }
+                _ => Ok(Err(CoreError::Invalid(
+                    "structured views unsupported or invalid".into(),
+                ))),
+            }
         }
     };
+    if context.cancellation().is_cancelled() {
+        callback = Ok(Err(CoreError::Cancelled));
+    } else if deadline_ms != 0 && started.elapsed().as_millis() >= u128::from(deadline_ms) {
+        callback = Ok(Err(CoreError::Invalid("execution deadline exceeded".into())));
+    }
+    let mut navigation = None;
     let (outcome, page_id, error) = match callback {
         Ok(Ok(ExecuteOutcome::Completed)) => (ExecuteOutcomeCode::from_i32(1), String::new(), None),
         // An action that opened a page reports the page rather than
@@ -1843,6 +2245,22 @@ fn handle_execute(
         // folding this onto the OK outcome would dismiss the window the page
         // was about to be drawn in.
         Ok(Ok(ExecuteOutcome::ShowPage { page_id })) => (ExecuteOutcomeCode::from_i32(4), page_id, None),
+        Ok(Ok(ExecuteOutcome::Navigate(route))) => {
+            match crikey_native_protocol::structured_view::to_navigation(&route) {
+                Ok(value) if context.structured_views => {
+                    navigation = Some(value);
+                    (ExecuteOutcomeCode::from_i32(5), String::new(), None)
+                }
+                _ => (
+                    ExecuteOutcomeCode::from_i32(2),
+                    String::new(),
+                    Some(structured_error(
+                        "structured navigation unsupported or invalid",
+                        request_id,
+                    )),
+                ),
+            }
+        }
         Ok(Err(error)) => (
             ExecuteOutcomeCode::from_i32(2),
             String::new(),
@@ -1865,6 +2283,7 @@ fn handle_execute(
                 outcome,
                 error,
                 page_id,
+                navigation,
                 unknown: Default::default(),
             })),
             unknown: Default::default(),
@@ -2128,14 +2547,34 @@ impl<'a> SuggestionSinkImpl<'a> {
     }
 
     fn wait_for_credit(&mut self, _terminal: bool) -> Result<(), CoreError> {
-        if self.input.shutdown {
-            return Err(CoreError::Cancelled);
-        }
-        while self.credits.remaining == 0 || self.credits.paused {
-            let envelope = self.input.next_raw().map_err(|error| {
-                self.transport_error = Some(error.clone());
-                CoreError::Invalid("transport closed while waiting for credit".to_owned())
-            })?;
+        self.wait_for_credit_until(None, false)
+    }
+
+    fn wait_for_credit_until(
+        &mut self,
+        deadline: Option<Instant>,
+        cancellable: bool,
+    ) -> Result<(), CoreError> {
+        loop {
+            if self.input.shutdown
+                || (cancellable && self.cancellation.cancellation_flag())
+                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Err(CoreError::Cancelled);
+            }
+            if self.credits.remaining != 0 && !self.credits.paused {
+                return Ok(());
+            }
+            let received = match deadline {
+                Some(deadline) => self.input.next_raw_until(deadline),
+                None => self.input.next_raw().map(Some),
+            };
+            let envelope = received
+                .map_err(|error| {
+                    self.transport_error = Some(error.clone());
+                    CoreError::Invalid("transport closed while waiting for credit".to_owned())
+                })?
+                .ok_or(CoreError::Cancelled)?;
             match envelope.payload {
                 Some(Payload::Flow(flow)) => self.credits.grant(&flow),
                 Some(Payload::Cancel(_)) => {
@@ -2153,11 +2592,7 @@ impl<'a> SuggestionSinkImpl<'a> {
                     })?;
                 }
             }
-            if self.input.shutdown {
-                return Err(CoreError::Cancelled);
-            }
         }
-        Ok(())
     }
 
     /// `ResultBatch` carries the same repeated `Item` field as `CatalogBatch`

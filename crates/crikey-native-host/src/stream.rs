@@ -78,6 +78,7 @@ pub enum ExecuteOutcome {
     Ok,
     Failed(PluginError),
     Unsupported,
+    Navigate(crikey_core::structured_view::StructuredRouteOutcome),
     /// The action asked the host to open the named plugin-drawn page
     /// (spec 32.2). The id is the plugin's own handle for the surface; every
     /// later frame request quotes it back, so an empty one names nothing the

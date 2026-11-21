@@ -17,8 +17,9 @@ use crikey_platform::IconImage;
 pub mod action_panel;
 mod native;
 pub mod navigation;
+pub mod standard_view;
 mod typed_input;
-pub use typed_input::{InlineArguments, TypedInputSubmission};
+pub use typed_input::{next_inline_input_revision, InlineArguments, TypedInputSubmission};
 mod root_presentation;
 use action_panel::{ActionActivation, ActionExecution, ActionPanelNavigation, ActionTree, HostAction};
 pub use action_panel::{ActionIdentity, ActionPanel, ActionTarget};
@@ -105,7 +106,14 @@ pub struct ResultSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResultSourceKind {
     Ordinary,
-    DeclaredCatalog { epoch: u64 },
+    DeclaredCatalog {
+        epoch: u64,
+    },
+    Standard {
+        logical_view: u64,
+        surface: u64,
+        revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -505,6 +513,19 @@ pub struct ViewModel {
 /// Not [`Eq`]: a page input carries pointer coordinates, which are floats.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiCommand {
+    StandardSelect {
+        context: crikey_core::structured_view::ViewExecutionContext,
+        target: crikey_core::structured_arguments::OwnedItem,
+    },
+    StandardActivate {
+        context: crikey_core::structured_view::ViewExecutionContext,
+        executable: crikey_core::structured_arguments::ExecutableKey,
+    },
+    StandardLink {
+        context: crikey_core::structured_view::ViewExecutionContext,
+        url: String,
+    },
+    StandardHorizontal(bool),
     SetTypedDraft {
         revision: u64,
         draft_revision: u64,
@@ -638,6 +659,17 @@ pub const PAGE_SIZE: usize = 8;
 /// Not [`Eq`], for the same reason [`UiCommand`] is not.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiEffect {
+    ExecuteStandard {
+        owner: PluginId,
+        context: crikey_core::structured_view::ViewExecutionContext,
+        executable: crikey_core::structured_arguments::ExecutableKey,
+    },
+    RefreshStandard(crikey_core::structured_view::ViewRefreshReason),
+    OpenStandardLink {
+        owner: PluginId,
+        context: crikey_core::structured_view::ViewExecutionContext,
+        url: String,
+    },
     ExecuteActionless {
         owner: PluginId,
         item: ItemId,
@@ -718,6 +750,7 @@ pub enum ViewKind {
     RootList,
     Settings,
     CustomPage,
+    Standard,
 }
 
 /// Process-local identity of a logical surface lifetime.
@@ -890,9 +923,12 @@ pub struct LauncherViewModel {
     navigation_title: Arc<str>,
     preserve_scroll: bool,
     inline_arguments: Option<InlineArguments>,
+    standard_restoring: bool,
+    standard_refresh_pending: bool,
     scope_choices: Arc<[ScopeChoice]>,
     section_headers: Arc<[SectionHeader]>,
     actionless_targets: Arc<[crikey_core::structured_arguments::OwnedItem]>,
+    standard: Option<Arc<standard_view::StandardSurface>>,
 }
 
 impl Default for LauncherViewModel {
@@ -910,9 +946,12 @@ impl LauncherViewModel {
         Self {
             command_management: Arc::default(),
             scope_choices: Arc::default(),
+            standard_restoring: false,
+            standard_refresh_pending: false,
             section_headers: Arc::default(),
             actionless_targets: Arc::default(),
             inline_arguments: None,
+            standard: None,
             visible: false,
             view_id: ViewId(0),
             publication_view: None,
@@ -970,7 +1009,11 @@ impl LauncherViewModel {
         source: PublicationIdentity,
         command: Option<(crikey_core::CommandRef, u64)>,
     ) -> bool {
-        if self.view().is_some_and(|(_, kind)| kind == ViewKind::RootList) && schema.validate().is_ok() {
+        if self
+            .view()
+            .is_some_and(|(_, kind)| matches!(kind, ViewKind::RootList | ViewKind::Standard))
+            && schema.validate().is_ok()
+        {
             let command = command.or_else(|| {
                 let row = self.rows.get(self.selected)?;
                 let ActionTarget::Command(reference) = &row.target else {
@@ -996,6 +1039,7 @@ impl LauncherViewModel {
                 command,
                 view: self.view_id,
                 generation: self.active.unwrap_or(Generation::ZERO),
+                view_context: self.standard.as_ref().map(|surface| surface.context.clone()),
                 outcome: None,
                 draft,
             });
@@ -1072,10 +1116,15 @@ impl LauncherViewModel {
         self.inline_arguments.as_ref()
     }
     pub fn accepts_typed_input(&self, revision: u64, view: ViewId, generation: Generation) -> bool {
-        self.view() == Some((view, ViewKind::RootList))
-            && self.active == Some(generation)
+        self.view().is_some_and(|(current, kind)| {
+            current == view && matches!(kind, ViewKind::RootList | ViewKind::Standard)
+        }) && self.active == Some(generation)
+            && !self.standard_refresh_pending
             && self.inline_arguments.as_ref().is_some_and(|input| {
-                input.revision == revision && input.view == view && input.generation == generation
+                input.revision == revision
+                    && input.view == view
+                    && input.generation == generation
+                    && input.view_context.as_ref() == self.standard.as_ref().map(|surface| &surface.context)
             })
     }
     pub fn accepts_typed_draft(
@@ -1149,6 +1198,10 @@ impl LauncherViewModel {
         });
         rows.dedup_by(|left, right| left.target == right.target);
         self.command_management = rows.into();
+        if self.standard.is_some() {
+            self.dirty |= self.visible;
+            return;
+        }
         if let Some(panel) = &mut self.action_panel {
             let replacement = self
                 .rows
@@ -1253,6 +1306,19 @@ impl LauncherViewModel {
                 page_id: page.page_id.clone(),
                 title: page.plugin_name.clone(),
             }
+        } else if let Some(surface) = &self.standard {
+            NavigationRoute::Standard {
+                owner: surface.owner.clone(),
+                producer: surface.producer,
+                logical_view: surface.context.session.logical_view,
+                route: surface.context.route.clone(),
+                title: self.navigation_title.to_string(),
+                collection: matches!(
+                    surface.descriptor.view,
+                    crikey_core::structured_view::StandardView::List(_)
+                        | crikey_core::structured_view::StandardView::Grid(_)
+                ),
+            }
         } else if let Some(route) = &self.page_reopen {
             route.clone()
         } else {
@@ -1260,11 +1326,30 @@ impl LauncherViewModel {
         };
         let state = self.navigation_restoration();
         let rows = self.rows.clone();
-        navigation::Entry { route, rows, state }
+        navigation::Entry {
+            route,
+            rows,
+            state,
+            descriptor: self.standard.as_ref().map(|s| s.descriptor.clone()),
+            admitted_descriptor: self
+                .standard
+                .as_ref()
+                .map(|surface| surface.admitted_descriptor.clone()),
+            panel: self.action_panel.clone(),
+            render_standard: self.standard.is_some() && !self.standard_refresh_pending,
+            transient_pixels: navigation::transient_pixels(self.page.as_ref(), self.preview.status.as_ref()),
+            transient_bytes: navigation::transient_bytes(self.page.as_ref(), self.preview.status.as_ref())
+                + self.standard.as_ref().map_or(0, |surface| {
+                    std::mem::size_of::<standard_view::StandardSurface>()
+                        + 2 * std::mem::size_of::<usize>()
+                        + surface.owner.0.capacity()
+                        + surface.context.route.0.capacity()
+                }),
+        }
     }
 
     fn push_navigation(&mut self) -> bool {
-        let entry = self.capture_entry();
+        let mut entry = self.capture_entry();
         if self.navigation_stack.len() + 1 >= navigation::MAX_NAVIGATION_ENTRIES
             || navigation::retained_bytes(self.navigation_stack.iter().chain(std::iter::once(&entry)))
                 > navigation::MAX_NAVIGATION_BYTES
@@ -1275,6 +1360,11 @@ impl LauncherViewModel {
             self.dirty = true;
             return false;
         }
+        entry.transient_bytes = 0;
+        entry.transient_pixels = 0;
+        entry.panel = None;
+        entry.render_standard = false;
+        entry.admitted_descriptor = None;
         self.navigation_stack.push(entry);
         self.inline_arguments = None;
         self.navigation_unavailable = None;
@@ -1285,11 +1375,17 @@ impl LauncherViewModel {
 
     fn restore_entry(&mut self, entry: navigation::Entry) {
         self.page = None;
+        self.standard = None;
         self.settings_open = false;
         self.settings_focus = None;
         self.page_reopen = None;
+        let no_standard_selection = matches!(entry.route, NavigationRoute::Standard { collection: true, .. })
+            && entry.state.selected.is_none();
         self.rows = entry.rows;
         self.restore_navigation_state(entry.state);
+        if no_standard_selection {
+            self.selected = usize::MAX;
+        }
         self.query_refresh = false;
         self.navigation_unavailable = None;
         self.navigation_notice_token = None;
@@ -1302,6 +1398,12 @@ impl LauncherViewModel {
                 self.navigation_title = Arc::from("Settings");
                 self.settings_open = true;
                 self.settings_focus = focus.filter(|focus| !focus.starts_with("record:"));
+            }
+            route @ NavigationRoute::Standard { .. } => {
+                if let NavigationRoute::Standard { title, .. } = &route {
+                    self.navigation_title = Arc::from(title.as_str());
+                }
+                self.page_reopen = Some(route);
             }
             route @ NavigationRoute::CustomPage { .. } => {
                 if let NavigationRoute::CustomPage { title, page_id, .. } = &route {
@@ -1323,10 +1425,13 @@ impl LauncherViewModel {
 
     /// Drain after closing the old surface. The descriptor has no engine state.
     pub fn take_page_reopen(&mut self) -> Option<NavigationRoute> {
-        if !self.visible || self.navigation_unavailable.is_some() {
+        if !self.visible || self.navigation_unavailable.is_some() || self.reopening {
             return None;
         }
         let route = self.page_reopen.take()?;
+        if matches!(route, NavigationRoute::Standard { .. }) {
+            self.page_reopen = Some(route.clone());
+        }
         self.reopening = true;
         Some(route)
     }
@@ -1342,11 +1447,23 @@ impl LauncherViewModel {
 
     fn navigation_presentation(&self) -> NavigationPresentation {
         NavigationPresentation {
+            standard: self.standard.clone(),
+            standard_refresh_pending: self.standard_refresh_pending,
             scopes: self.scope_choices.clone(),
             selected_scope: self.navigation_scope.clone(),
             section_headers: self.section_headers.clone(),
+            standard_route: self.standard.is_some()
+                || matches!(self.page_reopen, Some(NavigationRoute::Standard { .. })),
             actionless_targets: self.actionless_targets.clone(),
-            inline_arguments: self.inline_arguments.clone(),
+            // A restored route input is draft intent, not a live editor, until
+            // the fresh endpoint descriptor and exact schema have been admitted.
+            inline_arguments: if matches!(self.page_reopen, Some(NavigationRoute::Standard { .. }))
+                || self.standard_refresh_pending
+            {
+                None
+            } else {
+                self.inline_arguments.clone()
+            },
             title: self.navigation_title.clone(),
             can_go_back: !self.navigation_stack.is_empty(),
             scroll: self.navigation_scroll.clone(),
@@ -1423,6 +1540,8 @@ impl LauncherViewModel {
             self.view_id,
             if self.settings_open {
                 ViewKind::Settings
+            } else if self.standard.is_some() {
+                ViewKind::Standard
             } else if self.page.is_some() || self.page_reopen.is_some() || self.reopening {
                 ViewKind::CustomPage
             } else {
@@ -1501,6 +1620,7 @@ impl LauncherViewModel {
     }
 
     fn change_view(&mut self) {
+        self.standard_refresh_pending = false;
         self.view_id = ViewId(self.view_id.0.checked_add(1).expect("view identity exhausted"));
         self.recall = Arc::default();
         self.publication_view = None;
@@ -1556,10 +1676,15 @@ impl LauncherViewModel {
         self.navigation_notice_token = None;
         self.navigation_title = Arc::from("Search");
         if !self.resume_delay.is_zero() {
-            let entry = self.capture_entry();
+            let mut entry = self.capture_entry();
             if navigation::retained_bytes(self.navigation_stack.iter().chain(std::iter::once(&entry)))
                 <= navigation::MAX_NAVIGATION_BYTES
             {
+                entry.transient_bytes = 0;
+                entry.transient_pixels = 0;
+                entry.panel = None;
+                entry.render_standard = false;
+                entry.admitted_descriptor = None;
                 self.suspended = Some(entry);
                 self.suspended_at = Some(self.navigation_clock.now());
             } else {
@@ -1576,6 +1701,7 @@ impl LauncherViewModel {
             self.navigation_stack.clear();
         }
         self.inline_arguments = None;
+        self.standard = None;
         self.page_reopen = None;
         self.navigation_scroll = LogicalScroll::default();
         self.preserve_scroll = false;
@@ -1615,6 +1741,7 @@ impl LauncherViewModel {
         if !self.visible
             || self.settings_open
             || self.page.is_some()
+            || self.standard.is_some()
             || self.page_reopen.is_some()
             || self.reopening
             || generation == Generation::ZERO
@@ -1657,7 +1784,7 @@ impl LauncherViewModel {
     /// and nothing else, and dropping the rows here is what makes that true
     /// for every renderer instead of only for the one that remembers to check.
     pub fn publish(&mut self, generation: Generation, rows: Vec<ResultRow>, pending_plugins: bool) {
-        if !self.visible || self.active != Some(generation) || self.publication_view != Some(self.view_id) {
+        if !self.admits_root_generation(generation) {
             return;
         }
 
@@ -1700,7 +1827,14 @@ impl LauncherViewModel {
             query: self.query.clone(),
             // A refcount bump, not a copy of the row set (spec 25.5).
             rows: Arc::clone(&self.rows),
-            selected: self.selected,
+            selected: if self.standard.is_some()
+                && !self.rows.is_empty()
+                && !self.standard_selection_available()
+            {
+                usize::MAX
+            } else {
+                self.selected
+            },
             pending_plugins: self.pending_plugins,
             action_panel: self.action_panel.clone(),
             command_management: Arc::clone(&self.command_management),
@@ -1742,6 +1876,9 @@ impl LauncherViewModel {
         if !self.visible && !matches!(command, UiCommand::ClosePage) {
             return None;
         }
+        if let Some(effect) = self.apply_standard_command(&command) {
+            return effect;
+        }
 
         if matches!(
             &command,
@@ -1756,6 +1893,10 @@ impl LauncherViewModel {
             self.dirty = true;
         }
         match command {
+            UiCommand::StandardActivate { .. }
+            | UiCommand::StandardLink { .. }
+            | UiCommand::StandardHorizontal(_)
+            | UiCommand::StandardSelect { .. } => None,
             UiCommand::SetScope(scope) => {
                 if self.navigation_scope == scope {
                     return None;
@@ -1783,6 +1924,11 @@ impl LauncherViewModel {
                 revision,
                 draft_revision,
             } => {
+                if matches!(self.page_reopen, Some(NavigationRoute::Standard { .. }))
+                    || self.standard_refresh_pending
+                {
+                    return None;
+                }
                 if let Some(input) = self
                     .inline_arguments
                     .as_mut()
@@ -1800,6 +1946,11 @@ impl LauncherViewModel {
                 draft_revision,
                 draft,
             } => {
+                if matches!(self.page_reopen, Some(NavigationRoute::Standard { .. }))
+                    || self.standard_refresh_pending
+                {
+                    return None;
+                }
                 let mut previous = None;
                 if let Some(input) = self
                     .inline_arguments
@@ -1989,6 +2140,10 @@ impl LauncherViewModel {
                             let _ = self.set_selected_status(reason.to_string());
                         }
                     }
+                }
+                if !self.within_navigation_budget() {
+                    self.action_panel = None;
+                    self.set_navigation_notice("Actions exceed the shared navigation resource limit".into());
                 }
                 None
             }
@@ -2474,6 +2629,13 @@ impl LauncherViewModel {
         }
         self.preview.status = Some(status);
         self.preview.link_target = None;
+        if !self.within_navigation_budget() {
+            self.preview.status = Some(PreviewStatus::Unavailable(
+                "Shared navigation resource limit reached".into(),
+            ));
+            self.dirty = true;
+            return false;
+        }
         self.dirty = true;
         true
     }
@@ -2529,6 +2691,7 @@ impl LauncherViewModel {
             self.change_view();
         }
         let had_page = self.page.take().is_some();
+        self.standard = None;
         self.page_reopen = None;
         self.reopening = false;
         self.navigation_unavailable = None;
@@ -2580,10 +2743,16 @@ impl LauncherViewModel {
         }
         self.reopening = false;
         self.change_view();
+        self.standard = None;
         self.settings_open = false;
         self.settings_focus = None;
         self.navigation_title = Arc::from(format!("{} — {}", surface.plugin_name, surface.page_id));
         self.page = Some(surface);
+        if !self.within_navigation_budget() {
+            self.pop_navigation();
+            self.set_navigation_notice("Page exceeds the shared navigation resource limit".into());
+            return false;
+        }
         self.dirty = true;
         true
     }
@@ -2632,6 +2801,11 @@ impl LauncherViewModel {
             page.web_frame = None;
             page.web_generation = 0;
             page.web_caret_area = None;
+        }
+        if !self.within_navigation_budget() {
+            self.close_page();
+            self.set_navigation_notice("Page exceeds the shared navigation resource limit".into());
+            return false;
         }
         self.dirty = true;
         true
@@ -2683,6 +2857,13 @@ impl LauncherViewModel {
 
         page.web_generation = frame.generation;
         page.web_frame = Some(frame);
+        if !self.within_navigation_budget() {
+            if let Some(page) = &mut self.page {
+                page.web_frame = None;
+            }
+            self.set_navigation_notice("Web pixels exceed the shared navigation resource limit".into());
+            return false;
+        }
         self.dirty = true;
         true
     }
@@ -2764,9 +2945,17 @@ impl LauncherViewModel {
         let Some(row) = self.current_action_row() else {
             return;
         };
-        match action_tree(row, &self.command_management) {
+        match self.standard.as_ref().map_or_else(
+            || action_tree(row, &self.command_management),
+            |surface| standard_view::action_tree(surface, row),
+        ) {
             Ok(tree) => {
                 self.action_panel = Some(Arc::new(ActionPanel::new(tree)));
+                if !self.within_navigation_budget() {
+                    self.action_panel = None;
+                    self.set_navigation_notice("Actions exceed the shared navigation resource limit".into());
+                    return;
+                }
                 self.navigated = true;
                 self.preview.focused = false;
                 self.preview.detail = false;
@@ -2830,7 +3019,14 @@ impl LauncherViewModel {
             }
             return self.activate_panel();
         }
-        let tree = action_tree(row, &self.command_management).ok()?;
+        let tree = self
+            .standard
+            .as_ref()
+            .map_or_else(
+                || action_tree(row, &self.command_management),
+                |surface| standard_view::action_tree(surface, row),
+            )
+            .ok()?;
         let execution = tree.execution(identity, row).ok().flatten()?;
         self.execute_action(execution)
     }
@@ -2838,6 +3034,18 @@ impl LauncherViewModel {
     fn execute_action(&mut self, execution: ActionExecution) -> Option<UiEffect> {
         self.close_actions();
         match execution {
+            ActionExecution::Actionless { owner, item } => {
+                if self.standard.is_some() {
+                    self.standard_execute(None)
+                } else {
+                    Some(UiEffect::ExecuteActionless {
+                        owner,
+                        item,
+                        view: self.view_id,
+                        generation: self.active?,
+                    })
+                }
+            }
             ActionExecution::Command { reference } => {
                 let state = self.current_action_row()?.command_state.as_ref()?;
                 self.apply(UiCommand::InvokeCommand {
@@ -2849,7 +3057,11 @@ impl LauncherViewModel {
                 })
             }
             ActionExecution::Plugin { owner, item, action } => {
-                Some(UiEffect::Execute { owner, item, action })
+                if self.standard.is_some() {
+                    self.standard_execute(Some(action))
+                } else {
+                    Some(UiEffect::Execute { owner, item, action })
+                }
             }
             ActionExecution::Host(HostAction::OpenSettings) => {
                 self.open_settings(None).then_some(UiEffect::ClosePage)
