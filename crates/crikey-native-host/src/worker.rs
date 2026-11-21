@@ -2114,9 +2114,17 @@ impl NativeWorker {
         }
     }
 
-    /// Observes exit without consuming the PID/PGID identity.
+    /// Observes callable connection liveness without reaping or waiting for cleanup.
     pub(crate) fn poll_alive(&mut self) -> bool {
-        if self.exit.is_some() || self.process_status.is_some() || self.observed_exit.is_some() {
+        // Logical retirement is independent of physical ownership. A failed
+        // containment/reap attempt must not revive a terminal connection.
+        if self.retirement_kind.is_some()
+            || self.exit.is_some()
+            || self.process_status.is_some()
+            || self.observed_exit.is_some()
+            || self.link.closed.load(Ordering::Acquire)
+            || self.link.protocol_violation()
+        {
             return false;
         }
         match self.child.as_ref().map(child_exited) {
@@ -2133,7 +2141,7 @@ impl NativeWorker {
         }
     }
 
-    /// Cleans up an observed exit while retaining ownership on a failed reap.
+    /// Reports callable connection liveness, settling an already-observed process exit.
     pub fn is_alive(&mut self) -> bool {
         if self.poll_alive() {
             return true;
@@ -2395,6 +2403,13 @@ impl NativeWorker {
     fn ensure_alive(&mut self) -> Result<(), HostError> {
         if self.is_alive() {
             Ok(())
+        } else if self.link.protocol_violation() || self.retirement_kind == Some(ExitKind::ProtocolViolation)
+        {
+            // An asynchronous reader rejection can precede callback entry.
+            // Preserve its cause without admitting another request or joining.
+            Err(HostError::Protocol(
+                "native protocol connection is retired".into(),
+            ))
         } else {
             Err(HostError::Closed)
         }

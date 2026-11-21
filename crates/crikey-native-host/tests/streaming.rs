@@ -379,6 +379,16 @@ fn oversized_frame_is_a_protocol_error_and_protocol_violation_exit() {
     let spec = launch(&misbehaving, "misbehaving.oversized", "oversized");
     let mut worker = NativeWorker::spawn(spec, options(TransportKind::Stdio))
         .expect("oversized fixture completes startup handshake");
+    // This fixture rejects the wire contract before any callback. Observe its
+    // logical retirement first; a retained OS child must not revive the link.
+    let end = std::time::Instant::now() + Duration::from_millis(CALL_TIMEOUT_MS);
+    while worker.is_alive() {
+        assert!(
+            std::time::Instant::now() < end,
+            "the violated connection remained callable"
+        );
+        thread::yield_now();
+    }
     let error = worker
         .suggest(&request("oversized", 1))
         .expect_err("an oversized declared frame is rejected before body read");
@@ -389,6 +399,10 @@ fn oversized_frame_is_a_protocol_error_and_protocol_violation_exit() {
     assert!(!worker.is_alive());
     let exit = worker.shutdown();
     assert_eq!(exit.kind, ExitKind::ProtocolViolation);
+    assert!(
+        exit.code.is_some() || exit.signal.is_some(),
+        "the actual child was not reaped"
+    );
 }
 
 #[test]
