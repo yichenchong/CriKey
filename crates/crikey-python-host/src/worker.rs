@@ -42,6 +42,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crikey_core::command::{
+    PluginCommandDeclaration, PluginCommands, COMMANDS_CAPABILITY, MAX_COMMANDS, MAX_COMMAND_BYTES,
+    MAX_COMMAND_ID_BYTES, MAX_COMMAND_LABEL_BYTES,
+};
 use crikey_core::{Item, PluginId};
 use crikey_package_manager::ImportPath;
 use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
@@ -162,6 +166,10 @@ pub enum HostError {
     /// bounded excerpt, never the whole (possibly enormous) offending line.
     #[error("the modern worker sent a line that is not a protocol frame: {0}")]
     Protocol(String),
+
+    /// Declaration callback failed validation; transport and worker remain usable.
+    #[error("modern commands callback failed: {0}")]
+    CommandsFailed(&'static str),
 
     /// A call overran the bound the caller supplied (spec 9.6). The child is
     /// hard-stopped before this is returned, so one plugin cannot hang the host.
@@ -1011,6 +1019,7 @@ pub struct ModernWorker {
     reaped: Option<ExitStatus>,
     hard_stopped: bool,
     preview_supported: bool,
+    commands_supported: bool,
     alive: bool,
 }
 
@@ -1130,6 +1139,7 @@ impl ModernWorker {
             reaped: None,
             hard_stopped: false,
             preview_supported: false,
+            commands_supported: false,
             alive: true,
         };
 
@@ -1237,6 +1247,63 @@ impl ModernWorker {
             return Err(self.protocol_error(&line));
         }
         Ok(Value::Object(frame))
+    }
+
+    /// Explicit SDK override negotiated by this worker, not inferred from items.
+    pub fn supports_commands(&self) -> bool {
+        self.commands_supported
+    }
+
+    /// Fetch declarations on the catalog/suggestion worker, never a new child.
+    ///
+    /// Call on the existing supervised background path with its action budget.
+    /// Reset the cancel handle before installing its watcher (as for preview).
+    /// Capture `incarnation()` at admission and recheck the provider's source
+    /// at completion before publishing. Healthy idle release after publication
+    /// does not revoke installed catalog declarations.
+    pub fn commands(&mut self) -> Result<PluginCommands, HostError> {
+        if !self.commands_supported {
+            return Ok(PluginCommands::Unsupported);
+        }
+        if !self.alive {
+            return Err(self.crashed());
+        }
+        let incarnation = self.incarnation;
+        let id = self
+            .link
+            .next_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1))
+            .map_err(|_| HostError::Protocol("commands request counter exhausted".into()))?
+            .checked_add(1)
+            .ok_or_else(|| HostError::Protocol("commands request counter exhausted".into()))?;
+        if self
+            .link
+            .write_frame(&serde_json::json!({"id":id, "kind":"commands"}))
+            .is_err()
+        {
+            self.fail_and_reap();
+            return Err(self.crashed());
+        }
+        let line = self.recv_frame(self.options.call_timeout_ms)?;
+        let frame = self.expect_frame(&line, id, "commands_result")?;
+        if protocol::decode_log(&frame).is_none() {
+            return Err(self.protocol_error(&line));
+        }
+        if self.incarnation != incarnation || !self.poll_alive() {
+            return Err(self.crashed());
+        }
+        match frame.get("status").and_then(Value::as_str) {
+            Some("unsupported") => Ok(PluginCommands::Unsupported),
+            Some("cancelled") => Ok(PluginCommands::Cancelled),
+            Some("failed") => Err(HostError::CommandsFailed("invalid or failed commands callback")),
+            Some("content") => {
+                let declarations = decode_commands(frame.get("declarations")).ok_or(
+                    HostError::CommandsFailed("invalid or oversized command declarations"),
+                )?;
+                Ok(PluginCommands::Declarations(declarations))
+            }
+            _ => Err(self.protocol_error(&line)),
+        }
     }
 
     /// Delivers the latest complete configuration state to the plugin (spec 21.4).
@@ -1560,6 +1627,15 @@ impl ModernWorker {
                 .get("capabilities")
                 .and_then(Value::as_array)
                 .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("preview_v1")));
+            self.commands_supported =
+                frame
+                    .get("capabilities")
+                    .and_then(Value::as_array)
+                    .is_some_and(|values| {
+                        values
+                            .iter()
+                            .any(|value| value.as_str() == Some(COMMANDS_CAPABILITY))
+                    });
             Ok(())
         } else {
             Err(self.protocol_error(&line))
@@ -1969,9 +2045,93 @@ fn wait_bounded(child: &mut Child, budget: Duration) -> Option<ExitStatus> {
     }
 }
 
+/// Decode only item targets; owner, host targets and availability cannot cross
+/// this boundary. Validate borrowed fields before allocating declaration strings.
+fn decode_commands(value: Option<&Value>) -> Option<Vec<PluginCommandDeclaration>> {
+    let values = value?.as_array()?;
+    if values.len() > MAX_COMMANDS {
+        return None;
+    }
+    let mut bytes = 0usize;
+    let mut seen = std::collections::BTreeSet::new();
+    for value in values {
+        let object = value.as_object()?;
+        if object.len() != 5 {
+            return None;
+        }
+        let id = object.get("command_id")?.as_str()?;
+        let item = object.get("item_id")?.as_str()?;
+        let action = match object.get("action_id")? {
+            Value::Null => None,
+            value => Some(value.as_str()?),
+        };
+        for id in [Some(id), Some(item), action].into_iter().flatten() {
+            if id.is_empty() || id.len() > MAX_COMMAND_ID_BYTES || id.chars().any(char::is_control) {
+                return None;
+            }
+            bytes = bytes.checked_add(id.len())?;
+        }
+        let label = object.get("label")?.as_str()?;
+        if label.trim().is_empty() || label.len() > MAX_COMMAND_LABEL_BYTES || !seen.insert(id) {
+            return None;
+        }
+        let policy = object.get("argument_policy")?.as_str()?;
+        if !matches!(policy, "forbidden" | "optional" | "required") {
+            return None;
+        }
+        bytes = bytes.checked_add(label.len())?;
+        if bytes > MAX_COMMAND_BYTES {
+            return None;
+        }
+    }
+    let commands: Vec<_> = values
+        .iter()
+        .map(|value| {
+            Some(PluginCommandDeclaration {
+                command_id: value.get("command_id")?.as_str()?.to_owned(),
+                label: value.get("label")?.as_str()?.to_owned(),
+                item_id: crikey_core::ItemId(value.get("item_id")?.as_str()?.to_owned()),
+                action_id: match value.get("action_id")? {
+                    Value::Null => None,
+                    value => Some(crikey_core::ActionId(value.as_str()?.to_owned())),
+                },
+                argument_policy: protocol::decode_argument_policy(value.get("argument_policy")?.as_str()?),
+            })
+        })
+        .collect::<Option<_>>()?;
+    Some(commands)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_decode_refuses_authority_fields_and_invalid_targets() {
+        let declaration = serde_json::json!({
+            "command_id": "stable", "label": "Explicit", "item_id": "item",
+            "action_id": null, "argument_policy": "forbidden"
+        });
+        assert!(decode_commands(Some(&serde_json::json!([declaration.clone()]))).is_some());
+        for (key, value) in [
+            ("provider_id", serde_json::json!("other.owner")),
+            ("availability", serde_json::json!("available")),
+            ("host_target", serde_json::json!("open-settings")),
+            ("item_id", serde_json::json!("control\u{7f}")),
+            ("action_id", serde_json::json!("")),
+            ("command_id", serde_json::json!("x".repeat(257))),
+            ("argument_policy", serde_json::json!("unknown")),
+            ("label", serde_json::json!("x".repeat(8193))),
+        ] {
+            let mut invalid = declaration.clone();
+            invalid[key] = value;
+            assert!(
+                decode_commands(Some(&serde_json::json!([invalid]))).is_none(),
+                "{key}"
+            );
+        }
+        assert!(decode_commands(Some(&serde_json::json!([declaration.clone(), declaration]))).is_none());
+    }
     #[test]
     fn empty_protocol_lines_have_a_clear_error_excerpt() {
         assert_eq!(bounded_excerpt(""), "<empty line>");

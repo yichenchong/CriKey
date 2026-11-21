@@ -161,9 +161,74 @@ not apply fuzzy matching or consume `score_hint` for plugin suggestions, so
 filter and order suggestions yourself.
 
 Stable item identity is qualified by the owning plugin; a label is not an
-execution target. A stable ID alone also does not declare a reusable command:
-the current item model has no dedicated durable-command declaration. Do not
-use undocumented metadata keys as host command-registration APIs.
+execution target. Durable commands require an explicit `commands_v1`
+declaration; stable item IDs, suggestions and metadata do not register commands.
+
+### Explicit executable commands (`commands_v1`)
+
+Modern Python opts in by overriding `Plugin.commands()` on the same plugin
+instance that builds its catalog. Return an iterable of `Command` values
+(or await one); the inherited callback is unsupported:
+
+```python
+from crikey_sdk import Command
+
+def commands(self):
+    return [Command(
+        command_id="open-docs",
+        label="Open documentation",
+        item_id="docs",
+        argument_policy="forbidden",
+    )]
+```
+
+Place this method on your `Plugin` subclass and publish `docs` from
+`build_catalog`. Native Rust opts in with `Plugin::supports_commands() -> true`
+and implements `commands(&mut self, &dyn PluginContext) -> Result<PluginCommands>`,
+returning `PluginCommands::Declarations`. `CommandBuilder::new(command_id,
+label, item_id)` adds optional `.action(action_id)` and `.arguments(policy)`;
+see `sdk/rust/examples/commands.rs`. Native wire requests use envelope tags
+45/46 after a complete catalog on the same connection. Modern Python uses its
+separate JSON `commands`/`commands_result` transport, not protobuf.
+
+Each declaration names a stable command ID, display label, exact catalog item,
+optional action ID and `forbidden`, `optional` or `required` argument policy.
+The host supplies installed-owner identity and availability, and validates the
+current canonical catalog, action policy and permissions again at invocation.
+Omitting an action selects the catalog's first action when present; an actionless
+item uses the provider's default callback with no action ID. Different commands
+may share a target; labels need not be unique and never become identity.
+Plugins cannot declare host targets. The only built-in host command is
+`crikey.host` / `open-settings` (`OpenSettings`).
+
+Limits apply to the complete declaration response: 10,000 commands, 256 UTF-8
+bytes per identity, 8 KiB per label and 4 MiB aggregate strings. Duplicate
+command IDs or invalid targets/policies reject the response, not just one row.
+Native declaration callbacks run synchronously in the worker. Poll the request
+context's cancellation token during expensive work. The SDK checks cancellation
+and elapsed deadline after the callback returns; it does not preempt callback
+code. Host transport timeouts and worker supervision remain separate safeguards.
+
+Explicit declarations participate in command search, favorites/home, exact
+successful command recents, visibility, ordered fallbacks and item-ranking reset.
+Users manage them globally in **Settings → Configure Commands**, including
+hidden commands and unavailable saved references without favorite membership.
+Entries retain the exact installed-owner/command-ID pair; a matching label or
+item is never a replacement. Removing favorite or fallback membership leaves
+other preferences intact. Ranking reset affects the current owner/item shared
+by commands targeting it, not command recents, preferences or query recall.
+
+Preference controls submit revision-checked semantic edits to the user-global
+layer, preserving unrelated fields in that layer rather than copying effective
+profile/session values. Higher-priority layers may still mask a saved edit.
+Conflicts require refresh/retry; failed writes do not publish the proposed edit.
+Commands retain their real catalog owner/source for preview and permission
+checks; healthy idle worker release does not remove an installed command, but a
+retired preview producer cannot service deferred preview.
+
+Legacy, WASM and restricted C-ABI plugins do not gain a command callback through
+this transport. Command-specific alias/global shortcut controls and structured
+multi-field arguments are not capabilities of `commands_v1`.
 
 Cancellation is cooperative, but display admission is not: a late suggestion
 from an obsolete query or dismissed launcher session is discarded even if its

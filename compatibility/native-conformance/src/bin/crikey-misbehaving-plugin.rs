@@ -44,6 +44,7 @@ enum Mode {
     BadVersion(u32),
     BadToken,
     Hang,
+    Commands(String),
 }
 
 fn candidate(value: Option<String>) -> Option<String> {
@@ -75,6 +76,7 @@ fn parse_mode(spec: &str) -> Mode {
         "terminal-items" => Mode::TerminalItems,
         "bad-token" => Mode::BadToken,
         "hang" => Mode::Hang,
+        _ if spec.starts_with("commands-") => Mode::Commands(spec.to_owned()),
         _ if spec.starts_with("bad-version:") => Mode::BadVersion(
             spec.strip_prefix("bad-version:")
                 .and_then(|value| value.parse::<u32>().ok())
@@ -117,11 +119,17 @@ fn handshake(mode: &Mode, session_token: String) -> Envelope {
             protocol_version,
             plugin_id: PLUGIN_ID.to_owned(),
             plugin_version: PLUGIN_VERSION.to_owned(),
-            capabilities: vec![
-                "streaming_catalog".to_owned(),
-                "streaming_suggestions".to_owned(),
-                "cancellation".to_owned(),
-            ],
+            capabilities: {
+                let mut capabilities = vec![
+                    "streaming_catalog".to_owned(),
+                    "streaming_suggestions".to_owned(),
+                    "cancellation".to_owned(),
+                ];
+                if matches!(mode, Mode::Commands(_)) {
+                    capabilities.push("commands_v1".to_owned());
+                }
+                capabilities
+            },
             session_token,
             plugin_name: PLUGIN_NAME.to_owned(),
             sdk_version: "raw-fixture".to_owned(),
@@ -306,9 +314,7 @@ fn terminal_items(
     request_id: u64,
     generation: u64,
 ) -> Result<(), ProtocolError> {
-    let items = (0..8)
-        .map(|index| control_item(index, "terminal"))
-        .collect();
+    let items = (0..8).map(|index| control_item(index, "terminal")).collect();
     transport.send(&envelope(
         connection_id,
         request_id,
@@ -488,6 +494,7 @@ fn run() -> Result<(), ProtocolError> {
         | Mode::ControlWitness
         | Mode::DuplicateSequence
         | Mode::TerminalItems
+        | Mode::Commands(_)
         | Mode::Hang => loop_messages(&mut *transport, connection_id, mode),
         Mode::BadVersion(_) | Mode::BadToken => Ok(()),
     }
@@ -504,6 +511,46 @@ fn loop_messages(transport: &mut dyn Transport, connection_id: u64, mode: Mode) 
             }
             Some(Payload::CatalogRequest(_)) => {
                 send_empty_catalog(transport, connection_id, request_id, generation)?;
+            }
+            Some(Payload::CommandsRequest(_)) => {
+                use crikey_native_protocol::message::{CommandDeclaration, CommandsResponse};
+                let Mode::Commands(kind) = &mode else { continue };
+                let mut command = CommandDeclaration {
+                    command_id: "raw-command".into(),
+                    label: "Raw command".into(),
+                    item_id: "catalog-item".into(),
+                    argument_policy: 1,
+                    ..Default::default()
+                };
+                let commands = match kind.as_str() {
+                    "commands-oversized" => {
+                        command.label = "x".repeat(8193);
+                        vec![command]
+                    }
+                    "commands-count" => vec![command; 10_001],
+                    "commands-aggregate" => (0..600)
+                        .map(|index| {
+                            let mut value = command.clone();
+                            value.command_id = index.to_string();
+                            value.label = "x".repeat(8192);
+                            value
+                        })
+                        .collect(),
+                    _ => {
+                        command.command_id.clear();
+                        vec![command]
+                    }
+                };
+                transport.send(&envelope(
+                    connection_id,
+                    request_id,
+                    generation,
+                    Payload::CommandsResponse(CommandsResponse {
+                        status: 1,
+                        commands,
+                        ..Default::default()
+                    }),
+                ))?;
             }
             Some(Payload::Suggest(_)) => match &mode {
                 Mode::Flood => return flood(transport, connection_id, request_id, generation),

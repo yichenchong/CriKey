@@ -9,6 +9,40 @@ use crikey_core::{
 };
 
 use crate::PagePalette;
+use crikey_core::command::PluginCommandDeclaration;
+
+/// An explicit durable command targeting an item in this worker's catalog.
+#[derive(Debug)]
+pub struct CommandBuilder(PluginCommandDeclaration);
+
+impl CommandBuilder {
+    pub fn new(command_id: impl Into<String>, label: impl Into<String>, item_id: impl Into<String>) -> Self {
+        Self(PluginCommandDeclaration {
+            command_id: command_id.into(),
+            label: label.into(),
+            item_id: crikey_core::ItemId(item_id.into()),
+            action_id: None,
+            argument_policy: crikey_core::ArgumentPolicy::Forbidden,
+        })
+    }
+
+    pub fn action(mut self, action_id: impl Into<String>) -> Self {
+        self.0.action_id = Some(crikey_core::ActionId(action_id.into()));
+        self
+    }
+
+    pub fn arguments(mut self, policy: crikey_core::ArgumentPolicy) -> Self {
+        self.0.argument_policy = policy;
+        self
+    }
+
+    pub fn build(self) -> crikey_core::Result<PluginCommandDeclaration> {
+        self.0
+            .validate()
+            .map_err(|detail| crikey_core::CoreError::Invalid(detail.into()))?;
+        Ok(self.0)
+    }
+}
 
 /// Builds a core [`Item`] with the plugin-author defaults (spec 10.1–10.3).
 #[must_use = "call ItemBuilder::build to create the item"]

@@ -160,10 +160,72 @@ clicking a row activates that exact action. Numeric keys are ordinary search
 text, not action indexes.
 
 **Launcher Settings → Open Settings** opens the real host settings surface.
-Other command-management controls appear only as their backing services become
-available. Escape/Back first clears action search, then leaves a submenu, then
-closes Actions; the launcher query is unchanged. Settings editors, custom pages
-and IME composition retain their own keyboard input.
+Escape/Back first clears action search, then leaves a submenu, then closes
+Actions; the launcher query is unchanged. Settings editors, custom pages and
+IME composition retain their own keyboard input.
+
+### Declared commands and home
+
+Command controls apply only to explicitly declared commands, not arbitrary
+suggestions. Open **Settings → Configure Commands** to manage all declared and
+saved commands, including hidden commands and unavailable saved references that
+are not favorites. Each entry shows its plugin owner and command ID: that exact
+pair identifies the command, not its label or target item. Unavailable entries
+show a reason and cannot execute; they are never redirected to similarly named
+items.
+
+Here, or in a command's Actions panel, favorite/unfavorite and reorder favorites,
+hide/show, enroll/remove/reorder fallbacks, or reset learned item ranking.
+An ordinary result may expose several declarations; choose the exact
+owner/command entry. Commands sharing an item share its ranking reset. Reset
+does not clear preferences, command recents or query recall; host-only and
+unavailable targets have no verified item ranking to reset.
+
+Configure the empty-root command home with `launcher.command-home`. Accepted
+values are `compact` (default), `favorites`, `recent`, and
+`favorites-and-recent`. The last choice shows ordered favorites followed by
+successful recent commands, without repeating favorites:
+
+```toml
+[launcher]
+command-home = "favorites-and-recent"
+```
+
+Unavailable saved favorites remain visible in their saved order at home.
+Other unavailable saved preferences remain accessible in **Configure Commands**;
+removing a favorite or fallback membership does not erase its other preferences.
+Hidden commands are excluded from ordinary command discovery but remain
+explicitly invokable from saved favorites and eligible saved fallbacks. Hiding a
+command does not hide an ordinary suggestion that happens to target the same item.
+
+Fallback commands appear in saved order only for a nonblank query after every
+applicable ordinary provider successfully finishes with no matches. Pending,
+failed or cancelled work does not qualify. Selecting a fallback passes that
+captured query as one argument through the normal command dispatcher; it does
+not autoexecute or interpret shell syntax. Commands that forbid arguments
+cannot be newly enrolled as fallbacks. Required arguments must be supplied;
+optional arguments do not implicitly consume ordinary search text.
+
+Command preference controls save semantic edits to the user-global configuration
+layer, not a copy of the effective settings from other layers. A visibility edit
+preserves that layer's other command fields; favorite and fallback edits change
+their respective saved lists independently. A higher-priority profile or session
+override can still determine the displayed effective value. The save notice
+reports the effective layer. Configuration changes are reloaded; if an edit
+conflicts with a newer revision, refresh and retry rather than expecting it to
+overwrite the newer state. Failed persistence does not display an unsaved edit
+as successful. Edits are refused while configuration authority is unavailable.
+
+Command preview and link permissions belong to the original plugin/catalog
+source, not the host rendering the row. A retired preview producer can make
+deferred preview unavailable without removing the command.
+
+Only Open Settings is a declared host command. Plugin commands require explicit
+native or Modern Python `commands_v1` support; labels, metadata and legacy
+suggestions are not inferred declarations. Command-specific alias editors and
+global command shortcut controls are not available. The existing textual
+`[aliases]` table above is separate. Commands accept a single text argument,
+not structured multi-field arguments.
 
 An admitted provider refresh preserves action search and focus for the exact
 owner, item and action. A vanished target or action shows an unavailable
@@ -219,10 +281,11 @@ performing launcher query/result actions. Tab navigates the document, and
 `Ctrl+,` does not open launcher settings. Click the persistent `Settings`
 affordance to open settings from a web page. Escape closes the page.
 
-An empty query shows nothing but the query field: the launcher does not list
-the catalog at rest, and the window stays compact until there is something to
-show. Scrolling the result list with the wheel stays where you put it; the
-list only scrolls itself to follow a selection you moved.
+With the default `compact` command home, an empty query shows only the query
+field; the launcher does not list the catalog at rest. Other command-home modes
+show saved favorites, successful recent commands, or both as described above.
+Scrolling the result list with the wheel stays where you put it; the list only
+scrolls itself to follow a selection you moved.
 
 ### Navigation, logical resume, and query recall
 
@@ -240,9 +303,8 @@ surface opens. Back opens its saved owner/page route with fresh request and
 surface identities; it does not execute the original action again. Arbitrary
 web-document state, display lists and engine pixels are not snapshots. A missing
 owner yields **Page unavailable** with a working Back rather than an endless
-loading surface. Settings and real custom pages exercise this navigation now;
-worker-backed list/detail/form/grid flow verification is still required when
-those typed P6 views are introduced.
+loading surface. Logical resume applies to Settings and custom pages; arbitrary
+web-document state is not restored.
 
 `launcher.resume-delay-ms` defaults to `0`: dismissal immediately resets to root.
 A positive millisecond value resumes the logical view only if reopened strictly
@@ -332,9 +394,8 @@ keys must not select or accept history. The ignored native-window regression
 `native_touch_dispatch_precedes_ime_and_cannot_retarget_after_redraw` covers this
 actual application path; egui-only IME injection is not equivalent coverage.
 
-Native desktop geometry, actual OS behavior and later typed P6 flow acceptance
-remain separate runtime gates, not claims made by these instructions or model
-tests.
+Native desktop geometry and actual OS behavior require runtime verification;
+these instructions and model tests do not establish them.
 
 Typing updates the visible query immediately. Local catalog search runs in the
 current UI frame; plugin results arrive incrementally and late results from an

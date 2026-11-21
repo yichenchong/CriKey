@@ -204,6 +204,7 @@ pub fn serve_on(
         &config,
         &session_token,
         plugin.supports_preview(),
+        plugin.supports_commands(),
     )?;
     let reader_transport = transport.try_clone_handle().ok();
     let transport = Arc::new(Mutex::new(transport));
@@ -249,6 +250,11 @@ pub fn serve_on(
         remaining: ack.initial_credits,
         paused: false,
     };
+    let commands_negotiated = plugin.supports_commands()
+        && ack
+            .host_capabilities
+            .iter()
+            .any(|name| name == crikey_core::command::COMMANDS_CAPABILITY);
     let result = serve_requests(
         plugin,
         &transport,
@@ -258,6 +264,7 @@ pub fn serve_on(
         &context,
         &metrics,
         plugin_preview_negotiated(&ack),
+        commands_negotiated,
     );
     stop_reader(&reader_stop, reader);
     result
@@ -268,6 +275,7 @@ fn handshake(
     config: &ServeConfig,
     session_token: &str,
     preview: bool,
+    commands: bool,
 ) -> Result<(message::HandshakeAck, u64), SdkError> {
     let handshake = message::Handshake {
         protocol_version: PROTOCOL_VERSION,
@@ -277,6 +285,9 @@ fn handshake(
             let mut names = capability_names(&config.capabilities);
             if preview {
                 names.push(crikey_core::PREVIEW_CAPABILITY.to_owned());
+            }
+            if commands {
+                names.push(crikey_core::command::COMMANDS_CAPABILITY.to_owned());
             }
             names
         },
@@ -852,6 +863,7 @@ fn serve_requests(
     context: &RuntimeContext,
     metrics: &RuntimeMetrics,
     preview_negotiated: bool,
+    commands_negotiated: bool,
 ) -> Result<(), SdkError> {
     loop {
         let envelope = match input.next() {
@@ -887,6 +899,50 @@ fn serve_requests(
             Payload::Flow(flow) => credits.grant(&flow),
             Payload::Cancel(_) => {
                 cancellation.cancel((request_id, generation));
+            }
+            Payload::CommandsRequest(_) => {
+                cancellation.begin(CancellationKey {
+                    request_id,
+                    generation,
+                });
+                let started = Instant::now();
+                let callback = if !commands_negotiated {
+                    Ok(Ok(crate::PluginCommands::Unsupported))
+                } else if request_context.cancellation().is_cancelled() {
+                    Ok(Ok(crate::PluginCommands::Cancelled))
+                } else {
+                    let _in_flight = metrics.enter();
+                    invoke_callback(|| plugin.commands(&request_context))
+                };
+                let result = match callback {
+                    Ok(Ok(outcome)) => crikey_native_protocol::commands::to_response(outcome),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(detail) => Err(detail),
+                };
+                let mut response = result.unwrap_or_else(|detail| commands_failure(&detail));
+                if request_context.cancellation().is_cancelled() {
+                    response = message::CommandsResponse {
+                        status: 3,
+                        ..Default::default()
+                    };
+                } else if deadline_ms != 0 && started.elapsed().as_millis() >= u128::from(deadline_ms) {
+                    response = commands_failure("commands deadline exceeded");
+                }
+                send_envelope(
+                    transport,
+                    Envelope {
+                        connection_id: request_context.connection_id,
+                        request_id,
+                        generation,
+                        deadline_ms: 0,
+                        payload: Some(Payload::CommandsResponse(response)),
+                        unknown: Default::default(),
+                    },
+                )?;
+                cancellation.end();
+                if let Some(error) = request_context.take_log_error() {
+                    return Err(error);
+                }
             }
             Payload::PreviewRequest(request) => {
                 cancellation.begin(CancellationKey {
@@ -1170,6 +1226,18 @@ struct RequestRuntime<'a> {
     credits: &'a mut CreditState,
     context: &'a RuntimeContext,
     metrics: &'a RuntimeMetrics,
+}
+
+fn commands_failure(detail: &str) -> message::CommandsResponse {
+    let mut end = detail.len().min(8192);
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    message::CommandsResponse {
+        status: 4,
+        detail: detail[..end].to_owned(),
+        ..Default::default()
+    }
 }
 
 fn preview_failure(detail: &str) -> message::PreviewResponse {

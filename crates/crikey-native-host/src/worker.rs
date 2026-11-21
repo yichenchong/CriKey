@@ -111,6 +111,8 @@ pub struct PluginHandshake {
     pub capabilities: Capabilities,
     /// Optional preview capability intersected with host support.
     pub preview: bool,
+    /// Explicit executable declarations, independent of preview/process liveness.
+    pub commands: bool,
 }
 
 /// Bytes a plugin served in answer to one [`NativeWorker::request_resource`].
@@ -456,6 +458,7 @@ pub struct NativeWorker {
     sandbox_report: crikey_sandbox::SandboxReport,
     next_request_id: u64,
     call_succeeded: bool,
+    catalog_initialized: bool,
     failure_kind: Option<crikey_plugin_supervisor::FailureKind>,
     #[cfg(windows)]
     job: Option<OwnedJob>,
@@ -746,6 +749,7 @@ impl NativeWorker {
             sandbox_report,
             next_request_id: 1,
             call_succeeded: false,
+            catalog_initialized: false,
             failure_kind: None,
             #[cfg(windows)]
             job: Some(job),
@@ -819,6 +823,7 @@ impl NativeWorker {
     /// configured timeout used by subsequent catalog, query, or preview calls.
     pub fn build_catalog_with_timeout_ms(&mut self, timeout_ms: u64) -> Result<Vec<Item>, HostError> {
         self.ensure_alive()?;
+        self.catalog_initialized = false;
         let request_id = self.begin_request(0);
         let envelope = Envelope {
             connection_id: self.link.connection_id,
@@ -896,6 +901,7 @@ impl NativeWorker {
                         });
                     }
                     if batch.done {
+                        self.catalog_initialized = true;
                         self.mark_call_succeeded();
                         return Ok(items);
                     }
@@ -1267,6 +1273,82 @@ impl NativeWorker {
                     return Err(self.error_payload(error, request_id));
                 }
                 _ => return Err(self.protocol_failure("unexpected preview response")),
+            }
+        }
+    }
+
+    /// Requests explicit declarations on this catalog-originating worker.
+    /// The caller must validate each returned target against its current
+    /// owner-qualified catalog before binding owner/availability or publishing.
+    pub fn commands(&mut self, generation: u64) -> Result<crikey_core::command::PluginCommands, HostError> {
+        self.commands_with_cancel_latched(generation, &AtomicBool::new(false))
+    }
+
+    pub fn commands_with_cancel_latched(
+        &mut self,
+        generation: u64,
+        cancelled: &AtomicBool,
+    ) -> Result<crikey_core::command::PluginCommands, HostError> {
+        use crikey_core::command::PluginCommands;
+        let cancel_latched = self.link.cancel_latched.swap(false, Ordering::AcqRel);
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(PluginCommands::Cancelled);
+        }
+        self.ensure_alive()?;
+        if !self.handshake.commands {
+            return Ok(PluginCommands::Unsupported);
+        }
+        if !self.catalog_initialized {
+            return Err(HostError::Protocol(
+                "commands require this worker's complete catalog".into(),
+            ));
+        }
+        if self.next_request_id == u64::MAX {
+            return Err(HostError::Protocol("commands request identity exhausted".into()));
+        }
+        let request_id = self.begin_request(generation);
+        self.send_control(&Envelope {
+            connection_id: self.link.connection_id,
+            request_id,
+            generation,
+            deadline_ms: self.options.call_timeout_ms,
+            payload: Some(Payload::CommandsRequest(message::CommandsRequest::default())),
+            unknown: Default::default(),
+        })?;
+        if cancel_latched
+            || self.link.cancel_latched.load(Ordering::Acquire)
+            || cancelled.load(Ordering::Acquire)
+        {
+            self.link.send_cancel();
+        }
+        let end = deadline(self.options.call_timeout_ms);
+        loop {
+            let reply = match self.next_event(end, request_id, generation)? {
+                ReaderEvent::Envelope(value) => value,
+                ReaderEvent::Failure(failure) => return Err(self.transport_error(failure)),
+            };
+            if reply.generation != generation {
+                return Err(self.protocol_failure("commands response generation did not match request"));
+            }
+            match reply.payload {
+                Some(Payload::CommandsResponse(response)) => {
+                    self.link.cancel_latched.store(false, Ordering::Release);
+                    let outcome =
+                        crikey_native_protocol::commands::from_response(response).map_err(|detail| {
+                            HostError::PluginFailed {
+                                plugin: self.spec.plugin.clone(),
+                                detail,
+                            }
+                        })?;
+                    self.mark_call_succeeded();
+                    return Ok(outcome);
+                }
+                Some(Payload::Log(log)) => self.record_log(log.message),
+                Some(Payload::Error(error)) => {
+                    self.link.cancel_latched.store(false, Ordering::Release);
+                    return Err(self.error_payload(error, request_id));
+                }
+                _ => return Err(self.protocol_failure("unexpected commands response")),
             }
         }
     }
@@ -2387,6 +2469,7 @@ fn legal_plugin_payload(envelope: &Envelope, page_request: u64) -> bool {
             | Some(Payload::CatalogBatch(_))
             | Some(Payload::ExecuteResult(_))
             | Some(Payload::PreviewResponse(_))
+            | Some(Payload::CommandsResponse(_))
             | Some(Payload::Error(_))
             | Some(Payload::Log(_))
             | Some(Payload::HealthReport(_))
@@ -2475,6 +2558,7 @@ fn receive_handshake(
             "streaming_suggestions".to_owned(),
             "cancellation".to_owned(),
             crikey_core::PREVIEW_CAPABILITY.to_owned(),
+            crikey_core::command::COMMANDS_CAPABILITY.to_owned(),
         ],
         host_version: env!("CARGO_PKG_VERSION").to_owned(),
         accepted: rejection.is_none(),
@@ -2503,6 +2587,10 @@ fn receive_handshake(
         sdk_version: handshake.sdk_version,
         protocol_version: handshake.protocol_version,
         capabilities: capabilities_from_strings(&handshake.capabilities),
+        commands: handshake
+            .capabilities
+            .iter()
+            .any(|s| s == crikey_core::command::COMMANDS_CAPABILITY),
         preview: handshake
             .capabilities
             .iter()

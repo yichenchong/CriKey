@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, Coroutine, Iterable, Protocol
 
 __all__ = [
     "Action",
+    "Command",
     "Preview",
     "PreviewContext",
     "PreviewImage",
@@ -145,6 +146,22 @@ class PreviewContext(Protocol):
     def log(self, message: str) -> None: ...
 
 
+@dataclass(frozen=True)
+class Command:
+    """Explicit durable executable declaration; ownership is assigned by the host.
+
+    Targets must name a current catalog item and, optionally, one of its actions.
+    Labels and item metadata never implicitly declare commands. The host still
+    validates targets and permissions before making a declaration available.
+    """
+
+    command_id: str
+    label: str
+    item_id: str
+    action_id: str | None = None
+    argument_policy: str = "forbidden"
+
+
 class Plugin:
     """Base class for modern Python plugins.
 
@@ -157,6 +174,15 @@ class Plugin:
 
     def build_catalog(self) -> Iterable[Item] | Awaitable[Iterable[Item]] | None:
         return ()
+
+    def commands(self) -> Iterable[Command] | Awaitable[Iterable[Command]]:
+        """Override to negotiate ``commands_v1`` on this same plugin instance.
+
+        Return at most 10,000 explicit declarations, with 256-byte IDs,
+        8-KiB labels and 4-MiB aggregate UTF-8 content. Invalid content fails
+        the entire request; it is never truncated or inferred from items.
+        """
+        raise NotImplementedError("commands_v1 is unavailable")
 
     def suggest(
         self, query: Query, context: SuggestContext

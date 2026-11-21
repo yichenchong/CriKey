@@ -258,6 +258,8 @@ mod linux {
             action_panel: None,
             settings_open: false,
             settings: Arc::default(),
+            setting_edits: Arc::default(),
+            command_management: Arc::default(),
             settings_focus: None,
             page: None,
             show_hints: true,

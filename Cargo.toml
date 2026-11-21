@@ -88,6 +88,10 @@ serde_json = "1"
 toml = "0.8"
 thiserror = "2"
 
+# Configuration commits share an OS lock and atomically replace a sibling file.
+fs2 = "0.4"
+tempfile = "3.27"
+
 # Activation patterns declared in third-party plugin manifests (spec 8.11,
 # 19.4), compiled by `crikey-core` and evaluated by the query scheduler on
 # every keystroke. The engine choice is the security decision: `regex` compiles

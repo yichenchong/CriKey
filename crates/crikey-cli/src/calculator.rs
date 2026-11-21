@@ -19,6 +19,7 @@
 //!   this module keeps what it just published — generation, item id, and the
 //!   text to copy — and the composition root asks it first.
 
+use crikey_app::{OrdinaryProviderState, OrdinarySearchProvider, OrdinarySearchSummary};
 use crikey_core::{Action, ActionId, Category, ExecutionPolicy, Generation, ItemId, PluginId};
 use crikey_platform::Clipboard;
 use crikey_ui::ResultRow;
@@ -164,6 +165,7 @@ pub(crate) struct Calculator {
     /// copy. See [`Calculator::copy`].
     clipboard: Option<Box<dyn Clipboard>>,
     published: Option<PublishedResult>,
+    evidence: Option<(Generation, Option<OrdinaryProviderState>)>,
 }
 
 /// What the last published row resolves to when the user selects it.
@@ -179,6 +181,7 @@ impl Calculator {
             owner: PluginId(CALCULATOR_PLUGIN.to_owned()),
             clipboard,
             published: None,
+            evidence: None,
         }
     }
 
@@ -187,12 +190,22 @@ impl Calculator {
     /// Never more than one, so the frame this joins can never be the batch
     /// that crosses `max_items_per_plugin_per_query` and gets refused whole.
     pub(crate) fn rows(&mut self, generation: Generation, query: &str) -> Vec<ResultRow> {
+        self.evidence = Some((generation, None));
         let expression = query.trim();
-        let Ok(calculation) = evaluate(expression) else {
-            // Dropped rather than retained: a row the user can no longer see
-            // must not stay selectable through a stale item id.
-            self.published = None;
-            return Vec::new();
+        let calculation = match evaluate(expression) {
+            Ok(calculation) => calculation,
+            Err(error) => {
+                // Nonexpressions do not participate. An applicable expression
+                // with a numeric failure must not authorize fallback as Empty.
+                if matches!(
+                    error,
+                    CalculationError::DivisionByZero | CalculationError::NotFinite
+                ) {
+                    self.evidence = Some((generation, Some(OrdinaryProviderState::Failed)));
+                }
+                self.published = None;
+                return Vec::new();
+            }
         };
         // The row shows the expression that was evaluated, closers and all, so
         // the parenthesis the user has not typed yet is visible rather than
@@ -202,8 +215,16 @@ impl Calculator {
         let text = format_value(calculation.value);
         let item = ItemId::derived(&self.owner, &Category::Expression, &expression);
         let row = ResultRow {
-            plugin: self.owner.clone(),
-            item: item.clone(),
+            target: crikey_ui::ActionTarget::Result {
+                owner: self.owner.clone(),
+                item: item.clone(),
+            },
+            source: Some(crikey_ui::ResultSource {
+                owner: self.owner.clone(),
+                item: item.clone(),
+                kind: crikey_ui::ResultSourceKind::Ordinary,
+            }),
+            command_state: None,
             label: text.clone(),
             description: expression,
             icon_reference: None,
@@ -221,7 +242,24 @@ impl Calculator {
             item,
             text,
         });
+        self.evidence = Some((generation, Some(OrdinaryProviderState::Matches)));
         vec![row]
+    }
+
+    /// Synchronous query completion before any row limits or command filtering.
+    pub(crate) fn ordinary_search_summary(&self, view: u64) -> Option<OrdinarySearchSummary> {
+        let (generation, state) = self.evidence?;
+        Some(OrdinarySearchSummary {
+            view,
+            generation,
+            providers: state
+                .into_iter()
+                .map(|state| OrdinarySearchProvider {
+                    plugin: self.owner.clone(),
+                    state,
+                })
+                .collect(),
+        })
     }
 
     /// The text behind a selected row, when the selection really is this
@@ -676,14 +714,17 @@ mod tests {
             rows[0].description, "2*(3+4)",
             "the echo shows the closer the calculator supplied"
         );
-        assert_eq!(calculator.resolve(Generation::ZERO, &rows[0].item), Some("14"));
+        assert_eq!(
+            calculator.resolve(Generation::ZERO, &rows[0].source.as_ref().unwrap().item),
+            Some("14")
+        );
         // The keystroke that finally balances the expression changes nothing
         // the user can see, and a stray closer drops the row entirely.
         let closed = calculator.rows(Generation::ZERO, "2*(3+4)");
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].label, "14");
         assert_eq!(closed[0].description, "2*(3+4)");
-        assert_eq!(closed[0].item, rows[0].item);
+        assert_eq!(closed[0].target, rows[0].target);
         assert!(calculator.rows(Generation::ZERO, "2+3)").is_empty());
     }
 
@@ -758,14 +799,17 @@ mod tests {
                 .map(|action| action.action_id.0.as_str()),
             Some(COPY_ACTION_ID)
         );
-        assert_eq!(calculator.resolve(Generation::ZERO, &row.item), Some("4"));
+        assert_eq!(
+            calculator.resolve(Generation::ZERO, &row.source.as_ref().unwrap().item),
+            Some("4")
+        );
     }
 
     #[test]
     fn a_row_from_a_superseded_generation_does_not_resolve() {
         let mut calculator = calculator();
         let rows = calculator.rows(Generation::ZERO, "2+2");
-        let item = rows[0].item.clone();
+        let item = rows[0].source.as_ref().unwrap().item.clone();
         assert_eq!(calculator.resolve(Generation::from_raw(1), &item), None);
         // And a query that answers nothing retires the previous answer.
         calculator.rows(Generation::ZERO, "report");
@@ -793,7 +837,7 @@ mod tests {
         let mut calculator = Calculator::new(Some(Box::<RecordingClipboard>::default()));
         let rows = calculator.rows(Generation::ZERO, "6*7");
         let text = calculator
-            .resolve(Generation::ZERO, &rows[0].item)
+            .resolve(Generation::ZERO, &rows[0].source.as_ref().unwrap().item)
             .expect("the row it just published resolves")
             .to_owned();
         calculator
@@ -822,5 +866,31 @@ mod tests {
             error.contains("clipboard"),
             "the diagnostic must name what was missing, got {error:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ordinary_completion_tests {
+    use super::*;
+
+    #[test]
+    fn arithmetic_and_nonexpressions_report_exact_generation_evidence() {
+        let mut calculator = Calculator::new(None);
+        assert!(calculator.ordinary_search_summary(9).is_none());
+        let generation = Generation::from_raw(4);
+        calculator.rows(generation, "2+2");
+        let summary = calculator.ordinary_search_summary(9).unwrap();
+        assert_eq!(summary.view, 9);
+        assert_eq!(summary.generation, generation);
+        assert_eq!(summary.providers[0].plugin.0, CALCULATOR_PLUGIN);
+        assert_eq!(summary.providers[0].state, OrdinaryProviderState::Matches);
+        let next = Generation::from_raw(5);
+        calculator.rows(next, "not arithmetic");
+        let summary = calculator.ordinary_search_summary(9).unwrap();
+        assert_eq!(summary.generation, next);
+        assert!(summary.providers.is_empty());
+        calculator.rows(next, "1/0");
+        let summary = calculator.ordinary_search_summary(9).unwrap();
+        assert_eq!(summary.providers[0].state, OrdinaryProviderState::Failed);
     }
 }

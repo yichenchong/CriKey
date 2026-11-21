@@ -137,6 +137,7 @@ pub trait Message: Sized + std::fmt::Debug {
     fn decode(bytes: &[u8]) -> Result<Self, ProtocolError>;
 }
 
+pub mod commands;
 pub mod convert;
 pub mod frame;
 pub mod message;

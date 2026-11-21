@@ -195,6 +195,8 @@ fn measurement_frame(generation: Generation) -> ViewModel {
         action_panel: None,
         settings_open: false,
         settings: Arc::default(),
+        command_management: Arc::default(),
+        setting_edits: Arc::default(),
         settings_focus: None,
         show_hints: true,
         rounded_corners: true,

@@ -331,6 +331,7 @@ fn restoring_a_snapshot_rejects_oversized_keys() {
                 count: 9_999,
             },
         ],
+        commands: Vec::new(),
     };
 
     let restored = SelectionHistory::from_snapshot(snapshot).snapshot();
@@ -359,4 +360,98 @@ fn restoring_a_snapshot_rejects_oversized_keys() {
     // A high count must not buy an oversized record a place; the bound is not
     // a ranking decision.
     assert_eq!(restored.selections[0].frequency, 3);
+}
+
+fn command(id: &str) -> crikey_core::CommandRef {
+    crikey_core::CommandRef {
+        provider_id: PluginId("apps".into()),
+        command_id: id.into(),
+    }
+}
+
+#[test]
+fn exact_command_successes_never_reverse_join_ordinary_item_evidence() {
+    let mut history = SelectionHistory::default();
+    let shared_target = item("Shared");
+    let a = command("first-declaration");
+    let b = command("second-declaration");
+    // Both declarations may have this same target/action; history intentionally
+    // accepts no target mapping and cannot mistake one declaration for another.
+    history.record(&shared_target, &query("shared"), 1);
+    assert!(history.recent_commands().is_empty());
+    history.record_command_success(&a, 2).unwrap();
+    history.record_command_success(&b, 3).unwrap();
+    history.record_command_success(&a, 4).unwrap();
+    let recent = history.recent_commands();
+    assert_eq!(
+        recent.iter().map(|record| &record.reference).collect::<Vec<_>>(),
+        vec![&a, &b]
+    );
+    assert_eq!(recent[0].frequency, 2);
+    assert_eq!(recent[0].last_selected_secs, 4);
+    assert_eq!(history.snapshot().selections[0].frequency, 1);
+    let before_reset = history.snapshot().commands;
+    assert!(history.reset_item(&shared_target.plugin_id, &shared_target.stable_id));
+    assert_eq!(history.snapshot().commands, before_reset);
+    let restored = SelectionHistory::from_snapshot(history.snapshot());
+    assert_eq!(restored.recent_commands(), recent);
+}
+
+#[test]
+fn command_history_rejects_malformed_identities_and_evicts_deterministically() {
+    let mut history = SelectionHistory::default();
+    for bad in ["".to_owned(), "line\nbreak".into(), "x".repeat(257)] {
+        assert!(history.record_command_success(&command(&bad), 0).is_err());
+        let mut bad_owner = command("valid");
+        bad_owner.provider_id = PluginId(bad);
+        assert!(history.record_command_success(&bad_owner, 0).is_err());
+    }
+    assert!(history.snapshot().commands.is_empty());
+    let favorite = command("favorite");
+    for _ in 0..10 {
+        history.record_command_success(&favorite, 0).unwrap();
+    }
+    for index in 0..crikey_ranking::MAX_COMMAND_RECORDS * 3 {
+        history
+            .record_command_success(&command(&format!("once-{index:05}")), 1)
+            .unwrap();
+    }
+    let snapshot = history.snapshot();
+    assert!(snapshot.commands.len() <= crikey_ranking::MAX_COMMAND_RECORDS);
+    assert!(snapshot
+        .commands
+        .iter()
+        .any(|record| record.reference == favorite));
+    let restored = SelectionHistory::from_snapshot(snapshot.clone());
+    assert_eq!(restored.snapshot(), snapshot);
+    let recent = history.recent_commands();
+    assert!(recent.windows(2).all(|pair| {
+        pair[0].last_selected_secs > pair[1].last_selected_secs
+            || (pair[0].last_selected_secs == pair[1].last_selected_secs
+                && pair[0].reference < pair[1].reference)
+    }));
+    history.clear();
+    assert!(history.snapshot().commands.is_empty());
+}
+
+#[test]
+fn item_only_success_updates_ranking_without_creating_query_affinity() {
+    let selected = item("Recorded command target");
+    let mut history = SelectionHistory::default();
+    history.record_item_selection(&selected, 10);
+    history.record_item_selection(&selected, 20);
+    let asked = query("private argument never collected");
+    let mut signals = RankingSignals::default();
+    history.augment(&selected, &history.affinities_for(&asked), 25, None, &mut signals);
+    assert_eq!(signals.selection_frequency, 2);
+    assert_eq!(signals.selection_recency_secs, Some(5));
+    assert_eq!(signals.query_history, 0.0);
+    let snapshot = history.snapshot();
+    assert_eq!(snapshot.selections.len(), 1);
+    assert_eq!(snapshot.selections[0].frequency, 2);
+    assert!(snapshot.query_affinities.is_empty());
+    assert!(SelectionHistory::from_snapshot(snapshot)
+        .snapshot()
+        .query_affinities
+        .is_empty());
 }

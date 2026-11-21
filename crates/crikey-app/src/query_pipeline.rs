@@ -22,7 +22,30 @@ use crikey_result_aggregator::{
 };
 use crikey_ui::{ResultRow, ViewModel};
 
+use crate::command_preferences::OrdinaryProviderState;
 use crate::plugin_icons::PluginIconResolver;
+
+/// Completion evidence for one applicable owner, before presentation filtering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrdinarySearchProvider {
+    pub plugin: PluginId,
+    pub state: OrdinaryProviderState,
+}
+
+/// Only the latest admitted query is retained; provider count is registration-bounded.
+/// Consumers must compare both the root view and generation before using evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrdinarySearchSummary {
+    pub view: u64,
+    pub generation: Generation,
+    pub providers: Vec<OrdinarySearchProvider>,
+}
+
+#[derive(Debug)]
+struct OrdinaryEvidence {
+    state: OrdinaryProviderState,
+    saw_matches: bool,
+}
 
 /// Bounds and fairness policy for one composed query pipeline.
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +239,7 @@ pub struct QueryPipeline {
     visible_generation: Option<Generation>,
     presented_pending: Option<bool>,
     presentation_dirty: bool,
+    ordinary: HashMap<PluginId, OrdinaryEvidence>,
     /// Resolver for the icon references plugins put on their own items, set by
     /// whichever provider owns this pipeline. Absent until a provider installs
     /// one, and absent forever for a pipeline with no plugin rows.
@@ -266,6 +290,7 @@ impl QueryPipeline {
             visible_generation: None,
             presented_pending: None,
             presentation_dirty: false,
+            ordinary: HashMap::new(),
             icons: None,
         }
     }
@@ -498,6 +523,7 @@ impl QueryPipeline {
         if !self.health_sync.contains_key(plugin) {
             return false;
         }
+        self.set_ordinary_state(plugin, self.generation, OrdinaryProviderState::Cancelled);
 
         let admitted = self
             .admitted
@@ -544,6 +570,22 @@ impl QueryPipeline {
         self.query.clear();
         self.query.push_str(text);
         self.generation = generation;
+        self.ordinary.clear();
+        for plugin in &self.registered {
+            if self.scheduler.query_applicable(plugin, text) {
+                self.ordinary.insert(
+                    plugin.clone(),
+                    OrdinaryEvidence {
+                        state: if self.scheduler.pending(plugin) == Some(generation) {
+                            OrdinaryProviderState::Pending
+                        } else {
+                            OrdinaryProviderState::Failed
+                        },
+                        saw_matches: false,
+                    },
+                );
+            }
+        }
         self.unranked_batches = 0;
         self.last_intake_drain_at = None;
         self.capture_cancellations();
@@ -605,6 +647,7 @@ impl QueryPipeline {
         // carries it into `PluginHealth`. Retire the request here so the
         // scheduler is not left holding an in-flight entry nobody will answer.
         for (plugin, generation) in refused {
+            self.set_ordinary_state(&plugin, generation, OrdinaryProviderState::Failed);
             let _ = self.finish_completion(&plugin, generation, now);
         }
         self.capture_cancellations();
@@ -641,6 +684,11 @@ impl QueryPipeline {
         let state = batch.state;
         let item_count = batch.items.len();
 
+        if generation == self.generation {
+            if let Some(evidence) = self.ordinary.get_mut(&plugin) {
+                evidence.saw_matches |= item_count != 0;
+            }
+        }
         if self.health_sync.contains_key(&plugin)
             && !self.active_requests.contains(&(plugin.clone(), generation))
         {
@@ -653,6 +701,7 @@ impl QueryPipeline {
             );
             self.classify_cancelled_response(&plugin, generation, state);
             self.sync_health();
+            self.set_ordinary_state(&plugin, generation, OrdinaryProviderState::Failed);
             return Err(PipelineError::QueueRejected {
                 plugin,
                 generation,
@@ -663,6 +712,7 @@ impl QueryPipeline {
         match self.intake.submit(now, InboundBatch { batch, priority }) {
             Ok(_) => Ok(()),
             Err(reason) => {
+                self.set_ordinary_state(&plugin, generation, OrdinaryProviderState::Failed);
                 if reason == QueueReject::StaleGeneration {
                     let _ = self.scheduler.record_result_batch(
                         &plugin,
@@ -701,6 +751,7 @@ impl QueryPipeline {
     /// slot without advancing the current query generation. Repeating the
     /// call after retirement is a harmless no-op.
     pub fn abort_request(&mut self, plugin: &PluginId, generation: Generation, now: Millis) -> bool {
+        self.set_ordinary_state(plugin, generation, OrdinaryProviderState::Failed);
         let key = (plugin.clone(), generation);
         let had_request = self.active_requests.contains(&key)
             || self.admitted.contains_key(&key)
@@ -721,6 +772,63 @@ impl QueryPipeline {
                 .expect("scheduler and supervisor plugin registries stay in lockstep");
         }
         true
+    }
+
+    /// Explicit provider failure, including transport failure and timeout.
+    pub fn fail_request(&mut self, plugin: &PluginId, generation: Generation, now: Millis) -> bool {
+        self.abort_request(plugin, generation, now)
+    }
+
+    /// Retires cooperative cancellation without turning absence of rows into success.
+    pub fn cancel_request(&mut self, plugin: &PluginId, generation: Generation, now: Millis) -> bool {
+        let retired = self.abort_request(plugin, generation, now);
+        if generation == self.generation {
+            if let Some(evidence) = self.ordinary.get_mut(plugin) {
+                if evidence.state == OrdinaryProviderState::Failed {
+                    evidence.state = OrdinaryProviderState::Cancelled;
+                }
+            }
+        }
+        retired
+    }
+
+    /// Snapshot after intake, never inferred from rendered row count or worker liveness.
+    pub fn ordinary_search_summary(&self, view: u64) -> OrdinarySearchSummary {
+        OrdinarySearchSummary {
+            view,
+            generation: self.generation,
+            providers: {
+                let mut providers: Vec<_> = self
+                    .ordinary
+                    .iter()
+                    .map(|(plugin, evidence)| OrdinarySearchProvider {
+                        plugin: plugin.clone(),
+                        state: evidence.state,
+                    })
+                    .collect();
+                providers.sort_by(|left, right| left.plugin.cmp(&right.plugin));
+                providers
+            },
+        }
+    }
+
+    fn set_ordinary_state(
+        &mut self,
+        plugin: &PluginId,
+        generation: Generation,
+        state: OrdinaryProviderState,
+    ) {
+        if generation != self.generation {
+            return;
+        }
+        if let Some(evidence) = self.ordinary.get_mut(plugin) {
+            if !matches!(
+                evidence.state,
+                OrdinaryProviderState::Failed | OrdinaryProviderState::Cancelled
+            ) {
+                evidence.state = state;
+            }
+        }
     }
 
     /// Fair-drains intake, preserves plugin publication order and publishes at
@@ -814,6 +922,8 @@ impl QueryPipeline {
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,
+            command_management: Arc::default(),
+            setting_edits: Arc::default(),
             show_hints: true,
             rounded_corners: true,
             page: None,
@@ -856,7 +966,10 @@ impl QueryPipeline {
             let Some(reference) = row.icon_reference.as_deref() else {
                 continue;
             };
-            if let Some(image) = icons.resolve(&row.plugin.0, reference) {
+            let Some(source) = row.source.as_ref() else {
+                continue;
+            };
+            if let Some(image) = icons.resolve(&source.owner.0, reference) {
                 row.icon = Some(image);
                 changed = true;
             }
@@ -978,6 +1091,25 @@ impl QueryPipeline {
         let mut errors = Vec::with_capacity(report.merge_rejected.len());
 
         for merged in &report.merged_batches {
+            if merged.generation == self.generation {
+                if let Some(evidence) = self.ordinary.get_mut(&merged.plugin) {
+                    evidence.saw_matches |= merged.items != 0;
+                    if !matches!(
+                        evidence.state,
+                        OrdinaryProviderState::Failed | OrdinaryProviderState::Cancelled
+                    ) {
+                        evidence.state = match merged.state {
+                            BatchState::Partial => OrdinaryProviderState::Pending,
+                            BatchState::Final if evidence.saw_matches => OrdinaryProviderState::Matches,
+                            BatchState::Final => OrdinaryProviderState::Empty,
+                            BatchState::Failed => OrdinaryProviderState::Failed,
+                            BatchState::Cancelled => OrdinaryProviderState::Cancelled,
+                        };
+                    }
+                }
+            }
+        }
+        for merged in &report.merged_batches {
             match self.scheduler.record_result_batch(
                 &merged.plugin,
                 merged.generation,
@@ -1013,6 +1145,19 @@ impl QueryPipeline {
                 reason: *reason,
             }
         }));
+        for error in &errors {
+            match error {
+                PipelineError::QueueRejected {
+                    plugin, generation, ..
+                }
+                | PipelineError::AggregatorRejected {
+                    plugin, generation, ..
+                } => {
+                    self.set_ordinary_state(plugin, *generation, OrdinaryProviderState::Failed);
+                }
+                _ => {}
+            }
+        }
 
         self.flush_ready_completions(&report.merged_batches);
         self.sync_health();
@@ -1070,6 +1215,11 @@ impl QueryPipeline {
 
     fn capture_cancellations(&mut self) {
         for cancellation in self.scheduler.drain_cancellations() {
+            self.set_ordinary_state(
+                &cancellation.plugin,
+                cancellation.generation,
+                OrdinaryProviderState::Cancelled,
+            );
             let key = (cancellation.plugin.clone(), cancellation.generation);
             if !self.active_requests.contains(&key) {
                 continue;
@@ -1301,8 +1451,16 @@ fn result_row(item: Item, icons: Option<&Arc<PluginIconResolver>>) -> ResultRow 
         .and_then(|(resolver, reference)| resolver.resolve(&item.plugin_id.0, reference));
 
     ResultRow {
-        plugin: item.plugin_id.clone(),
-        item: item.stable_id,
+        target: crikey_ui::ActionTarget::Result {
+            owner: item.plugin_id.clone(),
+            item: item.stable_id.clone(),
+        },
+        source: Some(crikey_ui::ResultSource {
+            owner: item.plugin_id.clone(),
+            item: item.stable_id,
+            kind: crikey_ui::ResultSourceKind::Ordinary,
+        }),
+        command_state: None,
         label: item.label,
         description: item.description,
         icon,
@@ -1314,5 +1472,155 @@ fn result_row(item: Item, icons: Option<&Arc<PluginIconResolver>>) -> ResultRow 
         status: None,
         default_action,
         alternate_actions: actions.collect(),
+    }
+}
+
+#[cfg(test)]
+mod ordinary_evidence_tests {
+    use super::*;
+
+    fn setup() -> (QueryPipeline, PluginId, Generation) {
+        let owner = PluginId("test.ordinary".into());
+        let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+        pipeline
+            .register_plugin(owner.clone(), PluginPolicy::legacy_strict())
+            .unwrap();
+        let generation = pipeline.keystroke("missing", 0);
+        assert_eq!(pipeline.tick(0).dispatches.len(), 1);
+        (pipeline, owner, generation)
+    }
+
+    fn state(pipeline: &QueryPipeline) -> OrdinaryProviderState {
+        let summary = pipeline.ordinary_search_summary(7);
+        assert_eq!(summary.view, 7);
+        summary.providers[0].state
+    }
+
+    #[test]
+    fn retirement_without_final_intake_is_not_empty() {
+        let (mut pipeline, owner, generation) = setup();
+        pipeline.complete(&owner, generation, 0);
+        assert_eq!(state(&pipeline), OrdinaryProviderState::Pending);
+    }
+
+    #[test]
+    fn terminal_batches_distinguish_success_failure_and_cancellation() {
+        for (batch, expected) in [
+            (BatchState::Final, OrdinaryProviderState::Empty),
+            (BatchState::Failed, OrdinaryProviderState::Failed),
+            (BatchState::Cancelled, OrdinaryProviderState::Cancelled),
+        ] {
+            let (mut pipeline, owner, generation) = setup();
+            pipeline
+                .deliver(
+                    ResultBatch {
+                        plugin: owner.clone(),
+                        generation,
+                        state: batch,
+                        items: vec![],
+                    },
+                    0,
+                )
+                .unwrap();
+            pipeline.complete(&owner, generation, 0);
+            assert_eq!(state(&pipeline), OrdinaryProviderState::Pending);
+            pipeline.present_drained(0);
+            assert_eq!(state(&pipeline), expected);
+        }
+    }
+
+    #[test]
+    fn streamed_matches_survive_an_empty_final_batch() {
+        let (mut pipeline, owner, generation) = setup();
+        let item = Item {
+            stable_id: crikey_core::ItemId::derived(&owner, &crikey_core::Category::Application, "target"),
+            plugin_id: owner.clone(),
+            category: crikey_core::Category::Application,
+            label: "match".into(),
+            description: String::new(),
+            target: "target".into(),
+            search_terms: vec![],
+            icon_reference: None,
+            argument_policy: ArgumentPolicy::Forbidden,
+            hit_policy: crikey_core::HitPolicy::Ignored,
+            score_hint: 0,
+            metadata: Default::default(),
+            actions: vec![],
+        };
+        pipeline
+            .deliver(
+                ResultBatch {
+                    plugin: owner.clone(),
+                    generation,
+                    state: BatchState::Partial,
+                    items: vec![item],
+                },
+                0,
+            )
+            .unwrap();
+        pipeline.present_drained(0);
+        assert_eq!(state(&pipeline), OrdinaryProviderState::Pending);
+        pipeline
+            .deliver(
+                ResultBatch {
+                    plugin: owner.clone(),
+                    generation,
+                    state: BatchState::Final,
+                    items: vec![],
+                },
+                1,
+            )
+            .unwrap();
+        pipeline.complete(&owner, generation, 1);
+        pipeline.present_drained(1);
+        assert_eq!(state(&pipeline), OrdinaryProviderState::Matches);
+    }
+
+    #[test]
+    fn failure_is_sticky_and_old_generations_cannot_settle_new_work() {
+        let (mut pipeline, owner, generation) = setup();
+        pipeline.fail_request(&owner, generation, 0);
+        assert_eq!(state(&pipeline), OrdinaryProviderState::Failed);
+        let next = pipeline.keystroke("next", 1);
+        pipeline.fail_request(&owner, generation, 1);
+        assert_eq!(pipeline.ordinary_search_summary(7).generation, next);
+        assert_eq!(state(&pipeline), OrdinaryProviderState::Pending);
+    }
+
+    #[test]
+    fn rejected_publications_and_cancelled_work_never_report_empty() {
+        let (mut pipeline, owner, generation) = setup();
+        pipeline.complete(&owner, generation, 0);
+        assert!(pipeline
+            .deliver(
+                ResultBatch {
+                    plugin: owner.clone(),
+                    generation,
+                    state: BatchState::Final,
+                    items: vec![],
+                },
+                1
+            )
+            .is_err());
+        assert_eq!(state(&pipeline), OrdinaryProviderState::Failed);
+
+        let (mut pipeline, owner, generation) = setup();
+        pipeline.cancel_request(&owner, generation, 0);
+        assert_eq!(state(&pipeline), OrdinaryProviderState::Cancelled);
+    }
+
+    #[test]
+    fn capture_includes_debounced_work_and_excludes_gated_owners() {
+        let owner = PluginId("test.debounced".into());
+        let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+        let mut policy = PluginPolicy::modern();
+        policy.debounce.minimum_query_length = 2;
+        policy.debounce.leading_edge = false;
+        policy.debounce.trailing_edge = true;
+        pipeline.register_plugin(owner, policy).unwrap();
+        pipeline.keystroke("x", 0);
+        assert!(pipeline.ordinary_search_summary(7).providers.is_empty());
+        pipeline.keystroke("xy", 1);
+        assert_eq!(state(&pipeline), OrdinaryProviderState::Pending);
     }
 }

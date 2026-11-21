@@ -82,7 +82,7 @@ pub(crate) fn retained_bytes<'a>(entries: impl Iterator<Item = &'a Entry>) -> us
         bytes = bytes.saturating_add(entry.state.query.capacity());
         bytes += entry.state.scope.as_ref().map_or(0, String::capacity);
         if let Some(selected) = &entry.state.selected {
-            bytes += selected.owner.0.capacity() + selected.item.0.capacity();
+            bytes += selected.retained_bytes();
         }
         bytes += match &entry.route {
             NavigationRoute::Root => 0,
@@ -98,12 +98,21 @@ pub(crate) fn retained_bytes<'a>(entries: impl Iterator<Item = &'a Entry>) -> us
         }
         bytes += std::mem::size_of_val(entry.rows.as_ref()) + 2 * std::mem::size_of::<usize>();
         for row in entry.rows.iter() {
-            bytes += row.plugin.0.capacity()
-                + row.item.0.capacity()
+            bytes += row.target.retained_bytes()
                 + row.label.capacity()
                 + row.description.capacity()
                 + row.category.capacity()
                 + row.plugin_name.capacity();
+            if let Some(source) = &row.source {
+                bytes += source.owner.0.capacity() + source.item.0.capacity();
+            }
+            if let Some(state) = &row.command_state {
+                bytes += state.unavailable_reason.as_ref().map_or(0, String::capacity)
+                    + state.argument.as_ref().map_or(0, String::capacity)
+                    + state.hotkey.as_ref().map_or(0, String::capacity)
+                    + state.aliases.capacity() * std::mem::size_of::<String>();
+                bytes += state.aliases.iter().map(String::capacity).sum::<usize>();
+            }
             bytes += row.icon_reference.as_ref().map_or(0, String::capacity)
                 + row.argument_hint.as_ref().map_or(0, String::capacity)
                 + row.status.as_ref().map_or(0, String::capacity);

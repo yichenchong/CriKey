@@ -32,7 +32,7 @@ import sys
 import threading
 import traceback
 
-from crikey_sdk import Action, Item, Query, WorkerContext, Plugin, Preview
+from crikey_sdk import Action, Command, Item, Query, WorkerContext, Plugin, Preview
 
 
 def _pin_text_stream(stream, name, newline):
@@ -773,6 +773,8 @@ class _Worker:
             self._suggest(frame)
         elif kind == "build_catalog":
             self._build_catalog(frame)
+        elif kind == "commands":
+            self._commands(frame)
         elif kind == "execute":
             self._execute(frame)
         elif kind == "preview":
@@ -793,9 +795,88 @@ class _Worker:
                 "capabilities": [
                     "suggest", "build_catalog", "execute",
                     "background-tasks", "configuration",
-                ] + (["preview_v1"] if self._supports_preview() else []),
+                ] + (["preview_v1"] if self._supports_preview() else [])
+                  + (["commands_v1"] if self._supports_commands() else []),
             }
         )
+
+    def _supports_commands(self):
+        callback = getattr(type(self._plugin), "commands", None)
+        return callable(callback) and callback is not Plugin.commands
+
+    def _commands(self, frame):
+        reply = {"id": frame.get("id"), "kind": "commands_result"}
+        _CAPTURE.reset()
+        try:
+            if not self._supports_commands():
+                reply["status"] = "unsupported"
+            else:
+                result = self._plugin.commands()
+                if inspect.isawaitable(result):
+                    result = self._loop.run_until_complete(self._drain(
+                        WorkerContext(self._cancel.is_set, lambda _item: None,
+                                      _CAPTURE.line, self._loop, self._register_background),
+                        result,
+                    ))
+                declarations, seen, total = [], set(), 0
+                for command in result:
+                    if self._cancel.is_set():
+                        reply["status"] = "cancelled"
+                        break
+                    if len(declarations) >= 10_000:
+                        raise ValueError("commands exceed 10000 declarations")
+                    if not isinstance(command, Command):
+                        raise TypeError("commands must return Command declarations")
+                    fields = (command.command_id, command.item_id)
+                    if command.action_id is not None:
+                        fields += (command.action_id,)
+                    for value in fields:
+                        if (not isinstance(value, str) or not value or len(value) > 256
+                            or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value)):
+                            raise ValueError("invalid command target or identity")
+                        size = len(value.encode("utf-8"))
+                        if size > 256:
+                            raise ValueError("command IDs exceed 256 bytes")
+                        total += size
+                    label = command.label
+                    if not isinstance(label, str) or len(label) > 8192 or not label.strip():
+                        raise ValueError("invalid command label")
+                    size = len(label.encode("utf-8"))
+                    if size > 8192:
+                        raise ValueError("command label exceeds 8 KiB")
+                    total += size
+                    if command.argument_policy not in ("forbidden", "optional", "required"):
+                        raise ValueError("invalid command argument policy")
+                    if total > 4 * 1024 * 1024:
+                        raise ValueError("command declarations exceed 4 MiB")
+                    if command.command_id in seen:
+                        raise ValueError("duplicate command identity")
+                    seen.add(command.command_id)
+                    declarations.append({
+                        "command_id": command.command_id, "label": label,
+                        "item_id": command.item_id, "action_id": command.action_id,
+                        "argument_policy": command.argument_policy,
+                    })
+                else:
+                    reply.update(status="cancelled" if self._cancel.is_set() else "content")
+                    if reply["status"] == "content":
+                        reply["declarations"] = declarations
+            reply["log"] = _CAPTURE.take()
+            chunks, wire_bytes = [], 1  # terminating newline
+            for chunk in json.JSONEncoder(ensure_ascii=True, separators=(",", ":")).iterencode(reply):
+                wire_bytes += len(chunk)  # ensure_ascii makes characters bytes
+                if wire_bytes > _MAX_FRAME_BYTES:
+                    raise ValueError("commands frame exceeds 8 MiB after JSON escaping")
+                chunks.append(chunk)
+            line = "".join(chunks) + "\n"
+        except Exception:
+            # Do not stringify arbitrary plugin exceptions or include unbounded
+            # callback values in the failure frame.
+            reply = {"id": frame.get("id"), "kind": "commands_result",
+                     "status": "failed", "detail": "invalid or failed commands callback",
+                     "log": []}
+            line = _encode(reply)
+        _emit_line(line)
 
     def _supports_preview(self):
         callback = getattr(type(self._plugin), "preview", None)

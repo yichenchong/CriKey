@@ -319,8 +319,16 @@ mod linux {
 
     fn returned_row() -> ResultRow {
         ResultRow {
-            plugin: crikey_core::PluginId("wake-regression".into()),
-            item: ItemId("return-query-result".to_owned()),
+            target: crikey_ui::ActionTarget::Result {
+                owner: crikey_core::PluginId("wake-regression".into()),
+                item: ItemId("return-query-result".to_owned()),
+            },
+            source: Some(crikey_ui::ResultSource {
+                owner: crikey_core::PluginId("wake-regression".into()),
+                item: ItemId("return-query-result".to_owned()),
+                kind: crikey_ui::ResultSourceKind::Ordinary,
+            }),
+            command_state: None,
             label: "Returned provider result".to_owned(),
             description: String::new(),
             icon_reference: None,
@@ -345,6 +353,8 @@ mod linux {
             action_panel: None,
             settings_open: false,
             settings: Arc::default(),
+            setting_edits: Arc::default(),
+            command_management: Arc::default(),
             settings_focus: None,
             page: None,
             show_hints: true,

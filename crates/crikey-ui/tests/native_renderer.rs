@@ -28,6 +28,8 @@ fn model(query: &str) -> ViewModel {
         action_panel: None,
         settings_open: false,
         settings: Arc::default(),
+        setting_edits: Arc::default(),
+        command_management: Arc::default(),
         settings_focus: None,
         page: None,
         show_hints: true,
@@ -39,8 +41,16 @@ fn model(query: &str) -> ViewModel {
 
 fn result_row(index: usize) -> ResultRow {
     ResultRow {
-        plugin: PluginId("renderer-fixture".into()),
-        item: ItemId(format!("item-{index}")),
+        target: crikey_ui::ActionTarget::Result {
+            owner: PluginId("renderer-fixture".into()),
+            item: ItemId(format!("item-{index}")),
+        },
+        source: Some(crikey_ui::ResultSource {
+            owner: PluginId("renderer-fixture".into()),
+            item: ItemId(format!("item-{index}")),
+            kind: crikey_ui::ResultSourceKind::Ordinary,
+        }),
+        command_state: None,
         label: format!("row-{index}"),
         description: String::new(),
         icon_reference: None,
@@ -497,21 +507,17 @@ fn scrollable_model(rows: usize, selected: usize) -> ViewModel {
 }
 
 #[test]
-fn an_empty_query_renders_nothing_but_the_query_field() {
+fn admitted_home_rows_render_with_an_empty_query() {
     let context = create_launcher_context();
     let mut view = model("");
-    // Rows are handed in deliberately: the renderer must draw no result area
-    // for an untyped launcher whatever it is holding.
+    // Publication admission belongs to the view model, not the renderer.
     view.rows = (0..3).map(result_row).collect();
 
     let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
 
-    for absent in ["Ready", "Type a name", "No matches", "row-0", "3 results"] {
-        assert!(
-            !painted(&frame, absent),
-            "an untyped launcher shows nothing but the query field, yet it painted {absent:?}"
-        );
-    }
+    assert!(painted(&frame, "row-0"));
+    assert!(painted(&frame, "row-1"));
+    assert!(painted(&frame, "row-2"));
     assert!(painted(&frame, "Search apps, files, and actions"));
 }
 
@@ -851,7 +857,7 @@ fn the_settings_surface_lists_the_activation_hotkey_and_commits_an_edit() {
         .commands
         .iter()
         .find_map(|command| match command {
-            UiCommand::SetSetting { key, value } => Some((key.as_str(), value.as_str())),
+            UiCommand::SetSetting { key, value, .. } => Some((key.as_str(), value.as_str())),
             _ => None,
         })
         .expect("committing an edit must reach the host as SetSetting");
@@ -1042,7 +1048,7 @@ fn a_boolean_setting_is_a_switch_that_commits_when_it_moves() {
         .commands
         .iter()
         .find_map(|command| match command {
-            UiCommand::SetSetting { key, value } => Some((key.as_str(), value.as_str())),
+            UiCommand::SetSetting { key, value, .. } => Some((key.as_str(), value.as_str())),
             _ => None,
         })
         .expect("moving the switch commits the setting");
@@ -1065,7 +1071,7 @@ fn a_boolean_setting_is_a_switch_that_commits_when_it_moves() {
         .commands
         .iter()
         .find_map(|command| match command {
-            UiCommand::SetSetting { key, value } => Some((key.as_str(), value.as_str())),
+            UiCommand::SetSetting { key, value, .. } => Some((key.as_str(), value.as_str())),
             _ => None,
         })
         .expect("moving the switch back commits the setting");
@@ -3508,7 +3514,6 @@ fn invisible_preview_retires_its_pixels_and_the_exact_texture_it_painted() {
         "page",
         "narrow-results",
         "no-results",
-        "empty-query",
         "hide",
     ] {
         let context = create_launcher_context();
@@ -3549,7 +3554,6 @@ fn invisible_preview_retires_its_pixels_and_the_exact_texture_it_painted() {
             "page" => view.page = page_view(vec![probe_node()]).page,
             "narrow-results" => width = 480.0,
             "no-results" => view.rows = Arc::default(),
-            "empty-query" => view.query.clear(),
             "hide" => {
                 let retired = crikey_ui::release_launcher_textures(&context);
                 assert!(
@@ -4133,5 +4137,560 @@ fn back_keeps_the_wheeled_anchor_across_later_provider_publication() {
     assert!(
         painted(&navigated, "row-1"),
         "an actual navigation intent supersedes viewport restoration"
+    );
+}
+
+#[test]
+fn command_management_renders_real_p4_controls_without_p5_editors() {
+    let mut row = result_row(0);
+    row.target = crikey_ui::ActionTarget::Command(crikey_core::CommandRef {
+        provider_id: PluginId("renderer-fixture".into()),
+        command_id: "exact-command".into(),
+    });
+    row.command_state = Some(crikey_ui::CommandRowState {
+        registry_revision: 4,
+        preference_revision: 7,
+        available: true,
+        unavailable_reason: None,
+        favorite: Some(0),
+        favorite_count: 2,
+        hidden: false,
+        fallback: None,
+        fallback_count: 0,
+        aliases: vec!["stored alias".into()],
+        hotkey: Some("stored shortcut".into()),
+        argument_policy: crikey_core::ArgumentPolicy::Forbidden,
+        argument: None,
+        ranking_reset_available: true,
+    });
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(Generation::from_raw(1), vec![row], false);
+    model.apply(UiCommand::ShowActions);
+    let context = create_launcher_context();
+    let view = model.frame().unwrap();
+    let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(painted(&frame, "exact-command"));
+    assert!(painted(&frame, "Favorite / Home"));
+    assert!(painted(&frame, "Hidden from discovery"));
+    assert!(painted(&frame, "Fallback"));
+    assert!(!painted(&frame, "stored alias"));
+    assert!(!painted(&frame, "stored shortcut"));
+}
+
+#[test]
+fn external_settings_reload_never_replaces_an_active_text_draft() {
+    let context = create_launcher_context();
+    let settings = hotkey_settings_model().settings.to_vec();
+    let key = settings[0].key.clone();
+    let original = settings[0].value.clone();
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    model.set_settings(settings.clone());
+    model.open_settings(None);
+    let view = model.frame().unwrap();
+    let opened = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let editor = position_of(&opened, &original);
+    let _ = build_launcher_frame(
+        &context,
+        launcher_input(click_at(editor + egui::vec2(4.0, 4.0))),
+        &view,
+    );
+    let typed = build_launcher_frame(
+        &context,
+        launcher_input(vec![egui::Event::Text("draft".into())]),
+        &view,
+    );
+    assert!(!typed
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetSetting { .. })));
+    let draft_id = egui::Id::new(("crikey-setting-draft", key.as_str()));
+    let draft = context.data(|data| data.get_temp::<String>(draft_id)).unwrap();
+    assert_ne!(draft, original);
+    let mut reloaded = settings;
+    reloaded[0].value = "external configuration value".into();
+    model.set_settings(reloaded);
+    let fresh = model.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &fresh);
+    assert_eq!(
+        context.data(|data| data.get_temp::<String>(draft_id)),
+        Some(draft)
+    );
+}
+
+#[test]
+fn settings_configure_commands_reaches_unavailable_saved_fallback_controls() {
+    let context = create_launcher_context();
+    context.style_mut(|style| style.animation_time = 0.0);
+    let mut command = result_row(0);
+    command.target = crikey_ui::ActionTarget::Command(crikey_core::CommandRef {
+        provider_id: PluginId("removed-provider".into()),
+        command_id: "saved-fallback".into(),
+    });
+    command.source = None;
+    command.command_state = Some(crikey_ui::CommandRowState {
+        registry_revision: 4,
+        preference_revision: 7,
+        available: false,
+        unavailable_reason: Some("Command no longer installed".into()),
+        favorite: None,
+        favorite_count: 0,
+        hidden: true,
+        fallback: Some(0),
+        fallback_count: 1,
+        aliases: Vec::new(),
+        hotkey: None,
+        argument_policy: crikey_core::ArgumentPolicy::Forbidden,
+        argument: None,
+        ranking_reset_available: false,
+    });
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    model.set_command_management_rows(vec![command]);
+    model.open_settings(None);
+    let view = model.frame().unwrap();
+    let opened = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let configure = position_of(&opened, "Configure Commands");
+    let _ = build_launcher_frame(
+        &context,
+        launcher_input(click_at(configure + egui::vec2(4.0, 4.0))),
+        &view,
+    );
+    let listed = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let saved = position_of(&listed, "saved-fallback");
+    let _ = build_launcher_frame(
+        &context,
+        launcher_input(click_at(saved + egui::vec2(4.0, 4.0))),
+        &view,
+    );
+    let expanded = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(painted(&expanded, "Command no longer installed"));
+    let fallback = position_of(&expanded, "Fallback");
+    let clicked = build_launcher_frame(
+        &context,
+        launcher_input(click_at(fallback + egui::vec2(4.0, 4.0))),
+        &view,
+    );
+    let removal = clicked
+        .commands
+        .into_iter()
+        .find(|command| {
+            matches!(
+                command,
+                UiCommand::EditCommandPreference {
+                    edit: crikey_ui::CommandPreferenceEdit::Fallback(false),
+                    ..
+                }
+            )
+        })
+        .expect("an unavailable saved fallback remains removable");
+    assert!(matches!(
+        model.apply(removal),
+        Some(crikey_ui::UiEffect::MutateCommandPreferences {
+            expected_revision: 7,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn forbidden_command_actions_accept_keyboard_search_and_enter_without_a_click() {
+    let context = create_launcher_context();
+    let reference = crikey_core::CommandRef {
+        provider_id: PluginId("renderer-fixture".into()),
+        command_id: "keyboard-command".into(),
+    };
+    let mut row = result_row(0);
+    row.target = crikey_ui::ActionTarget::Command(reference.clone());
+    row.command_state = Some(crikey_ui::CommandRowState {
+        registry_revision: 4,
+        preference_revision: 7,
+        available: true,
+        unavailable_reason: None,
+        favorite: None,
+        favorite_count: 0,
+        hidden: false,
+        fallback: None,
+        fallback_count: 0,
+        aliases: Vec::new(),
+        hotkey: None,
+        argument_policy: crikey_core::ArgumentPolicy::Forbidden,
+        argument: None,
+        ranking_reset_available: true,
+    });
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("discovery text".into()));
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(Generation::from_raw(1), vec![row], false);
+    let root = model.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &root);
+    model.apply(UiCommand::ShowActions);
+    let open = model.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &open);
+    let typed = build_launcher_frame(
+        &context,
+        launcher_input(vec![egui::Event::Text("Invoke".into())]),
+        &open,
+    );
+    assert!(typed
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetActionQuery(query) if query == "Invoke")));
+    assert!(!typed
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetQuery(_))));
+    for command in typed.commands {
+        model.apply(command);
+    }
+    let filtered = model.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &filtered);
+    let submitted = build_launcher_frame(
+        &context,
+        launcher_input(vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)]),
+        &filtered,
+    );
+    let effects: Vec<_> = submitted
+        .commands
+        .into_iter()
+        .filter_map(|command| model.apply(command))
+        .collect();
+    assert!(matches!(effects.as_slice(), [crikey_ui::UiEffect::InvokeCommand {
+        reference: actual, argument: None, query, registry_revision: 4, ..
+    }] if actual == &reference && query == "discovery text"));
+}
+
+#[test]
+fn ordinary_query_retirement_frees_its_texture_but_fresh_home_preview_remains_admitted() {
+    let context = create_launcher_context();
+    let mut host = crikey_ui::LauncherViewModel::new();
+    host.activate();
+    host.apply(UiCommand::SetQuery("ordinary".into()));
+    host.begin_generation(Generation::from_raw(1));
+    host.publish(Generation::from_raw(1), vec![result_row(0)], false);
+    let publish_image = |host: &mut crikey_ui::LauncherViewModel, color: [u8; 4]| {
+        let content = Arc::new(crikey_core::PreviewContent {
+            image: Some(crikey_core::PreviewImage {
+                width: RASTER[0] as u32,
+                height: RASTER[1] as u32,
+                rgba: color.repeat(RASTER[0] * RASTER[1]),
+            }),
+            ..Default::default()
+        });
+        let weak = Arc::downgrade(&content);
+        let selection = host.preview_selection().expect("a live admitted selection");
+        assert!(host.publish_preview(
+            &selection,
+            crikey_ui::PreviewStatus::Content(Arc::new(crikey_ui::prepare_preview(content).unwrap(),))
+        ));
+        weak
+    };
+    let ordinary_pixels = publish_image(&mut host, [31, 170, 89, 255]);
+    let ordinary_view = host.frame().unwrap();
+    let opened = preview_frame(&context, &ordinary_view, 720.0);
+    let ordinary_texture = raster_texture(&opened);
+    let mut ordinary_sampled = Vec::new();
+    for shape in &opened.output.shapes {
+        textured_rects(&shape.shape, &mut ordinary_sampled);
+    }
+    assert!(ordinary_sampled
+        .iter()
+        .any(|(texture, _)| *texture == ordinary_texture));
+    drop(ordinary_view);
+
+    assert_eq!(
+        host.apply(UiCommand::SetQuery(String::new())),
+        Some(crikey_ui::UiEffect::Query(String::new()))
+    );
+    let retired = host.frame().unwrap();
+    assert!(
+        retired.rows.is_empty(),
+        "clearing retires prior ordinary results, not merely the displayed string"
+    );
+    assert!(retired.preview.status.is_none());
+    let cleared = preview_frame(&context, &retired, 720.0);
+    assert!(cleared.output.textures_delta.free.contains(&ordinary_texture));
+    assert!(ordinary_pixels.upgrade().is_none());
+
+    let mut home = result_row(0);
+    home.target = crikey_ui::ActionTarget::Command(crikey_core::CommandRef {
+        provider_id: home.source.as_ref().unwrap().owner.clone(),
+        command_id: "home-image".into(),
+    });
+    home.source.as_mut().unwrap().kind = crikey_ui::ResultSourceKind::DeclaredCatalog { epoch: 7 };
+    home.command_state = Some(crikey_ui::CommandRowState {
+        registry_revision: 1,
+        preference_revision: 1,
+        available: true,
+        unavailable_reason: None,
+        favorite: Some(0),
+        favorite_count: 1,
+        hidden: false,
+        fallback: None,
+        fallback_count: 0,
+        aliases: Vec::new(),
+        hotkey: None,
+        argument_policy: crikey_core::ArgumentPolicy::Forbidden,
+        argument: None,
+        ranking_reset_available: true,
+    });
+    host.begin_generation(Generation::from_raw(2));
+    host.publish(Generation::from_raw(2), vec![home], false);
+    let home_pixels = publish_image(&mut host, [170, 31, 89, 255]);
+    let home_view = host.frame().unwrap();
+    assert!(home_view.query.is_empty());
+    let opened_home = preview_frame(&context, &home_view, 720.0);
+    let home_texture = raster_texture(&opened_home);
+    let stable_home = preview_frame(&context, &home_view, 720.0);
+    assert!(!stable_home.output.textures_delta.free.contains(&home_texture));
+    let mut sampled = Vec::new();
+    for shape in &stable_home.output.shapes {
+        textured_rects(&shape.shape, &mut sampled);
+    }
+    assert!(sampled.iter().any(|(texture, _)| *texture == home_texture));
+    drop(home_view);
+
+    host.open_settings(None);
+    let covered = host.frame().unwrap();
+    let retired_home = preview_frame(&context, &covered, 720.0);
+    assert!(retired_home.output.textures_delta.free.contains(&home_texture));
+    assert!(home_pixels.upgrade().is_none());
+}
+
+fn setting_edit_model() -> crikey_ui::LauncherViewModel {
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    model.set_settings(vec![SettingRow {
+        key: "launcher.command-home".into(),
+        label: "Command home".into(),
+        value: "favorites-and-recent".into(),
+        source: "user-global".into(),
+        control: SettingControl::Text,
+    }]);
+    model.open_settings(None);
+    model
+}
+
+fn replace_rendered_setting(
+    context: &egui::Context,
+    view: &ViewModel,
+    previous: &str,
+    value: &str,
+) -> crikey_ui::NativeUiFrame {
+    let visible = build_launcher_frame(context, launcher_input(Vec::new()), view);
+    let editor = position_of(&visible, previous);
+    let _ = build_launcher_frame(
+        context,
+        launcher_input(click_at(editor + egui::vec2(4.0, 4.0))),
+        view,
+    );
+    build_launcher_frame(
+        context,
+        launcher_input(vec![
+            key_press(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Text(value.into()),
+        ]),
+        view,
+    )
+}
+
+fn save_rendered_setting(
+    model: &mut crikey_ui::LauncherViewModel,
+    context: &egui::Context,
+    view: &ViewModel,
+    frame: &crikey_ui::NativeUiFrame,
+) -> (u64, String, String) {
+    let save = position_of(frame, "Save");
+    let submitted = build_launcher_frame(
+        context,
+        launcher_input(click_at(save + egui::vec2(4.0, 4.0))),
+        view,
+    );
+    submitted
+        .commands
+        .into_iter()
+        .filter_map(|command| model.apply(command))
+        .find_map(|effect| match effect {
+            crikey_ui::UiEffect::SetSetting {
+                request_id,
+                key,
+                value,
+            } => Some((request_id, key, value)),
+            _ => None,
+        })
+        .expect("Save submits one correlated setting request")
+}
+
+#[test]
+fn setting_save_pending_failure_and_same_source_reload_keep_draft_until_retry_acknowledged() {
+    let context = create_launcher_context();
+    let mut model = setting_edit_model();
+    let view = model.frame().unwrap();
+    let typed = replace_rendered_setting(&context, &view, "favorites-and-recent", "recent");
+    let draft_id = egui::Id::new(("crikey-setting-draft", "launcher.command-home"));
+    assert_eq!(
+        context.data(|data| data.get_temp::<String>(draft_id)).as_deref(),
+        Some("recent")
+    );
+    let (request_id, key, value) = save_rendered_setting(&mut model, &context, &view, &typed);
+    assert_eq!(value, "recent");
+    let pending = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(painted(&pending, "recent"));
+    assert_eq!(
+        context.data(|data| data.get_temp::<String>(draft_id)).as_deref(),
+        Some("recent")
+    );
+    model.setting_edit_completed(crikey_ui::SettingEditOutcome {
+        request_id,
+        key: key.clone(),
+        value: value.clone(),
+        status: crikey_ui::SettingEditStatus::Failed,
+    });
+    let failed = model.frame().unwrap();
+    assert_eq!(failed.settings[0].value, "favorites-and-recent");
+    let failure = build_launcher_frame(&context, launcher_input(Vec::new()), &failed);
+    assert_eq!(
+        context.data(|data| data.get_temp::<String>(draft_id)).as_deref(),
+        Some("recent")
+    );
+    let (retry_id, retry_key, retry_value) = save_rendered_setting(&mut model, &context, &failed, &failure);
+    assert!(retry_id > request_id);
+    let mut saved_settings = failed.settings.to_vec();
+    saved_settings[0].value = retry_value.clone();
+    model.set_settings(saved_settings);
+    let same_source = model.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &same_source);
+    assert_eq!(
+        context.data(|data| data.get_temp::<String>(draft_id)).as_deref(),
+        Some("recent"),
+        "even an effective value equal to the draft is not a save acknowledgment"
+    );
+    model.setting_edit_completed(crikey_ui::SettingEditOutcome {
+        request_id: retry_id,
+        key: retry_key,
+        value: retry_value,
+        status: crikey_ui::SettingEditStatus::Saved,
+    });
+    let acknowledged = model.frame().unwrap();
+    let saved = build_launcher_frame(&context, launcher_input(Vec::new()), &acknowledged);
+    assert!(painted(&saved, "recent"));
+    assert_eq!(context.data(|data| data.get_temp::<String>(draft_id)), None);
+}
+
+#[test]
+fn older_setting_success_does_not_clear_edits_made_while_write_was_pending() {
+    let context = create_launcher_context();
+    let mut model = setting_edit_model();
+    let view = model.frame().unwrap();
+    let first = replace_rendered_setting(&context, &view, "favorites-and-recent", "recent");
+    let (request_id, key, value) = save_rendered_setting(&mut model, &context, &view, &first);
+    let _ = replace_rendered_setting(&context, &view, "recent", "favorites");
+    let draft_id = egui::Id::new(("crikey-setting-draft", "launcher.command-home"));
+    assert_eq!(
+        context.data(|data| data.get_temp::<String>(draft_id)).as_deref(),
+        Some("favorites")
+    );
+    let mut persisted = view.settings.to_vec();
+    persisted[0].value = value.clone();
+    model.set_settings(persisted);
+    model.setting_edit_completed(crikey_ui::SettingEditOutcome {
+        request_id,
+        key,
+        value,
+        status: crikey_ui::SettingEditStatus::Saved,
+    });
+    let first_saved = model.frame().unwrap();
+    let current = build_launcher_frame(&context, launcher_input(Vec::new()), &first_saved);
+    assert_eq!(
+        context.data(|data| data.get_temp::<String>(draft_id)).as_deref(),
+        Some("favorites")
+    );
+    let (next_id, next_key, next_value) = save_rendered_setting(&mut model, &context, &first_saved, &current);
+    assert!(next_id > request_id);
+    assert_eq!(next_value, "favorites");
+    let mut persisted = first_saved.settings.to_vec();
+    persisted[0].value = next_value.clone();
+    model.set_settings(persisted);
+    model.setting_edit_completed(crikey_ui::SettingEditOutcome {
+        request_id: next_id,
+        key: next_key,
+        value: next_value,
+        status: crikey_ui::SettingEditStatus::Saved,
+    });
+    let latest = model.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &latest);
+    assert_eq!(context.data(|data| data.get_temp::<String>(draft_id)), None);
+}
+
+#[test]
+fn setting_acknowledgment_matches_request_value_and_explicit_cancel_discards_only_the_draft() {
+    let context = create_launcher_context();
+    let mut model = setting_edit_model();
+    let view = model.frame().unwrap();
+    let typed = replace_rendered_setting(&context, &view, "favorites-and-recent", "recent");
+    let (request_id, key, value) = save_rendered_setting(&mut model, &context, &view, &typed);
+    model.setting_edit_completed(crikey_ui::SettingEditOutcome {
+        request_id,
+        key: key.clone(),
+        value: "a different submitted value".into(),
+        status: crikey_ui::SettingEditStatus::Saved,
+    });
+    let unrelated = model.frame().unwrap();
+    let current = build_launcher_frame(&context, launcher_input(Vec::new()), &unrelated);
+    let draft_id = egui::Id::new(("crikey-setting-draft", "launcher.command-home"));
+    assert_eq!(
+        context.data(|data| data.get_temp::<String>(draft_id)).as_deref(),
+        Some("recent")
+    );
+    let cancel = position_of(&current, "Cancel edit");
+    let cancelled = build_launcher_frame(
+        &context,
+        launcher_input(click_at(cancel + egui::vec2(4.0, 4.0))),
+        &unrelated,
+    );
+    assert!(!cancelled
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetSetting { .. })));
+    assert_eq!(context.data(|data| data.get_temp::<String>(draft_id)), None);
+    assert_eq!(unrelated.settings[0].value, "favorites-and-recent");
+    model.setting_edit_completed(crikey_ui::SettingEditOutcome {
+        request_id,
+        key,
+        value,
+        status: crikey_ui::SettingEditStatus::Saved,
+    });
+    let completed = model.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &completed);
+    assert_eq!(context.data(|data| data.get_temp::<String>(draft_id)), None);
+}
+
+#[test]
+fn changing_a_pending_draft_back_to_submitted_text_still_requires_a_new_save() {
+    let context = create_launcher_context();
+    let mut model = setting_edit_model();
+    let view = model.frame().unwrap();
+    let typed = replace_rendered_setting(&context, &view, "favorites-and-recent", "recent");
+    let (request_id, key, value) = save_rendered_setting(&mut model, &context, &view, &typed);
+    let _ = replace_rendered_setting(&context, &view, "recent", "favorites");
+    let _ = replace_rendered_setting(&context, &view, "favorites", "recent");
+    let mut persisted = view.settings.to_vec();
+    persisted[0].value = value.clone();
+    model.set_settings(persisted);
+    model.setting_edit_completed(crikey_ui::SettingEditOutcome {
+        request_id,
+        key,
+        value,
+        status: crikey_ui::SettingEditStatus::Saved,
+    });
+    let completed = model.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &completed);
+    let draft_id = egui::Id::new(("crikey-setting-draft", "launcher.command-home"));
+    assert_eq!(
+        context.data(|data| data.get_temp::<String>(draft_id)).as_deref(),
+        Some("recent")
     );
 }

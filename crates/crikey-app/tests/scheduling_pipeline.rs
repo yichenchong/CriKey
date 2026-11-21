@@ -632,7 +632,7 @@ impl Frame {
         Self {
             at,
             generation: view.generation,
-            rows: view.rows.iter().map(|row| row.item.clone()).collect(),
+            rows: view.rows.iter().map(|row| row_item(row).clone()).collect(),
             row_generations: view.rows.iter().map(row_generation).collect(),
             owners: view.rows.iter().map(row_owner).collect(),
             pending_plugins: view.pending_plugins,
@@ -654,8 +654,17 @@ impl Frame {
     }
 }
 
+fn row_item(row: &ResultRow) -> &ItemId {
+    match &row.target {
+        crikey_ui::ActionTarget::Result { item, .. } => item,
+        crikey_ui::ActionTarget::Command(_) => {
+            panic!("scripted provider rows must retain ordinary result identity")
+        }
+    }
+}
+
 fn row_generation(row: &ResultRow) -> u64 {
-    let id = row.item.0.as_str();
+    let id = row_item(row).0.as_str();
     let start = id
         .find("#g")
         .unwrap_or_else(|| panic!("scripted row id `{id}` lost its generation tag"))
@@ -668,7 +677,7 @@ fn row_generation(row: &ResultRow) -> u64 {
 }
 
 fn row_owner(row: &ResultRow) -> String {
-    row.item.0.split('#').next().unwrap_or_default().to_owned()
+    row_item(row).0.split('#').next().unwrap_or_default().to_owned()
 }
 
 /// The most recent frame that actually carried rows.
@@ -1222,7 +1231,7 @@ fn a_plugin_that_ignores_cancellation_cannot_change_what_is_on_screen() {
     fleet.accept(&supersede);
 
     // The worker ignores the cancellation and answers for the dead generation.
-    let before: Vec<ItemId> = pipeline.rows().iter().map(|row| row.item.clone()).collect();
+    let before: Vec<ItemId> = pipeline.rows().iter().map(|row| row_item(row).clone()).collect();
     let script = PluginScript::prompt(40, 2, 50);
     let refusal = pipeline.deliver(
         ResultBatch {
@@ -1242,7 +1251,7 @@ fn a_plugin_that_ignores_cancellation_cannot_change_what_is_on_screen() {
         }),
         "a batch for a cancelled generation must be refused at the boundary"
     );
-    let after: Vec<ItemId> = pipeline.rows().iter().map(|row| row.item.clone()).collect();
+    let after: Vec<ItemId> = pipeline.rows().iter().map(|row| row_item(row).clone()).collect();
     assert_eq!(before, after, "a refused batch mutated the visible rows");
 
     assert_eq!(

@@ -406,7 +406,7 @@ fn native_action_completion_wakes_without_another_query() {
     assert_eq!(completion.request_id, request_id);
     assert_eq!(completion.plugin, plugin);
     assert_eq!(completion.item_id, item_id);
-    assert_eq!(completion.action_id, action_id);
+    assert_eq!(completion.action_id, Some(action_id));
     assert_eq!(
         completion.outcome.expect("the native page action must succeed"),
         crikey_app::ActionEffect::ShowPage {

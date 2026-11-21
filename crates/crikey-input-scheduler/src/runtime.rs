@@ -47,6 +47,12 @@ pub struct PluginPolicy {
 }
 
 impl PluginPolicy {
+    /// Applies the scheduler's query gate without queueing work.
+    /// Drivers retain the scheduler-normalized policy for admission snapshots.
+    pub fn query_applicable(&self, query: &str) -> bool {
+        policy_gate_reason(self, &query.trim().to_lowercase()).is_none()
+    }
+
     /// Compatibility profile: prompt, ungated, serial and newest-pending.
     pub fn legacy_strict() -> Self {
         Self {
@@ -529,6 +535,15 @@ impl QueryScheduler {
             }
         }
         generation
+    }
+
+    /// Whether this owner participates in this query, before queue admission.
+    /// Uses the same activation and enabled-state gate as `submit_query`.
+    pub fn query_applicable(&self, plugin: &PluginId, query: &str) -> bool {
+        let normalized = query.trim().to_lowercase();
+        self.plugins
+            .get(plugin)
+            .is_some_and(|state| gate_reason(state, &normalized).is_none())
     }
 
     pub fn current_generation(&self) -> Generation {
@@ -1438,17 +1453,21 @@ fn gate_reason(state: &PluginState, normalized: &str) -> Option<GateReason> {
     if !state.enabled {
         return Some(GateReason::Disabled);
     }
-    if !state.policy.profile.allows_host_gating() {
+    policy_gate_reason(&state.policy, normalized)
+}
+
+fn policy_gate_reason(policy: &PluginPolicy, normalized: &str) -> Option<GateReason> {
+    if !policy.profile.allows_host_gating() {
         return None;
     }
     if normalized.is_empty() {
-        return (!state.policy.activation.supports_empty_query).then_some(GateReason::EmptyQueryUnsupported);
+        return (!policy.activation.supports_empty_query).then_some(GateReason::EmptyQueryUnsupported);
     }
-    if normalized.chars().count() < state.policy.debounce.minimum_query_length {
+    if normalized.chars().count() < policy.debounce.minimum_query_length {
         return Some(GateReason::MinimumQueryLength);
     }
 
-    let activation = &state.policy.activation;
+    let activation = &policy.activation;
     if activation.prefixes.is_empty() && activation.keywords.is_empty() && activation.patterns.is_empty() {
         return None;
     }
