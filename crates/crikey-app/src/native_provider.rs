@@ -177,6 +177,8 @@ struct NativeCatalogDispatcher {
     latest: BTreeMap<PluginId, u64>,
     next_id: u64,
     items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
+    /// Canonical targets whose healthy static catalog producer was released.
+    static_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
 }
 
 impl Default for NativeCatalogDispatcher {
@@ -189,6 +191,7 @@ impl Default for NativeCatalogDispatcher {
             latest: BTreeMap::new(),
             next_id: 0,
             items: Arc::new(Mutex::new(BTreeMap::new())),
+            static_items: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -232,6 +235,16 @@ impl NativeCatalogDispatcher {
             if let CatalogBuildResult::Complete(build) = &result {
                 let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
                 items.retain(|(owner, _), _| owner != &build.plugin);
+                let mut static_items = self
+                    .static_items
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                static_items.retain(|(owner, _), _| owner != &build.plugin);
+                if incarnation == 0 {
+                    for item in &build.items {
+                        static_items.insert((build.plugin.clone(), item.stable_id.clone()), item.clone());
+                    }
+                }
                 if incarnation != 0 {
                     for item in &build.items {
                         items.insert(
@@ -1278,16 +1291,10 @@ impl NativeProvider {
     fn execute_action_request(&mut self, request: NativeActionRequest) -> crikey_core::Result<ActionEffect> {
         let _guard = request.guard;
         let plugin = request.plugin;
-        let item_id = request.item.stable_id.clone();
-        let item = self
-            .action_items
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&(plugin.clone(), item_id.clone()))
-            .map(|(item, _)| item.clone())
-            .ok_or_else(|| {
-                crikey_core::CoreError::Invalid("native action item snapshot is no longer current".to_owned())
-            })?;
+        // Admission froze both validation and privacy evidence for this item.
+        // Current ownership/liveness still come from the loaded runtime below;
+        // a later result publication must not replace the admitted content.
+        let item = &request.item;
         if item.plugin_id != plugin {
             return Err(crikey_core::CoreError::Invalid(format!(
                 "native action item `{}` is owned by `{}`, not `{}`",
@@ -1339,17 +1346,36 @@ impl NativeProvider {
         let supervisor = self.pool.supervisors.get(&loaded.key).cloned().ok_or_else(|| {
             crikey_core::CoreError::Invalid(format!("native worker for `{}` is unavailable", plugin.0))
         })?;
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let mut supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
-            with_native_worker(&mut supervisor, &plugin, &self.incarnations, |worker| {
-                worker.execute(
-                    &request.item.stable_id,
-                    Some(&request.action_id),
-                    request.argument.as_deref(),
-                )
-            })
-            .map_err(|error| error.to_string())
-        }));
+        let mut supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
+        let execute = |worker: &mut crikey_native_host::NativeWorker| {
+            worker.execute(
+                &item.stable_id,
+                Some(&request.action_id),
+                request.argument.as_deref(),
+            )
+        };
+        let outcome = if let Some(origin) = request.origin {
+            refresh_incarnation(&mut supervisor, &plugin, &self.incarnations);
+            let worker = supervisor.live_worker(&plugin).ok_or_else(|| {
+                crikey_core::CoreError::Invalid("native action originating worker is unavailable".into())
+            })?;
+            if worker.connection_id() != origin {
+                return Err(crikey_core::CoreError::Invalid(
+                    "native action originating worker was replaced".into(),
+                ));
+            }
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                execute(worker).map_err(|error| error.to_string())
+            }));
+            refresh_incarnation(&mut supervisor, &plugin, &self.incarnations);
+            outcome
+        } else {
+            catch_unwind(AssertUnwindSafe(|| {
+                with_native_worker(&mut supervisor, &plugin, &self.incarnations, execute)
+                    .map_err(|error| error.to_string())
+            }))
+        };
+        drop(supervisor);
         match outcome {
             Ok(Ok(ExecuteOutcome::Ok)) => Ok(ActionEffect::Completed),
             Ok(Ok(ExecuteOutcome::ShowPage { page_id })) => Ok(ActionEffect::ShowPage { page_id }),
@@ -1861,6 +1887,8 @@ struct NativeActionRequest {
     request_id: ActionRequestId,
     plugin: PluginId,
     item: Item,
+    /// Suggestions require the producing live incarnation; canonical targets do not.
+    origin: Option<u64>,
     action_id: ActionId,
     argument: Option<String>,
     guard: OwnedBudgetGuard,
@@ -1924,6 +1952,8 @@ struct NativeActionEndpoint {
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
     budgets: BTreeMap<PluginId, PluginBudgetHandle>,
     items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
+    catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
+    static_catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     pending: Arc<Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>>,
     in_flight: Arc<AtomicUsize>,
     next_id: Arc<AtomicU64>,
@@ -1952,26 +1982,44 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         action_id: &ActionId,
         argument: Option<&str>,
     ) -> crikey_core::Result<ActionRequestId> {
+        self.submit_plugin_action_with_receipt(plugin, item, action_id, argument)
+            .map(|receipt| receipt.request_id)
+    }
+
+    fn submit_plugin_action_by_id_with_receipt(
+        &self,
+        plugin: &PluginId,
+        item_id: &ItemId,
+        action_id: &ActionId,
+        argument: Option<&str>,
+    ) -> crikey_core::Result<crate::plugin_action::PluginActionReceipt> {
+        let live_origin = self
+            .incarnations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(plugin)
+            .copied();
+        let (item, origin) = crate::plugin_action::resolve_action_item(
+            plugin,
+            item_id,
+            live_origin,
+            &self.items,
+            &self.catalog_items,
+            &self.static_catalog_items,
+        )
+        .ok_or_else(|| {
+            crikey_core::CoreError::Invalid("selected native plugin result is no longer current".into())
+        })?;
         if item.plugin_id != *plugin {
             return Err(crikey_core::CoreError::Invalid(
                 "selected native plugin result has stale ownership".to_owned(),
             ));
         }
-        let item_id = item.stable_id.clone();
-        let item = self
-            .items
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&(plugin.clone(), item_id))
-            .map(|(item, _)| item.clone())
-            .ok_or_else(|| {
-                crikey_core::CoreError::Invalid(
-                    "selected native plugin result is no longer current".to_owned(),
-                )
-            })?;
-        if item.plugin_id != *plugin {
+        let (action, query_history_allowed) =
+            crate::plugin_action::validate_action_item(&item, action_id, argument)?;
+        if action.execution_policy != crikey_core::ExecutionPolicy::Plugin {
             return Err(crikey_core::CoreError::Invalid(
-                "selected native plugin result has stale ownership".to_owned(),
+                "selected action is not plugin-owned".into(),
             ));
         }
         let reserved = self
@@ -2023,7 +2071,8 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         let request = NativeActionRequest {
             request_id: request_id.clone(),
             plugin: plugin.clone(),
-            item: item.clone(),
+            item,
+            origin,
             action_id: action_id.clone(),
             argument: argument.map(str::to_owned),
             guard,
@@ -2048,7 +2097,10 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
             });
         }
         self.mailbox.1.notify_one();
-        Ok(request_id)
+        Ok(crate::plugin_action::PluginActionReceipt {
+            request_id,
+            query_history_allowed,
+        })
     }
 
     fn poll_plugin_actions(&self) -> Vec<PluginActionCompletion> {
@@ -2080,11 +2132,21 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
     }
 
     fn owns_item(&self, plugin: &PluginId, item_id: &ItemId) -> bool {
+        let key = (plugin.clone(), item_id.clone());
         self.items
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .iter()
-            .any(|((owner, id), _)| owner == plugin && id == item_id)
+            .contains_key(&key)
+            || self
+                .catalog_items
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&key)
+            || self
+                .static_catalog_items
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&key)
     }
 
     fn submit_plugin_action_by_id(
@@ -2094,24 +2156,23 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         action_id: &ActionId,
         argument: Option<&str>,
     ) -> crikey_core::Result<ActionRequestId> {
-        let item = self
-            .items
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .iter()
-            .find(|((owner, id), _)| owner == plugin && id == item_id)
-            .map(|(_, (item, _))| item.clone())
-            .ok_or_else(|| {
-                crikey_core::CoreError::Invalid(
-                    "selected native plugin result is no longer current".to_owned(),
-                )
-            })?;
+        self.submit_plugin_action_by_id_with_receipt(plugin, item_id, action_id, argument)
+            .map(|receipt| receipt.request_id)
+    }
+
+    fn submit_plugin_action_with_receipt(
+        &self,
+        plugin: &PluginId,
+        item: &Item,
+        action_id: &ActionId,
+        argument: Option<&str>,
+    ) -> crikey_core::Result<crate::plugin_action::PluginActionReceipt> {
         if item.plugin_id != *plugin {
             return Err(crikey_core::CoreError::Invalid(
                 "selected native plugin result has stale ownership".to_owned(),
             ));
         }
-        self.submit_plugin_action(plugin, &item, action_id, argument)
+        self.submit_plugin_action_by_id_with_receipt(plugin, &item.stable_id, action_id, argument)
     }
 
     fn open_plugin_page(
@@ -2331,6 +2392,8 @@ impl NativeDriver {
             completions: Arc::clone(&completion_mailbox),
             budgets: provider.action_budgets(),
             items: Arc::clone(&provider.action_items),
+            catalog_items: Arc::clone(&provider.catalog.items),
+            static_catalog_items: Arc::clone(&provider.catalog.static_items),
             pending: Arc::new(Mutex::new(BTreeMap::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
             next_id: Arc::new(AtomicU64::new(0)),
@@ -2549,6 +2612,7 @@ impl NativeDriver {
                                 rounded_corners: true,
                                 page: None,
                                 preview: Default::default(),
+                                navigation: Default::default(),
                             };
                             let slot = lock.lock().unwrap_or_else(|error| error.into_inner());
                             if slot.stop
@@ -2601,6 +2665,7 @@ impl NativeDriver {
                         rounded_corners: true,
                         page: None,
                         preview: Default::default(),
+                        navigation: Default::default(),
                     };
 
                     // Hold the mailbox lock across the staleness check and the
@@ -2823,5 +2888,359 @@ impl Drop for NativeDriver {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod query_history_receipt_tests {
+    use super::*;
+    use crate::PluginActionExecutor;
+    use crikey_core::{ArgumentPolicy, ExecutionPolicy};
+
+    fn item() -> Item {
+        Item {
+            stable_id: ItemId("shared".into()),
+            plugin_id: PluginId("native.receipt".into()),
+            category: crikey_core::Category::Command,
+            label: "Receipt".into(),
+            description: String::new(),
+            target: String::new(),
+            search_terms: Vec::new(),
+            icon_reference: None,
+            argument_policy: ArgumentPolicy::Forbidden,
+            hit_policy: crikey_core::HitPolicy::Recorded,
+            score_hint: 0,
+            metadata: BTreeMap::new(),
+            actions: vec![crikey_core::Action {
+                action_id: ActionId("run".into()),
+                label: "Run".into(),
+                description: String::new(),
+                applicable_categories: Vec::new(),
+                icon_reference: None,
+                execution_policy: ExecutionPolicy::Plugin,
+            }],
+        }
+    }
+
+    fn endpoint(item: Item) -> (NativeActionEndpoint, mpsc::Receiver<NativeActionRequest>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let owner = item.plugin_id.clone();
+        let incarnations = NativeIncarnations::default();
+        incarnations.lock().unwrap().insert(owner.clone(), 1);
+        (
+            NativeActionEndpoint {
+                sender,
+                completions: Arc::default(),
+                budgets: BTreeMap::from([(
+                    owner.clone(),
+                    crikey_plugin_supervisor::shared_budget_from_section(&Default::default()),
+                )]),
+                items: Arc::new(Mutex::new(BTreeMap::from([(
+                    (owner, item.stable_id.clone()),
+                    (item, 1),
+                )]))),
+                catalog_items: Arc::default(),
+                static_catalog_items: Arc::default(),
+                pending: Arc::default(),
+                in_flight: Arc::default(),
+                next_id: Arc::default(),
+                mailbox: Arc::new((
+                    Mutex::new(NativeRequestSlot {
+                        job: None,
+                        configuration: None,
+                        stop: false,
+                    }),
+                    Condvar::new(),
+                )),
+                page_supervisors: BTreeMap::new(),
+                incarnations,
+                page: Mutex::new(None),
+                page_closing: Mutex::new(None),
+                wake: WakeSlot::default(),
+                action_wake: crate::plugin_action::CompletionWake::default(),
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn receipt_uses_the_frozen_accepted_item_not_the_displayed_catalog_policy() {
+        for policy in [
+            ArgumentPolicy::Forbidden,
+            ArgumentPolicy::Optional,
+            ArgumentPolicy::Required,
+        ] {
+            let displayed = item();
+            let mut current = displayed.clone();
+            current.argument_policy = policy;
+            let (endpoint, receiver) = endpoint(current);
+            let endpoint = Arc::new(endpoint);
+            let mut router = crate::PluginActionRouter::default();
+            router
+                .register([displayed.plugin_id.clone()], endpoint.clone())
+                .unwrap();
+            let mut search = crate::SearchService::new(crate::App::new());
+            for stage in [
+                crate::StartupStage::WindowAndHotkey,
+                crate::StartupStage::PersistedCatalog,
+                crate::StartupStage::AcceptQueries,
+            ] {
+                search.complete_stage(stage).unwrap();
+            }
+            search.set_plugin_action_router(Arc::new(router));
+            search
+                .replace_catalog(&displayed.plugin_id, 1, vec![displayed.clone()])
+                .unwrap();
+            search.submit_query("Receipt").unwrap();
+            let result = search.execute_owned(
+                &displayed.plugin_id,
+                &displayed.stable_id,
+                &ActionId("run".into()),
+            );
+            let mut history = crate::QueryHistoryStore::session(Duration::MAX);
+            if result.as_ref().is_ok_and(|receipt| receipt.query_history_allowed) {
+                history.record_submitted("Receipt").unwrap();
+            }
+            assert_eq!(
+                history.snapshot(),
+                if policy == ArgumentPolicy::Forbidden {
+                    vec!["Receipt".to_owned()]
+                } else {
+                    Vec::new()
+                }
+            );
+            if policy == ArgumentPolicy::Required {
+                assert!(result.is_err());
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "refused arguments have no admission receipt"
+                );
+            } else {
+                let receipt = result.unwrap();
+                endpoint
+                    .items
+                    .lock()
+                    .unwrap()
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .0
+                    .argument_policy = ArgumentPolicy::Required;
+                let accepted = receiver.try_recv().unwrap();
+                assert_eq!(
+                    receipt.submission,
+                    crate::ActionSubmission::Pending(accepted.request_id.clone())
+                );
+                assert_eq!(accepted.item.argument_policy, policy);
+                assert_eq!(receipt.query_history_allowed, policy == ArgumentPolicy::Forbidden);
+                assert!(endpoint
+                    .submit_plugin_action_with_receipt(
+                        &displayed.plugin_id,
+                        &displayed,
+                        &ActionId("run".into()),
+                        None
+                    )
+                    .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn stale_primary_action_cannot_authorize_query_collection() {
+        let displayed = item();
+        let mut current = displayed.clone();
+        current.actions.clear();
+        let (endpoint, receiver) = endpoint(current);
+        assert!(endpoint
+            .submit_plugin_action_with_receipt(
+                &displayed.plugin_id,
+                &displayed,
+                &ActionId("run".into()),
+                None
+            )
+            .is_err());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_displayed_primary_that_is_now_an_alternate_is_not_a_root_submission() {
+        let displayed = item();
+        let mut current = displayed.clone();
+        let mut replacement = current.actions[0].clone();
+        replacement.action_id = ActionId("new-primary".into());
+        current.actions.insert(0, replacement);
+        let (endpoint, receiver) = endpoint(current);
+        let receipt = endpoint
+            .submit_plugin_action_with_receipt(
+                &displayed.plugin_id,
+                &displayed,
+                &ActionId("run".into()),
+                None,
+            )
+            .unwrap();
+        assert!(!receipt.query_history_allowed);
+        assert_eq!(
+            receiver.try_recv().unwrap().item.actions[0].action_id.0,
+            "new-primary"
+        );
+    }
+
+    #[derive(Debug)]
+    struct ProcessFixture(std::path::PathBuf);
+    impl Drop for ProcessFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn real_fixture_binary() -> &'static std::path::Path {
+        static BINARY: std::sync::LazyLock<std::path::PathBuf> = std::sync::LazyLock::new(|| {
+            let app = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let manifest = app.join("../crikey-ui/tests/fixtures/navigation/Cargo.toml");
+            let target = app.join("../../target/navigation-action-consumer");
+            let output = std::process::Command::new("cargo")
+                .arg("build")
+                .arg("--manifest-path")
+                .arg(&manifest)
+                .arg("--target-dir")
+                .arg(&target)
+                .output()
+                .expect("build real native fixture");
+            assert!(
+                output.status.success(),
+                "native fixture build failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            target.join("debug").join(if cfg!(windows) {
+                "crikey-navigation-fixture.exe"
+            } else {
+                "crikey-navigation-fixture"
+            })
+        });
+        BINARY.as_path()
+    }
+
+    #[test]
+    fn released_static_catalog_executes_frozen_admission_in_the_real_consumer() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "crikey-native-receipt-consumer-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let fixture = ProcessFixture(root);
+        let package = fixture.0.join("receipt");
+        fs::create_dir(&package).unwrap();
+        let executable = if cfg!(windows) { "worker.exe" } else { "worker" };
+        fs::copy(real_fixture_binary(), package.join(executable)).unwrap();
+        fs::write(package.join("crikey.toml"), format!(
+            "manifest-version = 1\n[plugin]\nid = \"receipt\"\nname = \"Receipt\"\nversion = \"1.0.0\"\nruntime = \"native\"\nentrypoint = \"{executable}\"\n[performance]\nstartup = \"lazy\"\n"
+        )).unwrap();
+        let mut pipeline = QueryPipeline::new(crate::PipelineConfig::default());
+        let mut provider =
+            NativeProvider::load(&mut pipeline, &[fixture.0.clone()], &DisabledPlugins::default());
+        assert_eq!(provider.loaded.len(), 1, "{:?}", provider.unavailable());
+        let owner = provider.loaded[0].plugin.clone();
+        provider
+            .request_catalog_build(&owner, 1, Generation::ZERO)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let build = loop {
+            if let Some(result) = provider.take_catalog_results().into_iter().next() {
+                match result {
+                    CatalogBuildResult::Complete(build) => break build,
+                    other => panic!("real static catalog failed: {other:?}"),
+                }
+            }
+            assert!(Instant::now() < deadline, "native catalog never completed");
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert!(
+            provider.incarnations.lock().unwrap().get(&owner).is_none(),
+            "a healthy static producer is released"
+        );
+        let displayed = build
+            .items
+            .iter()
+            .find(|item| item.stable_id.0 == "route-0")
+            .unwrap()
+            .clone();
+        let (mut endpoint, receiver) = endpoint(displayed.clone());
+        endpoint.items = Arc::clone(&provider.action_items);
+        endpoint.catalog_items = Arc::clone(&provider.catalog.items);
+        endpoint.static_catalog_items = Arc::clone(&provider.catalog.static_items);
+        endpoint.incarnations = Arc::clone(&provider.incarnations);
+        endpoint.budgets = provider.action_budgets();
+        let action = displayed.actions[0].action_id.clone();
+        let receipt = endpoint
+            .submit_plugin_action_with_receipt(&owner, &displayed, &action, None)
+            .unwrap();
+        assert!(receipt.query_history_allowed);
+        let request = receiver.try_recv().unwrap();
+        assert!(
+            request.origin.is_none(),
+            "canonical catalog execution does not borrow a retired producer"
+        );
+        {
+            let mut catalog = provider.catalog.static_items.lock().unwrap();
+            let replacement = catalog
+                .get_mut(&(owner.clone(), displayed.stable_id.clone()))
+                .unwrap();
+            replacement.argument_policy = ArgumentPolicy::Required;
+            replacement.actions.clear();
+        }
+        assert_eq!(
+            provider.execute_action_request(request).unwrap(),
+            ActionEffect::ShowPage {
+                page_id: "route-0".into()
+            }
+        );
+        let log = package.join("navigation-lifecycle.log");
+        assert_eq!(
+            fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with("execute "))
+                .count(),
+            1
+        );
+        assert!(
+            endpoint
+                .submit_plugin_action_with_receipt(&owner, &displayed, &action, None)
+                .is_err(),
+            "a later admission validates the changed canonical snapshot"
+        );
+
+        // A dynamic suggestion may not borrow a replacement process.
+        let origin = provider
+            .incarnations
+            .lock()
+            .unwrap()
+            .get(&owner)
+            .copied()
+            .unwrap();
+        provider.action_items.lock().unwrap().insert(
+            (owner.clone(), displayed.stable_id.clone()),
+            (displayed.clone(), origin),
+        );
+        endpoint
+            .submit_plugin_action_with_receipt(&owner, &displayed, &action, None)
+            .unwrap();
+        let retired_request = receiver.try_recv().unwrap();
+        {
+            let supervisor = provider.pool.supervisors.get(&provider.loaded[0].key).unwrap();
+            let mut supervisor = supervisor.lock().unwrap();
+            supervisor.release_worker(&owner, native_policy_now());
+            refresh_incarnation(&mut supervisor, &owner, &provider.incarnations);
+        }
+        assert!(provider.execute_action_request(retired_request).is_err());
+        assert_eq!(
+            fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with("execute "))
+                .count(),
+            1
+        );
     }
 }

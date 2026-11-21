@@ -55,6 +55,8 @@ pub(crate) type PageWake = Arc<dyn Fn() + Send + Sync>;
 pub struct PageUpdate {
     pub frame: PageFrame,
     pub closed: bool,
+    /// Terminal runtime failure, distinct from the page deliberately closing.
+    pub failure: Option<String>,
 }
 
 /// One host-to-plugin frame request, as the session's backend needs it.
@@ -285,7 +287,14 @@ impl PageSession {
         let mailbox = self.mailbox.lock().unwrap_or_else(|error| error.into_inner());
         let frame = mailbox.last_frame.clone();
         drop(mailbox);
-        (Some(PageUpdate { frame, closed: true }), closing)
+        (
+            Some(PageUpdate {
+                frame,
+                closed: true,
+                failure: None,
+            }),
+            closing,
+        )
     }
 }
 
@@ -567,9 +576,18 @@ impl PageDriver {
     }
 
     fn publish(&self, frame: PageFrame, closed: bool) {
+        let failure = self
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
         let mut mailbox = self.mailbox.lock().unwrap_or_else(|error| error.into_inner());
         mailbox.last_frame = frame.clone();
-        mailbox.update = Some(PageUpdate { frame, closed });
+        mailbox.update = Some(PageUpdate {
+            frame,
+            closed,
+            failure,
+        });
         drop(mailbox);
         // The event loop is asleep between keystrokes. Without this the frame
         // would sit in the mailbox until something unrelated woke the
@@ -910,6 +928,10 @@ mod tests {
         }));
         let update = harness.next_update();
         assert!(update.closed);
+        assert!(
+            update.failure.is_none(),
+            "deliberate closure is not unavailability"
+        );
         assert_eq!(update.frame.generation, 1);
         let session = harness.session.take().expect("session is open");
         drop(session);
@@ -927,7 +949,7 @@ mod tests {
         let update = harness.next_update();
         assert!(update.closed);
         assert_eq!(
-            harness.session().failure().as_deref(),
+            update.failure.as_deref(),
             Some("plugin page frame is not drawable")
         );
         let session = harness.session.take().expect("session is open");

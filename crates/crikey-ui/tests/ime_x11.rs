@@ -263,6 +263,7 @@ mod linux {
             show_hints: true,
             rounded_corners: true,
             preview: Default::default(),
+            navigation: Default::default(),
         }
     }
 

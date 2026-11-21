@@ -2599,3 +2599,300 @@ fn action_status_admission_bounds_utf8_once_for_row_and_hover() {
     assert!(status.ends_with('…'));
     assert!(status.len() <= crikey_ui::action_panel::MAX_ACTION_TEXT_BYTES);
 }
+
+#[derive(Debug)]
+struct NavigationTestClock(std::sync::atomic::AtomicU64);
+impl crikey_ui::NavigationClock for NavigationTestClock {
+    fn now(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+#[test]
+fn navigation_back_restores_owner_query_selection_and_logical_scroll() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("shared".into()));
+    model.begin_generation(Generation::from_raw(1));
+    let first = row("shared");
+    let mut second = row("shared");
+    second.plugin = PluginId("other.owner".into());
+    model.publish(
+        Generation::from_raw(1),
+        vec![first.clone(), second.clone()],
+        false,
+    );
+    model.apply(UiCommand::SelectNext);
+    model.apply(UiCommand::SetLogicalScroll(crikey_ui::LogicalScroll {
+        row: 1,
+        offset: 7.0,
+    }));
+    model.open_page(web_page_surface());
+    assert!(model.open_settings(None));
+    model.close_settings();
+    assert!(model.page().is_none(), "covered pixels are never revived");
+    let route = model
+        .take_page_reopen()
+        .expect("Back requests a new page session");
+    assert!(matches!(route, crikey_ui::NavigationRoute::CustomPage { .. }));
+    model.open_page(web_page_surface());
+    model.close_page();
+    assert_eq!(model.take_query_refresh().as_deref(), Some("shared"));
+    model.begin_generation(Generation::from_raw(2));
+    model.publish(Generation::from_raw(1), vec![row("stale")], false);
+    model.publish(Generation::from_raw(2), vec![second.clone(), first], false);
+    let restored = model.frame().unwrap();
+    assert_eq!(restored.rows[restored.selected].plugin, second.plugin);
+    assert_eq!(restored.query, "shared");
+    assert_eq!(
+        restored.navigation.scroll,
+        crikey_ui::LogicalScroll { row: 1, offset: 7.0 }
+    );
+}
+
+#[test]
+fn delayed_resume_uses_fake_clock_exact_boundary_and_fresh_admission() {
+    for age in [99, 100] {
+        let clock = Arc::new(NavigationTestClock(std::sync::atomic::AtomicU64::new(0)));
+        let mut model = LauncherViewModel::new();
+        model.set_navigation_clock(clock.clone());
+        model.set_resume_delay(std::time::Duration::from_millis(100));
+        model.activate();
+        model.apply(UiCommand::SetQuery("retained".into()));
+        model.begin_generation(Generation::from_raw(1));
+        model.publish(Generation::from_raw(1), rows(&["A", "B"]), false);
+        model.apply(UiCommand::SelectNext);
+        let old_view = model.view();
+        model.dismiss();
+        clock.0.store(age, std::sync::atomic::Ordering::Relaxed);
+        model.activate();
+        assert_ne!(model.view(), old_view);
+        model.publish(Generation::from_raw(1), rows(&["late"]), false);
+        if age == 99 {
+            assert_eq!(model.take_query_refresh().as_deref(), Some("retained"));
+            model.begin_generation(Generation::from_raw(2));
+            model.publish(Generation::from_raw(2), rows(&["A", "B"]), false);
+            let frame = model.frame().unwrap();
+            assert_eq!(selected_id(&frame), "B");
+        } else {
+            assert_eq!(model.take_query_refresh(), None);
+            let frame = model.frame().unwrap();
+            assert!(frame.query.is_empty() && frame.rows.is_empty());
+        }
+    }
+}
+
+#[test]
+fn covered_page_retains_only_route_and_owner_loss_is_recoverable() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let page = web_page_surface();
+    let pixels = Arc::downgrade(&page.frame);
+    model.open_page(page);
+    model.open_settings(None);
+    assert!(
+        pixels.upgrade().is_none(),
+        "navigation must not retain arbitrary custom content"
+    );
+    model.close_settings();
+    let route = model.take_page_reopen().unwrap();
+    model.page_reopen_failed(route, "owner was removed".into());
+    assert_eq!(model.take_query_refresh(), None);
+    let unavailable = model.frame().unwrap();
+    assert!(unavailable.navigation.can_go_back);
+    assert!(unavailable
+        .navigation
+        .unavailable
+        .unwrap()
+        .contains("owner was removed"));
+    model.apply(UiCommand::Back);
+    assert_eq!(model.view().unwrap().1, crikey_ui::ViewKind::RootList);
+}
+
+#[test]
+fn navigation_refuses_depth_and_retained_content_excess_visibly() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    for _ in 1..crikey_ui::navigation::MAX_NAVIGATION_ENTRIES {
+        assert!(model.open_page(web_page_surface()));
+    }
+    assert!(!model.open_page(web_page_surface()));
+    assert!(model.frame().unwrap().navigation.unavailable.is_some());
+
+    let mut large = LauncherViewModel::new();
+    large.activate();
+    large.apply(UiCommand::SetQuery("large".into()));
+    large.begin_generation(Generation::from_raw(1));
+    let mut content = row("large");
+    content.description = "x".repeat(crikey_ui::navigation::MAX_NAVIGATION_BYTES);
+    large.publish(Generation::from_raw(1), vec![content], false);
+    assert!(!large.open_page(web_page_surface()));
+    assert!(large.frame().unwrap().navigation.unavailable.is_some());
+}
+
+#[test]
+fn recall_is_an_empty_root_intent_not_result_or_action_navigation() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    assert_eq!(model.apply(UiCommand::RecallQuery), Some(UiEffect::RecallQuery));
+    model.apply(UiCommand::SetQuery("query".into()));
+    assert_eq!(model.apply(UiCommand::RecallQuery), None);
+    model.open_settings(None);
+    assert_eq!(model.apply(UiCommand::RecallQuery), None);
+}
+
+#[test]
+fn retained_navigation_counts_overallocated_icons_once_per_shared_allocation() {
+    let mut pixels = Vec::with_capacity(crikey_ui::navigation::MAX_NAVIGATION_BYTES);
+    pixels.extend_from_slice(&[0, 0, 0, 255]);
+    let icon = Arc::new(crikey_platform::IconImage::new("overallocated", 1, 1, pixels).unwrap());
+    assert!(icon.retained_bytes() > crikey_ui::navigation::MAX_NAVIGATION_BYTES);
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("tiny image".into()));
+    model.begin_generation(Generation::from_raw(1));
+    let mut result = row("tiny");
+    result.icon = Some(icon);
+    model.publish(Generation::from_raw(1), vec![result], false);
+    assert!(
+        !model.open_page(web_page_surface()),
+        "pixel length alone cannot bound retained allocations"
+    );
+
+    let mut pixels = Vec::with_capacity(3 * 1024 * 1024);
+    pixels.extend_from_slice(&[0, 0, 0, 255]);
+    let shared = Arc::new(crikey_platform::IconImage::new("shared", 1, 1, pixels).unwrap());
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("shared".into()));
+    model.begin_generation(Generation::from_raw(1));
+    let mut first = row("first");
+    first.icon = Some(shared.clone());
+    let mut second = row("second");
+    second.icon = Some(shared);
+    model.publish(Generation::from_raw(1), vec![first, second], false);
+    for _ in 1..crikey_ui::navigation::MAX_NAVIGATION_ENTRIES {
+        assert!(
+            model.open_page(web_page_surface()),
+            "shared row/icon allocations are counted only once"
+        );
+    }
+}
+
+#[test]
+fn recall_picker_selects_a_bounded_submission_without_executing_it() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.set_query_recall(vec!["newest".into(), "older".into()]);
+    model.apply(UiCommand::SelectNext);
+    assert_eq!(
+        model.apply(UiCommand::ExecuteDefault),
+        Some(UiEffect::Query("older".into()))
+    );
+    let frame = model.frame().unwrap();
+    assert_eq!(frame.query, "older");
+    assert!(frame.navigation.recall.is_empty());
+    assert!(
+        model.submitted_root_query().is_none(),
+        "choosing recall is not a fresh submission"
+    );
+}
+
+#[test]
+fn reusable_restoration_keeps_logical_scope_and_excludes_argument_drafts() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.restore_navigation_state(crikey_ui::NavigationRestoration {
+        query: "root".into(),
+        scope: Some("documents".into()),
+        ..Default::default()
+    });
+    model.open_settings(None);
+    model.close_settings();
+    assert_eq!(model.navigation_restoration().scope.as_deref(), Some("documents"));
+    model.begin_generation(Generation::from_raw(1));
+    let mut argument = row("argument");
+    argument.argument_hint = Some("argument required".into());
+    model.publish(Generation::from_raw(1), vec![argument], false);
+    assert!(model.navigation_restoration().query.is_empty());
+    assert!(model.submitted_root_query().is_none());
+}
+
+#[test]
+fn custom_route_resume_never_reuses_a_web_identity_or_old_pixels() {
+    let clock = Arc::new(NavigationTestClock(std::sync::atomic::AtomicU64::new(0)));
+    let mut model = LauncherViewModel::new();
+    model.set_navigation_clock(clock.clone());
+    model.set_resume_delay(std::time::Duration::from_millis(100));
+    model.activate();
+    model.open_page(web_page_surface());
+    let before = model.view();
+    model.declare_web_surface(41);
+    assert!(model.update_web_frame(engine_frame(41, 3, &[1; 8])));
+    model.dismiss();
+    clock.0.store(99, std::sync::atomic::Ordering::Relaxed);
+    model.activate();
+    assert_ne!(model.view(), before);
+    assert!(model.page().is_none());
+    assert!(matches!(
+        model.take_page_reopen(),
+        Some(crikey_ui::NavigationRoute::CustomPage { .. })
+    ));
+    model.open_page(web_page_surface());
+    assert!(model.page().unwrap().web_frame.is_none());
+    model.declare_web_surface(42);
+    assert!(!model.update_web_frame(engine_frame(41, 4, &[2; 8])));
+    assert!(model.update_web_frame(engine_frame(42, 1, &[3; 8])));
+    model.apply(UiCommand::Back);
+    assert_eq!(model.view().unwrap().1, crikey_ui::ViewKind::RootList);
+}
+
+#[test]
+fn settings_suspends_an_unavailable_route_until_back_not_the_refresh_drain() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.open_page(web_page_surface());
+    model.open_settings(None);
+    model.close_settings();
+    let route = model.take_page_reopen().unwrap();
+    model.page_reopen_failed(route.clone(), "owner unavailable".into());
+    model.open_settings(None);
+    assert!(
+        model.take_page_reopen().is_none(),
+        "covered routes cannot open over Settings"
+    );
+    let settings = model.frame().unwrap();
+    assert!(settings.settings_open);
+    assert!(settings.navigation.unavailable.is_none());
+    model.close_settings();
+    assert_eq!(model.take_page_reopen(), Some(route));
+}
+
+#[test]
+fn restored_scroll_survives_provider_waves_until_explicit_navigation_or_edit() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("rows".into()));
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(Generation::from_raw(1), numbered_rows(40), false);
+    model.apply(UiCommand::SetLogicalScroll(crikey_ui::LogicalScroll {
+        row: 20,
+        offset: 3.0,
+    }));
+    model.open_settings(None);
+    model.close_settings();
+    model.take_query_refresh().unwrap();
+    model.begin_generation(Generation::from_raw(2));
+    model.publish(Generation::from_raw(2), numbered_rows(40), true);
+    assert!(model.frame().unwrap().navigation.preserve_scroll);
+    model.publish(Generation::from_raw(2), numbered_rows(41), false);
+    let refreshed = model.frame().unwrap();
+    assert!(refreshed.navigation.preserve_scroll);
+    assert_eq!(refreshed.navigation.scroll.row, 20);
+    assert_eq!(
+        refreshed.selected, 0,
+        "selected row intentionally remains outside the restored viewport"
+    );
+    model.apply(UiCommand::SelectNext);
+    assert!(!model.frame().unwrap().navigation.preserve_scroll);
+}

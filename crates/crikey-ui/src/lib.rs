@@ -16,8 +16,12 @@ use crikey_platform::IconImage;
 
 pub mod action_panel;
 mod native;
+pub mod navigation;
 use action_panel::{ActionActivation, ActionExecution, ActionPanelNavigation, ActionTree, HostAction};
 pub use action_panel::{ActionIdentity, ActionPanel, ActionTarget};
+pub use navigation::{
+    LogicalScroll, NavigationClock, NavigationPresentation, NavigationRestoration, NavigationRoute,
+};
 mod preview_content;
 mod session_end;
 pub use preview_content::{prepare_preview, PreparedPreview, PreviewBlock, PreviewBlockKind, PreviewSpan};
@@ -362,6 +366,7 @@ pub struct ViewModel {
     /// never has to decide which of two full-height surfaces wins.
     pub page: Option<PageSurface>,
     pub preview: PreviewPane,
+    pub navigation: NavigationPresentation,
 }
 
 /// Keyboard-only interaction surface (spec 6.3).
@@ -369,6 +374,10 @@ pub struct ViewModel {
 /// Not [`Eq`]: a page input carries pointer coordinates, which are floats.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiCommand {
+    Back,
+    SetLogicalScroll(LogicalScroll),
+    RecallQuery,
+    ClearQueryHistory,
     FocusPreview,
     LeavePreview,
     ShowPreviewDetail,
@@ -453,6 +462,8 @@ pub const PAGE_SIZE: usize = 8;
 /// Not [`Eq`], for the same reason [`UiCommand`] is not.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiEffect {
+    RecallQuery,
+    ClearQueryHistory,
     /// The query text changed; schedule a generation for it (spec 6.2.2).
     Query(String),
     /// Run `action` on `item` (spec 6.2.10). The launcher stays open —
@@ -655,6 +666,22 @@ pub struct LauncherViewModel {
     preview: PreviewPane,
     preview_selection: Option<PreviewSelection>,
     selection_revision: u64,
+    navigation_stack: Vec<navigation::Entry>,
+    navigation_scroll: LogicalScroll,
+    navigation_restore: u64,
+    navigation_unavailable: Option<String>,
+    page_reopen: Option<NavigationRoute>,
+    reopening: bool,
+    resume_delay: std::time::Duration,
+    suspended_at: Option<std::time::Duration>,
+    suspended: Option<navigation::Entry>,
+    navigation_clock: Arc<dyn NavigationClock>,
+    recall: Arc<[String]>,
+    recall_selected: usize,
+    navigation_scope: Option<String>,
+    restoration_target: Option<ActionTarget>,
+    navigation_title: Arc<str>,
+    preserve_scroll: bool,
 }
 
 impl Default for LauncherViewModel {
@@ -666,8 +693,8 @@ impl Default for LauncherViewModel {
 impl LauncherViewModel {
     /// Builds the warm launcher: fully constructed, hidden, presenting nothing.
     ///
-    /// Whatever this costs is paid once at startup; activation itself is a
-    /// visibility flip that allocates nothing (ADR-0002).
+    /// Construction and the bounded navigation entry pool are paid once at
+    /// startup. Default reset-mode activation needs no reconstruction.
     pub fn new() -> Self {
         Self {
             visible: false,
@@ -694,7 +721,241 @@ impl LauncherViewModel {
             preview: PreviewPane::default(),
             preview_selection: None,
             selection_revision: 0,
+            navigation_stack: Vec::with_capacity(navigation::MAX_NAVIGATION_ENTRIES - 1),
+            navigation_scroll: LogicalScroll::default(),
+            navigation_restore: 0,
+            navigation_unavailable: None,
+            page_reopen: None,
+            reopening: false,
+            resume_delay: std::time::Duration::ZERO,
+            suspended_at: None,
+            suspended: None,
+            navigation_clock: Arc::new(navigation::MonotonicNavigationClock::default()),
+            recall: Arc::default(),
+            recall_selected: 0,
+            navigation_scope: None,
+            restoration_target: None,
+            navigation_title: Arc::from("Search"),
+            preserve_scroll: false,
         }
+    }
+
+    /// Inject before first activation; expiry is monotonic and exact at the boundary.
+    pub fn set_navigation_clock(&mut self, clock: Arc<dyn NavigationClock>) {
+        self.suspended = None;
+        self.suspended_at = None;
+        self.navigation_clock = clock;
+    }
+
+    pub fn set_resume_delay(&mut self, delay: std::time::Duration) {
+        self.resume_delay = delay;
+        if delay.is_zero() {
+            self.suspended = None;
+            self.suspended_at = None;
+            if !self.visible {
+                self.navigation_stack.clear();
+            }
+        }
+    }
+
+    pub fn navigation_restoration(&self) -> NavigationRestoration {
+        // Legacy/free-form argument-bearing targets cannot donate raw argument text.
+        if self
+            .rows
+            .get(self.selected)
+            .is_some_and(|row| row.argument_hint.is_some())
+        {
+            return NavigationRestoration::default();
+        }
+        NavigationRestoration {
+            query: self.query.clone(),
+            selected: self.rows.get(self.selected).map(ActionTarget::of),
+            fallback_index: self.selected,
+            navigated: self.navigated,
+            scope: self.navigation_scope.clone(),
+            scroll: self.navigation_scroll.clone(),
+        }
+    }
+
+    /// Restores logical host state only. The caller owns route/resource cleanup;
+    /// the ordinary refresh drain issues fresh work instead of reviving answers.
+    pub fn restore_navigation_state(&mut self, state: NavigationRestoration) {
+        if !self.visible {
+            return;
+        }
+        self.query = state.query;
+        self.selected = state
+            .selected
+            .as_ref()
+            .and_then(|target| self.rows.iter().position(|row| target.matches(row)))
+            .unwrap_or(state.fallback_index.min(self.rows.len().saturating_sub(1)));
+        self.navigated = state.navigated;
+        self.restoration_target = state.selected;
+        self.navigation_scope = state.scope;
+        self.navigation_scroll = if state.scroll.offset.is_finite() && state.scroll.offset >= 0.0 {
+            state.scroll
+        } else {
+            LogicalScroll::default()
+        };
+        self.preserve_scroll = true;
+        self.navigation_restore = self
+            .navigation_restore
+            .checked_add(1)
+            .expect("restoration identity exhausted");
+        self.active = None;
+        self.published = None;
+        self.publication_view = None;
+        self.query_refresh = self.visible && self.view().is_some_and(|(_, kind)| kind == ViewKind::RootList);
+        self.restore_selection = self.navigated;
+        self.preview_selection();
+        self.dirty |= self.visible;
+    }
+
+    fn capture_entry(&self) -> navigation::Entry {
+        let route = if self.settings_open {
+            NavigationRoute::Settings {
+                focus: self.settings_focus.clone(),
+            }
+        } else if let Some(page) = &self.page {
+            NavigationRoute::CustomPage {
+                plugin: page.plugin.clone(),
+                page_id: page.page_id.clone(),
+                title: page.plugin_name.clone(),
+            }
+        } else if let Some(route) = &self.page_reopen {
+            route.clone()
+        } else {
+            NavigationRoute::Root
+        };
+        let state = self.navigation_restoration();
+        let rows = if state.query.is_empty() {
+            Arc::default()
+        } else {
+            self.rows.clone()
+        };
+        navigation::Entry { route, rows, state }
+    }
+
+    fn push_navigation(&mut self) -> bool {
+        let entry = self.capture_entry();
+        if self.navigation_stack.len() + 1 >= navigation::MAX_NAVIGATION_ENTRIES
+            || navigation::retained_bytes(self.navigation_stack.iter().chain(std::iter::once(&entry)))
+                > navigation::MAX_NAVIGATION_BYTES
+        {
+            self.navigation_unavailable =
+                Some("Navigation limit reached. Go Back before opening another view.".into());
+            self.dirty = true;
+            return false;
+        }
+        self.navigation_stack.push(entry);
+        self.navigation_unavailable = None;
+        self.navigation_scroll = LogicalScroll::default();
+        true
+    }
+
+    fn restore_entry(&mut self, entry: navigation::Entry) {
+        self.page = None;
+        self.settings_open = false;
+        self.settings_focus = None;
+        self.page_reopen = None;
+        self.rows = entry.rows;
+        self.restore_navigation_state(entry.state);
+        self.query_refresh = false;
+        self.navigation_unavailable = None;
+        match entry.route {
+            NavigationRoute::Root => {
+                self.navigation_title = Arc::from("Search");
+                self.query_refresh = self.visible;
+            }
+            NavigationRoute::Settings { focus } => {
+                self.navigation_title = Arc::from("Settings");
+                self.settings_open = true;
+                self.settings_focus = focus;
+            }
+            route @ NavigationRoute::CustomPage { .. } => {
+                if let NavigationRoute::CustomPage { title, page_id, .. } = &route {
+                    self.navigation_title = Arc::from(format!("{title} — {page_id}"));
+                }
+                self.page_reopen = Some(route);
+            }
+        }
+        self.preview_selection();
+        self.dirty |= self.visible;
+    }
+
+    fn pop_navigation(&mut self) {
+        if let Some(entry) = self.navigation_stack.pop() {
+            self.change_view();
+            self.restore_entry(entry);
+        }
+    }
+
+    /// Drain after closing the old surface. The descriptor has no engine state.
+    pub fn take_page_reopen(&mut self) -> Option<NavigationRoute> {
+        if !self.visible || self.navigation_unavailable.is_some() {
+            return None;
+        }
+        let route = self.page_reopen.take()?;
+        self.reopening = true;
+        Some(route)
+    }
+
+    /// An unavailable owner stays a recoverable route with host-owned Back.
+    pub fn page_reopen_failed(&mut self, route: NavigationRoute, reason: String) {
+        self.reopening = false;
+        self.page = None;
+        self.page_reopen = Some(route);
+        self.set_navigation_notice(format!("Page unavailable: {reason}"));
+        self.dirty = true;
+    }
+
+    fn navigation_presentation(&self) -> NavigationPresentation {
+        NavigationPresentation {
+            title: self.navigation_title.clone(),
+            can_go_back: !self.navigation_stack.is_empty(),
+            scroll: self.navigation_scroll.clone(),
+            restoration: self.navigation_restore,
+            preserve_scroll: self.preserve_scroll,
+            unavailable: self.navigation_unavailable.clone(),
+            recall: self.recall.clone(),
+            recall_selected: self.recall_selected,
+        }
+    }
+
+    /// One bounded transient picker snapshot, never retained in navigation.
+    pub fn set_query_recall(&mut self, queries: Vec<String>) {
+        if !self.visible
+            || self.view().is_none_or(|(_, kind)| kind != ViewKind::RootList)
+            || !self.query.is_empty()
+            || !self.rows.is_empty()
+        {
+            return;
+        }
+        let mut bytes = 0usize;
+        self.recall = queries
+            .into_iter()
+            .take(100)
+            .filter(|query| {
+                if query.is_empty() || query.len() > 4096 || query.chars().any(char::is_control) {
+                    return false;
+                }
+                bytes += query.len();
+                bytes <= 256 * 1024
+            })
+            .collect::<Vec<_>>()
+            .into();
+        self.recall_selected = 0;
+        self.dirty = true;
+    }
+
+    pub fn set_navigation_notice(&mut self, mut message: String) {
+        let mut end = message.len().min(action_panel::MAX_ACTION_TEXT_BYTES);
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        self.navigation_unavailable = Some(message);
+        self.dirty |= self.visible;
     }
 
     pub fn is_visible(&self) -> bool {
@@ -707,12 +968,23 @@ impl LauncherViewModel {
             self.view_id,
             if self.settings_open {
                 ViewKind::Settings
-            } else if self.page.is_some() {
+            } else if self.page.is_some() || self.page_reopen.is_some() || self.reopening {
                 ViewKind::CustomPage
             } else {
                 ViewKind::RootList
             },
         ))
+    }
+
+    /// A deliberate Enter on a non-argument root result, not an action search.
+    pub fn submitted_root_query(&self) -> Option<(&str, &PluginId, &ItemId)> {
+        let row = self.current_action_row()?;
+        (self.view().is_some_and(|(_, kind)| kind == ViewKind::RootList)
+            && self.action_panel.is_none()
+            && !self.query.trim().is_empty()
+            && row.argument_hint.is_none()
+            && row.default_action.is_some())
+        .then_some((self.query.as_str(), &row.plugin, &row.item))
     }
 
     /// Drains the fresh search owed after uncovering the root list.
@@ -721,7 +993,13 @@ impl LauncherViewModel {
     /// a lifecycle effect. The host drains this after applying commands and
     /// asynchronous page transitions, through its ordinary query dispatch.
     pub fn take_query_refresh(&mut self) -> Option<String> {
-        if !self.visible || self.settings_open || self.page.is_some() || !self.query_refresh {
+        if !self.visible
+            || self.settings_open
+            || self.page.is_some()
+            || self.page_reopen.is_some()
+            || self.reopening
+            || !self.query_refresh
+        {
             return None;
         }
         self.query_refresh = false;
@@ -731,6 +1009,7 @@ impl LauncherViewModel {
 
     fn change_view(&mut self) {
         self.view_id = ViewId(self.view_id.0.checked_add(1).expect("view identity exhausted"));
+        self.recall = Arc::default();
         self.publication_view = None;
         self.pending_plugins = false;
         self.close_actions();
@@ -745,13 +1024,24 @@ impl LauncherViewModel {
 
         self.visible = true;
         self.change_view();
+        if let Some(entry) = self.suspended.take() {
+            if self
+                .suspended_at
+                .take()
+                .and_then(|at| self.navigation_clock.now().checked_sub(at))
+                .is_some_and(|age| age < self.resume_delay)
+            {
+                self.restore_entry(entry);
+            } else {
+                self.navigation_stack.clear();
+            }
+        }
         self.dirty = true;
     }
 
-    /// Hides the launcher and clears the query, the rows, the selection, the
-    /// action list and the pending flag. The object survives for the next
-    /// hotkey press and the query buffer keeps its capacity, so reactivation
-    /// allocates nothing.
+    /// Hides and retires all live admission. Immediate reset is the default;
+    /// an optional bounded, memory-only logical snapshot can resume before its
+    /// monotonic deadline, but it never retains a page frame or engine.
     ///
     /// Clearing the accept target is what makes dismissal a session boundary:
     /// plugin results still in flight for the generation that was live when the
@@ -760,17 +1050,38 @@ impl LauncherViewModel {
     /// same generations also stay rejected by
     /// [`begin_generation`](Self::begin_generation) (spec 6.5).
     ///
-    /// The settings *rows* survive, because they describe the host's
-    /// configuration rather than this session, but the surface itself closes:
-    /// the next activation is a fresh launcher, not the panel the user left
-    /// open. An open page closes for the same reason, and the host's own
-    /// handling of [`UiEffect::Dismissed`] is what ends the plugin's side of
-    /// it: the model holds no transport and cannot tell the plugin anything.
+    /// Host configuration survives. Page surfaces always close; the host's
+    /// handling of [`UiEffect::Dismissed`] ends their resources. A resumed
+    /// custom route requests a new session rather than restoring those resources.
     pub fn dismiss(&mut self) {
         if !self.visible {
             return;
         }
 
+        self.navigation_unavailable = None;
+        self.navigation_title = Arc::from("Search");
+        if !self.resume_delay.is_zero() {
+            let entry = self.capture_entry();
+            if navigation::retained_bytes(self.navigation_stack.iter().chain(std::iter::once(&entry)))
+                <= navigation::MAX_NAVIGATION_BYTES
+            {
+                self.suspended = Some(entry);
+                self.suspended_at = Some(self.navigation_clock.now());
+            } else {
+                self.suspended = None;
+                self.suspended_at = None;
+                self.navigation_stack.clear();
+                self.navigation_unavailable =
+                    Some("Previous view exceeded the 8 MiB resume limit; search was reset.".into());
+            }
+        } else {
+            self.suspended = None;
+            self.suspended_at = None;
+            self.navigation_stack.clear();
+        }
+        self.page_reopen = None;
+        self.navigation_scroll = LogicalScroll::default();
+        self.preserve_scroll = false;
         self.visible = false;
         self.dirty = false;
         self.query.clear();
@@ -787,6 +1098,11 @@ impl LauncherViewModel {
         self.publication_view = None;
         self.query_refresh = false;
         self.restore_selection = false;
+        self.recall = Arc::default();
+        self.reopening = false;
+        self.navigation_scope = None;
+        self.restoration_target = None;
+        self.preview_selection();
     }
 
     /// Makes `generation` the active one and marks results outstanding.
@@ -802,6 +1118,8 @@ impl LauncherViewModel {
         if !self.visible
             || self.settings_open
             || self.page.is_some()
+            || self.page_reopen.is_some()
+            || self.reopening
             || generation == Generation::ZERO
             || self.floor.is_some_and(|floor| generation <= floor)
         {
@@ -855,6 +1173,9 @@ impl LauncherViewModel {
         }
         self.pending_plugins = pending_plugins;
         self.published = Some(generation);
+        if !pending_plugins {
+            self.restoration_target = None;
+        }
         self.dirty = true;
     }
 
@@ -891,6 +1212,7 @@ impl LauncherViewModel {
             show_hints: self.show_hints,
             rounded_corners: self.rounded_corners,
             preview: self.preview.clone(),
+            navigation: self.navigation_presentation(),
         })
     }
 
@@ -911,6 +1233,27 @@ impl LauncherViewModel {
         }
 
         match command {
+            UiCommand::Back => {
+                let had_page = self.page.is_some();
+                self.pop_navigation();
+                had_page.then_some(UiEffect::ClosePage)
+            }
+            UiCommand::SetLogicalScroll(scroll) => {
+                if scroll.offset.is_finite() && scroll.offset >= 0.0 {
+                    self.navigation_scroll = scroll;
+                }
+                None
+            }
+            UiCommand::RecallQuery => (self.view().is_some_and(|(_, kind)| kind == ViewKind::RootList)
+                && self.query.is_empty()
+                && self.rows.is_empty()
+                && self.action_panel.is_none())
+            .then_some(UiEffect::RecallQuery),
+            UiCommand::ClearQueryHistory => {
+                self.recall = Arc::default();
+                self.dirty = true;
+                Some(UiEffect::ClearQueryHistory)
+            }
             UiCommand::OpenPreviewLink { target, url } => {
                 if self.preview_selection().as_ref() == Some(&target.selection)
                     && self.preview.link_target.as_ref() == Some(&target)
@@ -950,6 +1293,14 @@ impl LauncherViewModel {
                     UiCommand::PageDown => PAGE_SIZE as isize,
                     _ => -(PAGE_SIZE as isize),
                 };
+                if !self.recall.is_empty() {
+                    self.recall_selected = self
+                        .recall_selected
+                        .saturating_add_signed(delta)
+                        .min(self.recall.len() - 1);
+                    self.dirty = true;
+                    return None;
+                }
                 if let Some(panel) = &mut self.action_panel {
                     self.dirty |= Arc::make_mut(panel).move_selection(delta);
                 } else {
@@ -984,6 +1335,9 @@ impl LauncherViewModel {
                 None
             }
             UiCommand::ExecuteDefault => {
+                if let Some(query) = self.recall.get(self.recall_selected).cloned() {
+                    return self.retype(query);
+                }
                 if self.action_panel.is_some() {
                     return self.activate_panel();
                 }
@@ -1035,6 +1389,11 @@ impl LauncherViewModel {
                 self.dirty = true;
                 None
             }
+            UiCommand::Cancel if !self.recall.is_empty() => {
+                self.recall = Arc::default();
+                self.dirty = true;
+                None
+            }
             UiCommand::Cancel if self.page.is_some() => {
                 self.close_page();
                 Some(UiEffect::ClosePage)
@@ -1045,6 +1404,10 @@ impl LauncherViewModel {
             }
             UiCommand::Cancel if self.action_panel.is_some() => {
                 self.action_back();
+                None
+            }
+            UiCommand::Cancel if !self.navigation_stack.is_empty() => {
+                self.pop_navigation();
                 None
             }
             // Clearing the query is an ordinary edit, so it goes through the
@@ -1065,10 +1428,18 @@ impl LauncherViewModel {
     /// field, and a row the user cannot see must not still be the one Enter
     /// runs.
     fn retype(&mut self, text: String) -> Option<UiEffect> {
+        if self.view().is_none_or(|(_, kind)| kind != ViewKind::RootList) {
+            return None;
+        }
+        self.dirty |= !self.recall.is_empty();
+        self.recall = Arc::default();
         if self.query == text {
             return None;
         }
         self.restore_selection = false;
+        self.restoration_target = None;
+        self.navigation_scroll = LogicalScroll::default();
+        self.preserve_scroll = false;
         self.close_actions();
         self.publication_view = None;
         self.preview_selection();
@@ -1096,6 +1467,8 @@ impl LauncherViewModel {
             return None;
         }
         self.restore_selection = false;
+        self.preserve_scroll = false;
+        self.navigation_scroll = LogicalScroll::default();
 
         self.query.clear();
         self.query.push_str(&row.label);
@@ -1319,11 +1692,18 @@ impl LauncherViewModel {
         }
 
         if !self.settings_open {
+            if !self.push_navigation() {
+                return false;
+            }
             self.change_view();
         }
         let had_page = self.page.take().is_some();
+        self.page_reopen = None;
+        self.reopening = false;
+        self.navigation_unavailable = None;
         self.settings_open = true;
         self.settings_focus = focus;
+        self.navigation_title = Arc::from("Settings");
         self.dirty |= self.visible;
         had_page
     }
@@ -1336,11 +1716,7 @@ impl LauncherViewModel {
             return;
         }
 
-        self.settings_open = false;
-        self.settings_focus = None;
-        self.change_view();
-        self.query_refresh = self.visible;
-        self.dirty |= self.visible;
+        self.pop_navigation();
     }
 
     /// The page the launcher is showing right now, if any (spec 32).
@@ -1367,9 +1743,14 @@ impl LauncherViewModel {
             return false;
         }
 
+        if !self.reopening && !self.push_navigation() {
+            return false;
+        }
+        self.reopening = false;
         self.change_view();
         self.settings_open = false;
         self.settings_focus = None;
+        self.navigation_title = Arc::from(format!("{} — {}", surface.plugin_name, surface.page_id));
         self.page = Some(surface);
         self.dirty = true;
         true
@@ -1540,10 +1921,7 @@ impl LauncherViewModel {
         if self.page.take().is_none() {
             return false;
         }
-        self.change_view();
-        self.query_refresh = self.visible;
-
-        self.dirty |= self.visible;
+        self.pop_navigation();
         true
     }
 
@@ -1651,6 +2029,8 @@ impl LauncherViewModel {
     /// Moves the selection to `target`, clamped into range. Navigation never
     /// wraps, and an empty list has nothing to move.
     fn select(&mut self, target: usize) {
+        self.dirty |= self.preserve_scroll;
+        self.preserve_scroll = false;
         let Some(last) = self.rows.len().checked_sub(1) else {
             return;
         };
@@ -1661,6 +2041,7 @@ impl LauncherViewModel {
         }
 
         self.selected = target;
+        self.restoration_target = None;
         self.preview_selection();
         // The only path a person's arrow or page key reaches, so this is where
         // a default becomes a choice.
@@ -1683,6 +2064,11 @@ impl LauncherViewModel {
             return 0;
         };
 
+        if let Some(target) = &self.restoration_target {
+            if let Some(index) = incoming.iter().position(|row| target.matches(row)) {
+                return index;
+            }
+        }
         if self.published != Some(generation) {
             return 0;
         }

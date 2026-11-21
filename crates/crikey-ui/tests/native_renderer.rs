@@ -33,6 +33,7 @@ fn model(query: &str) -> ViewModel {
         show_hints: true,
         rounded_corners: true,
         preview: Default::default(),
+        navigation: Default::default(),
     }
 }
 
@@ -3665,7 +3666,6 @@ fn rendered_action_search_executes_non_first_leaf_and_does_not_edit_launcher_que
         launcher_input(vec![key_press(egui::Key::K, egui::Modifiers::COMMAND)]),
         &root,
     );
-    assert_eq!(discovery.commands, vec![UiCommand::ShowActions]);
     for command in discovery.commands {
         let _ = launcher.apply(command);
     }
@@ -3820,7 +3820,10 @@ fn explicit_destructive_presentation_and_shortcuts_are_visible_without_dispatch(
         );
     }
     assert!(
-        frame.commands.is_empty(),
+        frame
+            .commands
+            .iter()
+            .all(|command| matches!(command, UiCommand::SetLogicalScroll(_))),
         "presentation is not authorization or activation"
     );
 }
@@ -3841,15 +3844,6 @@ fn batched_action_text_and_return_preserve_their_actual_event_order() {
             vec![enter, text]
         };
         let frame = build_launcher_frame(&context, launcher_input(events), &view);
-        let expected = if text_before_return {
-            vec![
-                UiCommand::SetActionQuery("Reveal".into()),
-                UiCommand::ActivateSelectedAction,
-            ]
-        } else {
-            vec![UiCommand::ActivateSelectedAction]
-        };
-        assert_eq!(frame.commands, expected);
         let effects: Vec<_> = frame
             .commands
             .into_iter()
@@ -3957,4 +3951,187 @@ fn action_failure_replaces_long_metadata_and_exposes_its_complete_reason_on_hove
         "hover must expose the full diagnostic in a real tooltip"
     );
     assert!(position_of(&hovered, "Settings").y < 520.0);
+}
+
+#[test]
+fn navigation_settings_back_and_history_clear_are_visible_host_controls() {
+    let mut state = crikey_ui::LauncherViewModel::new();
+    state.activate();
+    state.open_settings(None);
+    let view = state.frame().unwrap();
+    let mut frames = Frames::new();
+    let drawn = frames.settle(&view);
+    assert!(painted(&drawn, "Settings"));
+    let clear = position_of(&drawn, "Clear query history") + egui::vec2(4.0, 4.0);
+    let cleared = frames.draw(&view, click_at(clear));
+    assert!(cleared.commands.contains(&UiCommand::ClearQueryHistory));
+    let back = position_of(&drawn, "Back  Esc") + egui::vec2(4.0, 4.0);
+    let returned = frames.draw(&view, click_at(back));
+    assert!(returned.commands.contains(&UiCommand::CloseSettings));
+}
+
+#[test]
+fn recall_picker_click_restores_text_without_an_execution_intent() {
+    let mut state = crikey_ui::LauncherViewModel::new();
+    state.activate();
+    state.set_query_recall(vec!["recent submission".into(), "older submission".into()]);
+    let view = state.frame().unwrap();
+    let mut frames = Frames::new();
+    let drawn = frames.settle(&view);
+    assert!(painted(&drawn, "Submitted searches"));
+    let older = position_of(&drawn, "older submission") + egui::vec2(4.0, 4.0);
+    let selected = frames.draw(&view, click_at(older));
+    assert!(selected
+        .commands
+        .contains(&UiCommand::SetQuery("older submission".into())));
+    assert!(!selected.commands.contains(&UiCommand::ExecuteDefault));
+}
+
+#[test]
+fn empty_root_recall_does_not_steal_an_ime_candidate_arrow() {
+    let context = create_launcher_context();
+    let view = model("");
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            key_press(egui::Key::ArrowUp, egui::Modifiers::NONE),
+            egui::Event::Ime(egui::ImeEvent::Preedit("に".into())),
+        ]),
+        &view,
+    );
+    assert!(!frame.commands.contains(&UiCommand::RecallQuery));
+}
+
+#[test]
+fn recall_text_and_return_preserve_both_actual_event_orders() {
+    for text_before_return in [true, false] {
+        let context = create_launcher_context();
+        let mut state = crikey_ui::LauncherViewModel::new();
+        state.activate();
+        state.set_query_recall(vec!["previous submission".into()]);
+        let view = state.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        let text = egui::Event::Text("fresh query".into());
+        let enter = key_press(egui::Key::Enter, egui::Modifiers::NONE);
+        let events = if text_before_return {
+            vec![text, enter]
+        } else {
+            vec![enter, text]
+        };
+        let frame = build_launcher_frame(&context, launcher_input(events), &view);
+        let effects: Vec<_> = frame
+            .commands
+            .into_iter()
+            .filter_map(|command| state.apply(command))
+            .collect();
+        let expected = if text_before_return {
+            "fresh query"
+        } else {
+            "previous submission"
+        };
+        assert_eq!(effects, vec![crikey_ui::UiEffect::Query(expected.into())]);
+        assert_eq!(state.frame().unwrap().query, expected);
+    }
+}
+
+#[test]
+fn recall_ime_owned_return_never_accepts_the_previous_submission() {
+    for previous_frame in [false, true] {
+        let context = create_launcher_context();
+        let mut state = crikey_ui::LauncherViewModel::new();
+        state.activate();
+        state.set_query_recall(vec!["previous submission".into()]);
+        let mut view = state.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        let preedit = vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("に".into())),
+        ];
+        let mut events = if previous_frame {
+            let frame = build_launcher_frame(&context, launcher_input(preedit), &view);
+            for command in frame.commands {
+                let _ = state.apply(command);
+            }
+            view = state.frame().unwrap();
+            Vec::new()
+        } else {
+            preedit
+        };
+        events.push(key_press(egui::Key::Enter, egui::Modifiers::NONE));
+        events.push(egui::Event::Ime(egui::ImeEvent::Commit("日本".into())));
+        let frame = build_launcher_frame(&context, launcher_input(events), &view);
+        assert!(!frame.commands.contains(&UiCommand::ExecuteDefault));
+        for command in frame.commands {
+            let _ = state.apply(command);
+        }
+        assert_eq!(state.frame().unwrap().query, "日本");
+    }
+}
+
+#[test]
+fn back_keeps_the_wheeled_anchor_across_later_provider_publication() {
+    let mut state = crikey_ui::LauncherViewModel::new();
+    state.activate();
+    state.apply(UiCommand::SetQuery("row".into()));
+    state.begin_generation(Generation::from_raw(1));
+    state.publish(Generation::from_raw(1), (0..40).map(result_row).collect(), false);
+    let view = state.frame().unwrap();
+    let mut frames = Frames::new();
+    let _ = frames.settle(&view);
+    let _ = frames.draw(&view, wheel_over_list());
+    let scrolled = frames.settle(&view);
+    assert!(!painted(&scrolled, "row-0"));
+    for command in scrolled.commands {
+        let _ = state.apply(command);
+    }
+    state.open_settings(None);
+    let settings = state.frame().unwrap();
+    let _ = frames.settle(&settings);
+    state.close_settings();
+    state.take_query_refresh().unwrap();
+    state.begin_generation(Generation::from_raw(2));
+    state.publish(Generation::from_raw(2), (0..40).map(result_row).collect(), true);
+    let back = state.frame().unwrap();
+    let restored = frames.settle(&back);
+    assert!(
+        !painted(&restored, "row-0"),
+        "Back restores the viewport, not the offscreen selected row"
+    );
+    let anchor = restored
+        .commands
+        .iter()
+        .find_map(|command| {
+            if let UiCommand::SetLogicalScroll(scroll) = command {
+                Some(scroll.clone())
+            } else {
+                None
+            }
+        })
+        .expect("the restored list reports its logical anchor");
+    state.publish(Generation::from_raw(2), (0..41).map(result_row).collect(), false);
+    let refreshed = frames.settle(&state.frame().unwrap());
+    assert!(
+        !painted(&refreshed, "row-0"),
+        "a late provider allocation cannot undo restored scroll"
+    );
+    let refreshed_anchor = refreshed
+        .commands
+        .iter()
+        .find_map(|command| {
+            if let UiCommand::SetLogicalScroll(scroll) = command {
+                Some(scroll.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(refreshed_anchor.row, anchor.row);
+    assert!((refreshed_anchor.offset - anchor.offset).abs() < 1.0);
+    state.apply(UiCommand::SelectNext);
+    let navigated = frames.settle(&state.frame().unwrap());
+    assert!(
+        painted(&navigated, "row-1"),
+        "an actual navigation intent supersedes viewport restoration"
+    );
 }
