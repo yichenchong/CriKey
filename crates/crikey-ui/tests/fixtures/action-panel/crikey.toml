@@ -1,0 +1,16 @@
+manifest-version = 1
+
+[plugin]
+id = "action-panel-fixture"
+name = "Action Panel Fixture"
+version = "1.0.0"
+runtime = "python"
+entrypoint = "action_fixture:ActionFixture"
+
+[python]
+requires-python = ">=3.12"
+
+[performance]
+# Bounded by the existing host callback ceiling; enough time for manual panel
+# interaction before releasing the acceptance gate. Not a host policy change.
+suggest-hard-timeout-ms = 120000

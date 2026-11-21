@@ -25,7 +25,7 @@ fn model(query: &str) -> ViewModel {
         rows: Arc::default(),
         selected: 0,
         pending_plugins: false,
-        actions_open: false,
+        action_panel: None,
         settings_open: false,
         settings: Arc::default(),
         settings_focus: None,
@@ -3628,4 +3628,333 @@ fn split_and_narrow_detail_share_one_current_image_and_retire_it_on_replacement(
     let closed = preview_frame(&context, &view, 480.0);
     assert!(closed.output.textures_delta.free.contains(&new_id));
     assert!(current.upgrade().is_none());
+}
+
+fn action_launcher() -> crikey_ui::LauncherViewModel {
+    use crikey_core::{Action, ActionId, ExecutionPolicy};
+    let mut row = result_row(0);
+    let action = |id: &str, label: &str| Action {
+        action_id: ActionId(id.into()),
+        label: label.into(),
+        description: String::new(),
+        applicable_categories: Vec::new(),
+        icon_reference: None,
+        execution_policy: ExecutionPolicy::Plugin,
+    };
+    row.default_action = Some(action("run", "Run selected"));
+    row.alternate_actions = vec![
+        action("copy", "Copy selected"),
+        action("reveal", "Reveal selected"),
+    ];
+    let mut launcher = crikey_ui::LauncherViewModel::new();
+    launcher.activate();
+    let _ = launcher.apply(UiCommand::SetQuery("fixture".into()));
+    launcher.begin_generation(Generation::from_raw(1));
+    launcher.publish(Generation::from_raw(1), vec![row], false);
+    launcher
+}
+
+#[test]
+fn rendered_action_search_executes_non_first_leaf_and_does_not_edit_launcher_query() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    let root = launcher.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(vec![]), &root);
+    let discovery = build_launcher_frame(
+        &context,
+        launcher_input(vec![key_press(egui::Key::K, egui::Modifiers::COMMAND)]),
+        &root,
+    );
+    assert_eq!(discovery.commands, vec![UiCommand::ShowActions]);
+    for command in discovery.commands {
+        let _ = launcher.apply(command);
+    }
+    let open = launcher.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(vec![]), &open);
+    let typed = build_launcher_frame(
+        &context,
+        launcher_input(vec![egui::Event::Text("Reveal".into())]),
+        &open,
+    );
+    assert!(typed
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetActionQuery(query) if query == "Reveal")));
+    assert!(!typed
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetQuery(_))));
+    for command in typed.commands {
+        let _ = launcher.apply(command);
+    }
+    let filtered = launcher.frame().unwrap();
+    assert_eq!(filtered.query, "fixture");
+    let painted = build_launcher_frame(&context, launcher_input(vec![]), &filtered);
+    assert!(painted
+        .output
+        .shapes
+        .iter()
+        .any(|shape| contains_text(&shape.shape, "Reveal selected")));
+    assert!(!painted
+        .output
+        .shapes
+        .iter()
+        .any(|shape| contains_text(&shape.shape, "Copy selected")));
+    let execute = build_launcher_frame(
+        &context,
+        launcher_input(vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)]),
+        &filtered,
+    );
+    let effects: Vec<_> = execute
+        .commands
+        .into_iter()
+        .filter_map(|command| launcher.apply(command))
+        .collect();
+    assert_eq!(
+        effects,
+        vec![crikey_ui::UiEffect::Execute {
+            owner: PluginId("renderer-fixture".into()),
+            item: ItemId("item-0".into()),
+            action: crikey_core::ActionId("reveal".into()),
+        }]
+    );
+}
+
+#[test]
+fn discovery_shortcuts_do_not_steal_settings_page_or_composition_input() {
+    for (key, modifiers, expected_keysym, expected_modifiers) in [
+        (
+            egui::Key::K,
+            egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+            u32::from(b'k'),
+            crikey_ui::WEB_MODIFIER_CONTROL,
+        ),
+        (
+            egui::Key::K,
+            egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND,
+            u32::from(b'k'),
+            crikey_ui::WEB_MODIFIER_META,
+        ),
+        (
+            egui::Key::Enter,
+            egui::Modifiers::ALT,
+            0xff0d,
+            crikey_ui::WEB_MODIFIER_ALT,
+        ),
+    ] {
+        for surface in 0..3 {
+            let context = create_launcher_context();
+            let mut view = match surface {
+                0 => hotkey_settings_model(),
+                1 => page_view(vec![]),
+                _ => painted_web_view(41, 1, &[0; 8]),
+            };
+            view.query = "retained".into();
+            let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+            let frame =
+                build_launcher_frame(&context, launcher_input(vec![key_press(key, modifiers)]), &view);
+            assert!(!frame.commands.contains(&UiCommand::ShowActions));
+            if surface == 2 {
+                assert!(web_inputs(&frame).iter().any(|input| matches!(
+                    input, WebSurfaceInput::Key { surface_id: 41, pressed: true, keysym, modifiers, .. }
+                        if *keysym == expected_keysym && *modifiers == expected_modifiers
+                )));
+            }
+        }
+        let context = create_launcher_context();
+        let mut launcher = action_launcher();
+        let root = launcher.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(vec![]), &root);
+        let frame = build_launcher_frame(
+            &context,
+            launcher_input(vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("composing".into())),
+                key_press(key, modifiers),
+            ]),
+            &root,
+        );
+        assert!(!frame.commands.contains(&UiCommand::ShowActions));
+    }
+}
+
+#[test]
+fn explicit_destructive_presentation_and_shortcuts_are_visible_without_dispatch() {
+    use crikey_ui::action_panel::{ActionEntry, ActionPresentation, ActionSection, ActionTree};
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    let mut view = launcher.frame().unwrap();
+    let tree = ActionTree::new(
+        &view.rows[0],
+        vec![ActionSection {
+            id: "explicit".into(),
+            label: "Explicit section".into(),
+            entries: vec![ActionEntry::Plugin {
+                action: crikey_core::ActionId("copy".into()),
+                presentation: ActionPresentation {
+                    label: "Remove saved entry".into(),
+                    destructive: true,
+                    shortcut: Some("Ctrl+Shift+R".into()),
+                    icon_reference: Some("unresolved-resource".into()),
+                    ..Default::default()
+                },
+            }],
+        }],
+    )
+    .unwrap();
+    view.action_panel = Some(Arc::new(crikey_ui::ActionPanel::new(tree)));
+    let frame = build_launcher_frame(&context, launcher_input(vec![]), &view);
+    for text in [
+        "Explicit section",
+        "Remove saved entry",
+        "Destructive",
+        "Ctrl+Shift+R",
+    ] {
+        assert!(
+            frame
+                .output
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, text)),
+            "{text}"
+        );
+    }
+    assert!(
+        frame.commands.is_empty(),
+        "presentation is not authorization or activation"
+    );
+}
+
+#[test]
+fn batched_action_text_and_return_preserve_their_actual_event_order() {
+    for text_before_return in [true, false] {
+        let context = create_launcher_context();
+        let mut launcher = action_launcher();
+        let _ = launcher.apply(UiCommand::ShowActions);
+        let view = launcher.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+        let text = egui::Event::Text("Reveal".into());
+        let enter = key_press(egui::Key::Enter, egui::Modifiers::NONE);
+        let events = if text_before_return {
+            vec![text, enter]
+        } else {
+            vec![enter, text]
+        };
+        let frame = build_launcher_frame(&context, launcher_input(events), &view);
+        let expected = if text_before_return {
+            vec![
+                UiCommand::SetActionQuery("Reveal".into()),
+                UiCommand::ActivateSelectedAction,
+            ]
+        } else {
+            vec![UiCommand::ActivateSelectedAction]
+        };
+        assert_eq!(frame.commands, expected);
+        let effects: Vec<_> = frame
+            .commands
+            .into_iter()
+            .filter_map(|command| launcher.apply(command))
+            .collect();
+        assert_eq!(
+            effects,
+            vec![crikey_ui::UiEffect::Execute {
+                owner: PluginId("renderer-fixture".into()),
+                item: ItemId("item-0".into()),
+                action: crikey_core::ActionId(if text_before_return { "reveal" } else { "run" }.into()),
+            }]
+        );
+        assert_eq!(launcher.frame().unwrap().query, "fixture");
+    }
+}
+
+#[test]
+fn composition_owned_return_followed_by_commit_never_executes_an_action() {
+    for composition_started_in_previous_frame in [false, true] {
+        let context = create_launcher_context();
+        let mut launcher = action_launcher();
+        let _ = launcher.apply(UiCommand::ShowActions);
+        let mut view = launcher.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+        let preedit = vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("Re".into())),
+        ];
+        let mut events = if composition_started_in_previous_frame {
+            let frame = build_launcher_frame(&context, launcher_input(preedit), &view);
+            for command in frame.commands {
+                assert!(launcher.apply(command).is_none());
+            }
+            view = launcher.frame().unwrap();
+            Vec::new()
+        } else {
+            preedit
+        };
+        events.push(key_press(egui::Key::Enter, egui::Modifiers::NONE));
+        events.push(egui::Event::Ime(egui::ImeEvent::Commit("Reveal".into())));
+        let frame = build_launcher_frame(&context, launcher_input(events), &view);
+        assert!(!frame.commands.contains(&UiCommand::ActivateSelectedAction));
+        assert!(!frame
+            .commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::SetQuery(_))));
+        for command in frame.commands {
+            assert!(launcher.apply(command).is_none());
+        }
+        let frame = launcher.frame().unwrap();
+        assert_eq!(frame.query, "fixture");
+        assert_eq!(frame.action_panel.as_ref().unwrap().query(), "Reveal");
+    }
+}
+
+#[test]
+fn action_failure_replaces_long_metadata_and_exposes_its_complete_reason_on_hover() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    let mut view = launcher.frame().unwrap();
+    let mut rows = view.rows.to_vec();
+    rows[0].description =
+        "A long provider description that would otherwise consume the entire line ".repeat(20);
+    let diagnostic = format!(
+        "Action failed: {} terminal diagnostic detail",
+        "specific cause ".repeat(30)
+    );
+    rows[0].status = Some(diagnostic.clone());
+    view.rows = rows.into();
+    let input = |time, events| {
+        let mut input = launcher_input(events);
+        input.time = Some(time);
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(480.0, 520.0),
+        ));
+        input
+    };
+    let first = build_launcher_frame(&context, input(0.0, vec![]), &view);
+    let status = position_of(&first, "Action failed");
+    assert!(
+        status.x < 200.0,
+        "failure feedback must start before lengthy row metadata"
+    );
+    assert!(!painted(&first, "A long provider description"));
+    assert!(position_of(&first, "Settings").y < 520.0);
+    let pointer = status + egui::vec2(4.0, 4.0);
+    let _ = build_launcher_frame(
+        &context,
+        input(1.0, vec![egui::Event::PointerMoved(pointer)]),
+        &view,
+    );
+    let hovered = build_launcher_frame(&context, input(3.0, vec![]), &view);
+    let count = |frame: &crikey_ui::NativeUiFrame| {
+        frame
+            .output
+            .shapes
+            .iter()
+            .filter(|shape| contains_text(&shape.shape, &diagnostic))
+            .count()
+    };
+    assert!(
+        count(&hovered) > count(&first),
+        "hover must expose the full diagnostic in a real tooltip"
+    );
+    assert!(position_of(&hovered, "Settings").y < 520.0);
 }

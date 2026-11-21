@@ -53,12 +53,11 @@
 //! * `ViewModel::rows` is an `Arc<[ResultRow]>` shared with the model, so a
 //!   frame that changes only the query or the selection costs a refcount bump
 //!   instead of a deep copy of the whole result list (spec 25.5).
-//! * `ViewModel::actions_open` carries the action list of the selected row.
-//!   `ShowActions` opens it when that row has alternate actions and does
-//!   nothing when it has none; selection movement, a publish, an execution and
-//!   dismissal close it. `Cancel` is a ladder: it closes the settings surface
-//!   first, then an open action list, then clears a non-empty query, and only
-//!   then dismisses (spec 6.3).
+//! * `ViewModel::action_panel` shares immutable bounded action state. Discovery
+//!   includes host settings for default-only rows, owns its query/navigation,
+//!   and preserves exact owner/item/action focus through admitted refreshes.
+//!   Missing targets invalidate rather than redirect. Escape clears action
+//!   search, then leaves a submenu, then closes the panel before root cancellation.
 //! * An empty query carries no rows. A publish that lands while the query is
 //!   empty is accepted with its rows dropped, and an edit back to the empty
 //!   query drops the rows that were standing: an untyped launcher is the query
@@ -71,8 +70,8 @@
 //!   rows. `SetSetting` and `Quit` are the host's work and surface as
 //!   `UiEffect::SetSetting` and `UiEffect::Quit`, while `OpenSettings` and
 //!   `CloseSettings` are pure UI state and produce no effect.
-//! * Existing `ResultRow`, `ViewModel`, `UiCommand` and `LauncherWindow` stay
-//!   source-compatible: a frame is presentable through `LauncherWindow` as is.
+//! * Execution effects carry exact owner/item/action identity; all renderers
+//!   still present ordinary frames through `LauncherWindow`.
 
 use std::sync::Arc;
 
@@ -118,6 +117,16 @@ fn row(id: &str) -> ResultRow {
     }
 }
 
+fn action_intent(item: &str, action: &str) -> UiCommand {
+    UiCommand::ActivateAction {
+        target: crikey_ui::ActionTarget {
+            owner: PluginId("core".into()),
+            item: ItemId(item.into()),
+        },
+        identity: crikey_ui::ActionIdentity::Plugin(ActionId(action.into())),
+    }
+}
+
 fn rows(ids: &[&str]) -> Vec<ResultRow> {
     ids.iter().copied().map(row).collect()
 }
@@ -156,7 +165,7 @@ fn every_command() -> Vec<UiCommand> {
         UiCommand::Complete,
         UiCommand::ShowActions,
         UiCommand::ExecuteDefault,
-        UiCommand::ExecuteAlternate(0),
+        action_intent("alpha", "copy-path"),
         UiCommand::Cancel,
         UiCommand::Dismiss,
     ]
@@ -226,7 +235,7 @@ fn open_showing_actions(generation: Generation, ids: &[&str]) -> LauncherViewMod
     view_model.begin_generation(generation);
     view_model.publish(generation, rows_with_alternates(ids), false);
     assert!(
-        !expect_frame(&mut view_model).actions_open,
+        !expect_frame(&mut view_model).action_panel.is_some(),
         "a launcher opens with no action list"
     );
 
@@ -236,7 +245,7 @@ fn open_showing_actions(generation: Generation, ids: &[&str]) -> LauncherViewMod
         "opening the action list is pure UI state and schedules no host work"
     );
     assert!(
-        expect_frame(&mut view_model).actions_open,
+        expect_frame(&mut view_model).action_panel.is_some(),
         "ShowActions must open the action list of a row that has alternates"
     );
     view_model
@@ -874,6 +883,7 @@ fn execute_default_runs_the_selected_rows_default_action() {
     assert_eq!(
         view_model.apply(UiCommand::ExecuteDefault),
         Some(UiEffect::Execute {
+            owner: PluginId("core".into()),
             item: ItemId("beta".to_owned()),
             action: ActionId("run".to_owned()),
         })
@@ -898,7 +908,7 @@ fn execute_default_is_rejected_when_the_selected_row_has_no_default_action() {
 }
 
 #[test]
-fn execute_alternate_runs_the_indexed_alternate_action() {
+fn execute_alternate_runs_the_named_alternate_action() {
     let generation = fresh_generation();
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
@@ -910,10 +920,11 @@ fn execute_alternate_runs_the_indexed_alternate_action() {
     view_model.publish(generation, vec![alpha], false);
     let _ = expect_frame(&mut view_model);
 
-    for (index, expected) in [(0usize, "copy-path"), (1, "reveal")] {
+    for expected in ["copy-path", "reveal"] {
         assert_eq!(
-            view_model.apply(UiCommand::ExecuteAlternate(index)),
+            view_model.apply(action_intent("alpha", expected)),
             Some(UiEffect::Execute {
+                owner: PluginId("core".into()),
                 item: ItemId("alpha".to_owned()),
                 action: ActionId(expected.to_owned()),
             })
@@ -922,7 +933,7 @@ fn execute_alternate_runs_the_indexed_alternate_action() {
 }
 
 #[test]
-fn execute_alternate_out_of_range_is_rejected() {
+fn unknown_action_identity_is_rejected() {
     let generation = fresh_generation();
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
@@ -934,18 +945,18 @@ fn execute_alternate_out_of_range_is_rejected() {
     view_model.publish(generation, vec![alpha], false);
     let _ = expect_frame(&mut view_model);
 
-    for index in [1usize, 2, usize::MAX] {
+    for identity in ["missing", "unavailable", ""] {
         assert_eq!(
-            view_model.apply(UiCommand::ExecuteAlternate(index)),
+            view_model.apply(action_intent("alpha", identity)),
             None,
-            "alternate index {index} is out of range"
+            "unknown action {identity:?} must be refused"
         );
     }
 
-    // A row with no alternate actions at all rejects index zero.
+    // A replacement item cannot inherit a previous item's action intent.
     view_model.publish(generation, rows(&["beta"]), false);
     let _ = expect_frame(&mut view_model);
-    assert_eq!(view_model.apply(UiCommand::ExecuteAlternate(0)), None);
+    assert_eq!(view_model.apply(action_intent("alpha", "copy-path")), None);
     expect_idle(&mut view_model);
 }
 
@@ -953,17 +964,14 @@ fn execute_alternate_out_of_range_is_rejected() {
 fn executing_leaves_the_launcher_open_and_its_visible_state_untouched() {
     let generation = fresh_generation();
     let mut view_model = open_showing(generation, &["alpha", "beta"]);
-    assert_eq!(
-        view_model.apply(UiCommand::SetQuery("al".to_owned())),
-        Some(UiEffect::Query("al".to_owned()))
-    );
     let before = expect_frame(&mut view_model);
-    assert_eq!(before.query, "al");
+    assert_eq!(before.query, FIXTURE_QUERY);
     assert_eq!(before.selected, 0);
 
     assert_eq!(
         view_model.apply(UiCommand::ExecuteDefault),
         Some(UiEffect::Execute {
+            owner: PluginId("core".into()),
             item: ItemId("alpha".to_owned()),
             action: ActionId("run".to_owned()),
         })
@@ -1098,7 +1106,7 @@ fn execution_is_rejected_on_an_empty_result_list() {
     let _ = expect_frame(&mut view_model);
 
     assert_eq!(view_model.apply(UiCommand::ExecuteDefault), None);
-    assert_eq!(view_model.apply(UiCommand::ExecuteAlternate(0)), None);
+    assert_eq!(view_model.apply(action_intent("alpha", "copy-path")), None);
     expect_idle(&mut view_model);
 }
 
@@ -1364,103 +1372,152 @@ fn dismissing_while_results_are_outstanding_leaves_the_next_session_idle() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn show_actions_opens_the_list_only_for_a_row_that_has_alternates() {
-    let generation = fresh_generation();
-    let mut view_model = open_showing(generation, &["alpha", "beta"]);
-    assert!(
-        !expect_frame(&mut view_model).actions_open,
-        "a launcher opens with no action list"
-    );
-
-    // `alpha` carries a default action only: there is no list to put on screen,
-    // so the command changes nothing at all.
-    assert_eq!(view_model.apply(UiCommand::ShowActions), None);
-    expect_idle(&mut view_model);
-
-    view_model.publish(generation, rows_with_alternates(&["alpha", "beta"]), false);
-    assert!(!expect_frame(&mut view_model).actions_open);
-
+fn default_only_rows_still_offer_real_host_settings() {
+    let mut model = open_showing(fresh_generation(), &["alpha"]);
+    let _ = expect_frame(&mut model);
+    assert_eq!(model.apply(UiCommand::ShowActions), None);
+    let frame = expect_frame(&mut model);
+    let panel = frame.action_panel.as_ref().unwrap();
+    assert!(panel
+        .visible_entries()
+        .any(|entry| entry.presentation.label == "Launcher Settings"));
+    let target = panel.tree().target().clone();
     assert_eq!(
-        view_model.apply(UiCommand::ShowActions),
-        None,
-        "opening the list schedules no host work"
+        model.apply(UiCommand::ActivateAction {
+            target,
+            identity: crikey_ui::ActionIdentity::Submenu("launcher-settings".into()),
+        }),
+        None
     );
-    let model = expect_frame(&mut view_model);
-    assert!(model.actions_open);
-    assert_eq!(selected_id(&model), "alpha");
-    assert_eq!(
-        model
-            .rows
-            .get(model.selected)
-            .expect("the selected index must address a row")
-            .alternate_actions
-            .iter()
-            .map(|entry| entry.action_id.0.as_str())
-            .collect::<Vec<_>>(),
-        vec!["copy-path", "reveal"],
-        "the frame carries the actions the open list renders"
-    );
-
-    // Reopening an open list is not a change.
-    assert_eq!(view_model.apply(UiCommand::ShowActions), None);
-    expect_idle(&mut view_model);
+    let frame = expect_frame(&mut model);
+    assert_eq!(frame.action_panel.as_ref().unwrap().path().len(), 1);
+    assert_eq!(model.apply(UiCommand::ActivateSelectedAction), None);
+    assert!(model.is_settings_open());
+    assert_eq!(expect_frame(&mut model).query, FIXTURE_QUERY);
 }
 
 #[test]
-fn moving_the_selection_closes_the_action_list() {
-    let generation = fresh_generation();
-    let mut view_model = open_showing_actions(generation, &["alpha", "beta", "gamma"]);
-
-    assert_eq!(view_model.apply(UiCommand::SelectNext), None);
-    let model = expect_frame(&mut view_model);
-    assert!(
-        !model.actions_open,
-        "the list belongs to the row it was opened over, not to the launcher"
+fn action_navigation_and_search_execute_the_non_first_action_without_retyping_root() {
+    let mut model = open_showing_actions(fresh_generation(), &["alpha", "beta"]);
+    model.apply(UiCommand::SelectNext);
+    let frame = expect_frame(&mut model);
+    assert_eq!(selected_id(&frame), "alpha");
+    assert_eq!(
+        frame.action_panel.as_ref().unwrap().selected(),
+        Some(&crikey_ui::ActionIdentity::Plugin(ActionId("copy-path".into())))
     );
-    assert_eq!(selected_id(&model), "beta");
+    model.apply(UiCommand::SetActionQuery("reveal".into()));
+    let frame = expect_frame(&mut model);
+    assert_eq!(frame.query, FIXTURE_QUERY);
+    assert_eq!(frame.action_panel.as_ref().unwrap().visible_entries().len(), 1);
+    assert_eq!(
+        model.apply(UiCommand::ActivateSelectedAction),
+        Some(UiEffect::Execute {
+            owner: PluginId("core".into()),
+            item: ItemId("alpha".into()),
+            action: ActionId("reveal".into()),
+        })
+    );
+    assert!(expect_frame(&mut model).action_panel.is_none());
 }
 
 #[test]
-fn a_navigation_command_that_moves_nothing_leaves_the_action_list_open() {
+fn provider_refresh_preserves_action_query_and_exact_owner_focus() {
     let generation = fresh_generation();
-    let mut view_model = open_showing_actions(generation, &["alpha"]);
+    let mut model = open_showing_actions(generation, &["alpha", "beta"]);
+    model.apply(UiCommand::SetActionQuery("reveal".into()));
+    let original = expect_frame(&mut model);
+    let mut sibling = rows_with_alternates(&["alpha"]).remove(0);
+    sibling.plugin = PluginId("other".into());
+    let mut replacement = vec![sibling];
+    replacement.extend(rows_with_alternates(&["beta", "alpha"]));
+    model.publish(generation, replacement, true);
+    let frame = expect_frame(&mut model);
+    assert_eq!(frame.selected, 2);
+    assert_eq!(frame.action_panel.as_ref().unwrap().query(), "reveal");
+    assert_eq!(
+        frame.action_panel.as_ref().unwrap().selected(),
+        original.action_panel.as_ref().unwrap().selected()
+    );
+    assert_eq!(
+        model.apply(UiCommand::ActivateSelectedAction),
+        Some(UiEffect::Execute {
+            owner: PluginId("core".into()),
+            item: ItemId("alpha".into()),
+            action: ActionId("reveal".into()),
+        })
+    );
+}
 
-    // One row: every navigation command clamps onto the selection it already
-    // has, so none of them is a selection change.
-    for command in [
-        UiCommand::SelectNext,
-        UiCommand::SelectPrevious,
-        UiCommand::PageDown,
-        UiCommand::PageUp,
-    ] {
-        assert_eq!(view_model.apply(command.clone()), None, "{command:?}");
-        expect_idle(&mut view_model);
+#[test]
+fn vanished_owner_or_action_invalidates_and_never_revives_or_redirects() {
+    for remove_action in [false, true] {
+        let generation = fresh_generation();
+        let mut model = open_showing_actions(generation, &["alpha", "beta"]);
+        model.apply(UiCommand::SetActionQuery("reveal".into()));
+        let _ = expect_frame(&mut model);
+        let mut replacement = rows_with_alternates(&["alpha", "beta"]);
+        if remove_action {
+            replacement[0].alternate_actions.pop();
+        } else {
+            replacement[0].plugin = PluginId("other".into());
+        }
+        model.publish(generation, replacement, false);
+        assert!(expect_frame(&mut model)
+            .action_panel
+            .as_ref()
+            .unwrap()
+            .invalidation()
+            .is_some());
+        assert_eq!(model.apply(UiCommand::ActivateSelectedAction), None);
+        assert_eq!(model.apply(action_intent("alpha", "reveal")), None);
+        model.publish(generation, rows_with_alternates(&["alpha", "beta"]), false);
+        assert_eq!(model.apply(UiCommand::ActivateSelectedAction), None);
+        assert!(expect_frame(&mut model)
+            .action_panel
+            .as_ref()
+            .unwrap()
+            .invalidation()
+            .is_some());
     }
-
-    // A query edit is not a rung of the ladder either; the publish answering it
-    // is what closes the list. Forcing a frame this way proves the list is
-    // still open rather than merely unreported.
-    assert_eq!(
-        view_model.apply(UiCommand::SetQuery("al".to_owned())),
-        Some(UiEffect::Query("al".to_owned()))
-    );
-    let model = expect_frame(&mut view_model);
-    assert!(model.actions_open);
-    assert_eq!(model.query, "al");
 }
 
 #[test]
-fn a_publish_closes_the_action_list() {
-    let generation = fresh_generation();
-    let mut view_model = open_showing_actions(generation, &["alpha", "beta"]);
-
-    // Even a republish that keeps the same row selected: the actions on screen
-    // belong to a row snapshot that has just been replaced.
-    view_model.publish(generation, rows_with_alternates(&["alpha", "beta"]), false);
-
-    let model = expect_frame(&mut view_model);
-    assert!(!model.actions_open);
-    assert_eq!(selected_id(&model), "alpha");
+fn nested_back_clears_search_then_returns_to_panel_without_touching_root() {
+    let mut model = open_showing_actions(fresh_generation(), &["alpha"]);
+    let frame = model.frame();
+    assert!(frame.is_none());
+    let target = crikey_ui::ActionTarget {
+        owner: PluginId("core".into()),
+        item: ItemId("alpha".into()),
+    };
+    model.apply(UiCommand::ActivateAction {
+        target,
+        identity: crikey_ui::ActionIdentity::Submenu("launcher-settings".into()),
+    });
+    assert_eq!(
+        expect_frame(&mut model)
+            .action_panel
+            .as_ref()
+            .unwrap()
+            .path()
+            .len(),
+        1
+    );
+    model.apply(UiCommand::SetActionQuery("settings".into()));
+    model.apply(UiCommand::Cancel);
+    let frame = expect_frame(&mut model);
+    assert_eq!(frame.query, FIXTURE_QUERY);
+    assert_eq!(frame.action_panel.as_ref().unwrap().query(), "");
+    model.apply(UiCommand::Cancel);
+    assert!(expect_frame(&mut model)
+        .action_panel
+        .as_ref()
+        .unwrap()
+        .path()
+        .is_empty());
+    model.apply(UiCommand::Cancel);
+    assert!(expect_frame(&mut model).action_panel.is_none());
 }
 
 #[test]
@@ -1469,21 +1526,22 @@ fn executing_closes_the_action_list_but_a_rejected_pick_leaves_it_open() {
     let mut view_model = open_showing_actions(generation, &["alpha"]);
 
     assert_eq!(
-        view_model.apply(UiCommand::ExecuteAlternate(2)),
+        view_model.apply(action_intent("alpha", "missing")),
         None,
         "an out-of-range pick runs nothing, so it closes nothing"
     );
     expect_idle(&mut view_model);
 
     assert_eq!(
-        view_model.apply(UiCommand::ExecuteAlternate(1)),
+        view_model.apply(action_intent("alpha", "reveal")),
         Some(UiEffect::Execute {
+            owner: PluginId("core".into()),
             item: ItemId("alpha".to_owned()),
             action: ActionId("reveal".to_owned()),
         })
     );
     assert!(
-        !expect_frame(&mut view_model).actions_open,
+        !expect_frame(&mut view_model).action_panel.is_some(),
         "running a pick closes the list it was picked from"
     );
     assert!(
@@ -1493,15 +1551,16 @@ fn executing_closes_the_action_list_but_a_rejected_pick_leaves_it_open() {
 
     // The default action closes the list the same way.
     assert_eq!(view_model.apply(UiCommand::ShowActions), None);
-    assert!(expect_frame(&mut view_model).actions_open);
+    assert!(expect_frame(&mut view_model).action_panel.is_some());
     assert_eq!(
         view_model.apply(UiCommand::ExecuteDefault),
         Some(UiEffect::Execute {
+            owner: PluginId("core".into()),
             item: ItemId("alpha".to_owned()),
             action: ActionId("run".to_owned()),
         })
     );
-    assert!(!expect_frame(&mut view_model).actions_open);
+    assert!(!expect_frame(&mut view_model).action_panel.is_some());
     expect_idle(&mut view_model);
 }
 
@@ -1520,12 +1579,12 @@ fn dismissal_closes_the_action_list_and_the_next_session_opens_without_it() {
     assert!(!view_model.is_visible());
 
     view_model.activate();
-    assert!(!expect_frame(&mut view_model).actions_open);
+    assert!(!expect_frame(&mut view_model).action_panel.is_some());
 
     view_model.begin_generation(second);
     view_model.publish(second, rows_with_alternates(&["alpha"]), false);
     assert!(
-        !expect_frame(&mut view_model).actions_open,
+        !expect_frame(&mut view_model).action_panel.is_some(),
         "the reopened launcher must not resurrect the closed session's overlay"
     );
 }
@@ -1534,13 +1593,6 @@ fn dismissal_closes_the_action_list_and_the_next_session_opens_without_it() {
 fn cancel_takes_three_presses_to_close_a_launcher_with_an_open_action_list() {
     let generation = fresh_generation();
     let mut view_model = open_showing_actions(generation, &["alpha"]);
-    assert_eq!(
-        view_model.apply(UiCommand::SetQuery("al".to_owned())),
-        Some(UiEffect::Query("al".to_owned()))
-    );
-    let before = expect_frame(&mut view_model);
-    assert!(before.actions_open);
-    assert_eq!(before.query, "al");
 
     // Rung one: the action list closes and nothing else moves.
     assert_eq!(
@@ -1549,9 +1601,9 @@ fn cancel_takes_three_presses_to_close_a_launcher_with_an_open_action_list() {
         "closing the action list schedules no host work"
     );
     let model = expect_frame(&mut view_model);
-    assert!(!model.actions_open);
+    assert!(!model.action_panel.is_some());
     assert_eq!(
-        model.query, "al",
+        model.query, FIXTURE_QUERY,
         "the first Cancel must not also clear the query"
     );
     assert_eq!(row_ids(&model), vec!["alpha"]);
@@ -1586,7 +1638,7 @@ fn cancel_closes_an_open_action_list_before_it_clears_the_query() {
         "the first Cancel spends itself on the action list, whatever else is showing"
     );
     let model = expect_frame(&mut view_model);
-    assert!(!model.actions_open);
+    assert!(!model.action_panel.is_some());
     assert_eq!(model.query, FIXTURE_QUERY);
 
     assert_eq!(
@@ -1718,6 +1770,7 @@ fn navigation_stays_put_on_a_single_result() {
     assert_eq!(
         view_model.apply(UiCommand::ExecuteDefault),
         Some(UiEffect::Execute {
+            owner: PluginId("core".into()),
             item: ItemId("only".to_owned()),
             action: ActionId("run".to_owned()),
         }),
@@ -2426,4 +2479,123 @@ fn preview_selection_and_republication_keep_exact_owner_for_colliding_item_ids()
     assert_eq!(frame.rows[frame.selected].plugin, second.plugin);
     model.publish(Generation::from_raw(1), vec![row("shared")], false);
     assert!(!model.publish_preview(&second_request, PreviewStatus::Empty));
+}
+
+#[test]
+fn stale_pointer_actions_and_retired_query_targets_are_not_reinterpreted() {
+    let generation = fresh_generation();
+    let mut model = open_showing(generation, &["alpha", "beta"]);
+    let _ = expect_frame(&mut model);
+    model.apply(UiCommand::SelectNext);
+    let _ = expect_frame(&mut model);
+    assert_eq!(model.apply(action_intent("alpha", "run")), None);
+    model.apply(UiCommand::SetQuery("changed".into()));
+    assert_eq!(model.apply(action_intent("beta", "run")), None);
+    assert_eq!(model.apply(UiCommand::ExecuteDefault), None);
+}
+
+#[test]
+fn action_frames_share_immutable_state_and_refresh_does_not_mutate_old_frames() {
+    let generation = fresh_generation();
+    let mut model = open_showing_actions(generation, &["alpha"]);
+    assert!(model.set_selected_status("status".into()));
+    let old = expect_frame(&mut model);
+    assert!(model.set_selected_status("next status".into()));
+    let same = expect_frame(&mut model);
+    assert!(Arc::ptr_eq(
+        old.action_panel.as_ref().unwrap(),
+        same.action_panel.as_ref().unwrap()
+    ));
+    model.apply(UiCommand::SetActionQuery("reveal".into()));
+    let changed = expect_frame(&mut model);
+    assert_eq!(old.action_panel.as_ref().unwrap().query(), "");
+    assert_eq!(changed.action_panel.as_ref().unwrap().query(), "reveal");
+    model.publish(generation, vec![], false);
+    let vanished = expect_frame(&mut model);
+    assert!(vanished.action_panel.as_ref().unwrap().invalidation().is_some());
+    assert!(changed.action_panel.as_ref().unwrap().invalidation().is_none());
+}
+
+#[test]
+fn action_bounds_refuse_visibly_and_never_offer_a_truncated_executable_panel() {
+    let generation = fresh_generation();
+    let mut model = open_showing(generation, &["alpha"]);
+    let mut oversized = row("alpha");
+    oversized.alternate_actions = vec![action("oversized")];
+    oversized.alternate_actions[0].label = "x".repeat(crikey_ui::action_panel::MAX_ACTION_TEXT_BYTES + 1);
+    model.publish(generation, vec![oversized], false);
+    let _ = expect_frame(&mut model);
+    assert_eq!(model.apply(UiCommand::ShowActions), None);
+    let frame = expect_frame(&mut model);
+    assert!(frame.action_panel.is_none());
+    assert!(frame.rows[0].status.as_ref().unwrap().contains("text limit"));
+    assert_eq!(model.apply(UiCommand::ExecuteDefault), None);
+}
+
+#[test]
+fn oversized_action_search_preserves_the_last_admitted_query_and_selection() {
+    let mut model = open_showing_actions(fresh_generation(), &["alpha"]);
+    model.apply(UiCommand::SetActionQuery("reveal".into()));
+    let before = expect_frame(&mut model);
+    model.apply(UiCommand::SetActionQuery(
+        "x".repeat(crikey_ui::action_panel::MAX_ACTION_QUERY_BYTES + 1),
+    ));
+    let after = expect_frame(&mut model);
+    assert_eq!(after.action_panel.as_ref().unwrap().query(), "reveal");
+    assert_eq!(
+        after.action_panel.as_ref().unwrap().selected(),
+        before.action_panel.as_ref().unwrap().selected()
+    );
+    assert!(after.rows[0]
+        .status
+        .as_ref()
+        .unwrap()
+        .contains("Action search exceeds"));
+}
+
+#[test]
+fn refresh_lost_action_focus_stays_inert_until_explicit_navigation() {
+    let generation = fresh_generation();
+    let mut model = open_showing_actions(generation, &["alpha"]);
+    model.apply(UiCommand::SetActionQuery("copy".into()));
+    assert_eq!(
+        expect_frame(&mut model).action_panel.as_ref().unwrap().selected(),
+        Some(&crikey_ui::ActionIdentity::Plugin(ActionId("copy-path".into())))
+    );
+    let mut replacement = rows_with_alternates(&["alpha"]);
+    replacement[0].alternate_actions[0].label = "Duplicate".into();
+    model.publish(generation, replacement.clone(), false);
+    assert_eq!(
+        expect_frame(&mut model).action_panel.as_ref().unwrap().selected(),
+        None
+    );
+    replacement[0].default_action.as_mut().unwrap().label = "Copy alternate".into();
+    model.publish(generation, replacement.clone(), false);
+    model.publish(generation, replacement, false);
+    let frame = expect_frame(&mut model);
+    let panel = frame.action_panel.as_ref().unwrap();
+    assert_eq!(panel.visible_entries().len(), 1);
+    assert_eq!(panel.selected(), None);
+    assert_eq!(model.apply(UiCommand::ActivateSelectedAction), None);
+    model.apply(UiCommand::SelectNext);
+    assert_eq!(
+        model.apply(UiCommand::ActivateSelectedAction),
+        Some(UiEffect::Execute {
+            owner: PluginId("core".into()),
+            item: ItemId("alpha".into()),
+            action: ActionId("run".into()),
+        })
+    );
+}
+
+#[test]
+fn action_status_admission_bounds_utf8_once_for_row_and_hover() {
+    let mut model = open_showing(fresh_generation(), &["alpha"]);
+    let _ = expect_frame(&mut model);
+    assert!(model.set_selected_status(format!("Action failed: {}", "é".repeat(8192))));
+    let frame = expect_frame(&mut model);
+    let status = frame.rows[0].status.as_ref().unwrap();
+    assert!(status.starts_with("Action failed: "));
+    assert!(status.ends_with('…'));
+    assert!(status.len() <= crikey_ui::action_panel::MAX_ACTION_TEXT_BYTES);
 }

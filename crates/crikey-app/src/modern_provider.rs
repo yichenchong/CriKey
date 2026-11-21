@@ -2188,6 +2188,7 @@ enum ModernWork {
 struct ModernActionEndpoint {
     sender: SyncSender<ModernActionRequest>,
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
+    action_wake: crate::plugin_action::CompletionWake,
     budgets: BTreeMap<PluginId, PluginBudgetHandle>,
     items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
     pending: Arc<Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>>,
@@ -2368,6 +2369,7 @@ impl crate::PluginActionExecutor for ModernActionEndpoint {
 }
 fn enqueue_modern_completion(
     mailbox: &Mutex<VecDeque<PluginActionCompletion>>,
+    action_wake: &crate::plugin_action::CompletionWake,
     completion: PluginActionCompletion,
 ) {
     let mut mailbox = mailbox.lock().unwrap_or_else(|error| error.into_inner());
@@ -2379,6 +2381,8 @@ fn enqueue_modern_completion(
         return;
     }
     mailbox.push_back(completion);
+    drop(mailbox);
+    action_wake.ring();
 }
 
 /// Drives [`ModernProvider::drive_query`] on a dedicated supervisor thread so
@@ -2453,6 +2457,7 @@ impl ModernDriver {
         let action_endpoint = Arc::new(ModernActionEndpoint {
             sender: action_sender,
             completions: Arc::clone(&completion_mailbox),
+            action_wake: crate::plugin_action::CompletionWake::default(),
             budgets: provider.action_budgets(),
             items: Arc::clone(&provider.action_items),
             pending: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2469,6 +2474,7 @@ impl ModernDriver {
         let thread_outcome = Arc::clone(&outcome);
         let thread_current = Arc::clone(&current);
         let thread_completion_mailbox = Arc::clone(&completion_mailbox);
+        let thread_action_wake = action_endpoint.action_wake.clone();
         let thread_preview_endpoint = Arc::clone(&preview_endpoint);
         let spawned = std::thread::Builder::new()
             .name("crikey-modern".to_owned())
@@ -2498,7 +2504,11 @@ impl ModernDriver {
                                         action_id: request.action_id.clone(),
                                         outcome: Err(crikey_core::CoreError::Cancelled),
                                     };
-                                    enqueue_modern_completion(&thread_completion_mailbox, completion);
+                                    enqueue_modern_completion(
+                                        &thread_completion_mailbox,
+                                        &thread_action_wake,
+                                        completion,
+                                    );
                                 }
                                 while let Ok(request) = preview_receiver.try_recv() {
                                     thread_preview_endpoint.complete(request, PreviewState::Cancelled);
@@ -2598,7 +2608,11 @@ impl ModernDriver {
                                 action_id,
                                 outcome: result.map(|()| crate::ActionEffect::Completed),
                             };
-                            enqueue_modern_completion(&thread_completion_mailbox, completion);
+                            enqueue_modern_completion(
+                                &thread_completion_mailbox,
+                                &thread_action_wake,
+                                completion,
+                            );
                             thread_preview_endpoint.refresh_liveness(&mut provider);
                             *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
                                 pipeline.plugin_health_report();
@@ -2641,7 +2655,7 @@ impl ModernDriver {
                         rows: rows.into(),
                         selected: job.selected,
                         pending_plugins: pending,
-                        actions_open: false,
+                        action_panel: None,
                         settings_open: false,
                         settings: Arc::default(),
                         settings_focus: None,
@@ -2701,6 +2715,12 @@ impl ModernDriver {
             },
         }
     }
+
+    /// Installs the terminal action notification independently of result and preview wakes.
+    pub fn set_action_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
+        self.action_endpoint.action_wake.install(Arc::new(wake));
+    }
+
     /// Bounded preview endpoint; all transport and decoding runs off-thread.
     pub(crate) fn preview_dispatcher(&self) -> Arc<dyn PreviewDispatcher> {
         self.preview_endpoint.clone()

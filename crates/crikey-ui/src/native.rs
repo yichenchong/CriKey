@@ -3,7 +3,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
@@ -245,6 +245,9 @@ pub enum NativeLauncherEvent {
     /// active, so an answer belonging to a dismissed or superseded activation
     /// is dropped rather than merged into a newer one.
     ProviderAnswer,
+    /// Process-scoped action terminals are ready to drain, including while
+    /// hidden. This notification never activates or presents the launcher.
+    ActionCompletion,
 }
 
 /// Creates an egui context configured with the launcher's shared visual tokens.
@@ -356,6 +359,7 @@ enum NativeEvent {
     Hide { session: u64 },
     FrameReady { session: u64 },
     ProviderAnswer { session: u64 },
+    ActionCompletion,
     RepaintAfter(Duration),
     DriverError(String),
     Exit,
@@ -432,6 +436,7 @@ struct SharedState {
     lifecycle: AtomicU64,
     frames: Mutex<FrameMailbox>,
     latency: Mutex<ActivationLatencyTracker>,
+    action_wake_pending: AtomicBool,
 }
 
 /// The part of a frame that belongs to the host rather than to a query.
@@ -708,6 +713,14 @@ impl SharedState {
         }
     }
 
+    fn claim_action_wake(&self) -> bool {
+        !self.action_wake_pending.swap(true, Ordering::AcqRel)
+    }
+
+    fn acknowledge_action_wake(&self) {
+        self.action_wake_pending.store(false, Ordering::Release);
+    }
+
     fn clear_all_frames(&self) {
         let mut mailbox = lock_recover(&self.frames);
         mailbox.latest = None;
@@ -725,6 +738,7 @@ impl Default for SharedState {
             lifecycle: AtomicU64::new(lifecycle_state(0, false)),
             frames: Mutex::new(FrameMailbox::default()),
             latency: Mutex::new(ActivationLatencyTracker::new()),
+            action_wake_pending: AtomicBool::new(false),
         }
     }
 }
@@ -853,6 +867,20 @@ impl NativeLauncherHandle {
         Ok(())
     }
 
+    /// Announces process-scoped terminal action work without touching session
+    /// or visibility state. Every registered action endpoint uses this route,
+    /// not the presentation-scoped provider-answer route.
+    pub fn request_action_completion(&self) -> Result<(), RendererError> {
+        if !self.shared.claim_action_wake() {
+            return Ok(());
+        }
+        if let Err(error) = self.proxy.send(NativeEvent::ActionCompletion) {
+            self.shared.acknowledge_action_wake();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Replaces the frame waiting for the UI thread with the newest immutable
     /// view model and wakes the loop at most once for that session.
     ///
@@ -932,6 +960,11 @@ impl NativeLauncherHandle {
 
     pub fn is_visible(&self) -> bool {
         self.shared.is_visible()
+    }
+
+    /// Whether a presentation effect still belongs to this exact activation.
+    pub fn is_visible_session(&self, session: u64) -> bool {
+        self.shared.is_visible_session(session)
     }
 
     /// Reports process-lifetime count plus p95 over the fixed retained ring.
@@ -1597,6 +1630,12 @@ where
                     (self.on_event)(NativeLauncherEvent::ProviderAnswer);
                 }
             }
+            NativeEvent::ActionCompletion => {
+                // Retire first: a producer completing during the host drain
+                // must be able to announce another turn, even without a view.
+                self.shared.acknowledge_action_wake();
+                (self.on_event)(NativeLauncherEvent::ActionCompletion);
+            }
             NativeEvent::RepaintAfter(delay) => self.schedule_repaint(delay),
             NativeEvent::DriverError(message) => {
                 self.fail(event_loop, RendererError::Driver(message));
@@ -1650,6 +1689,25 @@ where
                 _ => None,
             };
         }
+        // Linux does not forward preedit to egui. Fence composition-owned
+        // action keys here, at their actual native event position, rather than
+        // overwriting the renderer's batch-start state with the final IME state.
+        let ime_owned_action_key = self.ime.composing
+            && self
+                .frame
+                .as_ref()
+                .is_some_and(|frame| !frame.settings_open && frame.page.is_none())
+            && matches!(&event,
+            WindowEvent::KeyboardInput { event, .. } if {
+                let discovery = matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Enter))
+                    && self.modifiers.alt_key()
+                    || matches!(event.logical_key.as_ref(), Key::Character(text) if text.eq_ignore_ascii_case("k"))
+                        && (self.modifiers.control_key() || self.modifiers.super_key());
+                discovery || self.frame.as_ref().is_some_and(|frame| frame.action_panel.is_some())
+                    && matches!(event.logical_key.as_ref(), Key::Named(
+                        NamedKey::Enter | NamedKey::Escape | NamedKey::ArrowUp | NamedKey::ArrowDown
+                        | NamedKey::PageUp | NamedKey::PageDown))
+            });
         {
             let Some(graphics) = self.graphics.as_mut() else {
                 return;
@@ -1658,7 +1716,7 @@ where
                 &event,
                 WindowEvent::CursorMoved { .. } | WindowEvent::CursorLeft { .. }
             );
-            if (command.is_none() && !web_consumed) || pointer_position_changed {
+            if (command.is_none() && !web_consumed && !ime_owned_action_key) || pointer_position_changed {
                 let response = graphics
                     .egui_state
                     .on_window_event(graphics.window.as_ref(), &event);
@@ -1837,7 +1895,7 @@ struct GraphicsState {
 /// field and nothing else. A query with no rows has nothing to list, and the
 /// count in the footer already says so.
 fn shows_results(model: &ViewModel) -> bool {
-    !model.query.is_empty() && !model.rows.is_empty()
+    !model.query.is_empty() && (!model.rows.is_empty() || model.action_panel.is_some())
 }
 
 /// How tall the window has to be to show `model`, in logical pixels.
@@ -1889,11 +1947,8 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     // opened its actions into a window sized for the list alone and pushed the
     // status line off the bottom -- the same clipping, from the other
     // direction, and one that a long result set hides because it is clamped.
-    let actions = if model.actions_open {
-        let buttons = model.rows.get(model.selected).map_or(0, |row| {
-            usize::from(row.default_action.is_some()) + row.alternate_actions.len()
-        });
-        BLOCK_GAP + actions_overlay_height(buttons)
+    let actions = if model.action_panel.is_some() {
+        BLOCK_GAP + actions_overlay_height()
     } else {
         0.0
     };
@@ -2794,6 +2849,18 @@ fn translate_keyboard(
         return matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
             .then_some(UiCommand::Cancel);
     }
+    if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Enter)) && modifiers.alt_key()
+        || matches!(event.logical_key.as_ref(), Key::Character(text) if text.eq_ignore_ascii_case("k"))
+            && (modifiers.control_key() || modifiers.super_key())
+            && !modifiers.alt_key()
+    {
+        return Some(UiCommand::ShowActions);
+    }
+    if model.is_some_and(|model| model.action_panel.is_some()) {
+        // Keep action keys in the same egui event batch as search edits. In
+        // particular, raw Return must not run before queued text is admitted.
+        return None;
+    }
     if model.is_some_and(|model| model.preview.status.is_some()) {
         if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::F6)) {
             return Some(if model.is_some_and(|model| model.preview.focused) {
@@ -2814,18 +2881,7 @@ fn translate_keyboard(
         Key::Named(NamedKey::PageUp) => Some(UiCommand::PageUp),
         Key::Named(NamedKey::Tab) => Some(UiCommand::Complete),
         Key::Named(NamedKey::Escape) => Some(UiCommand::Cancel),
-        Key::Named(NamedKey::Enter) if modifiers.alt_key() => Some(UiCommand::ShowActions),
         Key::Named(NamedKey::Enter) => Some(UiCommand::ExecuteDefault),
-        Key::Character(text) if model.is_some_and(|model| model.actions_open) => {
-            let mut characters = text.chars();
-            let digit = characters.next()?.to_digit(10)?;
-            if characters.next().is_some() || digit == 0 {
-                return None;
-            }
-            let index = digit as usize - 1;
-            let row = model?.rows.get(model?.selected)?;
-            (index < row.alternate_actions.len()).then_some(UiCommand::ExecuteAlternate(index))
-        }
         _ => None,
     }
 }
@@ -2861,6 +2917,7 @@ fn draw_launcher(
         preview_render::release_texture(context);
     }
     preview_render::keyboard(context, model, commands);
+    action_render::keyboard(context, model, commands);
     // Ctrl+, is what every desktop means by "open preferences". It is consumed
     // from the egui frame rather than translated out of the raw key event so
     // that the headless frame builder answers to the shortcut exactly as the
@@ -2924,7 +2981,7 @@ fn draw_launcher(
                 // on the window's bottom edge.
                 ui.add_space(theme::SPACE_3);
                 preview_render::draw_results_and_preview(ui, model, commands, colors);
-                if model.actions_open {
+                if model.action_panel.is_some() {
                     ui.add_space(theme::SPACE_3);
                     draw_actions(ui, model, commands, colors);
                 }
@@ -2956,7 +3013,7 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
                     .desired_width(f32::INFINITY)
                     .margin(Margin::symmetric(theme::SPACE_3, theme::SPACE_1))
                     .frame(false)
-                    .interactive(model.page.is_none())
+                    .interactive(model.page.is_none() && model.action_panel.is_none())
                     .lock_focus(true),
             );
             // The query field takes the keyboard back on every frame, which is
@@ -2969,7 +3026,7 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
             // and an editor that keeps it goes on swallowing every `Text`
             // event, so the user would type into a query they cannot see
             // instead of into the field the page is showing them.
-            if model.page.is_some() || model.preview.focused {
+            if model.page.is_some() || model.preview.focused || model.action_panel.is_some() {
                 if response.has_focus() {
                     response.surrender_focus();
                 }
@@ -3052,18 +3109,10 @@ fn draw_results(
     // The central panel's bottom inner margin is already outside
     // `available_height`, so it must not be counted again here.
     //
-    // The actions overlay stands between the list and the footer, so with it
-    // open the list gives up the overlay and a second gap as well. Its height
-    // follows the number of buttons the selected row publishes, because a row
-    // with three alternates draws an overlay half again as tall as one with
-    // none. [`draw_launcher`] spends the gap above the overlay whether or not
-    // [`draw_actions`] finds a row to describe.
-    let overlay = if model.actions_open {
-        BLOCK_GAP
-            + model.rows.get(model.selected).map_or(0.0, |row| {
-                let buttons = usize::from(row.default_action.is_some()) + row.alternate_actions.len();
-                actions_overlay_height(buttons)
-            })
+    // The bounded sheet scrolls internally and reserves the same geometry even
+    // when its target has disappeared and it displays an invalidation.
+    let overlay = if model.action_panel.is_some() {
+        BLOCK_GAP + actions_overlay_height()
     } else {
         0.0
     };
@@ -3169,33 +3218,45 @@ fn draw_result_row(
                     ui.add(egui::Label::new(highlighted_label(row, colors)).truncate());
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = theme::SPACE_1;
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(row_metadata(row))
-                                    .size(theme::TEXT_SMALL)
-                                    .color(colors.text_muted),
-                            )
-                            .truncate(),
-                        );
-                        if let Some(hint) = &row.argument_hint {
-                            ui.label(RichText::new(hint).size(theme::TEXT_SMALL).color(colors.accent));
-                        }
                         if let Some(status) = &row.status {
-                            ui.label(
-                                RichText::new(status)
-                                    .size(theme::TEXT_SMALL)
-                                    .color(colors.warning),
+                            // Failure feedback replaces metadata, rather than
+                            // losing its entire width to a long description.
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(status)
+                                        .size(theme::TEXT_SMALL)
+                                        .color(colors.warning),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(status);
+                        } else {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(row_metadata(row))
+                                        .size(theme::TEXT_SMALL)
+                                        .color(colors.text_muted),
+                                )
+                                .truncate(),
                             );
+                            if let Some(hint) = &row.argument_hint {
+                                ui.label(RichText::new(hint).size(theme::TEXT_SMALL).color(colors.accent));
+                            }
                         }
                     });
                 });
                 if selected && ui.max_rect().width() > 520.0 {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if !row.alternate_actions.is_empty() && ui.button("Actions  Alt+Enter").clicked() {
+                        if ui.button("Actions").clicked() {
                             commands.push(UiCommand::ShowActions);
                         }
                         if row.default_action.is_some() && ui.button("Run  Enter").clicked() {
-                            commands.push(UiCommand::ExecuteDefault);
+                            commands.push(UiCommand::ActivateAction {
+                                target: crate::ActionTarget::of(row),
+                                identity: crate::ActionIdentity::Plugin(
+                                    row.default_action.as_ref().unwrap().action_id.clone(),
+                                ),
+                            });
                         }
                     });
                 }
@@ -3372,80 +3433,16 @@ fn highlighted_label(row: &ResultRow, colors: theme::Palette) -> LayoutJob {
     job
 }
 
-/// The height of the header row [`draw_actions`] opens with, in logical
-/// pixels: one line of [`theme::TEXT_LABEL`] text, which egui lays out 24 px
-/// tall. There is no way to ask a style for that figure without laying the
-/// text out, so it is measured instead -- see [`actions_overlay_height`].
-const ACTIONS_HEADER_HEIGHT: f32 = 24.0;
-
-/// How tall the overlay [`draw_actions`] draws is, in logical pixels, for a
-/// row publishing `buttons` actions.
-///
-/// [`draw_results`] has to know this before the overlay is drawn, because the
-/// overlay comes out of the room the result list would otherwise take. The sum
-/// follows the drawing directly: the frame's [`theme::SPACE_3`] inner margin
-/// at the top and bottom, the header row, the explicit [`theme::SPACE_2`]
-/// under the header plus the one [`theme::ITEM_SPACING_Y`] egui adds ahead of
-/// the first button -- `add_space` advances the cursor and nothing else, so
-/// the implicit spacing lands after the explicit gap and not before it -- and
-/// then one button per action at [`theme::CONTROL_HEIGHT`], separated by item
-/// spacing.
-///
-/// Measured, not guessed:
-/// `a_clamped_window_still_leaves_the_status_line_room_to_be_read` lays the
-/// overlay out and fails if the frame it draws is not this tall, so a
-/// restyled overlay cannot quietly grow over the status line again.
-fn actions_overlay_height(buttons: usize) -> f32 {
-    let chrome = theme::SPACE_3 * 2.0 + ACTIONS_HEADER_HEIGHT + theme::SPACE_2 + theme::ITEM_SPACING_Y;
-    let stack =
-        (buttons as f32) * theme::CONTROL_HEIGHT + (buttons.saturating_sub(1) as f32) * theme::ITEM_SPACING_Y;
-    chrome + stack
+/// Fixed sheet budget, shared with its independently scrolling renderer.
+fn actions_overlay_height() -> f32 {
+    action_render::HEIGHT
 }
 
+#[path = "action_render.rs"]
+mod action_render;
+
 fn draw_actions(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
-    let Some(row) = model.rows.get(model.selected) else {
-        return;
-    };
-    // A sheet, not a bordered box: it is the only thing under the field while
-    // it is open, so the surface tier is enough to say it stands over the
-    // list. The accent outline it used to carry only shouted.
-    Frame::default()
-        .fill(colors.surface)
-        .rounding(Rounding::same(theme::RADIUS_MEDIUM))
-        .inner_margin(Margin::same(theme::SPACE_3))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Actions")
-                        .size(theme::TEXT_LABEL)
-                        .strong()
-                        .color(colors.text),
-                );
-                ui.label(RichText::new(display_label(row)).small().color(colors.text_muted));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new("Esc to close").small().color(colors.text_muted));
-                });
-            });
-            ui.add_space(theme::SPACE_2);
-            if let Some(action) = &row.default_action {
-                if ui
-                    .button(format!("Enter  {}", action.label))
-                    .on_hover_text(&action.description)
-                    .clicked()
-                {
-                    commands.push(UiCommand::ExecuteDefault);
-                }
-            }
-            for (index, action) in row.alternate_actions.iter().enumerate() {
-                if ui
-                    .button(format!("{}  {}", index + 1, action.label))
-                    .on_hover_text(&action.description)
-                    .clicked()
-                {
-                    commands.push(UiCommand::ExecuteAlternate(index));
-                }
-            }
-        });
+    action_render::draw(ui, model, commands, colors);
 }
 
 /// Draws the plugin-drawn page and turns this frame's input into page events
@@ -4057,8 +4054,9 @@ fn web_frame_pointer(context: &egui::Context) -> Arc<Mutex<WebPointerState>> {
 /// a frame, preserving hardware keycodes, repeat, wheel phase and IME ranges.
 /// Its event copies inform chrome without fallback replay, including touch:
 /// deferred contacts must never be delivered to a later surface identity.
-/// Standalone frames preserve pointer/scroll/IME and named navigation keys;
-/// missing hardware metadata remains zero. Printable text arrives as text.
+/// Standalone frames preserve pointer/scroll/IME, named navigation keys and
+/// modified printable shortcuts; missing hardware metadata remains zero.
+/// Unmodified printable input remains text-only to avoid duplicate insertion.
 fn web_frame_input(
     ui: &egui::Ui,
     page: &PageSurface,
@@ -4188,7 +4186,7 @@ fn web_frame_input(
                     modifiers,
                     ..
                 } => {
-                    if let Some(keysym) = egui_web_keysym(*key) {
+                    if let Some(keysym) = egui_web_keysym(*key, *modifiers) {
                         commands.push(UiCommand::WebInput(WebSurfaceInput::Key {
                             surface_id,
                             timestamp_ms,
@@ -4226,7 +4224,7 @@ fn web_frame_input(
     });
 }
 
-fn egui_web_keysym(key: egui::Key) -> Option<u32> {
+fn egui_web_keysym(key: egui::Key, modifiers: egui::Modifiers) -> Option<u32> {
     let named = match key {
         egui::Key::ArrowDown => NamedKey::ArrowDown,
         egui::Key::ArrowLeft => NamedKey::ArrowLeft,
@@ -4242,6 +4240,23 @@ fn egui_web_keysym(key: egui::Key) -> Option<u32> {
         egui::Key::PageUp => NamedKey::PageUp,
         egui::Key::PageDown => NamedKey::PageDown,
         _ => {
+            if modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd {
+                let symbol = match key {
+                    egui::Key::Space => " ",
+                    egui::Key::Minus => "-",
+                    egui::Key::Quote => "'",
+                    _ => key.symbol_or_name(),
+                };
+                if let [byte] = symbol.as_bytes() {
+                    if byte.is_ascii() {
+                        return Some(u32::from(if modifiers.shift {
+                            *byte
+                        } else {
+                            byte.to_ascii_lowercase()
+                        }));
+                    }
+                }
+            }
             let function = key.name().strip_prefix('F')?.parse::<u32>().ok()?;
             return (1..=35).contains(&function).then_some(0xffbd + function);
         }
@@ -5175,6 +5190,35 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
             if settings.clicked() {
                 commands.push(UiCommand::OpenSettings);
             }
+            if !model.settings_open && model.page.is_none() && !model.rows.is_empty() {
+                let actions = ui
+                    .add(
+                        egui::Label::new(RichText::new("Actions  Ctrl/Cmd+K").small())
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text("Discover actions: Ctrl/Cmd+K or Alt+Enter");
+                if actions.clicked() {
+                    commands.push(UiCommand::ShowActions);
+                }
+                if let Some(row) = model.rows.get(model.selected) {
+                    if let Some(action) = &row.default_action {
+                        let primary = ui
+                            .add_sized(
+                                [110.0, theme::FOOTER_HEIGHT],
+                                egui::Label::new(RichText::new(format!("{}  Enter", action.label)).small())
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(&action.label);
+                        if primary.clicked() {
+                            commands.push(UiCommand::ActivateAction {
+                                target: crate::ActionTarget::of(row),
+                                identity: crate::ActionIdentity::Plugin(action.action_id.clone()),
+                            });
+                        }
+                    }
+                }
+            }
             // Only the legend is optional; the `Settings  Ctrl+,` control above
             // is drawn unconditionally, because it is the one mouse route into
             // the settings surface and hiding it would make the setting that
@@ -5183,7 +5227,7 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
             // `interact_size.y` above, and what remains is the same one line of
             // small text the window arithmetic in `STATUS_BLOCK_HEIGHT` is
             // measured against.
-            if model.show_hints {
+            if model.show_hints && (model.rows.is_empty() || model.page.is_some() || model.settings_open) {
                 ui.label(
                     RichText::new(if web_page {
                         "Tab navigate page   Esc close page"
@@ -5251,7 +5295,7 @@ mod transparency_tests {
             rows: Arc::default(),
             selected: 0,
             pending_plugins: false,
-            actions_open: false,
+            action_panel: None,
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,
@@ -5523,7 +5567,7 @@ mod lifecycle_tests {
                     rows: Arc::default(),
                     selected: 0,
                     pending_plugins: false,
-                    actions_open: false,
+                    action_panel: None,
                     settings_open: false,
                     settings: Arc::default(),
                     settings_focus: None,
@@ -5599,6 +5643,28 @@ mod lifecycle_tests {
         );
     }
 
+    #[test]
+    fn action_completion_wakes_are_process_scoped_and_coalesce_until_drained() {
+        let state = SharedState::default();
+        assert!(!state.is_visible());
+        assert!(state.claim_action_wake());
+        assert!(!state.claim_action_wake());
+        let session = state.claim_activation().unwrap();
+        assert!(state.is_visible_session(session));
+        assert!(
+            !state.claim_action_wake(),
+            "activation cannot discard a process wake"
+        );
+        assert!(state.claim_hide(session));
+        assert!(!state.is_visible());
+        state.acknowledge_action_wake();
+        assert!(
+            state.claim_action_wake(),
+            "hidden terminal work can announce another drain"
+        );
+        assert!(!state.is_visible());
+    }
+
     /// The promise is per session, so an announcement left outstanding by a
     /// session that ended cannot silence the next one.
     #[test]
@@ -5634,7 +5700,7 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
                 rows: Arc::default(),
                 selected: 0,
                 pending_plugins: false,
-                actions_open: false,
+                action_panel: None,
                 settings_open: false,
                 settings: Arc::default(),
                 settings_focus: None,
@@ -5990,7 +6056,7 @@ mod window_geometry_tests {
             rows: Arc::default(),
             selected: 0,
             pending_plugins: false,
-            actions_open: false,
+            action_panel: None,
             settings_open,
             settings: Arc::default(),
             settings_focus: None,
@@ -6717,7 +6783,9 @@ mod window_geometry_tests {
             let mut all = model.rows.to_vec();
             all[0] = first;
             model.rows = all.into();
-            model.actions_open = true;
+            model.action_panel = Some(Arc::new(crate::ActionPanel::new(
+                crate::action_tree(&model.rows[model.selected]).unwrap(),
+            )));
 
             let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
             let bottom = frame_bottom(&frame_at(&model, height));
@@ -6763,9 +6831,7 @@ mod window_geometry_tests {
             }
         }
 
-        // Three actions per row, so the overlay is tall enough that reserving
-        // its chrome alone would not be enough either.
-        const BUTTONS: usize = 3;
+        // A structured sheet has a fixed height and scrolls its bounded entries.
 
         for actions_open in [false, true] {
             // Far more results than the window can hold: this is the case the
@@ -6782,7 +6848,11 @@ mod window_geometry_tests {
                 })
                 .collect();
             model.rows = rows.into();
-            model.actions_open = actions_open;
+            model.action_panel = actions_open.then(|| {
+                Arc::new(crate::ActionPanel::new(
+                    crate::action_tree(&model.rows[model.selected]).unwrap(),
+                ))
+            });
 
             let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
             assert_eq!(
@@ -6897,9 +6967,8 @@ mod window_geometry_tests {
                 );
                 assert_eq!(
                     sheets[1].height(),
-                    actions_overlay_height(BUTTONS),
-                    "the actions overlay for {BUTTONS} actions is not the height \
-                     draw_results reserves for it"
+                    actions_overlay_height(),
+                    "the action sheet must match the height reserved above the footer"
                 );
             }
         }

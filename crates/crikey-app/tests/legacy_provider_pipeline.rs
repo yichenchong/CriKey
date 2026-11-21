@@ -405,6 +405,12 @@ fn a_legacy_items_default_action_executes_in_its_owning_plugin() {
     let driver = LegacyDriver::spawn(provider, pipeline, move |frame| {
         *sink.lock().expect("the publish sink is not poisoned") = Some(frame.clone());
     });
+    let (action_wake, action_notification) = std::sync::mpsc::channel();
+    driver.set_action_wake(move || {
+        action_wake
+            .send(())
+            .expect("the action notification receiver remains alive");
+    });
 
     let mut router = PluginActionRouter::default();
     router
@@ -446,24 +452,21 @@ fn a_legacy_items_default_action_executes_in_its_owning_plugin() {
         .expect("the exact owner admits its own row's default action");
     assert_eq!(request_id.plugin, well_behaved);
 
-    let mut completion = None;
-    for _ in 0..2_000 {
-        if let Some(next) = router.poll().pop() {
-            completion = Some(next);
-            break;
-        }
-        sleep(Duration::from_millis(5));
-    }
-    let completion = completion.expect("the admitted action must produce a terminal completion");
+    // Wait for a dedicated terminal notification without another query/input
+    // and without polling the outcome to make progress.
+    action_notification
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the legacy action must wake the host without another query");
+    let completions = router.poll();
+    assert_eq!(completions.len(), 1, "exactly one action was admitted");
+    let completion = completions.into_iter().next().unwrap();
 
     assert_eq!(completion.request_id, request_id);
     assert_eq!(completion.plugin, well_behaved);
     assert_eq!(completion.item_id, row.item);
-    assert!(
-        completion.outcome.is_ok(),
-        "the fixture's `on_execute` succeeds; got {:?}",
-        completion.outcome,
-    );
+    assert_eq!(completion.action_id, action.action_id);
+    assert_eq!(completion.outcome.unwrap(), crikey_app::ActionEffect::Completed);
+    assert!(router.poll().is_empty(), "completion drains once");
 
     drop(driver);
 }

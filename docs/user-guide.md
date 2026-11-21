@@ -67,14 +67,14 @@ Both write the user-global layer, so the panel and the command line always
 agree. A hotkey the desktop refuses leaves the previous one working and says
 so rather than leaving the launcher unreachable.
 
-For query and result navigation, the hint line along the bottom reads
-`Up/Down navigate   Tab complete   Esc cancel`. Once you have learned those
-keys, turn the hints off with `launcher.show-hints = false` or the matching row
-in the panel. The `Settings` mouse affordance stays visible, so hiding the hints
-does not prevent you from turning them back on. It normally advertises
-`Ctrl+,`; on a web page it shows only `Settings`, because that shortcut belongs
-to the document. Web-page hints instead read `Tab navigate page   Esc close
-page`.
+With results visible, the footer shows the current primary action and
+**Actions**; result navigation remains Up/Down, Tab to complete and Escape to
+cancel. In compact mode the optional hint line reads
+`Up/Down navigate   Tab complete   Esc cancel`. Hide optional hints with
+`launcher.show-hints = false`; Settings and action affordances remain available.
+Settings normally advertises `Ctrl+,`; on a web page it shows only **Settings**,
+because that shortcut belongs to the document. Web-page hints read
+`Tab navigate page   Esc close page`.
 
 The launcher window is drawn with rounded corners where the desktop can
 composite them smoothly: a Wayland session, an X11 session with a compositing
@@ -144,11 +144,42 @@ The launcher is usable without a mouse. For query and result navigation:
 | Page Up / Page Down | Move by a page |
 | Tab | Complete the query |
 | Enter | Execute the selected result's default action |
-| Alt+Enter | Open the selected result's alternate actions |
+| Ctrl/Cmd+K or Alt+Enter | Discover the selected result's actions |
 | Ctrl+, | Open the settings surface |
 | Escape | Close the settings surface, else cancel or dismiss the launcher |
-| 1–9 (actions open) | Choose that alternate action |
+| Up / Down, Enter (Actions open) | Select and activate a matching action or submenu |
 | F6 | Focus the preview, or return to search |
+
+### Discovering actions
+
+The footer shows the current primary action and **Actions**. Open Actions with
+`Ctrl/Cmd+K` or `Alt+Enter`, then type into its separate search field. Search
+flattens matching executable actions; clearing it restores sections. Up/Down
+and Page Up/Down move the action selection, not the result selection. Enter or
+clicking a row activates that exact action. Numeric keys are ordinary search
+text, not action indexes.
+
+**Launcher Settings → Open Settings** opens the real host settings surface.
+Other command-management controls appear only as their backing services become
+available. Escape/Back first clears action search, then leaves a submenu, then
+closes Actions; the launcher query is unchanged. Settings editors, custom pages
+and IME composition retain their own keyboard input.
+
+An admitted provider refresh preserves action search and focus for the exact
+owner, item and action. A vanished target or action shows an unavailable
+explanation and cannot silently execute a replacement. Close Actions to make a
+new selection. Actions are bounded to 256 entries, depth four, 8 KiB per text
+field and 256 KiB total prepared text; excessive input is refused visibly.
+Icons use already prepared result pixels or host vector symbols, never
+paint-time file/network loading. Primary and host shortcuts are host labels;
+the current plugin action contract does not declare arbitrary shortcuts or
+destructive flags. Explicit destructive presentation, where supplied by a host
+declaration, is styling only: it does not grant permission or confirm an action.
+
+Action failures replace the selected row's secondary metadata so that long
+descriptions cannot hide them. Hover the diagnostic to read its complete
+bounded reason (up to 8 KiB). Terminal outcomes wake the host without another
+keystroke; outcomes from dismissed or replaced views cannot reopen that view.
 
 ### Selected-result previews
 

@@ -1354,6 +1354,12 @@ fn modern_action_submission_is_nonblocking_and_budgeted() {
         }],
     };
     let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+    let (action_wake, action_notification) = std::sync::mpsc::channel();
+    driver.set_action_wake(move || {
+        action_wake
+            .send(())
+            .expect("the action notification receiver remains alive");
+    });
     let endpoint = driver.action_executor();
     let mut wrong_owner = item.clone();
     wrong_owner.plugin_id = modern_plugin("other");
@@ -1382,21 +1388,23 @@ fn modern_action_submission_is_nonblocking_and_budgeted() {
         "refusal must identify the action budget: {refused}"
     );
 
-    let mut completions = None;
-    for _ in 0..2_000 {
-        let ready = endpoint.poll_plugin_actions();
-        if !ready.is_empty() {
-            completions = Some(ready);
-            break;
-        }
-        sleep(Duration::from_millis(5));
-    }
-    let completion = completions
-        .expect("the slow action must eventually produce a terminal completion")
-        .into_iter()
-        .find(|completion| completion.request_id == first)
-        .expect("the first request's completion must be attributed exactly");
-    assert!(completion.outcome.is_ok(), "the plugin action should succeed");
+    // No further query or input drives the host: the supervised child must
+    // notify it after publishing the terminal outcome, before any drain.
+    action_notification
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the slow action must wake the host without another query");
+    let completions = endpoint.poll_plugin_actions();
+    assert_eq!(completions.len(), 1, "exactly one action was admitted");
+    let completion = completions.into_iter().next().unwrap();
+    assert_eq!(completion.request_id, first);
+    assert_eq!(completion.plugin, action_plugin);
+    assert_eq!(completion.item_id, item.stable_id);
+    assert_eq!(completion.action_id, ActionId("open".to_owned()));
+    assert_eq!(completion.outcome.unwrap(), crikey_app::ActionEffect::Completed);
+    assert!(
+        endpoint.poll_plugin_actions().is_empty(),
+        "completion drains once"
+    );
     drop(driver);
     let gone = endpoint
         .submit_plugin_action(&action_plugin, &item, &ActionId("open".to_owned()), None)
