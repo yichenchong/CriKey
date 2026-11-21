@@ -357,6 +357,8 @@ impl NativeSupervisor {
     /// Releases a child with checked settlement, preserving its registration and
     /// prior failure, restart, and backoff accounting. Pending worker failures
     /// are recorded once at the caller's policy time before releasing the child.
+    /// A guest that loses control during release is a policy failure, even if
+    /// it was alive when release began.
     /// A later `worker` call may start a new child subject to that policy.
     /// Missing registrations or children are already released.
     ///
@@ -378,7 +380,7 @@ impl NativeSupervisor {
             (alive, failure, outcome)
         };
         if let Ok(exit) = outcome {
-            if !alive {
+            if !alive || matches!(exit.kind, ExitKind::Crashed | ExitKind::ProtocolViolation) {
                 self.record_failed_exit(plugin, exit, failure, now_ms);
             } else {
                 if let Some(registration) = self.registrations.get_mut(plugin) {

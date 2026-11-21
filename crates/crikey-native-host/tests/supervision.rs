@@ -1453,6 +1453,52 @@ fn losing_guest_control_during_checked_shutdown_is_retained_failure() {
 }
 
 #[test]
+fn a_crashed_catalog_finalizer_is_recorded_before_open_runtime_restart_policy() {
+    let (binary, _) = conformance_binaries();
+    let witness = std::env::temp_dir().join(format!(
+        "crikey-native-release-crash-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let owner = PluginId("release.crashed-finalizer".into());
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+    supervisor
+        .register(
+            launch(
+                &binary,
+                &owner.0,
+                "echo",
+                &[
+                    (
+                        "CRIKEY_CONFORMANCE_STOP_FILE".into(),
+                        witness.to_string_lossy().into_owned(),
+                    ),
+                    ("CRIKEY_CONFORMANCE_CRASH_ON_STOP".into(), "1".into()),
+                ],
+            ),
+            options(TransportKind::Stdio),
+        )
+        .unwrap();
+    supervisor.worker(&owner, 0).unwrap();
+    supervisor.release_worker(&owner, 100);
+    assert_eq!(supervisor.restarts(&owner), 1);
+    assert_eq!(supervisor.health(&owner).crashes, 1);
+    let exits = supervisor.exits(&owner);
+    assert_eq!(exits.len(), 1);
+    assert_eq!(exits[0].kind, ExitKind::Crashed);
+    assert_eq!(exits[0].code, Some(17));
+    assert!(matches!(
+        supervisor.worker(&owner, 100),
+        Err(HostError::ResourceLimit { .. })
+    ));
+    supervisor.release_worker(&owner, 100);
+    assert_eq!(supervisor.restarts(&owner), 1);
+    assert_eq!(supervisor.health(&owner).crashes, 1);
+    supervisor.shutdown_all_checked().unwrap();
+    fs::remove_file(witness).unwrap();
+}
+
+#[test]
 fn checked_shutdown_accounts_for_an_actual_failed_startup_child() {
     let (_, binary) = conformance_binaries();
     let owner = PluginId("checked.partial-startup".into());

@@ -2178,7 +2178,11 @@ impl NativeWorker {
         if let Some(error) = self.closing_failure {
             return Err(self.teardown_error(error));
         }
-        if matches!(exit.kind, ExitKind::Crashed | ExitKind::ProtocolViolation) {
+        // Open-runtime guest failures still feed normal restart policy. During
+        // global closing, newly settled control loss cannot authorize mutation.
+        if self.link.admission.is_closed()
+            && matches!(exit.kind, ExitKind::Crashed | ExitKind::ProtocolViolation)
+        {
             return Err(self.teardown_error("native worker lost control during shutdown"));
         }
         Ok(exit)
@@ -4037,13 +4041,16 @@ fn prepare_group_reap(child: &Child) -> bool {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn wait_group_absent(pid: u32) -> bool {
-    unsafe extern "C" {
-        fn killpg(pgrp: i32, sig: i32) -> i32;
-    }
     let end = Instant::now() + Duration::from_millis(CHILD_REAP_TIMEOUT_MS);
     loop {
-        if unsafe { killpg(pid as i32, 0) } != 0 {
-            return std::io::Error::last_os_error().raw_os_error() == Some(3);
+        if unsafe { libc::killpg(pid as i32, 0) } != 0 {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => return true,
+                // Darwin zombie-only groups report EPERM until their actual
+                // reaper runs. This is presence, never an absence proof.
+                Some(libc::EPERM) => {}
+                _ => return false,
+            }
         }
         if Instant::now() >= end {
             return false;
