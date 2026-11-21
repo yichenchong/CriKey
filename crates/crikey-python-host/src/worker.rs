@@ -1160,6 +1160,7 @@ pub struct ModernWorker {
     stdout_thread: Option<JoinHandle<()>>,
     cleanup_failed: bool,
     child: Option<Child>,
+    #[cfg(unix)]
     process_id: u32,
     tree_settled: bool,
     #[cfg(windows)]
@@ -1277,6 +1278,7 @@ impl ModernWorker {
         let mut child = spawned
             .ok_or(HostError::AdmissionClosed)?
             .map_err(|error| HostError::Spawn(format!("the process could not be started: {error}")))?;
+        #[cfg(unix)]
         let process_id = child.id();
 
         // Piped by construction immediately above, so these are `Some`.
@@ -1313,6 +1315,7 @@ impl ModernWorker {
             child: Some(child),
             stdout_thread: None,
             cleanup_failed: false,
+            #[cfg(unix)]
             process_id,
             tree_settled: false,
             #[cfg(windows)]
@@ -3017,6 +3020,7 @@ mod tests {
                 stdout_thread: None,
                 cleanup_failed: false,
                 child: None,
+                #[cfg(unix)]
                 process_id: 0,
                 tree_settled: false,
                 #[cfg(windows)]

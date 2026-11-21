@@ -4196,7 +4196,7 @@ pub struct ModernDriver {
     has_plugins: bool,
     control: DriverControl,
     worker_started: bool,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     runtime_owner: Arc<Mutex<ModernProvider>>,
 }
 
@@ -4568,7 +4568,7 @@ impl ModernDriver {
         let signal_actions = Arc::clone(&action_endpoint);
         let signal_cancellation = Arc::clone(&cancellation);
         let signal_runtime = Arc::clone(&runtime);
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         let test_runtime = Arc::clone(&runtime);
         let owners: Arc<[PluginId]> = owners.into();
         let control = DriverControl::new(
@@ -4626,7 +4626,7 @@ impl ModernDriver {
             has_plugins: has_plugins && worker_started,
             control,
             worker_started,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             runtime_owner: test_runtime,
         }
     }
