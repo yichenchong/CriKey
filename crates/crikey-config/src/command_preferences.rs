@@ -185,6 +185,32 @@ impl CommandPreferences {
 }
 
 impl crate::ConfigStore {
+    /// Checks only assignments winning in this resolved candidate context.
+    pub fn validate_command_hotkey_conflicts(&self) -> Result<(), String> {
+        let activation = self
+            .get(crate::KEY_ACTIVATION_HOTKEY)
+            .ok_or("launcher activation is unavailable")?;
+        let activation =
+            crikey_platform::Accelerator::parse(activation).map_err(|error| error.to_string())?;
+        let preferences = self
+            .get(KEY_COMMAND_PREFERENCES)
+            .map(CommandPreferences::decode)
+            .transpose()?
+            .unwrap_or_default();
+        for record in preferences.records {
+            if let Some(hotkey) = record.hotkey {
+                let command =
+                    crikey_platform::Accelerator::parse(&hotkey).map_err(|error| error.to_string())?;
+                if activation.canonical() == command.canonical() {
+                    return Err(
+                        "This shortcut is assigned to launcher activation and a command; unassign it first"
+                            .into(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
     /// Reads exactly one target layer, not the effective session-overridden document.
     pub fn command_preferences_at(
         &self,

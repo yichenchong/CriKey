@@ -218,6 +218,19 @@ item is never a replacement. Removing favorite or fallback membership leaves
 other preferences intact. Ranking reset affects the current owner/item shared
 by commands targeting it, not command recents, preferences or query recall.
 
+Users can also assign command aliases and global shortcuts to the exact declared
+reference. Hidden declarations are excluded from alias discovery, not explicit
+shortcut invocation. Shortcut dispatch revalidates current canonical command
+authority and permissions. Optional arguments are omitted; Required commands open
+host input without invoking the callback. No alias-plus-space argument syntax or
+structured argument support is implied. Native `Plugin::execute_outcome` may return
+`ExecuteOutcome::ShowPage`; a hidden callback's page outcome presents only for a
+current, once-consumed deliberate shortcut intent. Late superseded outcomes never
+revive a dismissed launcher. Modern Python execution currently discards callback
+return outcomes, so Modern command shortcuts execute but do not present result
+pages. Outcome propagation for that runtime is not delivered by this phase.
+
+
 Preference controls submit revision-checked semantic edits to the user-global
 layer, preserving unrelated fields in that layer rather than copying effective
 profile/session values. Higher-priority layers may still mask a saved edit.
@@ -227,8 +240,8 @@ checks; healthy idle worker release does not remove an installed command, but a
 retired preview producer cannot service deferred preview.
 
 Legacy, WASM and restricted C-ABI plugins do not gain a command callback through
-this transport. Command-specific alias/global shortcut controls and structured
-multi-field arguments are not capabilities of `commands_v1`.
+this transport. The host supplies alias/global-shortcut controls for explicit
+declarations; `commands_v1` does not add structured multi-field arguments.
 
 Cancellation is cooperative, but display admission is not: a late suggestion
 from an obsolete query or dismissed launcher session is discarded even if its

@@ -32,13 +32,9 @@
 //! because a launcher that hangs on shutdown is worse than a thread that
 //! outlives its owner by the length of one connection teardown.
 //!
-//! # Why every registration rebinds
-//!
-//! The portal permits one `BindShortcuts` attempt per session. A second
-//! accelerator therefore cannot be added to a bound session at all, so each
-//! change creates a *new* session carrying the full accumulated set and closes
-//! the previous one -- and only once the new binding is confirmed, so a refused
-//! rebinding leaves the shortcuts that were already live untouched.
+//! Each accelerator owns an independently approved portal session. Acquiring a
+//! replacement never releases an old chord, and removing one binding never
+//! opens an approval dialog for unrelated bindings.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -47,10 +43,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crikey_core::{CoreError, Result};
-use crikey_platform::{Accelerator, HotkeyActivationHandler, HotkeyBinding, HotkeyService};
+use crikey_platform::{
+    Accelerator, HotkeyActivationHandler, HotkeyBinding, HotkeyCancellation, HotkeyService,
+};
 use zbus::blocking::{Connection, MessageIterator, Proxy};
 use zbus::message::Type as MessageType;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
@@ -134,6 +132,7 @@ struct Shortcut {
     /// The same chord in the shortcuts-specification syntax the portal takes
     /// as a `preferred_trigger`.
     trigger: String,
+    session: OwnedObjectPath,
 }
 
 /// The live bindings, keyed by the shortcut id the portal knows them by, which
@@ -237,7 +236,7 @@ fn portal_trigger(accelerator: &Accelerator) -> Result<String> {
 /// because a portal dialog lists the description alone, and "CriKey" against
 /// three identical rows tells the user nothing about what they are approving.
 fn description(canonical: &str) -> String {
-    format!("Show the CriKey launcher ({canonical})")
+    format!("CriKey shortcut ({canonical})")
 }
 
 // ---------------------------------------------------------------------------
@@ -254,19 +253,21 @@ pub struct WaylandHotkeyService {
     shortcuts: Proxy<'static>,
     shared: Arc<Shared>,
     reader: Option<JoinHandle<()>>,
-    /// The portal session the live bindings hang off. Replaced wholesale by
-    /// every rebinding.
-    session: OwnedObjectPath,
     /// Makes each request and session token unique within this service, which
     /// is what lets a request path be predicted before the call is made.
     next_token: u64,
+    sessions: HashMap<String, OwnedObjectPath>,
+    retired: Vec<OwnedObjectPath>,
+    cancellation: HotkeyCancellation,
+    operation_epoch: u64,
+    retired_requests: Vec<String>,
 }
 
 impl fmt::Debug for WaylandHotkeyService {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WaylandHotkeyService")
-            .field("session", &self.session.as_str())
+            .field("sessions", &self.sessions.len())
             .field("registrations", &lock(&self.shared.registrations).len())
             .finish_non_exhaustive()
     }
@@ -312,29 +313,46 @@ impl WaylandHotkeyService {
         let shared = Arc::new(Shared::new());
         let reader = spawn_reader(messages, Arc::clone(&shared));
 
-        let mut service = Self {
+        let service = Self {
             connection,
             shortcuts,
             shared,
             reader: Some(reader),
-            session: OwnedObjectPath::default(),
             next_token: 0,
+            sessions: HashMap::new(),
+            retired: Vec::new(),
+            cancellation: HotkeyCancellation::default(),
+            operation_epoch: 0,
+            retired_requests: Vec::new(),
         };
-        service.session = service.create_session()?;
         Ok(service)
     }
 
     /// A token unique to this service, valid as the last element of an object
     /// path.
-    fn token(&mut self) -> String {
-        self.next_token += 1;
-        format!("crikey{}_{}", std::process::id(), self.next_token)
+    fn token(&mut self) -> Result<String> {
+        self.next_token = self
+            .next_token
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Invalid("portal shortcut token exhausted".into()))?;
+        Ok(format!("crikey{}_{}", std::process::id(), self.next_token))
     }
 
     /// Opens a fresh portal session.
     fn create_session(&mut self) -> Result<OwnedObjectPath> {
-        let handle_token = self.token();
-        let session_token = self.token();
+        let handle_token = self.token()?;
+        let session_token = self.token()?;
+        let sender = self
+            .connection
+            .unique_name()
+            .ok_or_else(|| CoreError::Invalid("portal connection has no unique name".into()))?
+            .as_str()
+            .trim_start_matches(':')
+            .replace('.', "_");
+        let predicted_session = OwnedObjectPath::try_from(format!(
+            "/org/freedesktop/portal/desktop/session/{sender}/{session_token}"
+        ))
+        .map_err(|error| invalid("predicting portal session", error))?;
         let waiter = self.begin_request(&handle_token)?;
 
         let mut options: HashMap<&str, Value<'_>> = HashMap::new();
@@ -345,7 +363,18 @@ impl WaylandHotkeyService {
             .call("CreateSession", &(options,))
             .map_err(|error| invalid("the GlobalShortcuts portal refused to open a session", error))?;
 
-        let results = self.await_response(waiter, handle, SESSION_TIMEOUT, "opening a portal session")?;
+        let results = match self.await_response(waiter, handle, SESSION_TIMEOUT, "opening a portal session") {
+            Ok(results) => results,
+            Err(error) => {
+                return match self.close_session(&predicted_session) {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => {
+                        self.retired.push(predicted_session);
+                        Err(CoreError::Invalid(format!("{error}; {cleanup}")))
+                    }
+                }
+            }
+        };
         // The portal returns this as a string rather than an object path: a
         // documented wart of the interface, kept for backwards compatibility.
         let session = results
@@ -369,36 +398,9 @@ impl WaylandHotkeyService {
             })
     }
 
-    /// Binds `desired` on a new session and retires the old one.
-    ///
-    /// The new session is opened and bound first. Only a confirmed binding
-    /// closes the previous session, so a portal that refuses -- or a user who
-    /// dismisses the dialog -- leaves the accelerators that were already live
-    /// exactly as they were.
-    fn rebind(&mut self, desired: Registrations, required: Option<&str>) -> Result<()> {
-        let session = self.create_session()?;
-        match self.bind(&session, &desired, required) {
-            Ok(()) => {
-                let previous = std::mem::replace(&mut self.session, session);
-                self.close_session(&previous);
-                *lock(&self.shared.registrations) = desired;
-                Ok(())
-            }
-            Err(error) => {
-                self.close_session(&session);
-                Err(error)
-            }
-        }
-    }
-
-    /// Asks the portal to bind every shortcut in `desired`, and checks that it
-    /// really did bind `required`.
-    fn bind(
-        &mut self,
-        session: &OwnedObjectPath,
-        desired: &Registrations,
-        required: Option<&str>,
-    ) -> Result<()> {
+    /// Asks the portal to bind every shortcut in `desired`, and confirms the
+    /// complete set before the previous session can be retired.
+    fn bind(&mut self, session: &OwnedObjectPath, desired: &Registrations) -> Result<()> {
         if desired.is_empty() {
             // Nothing left to bind. The empty session still replaces the old
             // one, which is what actually releases the shortcuts.
@@ -421,7 +423,7 @@ impl WaylandHotkeyService {
             })
             .collect();
 
-        let handle_token = self.token();
+        let handle_token = self.token()?;
         let waiter = self.begin_request(&handle_token)?;
         let mut options: HashMap<&str, Value<'_>> = HashMap::new();
         options.insert("handle_token", Value::from(handle_token.as_str()));
@@ -434,26 +436,25 @@ impl WaylandHotkeyService {
             .map_err(|error| invalid("the GlobalShortcuts portal refused the binding request", error))?;
 
         let results = self.await_response(waiter, handle, BIND_TIMEOUT, "binding a global shortcut")?;
-        let Some(required) = required else {
-            return Ok(());
-        };
-
-        // The portal answers with the subset it actually bound, and a subset
-        // that omits the chord just asked for is a refusal however successful
-        // the response code was. An older portal that reports no subset at all
-        // is taken at its word, because there is nothing else to go on.
-        match bound_ids(&results) {
-            Some(bound) if !bound.iter().any(|id| id == required) => Err(CoreError::Invalid(format!(
-                "the GlobalShortcuts portal accepted the request but did not bind {required}, so \
-                 that accelerator is not live"
-            ))),
-            _ => Ok(()),
+        let bound = bound_ids(&results).ok_or_else(|| CoreError::Invalid(
+            "the GlobalShortcuts portal did not confirm its bound shortcuts; the previous session remains active".into()
+        ))?;
+        for id in desired.keys() {
+            if !bound.iter().any(|bound_id| bound_id == id) {
+                return Err(CoreError::Invalid(format!(
+                    "the GlobalShortcuts portal did not bind {id}; the previous session remains active"
+                )));
+            }
         }
+        Ok(())
     }
 
     /// Registers interest in the `Response` for a request that is about to be
     /// made, returning what to wait on.
     fn begin_request(&self, handle_token: &str) -> Result<RequestWaiter> {
+        if self.cancellation.cancelled(self.operation_epoch) {
+            return Err(CoreError::Invalid("hotkey service is stopping".into()));
+        }
         let unique = self.connection.unique_name().ok_or_else(|| {
             CoreError::Invalid(
                 "this connection has no unique bus name, so a portal request could not be addressed"
@@ -464,32 +465,64 @@ impl WaylandHotkeyService {
         let path = format!("{REQUEST_PATH_PREFIX}/{sender}/{handle_token}");
         let (responses, receiver) = mpsc::channel();
         lock(&self.shared.pending).insert(path.clone(), responses);
-        Ok(RequestWaiter { path, receiver })
+        Ok(RequestWaiter {
+            path,
+            receiver,
+            epoch: self.operation_epoch,
+            shared: Arc::clone(&self.shared),
+        })
     }
 
     /// Waits for the `Response` the reader routes back, and unwraps its code.
     fn await_response(
-        &self,
+        &mut self,
         waiter: RequestWaiter,
         handle: OwnedObjectPath,
         timeout: Duration,
         attempt: &str,
     ) -> Result<HashMap<String, OwnedValue>> {
-        let RequestWaiter { path, receiver } = waiter;
+        let RequestWaiter {
+            ref path,
+            ref receiver,
+            epoch,
+            ..
+        } = waiter;
         // A portal is entitled to hand back a path other than the predicted
         // one. Listening on both costs one map entry and is the difference
         // between a working registration and a timeout.
         let handle = handle.as_str().to_owned();
-        if handle != path {
+        if handle != *path {
             let mut pending = lock(&self.shared.pending);
-            if let Some(responses) = pending.get(&path).cloned() {
+            if let Some(responses) = pending.get(path).cloned() {
                 pending.insert(handle.clone(), responses);
             }
         }
 
-        let outcome = receiver.recv_timeout(timeout);
+        let deadline = Instant::now() + timeout;
+        let outcome = loop {
+            if self.cancellation.cancelled(epoch) {
+                let close = self.close_request(&handle);
+                if close.is_err() {
+                    self.retired_requests.push(handle.clone());
+                }
+                lock(&self.shared.pending).remove(path);
+                lock(&self.shared.pending).remove(&handle);
+                return Err(CoreError::Invalid(match close {
+                    Ok(()) => format!("cancelled {attempt}; portal request closed"),
+                    Err(error) => format!("cancelled {attempt}; portal request cleanup failed: {error}"),
+                }));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Err(RecvTimeoutError::Timeout);
+            }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(20))) {
+                Err(RecvTimeoutError::Timeout) => continue,
+                outcome => break outcome,
+            }
+        };
         let mut pending = lock(&self.shared.pending);
-        pending.remove(&path);
+        pending.remove(path);
         pending.remove(&handle);
         drop(pending);
 
@@ -511,10 +544,16 @@ impl WaylandHotkeyService {
                 "the GlobalShortcuts portal answered {attempt} with a body this backend cannot \
                  read: {reason}"
             ))),
-            Err(RecvTimeoutError::Timeout) => Err(CoreError::Invalid(format!(
-                "the GlobalShortcuts portal did not answer {attempt} within {} seconds",
-                timeout.as_secs()
-            ))),
+            Err(RecvTimeoutError::Timeout) => {
+                let cleanup = self.close_request(&handle);
+                if cleanup.is_err() {
+                    self.retired_requests.push(handle.clone());
+                }
+                Err(CoreError::Invalid(format!(
+                    "the GlobalShortcuts portal did not answer {attempt} within {} seconds; request cleanup: {}",
+                    timeout.as_secs(), cleanup.err().map(|error| error.to_string()).unwrap_or_else(|| "closed".into())
+                )))
+            }
             // The reader is gone, so no answer can ever arrive on this
             // connection again, whatever the portal does next.
             Err(RecvTimeoutError::Disconnected) => Err(CoreError::Invalid(format!(
@@ -524,22 +563,59 @@ impl WaylandHotkeyService {
         }
     }
 
-    /// Retires a portal session. Best effort and deliberately reply-less: the
-    /// caller is either replacing this session or shutting down, and neither
-    /// has anything to do with a refusal.
-    fn close_session(&self, session: &OwnedObjectPath) {
-        if session.as_str().is_empty() {
-            return;
+    fn close_request(&self, path: &str) -> Result<()> {
+        self.close_portal_object(path, REQUEST_INTERFACE, "closing portal shortcut request")
+    }
+
+    fn close_portal_object(&self, path: &str, interface: &str, context: &str) -> Result<()> {
+        let proxy = Proxy::new(&self.connection, PORTAL_BUS_NAME, path, interface)
+            .map_err(|error| invalid(context, error))?;
+        match proxy.call::<_, _, ()>("Close", &()) {
+            Ok(()) => Ok(()),
+            // An explicit absent-object answer discharges cleanup. Transport
+            // failures and Close refusals remain unresolved obligations.
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.freedesktop.DBus.Error.UnknownObject" =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(invalid(context, error)),
         }
-        let Ok(proxy) = Proxy::new(
-            &self.connection,
-            PORTAL_BUS_NAME,
-            ObjectPath::from(session.clone()),
+    }
+
+    fn retry_retired(&mut self) -> Result<()> {
+        let mut errors = Vec::new();
+        let mut requests = Vec::new();
+        for path in std::mem::take(&mut self.retired_requests) {
+            if let Err(error) = self.close_request(&path) {
+                errors.push(error.to_string());
+                requests.push(path);
+            }
+        }
+        self.retired_requests = requests;
+        let mut held = Vec::new();
+        for session in std::mem::take(&mut self.retired) {
+            if let Err(error) = self.close_session(&session) {
+                errors.push(error.to_string());
+                held.push(session);
+            }
+        }
+        self.retired = held;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(CoreError::Invalid(errors.join("; ")))
+        }
+    }
+
+    /// An acknowledged Close or explicit UnknownObject confirms retirement.
+    /// Every other refusal remains an unresolved physical cleanup obligation.
+    fn close_session(&self, session: &OwnedObjectPath) -> Result<()> {
+        self.close_portal_object(
+            session.as_str(),
             SESSION_INTERFACE,
-        ) else {
-            return;
-        };
-        let _ = proxy.call_noreply("Close", &());
+            "closing portal shortcut session",
+        )
     }
 
     /// Gets the reader out of its blocking read, reporting whether joining it
@@ -565,6 +641,14 @@ impl WaylandHotkeyService {
 struct RequestWaiter {
     path: String,
     receiver: Receiver<PortalResponse>,
+    epoch: u64,
+    shared: Arc<Shared>,
+}
+
+impl Drop for RequestWaiter {
+    fn drop(&mut self) {
+        lock(&self.shared.pending).remove(&self.path);
+    }
 }
 
 impl HotkeyService for WaylandHotkeyService {
@@ -577,17 +661,43 @@ impl HotkeyService for WaylandHotkeyService {
     /// on the canonical rendering, so every spelling of one chord is one
     /// registration.
     fn register(&mut self, binding: &HotkeyBinding) -> Result<()> {
+        self.register_at(binding, self.cancellation.epoch())
+    }
+
+    fn register_at(&mut self, binding: &HotkeyBinding, epoch: u64) -> Result<()> {
+        self.operation_epoch = epoch;
+        if self.cancellation.cancelled(self.operation_epoch) {
+            return Err(CoreError::Invalid("hotkey service is stopping".into()));
+        }
+        self.retry_retired()?;
         let accelerator = parse(binding)?;
         let canonical = accelerator.canonical();
         let id = shortcut_id(&canonical);
-        if lock(&self.shared.registrations).contains_key(&id) {
+        if self.sessions.contains_key(&id) {
             return Ok(());
         }
-
         let trigger = portal_trigger(&accelerator)?;
-        let mut desired = lock(&self.shared.registrations).clone();
-        desired.insert(id.clone(), Shortcut { canonical, trigger });
-        self.rebind(desired, Some(&id))
+        let session = self.create_session()?;
+        let desired = HashMap::from([(
+            id.clone(),
+            Shortcut {
+                canonical,
+                trigger,
+                session: session.clone(),
+            },
+        )]);
+        if let Err(error) = self.bind(&session, &desired) {
+            return match self.close_session(&session) {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    self.retired.push(session);
+                    Err(CoreError::Invalid(format!("{error}; {cleanup}")))
+                }
+            };
+        }
+        self.sessions.insert(id, session);
+        lock(&self.shared.registrations).extend(desired);
+        Ok(())
     }
 
     /// Releases an accelerator this service bound.
@@ -599,13 +709,14 @@ impl HotkeyService for WaylandHotkeyService {
         let accelerator = parse(binding)?;
         let canonical = accelerator.canonical();
         let id = shortcut_id(&canonical);
-        let mut desired = lock(&self.shared.registrations).clone();
-        if desired.remove(&id).is_none() {
-            return Err(CoreError::Invalid(format!(
-                "{canonical} holds no portal shortcut to release"
-            )));
-        }
-        self.rebind(desired, None)
+        let session = self
+            .sessions
+            .get(&id)
+            .ok_or_else(|| CoreError::Invalid(format!("{canonical} holds no portal shortcut to release")))?;
+        self.close_session(session)?;
+        self.sessions.remove(&id);
+        lock(&self.shared.registrations).remove(&id);
+        Ok(())
     }
 
     /// Installs the callback the reader invokes on an activation.
@@ -615,6 +726,33 @@ impl HotkeyService for WaylandHotkeyService {
     /// approval dialog to get them back.
     fn set_activation_handler(&mut self, handler: Option<HotkeyActivationHandler>) {
         *lock(&self.shared.handler) = handler.map(Arc::new);
+    }
+
+    fn cancellation_handle(&self) -> Option<HotkeyCancellation> {
+        Some(self.cancellation.clone())
+    }
+
+    fn shutdown(&mut self, _bindings: &[HotkeyBinding]) -> Result<()> {
+        self.set_activation_handler(None);
+        self.cancellation.stop();
+        let mut errors = Vec::new();
+        for (id, session) in self.sessions.clone() {
+            match self.close_session(&session) {
+                Ok(()) => {
+                    self.sessions.remove(&id);
+                    lock(&self.shared.registrations).remove(&id);
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        if let Err(error) = self.retry_retired() {
+            errors.push(error.to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(CoreError::Invalid(errors.join("; ")))
+        }
     }
 }
 
@@ -626,8 +764,7 @@ impl Drop for WaylandHotkeyService {
     /// thread blocked on a socket hangs the whole launcher on shutdown, and a
     /// detached reader costs a thread that ends with the connection anyway.
     fn drop(&mut self) {
-        let session = std::mem::take(&mut self.session);
-        self.close_session(&session);
+        let _ = self.shutdown(&[]);
 
         let Some(reader) = self.reader.take() else {
             return;
@@ -719,7 +856,7 @@ fn deliver_response(shared: &Shared, path: Option<String>, message: &zbus::Messa
 
 /// Turns one `Activated` signal into a handler call.
 fn deliver_activation(shared: &Shared, message: &zbus::Message) {
-    let Ok((_session, id, _timestamp, _options)) =
+    let Ok((session, id, _timestamp, _options)) =
         message
             .body()
             .deserialize::<(OwnedObjectPath, String, u64, HashMap<String, OwnedValue>)>()
@@ -729,6 +866,9 @@ fn deliver_activation(shared: &Shared, message: &zbus::Message) {
     let Some(shortcut) = lock(&shared.registrations).get(&id).cloned() else {
         return;
     };
+    if shortcut.session != session {
+        return;
+    }
     let Some(handler) = lock(&shared.handler).clone() else {
         return;
     };

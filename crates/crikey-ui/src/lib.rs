@@ -130,6 +130,8 @@ pub enum CommandPreferenceEdit {
     Hidden(bool),
     Fallback(bool),
     MoveFallback { position: usize },
+    SetAlias(Option<String>),
+    SetHotkey(Option<String>),
 }
 
 impl ResultRow {
@@ -193,6 +195,7 @@ pub struct SettingRow {
 pub enum SettingEditStatus {
     Saved,
     Failed,
+    PersistedReloadRequired,
 }
 
 /// An actual persistence result, correlated with the original submitted edit.
@@ -202,6 +205,24 @@ pub struct SettingEditOutcome {
     pub key: String,
     pub value: String,
     pub status: SettingEditStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPreferenceEditOutcome {
+    pub request_id: u64,
+    pub reference: crikey_core::CommandRef,
+    pub edit: CommandPreferenceEdit,
+    pub status: SettingEditStatus,
+}
+
+pub fn command_edit_key(reference: &crikey_core::CommandRef, hotkey: bool) -> String {
+    format!(
+        "command:{}:{}:{}:{}",
+        reference.provider_id.0.len(),
+        reference.provider_id.0,
+        reference.command_id,
+        if hotkey { "hotkey" } else { "alias" }
+    )
 }
 
 static NEXT_SETTING_EDIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -492,6 +513,12 @@ pub enum UiCommand {
         expected_revision: u64,
         edit: CommandPreferenceEdit,
     },
+    EditCommandShortcut {
+        request_id: u64,
+        target: ActionTarget,
+        expected_revision: u64,
+        edit: CommandPreferenceEdit,
+    },
     ResetCommandRanking {
         target: ActionTarget,
         registry_revision: u64,
@@ -504,6 +531,11 @@ pub enum UiCommand {
     LeavePreview,
     ShowPreviewDetail,
     SetPreviewRatio(f32),
+    BeginShortcutCapture(String),
+    RecordShortcut(String),
+    CancelShortcutCapture,
+    /// Native input owned by a focused editor still supersedes asynchronous presentation.
+    UserActivity,
     OpenPreviewLink {
         target: PreviewLinkTarget,
         url: String,
@@ -595,6 +627,7 @@ pub enum UiEffect {
         query: String,
     },
     MutateCommandPreferences {
+        request_id: u64,
         reference: crikey_core::CommandRef,
         expected_revision: u64,
         edit: CommandPreferenceEdit,
@@ -986,7 +1019,12 @@ impl LauncherViewModel {
     fn capture_entry(&self) -> navigation::Entry {
         let route = if self.settings_open {
             NavigationRoute::Settings {
-                focus: self.settings_focus.clone(),
+                // Recorder capture is transient input ownership, never a resumable route.
+                focus: self
+                    .settings_focus
+                    .as_ref()
+                    .filter(|focus| !focus.starts_with("record:"))
+                    .cloned(),
             }
         } else if let Some(page) = &self.page {
             NavigationRoute::CustomPage {
@@ -1041,7 +1079,7 @@ impl LauncherViewModel {
             NavigationRoute::Settings { focus } => {
                 self.navigation_title = Arc::from("Settings");
                 self.settings_open = true;
-                self.settings_focus = focus;
+                self.settings_focus = focus.filter(|focus| !focus.starts_with("record:"));
             }
             route @ NavigationRoute::CustomPage { .. } => {
                 if let NavigationRoute::CustomPage { title, page_id, .. } = &route {
@@ -1454,6 +1492,13 @@ impl LauncherViewModel {
     /// nothing. A hidden launcher ignores every command: only `activate` moves
     /// it, and [`UiCommand::ClosePage`] -- which has a plugin session to end
     /// however the launcher got into this state.
+    pub fn shortcut_capture(&self) -> Option<&str> {
+        self.visible
+            .then_some(self.settings_focus.as_deref())
+            .flatten()?
+            .strip_prefix("record:")
+    }
+
     pub fn apply(&mut self, command: UiCommand) -> Option<UiEffect> {
         // Closing a page is the one command whose work outlives the launcher
         // session, so it is the one command a hidden launcher still answers:
@@ -1465,6 +1510,42 @@ impl LauncherViewModel {
         }
 
         match command {
+            UiCommand::UserActivity => None,
+            UiCommand::BeginShortcutCapture(key) => {
+                self.settings_focus = Some(format!("record:{key}"));
+                self.dirty = true;
+                None
+            }
+            UiCommand::RecordShortcut(chord) => {
+                if let Some(key) = self.shortcut_capture().map(str::to_owned) {
+                    self.setting_edit_completed(SettingEditOutcome {
+                        request_id: next_setting_edit_id(),
+                        key: format!("capture:{key}"),
+                        value: chord,
+                        status: SettingEditStatus::Saved,
+                    });
+                    self.settings_focus = None;
+                    self.dirty = true;
+                }
+                None
+            }
+            UiCommand::CancelShortcutCapture => {
+                if self.shortcut_capture().is_some() {
+                    self.settings_focus = None;
+                    self.dirty = true;
+                }
+                None
+            }
+            UiCommand::EditCommandPreference {
+                target,
+                expected_revision,
+                edit,
+            } => self.apply(UiCommand::EditCommandShortcut {
+                request_id: next_setting_edit_id(),
+                target,
+                expected_revision,
+                edit,
+            }),
             UiCommand::Back => {
                 let had_page = self.page.is_some();
                 self.pop_navigation();
@@ -1606,7 +1687,8 @@ impl LauncherViewModel {
                     query,
                 })
             }
-            UiCommand::EditCommandPreference {
+            UiCommand::EditCommandShortcut {
+                request_id,
                 target,
                 expected_revision,
                 edit,
@@ -1629,6 +1711,7 @@ impl LauncherViewModel {
                     return None;
                 }
                 Some(UiEffect::MutateCommandPreferences {
+                    request_id,
                     reference: reference.clone(),
                     expected_revision,
                     edit,
@@ -1853,6 +1936,19 @@ impl LauncherViewModel {
         true
     }
 
+    pub fn command_edit_completed(&mut self, outcome: CommandPreferenceEditOutcome) {
+        let (hotkey, value) = match outcome.edit {
+            CommandPreferenceEdit::SetAlias(value) => (false, value),
+            CommandPreferenceEdit::SetHotkey(value) => (true, value),
+            _ => return,
+        };
+        self.setting_edit_completed(SettingEditOutcome {
+            request_id: outcome.request_id,
+            key: command_edit_key(&outcome.reference, hotkey),
+            value: value.unwrap_or_default(),
+            status: outcome.status,
+        });
+    }
     pub fn setting_edit_completed(&mut self, outcome: SettingEditOutcome) {
         if self
             .setting_edits

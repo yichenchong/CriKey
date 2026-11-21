@@ -402,7 +402,11 @@ impl X11HotkeyService {
                 });
 
             if let Err(error) = outcome {
-                self.release_masks(grab.keycode, &grab.grabbed[..taken]);
+                if let Err(rollback) = self.release_masks(grab.keycode, &grab.grabbed[..taken]) {
+                    return Err(CoreError::Invalid(format!(
+                        "{error}; hotkey grab rollback also failed: {rollback}"
+                    )));
+                }
                 return Err(error);
             }
         }
@@ -414,33 +418,30 @@ impl X11HotkeyService {
     /// A refusal is reported rather than swallowed: it means the key is still
     /// being eaten, which the caller has to be able to see.
     fn ungrab(&self, grab: &Grab) -> Result<()> {
-        let mut failure = None;
-        for mask in &grab.grabbed {
-            let outcome = self
+        self.release_masks(grab.keycode, &grab.grabbed)
+    }
+
+    /// Rolls back every taken permutation, reporting native cleanup failures.
+    fn release_masks(&self, keycode: Keycode, masks: &[u32]) -> Result<()> {
+        let mut failures = Vec::new();
+        for mask in masks {
+            let result = self
                 .connection
-                .ungrab_key(grab.keycode, self.root, ModMask::from(*mask as u16))
+                .ungrab_key(keycode, self.root, ModMask::from(*mask as u16))
                 .map_err(|error| invalid("releasing the hotkey", error))
                 .and_then(|cookie| {
                     cookie
                         .check()
                         .map_err(|error| invalid("releasing the hotkey", error))
                 });
-            if let Err(error) = outcome {
-                failure.get_or_insert(error);
+            if let Err(error) = result {
+                failures.push(error.to_string());
             }
         }
-        failure.map_or(Ok(()), Err)
-    }
-
-    /// Rolls back a grab that was refused part way through its permutations.
-    fn release_masks(&self, keycode: Keycode, masks: &[u32]) {
-        for mask in masks {
-            if let Ok(cookie) = self
-                .connection
-                .ungrab_key(keycode, self.root, ModMask::from(*mask as u16))
-            {
-                let _ = cookie.check();
-            }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(CoreError::Invalid(failures.join("; ")))
         }
     }
 }
@@ -782,16 +783,18 @@ impl HotkeyService for X11HotkeyService {
     /// and a launcher that thinks it released a hotkey it never held will keep
     /// swallowing that key press.
     ///
-    /// The bookkeeping entry is dropped even when X refuses the ungrab. Keeping
-    /// it would describe a registration nobody can act on any more, and the
-    /// error still reaches the caller.
+    /// Keep bookkeeping on refusal: a failed release is still a cleanup
+    /// obligation, and must not make idempotent registration claim new ownership.
     fn unregister(&mut self, binding: &HotkeyBinding) -> Result<()> {
         let accelerator = parse(binding)?;
         let canonical = accelerator.canonical();
         let grab = lock(&self.shared.registrations)
-            .remove(&canonical)
+            .get(&canonical)
+            .cloned()
             .ok_or_else(|| CoreError::Invalid(format!("{canonical} holds no X11 hotkey grab to release")))?;
-        self.ungrab(&grab)
+        self.ungrab(&grab)?;
+        lock(&self.shared.registrations).remove(&canonical);
+        Ok(())
     }
 
     /// Installs the callback the reader thread invokes on an activation.

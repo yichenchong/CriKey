@@ -535,15 +535,6 @@ pub struct LinuxBackend {
     /// Connected on first use and cached: a connection is a side effect, and
     /// the constructors are pure functions over their arguments.
     window: OnceLock<Option<window::X11WindowService>>,
-    /// Connected on first use, like the window service, but held directly
-    /// rather than behind a `OnceLock`: [`HotkeyService`] registration takes
-    /// `&mut self`, which a shared cell cannot hand out.
-    hotkeys: Option<hotkeys::X11HotkeyService>,
-    /// The Wayland half of the same thing, held for the same reason. Two
-    /// fields rather than one boxed trait object because the two services
-    /// share no state and a `Box<dyn HotkeyService>` would cost this struct
-    /// its derived `Debug`.
-    portal_hotkeys: Option<wayland::WaylandHotkeyService>,
     /// Whether the `GlobalShortcuts` portal answers, probed on first ask and
     /// then cached. Under Wayland the honest answer to
     /// [`Capability::GlobalHotkeys`] cannot be derived from the session label
@@ -613,7 +604,7 @@ impl LinuxBackend {
     /// The seam the capability tests need: under Wayland the truthful answer
     /// for global shortcuts depends on a portal, and a test that consulted the
     /// build host's bus would pass or fail on whether that host runs a desktop.
-    /// Only the *reporting* is injected -- [`Self::hotkeys`] still connects for
+    /// Only reporting is injected; [`Self::hotkey_factory`] still connects for
     /// real and still refuses by name when nothing answers.
     pub fn with_desktop_environment_and_portal(desktop: DesktopEnvironment, portal: bool) -> Self {
         let backend = Self::with_desktop_environment(desktop);
@@ -654,8 +645,6 @@ impl LinuxBackend {
             processes: CommandLauncher::new(),
             desktop,
             window: OnceLock::new(),
-            hotkeys: None,
-            portal_hotkeys: None,
             portal: OnceLock::new(),
             user_time: Arc::new(AtomicU32::new(0)),
             icons: OnceLock::new(),
@@ -935,56 +924,23 @@ impl LinuxBackend {
         *self.portal.get_or_init(wayland::portal_is_available)
     }
 
-    /// The service behind [`Capability::GlobalHotkeys`], connecting on first
-    /// use.
-    ///
-    /// X11 grabs keys itself; Wayland asks the portal for them (ADR-0011).
-    /// Both are real bindings and both arrive through the same callback
-    /// contract, so a caller never has to know which session it is in.
-    ///
-    /// `&mut` all the way down because [`HotkeyService::register`] is: a grab is
-    /// exclusive server state, and two callers taking one concurrently is not a
-    /// thing this backend should make expressible.
-    ///
-    /// # Errors
-    ///
-    /// [`CoreError::Invalid`] naming the session when it can offer nothing --
-    /// a headless unit has neither a display to grab against nor a desktop
-    /// portal to ask -- and the display's or the portal's own refusal
-    /// otherwise. The failure is never softened into a service that swallows
-    /// registrations.
-    pub fn hotkeys(&mut self) -> Result<&mut dyn HotkeyService> {
-        match self.desktop {
-            DesktopEnvironment::X11 => {
-                if self.hotkeys.is_none() {
-                    self.hotkeys = Some(hotkeys::X11HotkeyService::connect_sharing(
-                        None,
-                        Arc::clone(&self.user_time),
-                    )?);
-                }
-                let Some(service) = self.hotkeys.as_mut() else {
-                    return Err(CoreError::Invalid(
-                        "the X11 hotkey service disappeared before it could be returned".to_owned(),
-                    ));
-                };
-                Ok(service)
-            }
-            DesktopEnvironment::Wayland => {
-                if self.portal_hotkeys.is_none() {
-                    self.portal_hotkeys = Some(wayland::WaylandHotkeyService::connect()?);
-                }
-                let Some(service) = self.portal_hotkeys.as_mut() else {
-                    return Err(CoreError::Invalid(
-                        "the Wayland hotkey service disappeared before it could be returned".to_owned(),
-                    ));
-                };
-                Ok(service)
-            }
-            DesktopEnvironment::Headless => Err(CoreError::Invalid(format!(
-                "global hotkeys need an X11 display or a desktop portal; this one is {:?}, which \
-                 offers neither",
-                self.desktop
-            ))),
+    /// Creates the process service on its registration-owner thread while
+    /// preserving the X11 user-activity clock shared with window activation.
+    pub fn hotkey_factory(
+        &self,
+    ) -> impl FnOnce() -> std::result::Result<Box<dyn HotkeyService>, String> + Send + 'static {
+        let desktop = self.desktop;
+        let user_time = Arc::clone(&self.user_time);
+        move || match desktop {
+            DesktopEnvironment::X11 => hotkeys::X11HotkeyService::connect_sharing(None, user_time)
+                .map(|service| Box::new(service) as Box<dyn HotkeyService>)
+                .map_err(|error| error.to_string()),
+            DesktopEnvironment::Wayland => wayland::WaylandHotkeyService::connect()
+                .map(|service| Box::new(service) as Box<dyn HotkeyService>)
+                .map_err(|error| error.to_string()),
+            DesktopEnvironment::Headless => Err(
+                "Headless session: global hotkeys require an X11 display or a GlobalShortcuts portal".into(),
+            ),
         }
     }
 }

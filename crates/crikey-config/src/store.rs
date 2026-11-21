@@ -804,12 +804,39 @@ impl ConfigStore {
         Ok(())
     }
 
-    fn reload(&self) -> Result<Self, ConfigError> {
+    /// Reloads retained directories, policy, session values and plugin schemas.
+    /// Blocking: the configuration worker owns publication of this complete store.
+    pub fn reload(&self) -> Result<Self, ConfigError> {
         let overrides: Vec<_> = self.layers[ConfigLayer::SessionOverride.index()]
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let mut store = Self::load_with_overrides(&self.directories, self.policy.as_deref(), &overrides)?;
+        self.reload_with_session_overrides(&overrides)
+    }
+
+    /// Resolves the retained policy/profile/user inputs as a fresh process,
+    /// without promoting or retaining any session-only document.
+    pub fn reload_without_session_overrides(&self) -> Result<Self, ConfigError> {
+        self.reload_with_session_overrides(&[])
+    }
+
+    /// Projects a user-global draft through real current and restart precedence,
+    /// without writing disk or promoting either context's winning values.
+    /// Blocking: reloads retained sources for the non-session candidate.
+    pub fn project_user_global_candidates(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<(Self, Self), ConfigError> {
+        let mut current = self.clone();
+        current.set_user_global(key, value);
+        let mut retained = self.reload_without_session_overrides()?;
+        retained.set_user_global(key, value);
+        Ok((current, retained))
+    }
+
+    fn reload_with_session_overrides(&self, overrides: &[(String, String)]) -> Result<Self, ConfigError> {
+        let mut store = Self::load_with_overrides(&self.directories, self.policy.as_deref(), overrides)?;
         for (plugin, schema) in &self.schemas {
             store.register_plugin_schema(&PluginId(plugin.clone()), schema);
         }

@@ -3,7 +3,7 @@
 //! binds its installed owner after validating the current catalog targets.
 //! For the reusable GUI fixture, put `integration` in package-cwd
 //! `command-ui-mode` (an explicit argv mode wins). That mode declares shared-a,
-//! shared-b, alternate, actionless, required and forbidden. Successful callbacks
+//! shared-b, alternate, actionless, required, forbidden and page. Successful callbacks
 //! append exact item/action/argument Debug fields to command-ui-executions.log,
 //! capped at 1 MiB. Sentinel queries: command-ui-conflict, command-ui-fail and
 //! command-ui-pending (five seconds, cooperative cancellation).
@@ -12,12 +12,18 @@
 //! producing PID under the same 1 MiB witness cap. The conflicting suggestion
 //! instead has inline COMMAND_UI_SUGGESTION_INLINE_NO_LINK and no link authority:
 //! the native preview callback receives only an item ID, not source provenance.
+//! The page command returns a real native ShowPage outcome. Creating package-local
+//! command-ui-page-hold before invocation holds its outcome until the marker is
+//! removed (at most 15 seconds, with cooperative cancellation). The bounded
+//! command-ui-pages.log records execute-start/released/timeout/cancelled and
+//! genuine page callback generations; its visible marker is COMMAND_UI_SHORTCUT_PAGE.
 use crikey_core::{
-    CoreError, PreviewContent, PreviewOutcome, PreviewText, PreviewValue, PreviewValueKind, Result,
+    CoreError, NodeShape, PageFrame, PageNode, PreviewContent, PreviewOutcome, PreviewText, PreviewValue,
+    PreviewValueKind, Result,
 };
 use crikey_plugin_sdk::{
-    serve, ActionBuilder, CatalogSink, CommandBuilder, ExecuteRequest, ItemBuilder, Plugin, PluginCommands,
-    PluginContext, Query, ServeConfig, SuggestionSink,
+    serve, ActionBuilder, CatalogSink, CommandBuilder, ExecuteOutcome, ExecuteRequest, ItemBuilder,
+    PageRequest, Plugin, PluginCommands, PluginContext, Query, ServeConfig, SuggestionSink,
 };
 use std::io::Write;
 
@@ -26,6 +32,10 @@ const EXECUTION_LOG_LIMIT: u64 = 1024 * 1024;
 const PREVIEW_LOG: &str = "command-ui-previews.log";
 const CANONICAL_PREVIEW: &str = "COMMAND_UI_CATALOG";
 const CANONICAL_LINK: &str = "https://example.invalid/command-fixture";
+const PAGE_LOG: &str = "command-ui-pages.log";
+const PAGE_HOLD: &str = "command-ui-page-hold";
+const PAGE_ID: &str = "command-shortcut-page";
+const PAGE_MARKER: &str = "COMMAND_UI_SHORTCUT_PAGE";
 
 fn integration_catalog() -> Vec<crikey_core::Item> {
     let mut shared = ItemBuilder::new("ui-shared", "Shared catalog item")
@@ -45,7 +55,10 @@ fn integration_catalog() -> Vec<crikey_core::Item> {
     let forbidden = ItemBuilder::new("ui-forbidden", "Forbidden catalog item")
         .action(ActionBuilder::new("primary", "Primary").build())
         .build();
-    vec![shared, actionless, required, forbidden]
+    let page = ItemBuilder::new("ui-page", "Page catalog item")
+        .action(ActionBuilder::new("primary", "Open command page").build())
+        .build();
+    vec![shared, actionless, required, forbidden, page]
 }
 
 fn integration_commands() -> Result<PluginCommands> {
@@ -74,6 +87,10 @@ fn integration_commands() -> Result<PluginCommands> {
             .action("primary")
             .arguments(Forbidden)
             .build()?,
+        CommandBuilder::new("page", "Page command", "ui-page")
+            .action("primary")
+            .arguments(Forbidden)
+            .build()?,
     ]))
 }
 
@@ -89,7 +106,7 @@ fn record_integration_execution(request: &ExecuteRequest) -> Result<()> {
                     .as_deref()
                     .is_some_and(|argument| !argument.is_empty())
         }
-        "ui-forbidden" => action == Some("primary") && request.argument.is_none(),
+        "ui-forbidden" | "ui-page" => action == Some("primary") && request.argument.is_none(),
         _ => false,
     };
     if !valid {
@@ -180,6 +197,86 @@ impl Plugin for CommandsDemo {
             return Err(CoreError::Invalid("unknown command target".into()));
         }
         Ok(())
+    }
+    fn execute_outcome(
+        &mut self,
+        request: ExecuteRequest,
+        context: &dyn PluginContext,
+    ) -> Result<ExecuteOutcome> {
+        if self.mode != "integration" || request.item.0 != "ui-page" {
+            return self.execute(request, context).map(ExecuteOutcome::from);
+        }
+        if request.argument.is_some() || request.action.as_ref().is_none_or(|action| action.0 != "primary") {
+            return Err(CoreError::Invalid(
+                "invalid page command target or argument policy".into(),
+            ));
+        }
+        let witness = |stage: &str| {
+            append_witness(
+                PAGE_LOG,
+                &format!(
+                    "stage={stage}\titem=ui-page\taction=primary\tpid={}\n",
+                    std::process::id()
+                ),
+            )
+        };
+        witness("execute-start")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if context.cancellation().is_cancelled() {
+                witness("cancelled")?;
+                return Err(CoreError::Invalid("page command cancelled".into()));
+            }
+            match std::fs::metadata(PAGE_HOLD) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => {
+                    return Err(CoreError::Invalid(format!(
+                        "page hold marker unavailable: {error}"
+                    )))
+                }
+                Ok(_) if std::time::Instant::now() >= deadline => {
+                    witness("timeout")?;
+                    return Err(CoreError::Invalid("page command hold exceeded 15 seconds".into()));
+                }
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        self.execute(request, context)?;
+        witness("released")?;
+        Ok(ExecuteOutcome::show_page(PAGE_ID))
+    }
+
+    fn page(&mut self, request: PageRequest, _: &dyn PluginContext) -> Result<PageFrame> {
+        if self.mode != "integration" || request.page_id != PAGE_ID {
+            return Ok(PageFrame {
+                generation: request.generation,
+                close: true,
+                ..PageFrame::default()
+            });
+        }
+        append_witness(
+            PAGE_LOG,
+            &format!(
+                "stage=page\tpage={PAGE_ID}\tgeneration={}\tpid={}\n",
+                request.generation,
+                std::process::id()
+            ),
+        )?;
+        Ok(PageFrame {
+            generation: request.generation,
+            title: "Command shortcut page".into(),
+            nodes: vec![PageNode {
+                shape: NodeShape::Text,
+                x: 16.0,
+                y: 16.0,
+                width: request.width.saturating_sub(32).min(600) as f32,
+                height: 32.0,
+                fill: request.palette.text,
+                text: PAGE_MARKER.into(),
+                ..PageNode::default()
+            }],
+            ..PageFrame::default()
+        })
     }
     fn supports_preview(&self) -> bool {
         self.mode == "integration"

@@ -153,6 +153,20 @@ pub(super) fn draw(
             {
                 commands.push(UiCommand::ActivateSelectedAction);
             }
+            let scroll_id = egui::Id::new("crikey-action-scroll-selection");
+            let previous = ui
+                .ctx()
+                .data(|data| data.get_temp::<(u64, Option<ActionIdentity>)>(scroll_id));
+            let selection_changed = previous.as_ref().is_some_and(|(token, selected)| {
+                *token == panel.focus_token() && selected.as_ref() != panel.selected()
+            });
+            if previous.as_ref().is_none_or(|(token, selected)| {
+                *token != panel.focus_token() || selected.as_ref() != panel.selected()
+            }) {
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(scroll_id, (panel.focus_token(), panel.selected().cloned()))
+                });
+            }
             egui::ScrollArea::vertical()
                 .id_salt("crikey-action-entries")
                 .max_height(ui.available_height())
@@ -272,7 +286,7 @@ pub(super) fn draw(
                                 });
                             }
                         }
-                        if entry.selected && !response.rect.intersects(ui.clip_rect()) {
+                        if selection_changed && entry.selected && !response.rect.intersects(ui.clip_rect()) {
                             response.scroll_to_me(None);
                         }
                     }
@@ -297,6 +311,15 @@ pub(super) fn draw_command_controls(
     ui.label(RichText::new(format!("{} / {}", reference.provider_id.0, reference.command_id)).small());
     if let Some(reason) = &state.unavailable_reason {
         ui.label(reason);
+    }
+    if let Some(status) = model
+        .command_management
+        .iter()
+        .find(|managed| managed.target == row.target)
+        .and_then(|managed| managed.status.as_ref())
+        .or(row.status.as_ref())
+    {
+        ui.label(status);
     }
     if !model.settings_open
         && state.argument_policy != crikey_core::ArgumentPolicy::Forbidden
@@ -341,6 +364,56 @@ pub(super) fn draw_command_controls(
                 registry_revision: state.registry_revision,
                 argument: (!argument.is_empty()).then_some(argument),
             });
+        }
+    }
+    for (hotkey, label, value) in [
+        (
+            false,
+            "Command alias (separate from textual aliases)",
+            state.aliases.first().cloned().unwrap_or_default(),
+        ),
+        (
+            true,
+            "Global command shortcut",
+            state.hotkey.clone().unwrap_or_default(),
+        ),
+    ] {
+        let key = crate::command_edit_key(reference, hotkey);
+        let row = SettingRow {
+            key: key.clone(),
+            label: label.into(),
+            value,
+            source: "effective command preferences".into(),
+            control: SettingControl::Text,
+        };
+        let start = commands.len();
+        draw_setting_row(ui, &row, &model.setting_edits, None, commands, theme::palette());
+        for command in &mut commands[start..] {
+            if let UiCommand::SetSetting {
+                request_id, value, ..
+            } = command
+            {
+                *command = UiCommand::EditCommandShortcut {
+                    request_id: *request_id,
+                    target: crate::ActionTarget::Command(reference.clone()),
+                    expected_revision: state.preference_revision,
+                    edit: if hotkey {
+                        crate::CommandPreferenceEdit::SetHotkey((!value.is_empty()).then(|| value.clone()))
+                    } else {
+                        crate::CommandPreferenceEdit::SetAlias((!value.is_empty()).then(|| value.clone()))
+                    },
+                };
+            }
+        }
+        if hotkey {
+            if model.settings_focus.as_deref() == Some(format!("record:{key}").as_str()) {
+                ui.label("Press a shortcut; Escape cancels");
+                if ui.button("Cancel recording").clicked() {
+                    commands.push(UiCommand::CancelShortcutCapture);
+                }
+            } else if ui.button("Record shortcut").clicked() {
+                commands.push(UiCommand::BeginShortcutCapture(key));
+            }
         }
     }
     let mut edits = Vec::new();
