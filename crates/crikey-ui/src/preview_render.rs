@@ -61,7 +61,11 @@ fn image_texture(context: &egui::Context, content: &Arc<crikey_core::PreviewCont
 }
 
 pub(super) fn keyboard(context: &egui::Context, model: &ViewModel, commands: &mut Vec<UiCommand>) {
-    if model.page.is_some() || model.settings_open || model.preview.status.is_none() {
+    if model.action_panel.is_some()
+        || model.page.is_some()
+        || model.settings_open
+        || model.preview.status.is_none()
+    {
         return;
     }
     if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F6)) {
@@ -106,13 +110,8 @@ pub(super) fn draw_results_and_preview(
         return;
     }
     let available = ui.available_rect_before_wrap();
-    let overlay = if model.actions_open {
-        BLOCK_GAP
-            + model.rows.get(model.selected).map_or(0.0, |row| {
-                actions_overlay_height(
-                    usize::from(row.default_action.is_some()) + row.alternate_actions.len(),
-                )
-            })
+    let overlay = if model.action_panel.is_some() {
+        BLOCK_GAP + actions_overlay_height()
     } else {
         0.0
     };

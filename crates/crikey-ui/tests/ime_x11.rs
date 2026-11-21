@@ -255,7 +255,7 @@ mod linux {
             rows: Arc::default(),
             selected: 0,
             pending_plugins: false,
-            actions_open: false,
+            action_panel: None,
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,
