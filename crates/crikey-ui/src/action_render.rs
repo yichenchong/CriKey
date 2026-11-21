@@ -172,6 +172,27 @@ pub(super) fn draw(
                 .max_height(ui.available_height())
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    // Keep the prepared command configuration action reachable
+                    // above the inline preference controls in the short sheet.
+                    let configure = panel.visible_entries().find(|entry| {
+                        entry.identity
+                            == &ActionIdentity::Host(crate::action_panel::HostAction::ConfigureCommand)
+                    });
+                    let mut any = configure.is_some();
+                    if let Some(entry) = configure {
+                        let response = ui
+                            .selectable_label(entry.selected, &entry.presentation.label)
+                            .on_hover_text(&entry.presentation.description);
+                        if response.clicked() {
+                            commands.push(UiCommand::ActivateAction {
+                                target: target.clone(),
+                                identity: entry.identity.clone(),
+                            });
+                        }
+                        if selection_changed && entry.selected && !response.rect.intersects(ui.clip_rect()) {
+                            response.scroll_to_me(None);
+                        }
+                    }
                     if let Some(row) = row {
                         draw_command_controls(ui, row, model, commands, initial_focus && argument_editor);
                     }
@@ -189,8 +210,12 @@ pub(super) fn draw(
                         });
                     }
                     let mut section = "";
-                    let mut any = false;
                     for entry in panel.visible_entries() {
+                        if entry.identity
+                            == &ActionIdentity::Host(crate::action_panel::HostAction::ConfigureCommand)
+                        {
+                            continue;
+                        }
                         any = true;
                         if !panel.is_searching() && section != entry.section_id {
                             section = entry.section_id;
@@ -387,7 +412,14 @@ pub(super) fn draw_command_controls(
             control: SettingControl::Text,
         };
         let start = commands.len();
-        draw_setting_row(ui, &row, &model.setting_edits, None, commands, theme::palette());
+        draw_setting_row(
+            ui,
+            &row,
+            &model.setting_edits,
+            model.settings_focus.as_deref(),
+            commands,
+            theme::palette(),
+        );
         for command in &mut commands[start..] {
             if let UiCommand::SetSetting {
                 request_id, value, ..

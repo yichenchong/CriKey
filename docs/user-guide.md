@@ -66,6 +66,12 @@ crikey settings set launcher.activation-hotkey Ctrl+Alt+K
 Launcher-setting edits write the user-global layer. A hotkey the desktop
 refuses leaves the previous one working and reports the refusal.
 
+Use the category controls for **Launcher**, **Appearance**, **Keyboard**,
+**Shortcuts**, **Plugins**, or **Privacy/History**; **All** shows every section.
+Search stays scoped to the selected category. A declared command's Actions
+panel also offers **Configure command…**, opening its exact Shortcuts controls
+without invoking the command. A plugin's **Configure** opens its own schema.
+
 Settings search matches launcher and schema-backed plugin metadata, not stored
 values, defaults or secret declarations. Browse a plugin to edit its declared
 fields; plugin edits target its own user-plugin file rather than copying
@@ -74,10 +80,12 @@ their own configuration mechanism.
 
 Rows distinguish the effective value, its source and restart requirements.
 Higher-priority layers can shadow a saved edit. External changes or changed
-schemas invalidate stale drafts: refresh and explicitly retry rather than
-overwriting another edit. A saved value whose effective reload failed is
-reported separately from a write that never persisted. Secret inputs are
-masked and retired on save, discard or leaving their editor.
+schemas invalidate stale drafts: **Rebase draft** explicitly adopts the current
+revision before retrying; category/search navigation preserves nonsecret
+conflicting text. A saved value whose effective reload failed is reported
+separately from a write that never persisted. Secret inputs are masked and
+retired on save, discard, category changes or leaving their editor; a stale
+schema closes private entry until metadata is refreshed.
 
 With results visible, the footer shows the current primary action and
 **Actions**; result navigation remains Up/Down, Tab to complete and Escape to
@@ -666,6 +674,12 @@ longer be cancellable. Its terminal result reports the actual package/config
 state and whether another launch is required. Enable/disable is a serialized
 configuration change for the next launch, not live activation. Quit waits for
 running jobs and owned runtime teardown before releasing the launcher lock.
+
+**Package details** inspects the selected local runtime/package identity,
+location and declared metadata without executing it or requiring an index.
+Index search/details and **Update index** use the configured index policy.
+Inspection and index operations do not stop running plugins; no configured
+index is reported explicitly rather than silently changing policy.
 
 For package authors and operators, package operations are explicit:
 

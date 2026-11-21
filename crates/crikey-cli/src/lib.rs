@@ -2649,8 +2649,12 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 }
             }
             if let Some((view, crikey_ui::ViewKind::Settings)) = view_model.view() {
-                if settings_management.panel.view != Some(view) && package_jobs.is_some() {
-                    settings_management.search(view, command_preferences::SettingsOperation::Search { text: String::new() }, &preference_worker, None);
+                let entering = settings_management.panel.view != Some(view);
+                let routed = package_jobs.is_some() && settings_management.route_focus(view, view_model.settings_focus(), &preference_worker);
+                if entering && package_jobs.is_some() {
+                    if !routed {
+                        settings_management.search(view, command_preferences::SettingsOperation::Search { text: String::new() }, &preference_worker, None);
+                    }
                     if let Some(jobs) = package_jobs.as_ref() {
                         settings_management.request(crikey_ui::settings_management::Request::Packages, view, &preference_worker, jobs);
                     }

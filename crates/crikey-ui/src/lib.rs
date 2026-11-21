@@ -2677,6 +2677,10 @@ impl LauncherViewModel {
         self.settings_open
     }
 
+    pub fn settings_focus(&self) -> Option<&str> {
+        self.settings_focus.as_deref()
+    }
+
     /// Shows the settings surface, optionally putting the keyboard in the
     /// editor for `focus_key` (spec 6.3).
     ///
@@ -3081,6 +3085,13 @@ impl LauncherViewModel {
             ActionExecution::Host(HostAction::OpenSettings) => {
                 self.open_settings(None).then_some(UiEffect::ClosePage)
             }
+            ActionExecution::Host(HostAction::ConfigureCommand) => {
+                let focus = self.current_action_row().and_then(|row| match &row.target {
+                    ActionTarget::Command(reference) => Some(command_edit_key(reference, false)),
+                    ActionTarget::Result { .. } => None,
+                })?;
+                self.open_settings(Some(&focus)).then_some(UiEffect::ClosePage)
+            }
         }
     }
 
@@ -3196,7 +3207,21 @@ fn action_tree(
         },
         entries: vec![ActionTree::open_settings_entry()],
     };
-    ActionTree::from_flat(row, vec![host]).map(|tree| ActionTree::with_management(tree, row, management))
+    let command = matches!(row.target, ActionTarget::Command(_));
+    let mut entries = Vec::with_capacity(1 + usize::from(command));
+    if command {
+        entries.push(ActionEntry::Host {
+            action: HostAction::ConfigureCommand,
+            presentation: ActionPresentation {
+                label: "Configure command…".into(),
+                description: "Edit this command's aliases, shortcuts and saved preferences.".into(),
+                icon_reference: Some("host:settings".into()),
+                ..Default::default()
+            },
+        });
+    }
+    entries.push(host);
+    ActionTree::from_flat(row, entries).map(|tree| ActionTree::with_management(tree, row, management))
 }
 
 /// Opaque authority to retire one host notice, never a newer unrelated notice.

@@ -263,6 +263,9 @@ install/remove permanently stops every third-party runtime in that launcher
 session, so do not assume configuration delivery or another callback after
 package mutation. Restart requirements remain distinct from successful saving.
 
+For an explicit command, the host's **Configure command…** action navigates to
+that exact command's preferences without calling your execution callback.
+
 ## Typed root arguments and presentation
 
 Typed root arguments extend the existing root list, not the custom-page

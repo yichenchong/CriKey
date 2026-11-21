@@ -499,6 +499,55 @@ fn position_of(frame: &crikey_ui::NativeUiFrame, needle: &str) -> egui::Pos2 {
         .unwrap_or_else(|| panic!("{needle:?} is not painted in this frame"))
 }
 
+/// Reach a settings control through real wheel input, respecting nested body
+/// viewports. Exact matching distinguishes the checkbox from its position label.
+fn reveal_settings_text(
+    context: &egui::Context,
+    view: &ViewModel,
+    mut frame: crikey_ui::NativeUiFrame,
+    needle: &str,
+    exact: bool,
+) -> (crikey_ui::NativeUiFrame, egui::Pos2) {
+    fn origin(shape: &egui::Shape, needle: &str, exact: bool) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text)
+                if (exact && text.galley.text() == needle)
+                    || (!exact && text.galley.text().contains(needle)) =>
+            {
+                Some(text.pos)
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| origin(shape, needle, exact)),
+            _ => None,
+        }
+    }
+    for _ in 0..32 {
+        if let Some(position) = frame.output.shapes.iter().find_map(|clipped| {
+            let position = origin(&clipped.shape, needle, exact)?;
+            clipped
+                .clip_rect
+                .contains(position + egui::vec2(4.0, 4.0))
+                .then_some(position)
+        }) {
+            return (frame, position);
+        }
+        let quit = position_of(&frame, "Quit CriKey");
+        let settings = position_of(&frame, "Settings");
+        frame = build_launcher_frame(
+            context,
+            launcher_input(vec![
+                egui::Event::PointerMoved(egui::pos2(settings.x + 64.0, quit.y - 24.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -120.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            view,
+        );
+    }
+    panic!("settings control {needle:?} was not reachable by body scrolling");
+}
+
 fn scrollable_model(rows: usize, selected: usize) -> ViewModel {
     let mut view = model("row");
     view.rows = (0..rows).map(result_row).collect();
@@ -585,6 +634,50 @@ impl Frames {
         }
         last
     }
+}
+
+/// Reach inline action-sheet controls using its real, independently scrolling
+/// viewport, excluding matching shortcut metadata in the root result list.
+fn reveal_action_text(
+    context: &egui::Context,
+    view: &ViewModel,
+    needle: &str,
+) -> (crikey_ui::NativeUiFrame, egui::Pos2) {
+    let mut frames = Frames {
+        context: context.clone(),
+        clock: context.input(|input| input.time),
+    };
+    let initial = frames.settle(view);
+    let back = position_of(&initial, "Back / Esc");
+    let pointer = back + egui::vec2(4.0, 100.0);
+    let wheel = |delta| {
+        vec![
+            egui::Event::PointerMoved(pointer),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, delta),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+    let _ = frames.draw(view, wheel(10000.0));
+    for _ in 0..32 {
+        let frame = frames.settle(view);
+        let point = frame
+            .output
+            .shapes
+            .iter()
+            .filter_map(|clipped| {
+                let point = text_origin(&clipped.shape, needle)? + egui::vec2(4.0, 4.0);
+                (point.y > back.y + 32.0 && clipped.clip_rect.contains(point)).then_some(point)
+            })
+            .next_back();
+        if let Some(point) = point {
+            return (frame, point);
+        }
+        let _ = frames.draw(view, wheel(-80.0));
+    }
+    panic!("action-sheet control {needle:?} was not reachable by scrolling");
 }
 
 /// The wheel, over the middle of the result list.
@@ -883,6 +976,315 @@ fn the_settings_surface_offers_a_quit_control() {
     );
 
     assert!(clicked.commands.contains(&UiCommand::Quit));
+}
+
+#[test]
+fn plugin_details_and_index_refresh_are_reachable_background_requests() {
+    use crikey_ui::settings_management::{Category, Package, Panel, Request};
+
+    for kind in [
+        None,
+        Some(crikey_platform::PluginKind::Native),
+        Some(crikey_platform::PluginKind::Legacy),
+    ] {
+        let context = create_launcher_context();
+        context.style_mut(|style| style.animation_time = 0.0);
+        let mut view = hotkey_settings_model();
+        view.navigation.settings_management = Arc::new(Panel {
+            schema: 1,
+            category: Category::Plugins,
+            packages: Arc::from([Package {
+                id: "sample-package".into(),
+                plugin: kind.map(|_| PluginId("operator.sample-package".into())),
+                kind,
+                name: "Sample package".into(),
+                version: "1.0".into(),
+                summary: "Package inventory entry".into(),
+                installed: false,
+                enabled: None,
+            }]),
+            ..Default::default()
+        });
+        let initial = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        let (_, refresh) = reveal_settings_text(&context, &view, initial, "Update index", true);
+        let refreshed = build_launcher_frame(
+            &context,
+            launcher_input(click_at(refresh + egui::vec2(4.0, 4.0))),
+            &view,
+        );
+        assert!(refreshed
+            .commands
+            .contains(&UiCommand::ManageSettings(Request::UpdateIndex)));
+        let (_, details) = reveal_settings_text(&context, &view, refreshed, "Package details", true);
+        let detailed = build_launcher_frame(
+            &context,
+            launcher_input(click_at(details + egui::vec2(4.0, 4.0))),
+            &view,
+        );
+        assert!(detailed
+            .commands
+            .contains(&UiCommand::ManageSettings(Request::Details(match kind {
+                Some(kind) => crikey_ui::settings_management::PackageDetailsTarget::Local {
+                    kind,
+                    id: "sample-package".into()
+                },
+                None => crikey_ui::settings_management::PackageDetailsTarget::Index {
+                    id: "sample-package".into()
+                },
+            }))));
+    }
+}
+
+#[test]
+fn visible_configure_command_opens_preferences_and_refocuses_on_a_new_visit() {
+    use crikey_ui::settings_management::Category;
+    let context = create_launcher_context();
+    context.style_mut(|style| style.animation_time = 0.0);
+    let reference = crikey_core::CommandRef {
+        provider_id: PluginId("renderer-fixture".into()),
+        command_id: "configure-command".into(),
+    };
+    let key = crikey_ui::command_edit_key(&reference, false);
+    let mut command = result_row(0);
+    command.target = crikey_ui::ActionTarget::Command(reference);
+    command.source = None;
+    command.command_state = Some(crikey_ui::CommandRowState {
+        registry_revision: 4,
+        preference_revision: 7,
+        available: true,
+        unavailable_reason: None,
+        favorite: None,
+        favorite_count: 0,
+        hidden: false,
+        fallback: None,
+        fallback_count: 0,
+        aliases: Vec::new(),
+        hotkey: None,
+        argument_policy: crikey_core::ArgumentPolicy::Forbidden,
+        argument: None,
+        ranking_reset_available: false,
+    });
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    model.set_command_management_rows(vec![command.clone()]);
+    let editor = egui::Id::new(("crikey-setting-draft", key.as_str())).with("editor");
+    let mut previous_view = None;
+    for generation in 1..=2 {
+        // Leaving Settings retires the old root publication. Reopening actions
+        // requires the fresh canonical publication requested by navigation.
+        let generation = Generation::from_raw(generation);
+        model.begin_generation(generation);
+        model.publish(generation, vec![command.clone()], false);
+        model.apply(UiCommand::ShowActions);
+        let actions = model.frame().expect("command action sheet");
+        let visible = build_launcher_frame(&context, launcher_input(Vec::new()), &actions);
+        let configure = position_of(&visible, "Configure command…");
+        assert!(
+            visible.output.shapes.iter().any(|clipped| {
+                text_origin(&clipped.shape, "Configure command…")
+                    .is_some_and(|position| clipped.clip_rect.contains(position + egui::vec2(4.0, 4.0)))
+            }),
+            "configuration must be visible without scrolling past inline controls"
+        );
+        let clicked = build_launcher_frame(
+            &context,
+            launcher_input(click_at(configure + egui::vec2(4.0, 4.0))),
+            &actions,
+        );
+        let intent = clicked
+            .commands
+            .into_iter()
+            .find(|command| matches!(command, UiCommand::ActivateAction { .. }))
+            .expect("clicking Configure emits the real prepared host action");
+        assert!(
+            model.apply(intent).is_none(),
+            "configuration must not invoke the command"
+        );
+        assert_eq!(model.settings_focus(), Some(key.as_str()));
+        let visit = model.view().expect("settings route").0;
+        assert_ne!(previous_view, Some(visit));
+        previous_view = Some(visit);
+        let mut settings = model.frame().expect("settings presentation");
+        let panel = Arc::make_mut(&mut settings.navigation.settings_management);
+        panel.view = Some(visit);
+        panel.category = Category::Shortcuts;
+        let opened = build_launcher_frame(&context, launcher_input(Vec::new()), &settings);
+        assert!(painted(&opened, "Command alias (separate from textual aliases)"));
+        assert_eq!(context.memory(|memory| memory.focused()), Some(editor));
+        context.memory_mut(|memory| memory.surrender_focus(editor));
+        model.apply(UiCommand::CloseSettings);
+        let root = model.frame().expect("restored launcher");
+        let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &root);
+        assert!(
+            model.take_query_refresh().is_some(),
+            "return requests a fresh root search"
+        );
+    }
+}
+
+#[test]
+fn metadata_categories_select_fields_and_keep_history_clear_in_privacy() {
+    use crikey_ui::settings_management::{Category, Field, Panel, Request};
+
+    let context = create_launcher_context();
+    context.style_mut(|style| style.animation_time = 0.0);
+    let mut view = hotkey_settings_model();
+    let field = |key: &str, label: &str, category: Category| Field {
+        key: key.into(),
+        label: label.into(),
+        description: String::new(),
+        category: category.label().into(),
+        plugin: None,
+        value: "12".into(),
+        source: "user-global".into(),
+        restart: false,
+        secret: false,
+        toggle: None,
+        value_available: true,
+    };
+    let mut panel = Panel {
+        schema: 1,
+        config: 1,
+        projection_schema: 1,
+        projection_config: 1,
+        authoritative: true,
+        fields: Arc::from([
+            field("launcher.max-results", "Visible result limit", Category::Launcher),
+            field(
+                "launcher.rounded-corners",
+                "Visible corner style",
+                Category::Appearance,
+            ),
+        ]),
+        ..Default::default()
+    };
+    view.navigation.settings_management = Arc::new(panel.clone());
+    let initial = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let category = position_of(&initial, "Appearance");
+    let selected = build_launcher_frame(
+        &context,
+        launcher_input(click_at(category + egui::vec2(4.0, 4.0))),
+        &view,
+    );
+    assert!(selected
+        .commands
+        .contains(&UiCommand::ManageSettings(Request::Category(
+            Category::Appearance
+        ))));
+
+    // Project the host-approved selection; filtering follows metadata rather
+    // than deriving a category from the field's launcher-prefixed key.
+    panel.category = Category::Appearance;
+    view.navigation.settings_management = Arc::new(panel.clone());
+    let appearance = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    assert!(painted(&appearance, "Visible corner style"));
+    assert!(!painted(&appearance, "Visible result limit"));
+    assert!(!painted(&appearance, "Clear query history"));
+    assert!(!painted(&appearance, "Plugins / Background jobs"));
+
+    panel.category = Category::PrivacyHistory;
+    view.navigation.settings_management = Arc::new(panel);
+    let privacy = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+    let (_, clear) = reveal_settings_text(&context, &view, privacy, "Clear query history", true);
+    let cleared = build_launcher_frame(
+        &context,
+        launcher_input(click_at(clear + egui::vec2(4.0, 4.0))),
+        &view,
+    );
+    assert!(cleared.commands.contains(&UiCommand::ClearQueryHistory));
+}
+
+#[test]
+fn long_security_reports_wrap_without_moving_the_fixed_settings_quit_control() {
+    use crikey_ui::settings_management::{Job, Panel};
+
+    fn report_geometry(shape: &egui::Shape, report: &str) -> Option<(egui::Rect, usize)> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == report => Some((
+                egui::Rect::from_min_size(text.pos, text.galley.size()),
+                text.galley.rows.len(),
+            )),
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| report_geometry(shape, report)),
+            _ => None,
+        }
+    }
+
+    let report: Arc<str> = format!(
+        "permissions={}\n{}full-security-information-END",
+        "unbroken-owner-identity".repeat(180),
+        "required capability: filesystem read/write; containment diagnostic retained\n".repeat(48),
+    )
+    .into();
+    for width in [480.0, 1000.0] {
+        let context = create_launcher_context();
+        context.style_mut(|style| style.animation_time = 0.0);
+        let mut view = hotkey_settings_model();
+        view.navigation.settings_management = Arc::new(Panel {
+            schema: 1,
+            jobs: Arc::from([Job {
+                id: 1,
+                sequence: 1,
+                operation: "doctor",
+                status: Arc::clone(&report),
+                terminal: true,
+            }]),
+            ..Default::default()
+        });
+        let input = |events| {
+            let mut input = launcher_input(events);
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 520.0),
+            ));
+            input
+        };
+        let initial = build_launcher_frame(&context, input(Vec::new()), &view);
+        let package_header = position_of(&initial, "Plugins / Background jobs");
+        let _ = build_launcher_frame(
+            &context,
+            input(click_at(package_header + egui::vec2(4.0, 4.0))),
+            &view,
+        );
+        let expanded = build_launcher_frame(&context, input(Vec::new()), &view);
+        let (report_rect, rows) = expanded
+            .output
+            .shapes
+            .iter()
+            .find_map(|clipped| report_geometry(&clipped.shape, &report))
+            .expect("the complete diagnostic is laid out, not elided or truncated");
+        assert!(
+            rows > report.lines().count(),
+            "the unbroken identity must wrap as well as explicit lines"
+        );
+        assert!(
+            report_rect.left() >= 0.0 && report_rect.right() <= width,
+            "diagnostic exceeded the settings width: {report_rect:?}"
+        );
+        let quit = position_of(&expanded, "Quit CriKey");
+        assert!(quit.x >= 0.0 && quit.x < width && quit.y >= 0.0 && quit.y < 520.0);
+        let scrolled = build_launcher_frame(
+            &context,
+            input(vec![
+                egui::Event::PointerMoved(report_rect.min + egui::vec2(4.0, 4.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -10000.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            &view,
+        );
+        assert_eq!(
+            position_of(&scrolled, "Quit CriKey"),
+            quit,
+            "only the settings body may scroll"
+        );
+        let clicked = build_launcher_frame(&context, input(click_at(quit + egui::vec2(4.0, 4.0))), &view);
+        assert!(
+            clicked.commands.contains(&UiCommand::Quit),
+            "Quit must remain clickable after a long diagnostic at width {width}"
+        );
+    }
 }
 
 /// The window's corner and the query field's corner have to begin turning on
@@ -4173,11 +4575,16 @@ fn command_management_preserves_membership_controls_and_submits_exact_shortcut_e
     let view = model.frame().unwrap();
     let frame = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
     assert!(painted(&frame, "exact-command"));
-    assert!(painted(&frame, "Favorite / Home"));
-    assert!(painted(&frame, "Hidden from discovery"));
-    assert!(painted(&frame, "Fallback"));
-    assert!(painted(&frame, "stored alias"));
-    assert!(painted(&frame, "stored shortcut"));
+    for label in [
+        "Favorite / Home",
+        "Hidden from discovery",
+        "Fallback",
+        "stored alias",
+        "stored shortcut",
+    ] {
+        let (visible, _) = reveal_action_text(&context, &view, label);
+        assert!(painted(&visible, label));
+    }
 
     let mut last_submission = None;
     for (previous, value, expected) in [
@@ -4192,18 +4599,7 @@ fn command_management_preserves_membership_controls_and_submits_exact_shortcut_e
             crikey_ui::CommandPreferenceEdit::SetHotkey(Some("Ctrl+Alt+J".into())),
         ),
     ] {
-        let visible = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
-        let editor = visible
-            .output
-            .shapes
-            .iter()
-            .filter_map(|clipped| {
-                let origin = text_origin(&clipped.shape, previous)?;
-                let point = origin + egui::vec2(4.0, 4.0);
-                clipped.clip_rect.contains(point).then_some(point)
-            })
-            .next_back()
-            .expect("the editable value is visible inside the management scroll area");
+        let (_, editor) = reveal_action_text(&context, &view, previous);
         let _ = build_launcher_frame(&context, launcher_input(click_at(editor)), &view);
         let crikey_ui::ActionTarget::Command(reference) = &target else {
             unreachable!()
@@ -4263,7 +4659,7 @@ fn command_management_preserves_membership_controls_and_submits_exact_shortcut_e
     }
     let mut frames = Frames {
         context: context.clone(),
-        clock: 100.0,
+        clock: context.input(|input| input.time),
     };
     let before_scroll = frames.settle(&view);
     let anchor = position_of(&before_scroll, "Ctrl+Alt+J");
@@ -4345,77 +4741,85 @@ fn external_settings_reload_never_replaces_an_active_text_draft() {
 
 #[test]
 fn settings_configure_commands_reaches_unavailable_saved_fallback_controls() {
-    let context = create_launcher_context();
-    context.style_mut(|style| style.animation_time = 0.0);
-    let mut command = result_row(0);
-    command.target = crikey_ui::ActionTarget::Command(crikey_core::CommandRef {
-        provider_id: PluginId("removed-provider".into()),
-        command_id: "saved-fallback".into(),
-    });
-    command.source = None;
-    command.command_state = Some(crikey_ui::CommandRowState {
-        registry_revision: 4,
-        preference_revision: 7,
-        available: false,
-        unavailable_reason: Some("Command no longer installed".into()),
-        favorite: None,
-        favorite_count: 0,
-        hidden: true,
-        fallback: Some(0),
-        fallback_count: 1,
-        aliases: Vec::new(),
-        hotkey: None,
-        argument_policy: crikey_core::ArgumentPolicy::Forbidden,
-        argument: None,
-        ranking_reset_available: false,
-    });
-    let mut model = crikey_ui::LauncherViewModel::new();
-    model.activate();
-    model.set_command_management_rows(vec![command]);
-    model.open_settings(None);
-    let view = model.frame().unwrap();
-    let opened = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
-    let configure = position_of(&opened, "Configure Commands");
-    let _ = build_launcher_frame(
-        &context,
-        launcher_input(click_at(configure + egui::vec2(4.0, 4.0))),
-        &view,
-    );
-    let listed = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
-    let saved = position_of(&listed, "saved-fallback");
-    let _ = build_launcher_frame(
-        &context,
-        launcher_input(click_at(saved + egui::vec2(4.0, 4.0))),
-        &view,
-    );
-    let expanded = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
-    assert!(painted(&expanded, "Command no longer installed"));
-    let fallback = position_of(&expanded, "Fallback");
-    let clicked = build_launcher_frame(
-        &context,
-        launcher_input(click_at(fallback + egui::vec2(4.0, 4.0))),
-        &view,
-    );
-    let removal = clicked
-        .commands
-        .into_iter()
-        .find(|command| {
-            matches!(
-                command,
-                UiCommand::EditCommandPreference {
-                    edit: crikey_ui::CommandPreferenceEdit::Fallback(false),
-                    ..
-                }
-            )
-        })
-        .expect("an unavailable saved fallback remains removable");
-    assert!(matches!(
-        model.apply(removal),
-        Some(crikey_ui::UiEffect::MutateCommandPreferences {
-            expected_revision: 7,
-            ..
-        })
-    ));
+    use crikey_ui::settings_management::Category;
+    for category in [Category::All, Category::Shortcuts] {
+        let context = create_launcher_context();
+        context.style_mut(|style| style.animation_time = 0.0);
+        let mut command = result_row(0);
+        command.target = crikey_ui::ActionTarget::Command(crikey_core::CommandRef {
+            provider_id: PluginId("removed-provider".into()),
+            command_id: "saved-fallback".into(),
+        });
+        command.source = None;
+        command.command_state = Some(crikey_ui::CommandRowState {
+            registry_revision: 4,
+            preference_revision: 7,
+            available: false,
+            unavailable_reason: Some("Command no longer installed".into()),
+            favorite: None,
+            favorite_count: 0,
+            hidden: true,
+            fallback: Some(0),
+            fallback_count: 1,
+            aliases: Vec::new(),
+            hotkey: None,
+            argument_policy: crikey_core::ArgumentPolicy::Forbidden,
+            argument: None,
+            ranking_reset_available: false,
+        });
+        let mut model = crikey_ui::LauncherViewModel::new();
+        model.activate();
+        model.set_command_management_rows(vec![command]);
+        model.open_settings(None);
+        let mut view = model.frame().unwrap();
+        Arc::make_mut(&mut view.navigation.settings_management).category = category;
+        let opened = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        if category == Category::All {
+            let (_, configure) = reveal_settings_text(&context, &view, opened, "Configure Commands", false);
+            let _ = build_launcher_frame(
+                &context,
+                launcher_input(click_at(configure + egui::vec2(4.0, 4.0))),
+                &view,
+            );
+        }
+        let listed = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        let (_, saved) = reveal_settings_text(&context, &view, listed, "saved-fallback", false);
+        let _ = build_launcher_frame(
+            &context,
+            launcher_input(click_at(saved + egui::vec2(4.0, 4.0))),
+            &view,
+        );
+        let expanded = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        let (expanded, _) =
+            reveal_settings_text(&context, &view, expanded, "Command no longer installed", true);
+        assert!(painted(&expanded, "Command no longer installed"));
+        let (_, fallback) = reveal_settings_text(&context, &view, expanded, "Fallback", true);
+        let clicked = build_launcher_frame(
+            &context,
+            launcher_input(click_at(fallback + egui::vec2(4.0, 4.0))),
+            &view,
+        );
+        let removal = clicked
+            .commands
+            .into_iter()
+            .find(|command| {
+                matches!(
+                    command,
+                    UiCommand::EditCommandPreference {
+                        edit: crikey_ui::CommandPreferenceEdit::Fallback(false),
+                        ..
+                    }
+                )
+            })
+            .expect("an unavailable saved fallback remains removable");
+        assert!(matches!(
+            model.apply(removal),
+            Some(crikey_ui::UiEffect::MutateCommandPreferences {
+                expected_revision: 7,
+                ..
+            })
+        ));
+    }
 }
 
 #[test]

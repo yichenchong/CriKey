@@ -315,6 +315,8 @@ pub(crate) struct Management {
     query: String,
     plugin: Option<crikey_core::PluginId>,
     refresh_pending: bool,
+    focus: Option<(crikey_ui::ViewId, Option<String>)>,
+    pending_category: Option<crikey_ui::settings_management::Category>,
 }
 impl Management {
     pub fn new() -> Self {
@@ -326,6 +328,8 @@ impl Management {
             query: String::new(),
             plugin: None,
             refresh_pending: false,
+            focus: None,
+            pending_category: None,
         }
     }
     pub fn search(
@@ -382,6 +386,61 @@ impl Management {
         );
         self.search(view, operation, worker, None);
     }
+    fn select_category(
+        &mut self,
+        view: crikey_ui::ViewId,
+        category: crikey_ui::settings_management::Category,
+        worker: &super::command_preferences::PreferenceWorker,
+    ) {
+        self.panel.category = category;
+        self.pending_category = None;
+        self.search(
+            view,
+            super::command_preferences::SettingsOperation::Search { text: String::new() },
+            worker,
+            None,
+        );
+        self.panel.query_reset = self.panel.request;
+    }
+    pub fn route_focus(
+        &mut self,
+        view: crikey_ui::ViewId,
+        focus: Option<&str>,
+        worker: &super::command_preferences::PreferenceWorker,
+    ) -> bool {
+        use crikey_ui::settings_management::Category;
+        if self
+            .focus
+            .as_ref()
+            .is_some_and(|(old_view, old_focus)| *old_view == view && old_focus.as_deref() == focus)
+        {
+            return false;
+        }
+        self.focus = Some((view, focus.map(str::to_owned)));
+        let category = focus.and_then(|focus| {
+            let focus = focus.strip_prefix("record:").unwrap_or(focus);
+            crikey_app::launcher_settings::declaration(focus)
+                .and_then(|declaration| Category::from_metadata(declaration.category))
+                .or_else(|| focus.starts_with("command:").then_some(Category::Shortcuts))
+        });
+        let Some(category) = category else {
+            return false;
+        };
+        self.pending_category = Some(category);
+        // Keep the existing bootstrap recovery rows visible until real metadata
+        // arrives; no UI-owned key/category table authorizes fallback fields.
+        if self.panel.schema != 0 || category == Category::Shortcuts {
+            self.panel.category = category;
+        }
+        self.search(
+            view,
+            super::command_preferences::SettingsOperation::Search { text: String::new() },
+            worker,
+            None,
+        );
+        self.panel.query_reset = self.panel.request;
+        true
+    }
     fn current_package_target(&self, request: &crikey_ui::settings_management::Request) -> bool {
         use crikey_ui::settings_management::Request;
         match request {
@@ -400,12 +459,22 @@ impl Management {
                 .packages
                 .iter()
                 .any(|row| !row.installed && row.plugin.is_none() && &row.id == id),
+            Request::Details(target) => self.panel.packages.iter().any(|row| match target {
+                crikey_ui::settings_management::PackageDetailsTarget::Index { id } => {
+                    row.plugin.is_none() && &row.id == id
+                }
+                crikey_ui::settings_management::PackageDetailsTarget::Local { kind, id } => {
+                    row.plugin.is_some() && row.kind == Some(*kind) && &row.id == id
+                }
+            }),
             Request::Search(_)
+            | Request::Category(_)
             | Request::BrowsePlugin(_)
             | Request::LegacyConfiguration(_)
             | Request::Edit { .. }
             | Request::Packages
             | Request::PackageSearch(_)
+            | Request::UpdateIndex
             | Request::InstallFrom { .. }
             | Request::Diagnose(_)
             | Request::Cancel(_) => true,
@@ -419,18 +488,25 @@ impl Management {
         packages: &crikey_app::package_jobs::PackageJobs,
     ) {
         use super::command_preferences::{SettingsOperation as S, SettingsTarget};
-        use crikey_app::package_jobs::PackageOperation as P;
-        use crikey_ui::settings_management::Request as R;
+        use crikey_app::package_jobs::{PackageOperation as P, PackageShowTarget};
+        use crikey_ui::settings_management::{PackageDetailsTarget, Request as R};
         if !self.current_package_target(&request) {
             self.panel.notice = "Package inventory changed; refresh and select the operation again".into();
             return;
         }
         let operation = match request {
+            R::Category(category) => {
+                self.select_category(view, category, worker);
+                return;
+            }
             R::Search(text) => {
+                self.pending_category = None;
                 self.search(view, S::Search { text }, worker, None);
                 return;
             }
             R::BrowsePlugin(plugin) => {
+                self.pending_category = None;
+                self.panel.category = crikey_ui::settings_management::Category::Plugins;
                 self.search(view, S::BrowsePlugin { plugin }, worker, None);
                 return;
             }
@@ -465,6 +541,11 @@ impl Management {
             }
             R::Packages => P::List,
             R::PackageSearch(text) => P::Search(text),
+            R::Details(target) => P::Show(match target {
+                PackageDetailsTarget::Index { id } => PackageShowTarget::Index { id },
+                PackageDetailsTarget::Local { kind, id } => PackageShowTarget::Local { kind, id },
+            }),
+            R::UpdateIndex => P::UpdateIndex,
             R::Install(id) => P::InstallIndexed(id),
             R::InstallFrom { source, kind } => {
                 use crikey_package_manager::InstallSource;
@@ -543,6 +624,10 @@ impl Management {
                     self.panel.projection_config = response.config_revision;
                     self.panel.projection_schema = response.schema_revision;
                     self.panel.authoritative = true;
+                    self.panel.schema_rejected = false;
+                    if let Some(category) = self.pending_category.take() {
+                        self.panel.category = category;
+                    }
                     self.panel.fields = results
                         .hits
                         .into_iter()
@@ -559,6 +644,7 @@ impl Management {
                                 key: hit.key,
                                 label: hit.label,
                                 description: hit.description,
+                                category: hit.category,
                                 value: row.value,
                                 source: row.source,
                                 restart: row.requires_restart,
@@ -612,15 +698,23 @@ impl Management {
                     self.refresh_pending = true;
                 }
                 Err(failure) => {
+                    if failure == SettingsFailure::StaleSchema {
+                        // The typed refusal itself revokes private editor state,
+                        // even when a failed reload retains the last schema revision.
+                        self.panel.schema_refusal = response.request_id;
+                        self.panel.schema_rejected = true;
+                    }
                     if matches!(
                         failure,
-                        SettingsFailure::Unavailable | SettingsFailure::PersistedReload
+                        SettingsFailure::Unavailable
+                            | SettingsFailure::PersistedReload
+                            | SettingsFailure::StaleSchema
                     ) {
                         self.panel.authoritative = false;
                     }
                     self.panel.edit_notice = match failure {
                         SettingsFailure::Conflict => "Configuration changed. Draft retained; refresh settings and explicitly rebase before saving",
-                        SettingsFailure::StaleSchema => "Setting declaration changed. Refresh before editing; draft retained",
+                        SettingsFailure::StaleSchema => "Setting declaration changed. Secret drafts were cleared; refresh before editing. Nonsecret drafts are retained",
                         SettingsFailure::Unavailable => "Configuration authority unavailable; no edit accepted",
                         SettingsFailure::Invalid => "Edit rejected by the setting declaration; draft retained",
                         SettingsFailure::PersistedReload => "Setting was saved, but effective reload failed. Do not assume the old value remains on disk",
@@ -1033,6 +1127,24 @@ mod tests {
             id: "operator".into()
         }));
         assert!(!management.current_package_target(&Request::Install("operator".into())));
+        use crikey_ui::settings_management::PackageDetailsTarget;
+        assert!(
+            management.current_package_target(&Request::Details(PackageDetailsTarget::Local {
+                kind: PluginKind::Native,
+                id: "operator".into(),
+            }))
+        );
+        assert!(
+            !management.current_package_target(&Request::Details(PackageDetailsTarget::Local {
+                kind: PluginKind::Legacy,
+                id: "operator".into(),
+            }))
+        );
+        assert!(
+            !management.current_package_target(&Request::Details(PackageDetailsTarget::Index {
+                id: "operator".into(),
+            }))
+        );
     }
 
     #[test]
@@ -1110,6 +1222,117 @@ mod tests {
             management.panel.packages_revision > populated_revision,
             "old destructive confirmations must expire"
         );
+    }
+
+    #[test]
+    fn shared_launcher_metadata_remains_reachable_by_category_and_deep_link() {
+        use crate::command_preferences::PreferenceWorker;
+        use crikey_app::CommandPreferencesStore;
+        use crikey_ui::settings_management::Category;
+        use std::time::{Duration, Instant};
+
+        fn receive_projection(
+            management: &mut Management,
+            worker: &PreferenceWorker,
+            view: crikey_ui::ViewId,
+            wakes: &mpsc::Receiver<()>,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                while worker.take().is_some() {}
+                management.drain(Some((view, crikey_ui::ViewKind::Settings)), worker, None);
+                if !management.panel.loading {
+                    assert!(
+                        management.panel.authoritative,
+                        "real authority must approve the projection"
+                    );
+                    return;
+                }
+                wakes
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("configuration authority must complete the correlated search");
+            }
+        }
+
+        let directory = ConfigDir::new("canonical-categories");
+        let environment = [
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "CRIKEY_CONFIG_DIR",
+            "CRIKEY_DATA_DIR",
+            "CRIKEY_CACHE_DIR",
+            "CRIKEY_STATE_DIR",
+        ]
+        .into_iter()
+        .fold(DirectoryEnvironment::new(), |environment, variable| {
+            environment.set(variable, directory.root.as_os_str())
+        });
+        let directories = StandardDirectories::resolve(DirectoryConvention::current(), &environment)
+            .expect("isolated configuration directories");
+        let config = ConfigStore::load_with_policy(&directories, None).expect("real configuration");
+        let (wake, wakes) = mpsc::channel();
+        let mut worker = PreferenceWorker::spawn(
+            Arc::new(Mutex::new(CommandPreferencesStore::empty())),
+            Some(config),
+            directories,
+            Vec::new(),
+            None,
+            Vec::new(),
+            move || {
+                let _ = wake.send(());
+            },
+        )
+        .expect("real configuration authority");
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        model.open_settings(None);
+        let view = model.view().expect("settings view").0;
+        let mut management = Management::new();
+
+        // These are the approved user-facing destinations, not replacement
+        // metadata: every request and returned field below uses the real shared
+        // declarations and the production authority/consumer projection.
+        for (key, destination) in [
+            (KEY_ACTIVATION_HOTKEY, Category::Keyboard),
+            (KEY_MAX_RESULTS, Category::Launcher),
+            (crikey_config::KEY_PROFILE, Category::Launcher),
+            (KEY_SHOW_HINTS, Category::Appearance),
+            (KEY_ROUNDED_CORNERS, Category::Appearance),
+            ("launcher.preview-split", Category::Appearance),
+            ("launcher.resume-delay-ms", Category::Launcher),
+            ("launcher.query-history", Category::PrivacyHistory),
+            ("launcher.command-home", Category::Launcher),
+        ] {
+            let declaration =
+                crikey_app::launcher_settings::declaration(key).expect("shared launcher declaration");
+            assert!(management.route_focus(view, Some(declaration.navigation_target), &worker));
+            receive_projection(&mut management, &worker, view, &wakes);
+            assert_eq!(
+                management.panel.category, destination,
+                "deep-link destination for {key}"
+            );
+            assert!(
+                management.panel.fields.iter().any(|field| {
+                    field.key == declaration.key && field.category == management.panel.category.label()
+                }),
+                "the deep-linked field must survive the selected category filter: {key}"
+            );
+
+            management.select_category(view, destination, &worker);
+            receive_projection(&mut management, &worker, view, &wakes);
+            assert!(
+                management.panel.fields.iter().any(|field| {
+                    field.key == declaration.key && field.category == management.panel.category.label()
+                }),
+                "direct category navigation must also expose the shared field: {key}"
+            );
+        }
+        worker
+            .take_shutdown()
+            .expect("authority shutdown ticket")
+            .join()
+            .expect("authority shutdown");
     }
 
     /// A private configuration directory, removed on drop, so a test writes a

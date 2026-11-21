@@ -9,6 +9,7 @@ pub enum Request {
     BrowsePlugin(PluginId),
     LegacyConfiguration(String),
     Search(String),
+    Category(Category),
     Edit {
         request_id: u64,
         key: String,
@@ -19,6 +20,8 @@ pub enum Request {
     },
     Packages,
     PackageSearch(String),
+    Details(PackageDetailsTarget),
+    UpdateIndex,
     Install(String),
     InstallFrom {
         source: String,
@@ -40,6 +43,12 @@ impl std::fmt::Debug for Request {
         f.write_str("SettingsRequest([private])")
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageDetailsTarget {
+    Index { id: String },
+    Local { kind: PluginKind, id: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
     Index,
@@ -67,15 +76,65 @@ pub enum RuntimeState {
     Offline,
     FailedClosed,
 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Category {
+    #[default]
+    All,
+    Launcher,
+    Appearance,
+    Keyboard,
+    Shortcuts,
+    Plugins,
+    PrivacyHistory,
+}
+impl Category {
+    pub const ALL: [Self; 7] = [
+        Self::All,
+        Self::Launcher,
+        Self::Appearance,
+        Self::Keyboard,
+        Self::Shortcuts,
+        Self::Plugins,
+        Self::PrivacyHistory,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Launcher => "Launcher",
+            Self::Appearance => "Appearance",
+            Self::Keyboard => "Keyboard",
+            Self::Shortcuts => "Shortcuts",
+            Self::Plugins => "Plugins",
+            Self::PrivacyHistory => "Privacy/History",
+        }
+    }
+    pub fn from_metadata(label: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|category| *category != Self::All && category.label() == label)
+    }
+    pub fn shows(self, section: Self) -> bool {
+        self == Self::All || self == section
+    }
+    fn includes(self, category: &str) -> bool {
+        self == Self::All || self.label() == category
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Panel {
     pub view: Option<ViewId>,
+    pub category: Category,
+    pub query_reset: u64,
     pub request: u64,
     pub config: u64,
     pub schema: u64,
     pub projection_config: u64,
     pub projection_schema: u64,
     pub authoritative: bool,
+    /// Correlated typed schema-refusal receipt; persists across fresh projections.
+    pub schema_refusal: u64,
+    pub schema_rejected: bool,
     pub edit_notice: Arc<str>,
     pub loading: bool,
     pub notice: Arc<str>,
@@ -92,6 +151,7 @@ pub struct Field {
     pub key: String,
     pub label: String,
     pub description: String,
+    pub category: String,
     pub plugin: Option<PluginId>,
     pub value: String,
     pub source: String,
@@ -131,24 +191,44 @@ struct Draft {
     text: String,
     config: u64,
     schema: u64,
+    schema_refusal: u64,
     changed: bool,
     revision: u64,
     pending: Option<(u64, u64)>,
     focused: bool,
 }
 
+#[derive(Clone, Copy)]
+struct EditorIdentity {
+    id: egui::Id,
+    secret: bool,
+    schema: u64,
+}
 #[derive(Clone, Default)]
 struct Editors {
     view: Option<ViewId>,
-    ids: Vec<egui::Id>,
+    entries: Vec<EditorIdentity>,
+    schema_refusal: u64,
+    category: Category,
+    query_reset: u64,
 }
 
 fn editor_id(view: Option<ViewId>, key: &str, secret: bool) -> egui::Id {
     egui::Id::new(("managed-setting", view.map(ViewId::get), key, secret))
 }
 fn retire_text_state(context: &egui::Context, id: egui::Id) {
-    context.data_mut(|data| data.remove::<egui::text_edit::TextEditState>(id.with("text")));
-    context.memory_mut(|memory| memory.surrender_focus(id.with("text")));
+    let private_focus = context.data_mut(|data| {
+        data.remove::<egui::text_edit::TextEditState>(id.with("text"));
+        let focus = data.get_temp::<egui::Id>(id.with("private-focus"));
+        data.remove::<egui::Id>(id.with("private-focus"));
+        focus
+    });
+    context.memory_mut(|memory| {
+        memory.surrender_focus(id.with("text"));
+        if let Some(focus) = private_focus {
+            memory.surrender_focus(focus);
+        }
+    });
 }
 fn retire_projection(context: &egui::Context, panel: &Panel, open: bool) {
     let registry = egui::Id::new("managed-settings-editor-registry");
@@ -156,17 +236,38 @@ fn retire_projection(context: &egui::Context, panel: &Panel, open: bool) {
         .data_mut(|data| data.remove_temp::<Editors>(registry))
         .unwrap_or_default();
     let same_view = open && editors.view == panel.view;
-    editors.ids.retain(|id| {
-        if same_view
-            && panel
-                .fields
-                .iter()
-                .any(|field| editor_id(panel.view, &field.key, field.secret) == *id)
+    let category_changed = editors.category != panel.category;
+    let private_revoked = editors.schema_refusal != panel.schema_refusal || category_changed;
+    if same_view && (category_changed || editors.query_reset != panel.query_reset) {
+        context.data_mut(|data| {
+            data.remove::<String>(egui::Id::new((
+                "settings-metadata-search",
+                panel.view.map(ViewId::get),
+            )))
+        });
+    }
+    editors.entries.retain(|editor| {
+        let visible = same_view
+            && panel.fields.iter().any(|field| {
+                panel.category.includes(&field.category)
+                    && editor_id(panel.view, &field.key, field.secret) == editor.id
+            });
+        if visible
+            && (!editor.secret || editor.schema == panel.schema && !private_revoked && !panel.schema_rejected)
         {
             return true;
         }
-        context.data_mut(|data| data.remove::<Draft>(*id));
-        retire_text_state(context, *id);
+        // Filtering is not closing the logical settings view. Retain bounded
+        // nonsecret drafts with their original config/schema stamps so returning
+        // to a field still requires explicit rebase after a conflict.
+        let draft = context.data_mut(|data| data.remove_temp::<Draft>(editor.id));
+        retire_text_state(context, editor.id);
+        if same_view && !editor.secret {
+            if let Some(draft) = draft.filter(|draft| draft.changed || draft.pending.is_some()) {
+                context.data_mut(|data| data.insert_temp(editor.id, draft));
+                return true;
+            }
+        }
         false
     });
     if !same_view {
@@ -180,6 +281,9 @@ fn retire_projection(context: &egui::Context, panel: &Panel, open: bool) {
         });
     }
     editors.view = if open { panel.view } else { None };
+    editors.schema_refusal = panel.schema_refusal;
+    editors.category = panel.category;
+    editors.query_reset = panel.query_reset;
     context.data_mut(|data| data.insert_temp(registry, editors));
 }
 pub(crate) fn clear_editors(context: &egui::Context) {
@@ -210,7 +314,7 @@ fn draw_input(
         return (response, changed, commit);
     }
     // As in the structured editor, plaintext never enters TextEdit/undo state.
-    retire_text_state(ui.ctx(), id);
+    ui.data_mut(|data| data.remove::<egui::text_edit::TextEditState>(id.with("text")));
     let response = ui
         .push_id(id.with("private"), |ui| {
             ui.add(
@@ -223,6 +327,7 @@ fn draw_input(
             )
         })
         .inner;
+    ui.data_mut(|data| data.insert_temp(id.with("private-focus"), response.id));
     if response.clicked() {
         response.request_focus();
     }
@@ -265,6 +370,40 @@ fn draw_input(
     let commit = enter && response.has_focus();
     (response, changed, commit)
 }
+pub(crate) fn draw_categories(ui: &mut egui::Ui, panel: &Panel, commands: &mut Vec<UiCommand>) {
+    ui.horizontal_wrapped(|ui| {
+        for category in Category::ALL {
+            if ui
+                .selectable_label(panel.category == category, category.label())
+                .clicked()
+            {
+                commands.push(UiCommand::ManageSettings(Request::Category(category)));
+            }
+        }
+    });
+}
+
+fn draw_job(ui: &mut egui::Ui, job: &Job, commands: &mut Vec<UiCommand>) {
+    ui.group(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(job.operation);
+            if !job.terminal && ui.button("Request cancellation").clicked() {
+                commands.push(UiCommand::ManageSettings(Request::Cancel(job.id)));
+            }
+        });
+        // Reports include security findings and unbroken paths/identities.
+        // Wrap every character if necessary; never elide or truncate findings.
+        let mut text = egui::text::LayoutJob::simple(
+            job.status.to_string(),
+            egui::TextStyle::Body.resolve(ui.style()),
+            ui.visuals().text_color(),
+            ui.available_width().max(1.0),
+        );
+        text.wrap.break_anywhere = true;
+        ui.add(egui::Label::new(text).wrap().selectable(true));
+    });
+}
+
 pub(crate) fn draw(
     ui: &mut egui::Ui,
     panel: &Panel,
@@ -326,25 +465,35 @@ pub(crate) fn draw(
     let projection_ready = panel.authoritative
         && panel.projection_config == panel.config
         && panel.projection_schema == panel.schema;
+    let projection_ready = projection_ready && !panel.schema_rejected;
     egui::ScrollArea::vertical().id_salt("settings-fields").max_height(320.0).show(ui, |ui| {
-        for field in panel.fields.iter() {
+        for field in panel.fields.iter().filter(|field| panel.category.includes(&field.category)) {
             let id = editor_id(panel.view, &field.key, field.secret);
+            if field.secret && panel.schema_rejected {
+                retire_text_state(ui.ctx(), id);
+                ui.group(|ui| {
+                    ui.label(&field.label);
+                    ui.label("Secret declaration unavailable. Refresh settings before entering a replacement.");
+                });
+                continue;
+            }
             let registry = egui::Id::new("managed-settings-editor-registry");
             let admitted = ui.data_mut(|data| {
                 let mut editors = data.remove_temp::<Editors>(registry).unwrap_or_default();
-                if !editors.ids.contains(&id) {
-                    if editors.ids.len() == 128 {
-                        let Some(clean) = editors.ids.iter().position(|id| {
-                            let Some(draft) = data.remove_temp::<Draft>(*id) else { return true; };
+                if !editors.entries.iter().any(|editor| editor.id == id) {
+                    if editors.entries.len() == 128 {
+                        let Some(clean) = editors.entries.iter().position(|editor| {
+                            let Some(draft) = data.remove_temp::<Draft>(editor.id) else { return true; };
                             let dirty = draft.changed || draft.pending.is_some();
-                            data.insert_temp(*id, draft);
+                            data.insert_temp(editor.id, draft);
                             !dirty
                         }) else { data.insert_temp(registry, editors); return false; };
-                        let retired = editors.ids.remove(clean);
+                        let retired = editors.entries.remove(clean).id;
                         data.remove::<Draft>(retired);
                         data.remove::<egui::text_edit::TextEditState>(retired.with("text"));
+                        data.remove::<egui::Id>(retired.with("private-focus"));
                     }
-                    editors.ids.push(id);
+                    editors.entries.push(EditorIdentity { id, secret: field.secret, schema: panel.schema });
                 }
                 data.insert_temp(registry, editors);
                 true
@@ -353,7 +502,7 @@ pub(crate) fn draw(
                 ui.label(format!("{} — editor capacity reached; finish/discard a draft or close Settings", field.label));
                 continue;
             }
-            let mut draft = ui.data_mut(|data| data.remove_temp::<Draft>(id)).unwrap_or_else(|| Draft { text: if field.secret { String::new() } else { field.value.clone() }, config: panel.config, schema: panel.schema, ..Default::default() });
+            let mut draft = ui.data_mut(|data| data.remove_temp::<Draft>(id)).unwrap_or_else(|| Draft { text: if field.secret { String::new() } else { field.value.clone() }, config: panel.config, schema: panel.schema, schema_refusal: panel.schema_refusal, ..Default::default() });
             // Reuse the existing recorder's consumed-receipt identity across
             // bootstrap and searchable forms; discarding a draft cannot replay it.
             let capture_id = egui::Id::new(("crikey-setting-draft", field.key.as_str())).with("state").with("capture");
@@ -372,7 +521,7 @@ pub(crate) fn draw(
                     draft.pending = None;
                 }
             }
-            if !draft.changed && (draft.config != panel.config || draft.schema != panel.schema) { draft.config = panel.config; draft.schema = panel.schema; if !field.secret { draft.text.clone_from(&field.value); } }
+            if !draft.changed && (draft.config != panel.config || draft.schema != panel.schema || draft.schema_refusal != panel.schema_refusal) { draft.config = panel.config; draft.schema = panel.schema; draft.schema_refusal = panel.schema_refusal; if !field.secret { draft.text.clone_from(&field.value); } }
             ui.group(|ui| {
                 ui.label(&field.label);
                 ui.small(&field.description);
@@ -391,7 +540,7 @@ pub(crate) fn draw(
                 if field.key == "launcher.activation-hotkey" && ui.button("Record shortcut").clicked() {
                     commands.push(UiCommand::BeginShortcutCapture(field.key.clone()));
                 }
-                let (response, changed, commit) = draw_input(ui, id, field.secret, &mut draft.text);
+                let (response, changed, commit) = ui.add_enabled_ui(!panel.schema_rejected, |ui| draw_input(ui, id, field.secret, &mut draft.text)).inner;
                 if focus == Some(field.key.as_str()) && !draft.focused {
                     response.request_focus();
                     draft.focused = true;
@@ -400,7 +549,7 @@ pub(crate) fn draw(
                     draft.changed = true;
                     draft.revision = draft.revision.checked_add(1).expect("settings draft revision exhausted");
                 }
-                let conflict = draft.changed && (draft.config != panel.config || draft.schema != panel.schema);
+                let conflict = draft.changed && (draft.config != panel.config || draft.schema != panel.schema || draft.schema_refusal != panel.schema_refusal);
                 if conflict { ui.label("Configuration changed. Your draft is retained; explicitly rebase before saving."); }
                 ui.horizontal(|ui| {
                     let can_save = draft.changed && !conflict && !panel.loading && projection_ready;
@@ -410,66 +559,182 @@ pub(crate) fn draw(
                         draft.pending = Some((request_id, draft.revision));
                         send(Request::Edit { request_id, key: field.key.clone(), plugin: field.plugin.clone(), draft: draft.text.clone(), config: draft.config, schema: draft.schema }, commands);
                     }
-                    if conflict && ui.add_enabled(projection_ready, egui::Button::new("Rebase draft")).clicked() { draft.config = panel.config; draft.schema = panel.schema; }
+                    if conflict && ui.add_enabled(projection_ready, egui::Button::new("Rebase draft")).clicked() { draft.config = panel.config; draft.schema = panel.schema; draft.schema_refusal = panel.schema_refusal; }
                     if draft.changed && ui.button("Discard draft").clicked() {
                         retire_text_state(ui.ctx(), id);
-                        draft = Draft { text: if field.secret { String::new() } else { field.value.clone() }, config: panel.config, schema: panel.schema, ..Default::default() };
+                        draft = Draft { text: if field.secret { String::new() } else { field.value.clone() }, config: panel.config, schema: panel.schema, schema_refusal: panel.schema_refusal, ..Default::default() };
                     }
                 });
             });
             ui.data_mut(|data| data.insert_temp(id, draft));
         }
     });
-    egui::CollapsingHeader::new("Plugins / Background jobs").id_salt("package-management").show(ui, |ui| {
-        ui.small("Enable/disable changes runtime admission on the next launch.");
-        ui.horizontal(|ui| {
+    if panel.category.shows(Category::Plugins) {
+        let mut packages = |ui: &mut egui::Ui| {
+            ui.small("Enable/disable changes runtime admission on the next launch.");
+            ui.horizontal_wrapped(|ui| {
             if ui.button("Refresh inventory").clicked() { send(Request::Packages, commands); }
             if ui.button("Diagnose all").clicked() { send(Request::Diagnose(None), commands); }
-        });
-        let source_id = egui::Id::new("package-source");
-        let kind_id = source_id.with("kind");
-        let mut kind = ui.data(|data| data.get_temp::<SourceKind>(kind_id)).unwrap_or(SourceKind::Index);
-        egui::ComboBox::from_id_salt(kind_id).selected_text(kind.label()).show_ui(ui, |ui| {
-            for value in [SourceKind::Index, SourceKind::Directory, SourceKind::Archive, SourceKind::Legacy, SourceKind::Url] {
-                ui.selectable_value(&mut kind, value, value.label());
+            if ui.button("Update index").on_hover_text("Refresh configured indexes using the current source and signature policy; progress and failures appear in background jobs.").clicked() {
+                send(Request::UpdateIndex, commands);
             }
         });
-        ui.data_mut(|data| data.insert_temp(kind_id, kind));
-        let mut source = ui.data_mut(|data| data.remove_temp::<String>(source_id)).unwrap_or_default();
-        ui.add(egui::TextEdit::singleline(&mut source).char_limit(4096).hint_text(kind.label()));
-        ui.horizontal(|ui| {
-            if ui.button("Search index").clicked() { send(Request::PackageSearch(source.clone()), commands); }
-            if ui.button("Install…").clicked() { ui.data_mut(|data| data.insert_temp(egui::Id::new("package-confirm"), (panel.packages_revision, Request::InstallFrom { source: source.clone(), kind }))); }
-        });
-        ui.data_mut(|data| data.insert_temp(source_id, source));
-        egui::ScrollArea::vertical().id_salt("package-inventory").max_height(240.0).show(ui, |ui| {
-            for package in panel.packages.iter() {
-                ui.group(|ui| {
-                    ui.label(format!("{} {}", if package.name.is_empty() { &package.id } else { &package.name }, package.version));
-                    ui.small(&package.summary);
-                    ui.horizontal(|ui| {
-                        if package.kind == Some(PluginKind::Legacy) {
-                            if ui.link("Legacy .ini configuration").clicked() { send(Request::LegacyConfiguration(package.id.clone()), commands); }
-                        } else if let Some(plugin) = &package.plugin { if ui.button("Configure").clicked() { send(Request::BrowsePlugin(plugin.clone()), commands); } }
-                        if let (Some(plugin), Some(enabled)) = (&package.plugin, package.enabled) {
-                            if ui.button(if enabled { "Disable" } else { "Enable" }).clicked() { send(Request::Enable { plugin: plugin.clone(), enabled: !enabled }, commands); }
-                        }
-                        if ui.button("Diagnose").clicked() { send(Request::Diagnose(Some(package.id.clone())), commands); }
-                        if package.installed {
-                            if let Some(kind) = package.kind { if ui.button("Remove…").clicked() { ui.data_mut(|data| data.insert_temp(egui::Id::new("package-confirm"), (panel.packages_revision, Request::Remove { kind, id: package.id.clone() }))); } }
-                        } else if package.plugin.is_some() {
-                            ui.small("Operator-discovered package; not a managed installation.");
-                        } else if ui.button("Install…").clicked() { ui.data_mut(|data| data.insert_temp(egui::Id::new("package-confirm"), (panel.packages_revision, Request::Install(package.id.clone())))); }
-                    });
+            let source_id = egui::Id::new("package-source");
+            let kind_id = source_id.with("kind");
+            let mut kind = ui
+                .data(|data| data.get_temp::<SourceKind>(kind_id))
+                .unwrap_or(SourceKind::Index);
+            egui::ComboBox::from_id_salt(kind_id)
+                .selected_text(kind.label())
+                .show_ui(ui, |ui| {
+                    for value in [
+                        SourceKind::Index,
+                        SourceKind::Directory,
+                        SourceKind::Archive,
+                        SourceKind::Legacy,
+                        SourceKind::Url,
+                    ] {
+                        ui.selectable_value(&mut kind, value, value.label());
+                    }
                 });
+            ui.data_mut(|data| data.insert_temp(kind_id, kind));
+            let mut source = ui
+                .data_mut(|data| data.remove_temp::<String>(source_id))
+                .unwrap_or_default();
+            ui.add(
+                egui::TextEdit::singleline(&mut source)
+                    .char_limit(4096)
+                    .hint_text(kind.label()),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Search index").clicked() {
+                    send(Request::PackageSearch(source.clone()), commands);
+                }
+                if ui.button("Install…").clicked() {
+                    ui.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("package-confirm"),
+                            (
+                                panel.packages_revision,
+                                Request::InstallFrom {
+                                    source: source.clone(),
+                                    kind,
+                                },
+                            ),
+                        )
+                    });
+                }
+            });
+            ui.data_mut(|data| data.insert_temp(source_id, source));
+            egui::ScrollArea::vertical()
+                .id_salt("package-inventory")
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    for package in panel.packages.iter() {
+                        ui.group(|ui| {
+                            ui.label(format!(
+                                "{} {}",
+                                if package.name.is_empty() {
+                                    &package.id
+                                } else {
+                                    &package.name
+                                },
+                                package.version
+                            ));
+                            ui.small(&package.summary);
+                            ui.horizontal_wrapped(|ui| {
+                                if package.kind == Some(PluginKind::Legacy) {
+                                    if ui.link("Legacy .ini configuration").clicked() {
+                                        send(Request::LegacyConfiguration(package.id.clone()), commands);
+                                    }
+                                } else if let Some(plugin) = &package.plugin {
+                                    if ui.button("Configure").clicked() {
+                                        send(Request::BrowsePlugin(plugin.clone()), commands);
+                                    }
+                                }
+                                if ui
+                                    .add_enabled(
+                                        package.plugin.is_none() || package.kind.is_some(),
+                                        egui::Button::new("Package details"),
+                                    )
+                                    .on_hover_text(if package.plugin.is_some() {
+                                        "Inspect discovered local package metadata without executing it"
+                                    } else {
+                                        "Show details from the configured package indexes"
+                                    })
+                                    .clicked()
+                                {
+                                    let target = if package.plugin.is_some() {
+                                        package.kind.map(|kind| PackageDetailsTarget::Local {
+                                            kind,
+                                            id: package.id.clone(),
+                                        })
+                                    } else {
+                                        Some(PackageDetailsTarget::Index {
+                                            id: package.id.clone(),
+                                        })
+                                    };
+                                    if let Some(target) = target {
+                                        send(Request::Details(target), commands);
+                                    }
+                                }
+                                if let (Some(plugin), Some(enabled)) = (&package.plugin, package.enabled) {
+                                    if ui.button(if enabled { "Disable" } else { "Enable" }).clicked() {
+                                        send(
+                                            Request::Enable {
+                                                plugin: plugin.clone(),
+                                                enabled: !enabled,
+                                            },
+                                            commands,
+                                        );
+                                    }
+                                }
+                                if ui.button("Diagnose").clicked() {
+                                    send(Request::Diagnose(Some(package.id.clone())), commands);
+                                }
+                                if package.installed {
+                                    if let Some(kind) = package.kind {
+                                        if ui.button("Remove…").clicked() {
+                                            ui.data_mut(|data| {
+                                                data.insert_temp(
+                                                    egui::Id::new("package-confirm"),
+                                                    (
+                                                        panel.packages_revision,
+                                                        Request::Remove {
+                                                            kind,
+                                                            id: package.id.clone(),
+                                                        },
+                                                    ),
+                                                )
+                                            });
+                                        }
+                                    }
+                                } else if package.plugin.is_some() {
+                                    ui.small("Operator-discovered package; not a managed installation.");
+                                } else if ui.button("Install…").clicked() {
+                                    ui.data_mut(|data| {
+                                        data.insert_temp(
+                                            egui::Id::new("package-confirm"),
+                                            (panel.packages_revision, Request::Install(package.id.clone())),
+                                        )
+                                    });
+                                }
+                            });
+                        });
+                    }
+                });
+            let confirm_id = egui::Id::new("package-confirm");
+            if ui
+                .data(|data| data.get_temp::<(u64, Request)>(confirm_id))
+                .is_some_and(|(revision, _)| revision != panel.packages_revision)
+            {
+                ui.data_mut(|data| data.remove::<(u64, Request)>(confirm_id));
             }
-        });
-        let confirm_id = egui::Id::new("package-confirm");
-        if ui.data(|data| data.get_temp::<(u64, Request)>(confirm_id)).is_some_and(|(revision, _)| revision != panel.packages_revision) {
-            ui.data_mut(|data| data.remove::<(u64, Request)>(confirm_id));
-        }
-        if let Some((_revision, request)) = ui.data(|data| data.get_temp::<(u64, Request)>(confirm_id)).filter(|(revision, _)| *revision == panel.packages_revision) {
-            ui.group(|ui| {
+            if let Some((_revision, request)) = ui
+                .data(|data| data.get_temp::<(u64, Request)>(confirm_id))
+                .filter(|(revision, _)| *revision == panel.packages_revision)
+            {
+                ui.group(|ui| {
                 match &request {
                     Request::Remove { kind, id } => { ui.label(format!("Remove {} package {id}", kind.directory_name())); }
                     Request::Install(id) => { ui.label(format!("Install package {id}")); }
@@ -482,14 +747,20 @@ pub(crate) fn draw(
                     if ui.button("Keep current installation").clicked() { ui.data_mut(|data| data.remove::<(u64, Request)>(confirm_id)); }
                 });
             });
+            }
+            for job in panel.jobs.iter() {
+                draw_job(ui, job, commands);
+            }
+        };
+        if panel.category == Category::Plugins {
+            ui.heading("Plugins / Background jobs");
+            packages(ui);
+        } else {
+            egui::CollapsingHeader::new("Plugins / Background jobs")
+                .id_salt("package-management")
+                .show(ui, packages);
         }
-        for job in panel.jobs.iter() {
-            ui.horizontal(|ui| {
-                ui.label(format!("{}: {}", job.operation, job.status));
-                if !job.terminal && ui.button("Request cancellation").clicked() { send(Request::Cancel(job.id), commands); }
-            });
-        }
-    });
+    }
 }
 
 #[cfg(test)]
@@ -501,8 +772,18 @@ mod tests {
         events: Vec<egui::Event>,
         time: f64,
     ) -> egui::FullOutput {
+        paint_commands(context, panel, events, time).0
+    }
+
+    fn paint_commands(
+        context: &egui::Context,
+        panel: &Panel,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) -> (egui::FullOutput, Vec<UiCommand>) {
         retire_projection(context, panel, true);
-        context.run(
+        let mut commands = Vec::new();
+        let output = context.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -520,11 +801,271 @@ mod tests {
                         panel,
                         &[],
                         panel.fields.first().map(|field| field.key.as_str()),
-                        &mut Vec::new(),
+                        &mut commands,
                     );
                 });
             },
-        )
+        );
+        (output, commands)
+    }
+
+    #[test]
+    fn conflicted_nonsecret_draft_survives_filtering_without_reauthorizing_a_stale_schema() {
+        let context = egui::Context::default();
+        let key = "plugins.modern.sample.settings.endpoint";
+        let view = Some(ViewId(52));
+        let id = editor_id(view, key, false);
+        let field = Field {
+            key: key.into(),
+            label: "Endpoint".into(),
+            description: String::new(),
+            category: "Plugins".into(),
+            plugin: Some(PluginId("modern.sample".into())),
+            value: "initial".into(),
+            source: "user-plugin".into(),
+            restart: false,
+            secret: false,
+            toggle: None,
+            value_available: true,
+        };
+        let mut panel = Panel {
+            view,
+            config: 1,
+            schema: 1,
+            projection_config: 1,
+            projection_schema: 1,
+            authoritative: true,
+            fields: Arc::from([field.clone()]),
+            ..Default::default()
+        };
+        let _ = paint(&context, &panel, Vec::new(), 0.0);
+        let _ = paint(
+            &context,
+            &panel,
+            vec![egui::Event::Text("modern-draft-retain".into())],
+            1.0,
+        );
+        let original = context
+            .data(|data| data.get_temp::<Draft>(id))
+            .expect("typed draft");
+        assert!(original.changed && original.text.contains("modern-draft-retain"));
+        panel.config = 2;
+        panel.projection_config = 2;
+        let mut external = field;
+        external.value = "external-writer-wins".into();
+        panel.fields = Arc::from([external.clone()]);
+        let _ = paint(&context, &panel, Vec::new(), 2.0);
+        panel.fields = Arc::from([]);
+        let _ = paint(&context, &panel, Vec::new(), 3.0);
+        assert!(egui::text_edit::TextEditState::load(&context, id.with("text")).is_none());
+        panel.fields = Arc::from([external.clone()]);
+        let _ = paint(&context, &panel, Vec::new(), 4.0);
+        let restored = context
+            .data(|data| data.get_temp::<Draft>(id))
+            .expect("draft restored after filtering");
+        assert_eq!(restored.text, original.text);
+        assert!(restored.changed && restored.config != panel.config);
+        assert_eq!(restored.schema, 1);
+
+        // A disappeared/changed declaration cannot silently rebase that draft.
+        panel.schema = 2;
+        panel.projection_schema = 2;
+        panel.fields = Arc::from([]);
+        let enter = || {
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        let (_, absent_commands) = paint_commands(&context, &panel, enter(), 5.0);
+        assert!(!absent_commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::ManageSettings(Request::Edit { .. }))));
+        external.description = "Changed declaration".into();
+        panel.fields = Arc::from([external]);
+        let _ = paint(&context, &panel, Vec::new(), 6.0);
+        context.memory_mut(|memory| memory.request_focus(id.with("text")));
+        let (_, changed_commands) = paint_commands(&context, &panel, enter(), 7.0);
+        assert!(!changed_commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::ManageSettings(Request::Edit { .. }))));
+        let retained = context
+            .data(|data| data.get_temp::<Draft>(id))
+            .expect("unrebased draft");
+        assert_eq!(retained.text, original.text);
+        assert_eq!(retained.schema, 1);
+        assert!(retained.schema != panel.schema);
+        clear_editors(&context);
+        assert!(context.data(|data| data.get_temp::<Draft>(id)).is_none());
+    }
+
+    #[test]
+    fn typed_schema_refusal_retires_private_state_without_wiping_nonsecret_conflicts() {
+        let context = egui::Context::default();
+        let view = Some(ViewId(63));
+        let private_key = "plugins.native.sample.settings.api-key";
+        let public_key = "plugins.native.sample.settings.endpoint";
+        let private_id = editor_id(view, private_key, true);
+        let public_id = editor_id(view, public_key, false);
+        let secret = "schema-refusal-private-canary";
+        let private_field = Field {
+            key: private_key.into(),
+            label: "API key".into(),
+            description: String::new(),
+            category: "Plugins".into(),
+            plugin: Some(PluginId("native.sample".into())),
+            value: String::new(),
+            source: "user-plugin".into(),
+            restart: false,
+            secret: true,
+            toggle: None,
+            value_available: true,
+        };
+        let mut public_field = private_field.clone();
+        public_field.key = public_key.into();
+        public_field.label = "Endpoint".into();
+        public_field.secret = false;
+        public_field.value = "initial".into();
+        let mut panel = Panel {
+            view,
+            config: 1,
+            schema: 1,
+            projection_config: 1,
+            projection_schema: 1,
+            authoritative: true,
+            fields: Arc::from([private_field, public_field]),
+            ..Default::default()
+        };
+        let _ = paint(&context, &panel, Vec::new(), 0.0);
+        let _ = paint(&context, &panel, vec![egui::Event::Text(secret.into())], 1.0);
+        assert!(context
+            .data(|data| data.get_temp::<Draft>(private_id))
+            .is_some_and(|draft| draft.text == secret));
+        context.memory_mut(|memory| memory.request_focus(public_id.with("text")));
+        let _ = paint(
+            &context,
+            &panel,
+            vec![egui::Event::Text("nonsecret-retained".into())],
+            2.0,
+        );
+        let public_text = context
+            .data(|data| data.get_temp::<Draft>(public_id))
+            .expect("nonsecret draft")
+            .text;
+        assert!(public_text.contains("nonsecret-retained"));
+
+        // A plain configuration conflict must not revoke the private draft.
+        panel.config = 2;
+        let _ = paint(&context, &panel, Vec::new(), 3.0);
+        assert!(context
+            .data(|data| data.get_temp::<Draft>(private_id))
+            .is_some_and(|draft| draft.text == secret));
+        let private_focus = context
+            .data(|data| data.get_temp::<egui::Id>(private_id.with("private-focus")))
+            .expect("private widget identity");
+        context.memory_mut(|memory| memory.request_focus(private_focus));
+
+        // The host projects a typed StaleSchema refusal. Its retained schema
+        // counter can be unchanged when the declaration source is unavailable.
+        panel.schema_refusal = 92;
+        panel.schema_rejected = true;
+        panel.authoritative = false;
+        let (output, commands) = paint_commands(&context, &panel, Vec::new(), 4.0);
+        assert_eq!(panel.schema, 1);
+        assert!(context.data(|data| data.get_temp::<Draft>(private_id)).is_none());
+        assert!(context
+            .data(|data| data.get_temp::<egui::Id>(private_id.with("private-focus")))
+            .is_none());
+        assert!(egui::text_edit::TextEditState::load(&context, private_id.with("text")).is_none());
+        assert_ne!(context.memory(|memory| memory.focused()), Some(private_focus));
+        assert!(context
+            .data(|data| data.get_temp::<Editors>(egui::Id::new("managed-settings-editor-registry")))
+            .is_some_and(|editors| !editors.entries.iter().any(|editor| editor.id == private_id)));
+        assert!(!format!("{:?}", output.shapes).contains(secret));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::ManageSettings(Request::Edit { .. }))));
+        let retained = context
+            .data(|data| data.get_temp::<Draft>(public_id))
+            .expect("nonsecret conflict retained");
+        assert_eq!(retained.text, public_text);
+        assert!(retained.changed && retained.schema_refusal != panel.schema_refusal);
+
+        // Freshly approved metadata may recreate an empty secret editor, never
+        // the revoked buffer or its previous widget state.
+        panel.authoritative = true;
+        panel.schema_rejected = false;
+        panel.projection_config = panel.config;
+        let _ = paint(&context, &panel, Vec::new(), 5.0);
+        assert!(context
+            .data(|data| data.get_temp::<Draft>(private_id))
+            .is_some_and(|draft| draft.text.is_empty() && !draft.changed && draft.pending.is_none()));
+        context.memory_mut(|memory| memory.request_focus(public_id.with("text")));
+        let (_, commands) = paint_commands(
+            &context,
+            &panel,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            6.0,
+        );
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::ManageSettings(Request::Edit { .. }))));
+        assert!(context
+            .data(|data| data.get_temp::<Draft>(public_id))
+            .is_some_and(|draft| draft.text == public_text && draft.schema_refusal != panel.schema_refusal));
+
+        let private_focus = context
+            .data(|data| data.get_temp::<egui::Id>(private_id.with("private-focus")))
+            .expect("fresh private widget");
+        context.memory_mut(|memory| memory.request_focus(private_focus));
+        let _ = paint(&context, &panel, vec![egui::Event::Text(secret.into())], 7.0);
+        assert!(context
+            .data(|data| data.get_temp::<Draft>(private_id))
+            .is_some_and(|draft| draft.text == secret));
+        panel.category = Category::Appearance;
+        let _ = paint(&context, &panel, Vec::new(), 8.0);
+        assert!(context.data(|data| data.get_temp::<Draft>(private_id)).is_none());
+        assert_ne!(context.memory(|memory| memory.focused()), Some(private_focus));
+        panel.category = Category::Plugins;
+        let _ = paint(&context, &panel, Vec::new(), 9.0);
+        assert!(context
+            .data(|data| data.get_temp::<Draft>(private_id))
+            .is_some_and(|draft| draft.text.is_empty() && !draft.changed));
+        assert!(context
+            .data(|data| data.get_temp::<Draft>(public_id))
+            .is_some_and(|draft| draft.text == public_text && draft.schema_refusal != panel.schema_refusal));
+
+        let private_focus = context
+            .data(|data| data.get_temp::<egui::Id>(private_id.with("private-focus")))
+            .expect("private widget in Plugins");
+        context.memory_mut(|memory| memory.request_focus(private_focus));
+        let _ = paint(&context, &panel, vec![egui::Event::Text(secret.into())], 10.0);
+        assert!(context
+            .data(|data| data.get_temp::<Draft>(private_id))
+            .is_some_and(|draft| draft.text == secret));
+        // The same field remains present in All: category retirement cannot
+        // depend on field visibility or wait for the asynchronous projection.
+        panel.category = Category::All;
+        panel.loading = true;
+        retire_projection(&context, &panel, true);
+        assert!(context.data(|data| data.get_temp::<Draft>(private_id)).is_none());
+        assert!(context
+            .data(|data| data.get_temp::<egui::Id>(private_id.with("private-focus")))
+            .is_none());
+        assert!(egui::text_edit::TextEditState::load(&context, private_id.with("text")).is_none());
+        assert_ne!(context.memory(|memory| memory.focused()), Some(private_focus));
+        assert!(context
+            .data(|data| data.get_temp::<Draft>(public_id))
+            .is_some_and(|draft| draft.text == public_text && draft.schema_refusal != panel.schema_refusal));
     }
 
     #[test]
@@ -545,6 +1086,7 @@ mod tests {
                 key: secret_key.into(),
                 label: "Value".into(),
                 description: String::new(),
+                category: "Plugins".into(),
                 plugin: Some(PluginId("native.sample".into())),
                 value: String::new(),
                 source: "user-plugin".into(),
@@ -577,6 +1119,12 @@ mod tests {
         let mut debug_field = panel.fields[0].clone();
         debug_field.value = secret.into();
         assert!(!format!("{debug_field:?}").contains(secret));
+        panel.schema = 2;
+        panel.projection_schema = 2;
+        let _ = paint(&context, &panel, Vec::new(), 1.5);
+        assert!(context
+            .data(|data| data.get_temp::<Draft>(secret_id))
+            .is_some_and(|draft| draft.text.is_empty()));
         let mut ordinary = panel.fields[0].clone();
         ordinary.key = "plugins.native.sample.settings.label".into();
         ordinary.secret = false;
@@ -628,6 +1176,7 @@ mod tests {
                 key: key.into(),
                 label: "Password".into(),
                 description: String::new(),
+                category: "Plugins".into(),
                 plugin: Some(PluginId("native.sample".into())),
                 value: String::new(),
                 source: "user-plugin".into(),
@@ -654,6 +1203,7 @@ mod tests {
                 text: "newer-private-draft".into(),
                 config: 1,
                 schema: 1,
+                schema_refusal: 0,
                 changed: true,
                 revision: 2,
                 pending: Some((7, 1)),
@@ -674,6 +1224,7 @@ mod tests {
                 text: "submitted-private-draft".into(),
                 config: 1,
                 schema: 1,
+                schema_refusal: 0,
                 changed: true,
                 revision: 1,
                 pending: Some((7, 1)),

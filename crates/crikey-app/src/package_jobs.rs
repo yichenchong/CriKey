@@ -48,11 +48,33 @@ const INVENTORY_LIMIT: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct JobId(u64);
 
+/// Inventory identity or index identity, never a caller-selected filesystem path.
+#[derive(Clone)]
+pub enum PackageShowTarget {
+    Index { id: String },
+    Local { kind: PluginKind, id: String },
+}
+
+impl std::fmt::Debug for PackageShowTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PackageShowTarget")
+            .field(
+                "source",
+                &match self {
+                    Self::Index { .. } => "index",
+                    Self::Local { .. } => "local",
+                },
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub enum PackageOperation {
     Search(String),
     List,
-    Show(String),
+    Show(PackageShowTarget),
     Install(InstallSource),
     InstallIndexed(String),
     Remove { kind: PluginKind, id: String },
@@ -71,12 +93,15 @@ impl PackageOperation {
     }
     fn target(&self) -> Option<Arc<str>> {
         match self {
-            Self::Show(id)
+            Self::Show(PackageShowTarget::Index { id })
             | Self::InstallIndexed(id)
             | Self::Enable(id)
             | Self::Disable(id)
             | Self::Doctor(Some(id)) => Some(Arc::from(id.as_str())),
             Self::Remove { kind, id } => Some(Arc::from(format!("{}.{}", kind.directory_name(), id))),
+            Self::Show(PackageShowTarget::Local { kind, id }) => {
+                Some(Arc::from(format!("{}.{}", kind.directory_name(), id)))
+            }
             // Never retain a source URL (which may embed credentials), source
             // path or arbitrary search text in diagnostic/event metadata.
             _ => None,
@@ -88,8 +113,13 @@ impl PackageOperation {
         };
         match self {
             Self::Search(text) => text.capacity() <= INPUT_BYTES,
-            Self::Show(id) | Self::InstallIndexed(id) | Self::Enable(id) | Self::Disable(id) => bounded(id),
-            Self::Remove { id, .. } => bounded(id) && id != "." && id != ".." && !id.contains(['/', '\\']),
+            Self::Show(PackageShowTarget::Index { id })
+            | Self::InstallIndexed(id)
+            | Self::Enable(id)
+            | Self::Disable(id) => bounded(id),
+            Self::Show(PackageShowTarget::Local { id, .. }) | Self::Remove { id, .. } => {
+                bounded(id) && id != "." && id != ".." && !id.contains(['/', '\\'])
+            }
             Self::Doctor(Some(id)) => bounded(id),
             Self::Install(InstallSource::Url(url)) => bounded(url),
             Self::Install(
@@ -892,7 +922,10 @@ fn execute(
             context.phase(JobPhase::Working)?;
             Ok(completed_rows(report, rows))
         }
-        PackageOperation::Show(wanted) => {
+        PackageOperation::Show(PackageShowTarget::Local { kind, id }) => {
+            local_details(context, directories, roots, kind, &id)
+        }
+        PackageOperation::Show(PackageShowTarget::Index { id: wanted }) => {
             let snapshots = load_indexes(context, &index(directories, &store)?, false)?;
             let mut report = String::new();
             for snapshot in &snapshots {
@@ -1408,6 +1441,124 @@ fn resolve<'a>(entries: &'a [InventoryEntry], wanted: &str) -> Result<&'a Invent
     Ok(first)
 }
 
+fn detail_field(report: &mut String, key: &str, value: &str) -> Result<(), JobError> {
+    if key.len().saturating_add(value.len()).saturating_add(2) > REPORT_BYTES.saturating_sub(report.len()) {
+        return Err(JobError::new(
+            "report-limit",
+            "package metadata exceeds the bounded details report",
+        ));
+    }
+    report.push_str(key);
+    report.push('=');
+    report.push_str(value);
+    report.push('\n');
+    Ok(())
+}
+
+fn local_details(
+    context: &Context,
+    directories: &StandardDirectories,
+    roots: &[(PluginKind, PathBuf)],
+    kind: PluginKind,
+    id: &str,
+) -> Result<JobOutcome, JobError> {
+    let entries = inventory(context, directories, roots)?;
+    let mut matching = entries
+        .iter()
+        .filter(|entry| entry.kind == kind && entry.id == id);
+    let entry = matching.next().ok_or_else(|| {
+        JobError::new(
+            "not-found",
+            "local package is no longer present in the captured discovery inventory",
+        )
+    })?;
+    if matching.next().is_some() {
+        return Err(JobError::new(
+            "ambiguous",
+            "multiple local copies have this exact runtime and package identity; no arbitrary copy was selected",
+        ));
+    }
+    context.phase(JobPhase::Working)?;
+    let mut report = String::new();
+    detail_field(&mut report, "plugin", &entry.plugin.0)?;
+    detail_field(&mut report, "package", &entry.id)?;
+    detail_field(
+        &mut report,
+        "source",
+        if entry.installed {
+            "managed"
+        } else {
+            "operator-root"
+        },
+    )?;
+    detail_field(&mut report, "location", &entry.root.to_string_lossy())?;
+    if let Some(manifest) = &entry.manifest {
+        detail_field(&mut report, "name", &manifest.plugin.name)?;
+        detail_field(&mut report, "version", &manifest.plugin.version)?;
+        detail_field(
+            &mut report,
+            "runtime",
+            match manifest.plugin.runtime {
+                Runtime::LegacyPython => "legacy-python",
+                Runtime::Python => "python",
+                Runtime::Native => "native",
+                Runtime::CAbi => "c-abi",
+                Runtime::Wasm => "wasm",
+                Runtime::Builtin => "builtin",
+            },
+        )?;
+        for (platform, path) in &manifest.plugin.entrypoint {
+            detail_field(&mut report, "entrypoint-platform", platform)?;
+            detail_field(&mut report, "entrypoint", path)?;
+        }
+        if let Some(api) = &manifest.plugin.api {
+            detail_field(&mut report, "api", api)?;
+        }
+        append(&mut report, &format!(
+            "declared-permissions network={} network-listener={} process={} window-enumeration={} window-control={} notifications={} secrets={} environment={} native-library-loading={} web-storage={} background-execution={} clipboard={:?}",
+            manifest.permissions.network, manifest.permissions.network_listener,
+            manifest.permissions.process, manifest.permissions.window_enumeration,
+            manifest.permissions.window_control, manifest.permissions.notifications,
+            manifest.permissions.secrets, manifest.permissions.environment,
+            manifest.permissions.native_library_loading, manifest.permissions.web_storage,
+            manifest.permissions.background_execution, manifest.permissions.clipboard,
+        ))?;
+        for permission in &manifest.permissions.filesystem {
+            append(&mut report, &format!("declared-filesystem={permission:?}"))?;
+        }
+    } else {
+        let package = PackageLoader::new(directories.cache_dir().join("legacy-packages"))
+            .load(&entry.root)
+            .map_err(|_| {
+                JobError::new(
+                    "legacy-package",
+                    "legacy package metadata could not be loaded safely",
+                )
+            })?;
+        detail_field(&mut report, "runtime", "legacy-python")?;
+        detail_field(&mut report, "version", "not-declared-by-format")?;
+        detail_field(&mut report, "entrypoint-module", &package.main_module)?;
+        append(
+            &mut report,
+            &format!(
+                "modules={} resources={} configuration-files={}",
+                package.modules.len(),
+                package.resources.len(),
+                package
+                    .resources
+                    .iter()
+                    .filter(|path| path
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("ini")))
+                    .count(),
+            ),
+        )?;
+        detail_field(&mut report, "configuration", "legacy-ini; values not inspected")?;
+    }
+    context.phase(JobPhase::Working)?;
+    Ok(completed(report, false))
+}
+
 fn doctor(
     context: &Context,
     directories: &StandardDirectories,
@@ -1803,7 +1954,9 @@ mod tests {
         let (jobs, _) = harness();
         for index in 0..RETAINED {
             let id = jobs
-                .submit(PackageOperation::Show("t".repeat(INPUT_BYTES)))
+                .submit(PackageOperation::Show(PackageShowTarget::Index {
+                    id: "t".repeat(INPUT_BYTES),
+                }))
                 .expect("reserved terminal");
             let context = context(&jobs, id);
             let outcome = if index % 2 == 0 {
@@ -1854,7 +2007,9 @@ mod tests {
         let (jobs, _) = harness();
         for _ in 0..RETAINED - QUEUED - 1 {
             let id = jobs
-                .submit(PackageOperation::Show("t".repeat(INPUT_BYTES)))
+                .submit(PackageOperation::Show(PackageShowTarget::Index {
+                    id: "t".repeat(INPUT_BYTES),
+                }))
                 .expect("terminal slot");
             context(&jobs, id).finish(completed("r".repeat(REPORT_BYTES), true));
         }
@@ -1876,9 +2031,17 @@ mod tests {
             id: working_id,
         };
         working_context.phase(JobPhase::Working).expect("working");
-        for _ in 0..QUEUED {
-            jobs.submit(PackageOperation::Show("q".repeat(INPUT_BYTES)))
-                .expect("queued slot");
+        for index in 0..QUEUED {
+            let id = "q".repeat(INPUT_BYTES);
+            let target = if index % 2 == 0 {
+                PackageShowTarget::Index { id }
+            } else {
+                PackageShowTarget::Local {
+                    kind: PluginKind::Native,
+                    id,
+                }
+            };
+            jobs.submit(PackageOperation::Show(target)).expect("queued slot");
         }
         assert_eq!(jobs.submit(PackageOperation::List), Err(JobRefusal::Saturated));
         assert!(jobs.retained_bytes() <= RETAINED_BYTES);
@@ -1891,7 +2054,9 @@ mod tests {
                 .queue
                 .iter()
                 .map(|(_, operation)| match operation {
-                    PackageOperation::Show(text) => text.capacity(),
+                    PackageOperation::Show(
+                        PackageShowTarget::Index { id } | PackageShowTarget::Local { id, .. },
+                    ) => id.capacity(),
                     _ => unreachable!("queued show"),
                 })
                 .sum::<usize>();
@@ -1926,7 +2091,9 @@ mod tests {
     fn successful_mutation_stays_completed_when_its_report_exceeds_capacity() {
         let (jobs, _) = harness();
         let id = jobs
-            .submit(PackageOperation::Show("t".repeat(INPUT_BYTES)))
+            .submit(PackageOperation::Show(PackageShowTarget::Index {
+                id: "t".repeat(INPUT_BYTES),
+            }))
             .expect("reservation");
         context(&jobs, id).finish(completed("界".repeat(REPORT_BYTES), true));
         let event = jobs.drain_events(1).pop().expect("terminal event");
@@ -1987,6 +2154,171 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn local_details_use_exact_fresh_inventory_without_indexes_or_plugin_execution() {
+        let fixture = Fixture::new();
+        let native_root = fixture.root.join("native-root");
+        let legacy_root = fixture.root.join("legacy-root");
+        std::fs::create_dir_all(&native_root).expect("native discovery root");
+        std::fs::create_dir_all(legacy_root.join("same")).expect("legacy package");
+        fixture.archive("native-source", "same", "1.2.3");
+        std::fs::rename(fixture.root.join("native-source"), native_root.join("same"))
+            .expect("native operator package");
+        let manifest_path = native_root.join("same/crikey.toml");
+        let manifest = std::fs::read_to_string(&manifest_path).expect("native declaration");
+        std::fs::write(&manifest_path, format!(
+            "{manifest}\n[[configuration.field]]\nname = \"token\"\ntype = \"string\"\nsecret = true\ndefault = \"DETAILS-SECRET-CANARY\"\n",
+        )).expect("secret schema default");
+        std::fs::write(
+            legacy_root.join("same/same.py"),
+            "raise AssertionError('inspection must not execute plugins')\n",
+        )
+        .expect("legacy entrypoint");
+        std::fs::write(
+            legacy_root.join("same/same.ini"),
+            "[main]\npassword = DETAILS-SECRET-CANARY\n",
+        )
+        .expect("legacy settings");
+        let managed = fixture.archive("managed-source", "managed", "2.0.0");
+        PluginInstaller::new(&fixture.directories)
+            .install(&InstallSource::Archive(managed), &mut |_| Ok(()))
+            .expect("managed package");
+        let configuration = Arc::new(SessionConfiguration {
+            directories: fixture.directories.clone(),
+            overrides: Mutex::new(Vec::new()),
+            loads: AtomicUsize::new(0),
+        });
+        let (wake, wakes) = std::sync::mpsc::channel();
+        let mut jobs = PackageJobs::new(
+            fixture.directories.clone(),
+            vec![
+                (PluginKind::Native, native_root.clone()),
+                (PluginKind::Legacy, legacy_root.clone()),
+            ],
+            None,
+            configuration,
+            Arc::new(move || {
+                let _ = wake.send(());
+            }),
+        )
+        .expect("inspection worker");
+        for (kind, id, runtime, source, version) in [
+            (PluginKind::Native, "same", "native", "operator-root", "1.2.3"),
+            (
+                PluginKind::Legacy,
+                "same",
+                "legacy-python",
+                "operator-root",
+                "not-declared-by-format",
+            ),
+            (PluginKind::Native, "managed", "native", "managed", "2.0.0"),
+        ] {
+            let job = jobs
+                .submit(PackageOperation::Show(PackageShowTarget::Local {
+                    kind,
+                    id: id.into(),
+                }))
+                .expect("local details");
+            let outcome = terminal(&jobs, job, &wakes).outcome.expect("details terminal");
+            let JobOutcome::Completed {
+                report,
+                restart_required,
+                ..
+            } = outcome
+            else {
+                panic!("local details must work without indexes: {outcome:?}")
+            };
+            assert!(!restart_required);
+            assert!(report.contains(&format!("plugin={}.{id}\n", kind.directory_name())));
+            assert!(report.contains(&format!("runtime={runtime}\n")));
+            assert!(report.contains(&format!("source={source}\n")));
+            assert!(report.contains(&format!("version={version}\n")));
+            assert!(report.contains("location="));
+            assert!(!report.contains("DETAILS-SECRET-CANARY"));
+        }
+        // A second copy with the same exact kind/id cannot silently redirect a
+        // details action to a guessed winning path.
+        std::fs::create_dir(native_root.join("duplicate")).expect("duplicate candidate");
+        std::fs::copy(&manifest_path, native_root.join("duplicate/crikey.toml")).expect("duplicate manifest");
+        let duplicate = jobs
+            .submit(PackageOperation::Show(PackageShowTarget::Local {
+                kind: PluginKind::Native,
+                id: "same".into(),
+            }))
+            .expect("duplicate details");
+        assert!(matches!(
+            terminal(&jobs, duplicate, &wakes).outcome,
+            Some(JobOutcome::Failed { error, restart_required: false, .. }) if error.code == "ambiguous"
+        ));
+        std::fs::remove_dir_all(legacy_root.join("same")).expect("package disappears after row publication");
+        let stale = jobs
+            .submit(PackageOperation::Show(PackageShowTarget::Local {
+                kind: PluginKind::Legacy,
+                id: "same".into(),
+            }))
+            .expect("stale row details");
+        assert!(matches!(
+            terminal(&jobs, stale, &wakes).outcome,
+            Some(JobOutcome::Failed { error, restart_required: false, .. }) if error.code == "not-found"
+        ));
+        // Local details must not silently reinterpret an explicit index target.
+        let indexed = jobs
+            .submit(PackageOperation::Show(PackageShowTarget::Index {
+                id: "same".into(),
+            }))
+            .expect("index details");
+        assert!(matches!(
+            terminal(&jobs, indexed, &wakes).outcome,
+            Some(JobOutcome::Failed { .. })
+        ));
+        jobs.shutdown().expect("inspection shutdown");
+    }
+
+    #[test]
+    fn local_details_refuse_oversized_metadata_and_allocated_target_capacity() {
+        let fixture = Fixture::new();
+        fixture.archive("oversized", "large", "1.0.0");
+        let path = fixture.root.join("oversized/crikey.toml");
+        let declaration = std::fs::read_to_string(&path).expect("declaration");
+        std::fs::write(
+            &path,
+            declaration.replace(
+                "name = \"Fixture\"",
+                &format!("name = \"{}\"", "x".repeat(REPORT_BYTES)),
+            ),
+        )
+        .expect("oversized display name");
+        let configuration = SessionConfiguration {
+            directories: fixture.directories.clone(),
+            overrides: Mutex::new(Vec::new()),
+            loads: AtomicUsize::new(0),
+        };
+        let (jobs, _) = harness();
+        let operation = PackageOperation::Show(PackageShowTarget::Local {
+            kind: PluginKind::Native,
+            id: "large".into(),
+        });
+        let id = jobs.submit(operation.clone()).expect("bounded identity");
+        let outcome = execute(
+            &context(&jobs, id),
+            &fixture.directories,
+            &[(PluginKind::Native, fixture.root.clone())],
+            None,
+            &configuration,
+            operation,
+        );
+        assert!(matches!(outcome, Err(error) if error.code == "report-limit"));
+        let mut oversized = String::with_capacity(RETAINED_BYTES);
+        oversized.push_str("large");
+        assert_eq!(
+            jobs.submit(PackageOperation::Show(PackageShowTarget::Local {
+                kind: PluginKind::Native,
+                id: oversized
+            })),
+            Err(JobRefusal::InvalidInput)
+        );
     }
 
     struct SessionConfiguration {
@@ -2373,7 +2705,9 @@ mod tests {
         );
         let (jobs, _) = harness();
         let id = jobs
-            .submit(PackageOperation::Show("selected".into()))
+            .submit(PackageOperation::Show(PackageShowTarget::Index {
+                id: "selected".into(),
+            }))
             .expect("terminal reservation");
         let context = context(&jobs, id);
         // Exercise the same mutation path after a real digest-verified download:
