@@ -129,6 +129,11 @@ draft; **Save** applies it live. **Discard** abandons the draft, and
 observed OS theme changes; if the system theme is unavailable, the preference
 stays System and the interface explicitly reports its dark fallback.
 
+CLI and external file edits are checked when the resident launcher next handles
+a host interaction; there is no idle configuration watcher. Clicking a blank
+part of the launcher footer triggers that check without closing the current
+custom page. Reloading does not require restarting the launcher.
+
 Interface size changes logical UI geometry independently of OS display scaling
 and DPI. Result density changes result-row spacing. The default size and density
 preserve the existing metrics; neither changes the default compact command home

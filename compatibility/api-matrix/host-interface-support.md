@@ -4,12 +4,12 @@ This matrix covers CriKey's G01–G13 host-interface features, not Legacy API
 symbols. The [Legacy matrix](README.md) and `matrix.toml` retain their closed
 API-symbol schema; this document does not extend that schema.
 
-**Acceptance boundary:** P0–P7 are accepted at
-[PR22](https://github.com/yichenchong/CriKey/pull/22), checkpoint
-`c269c7bcaa7f8a5485934f1b91dad13c1d0d8939`. P8/G12 is **in progress and not
-runtime-accepted**. Accepted below means applicable isolated Linux
-native-window scenarios and component/real-worker checks, not every desktop,
-runtime or interaction. Platform evidence and exclusions follow the matrices.
+**Acceptance boundary:** P0–P8 have applicable isolated Linux runtime and
+component/real-worker acceptance at
+[PR23](https://github.com/yichenchong/CriKey/pull/23), functional checkpoint
+`4fc0dcad3560b095fe7b3cd219cf859ea837a4a6`. Accepted below does not mean every
+desktop, runtime or interaction. Platform evidence and exclusions follow the
+matrices; these stacked PRs are not merged.
 
 ## Host behavior and plugin requirements
 
@@ -30,7 +30,7 @@ requirements; a host-rendered control does not grant them.
 | G09 | Configurable logical resume and bounded submitted-query recall | Immediate reset is default; delayed snapshots are memory-only, expire monotonically and issue fresh work. Recall defaults to session-only, with Off/Clear and opt-in persistence. Legacy/free-form admissions are conservatively excluded from recall; argument values are excluded. Not ranking history or arbitrary page/process persistence. | P3 accepted |
 | G10 | In-context command configuration, favorite/order, alias/hotkey, visibility and exact ranking reset | Durable-command controls require explicit declarations; ordinary result actions remain available without them. Configure command navigates to exact host preferences, not the guest callback. Hiding is discovery policy, not authorization. Reset affects the verified exact item's ranking, not all history. | P2/P4/P5; P7 deep-link accepted |
 | G11 | Searchable categorized settings and graphical plugin/package management | Shared schema/validation/layer provenance, not a second settings registry. Native/Modern live configuration has same-process Linux evidence; do not infer guest delivery for other ABIs. Package jobs reuse installer/signature/lock policy, report cancellation/restart limits and outlive closing Settings. Install/remove permanently stops third-party runtimes for that launcher session. | P7 accepted; package evidence limits below |
-| G12 | Theme, bounded color overrides, interface size/density and navigation preferences | P8 implementation/integration is active. User layout size is not OS DPI. System-theme fallback, focus/input ownership, shortcut conflicts, custom-page palette and genuine web-document color-scheme support require distinct proof. Existing rounded-corner capability checks still apply. | **P8 in progress; no P8 runtime acceptance yet** |
+| G12 | Theme, bounded color overrides, interface size/density and navigation preferences | Cached System/Light/Dark, logical size independent of OS DPI, density and contextual default/Emacs/modified-Vim navigation with bounded overrides. Unknown system theme reports a dark fallback. Host/custom-page palette updates retain the same session; the installed WPE/FDO API has no document preferred-color-scheme setter, so website theming is not claimed. External edits reload on the next existing host event, not an idle watcher. Rounded-corner capability checks remain authoritative. | P8 accepted within evidence below |
 | G13 | Ordered configurable fallback actions | Declared commands accepting literal free-form query arguments only; typed-schema/argument-forbidden targets are ineligible. All applicable ordinary providers must finish successfully with no matches. Pending/failed/cancelled searches block fallbacks. Explicit selection passes the captured query as one argument, not shell syntax or automatic execution. | P4 accepted |
 
 ## Independent runtime capabilities
@@ -76,6 +76,10 @@ cannot use host chrome.
 
 ## Platform, evidence and security boundaries
 
+- [P8 native-platform CI](https://github.com/yichenchong/CriKey/actions/runs/44940028092)
+  passes Linux/macOS/Windows Rust suites, strict lint/format, documentation,
+  native/WASM/C-ABI conformance, Python SDK and packaging checks at functional
+  checkpoint `4fc0dcad3560b095fe7b3cd219cf859ea837a4a6`.
 - [P7 native-platform CI](https://github.com/yichenchong/CriKey/actions/runs/44919120216)
   passed Linux/macOS/Windows Rust suites, lint, documentation and conformance
   checks at the accepted checkpoint. [P6 CI](https://github.com/yichenchong/CriKey/actions/runs/44899764023)
@@ -86,7 +90,12 @@ cannot use host chrome.
   favorites/fallbacks, physical X11 command shortcuts, typed validation/privacy,
   six-cell grid navigation/detail/forms, and settings/package flows. This is not
   real-desktop compositor, high-DPI, broad live-IME, screen-reader or non-Linux
-  GUI proof. P8 appearance/remapping has no runtime acceptance yet.
+  GUI proof. P8 additionally exercises size/density combinations, forced native
+  2× rendering, full stationary tooltips, readable applied bindings, bounded
+  compact diagnostics/recovery, graphical Save completion, same-session palette
+  wake, remapped/editor input, actual IME commit/provider wake and real WPE
+  text/password/select HTTP submission. Forced 2× is not physical-monitor proof;
+  nonempty IME preedit remains component-test evidence.
 - Global hotkey implementations use X11, the Wayland GlobalShortcuts portal or
   Windows registration. Desktop policy/chord availability can refuse them.
   Actual X11 activation is narrower evidence than Wayland/Windows runtime
