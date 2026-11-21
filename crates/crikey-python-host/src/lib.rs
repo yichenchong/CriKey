@@ -10,9 +10,11 @@
 
 use std::path::PathBuf;
 
+mod bounded_json;
 mod host;
 mod interpreter;
 mod protocol;
+mod typed;
 mod worker;
 
 pub use host::WorkerPool;

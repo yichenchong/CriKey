@@ -285,12 +285,13 @@ impl GlobalShortcuts {
         options: HashMap<String, OwnedValue>,
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-        #[zbus(object_server)] server: &zbus::ObjectServer,
     ) -> zbus::fdo::Result<OwnedObjectPath> {
         let client = sender_of(&header);
         let request = request_path(&client, &text(&options, "handle_token"));
         let asked: Vec<String> = shortcuts.iter().map(|(id, _)| id.clone()).collect();
-        server
+        emitter
+            .connection()
+            .object_server()
             .at(
                 path(&request),
                 PortalRequest {

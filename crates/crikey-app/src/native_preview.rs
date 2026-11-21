@@ -1,7 +1,8 @@
 //! Native previews pin canonical catalog provenance while sharing provider budgets.
 use super::*;
 use crate::plugin_preview::{
-    PreviewDispatcher, PreviewIdentity, PreviewPublish, PreviewRequest, PreviewState, PreviewUpdate,
+    PendingPreviews, PreviewDispatcher, PreviewIdentity, PreviewPublish, PreviewRequest, PreviewState,
+    PreviewUpdate,
 };
 struct Job {
     request: PreviewRequest,
@@ -12,11 +13,11 @@ pub(super) struct NativePreviewEndpoint {
     sender: SyncSender<Job>,
     gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
     incarnations: NativeIncarnations,
-    items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
-    catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
+    items: SharedOriginItems,
+    catalog_items: SharedOriginItems,
     static_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     commands: Arc<Mutex<NativeCommandPublications>>,
-    pending: Arc<Mutex<Vec<(PreviewIdentity, Arc<CallControl>)>>>,
+    pending: PendingPreviews<CallControl>,
     stopped: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     wake: WakeSlot,

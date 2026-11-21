@@ -1,8 +1,8 @@
 # CriKey user guide
 
-CriKey is an independent, keyboard-driven launcher. It is not Keypirinha and is
-not affiliated with Keypirinha or its authors. The compatibility layer exists
-only to run documented Keypirinha packages.
+CriKey is an independent, keyboard-driven launcher. New plugins use its modern
+Python or supervised native interfaces; a separate compatibility layer runs
+supported legacy packages.
 
 ## Install and start
 
@@ -140,8 +140,10 @@ Saved desired shortcuts, their effective configuration layer and actual active
 registrations are distinct. An OS refusal preserves the previous usable binding;
 cleanup failures remain visible. Unassign occupied shortcuts before swapping
 commands. Removed or unavailable commands cannot execute through queued receipts.
-Optional commands execute without an argument; Required commands open fresh
-free-form input. Hidden direct actions remain hidden unless their still-current
+Optional free-form commands execute without an argument; Required free-form
+commands open fresh input. Commands with a typed schema open that same inline
+typed editor instead: aliases and shortcuts do not invent positional values.
+Hidden direct actions remain hidden unless their still-current
 deliberate shortcut result opens a page. Native command `ShowPage` outcomes support
 this presentation; Modern Python execution currently discards returned outcomes,
 so Modern command shortcuts do not open result pages. New input or dismissal
@@ -230,9 +232,11 @@ Fallback commands appear in saved order only for a nonblank query after every
 applicable ordinary provider successfully finishes with no matches. Pending,
 failed or cancelled work does not qualify. Selecting a fallback passes that
 captured query as one argument through the normal command dispatcher; it does
-not autoexecute or interpret shell syntax. Commands that forbid arguments
-cannot be newly enrolled as fallbacks. Required arguments must be supplied;
-optional arguments do not implicitly consume ordinary search text.
+not autoexecute or interpret shell syntax. Commands that forbid arguments or
+have typed schemas cannot be newly enrolled as text fallbacks. Saved incompatible
+fallbacks remain manageable but unavailable; the captured query cannot fill
+structured fields. Optional free-form arguments do not implicitly consume
+ordinary search text.
 
 Command preference controls save semantic edits to the user-global configuration
 layer, not a copy of the effective settings from other layers. A visibility edit
@@ -250,10 +254,104 @@ deferred preview unavailable without removing the command.
 
 Only Open Settings is a declared host command. Plugin commands require explicit
 native or Modern Python `commands_v1` support; labels, metadata and legacy
-suggestions are not inferred declarations. Command-specific alias editors and
-global command shortcut controls are not available. The existing textual
-`[aliases]` table above is separate. Commands accept a single text argument,
-not structured multi-field arguments.
+suggestions are not inferred declarations. Command aliases and global shortcuts
+refer to those exact declarations, separately from textual `[aliases]`.
+Typed arguments require independent `typed_arguments_v1` support; command
+declarations alone do not grant it.
+
+### Inline typed arguments
+
+An explicitly supported result or command opens inline fields near the root
+query instead of requesting one free-form argument. Text can be single- or
+multiline; dropdowns offer declared options; passwords show a fixed mask, not a
+character count. **Run command** checks required fields, UTF-8 byte bounds and
+dropdown selections before submission. Field failures use current schema
+guidance and fixed codes, not exception text or rejected values. Re-enter
+passwords after submission.
+While inline input is open its editor owns keyboard input; Escape closes the
+editor before query clearing, Back or dismissal. Covering/hiding root or changing
+view, generation or input revision clears the live native editor. Only the
+separate nonsecret logical draft is eligible for restoration.
+
+The schema belongs to the exact plugin/item/action. Commands sharing that
+executable, actions, aliases and global shortcuts use the same schema; none
+infer positional values. A changed or unavailable schema refuses execution,
+without conversion to legacy text. Native and Modern Python independently opt
+into typed arguments and result presentation. Older workers keep ordinary
+operations; Legacy Python, WASM and restricted C ABI have no typed callback.
+Schemas are never inferred from metadata.
+
+Limits are 64 fields, 256 options per dropdown, 8 KiB per text value, 256 UTF-8
+bytes per identifier and a 256 KiB schema footprint, also subject to existing
+transport and shared navigation retention limits.
+
+Passwords have no defaults. They are memory-only live input, excluded from
+query recall, configuration, navigation snapshots and host diagnostics.
+Nonsecret drafts may restore only for the same executable/schema. Clearing
+buffers is best effort, not cryptographic erasure or protection from crash
+collection. A malicious plugin receiving input can deliberately store or send
+it; choose trusted plugins.
+
+Every typed submission makes its worker diagnostically sensitive for that
+process's remaining lifetime: plugin logs, captured output, exception text,
+tracebacks and stderr tails are suppressed. Fixed host codes still report
+refusal, timeout, cancellation and transport failure. Cancellation does not
+undo effects. Inline fields do not add standard grid, detail, form or
+structured routes; existing previews and custom pages remain separate.
+
+### Result groups and scopes
+
+Sections and scopes come from explicit, admitted plugin presentation sidecars,
+not labels or undocumented metadata. A section header is not a selectable or
+executable result. Grouping keeps the existing result order within each section;
+it does not introduce plugin score-hint ranking or change command-alias
+precedence.
+
+Choose a scope from the dropdown directly below the query: **All** or an
+owner-qualified declared scope. Scope identity includes its declaration source,
+not just its label. Changing scope retires old results and input before a fresh
+query; only that scope's capable owner receives its scope ID. Other providers
+are nonapplicable, and legacy callback arguments do not change.
+
+Back/resume retains the exact scope source. If it is no longer available, the
+choice remains **Unavailable scope** with a notice; explicitly choose All or
+another scope. It never silently broadens the search. Group headers do not
+consume selection or logical scroll indexes.
+
+#### Proposed private-desktop acceptance procedure
+
+These are verification proposals, not evidence that a desktop exercise passed.
+Use disposable configuration/state/data/cache directories and private copies of
+the Native and Modern Python workers described in the
+[plugin author guide](plugin-author-guide.md#typed-root-arguments-and-presentation).
+Use synthetic passwords only; never stage adversarial fixtures in a normal
+user profile.
+
+1. Open both real workers' actionless and explicit-action targets. Check required
+   text, UTF-8 byte bounds, dropdown selection, fixed password masking and
+   password re-entry after submission. Exercise successful submission and a
+   fixed current-field failure; confirm no legacy callback receives typed input.
+2. Invoke the same declared target through ordinary results, its command alias
+   and an actual registered OS shortcut. Each must open the same schema, not
+   infer positional values. Check unsupported desktop/chord errors separately.
+   Refuse new typed fallback enrollment and keep an existing incompatible saved
+   reference visible/manageable without executing it.
+3. Compare grouped rows with the authoritative ungrouped ordering. Navigate past
+   headers by keyboard, use duplicate item/section/scope names in different
+   owners, and verify exact command-alias precedence under a low result ceiling.
+4. Change scope while `typed-scope-wait` is pending, then release/retire old work.
+   Old results must not reappear. Cover root with Settings and return; exercise
+   exact scope/selection/nonsecret restoration, unavailable scope declarations
+   and fresh schema changes without silently broadening the search.
+5. Submit synthetic secret canaries through the regression worker's deliberate
+   diagnostic-leak paths. Inspect host diagnostics, query recall, configuration
+   and navigation restoration, including later background callbacks in that
+   same process. No canary may appear; fixed failures must remain visible.
+   Worker cancellation, timeout and replacement must not leave Loading stuck
+   or revive a dismissed view. This checks diagnostic boundaries, not secure
+   erasure or protection against deliberate plugin I/O.
+
+### Action refresh and failures
 
 An admitted provider refresh preserves action search and focus for the exact
 owner, item and action. A vanished target or action shows an unavailable
@@ -338,9 +436,10 @@ web-document state is not restored.
 A positive millisecond value resumes the logical view only if reopened strictly
 before that monotonic deadline. At the boundary or after process restart it
 starts at root. Hide always retires asynchronous admission and closes page/web
-resources; resume issues fresh work and cannot revive an old answer. Argument
-drafts are excluded from navigation snapshots. No navigation snapshot is written
-to disk.
+resources; resume issues fresh work and cannot revive an old answer. Only
+explicitly nonsecret typed drafts are eligible for logical restoration against
+the same executable and schema; passwords are not snapshots. No navigation
+snapshot is written to disk.
 
 `launcher.query-history` accepts `session` (default), `off`, or opt-in
 `persistent`. Enter on a root primary action records its submitted query only

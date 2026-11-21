@@ -17,11 +17,15 @@ use crikey_platform::IconImage;
 pub mod action_panel;
 mod native;
 pub mod navigation;
+mod typed_input;
+pub use typed_input::{InlineArguments, TypedInputSubmission};
+mod root_presentation;
 use action_panel::{ActionActivation, ActionExecution, ActionPanelNavigation, ActionTree, HostAction};
 pub use action_panel::{ActionIdentity, ActionPanel, ActionTarget};
 pub use navigation::{
     LogicalScroll, NavigationClock, NavigationPresentation, NavigationRestoration, NavigationRoute,
 };
+pub use root_presentation::{PublicationIdentity, ScopeChoice, ScopeIdentity, SectionHeader};
 mod preview_content;
 mod session_end;
 pub use preview_content::{prepare_preview, PreparedPreview, PreviewBlock, PreviewBlockKind, PreviewSpan};
@@ -501,6 +505,22 @@ pub struct ViewModel {
 /// Not [`Eq`]: a page input carries pointer coordinates, which are floats.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiCommand {
+    SetTypedDraft {
+        revision: u64,
+        draft_revision: u64,
+        draft: std::collections::BTreeMap<
+            crikey_core::structured_arguments::FieldId,
+            crikey_core::structured_arguments::NonSecretValue,
+        >,
+    },
+    TypedInputActivity {
+        revision: u64,
+        draft_revision: u64,
+    },
+    SetScope(Option<ScopeIdentity>),
+    ActivateActionless {
+        target: ActionTarget,
+    },
     InvokeCommand {
         target: ActionTarget,
         argument: Option<String>,
@@ -537,7 +557,8 @@ pub enum UiCommand {
     /// Native input owned by a focused editor still supersedes asynchronous presentation.
     UserActivity,
     OpenPreviewLink {
-        target: PreviewLinkTarget,
+        /// Rare link activation owns its large source identity off the hot command enum.
+        target: Box<PreviewLinkTarget>,
         url: String,
     },
     SetQuery(String),
@@ -617,6 +638,12 @@ pub const PAGE_SIZE: usize = 8;
 /// Not [`Eq`], for the same reason [`UiCommand`] is not.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiEffect {
+    ExecuteActionless {
+        owner: PluginId,
+        item: ItemId,
+        view: ViewId,
+        generation: Generation,
+    },
     RecallQuery,
     InvokeCommand {
         reference: crikey_core::CommandRef,
@@ -858,10 +885,14 @@ pub struct LauncherViewModel {
     navigation_clock: Arc<dyn NavigationClock>,
     recall: Arc<[String]>,
     recall_selected: usize,
-    navigation_scope: Option<String>,
+    navigation_scope: Option<ScopeIdentity>,
     restoration_target: Option<ActionTarget>,
     navigation_title: Arc<str>,
     preserve_scroll: bool,
+    inline_arguments: Option<InlineArguments>,
+    scope_choices: Arc<[ScopeChoice]>,
+    section_headers: Arc<[SectionHeader]>,
+    actionless_targets: Arc<[crikey_core::structured_arguments::OwnedItem]>,
 }
 
 impl Default for LauncherViewModel {
@@ -878,6 +909,10 @@ impl LauncherViewModel {
     pub fn new() -> Self {
         Self {
             command_management: Arc::default(),
+            scope_choices: Arc::default(),
+            section_headers: Arc::default(),
+            actionless_targets: Arc::default(),
+            inline_arguments: None,
             visible: false,
             view_id: ViewId(0),
             publication_view: None,
@@ -922,6 +957,186 @@ impl LauncherViewModel {
             navigation_title: Arc::from("Search"),
             preserve_scroll: false,
         }
+    }
+    const INLINE_SOURCE_CHANGED_NOTICE: &str =
+        "Command input source changed; select the current command again";
+
+    /// Install only an exact source-pinned schema resolved by the application.
+    pub fn open_inline_arguments(
+        &mut self,
+        revision: u64,
+        executable: crikey_core::structured_arguments::ExecutableKey,
+        schema: Arc<crikey_core::structured_arguments::ArgumentSchema>,
+        source: PublicationIdentity,
+        command: Option<(crikey_core::CommandRef, u64)>,
+    ) -> bool {
+        if self.view().is_some_and(|(_, kind)| kind == ViewKind::RootList) && schema.validate().is_ok() {
+            let command = command.or_else(|| {
+                let row = self.rows.get(self.selected)?;
+                let ActionTarget::Command(reference) = &row.target else {
+                    return None;
+                };
+                Some((reference.clone(), row.command_state.as_ref()?.registry_revision))
+            });
+            let Ok(fingerprint) = schema.fingerprint() else {
+                return false;
+            };
+            let draft = Arc::new(crikey_core::structured_arguments::NonSecretDraft {
+                executable: executable.clone(),
+                values: Default::default(),
+            });
+            let previous = self.inline_arguments.replace(InlineArguments {
+                revision,
+                draft_revision: 0,
+                draft_retained: true,
+                executable,
+                schema,
+                source,
+                fingerprint,
+                command,
+                view: self.view_id,
+                generation: self.active.unwrap_or(Generation::ZERO),
+                outcome: None,
+                draft,
+            });
+            let entry = self.capture_entry();
+            if navigation::retained_bytes(self.navigation_stack.iter().chain(std::iter::once(&entry)))
+                > navigation::MAX_NAVIGATION_BYTES
+            {
+                self.inline_arguments = previous;
+                self.set_navigation_notice(
+                    "Command input exceeds the 8 MiB navigation limit. Go Back before opening it.".into(),
+                );
+                return false;
+            }
+            // This refusal belongs to the retired input, not the newly admitted
+            // exact context. Preserve every other diagnostic, including notices
+            // published after that refusal and notices restored through Back.
+            if self.navigation_unavailable.as_deref() == Some(Self::INLINE_SOURCE_CHANGED_NOTICE) {
+                self.navigation_unavailable = None;
+                self.navigation_notice_token = None;
+            }
+            self.action_panel = None;
+            self.preview.focused = false;
+            self.preview.detail = false;
+            self.recall = Arc::default();
+            self.dirty = true;
+            return true;
+        }
+        false
+    }
+    /// Explicit command input is another root entry in the same bounded P3 stack.
+    pub fn open_root_input(&mut self) -> bool {
+        self.activate();
+        if self.view().is_none() {
+            return false;
+        }
+        if (!self.query.is_empty()
+            || self.inline_arguments.is_some()
+            || self.navigation_scope.is_some()
+            || self.settings_open
+            || self.page.is_some()
+            || self.page_reopen.is_some())
+            && !self.push_navigation()
+        {
+            return false;
+        }
+        self.change_view();
+        self.page = None;
+        self.page_reopen = None;
+        self.reopening = false;
+        self.settings_open = false;
+        self.settings_focus = None;
+        self.navigation_scope = None;
+        self.navigation_title = Arc::from("Command input");
+        self.navigation_unavailable = None;
+        self.navigation_notice_token = None;
+        self.active = None;
+        self.published = None;
+        self.query.clear();
+        self.rows = Arc::default();
+        self.selected = 0;
+        self.query_refresh = false;
+        self.dirty = true;
+        true
+    }
+    pub fn retire_inline_arguments(&mut self) {
+        self.inline_arguments = None;
+        self.dirty = true;
+    }
+    pub fn retire_unavailable_inline_arguments(&mut self) {
+        self.retire_inline_arguments();
+        self.set_navigation_notice(Self::INLINE_SOURCE_CHANGED_NOTICE.into());
+    }
+    pub fn inline_arguments(&self) -> Option<&InlineArguments> {
+        self.inline_arguments.as_ref()
+    }
+    pub fn accepts_typed_input(&self, revision: u64, view: ViewId, generation: Generation) -> bool {
+        self.view() == Some((view, ViewKind::RootList))
+            && self.active == Some(generation)
+            && self.inline_arguments.as_ref().is_some_and(|input| {
+                input.revision == revision && input.view == view && input.generation == generation
+            })
+    }
+    pub fn accepts_typed_draft(
+        &self,
+        revision: u64,
+        draft_revision: u64,
+        view: ViewId,
+        generation: Generation,
+    ) -> bool {
+        self.accepts_typed_input(revision, view, generation)
+            && self
+                .inline_arguments
+                .as_ref()
+                .is_some_and(|input| input.draft_retained && input.draft_revision == draft_revision)
+    }
+    pub fn inline_arguments_completed(
+        &mut self,
+        revision: u64,
+        draft_revision: u64,
+        outcome: crikey_core::structured_arguments::SubmissionOutcome,
+    ) {
+        if let Some(input) = self
+            .inline_arguments
+            .as_mut()
+            .filter(|input| input.revision == revision && input.draft_revision == draft_revision)
+        {
+            if outcome.validate(Some(&input.schema)).is_ok() {
+                input.outcome = Some(outcome);
+                self.dirty = true;
+            }
+        }
+    }
+    pub fn selected_scope(&self) -> Option<&ScopeIdentity> {
+        self.navigation_scope.as_ref()
+    }
+    /// Presentation text only; provider admission separately validates its captured source.
+    pub fn selected_scope_choice(&self) -> Option<&ScopeChoice> {
+        let selected = self.navigation_scope.as_ref()?;
+        self.scope_choices
+            .iter()
+            .find(|choice| &choice.identity == selected)
+    }
+    pub fn admits_root_generation(&self, generation: Generation) -> bool {
+        self.active == Some(generation)
+            && self.publication_view == Some(self.view_id)
+            && self.view().is_some_and(|(_, kind)| kind == ViewKind::RootList)
+    }
+    pub fn set_root_presentation(
+        &mut self,
+        generation: Generation,
+        choices: Vec<ScopeChoice>,
+        headers: Vec<SectionHeader>,
+        actionless: Vec<crikey_core::structured_arguments::OwnedItem>,
+    ) {
+        if !self.admits_root_generation(generation) {
+            return;
+        }
+        self.scope_choices = choices.into();
+        self.section_headers = headers.into();
+        self.actionless_targets = actionless.into();
+        self.dirty |= self.visible;
     }
 
     /// Refresh from the same authoritative registry/preferences projection as discovery.
@@ -970,9 +1185,14 @@ impl LauncherViewModel {
         if self.rows.get(self.selected).is_some_and(|row| {
             matches!(row.target, ActionTarget::Result { .. }) && row.argument_hint.is_some()
         }) {
-            return NavigationRestoration::default();
+            return NavigationRestoration {
+                inline_arguments: self.inline_arguments.clone(),
+                scope: self.navigation_scope.clone(),
+                ..Default::default()
+            };
         }
         NavigationRestoration {
+            inline_arguments: self.inline_arguments.clone(),
             query: self.query.clone(),
             selected: self.rows.get(self.selected).map(ActionTarget::of),
             fallback_index: self.selected,
@@ -989,6 +1209,7 @@ impl LauncherViewModel {
             return;
         }
         self.query = state.query;
+        self.inline_arguments = state.inline_arguments;
         self.selected = state
             .selected
             .as_ref()
@@ -1055,6 +1276,7 @@ impl LauncherViewModel {
             return false;
         }
         self.navigation_stack.push(entry);
+        self.inline_arguments = None;
         self.navigation_unavailable = None;
         self.navigation_notice_token = None;
         self.navigation_scroll = LogicalScroll::default();
@@ -1120,6 +1342,11 @@ impl LauncherViewModel {
 
     fn navigation_presentation(&self) -> NavigationPresentation {
         NavigationPresentation {
+            scopes: self.scope_choices.clone(),
+            selected_scope: self.navigation_scope.clone(),
+            section_headers: self.section_headers.clone(),
+            actionless_targets: self.actionless_targets.clone(),
+            inline_arguments: self.inline_arguments.clone(),
             title: self.navigation_title.clone(),
             can_go_back: !self.navigation_stack.is_empty(),
             scroll: self.navigation_scroll.clone(),
@@ -1348,6 +1575,7 @@ impl LauncherViewModel {
             self.suspended_at = None;
             self.navigation_stack.clear();
         }
+        self.inline_arguments = None;
         self.page_reopen = None;
         self.navigation_scroll = LogicalScroll::default();
         self.preserve_scroll = false;
@@ -1405,9 +1633,15 @@ impl LauncherViewModel {
             self.navigated = false;
         }
         self.active = Some(generation);
+        if let Some(input) = &mut self.inline_arguments {
+            input.view = self.view_id;
+            input.generation = generation;
+        }
         self.publication_view = Some(self.view_id);
         self.query_refresh = false;
         self.pending_plugins = true;
+        self.actionless_targets = Arc::default();
+        self.section_headers = Arc::default();
         self.dirty = true;
     }
 
@@ -1509,7 +1743,123 @@ impl LauncherViewModel {
             return None;
         }
 
+        if matches!(
+            &command,
+            UiCommand::SetQuery(_)
+                | UiCommand::SelectNext
+                | UiCommand::SelectPrevious
+                | UiCommand::PageDown
+                | UiCommand::PageUp
+                | UiCommand::Complete
+        ) && self.inline_arguments.take().is_some()
+        {
+            self.dirty = true;
+        }
         match command {
+            UiCommand::SetScope(scope) => {
+                if self.navigation_scope == scope {
+                    return None;
+                }
+                if scope.as_ref().is_some_and(|identity| {
+                    !self
+                        .scope_choices
+                        .iter()
+                        .any(|choice| &choice.identity == identity)
+                }) {
+                    return None;
+                }
+                self.inline_arguments = None;
+                self.navigation_scope = scope;
+                self.navigation_unavailable = None;
+                self.navigation_notice_token = None;
+                self.publication_view = None;
+                self.active = None;
+                self.rows = Arc::default();
+                self.selected = 0;
+                self.dirty = true;
+                Some(UiEffect::Query(self.query.clone()))
+            }
+            UiCommand::TypedInputActivity {
+                revision,
+                draft_revision,
+            } => {
+                if let Some(input) = self
+                    .inline_arguments
+                    .as_mut()
+                    .filter(|input| input.revision == revision && input.draft_revision < draft_revision)
+                {
+                    input.draft_revision = draft_revision;
+                    input.draft_retained = false;
+                    input.outcome = None;
+                    self.dirty = true;
+                }
+                None
+            }
+            UiCommand::SetTypedDraft {
+                revision,
+                draft_revision,
+                draft,
+            } => {
+                let mut previous = None;
+                if let Some(input) = self
+                    .inline_arguments
+                    .as_mut()
+                    .filter(|input| input.revision == revision && input.draft_revision <= draft_revision)
+                {
+                    use crikey_core::structured_arguments::{
+                        ArgumentValues, NonSecretDraft, StructuredValue, ValidationCode,
+                    };
+                    let values = ArgumentValues(
+                        draft
+                            .into_iter()
+                            .map(|(id, value)| (id, StructuredValue::NonSecret(value)))
+                            .collect(),
+                    );
+                    let valid = input.schema.validate_values(&values).err().is_none_or(|errors| {
+                        errors.iter().all(|error| {
+                            matches!(error.code, ValidationCode::Required | ValidationCode::TooShort)
+                        })
+                    });
+                    if valid {
+                        let values = values
+                            .0
+                            .into_iter()
+                            .filter_map(|(id, value)| match value {
+                                StructuredValue::NonSecret(value) => Some((id, value)),
+                                StructuredValue::Password(_) => None,
+                            })
+                            .collect();
+                        previous = Some(std::mem::replace(
+                            &mut input.draft,
+                            Arc::new(NonSecretDraft {
+                                executable: input.executable.clone(),
+                                values,
+                            }),
+                        ));
+                        input.draft_revision = draft_revision;
+                        input.draft_retained = true;
+                        input.outcome = None;
+                        self.dirty = true;
+                    }
+                }
+                if let Some(previous) = previous {
+                    let entry = self.capture_entry();
+                    if navigation::retained_bytes(self.navigation_stack.iter().chain(std::iter::once(&entry)))
+                        > navigation::MAX_NAVIGATION_BYTES
+                    {
+                        if let Some(input) = &mut self.inline_arguments {
+                            input.draft = previous;
+                            input.draft_retained = false;
+                            input.outcome =
+                                Some(crikey_core::structured_arguments::SubmissionOutcome::Failed(
+                                    crikey_core::structured_arguments::SubmissionFailureCode::ResourceLimit,
+                                ));
+                        }
+                        self.set_navigation_notice("Draft exceeds the 8 MiB navigation limit. Go Back or shorten the input before submitting.".into());
+                    }
+                }
+                None
+            }
             UiCommand::UserActivity => None,
             UiCommand::BeginShortcutCapture(key) => {
                 self.settings_focus = Some(format!("record:{key}"));
@@ -1569,9 +1919,9 @@ impl LauncherViewModel {
             }
             UiCommand::OpenPreviewLink { target, url } => {
                 if self.preview_selection().as_ref() == Some(&target.selection)
-                    && self.preview.link_target.as_ref() == Some(&target)
+                    && self.preview.link_target.as_ref() == Some(target.as_ref())
                 {
-                    Some(UiEffect::OpenPreviewLink { target, url })
+                    Some(UiEffect::OpenPreviewLink { target: *target, url })
                 } else {
                     None
                 }
@@ -1737,6 +2087,13 @@ impl LauncherViewModel {
                     registry_revision,
                 })
             }
+            UiCommand::ActivateActionless { target } => {
+                if self.current_action_row().is_some_and(|row| target.matches(row)) {
+                    self.apply(UiCommand::ExecuteDefault)
+                } else {
+                    None
+                }
+            }
             UiCommand::ActivateAction { target, identity } => self.dispatch_action(&target, &identity),
             UiCommand::ActivateSelectedAction => self.activate_panel(),
             UiCommand::ActionBack => {
@@ -1749,6 +2106,22 @@ impl LauncherViewModel {
                 }
                 if self.action_panel.is_some() {
                     return self.activate_panel();
+                }
+                if let Some(row) = self.current_action_row() {
+                    if let ActionTarget::Result { owner, item } = &row.target {
+                        if self
+                            .actionless_targets
+                            .iter()
+                            .any(|target| &target.owner == owner && &target.item == item)
+                        {
+                            return Some(UiEffect::ExecuteActionless {
+                                owner: owner.clone(),
+                                item: item.clone(),
+                                view: self.view_id,
+                                generation: self.active?,
+                            });
+                        }
+                    }
                 }
                 let row = self.current_action_row()?;
                 let target = ActionTarget::of(row);
@@ -1800,6 +2173,10 @@ impl LauncherViewModel {
             // A page rung ends the plugin's session as well as the surface,
             // which is why this one carries an effect where the other UI-state
             // rungs do not.
+            UiCommand::Cancel if self.inline_arguments.is_some() => {
+                self.retire_inline_arguments();
+                None
+            }
             UiCommand::Cancel if self.preview.focused || self.preview.detail => {
                 self.preview.focused = false;
                 self.preview.detail = false;

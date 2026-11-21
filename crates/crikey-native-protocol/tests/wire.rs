@@ -200,6 +200,7 @@ fn proto3_defaults_elide_and_decode_from_empty() {
         done: false,
         sequence: 0,
         error: None,
+        presentation: None,
         unknown: unknown(),
     });
     assert_default_encoding(message::SuggestRequest {
@@ -208,6 +209,7 @@ fn proto3_defaults_elide_and_decode_from_empty() {
         selected_item_id: String::new(),
         max_items: 0,
         max_batches: 0,
+        selected_scope_id: None,
         unknown: unknown(),
     });
     assert_default_encoding(message::Action {
@@ -239,6 +241,7 @@ fn proto3_defaults_elide_and_decode_from_empty() {
         items: Vec::new(),
         sequence: 0,
         error: None,
+        presentation: None,
         unknown: unknown(),
     });
     assert_default_encoding(message::Cancel {
@@ -369,6 +372,7 @@ fn every_message_round_trips_all_non_default_fields() {
         done: true,
         sequence: 2,
         error: Some(error.clone()),
+        presentation: None,
         unknown: unknown(),
     });
     assert_round_trip(message::SuggestRequest {
@@ -377,6 +381,7 @@ fn every_message_round_trips_all_non_default_fields() {
         selected_item_id: "plugin:item:1".to_owned(),
         max_items: 100,
         max_batches: 4,
+        selected_scope_id: None,
         unknown: unknown(),
     });
     assert_round_trip(action());
@@ -386,6 +391,7 @@ fn every_message_round_trips_all_non_default_fields() {
         items: vec![nested_item],
         sequence: 3,
         error: Some(error.clone()),
+        presentation: None,
         unknown: unknown(),
     });
     assert_round_trip(message::Cancel {
@@ -540,6 +546,7 @@ fn minimal_messages_pin_frozen_field_numbers() {
             done: false,
             sequence: 0,
             error: None,
+            presentation: None,
             unknown: unknown(),
         },
         0x0a
@@ -551,6 +558,7 @@ fn minimal_messages_pin_frozen_field_numbers() {
             selected_item_id: String::new(),
             max_items: 0,
             max_batches: 0,
+            selected_scope_id: None,
             unknown: unknown(),
         },
         0x0a
@@ -591,6 +599,7 @@ fn minimal_messages_pin_frozen_field_numbers() {
             items: Vec::new(),
             sequence: 0,
             error: None,
+            presentation: None,
             unknown: unknown(),
         },
         0x08
@@ -732,6 +741,7 @@ fn envelope_oneof_tags_are_frozen() {
                 selected_item_id: String::new(),
                 max_items: 0,
                 max_batches: 0,
+                selected_scope_id: None,
                 unknown: unknown(),
             }),
             vec![0x62],
@@ -742,6 +752,7 @@ fn envelope_oneof_tags_are_frozen() {
                 items: Vec::new(),
                 sequence: 0,
                 error: None,
+                presentation: None,
                 unknown: unknown(),
             }),
             vec![0x6a],
@@ -773,6 +784,7 @@ fn envelope_oneof_tags_are_frozen() {
                 done: true,
                 sequence: 0,
                 error: None,
+                presentation: None,
                 unknown: unknown(),
             }),
             vec![0x8a, 0x01],

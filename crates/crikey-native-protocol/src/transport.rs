@@ -13,11 +13,21 @@ use std::time::Instant;
 
 use crate::frame;
 use crate::message::Envelope;
-use crate::{Endpoint, Message, ProtocolError};
+use crate::{Endpoint, ProtocolError};
 /// A framed, transport-independent native protocol connection.
 pub trait Transport: std::fmt::Debug + Send {
     fn send(&mut self, envelope: &Envelope) -> Result<(), ProtocolError>;
     fn recv(&mut self) -> Result<Envelope, ProtocolError>;
+    /// A custom transport must explicitly support diagnostic-aware decoding
+    /// before it can continue reading a sensitive physical incarnation.
+    fn recv_with_diagnostics(
+        &mut self,
+        _sensitive: &std::sync::atomic::AtomicBool,
+    ) -> Result<Envelope, ProtocolError> {
+        Err(ProtocolError::Rejected(
+            "diagnostic-aware decoding unsupported".into(),
+        ))
+    }
     /// Returns an independent handle to the same duplex connection.
     ///
     /// The clone is deliberately explicit so a blocking reader can coexist
@@ -164,16 +174,43 @@ impl Transport for IoTransport {
         if matches!(self.stream, IoStream::Closed) {
             return Err(ProtocolError::Closed);
         }
-        frame::write_frame(&mut self.stream, &envelope.encode())
+        let mut bytes = crate::message::checked_encode(envelope)?;
+        let result = frame::write_frame(&mut self.stream, &bytes);
+        if matches!(
+            envelope.payload,
+            Some(crate::message::Payload::TypedExecuteRequest(_))
+        ) {
+            bytes.fill(0);
+        }
+        result
     }
 
     fn recv(&mut self) -> Result<Envelope, ProtocolError> {
+        self.recv_with_diagnostics(&std::sync::atomic::AtomicBool::new(false))
+    }
+
+    fn recv_with_diagnostics(
+        &mut self,
+        sensitive: &std::sync::atomic::AtomicBool,
+    ) -> Result<Envelope, ProtocolError> {
         if matches!(self.stream, IoStream::Closed) {
             return Err(ProtocolError::Closed);
         }
         let mut bytes = Vec::new();
         self.reader.read_frame(&mut self.stream, &mut bytes)?;
-        Envelope::decode(&bytes)
+        let result = Envelope::decode_with_diagnostics(&bytes, sensitive);
+        if sensitive.load(std::sync::atomic::Ordering::Acquire)
+            || matches!(
+                &result,
+                Ok(Envelope {
+                    payload: Some(crate::message::Payload::TypedExecuteRequest(_)),
+                    ..
+                })
+            )
+        {
+            bytes.fill(0);
+        }
+        result
     }
 
     fn try_clone_handle(&self) -> Result<Box<dyn Transport>, ProtocolError> {
@@ -219,7 +256,7 @@ struct PairSide {
 impl Transport for PairSide {
     fn send(&mut self, envelope: &Envelope) -> Result<(), ProtocolError> {
         let sender = self.sender.as_ref().ok_or(ProtocolError::Closed)?;
-        let payload = envelope.encode();
+        let mut payload = crate::message::checked_encode(envelope)?;
         if payload.len() > crate::MAX_FRAME_BYTES {
             return Err(ProtocolError::FrameTooLarge(payload.len()));
         }
@@ -229,10 +266,23 @@ impl Transport for PairSide {
             .ok_or(ProtocolError::FrameTooLarge(payload.len()))?;
         let mut framed = Vec::with_capacity(capacity);
         frame::write_frame(&mut framed, &payload)?;
+        if matches!(
+            envelope.payload,
+            Some(crate::message::Payload::TypedExecuteRequest(_))
+        ) {
+            payload.fill(0);
+        }
         sender.send(framed).map_err(|_| ProtocolError::Closed)
     }
 
     fn recv(&mut self) -> Result<Envelope, ProtocolError> {
+        self.recv_with_diagnostics(&std::sync::atomic::AtomicBool::new(false))
+    }
+
+    fn recv_with_diagnostics(
+        &mut self,
+        sensitive: &std::sync::atomic::AtomicBool,
+    ) -> Result<Envelope, ProtocolError> {
         let framed = {
             let receiver = self
                 .receiver
@@ -246,10 +296,24 @@ impl Transport for PairSide {
                 None => receiver.recv().map_err(|_| ProtocolError::Closed)?,
             }
         };
-        let mut cursor = Cursor::new(framed);
+        let mut framed = framed;
+        let mut cursor = Cursor::new(&framed);
         let mut payload = Vec::new();
         frame::read_frame(&mut cursor, &mut payload)?;
-        Envelope::decode(&payload)
+        let result = Envelope::decode_with_diagnostics(&payload, sensitive);
+        if sensitive.load(std::sync::atomic::Ordering::Acquire)
+            || matches!(
+                &result,
+                Ok(Envelope {
+                    payload: Some(crate::message::Payload::TypedExecuteRequest(_)),
+                    ..
+                })
+            )
+        {
+            payload.fill(0);
+            framed.fill(0);
+        }
+        result
     }
 
     fn try_clone_handle(&self) -> Result<Box<dyn Transport>, ProtocolError> {

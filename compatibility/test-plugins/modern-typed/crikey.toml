@@ -1,0 +1,14 @@
+manifest-version = 1
+
+[plugin]
+id = "typed-fixture"
+name = "Modern Typed Arguments Fixture"
+version = "1.0.0"
+runtime = "python"
+entrypoint = "typed_plugin:TypedPlugin"
+
+[python]
+requires-python = ">=3.12"
+
+[performance]
+suggest-hard-timeout-ms = 10000

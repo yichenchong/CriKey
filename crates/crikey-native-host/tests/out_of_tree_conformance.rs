@@ -13,10 +13,16 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+use crikey_core::structured_arguments::{
+    ArgumentValues, FieldId, NonSecretValue, OptionId, Password, StructuredValue, SubmissionFailureCode,
+    SubmissionFieldCode, SubmissionFieldFailure, SubmissionOutcome,
+};
 use crikey_core::PluginId;
+use crikey_core::{ActionId, ItemId};
 use crikey_native_host::{
     BatchState, ExitKind, LaunchSpec, NativeSuggestRequest, NativeSupervisor, SupervisorConfig, WorkerOptions,
 };
+use crikey_native_host::{NativeWorker, TransportKind, TypedPreparation};
 use crikey_plugin_supervisor::CircuitBreakerConfig;
 
 /// Builds the out-of-tree conformance workspace once and returns both plugin
@@ -99,6 +105,7 @@ fn request(generation: u64, text: &str) -> NativeSuggestRequest {
         text: text.to_owned(),
         normalized: text.to_lowercase(),
         selected_item_id: None,
+        selected_scope_id: None,
     }
 }
 
@@ -294,4 +301,391 @@ fn raw_worker_command_declarations_cannot_bypass_host_validation() {
         );
         worker.shutdown();
     }
+}
+
+fn typed_values(password: &str) -> ArgumentValues {
+    ArgumentValues(std::collections::BTreeMap::from([
+        (
+            FieldId("username".into()),
+            StructuredValue::NonSecret(NonSecretValue::Text("alice".into())),
+        ),
+        (
+            FieldId("password".into()),
+            StructuredValue::Password(Password::new(password.into()).unwrap()),
+        ),
+        (
+            FieldId("region".into()),
+            StructuredValue::NonSecret(NonSecretValue::Dropdown(OptionId("remote".into()))),
+        ),
+    ]))
+}
+
+fn catalog_fingerprint(worker: &mut NativeWorker, item: &str, action: Option<&str>) -> [u8; 32] {
+    worker.build_catalog().unwrap();
+    worker
+        .catalog_presentation()
+        .unwrap()
+        .schemas
+        .iter()
+        .find(|binding| {
+            binding.executable.target.item.0 == item
+                && binding.executable.action.as_ref().map(|action| action.0.as_str()) == action
+        })
+        .unwrap()
+        .schema
+        .fingerprint()
+        .unwrap()
+}
+
+#[test]
+fn real_typed_worker_authenticates_actionless_and_declared_actions() {
+    let (executable, _) = conformance_binaries();
+    for transport in [TransportKind::default(), TransportKind::Stdio] {
+        let mut worker = NativeWorker::spawn(
+            launch_spec(&executable, "typed"),
+            WorkerOptions::new().with_transport(transport),
+        )
+        .unwrap();
+        assert!(worker.handshake().typed_arguments);
+        assert!(worker.handshake().result_presentation);
+        let fingerprint = catalog_fingerprint(&mut worker, "typed-login", None);
+        let presentation = worker.catalog_presentation().unwrap();
+        assert_eq!(presentation.sections[0].id.0, "accounts");
+        assert_eq!(presentation.scopes[0].id.0, "secure");
+        assert_eq!(presentation.schemas.len(), 2);
+        assert!(presentation
+            .items
+            .iter()
+            .all(|item| item.target.owner == *worker.plugin()
+                && item.section.as_ref().unwrap().0 == "accounts"
+                && item.scopes[0].0 == "secure"));
+        assert_eq!(
+            worker
+                .execute_typed(
+                    &ItemId("typed-login".into()),
+                    None,
+                    fingerprint,
+                    typed_values("conformance-secret"),
+                )
+                .unwrap(),
+            SubmissionOutcome::Completed
+        );
+        assert_eq!(
+            worker
+                .execute_typed(
+                    &ItemId("typed-action".into()),
+                    None,
+                    fingerprint,
+                    typed_values("conformance-secret"),
+                )
+                .unwrap(),
+            SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch)
+        );
+        assert_eq!(
+            worker
+                .execute_typed(
+                    &ItemId("typed-action".into()),
+                    Some(&ActionId("signin".into())),
+                    fingerprint,
+                    typed_values("conformance-secret"),
+                )
+                .unwrap(),
+            SubmissionOutcome::Completed
+        );
+        assert_eq!(
+            worker
+                .execute_typed(
+                    &ItemId("typed-login".into()),
+                    None,
+                    fingerprint,
+                    typed_values("wrong-password"),
+                )
+                .unwrap(),
+            SubmissionOutcome::InvalidFields(vec![SubmissionFieldFailure {
+                field: FieldId("password".into()),
+                code: SubmissionFieldCode::Rejected,
+            }])
+        );
+        assert!(worker.shutdown().stderr_tail.is_empty());
+    }
+}
+
+#[test]
+fn real_scoped_suggestions_retire_dynamic_schema_authority() {
+    let (executable, _) = conformance_binaries();
+    let mut worker = NativeWorker::spawn(launch_spec(&executable, "typed"), WorkerOptions::new()).unwrap();
+    let mut query = request(1, "accounts");
+    query.selected_scope_id = Some("secure".into());
+    let suggestions = worker.suggest(&query).unwrap();
+    assert_eq!(suggestions.state, BatchState::Final);
+    assert_eq!(suggestions.items.len(), 1);
+    assert_eq!(suggestions.items[0].stable_id.0, "typed-suggestion");
+    let sidecar = suggestions.presentation.unwrap();
+    assert_eq!(sidecar.sections[0].id.0, "accounts");
+    assert_eq!(sidecar.scopes[0].id.0, "secure");
+    let fingerprint = sidecar.schemas[0].schema.fingerprint().unwrap();
+    assert_eq!(
+        worker
+            .execute_typed(
+                &ItemId("typed-suggestion".into()),
+                None,
+                fingerprint,
+                typed_values("conformance-secret"),
+            )
+            .unwrap(),
+        SubmissionOutcome::Completed
+    );
+    let TypedPreparation::Ready(confirmed) = worker
+        .prepare_typed_execution(&ItemId("typed-suggestion".into()), None, fingerprint)
+        .unwrap()
+    else {
+        panic!("live dynamic schema was not confirmed");
+    };
+    query.generation = 2;
+    query.selected_scope_id = Some("not-secure".into());
+    let filtered = worker.suggest(&query).unwrap();
+    assert!(
+        filtered.items.is_empty(),
+        "selected scope must reach the actual callback"
+    );
+    assert!(filtered.presentation.unwrap().schemas.is_empty());
+    assert_eq!(
+        worker
+            .execute_typed_confirmed(confirmed, typed_values("conformance-secret"))
+            .unwrap(),
+        SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch)
+    );
+    worker.shutdown();
+
+    let mut fresh = NativeWorker::spawn(launch_spec(&executable, "typed"), WorkerOptions::new()).unwrap();
+    assert!(matches!(
+        fresh
+            .prepare_typed_execution(&ItemId("typed-suggestion".into()), None, fingerprint,)
+            .unwrap(),
+        TypedPreparation::Refused(SubmissionFailureCode::SchemaMismatch)
+    ));
+    assert!(
+        fresh.catalog_presentation().is_some(),
+        "only static discovery may bootstrap"
+    );
+    assert!(fresh
+        .catalog_presentation()
+        .unwrap()
+        .schemas
+        .iter()
+        .all(|binding| binding.executable.target.item.0 != "typed-suggestion"));
+    fresh.shutdown();
+}
+
+#[test]
+fn healthy_suggestion_first_worker_bootstraps_static_schema_without_regenerating_dynamic_authority() {
+    let (executable, _) = conformance_binaries();
+    let mut source = NativeWorker::spawn(launch_spec(&executable, "typed"), WorkerOptions::new()).unwrap();
+    let fingerprint = catalog_fingerprint(&mut source, "typed-login", None);
+    source.shutdown();
+
+    let owner = PluginId("conformance".into());
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+    supervisor
+        .register(launch_spec(&executable, "typed"), WorkerOptions::new())
+        .unwrap();
+    let mut query = request(1, "accounts");
+    query.selected_scope_id = Some("secure".into());
+    let (connection, dynamic_fingerprint, dynamic_confirmed) = {
+        let worker = supervisor.worker(&owner, 0).unwrap();
+        let suggestions = worker.suggest(&query).unwrap();
+        assert_eq!(suggestions.items[0].stable_id.0, "typed-suggestion");
+        let dynamic_fingerprint = suggestions.presentation.unwrap().schemas[0]
+            .schema
+            .fingerprint()
+            .unwrap();
+        let TypedPreparation::Ready(confirmed) = worker
+            .prepare_typed_execution(&ItemId("typed-suggestion".into()), None, dynamic_fingerprint)
+            .unwrap()
+        else {
+            panic!("live dynamic schema was not confirmed");
+        };
+        assert!(
+            worker.catalog_presentation().is_none(),
+            "an admitted dynamic binding must not trigger static discovery"
+        );
+        (worker.connection_id(), dynamic_fingerprint, confirmed)
+    };
+
+    let worker = supervisor.worker(&owner, 1).unwrap();
+    assert_eq!(
+        worker.connection_id(),
+        connection,
+        "reacquisition must stay healthy"
+    );
+    let TypedPreparation::Ready(confirmed) = worker
+        .prepare_typed_execution(&ItemId("typed-login".into()), None, fingerprint)
+        .unwrap()
+    else {
+        panic!("suggestion-first worker did not bootstrap the missing static schema");
+    };
+    assert!(worker.catalog_presentation().is_some());
+    assert_eq!(
+        worker
+            .execute_typed_confirmed(confirmed, typed_values("conformance-secret"))
+            .unwrap(),
+        SubmissionOutcome::Completed
+    );
+    assert_eq!(
+        worker
+            .execute_typed_confirmed(dynamic_confirmed, typed_values("conformance-secret"))
+            .unwrap(),
+        SubmissionOutcome::Completed,
+        "static discovery must preserve the existing dynamic binding"
+    );
+
+    query.generation = 2;
+    query.selected_scope_id = Some("not-secure".into());
+    assert!(worker.suggest(&query).unwrap().items.is_empty());
+    assert!(matches!(
+        worker
+            .prepare_typed_execution(&ItemId("typed-suggestion".into()), None, dynamic_fingerprint)
+            .unwrap(),
+        TypedPreparation::Refused(SubmissionFailureCode::SchemaMismatch)
+    ));
+    supervisor.shutdown_all();
+}
+
+#[test]
+fn released_worker_bootstraps_static_schema_but_refuses_stale_confirmation_and_fingerprint() {
+    let (executable, _) = conformance_binaries();
+    let owner = PluginId("conformance".into());
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+    supervisor
+        .register(launch_spec(&executable, "typed"), WorkerOptions::new())
+        .unwrap();
+    let (fingerprint, connection, confirmed) = {
+        let worker = supervisor.worker(&owner, 0).unwrap();
+        let fingerprint = catalog_fingerprint(worker, "typed-login", None);
+        let TypedPreparation::Ready(confirmed) = worker
+            .prepare_typed_execution(&ItemId("typed-login".into()), None, fingerprint)
+            .unwrap()
+        else {
+            panic!("static schema was not confirmed");
+        };
+        (fingerprint, worker.connection_id(), confirmed)
+    };
+    supervisor.release_worker(&owner, 1);
+    let worker = supervisor.worker(&owner, 2).unwrap();
+    assert_ne!(worker.connection_id(), connection);
+    assert!(worker.catalog_presentation().is_none());
+    assert_eq!(
+        worker
+            .execute_typed_confirmed(confirmed, typed_values("conformance-secret"))
+            .unwrap(),
+        SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch)
+    );
+    assert!(
+        worker.catalog_presentation().is_none(),
+        "confirmed execution must never discover"
+    );
+    assert_eq!(
+        worker
+            .execute_typed(
+                &ItemId("typed-login".into()),
+                None,
+                fingerprint,
+                typed_values("conformance-secret"),
+            )
+            .unwrap(),
+        SubmissionOutcome::Completed
+    );
+    assert!(
+        worker.catalog_presentation().is_some(),
+        "fresh static worker must discover its own schema"
+    );
+    supervisor.shutdown_all();
+
+    let mut changed =
+        NativeWorker::spawn(launch_spec(&executable, "typed-changed"), WorkerOptions::new()).unwrap();
+    assert_eq!(
+        changed
+            .execute_typed(
+                &ItemId("typed-login".into()),
+                None,
+                fingerprint,
+                typed_values("conformance-secret"),
+            )
+            .unwrap(),
+        SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch)
+    );
+    assert_ne!(
+        changed.catalog_presentation().unwrap().schemas[0]
+            .schema
+            .fingerprint()
+            .unwrap(),
+        fingerprint
+    );
+    changed.shutdown();
+}
+
+#[test]
+fn real_worker_privacy_survives_background_panics_and_later_callbacks() {
+    let (executable, _) = conformance_binaries();
+    for transport in [TransportKind::default(), TransportKind::Stdio] {
+        let mut worker = NativeWorker::spawn(
+            launch_spec(&executable, "typed-privacy"),
+            WorkerOptions::new().with_transport(transport),
+        )
+        .unwrap();
+        let fingerprint = catalog_fingerprint(&mut worker, "typed-login", None);
+        let connection = worker.connection_id();
+        assert_eq!(
+            worker
+                .execute_typed(
+                    &ItemId("typed-login".into()),
+                    None,
+                    fingerprint,
+                    typed_values("private-incarnation-marker"),
+                )
+                .unwrap(),
+            SubmissionOutcome::Failed(SubmissionFailureCode::Failed)
+        );
+        for generation in 1..=2 {
+            let response = worker
+                .suggest(&request(generation, "later unrelated callback"))
+                .unwrap();
+            assert_eq!(response.state, BatchState::Failed);
+            assert!(response.log.is_empty());
+            let error = response.error.unwrap();
+            assert!(error.message.is_empty());
+            assert!(error.detail.is_empty());
+            assert_eq!(worker.connection_id(), connection);
+            assert!(worker.is_alive());
+        }
+        let exit = worker.shutdown();
+        assert!(
+            exit.stderr_tail.is_empty(),
+            "incarnation stderr must remain suppressed"
+        );
+    }
+}
+
+#[test]
+fn real_worker_hostile_field_failures_become_fixed_global_refusals() {
+    let (executable, _) = conformance_binaries();
+    let mut worker = NativeWorker::spawn(
+        launch_spec(&executable, "typed-invalid-failure"),
+        WorkerOptions::new(),
+    )
+    .unwrap();
+    let fingerprint = catalog_fingerprint(&mut worker, "typed-login", None);
+    assert_eq!(
+        worker
+            .execute_typed(
+                &ItemId("typed-login".into()),
+                None,
+                fingerprint,
+                typed_values("conformance-secret"),
+            )
+            .unwrap(),
+        SubmissionOutcome::Failed(SubmissionFailureCode::Failed)
+    );
+    assert!(worker.is_alive());
+    assert!(worker.shutdown().stderr_tail.is_empty());
 }

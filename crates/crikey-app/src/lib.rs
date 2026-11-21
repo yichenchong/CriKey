@@ -67,6 +67,8 @@ pub use native_provider::{
 pub use plugin_action::{
     ActionEffect, ActionReceipt, ActionRequestId, ActionSubmission, DeclaredCommandSource, HostCapability,
     PluginActionCompletion, PluginActionExecutor, PluginActionReceipt, PluginActionRouter,
+    RootExecutableBinding, RootPresentationSnapshot, RootScope, RootSource, RootSourceLedger,
+    TypedActionReceipt,
 };
 pub use plugin_icons::{
     IconFetch, PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
@@ -74,7 +76,8 @@ pub use plugin_icons::{
 pub use plugin_page::PageUpdate;
 pub use plugin_preview::{PreviewIdentity, PreviewRequest, PreviewService, PreviewState, PreviewUpdate};
 pub use query_pipeline::{
-    OrdinarySearchProvider, OrdinarySearchSummary, PipelineConfig, PipelineError, PipelineTick, QueryPipeline,
+    OrdinarySearchProvider, OrdinarySearchSummary, PipelineConfig, PipelineError, PipelineTick,
+    ProviderQueryContext, QueryPipeline,
 };
 pub use remote_catalog::{
     fetch_source, remote_owner, CatalogFetcher, DefaultCatalogFetcher, RemoteCatalogError,
@@ -1038,6 +1041,12 @@ impl SearchService {
     pub fn record_selection_learning(&mut self, learning: SelectionLearning) {
         self.history
             .record(&learning.item, &learning.query, self.now_secs);
+        self.candidate_cache = None;
+    }
+
+    /// Credit only the frozen admitted item, without retaining any query affinity.
+    pub fn record_item_learning(&mut self, item: Item) {
+        self.history.record_item_selection(&item, self.now_secs);
         self.candidate_cache = None;
     }
 

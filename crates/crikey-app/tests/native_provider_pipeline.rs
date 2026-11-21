@@ -15,8 +15,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crikey_app::{
-    DisabledPlugins, NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, QueryPipeline,
-    PLUGIN_ICON_DEADLINE,
+    DisabledPlugins, NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, ProviderQueryContext,
+    QueryPipeline, PLUGIN_ICON_DEADLINE,
 };
 use crikey_core::{ActionId, Generation, ItemId, PluginId};
 use crikey_ui::ViewModel;
@@ -1606,4 +1606,331 @@ fn a_plugin_busy_with_an_older_call_does_not_strand_the_newest_query() {
         }
     }
     drop(driver);
+}
+
+fn typed_values(password: &str) -> crikey_core::structured_arguments::ArgumentValues {
+    use crikey_core::structured_arguments::*;
+    ArgumentValues(std::collections::BTreeMap::from([
+        (
+            FieldId("username".into()),
+            StructuredValue::NonSecret(NonSecretValue::Text("operator".into())),
+        ),
+        (
+            FieldId("password".into()),
+            StructuredValue::Password(Password::new(password.to_owned()).unwrap()),
+        ),
+        (
+            FieldId("region".into()),
+            StructuredValue::NonSecret(NonSecretValue::Dropdown(OptionId("local".into()))),
+        ),
+    ]))
+}
+
+#[test]
+fn real_native_typed_static_release_confirms_current_worker_and_excludes_history() {
+    use crikey_core::structured_arguments::{ExecutableKey, OwnedItem, SubmissionOutcome};
+    let scratch = Scratch::new("typed-static");
+    let (binary, _) = conformance_binaries();
+    write_native_plugin(&scratch.path, "typed", &binary, "typed");
+    let owner = native_plugin("typed");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load(
+        &mut pipeline,
+        &[scratch.path.clone()],
+        &DisabledPlugins::default(),
+    );
+    assert!(provider.unavailable().is_empty(), "{:?}", provider.unavailable());
+    provider
+        .request_catalog_build(&owner, 1, Generation::ZERO)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(result) = provider.take_catalog_results().into_iter().next() {
+            assert!(
+                matches!(result, crikey_app::CatalogBuildResult::Complete(_)),
+                "{result:?}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "typed catalog did not finish");
+        sleep(Duration::from_millis(2));
+    }
+    let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| {}));
+    let executor = driver.action_executor();
+    let key = ExecutableKey {
+        target: OwnedItem {
+            owner,
+            item: ItemId("typed-login".into()),
+        },
+        action: None,
+    };
+    let binding = executor
+        .root_binding(&key, None)
+        .expect("complete catalog grants typed binding");
+    let receipt = executor
+        .submit_typed(&binding, typed_values("conformance-secret"))
+        .unwrap();
+    assert!(!receipt.receipt.query_history_allowed);
+    loop {
+        if let Some(completion) = executor.poll_plugin_actions().into_iter().next() {
+            assert_eq!(completion.request_id, receipt.receipt.request_id);
+            assert!(matches!(
+                completion.outcome,
+                Ok(crikey_app::ActionEffect::Typed(SubmissionOutcome::Completed))
+            ));
+            break;
+        }
+        assert!(Instant::now() < deadline, "typed execution did not finish");
+        sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn real_native_typed_reacquisition_refuses_changed_physical_worker_schema() {
+    use crikey_core::structured_arguments::{
+        ExecutableKey, OwnedItem, SubmissionFailureCode, SubmissionOutcome,
+    };
+    let scratch = Scratch::new("typed-schema-change");
+    let (binary, _) = conformance_binaries();
+    let package = write_native_plugin(&scratch.path, "typed-change", &binary, "typed");
+    let owner = native_plugin("typed-change");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = NativeProvider::load(
+        &mut pipeline,
+        &[scratch.path.clone()],
+        &DisabledPlugins::default(),
+    );
+    provider
+        .request_catalog_build(&owner, 1, Generation::ZERO)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(result) = provider.take_catalog_results().into_iter().next() {
+            assert!(
+                matches!(result, crikey_app::CatalogBuildResult::Complete(_)),
+                "{result:?}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "typed catalog did not finish");
+        sleep(Duration::from_millis(2));
+    }
+    fs::write(package.join("conformance-mode"), "typed-changed").unwrap();
+    let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| {}));
+    let executor = driver.action_executor();
+    let key = ExecutableKey {
+        target: OwnedItem {
+            owner,
+            item: ItemId("typed-login".into()),
+        },
+        action: None,
+    };
+    let binding = executor.root_binding(&key, None).unwrap();
+    executor
+        .submit_typed(&binding, typed_values("conformance-secret"))
+        .unwrap();
+    loop {
+        if let Some(completion) = executor.poll_plugin_actions().into_iter().next() {
+            assert!(matches!(
+                completion.outcome,
+                Ok(crikey_app::ActionEffect::Typed(SubmissionOutcome::Failed(
+                    SubmissionFailureCode::SchemaMismatch
+                )))
+            ));
+            break;
+        }
+        assert!(Instant::now() < deadline, "typed schema refusal did not finish");
+        sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn real_native_typed_suggestions_retire_execution_but_retain_the_selected_scope() {
+    use crikey_core::result_presentation::ScopeId;
+    use crikey_core::structured_arguments::{ExecutableKey, OwnedItem};
+    let scratch = Scratch::new("typed-source");
+    let (binary, _) = conformance_binaries();
+    write_native_plugin(&scratch.path, "typed-source", &binary, "typed");
+    let owner = native_plugin("typed-source");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = NativeProvider::load(
+        &mut pipeline,
+        &[scratch.path.clone()],
+        &DisabledPlugins::default(),
+    );
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut held = false;
+    let publication_gate = Mutex::new(move |view: &ViewModel| {
+        if view.generation == Generation::from_raw(1) && !held {
+            held = true;
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(ROW_DELIVERY_WINDOW);
+        }
+    });
+    let driver = NativeDriver::spawn(
+        provider,
+        pipeline,
+        Box::new(move |view| publication_gate.lock().unwrap()(view)),
+    );
+    let executor = driver.action_executor();
+    let key = ExecutableKey {
+        target: OwnedItem {
+            owner: owner.clone(),
+            item: ItemId("typed-suggestion".into()),
+        },
+        action: None,
+    };
+    driver.submit(Generation::from_raw(1), "typed", 0, Vec::new(), false, 0);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let binding = loop {
+        if let Some(binding) = executor.root_binding(&key, None) {
+            break binding;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "typed suggestion publication did not arrive"
+        );
+        sleep(Duration::from_millis(2));
+    };
+    let scope = crikey_app::RootScope {
+        owner,
+        id: ScopeId("secure".into()),
+        source: binding.source.clone(),
+    };
+    assert!(executor.root_scope_current(&scope));
+    let mut missing = scope.clone();
+    missing.id = ScopeId("missing".into());
+    assert!(!executor.root_scope_current(&missing));
+    let mut replacement = scope.clone();
+    if let crikey_app::RootSource::Suggestion { producer, .. } = &mut replacement.source {
+        *producer = producer.checked_add(1).unwrap();
+    } else {
+        panic!("scope must originate only from a dynamic suggestion");
+    }
+    assert!(!executor.root_scope_current(&replacement));
+    let mut foreign = scope.clone();
+    foreign.owner = native_plugin("not-registered");
+    assert!(!executor.root_scope_current(&foreign));
+    entered_rx
+        .recv_timeout(ROW_DELIVERY_WINDOW)
+        .expect("first publication reaches the held provider thread");
+    driver
+        .submit_scoped(
+            ProviderQueryContext {
+                generation: Generation::from_raw(2),
+                text: "typed",
+                now: 1,
+                selected: 0,
+            },
+            Vec::new(),
+            false,
+            Some(scope.clone()),
+        )
+        .unwrap();
+    assert!(
+        executor.root_scope_current(&scope),
+        "selected dynamic scope survives executable-generation retirement"
+    );
+    assert!(executor
+        .submit_typed(&binding, typed_values("conformance-secret"))
+        .is_err());
+    assert!(
+        executor.root_binding(&key, None).is_none(),
+        "no executable survives while the scoped query is still pending"
+    );
+    release_tx.send(()).unwrap();
+    let current = loop {
+        if let Some(current) = executor.root_binding(&key, None) {
+            assert_ne!(current.source, binding.source);
+            break current;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scoped typed suggestion did not arrive"
+        );
+        sleep(Duration::from_millis(2));
+    };
+    assert!(executor.root_scope_current(&scope));
+    let receipt = executor
+        .submit_typed(&current, typed_values("conformance-secret"))
+        .expect("fresh scoped publication grants executable authority");
+    await_condition(ROW_DELIVERY_WINDOW, "fresh scoped typed execution", || {
+        executor.poll_plugin_actions().into_iter().any(|completion| {
+            completion.request_id == receipt.receipt.request_id
+                && matches!(
+                    completion.outcome,
+                    Ok(crikey_app::ActionEffect::Typed(
+                        crikey_core::structured_arguments::SubmissionOutcome::Completed
+                    ))
+                )
+        })
+    });
+    driver
+        .submit_scoped(
+            ProviderQueryContext {
+                generation: Generation::from_raw(3),
+                text: "typed next",
+                now: 2,
+                selected: 0,
+            },
+            Vec::new(),
+            false,
+            Some(scope.clone()),
+        )
+        .expect("the original captured token remains valid across typed queries");
+    assert!(executor.root_scope_current(&scope));
+    await_condition(ROW_DELIVERY_WINDOW, "next scoped publication", || {
+        executor
+            .root_binding(&key, None)
+            .is_some_and(|next| next.source != current.source)
+    });
+    driver.submit(Generation::from_raw(4), "typed", 3, Vec::new(), false, 0);
+    assert!(!executor.root_scope_current(&scope));
+    assert!(
+        driver
+            .submit_scoped(
+                ProviderQueryContext {
+                    generation: Generation::from_raw(5),
+                    text: "typed",
+                    now: 4,
+                    selected: 0
+                },
+                Vec::new(),
+                false,
+                Some(scope.clone())
+            )
+            .is_err(),
+        "All revokes capture; an old uncaptured declaration cannot silently become All"
+    );
+    let latest = loop {
+        if let Some(latest) = executor.root_binding(&key, None) {
+            break latest;
+        }
+        assert!(Instant::now() < deadline, "All suggestion did not arrive");
+        sleep(Duration::from_millis(2));
+    };
+    let latest_scope = crikey_app::RootScope {
+        source: latest.source,
+        ..scope
+    };
+    driver
+        .submit_scoped(
+            ProviderQueryContext {
+                generation: Generation::from_raw(5),
+                text: "typed",
+                now: 4,
+                selected: 0,
+            },
+            Vec::new(),
+            false,
+            Some(latest_scope.clone()),
+        )
+        .unwrap();
+    assert!(executor.root_scope_current(&latest_scope));
+    drop(driver);
+    assert!(
+        !executor.root_scope_current(&latest_scope),
+        "producer shutdown revokes even a captured token"
+    );
 }

@@ -56,6 +56,8 @@ message Envelope {
     PreviewResponse preview_response = 44;
     CommandsRequest commands_request = 45;
     CommandsResponse commands_response = 46;
+    TypedExecuteRequest typed_execute_request = 47;
+    TypedExecuteResponse typed_execute_response = 48;
   }
 }
 
@@ -163,6 +165,7 @@ message CatalogBatch {
   bool done = 2;
   uint64 sequence = 3;
   Error error = 4;
+  ResultPresentation presentation = 5;
 }
 
 message SuggestRequest {
@@ -173,6 +176,7 @@ message SuggestRequest {
   // Per-query quota the host will enforce; zero means host default.
   uint64 max_items = 4;
   uint64 max_batches = 5;
+  optional string selected_scope_id = 6;
 }
 
 // Category tags (spec 10.3) are encoded so that every distinct category has a
@@ -228,6 +232,7 @@ message ResultBatch {
   repeated Item items = 2;
   uint64 sequence = 3;
   Error error = 4;
+  ResultPresentation presentation = 5;
 }
 
 message Cancel {
@@ -242,6 +247,63 @@ message ExecuteRequest {
   string item_id = 1;
   string action_id = 2;
   string argument = 3;
+}
+
+// Independently negotiated typed_arguments_v1 and result_presentation_v1.
+// Owner/source authority comes exclusively from the endpoint.
+message PresentationDeclaration { string id = 1; string label = 2; }
+message ItemPresentation {
+  string item_id = 1;
+  optional string section_id = 2;
+  repeated string scope_ids = 3;
+}
+message DropdownOption { string id = 1; string label = 2; }
+message ArgumentField {
+  string id = 1;
+  string label = 2;
+  bool required = 3;
+  optional string placeholder = 4;
+  optional string validation_message = 5;
+  uint32 kind = 6; // 1 text, 2 password, 3 dropdown.
+  uint32 min_bytes = 7;
+  optional uint32 max_bytes = 8; // Omitted means 8192.
+  bool multiline = 9;
+  optional string default_value = 10; // Forbidden for passwords.
+  repeated DropdownOption options = 11;
+}
+message ArgumentSchema { repeated ArgumentField fields = 1; }
+message ExecutableSchemaBinding {
+  string item_id = 1;
+  optional string action_id = 2; // Absence is genuinely actionless.
+  ArgumentSchema schema = 3;
+}
+message ResultPresentation {
+  repeated PresentationDeclaration sections = 1;
+  repeated PresentationDeclaration scopes = 2;
+  repeated ItemPresentation items = 3;
+  repeated ExecutableSchemaBinding schemas = 4;
+}
+message TypedValue {
+  string field_id = 1;
+  uint32 kind = 2; // 1 text, 2 password, 3 dropdown option ID.
+  string value = 3;
+}
+message TypedExecuteRequest {
+  string item_id = 1;
+  optional string action_id = 2;
+  bytes expected_fingerprint = 3; // Exactly 32 bytes, canonical Core v1 SHA-256.
+  repeated TypedValue values = 4;
+}
+message TypedFieldFailure {
+  string field_id = 1;
+  uint32 code = 2; // Required1, TooShort2, TooLong3, InvalidSelection4, Rejected5.
+}
+message TypedExecuteResponse {
+  uint32 status = 1; // Completed1, InvalidFields2, Failed3.
+  repeated TypedFieldFailure failures = 2;
+  // Unavailable1, Denied2, Cancelled3, Timeout4, Unsupported5, Failed6,
+  // SchemaMismatch7, ResourceLimit8, ProtocolViolation9. No plugin text.
+  uint32 failure_code = 3;
 }
 
 message ExecuteResult {
