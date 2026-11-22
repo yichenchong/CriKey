@@ -3318,7 +3318,7 @@ fn formatted_preview_link_click_reports_host_intent_without_browser_output() {
     );
     assert!(clicked.output.platform_output.open_url.is_none());
     assert!(clicked.commands.contains(&UiCommand::OpenPreviewLink {
-        target,
+        target: Box::new(target),
         url: "https://example.org/".into()
     }));
 }

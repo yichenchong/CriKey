@@ -3,6 +3,10 @@ use super::*;
 use crate::plugin_preview::{
     PreviewDispatcher, PreviewIdentity, PreviewPublish, PreviewRequest, PreviewState, PreviewUpdate,
 };
+
+/// Cancellation controls shared by preview admission and its worker thread.
+type NativePreviewCalls = Arc<Mutex<Vec<(PreviewIdentity, Arc<CallControl>)>>>;
+
 struct Job {
     request: PreviewRequest,
     publish: PreviewPublish,
@@ -12,11 +16,11 @@ pub(super) struct NativePreviewEndpoint {
     sender: SyncSender<Job>,
     gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
     incarnations: NativeIncarnations,
-    items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
-    catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
+    items: NativeItemStore,
+    catalog_items: NativeItemStore,
     static_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     commands: Arc<Mutex<NativeCommandPublications>>,
-    pending: Arc<Mutex<Vec<(PreviewIdentity, Arc<CallControl>)>>>,
+    pending: NativePreviewCalls,
     stopped: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     wake: WakeSlot,
@@ -29,7 +33,7 @@ impl std::fmt::Debug for NativePreviewEndpoint {
 impl NativePreviewEndpoint {
     pub(super) fn spawn(provider: &NativeProvider) -> Arc<Self> {
         let (sender, receiver) = mpsc::sync_channel::<Job>(1);
-        let pending = Arc::new(Mutex::new(Vec::<(PreviewIdentity, Arc<CallControl>)>::new()));
+        let pending: NativePreviewCalls = Arc::new(Mutex::new(Vec::new()));
         let stopped = Arc::new(AtomicBool::new(false));
         let thread_supervisors = provider.page_supervisors();
         let endpoint_gates = provider.action_gates();

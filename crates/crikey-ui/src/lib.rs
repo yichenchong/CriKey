@@ -505,7 +505,8 @@ pub enum UiCommand {
     ShowPreviewDetail,
     SetPreviewRatio(f32),
     OpenPreviewLink {
-        target: PreviewLinkTarget,
+        /// Rare link activation owns its large source identity off the hot command enum.
+        target: Box<PreviewLinkTarget>,
         url: String,
     },
     SetQuery(String),
@@ -1487,6 +1488,7 @@ impl LauncherViewModel {
                 Some(UiEffect::ClearQueryHistory)
             }
             UiCommand::OpenPreviewLink { target, url } => {
+                let target = *target;
                 if self.preview_selection().as_ref() == Some(&target.selection)
                     && self.preview.link_target.as_ref() == Some(&target)
                 {

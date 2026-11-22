@@ -1029,9 +1029,11 @@ mod canonical_discovery_tests {
 
     #[test]
     fn represented_hidden_primary_does_not_consume_the_only_ordinary_result_slot() {
-        let mut limits = crate::ResultLimits::default();
-        limits.max_items_per_query = 1;
-        limits.max_items_per_plugin_per_query = 1;
+        let limits = crate::ResultLimits {
+            max_items_per_query: 1,
+            max_items_per_plugin_per_query: 1,
+            ..Default::default()
+        };
         let mut search = SearchService::new(crate::App::with_limits(limits));
         for stage in [
             crate::StartupStage::WindowAndHotkey,

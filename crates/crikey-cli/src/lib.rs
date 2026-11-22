@@ -958,13 +958,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             // change on its next event — which is before it answers the query
             // the user is about to type, because the provider drivers take a
             // configuration publication ahead of a queued query.
-            if configuration.is_none() && configuration_retry.elapsed() >= Duration::from_millis(500) {
-                if preference_worker
+            if configuration.is_none()
+                && configuration_retry.elapsed() >= Duration::from_millis(500)
+                && preference_worker
                     .submit(command_preferences::Request::Poll)
                     .is_ok()
-                {
-                    configuration_retry = Instant::now();
-                }
+            {
+                configuration_retry = Instant::now();
             }
             if let Some(configuration) = configuration.as_mut() {
                 if let Some(state) = configuration.poll(Instant::now(), &preference_worker) {
@@ -3575,6 +3575,65 @@ fn measurement_failure(config: &BenchmarkConfig, report: &BenchmarkReport) -> Op
     None
 }
 
+fn publish_learning(
+    learning: command_history::Learning,
+    search: &mut SearchService,
+    writer: &command_history::HistoryWorker,
+    reset_pending: bool,
+    deferred: &mut Vec<command_history::Learning>,
+) -> Result<(), String> {
+    if reset_pending {
+        deferred.push(learning);
+        return Ok(());
+    }
+    learning.publish(search).map_err(str::to_owned)?;
+    writer.save(search.selection_history_snapshot())
+}
+
+fn compose_fallback_search(
+    query: &str,
+    view: crikey_ui::ViewId,
+    generation: Generation,
+    catalog: crikey_app::OrdinaryProviderState,
+    summaries: &[Option<crikey_app::OrdinarySearchSummary>],
+) -> Option<crikey_app::FallbackSearch> {
+    let mut states = vec![catalog];
+    for summary in summaries {
+        match summary {
+            Some(summary) if summary.view == view.get() && summary.generation == generation => {
+                states.extend(summary.providers.iter().map(|provider| provider.state));
+            }
+            _ => states.push(crikey_app::OrdinaryProviderState::Pending),
+        }
+    }
+    let mut search = crikey_app::FallbackSearch::new(query.to_owned(), states.len()).ok()?;
+    for (index, state) in states.into_iter().enumerate() {
+        search.update(index, state).ok()?;
+    }
+    Some(search)
+}
+
+fn publish_root_rows(
+    search: &SearchService,
+    configuration: Option<&ConfigStore>,
+    retained: &mut RetainedRows,
+    model: &mut LauncherViewModel,
+    generation: Generation,
+    query: &str,
+    fallback: Option<&crikey_app::FallbackSearch>,
+) {
+    let home = configuration
+        .and_then(|store| store.get("launcher.command-home"))
+        .unwrap_or("compact");
+    let mut context = crikey_app::CommandCompositionContext::root(generation, query);
+    context.compact = home == "compact";
+    context.include_favorites = matches!(home, "favorites" | "favorites-and-recent");
+    context.include_recent = matches!(home, "recent" | "favorites-and-recent");
+    context.fallback = fallback;
+    retained.set_commands(generation, search.compose_command_rows(context));
+    model.publish(generation, retained.merged(), retained.pending());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5694,63 +5753,4 @@ mod tests {
             Some(UiEffect::InvokeCommand { reference: invoked, generation, .. })
                 if invoked == reference && generation == refreshed));
     }
-}
-
-fn publish_learning(
-    learning: command_history::Learning,
-    search: &mut SearchService,
-    writer: &command_history::HistoryWorker,
-    reset_pending: bool,
-    deferred: &mut Vec<command_history::Learning>,
-) -> Result<(), String> {
-    if reset_pending {
-        deferred.push(learning);
-        return Ok(());
-    }
-    learning.publish(search).map_err(str::to_owned)?;
-    writer.save(search.selection_history_snapshot())
-}
-
-fn compose_fallback_search(
-    query: &str,
-    view: crikey_ui::ViewId,
-    generation: Generation,
-    catalog: crikey_app::OrdinaryProviderState,
-    summaries: &[Option<crikey_app::OrdinarySearchSummary>],
-) -> Option<crikey_app::FallbackSearch> {
-    let mut states = vec![catalog];
-    for summary in summaries {
-        match summary {
-            Some(summary) if summary.view == view.get() && summary.generation == generation => {
-                states.extend(summary.providers.iter().map(|provider| provider.state));
-            }
-            _ => states.push(crikey_app::OrdinaryProviderState::Pending),
-        }
-    }
-    let mut search = crikey_app::FallbackSearch::new(query.to_owned(), states.len()).ok()?;
-    for (index, state) in states.into_iter().enumerate() {
-        search.update(index, state).ok()?;
-    }
-    Some(search)
-}
-
-fn publish_root_rows(
-    search: &SearchService,
-    configuration: Option<&ConfigStore>,
-    retained: &mut RetainedRows,
-    model: &mut LauncherViewModel,
-    generation: Generation,
-    query: &str,
-    fallback: Option<&crikey_app::FallbackSearch>,
-) {
-    let home = configuration
-        .and_then(|store| store.get("launcher.command-home"))
-        .unwrap_or("compact");
-    let mut context = crikey_app::CommandCompositionContext::root(generation, query);
-    context.compact = home == "compact";
-    context.include_favorites = matches!(home, "favorites" | "favorites-and-recent");
-    context.include_recent = matches!(home, "recent" | "favorites-and-recent");
-    context.fallback = fallback;
-    retained.set_commands(generation, search.compose_command_rows(context));
-    model.publish(generation, retained.merged(), retained.pending());
 }
