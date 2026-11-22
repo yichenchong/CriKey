@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crikey_app::{
     DisabledPlugins, NativeDriver, NativeProvider, PipelineConfig, PluginActionRouter, ProviderQueryContext,
-    QueryPipeline, PLUGIN_ICON_DEADLINE,
+    QueryPipeline,
 };
 use crikey_core::{ActionId, Generation, ItemId, PluginId};
 use crikey_ui::ViewModel;
@@ -44,10 +44,9 @@ const ROW_DELIVERY_WINDOW: Duration = Duration::from_secs(5);
 /// Windows and did not on macOS, which is the whole reason this is its own
 /// number.
 ///
-/// Its value asserts nothing. The latency contract is
-/// [`ICON_ISOLATION_WINDOW`] and [`BATCH_PUBLICATION_SLACK`], measured
-/// separately and deliberately tight; this only decides how long a genuinely
-/// stuck run takes to say so, and a passing run never waits it out.
+/// Its value asserts nothing; it only bounds how long a genuinely stuck run
+/// takes to say so. Isolation is witnessed by publication before an explicit
+/// resource release, independently of driver/OS scheduling latency.
 const RESOURCE_DELIVERY_WINDOW: Duration = Duration::from_secs(60);
 
 /// Liveness ceiling for an answer that is *deliberately* late, from a plugin
@@ -1100,23 +1099,10 @@ fn native_healthy_worker_survives_repeated_queries() {
 
 /// Collection window for the icon-isolation tests.
 ///
-/// Deliberately shorter than the fixture's 150 ms icon answer. The subject is
-/// that an outstanding icon fetch costs the NEXT query nothing, and that is
-/// only observable while the window is narrow enough that a fetch which had
-/// consumed it would show up as a query with no rows at all.
-///
-/// Both packages start eagerly, so no measured QUERY pays child startup. That
-/// says nothing about the icon: eager startup covers a package's query
-/// supervisor, while the resource child behind an icon is spawned on first
-/// use. Waits that include that spawn use [`RESOURCE_DELIVERY_WINDOW`].
+/// Kept at 60 ms even when the real resource child is blocked. The isolation
+/// witness asserts publication while that child remains held, rather than
+/// conflating the collection budget with driver/OS scheduling latency.
 const ICON_ISOLATION_WINDOW: Duration = Duration::from_millis(60);
-
-/// How far past the collection window a batch may still be called on time.
-///
-/// Covers driver wake-up, one warm pipe round trip and frame assembly on a
-/// loaded machine. It stays well below the fixture's 150 ms icon answer, so a
-/// batch that waited for the icon can never pass for a batch that did not.
-const BATCH_PUBLICATION_SLACK: Duration = Duration::from_millis(60);
 
 /// Writes a native package whose worker is started at load time.
 ///
@@ -1225,19 +1211,32 @@ fn await_condition(ceiling: Duration, expectation: &str, mut ready: impl FnMut()
     }
 }
 
-/// A slow icon must not be paid for out of a query's collection window.
+/// A blocked resource worker must not prevent the next query's publication.
 ///
-/// The fetch used to run on the same supervisor lock the query dispatcher
-/// takes, so a plugin that spent its resource deadline answering an icon made
-/// the next query time out with no rows at all — the plugin vanished because
-/// one of its pictures was slow. The icon itself is decoration and is expected
-/// late: a later refresh republishes the same generation once it lands.
+/// The resource child's startup is gated while its real supervisor mutex is
+/// held. A second-generation row must reach the public sink before release;
+/// a later refresh must decorate that same generation after release.
 #[test]
 fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
+    struct ReleaseResourceOnDrop(Option<PathBuf>);
+    impl ReleaseResourceOnDrop {
+        fn release(mut self) {
+            fs::write(self.0.as_ref().unwrap(), b"continue").expect("resource release is writable");
+            self.0 = None;
+        }
+    }
+    impl Drop for ReleaseResourceOnDrop {
+        fn drop(&mut self) {
+            if let Some(path) = self.0.take() {
+                let _ = fs::write(path, b"continue");
+            }
+        }
+    }
+
     let (conformance, _) = conformance_binaries();
     let scratch = Scratch::new("icon-slow");
     let plugins_root = scratch.subdir("plugins");
-    let package = write_eager_native_plugin(&plugins_root, "slowicon", &conformance, "icon-slow");
+    let package = write_eager_native_plugin(&plugins_root, "slowicon", &conformance, "icon-gated");
     let owner = native_plugin("slowicon");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
@@ -1248,11 +1247,17 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
         &DisabledPlugins::default(),
     );
     assert!(provider.plugins().contains(&owner));
+    let gate = scratch.subdir("resource-gate");
+    // The eager query process has already started, so only the resource
+    // process launched on the first icon fetch reads this startup gate.
+    fs::write(package.join("icon-startup-gate"), gate.to_str().unwrap())
+        .expect("resource startup gate is writable");
     let (driver, published) = spawn_icon_timing_driver(provider, pipeline, owner);
+    // Declared after the driver so panic unwinding releases its child before
+    // driver teardown joins the supervised resource work.
+    let release = ReleaseResourceOnDrop(Some(gate.join("release")));
 
-    // The first query is what puts the icon reference on a row, and the row is
-    // what starts the fetch. Everything measured below happens while that
-    // fetch is still outstanding.
+    // The first row starts the lazy, separately supervised resource child.
     driver.submit(Generation::from_raw(1), "icon one", 17, Vec::new(), false, 0);
     let opening = await_publication(
         &published,
@@ -1265,7 +1270,14 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
         "the batch that first names the icon cannot already carry it"
     );
 
-    let submitted = Instant::now();
+    await_condition(
+        RESOURCE_DELIVERY_WINDOW,
+        "the resource child entering its startup gate",
+        || gate.join("entered").is_file(),
+    );
+    let resource_pid = fs::read_to_string(gate.join("entered")).expect("resource child named its PID");
+    assert!(!resource_pid.is_empty());
+    assert!(!gate.join("released").exists());
     driver.submit(Generation::from_raw(2), "icon two", 200, Vec::new(), false, 0);
     let batch = await_publication(
         &published,
@@ -1273,20 +1285,30 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
         "a second-generation row",
         |(_, generation, row, _)| *generation == Generation::from_raw(2) && *row,
     );
-    let batch_delay = batch.0.duration_since(submitted);
     assert!(
-        batch_delay <= ICON_ISOLATION_WINDOW + BATCH_PUBLICATION_SLACK,
-        "the batch waited {batch_delay:?} for a {ICON_ISOLATION_WINDOW:?} collection window"
+        !gate.join("released").exists(),
+        "the batch arrived before resource release"
     );
     assert!(
         !batch.3,
-        "the on-time batch is published without the icon that has not arrived"
+        "the batch is published without the icon while the resource child is held"
     );
+
+    // A post-publication challenge proves the same real child is still alive
+    // and blocked: a timed-out/killed child or a replacement cannot satisfy
+    // the PID-scoped witness. No wall-clock slack stands in for this ordering.
+    fs::write(gate.join("probe"), b"still held?").expect("resource probe is writable");
+    await_condition(
+        ROW_DELIVERY_WINDOW,
+        "the held resource child's reply to the probe",
+        || fs::read_to_string(gate.join("held")).is_ok_and(|pid| pid == resource_pid),
+    );
+    assert!(!gate.join("released").exists());
+    release.release();
 
     let decorated = await_publication(
         &published,
-        // The only wait here that can include the resource child's first
-        // spawn, because this is the first icon of the run.
+        // Retains the existing resource liveness bound, including startup.
         RESOURCE_DELIVERY_WINDOW,
         "a second-generation row carrying its icon",
         |(_, generation, _, icon)| *generation == Generation::from_raw(2) && *icon,
@@ -1295,10 +1317,41 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
         decorated.0 > batch.0,
         "the icon reaches the same generation by a later refresh, not by holding the batch"
     );
-    let icon_delay = decorated.0.duration_since(submitted);
-    assert!(
-        icon_delay > ICON_ISOLATION_WINDOW,
-        "the icon genuinely arrived after the collection window closed, not inside it"
+    assert_eq!(
+        fs::read_to_string(gate.join("released")).expect("resource startup was released"),
+        resource_pid,
+        "the same isolated child was released before its icon decorated generation two"
+    );
+    assert_eq!(
+        fs::read_to_string(gate.join("served")).expect("the icon server named its PID"),
+        resource_pid,
+        "the first resource owner, not a replacement, supplied the decoded icon"
+    );
+
+    let proof = driver
+        .control()
+        .request_stop(std::num::NonZeroU64::MIN)
+        .unwrap()
+        .wait()
+        .expect("both real children must be physically settled");
+    assert_eq!(
+        proof.native_exits().len(),
+        2,
+        "exactly the eager query child and first resource child ran; no retry/replacement"
+    );
+    assert!(proof
+        .native_exits()
+        .iter()
+        .all(|exit| exit.code.is_some() || exit.signal.is_some()));
+    assert_eq!(
+        proof.retirement().resource_calls,
+        1,
+        "the first fetch must succeed without a same-worker timeout/retry"
+    );
+    assert_eq!(
+        proof.retirement().resource_threads,
+        1,
+        "exactly one fetch thread must serve the single icon reference"
     );
 
     // The icon arriving proves a resource child ran; teardown owes the same
@@ -1315,17 +1368,40 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
     }
 }
 
-/// A plugin that never answers a resource request must cost queries nothing.
+/// An unanswered resource must not displace current query rows.
 ///
-/// Silence is bounded by the host's own icon deadline and by nothing the
-/// plugin does, so the queries either side of it are published on time and the
-/// abandoned request leaves nothing behind for a later query to queue behind.
+/// Wire receipt of a distinct retry proves that the serialized first host
+/// fetch has returned without an answer. The original guest callback stays
+/// unanswered until admission closes; this does not claim its original host
+/// wait is still pending. Checked stop proves final physical settlement,
+/// including any latest retry that was active when admission closed.
 #[test]
 fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
+    struct ReleaseSilentOnDrop(PathBuf);
+    impl Drop for ReleaseSilentOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, b"return through SDK shutdown");
+        }
+    }
+
+    fn request_witness(gate: &Path, attempt: usize, ceiling: Duration) -> (u32, u64) {
+        let path = gate.join(format!("request-{attempt}"));
+        await_condition(ceiling, "a real inbound resource request", || path.is_file());
+        let record = fs::read_to_string(path).expect("complete request witness was published");
+        let fields: Vec<_> = record.split_whitespace().collect();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[2], "never.svg", "every attempt serves the same icon key");
+        let pid = fields[0].parse::<u32>().expect("physical PID is numeric");
+        let request = fields[1].parse::<u64>().expect("request ID is numeric");
+        assert_ne!(pid, 0);
+        assert_ne!(request, 0);
+        (pid, request)
+    }
+
     let (conformance, _) = conformance_binaries();
     let scratch = Scratch::new("icon-silent");
     let plugins_root = scratch.subdir("plugins");
-    write_eager_native_plugin(&plugins_root, "silenticon", &conformance, "icon-silent");
+    let package = write_eager_native_plugin(&plugins_root, "silenticon", &conformance, "icon-silent");
     let owner = native_plugin("silenticon");
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
@@ -1336,8 +1412,33 @@ fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
         &DisabledPlugins::default(),
     );
     assert!(provider.plugins().contains(&owner));
-    let (driver, published) = spawn_icon_timing_driver(provider, pipeline, owner);
-
+    let gate = scratch.subdir("silent-resource");
+    fs::write(package.join("icon-silent-gate"), gate.to_str().unwrap())
+        .expect("silent resource witness is configured after eager query startup");
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&published);
+    let driver = NativeDriver::spawn(
+        provider,
+        pipeline,
+        Box::new(move |frame| {
+            let row = frame.rows.iter().find(|row| row.plugin_name == owner.0);
+            if let Some(row) = row {
+                assert_eq!(
+                    row.label,
+                    format!("icon-never-{}", frame.generation.get()),
+                    "a current generation must never publish an earlier query's item"
+                );
+            }
+            sink.lock().unwrap().push((
+                Instant::now(),
+                frame.generation,
+                row.is_some(),
+                row.is_some_and(|row| row.icon.is_some()),
+            ));
+        }),
+    );
+    // Release the callback before driver teardown even when an assertion panics.
+    let release = ReleaseSilentOnDrop(gate.join("release"));
     driver.submit(Generation::from_raw(1), "icon one", 17, Vec::new(), false, 0);
     await_publication(
         &published,
@@ -1345,47 +1446,101 @@ fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
         "a first-generation row",
         |(_, generation, row, _)| *generation == Generation::from_raw(1) && *row,
     );
-
-    let submitted = Instant::now();
+    let first = request_witness(&gate, 1, RESOURCE_DELIVERY_WINDOW);
+    let resource_pid = first.0.to_string();
+    let held = gate.join("held");
     driver.submit(Generation::from_raw(2), "icon two", 200, Vec::new(), false, 0);
     let during = await_publication(
         &published,
         ROW_DELIVERY_WINDOW,
-        "a second-generation row",
+        "a current second-generation row while the resource is unanswered",
         |(_, generation, row, _)| *generation == Generation::from_raw(2) && *row,
     );
-    let during_delay = during.0.duration_since(submitted);
-    assert!(
-        during_delay <= ICON_ISOLATION_WINDOW + BATCH_PUBLICATION_SLACK,
-        "a query issued while the request is unanswered waited {during_delay:?}"
+    assert!(!during.3);
+    fs::write(gate.join("probe"), b"still unanswered?").expect("silent callback probe is writable");
+    await_condition(
+        ROW_DELIVERY_WINDOW,
+        "the original unanswered callback's probe",
+        || fs::read_to_string(&held).is_ok_and(|pid| pid == resource_pid),
     );
+    assert!(!gate.join("answered").exists());
 
-    // Past the host's own deadline the request is abandoned. Nothing may
-    // remain of it that a later query could be made to queue behind.
-    sleep(PLUGIN_ICON_DEADLINE + BATCH_PUBLICATION_SLACK);
-    let resubmitted = Instant::now();
+    // The resource supervisor serializes requests: receipt of request two
+    // proves fetch one abandoned its unanswered wait, without a test sleep.
+    let second = request_witness(&gate, 2, ROW_DELIVERY_WINDOW);
+    let third = request_witness(&gate, 3, ROW_DELIVERY_WINDOW);
+    assert_eq!(first.0, second.0, "silence must not respawn the resource child");
+    assert_eq!(first.0, third.0, "all bounded attempts use the original child");
+    assert_ne!(first.1, second.1);
+    assert_ne!(first.1, third.1);
+    assert_ne!(second.1, third.1);
     driver.submit(Generation::from_raw(3), "icon three", 900, Vec::new(), false, 0);
     let after = await_publication(
         &published,
         ROW_DELIVERY_WINDOW,
-        "a third-generation row",
+        "a current third-generation row after the first fetch was abandoned",
         |(_, generation, row, _)| *generation == Generation::from_raw(3) && *row,
     );
-    let after_delay = after.0.duration_since(resubmitted);
+    assert!(!after.3);
+    assert!(!gate.join("request-4").exists());
+    assert!(!gate.join("answered").exists());
     assert!(
-        after_delay <= ICON_ISOLATION_WINDOW + BATCH_PUBLICATION_SLACK,
-        "a query issued after the abandoned request waited {after_delay:?}"
+        published.lock().unwrap().iter().all(|(_, _, _, icon)| !*icon),
+        "an icon the guest never answers must never decorate any generation"
     );
 
-    assert!(
-        published
-            .lock()
-            .expect("the publish sink is not poisoned")
-            .iter()
-            .all(|(_, _, _, icon)| !*icon),
-        "a reference the plugin never answers stays undecorated"
+    // Close admission before releasing the callback into the real SDK. Only
+    // then may missing-resource replies drain before its normal Shutdown.
+    let ticket = driver.control().request_stop(std::num::NonZeroU64::MIN).unwrap();
+    drop(release);
+    assert!(gate.join("release").is_file());
+    let proof = ticket
+        .wait()
+        .expect("silent resources and both children must settle");
+    assert_eq!(
+        proof.retirement().resource_calls,
+        3,
+        "exactly the bounded three attempts ran"
     );
+    assert_eq!(
+        proof.retirement().resource_threads,
+        3,
+        "every admitted fetch thread was joined"
+    );
+    assert_eq!(
+        proof.native_exits().len(),
+        2,
+        "only the query child and original resource child ran"
+    );
+    assert!(proof
+        .native_exits()
+        .iter()
+        .all(|exit| exit.code.is_some() || exit.signal.is_some()));
+    assert!(!gate.join("request-4").exists());
+    assert!(
+        gate.join("answered").is_file(),
+        "release must return through the SDK's real missing-resource response"
+    );
+    assert_eq!(
+        fs::read_to_string(gate.join("shutdown")).expect("resource child received real Shutdown"),
+        resource_pid
+    );
+    assert_eq!(
+        fs::read_to_string(gate.join("stopped")).expect("resource child ran the SDK stop callback"),
+        resource_pid
+    );
+    assert!(
+        published.lock().unwrap().iter().all(|(_, _, _, icon)| !*icon),
+        "responses after admission closes cannot decorate a retired generation"
+    );
+    let observable = process_table_contains_working_dir(&package).is_some();
     drop(driver);
+    if observable {
+        assert!(
+            wait_for_process_table_absence(&package),
+            "both real children must be reaped"
+        );
+    }
 }
 
 /// A plugin that answers after the collection window still gets its rows shown.
