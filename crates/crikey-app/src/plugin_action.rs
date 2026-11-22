@@ -14,11 +14,13 @@ use crikey_plugin_model::{permissions::admit_web_surface, FilesystemScope, Permi
 
 use crate::plugin_page::PageUpdate;
 
+type CompletionCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// Process-scoped terminal notification, independent of result/session wakes.
 /// Ring only after releasing the completion mailbox lock, so the receiver may
 /// drain immediately without blocking the producer.
 #[derive(Clone, Default)]
-pub(crate) struct CompletionWake(Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>);
+pub(crate) struct CompletionWake(Arc<Mutex<Option<CompletionCallback>>>);
 
 impl CompletionWake {
     pub(crate) fn install(&self, wake: Arc<dyn Fn() + Send + Sync>) {

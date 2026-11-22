@@ -425,6 +425,13 @@ impl FileOpener for OpenLauncher {
         self.spawn(&mut command, &path.display().to_string())
     }
 
+    fn open_url(&self, url: &str) -> Result<()> {
+        crikey_platform::validate_web_url(url)?;
+        let mut command = Command::new(OPEN);
+        command.arg(url);
+        self.spawn(&mut command, "web URL")
+    }
+
     /// Selects the item in the Finder, through `open -R`.
     ///
     /// A true reveal, unlike the other two backends: `-R` is Launch Services'
