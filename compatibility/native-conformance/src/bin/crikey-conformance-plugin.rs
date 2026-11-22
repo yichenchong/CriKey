@@ -123,6 +123,7 @@ impl Transport for ObservedSilentTransport {
         self.inner.close();
     }
 }
+
 #[derive(Debug, Clone)]
 enum Mode {
     Echo,
@@ -1155,8 +1156,8 @@ impl Plugin for ConformancePlugin {
             Mode::FailSuggest => Err(invalid("conformance fail-suggest requested")),
             Mode::Sequence => Err(invalid("sequence mode must be resolved before serving")),
             Mode::Icon => emit_final(sink, icon_items()),
-            Mode::IconSlow => emit_final(sink, vec![icon_item("icon-after-window", ICON_AFTER_WINDOW)]),
             Mode::IconGated => emit_final(sink, vec![icon_item("icon-gated", ICON_SERVED)]),
+            Mode::IconSlow => emit_final(sink, vec![icon_item("icon-after-window", ICON_AFTER_WINDOW)]),
             Mode::IconSilent => emit_final(
                 sink,
                 vec![icon_item(&format!("icon-never-{}", query.generation), ICON_NEVER)],
@@ -1368,8 +1369,13 @@ fn run() -> Result<(), SdkError> {
     config.capabilities.streaming_suggestions = true;
     config.capabilities.cancellation = true;
     let mut plugin = ConformancePlugin::new(mode);
-    if matches!(plugin.mode, Mode::IconSilent) {
-        if let Ok(path) = fs::read_to_string("icon-silent-gate") {
+    if matches!(plugin.mode, Mode::IconSilent | Mode::IconGated) {
+        let gate_file = if matches!(plugin.mode, Mode::IconGated) {
+            "icon-startup-gate"
+        } else {
+            "icon-silent-gate"
+        };
+        if let Ok(path) = fs::read_to_string(gate_file) {
             let endpoint = config
                 .endpoint
                 .as_ref()
@@ -1403,6 +1409,13 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("crikey-conformance-plugin: {error:?}");
         std::process::exit(1);
+    }
+    if matches!(parse_mode(&selected_mode()), Mode::IconGated | Mode::IconSilent) {
+        fs::write(
+            format!("icon-exit-{}", std::process::id()),
+            b"SDK returned successfully",
+        )
+        .expect("successful SDK return receipt is writable");
     }
 }
 
