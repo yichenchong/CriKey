@@ -1359,6 +1359,46 @@ fn a_slow_icon_fetch_neither_delays_nor_displaces_the_next_result_batch() {
     // directory, so its absence covers the pair.
     let observable = process_table_contains_working_dir(&package).is_some();
     drop(driver);
+    let children =
+        fs::read_to_string(package.join("icon-child-pids")).expect("physical child receipts are readable");
+    let children: Vec<u32> = children
+        .lines()
+        .map(|pid| pid.parse().expect("physical PID is numeric"))
+        .collect();
+    assert_eq!(
+        children.len(),
+        2,
+        "only the eager query and first resource child ran"
+    );
+    assert_ne!(
+        children[0], children[1],
+        "query and resource must be physically isolated"
+    );
+    assert_eq!(
+        children[1].to_string(),
+        resource_pid,
+        "the first resource owner was not replaced"
+    );
+    await_condition(
+        ROW_DELIVERY_WINDOW,
+        "both SDK servers returning successfully",
+        || {
+            children
+                .iter()
+                .all(|pid| package.join(format!("icon-exit-{pid}")).is_file())
+        },
+    );
+    let request = fs::read_to_string(gate.join("request-1"))
+        .expect("the successful first icon request crossed the real transport");
+    let fields: Vec<_> = request.split_whitespace().collect();
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0], resource_pid);
+    assert_ne!(fields[1].parse::<u64>().expect("request ID is numeric"), 0);
+    assert_eq!(fields[2], "served.svg");
+    assert!(
+        !gate.join("request-2").exists(),
+        "the first fetch succeeded without a retry"
+    );
     if observable {
         assert!(
             wait_for_process_table_absence(&package),
@@ -1535,6 +1575,35 @@ fn an_unanswered_icon_request_delays_no_query_and_leaves_nothing_outstanding() {
     );
     let observable = process_table_contains_working_dir(&package).is_some();
     drop(driver);
+    let children =
+        fs::read_to_string(package.join("icon-child-pids")).expect("physical child receipts are readable");
+    let children: Vec<u32> = children
+        .lines()
+        .map(|pid| pid.parse().expect("physical PID is numeric"))
+        .collect();
+    assert_eq!(
+        children.len(),
+        2,
+        "only the eager query and first resource child ran"
+    );
+    assert_ne!(
+        children[0], children[1],
+        "query and resource must be physically isolated"
+    );
+    assert_eq!(
+        children[1].to_string(),
+        resource_pid,
+        "the first resource owner was not replaced"
+    );
+    await_condition(
+        ROW_DELIVERY_WINDOW,
+        "both SDK servers returning successfully",
+        || {
+            children
+                .iter()
+                .all(|pid| package.join(format!("icon-exit-{pid}")).is_file())
+        },
+    );
     if observable {
         assert!(
             wait_for_process_table_absence(&package),

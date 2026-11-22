@@ -12,10 +12,6 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crikey_native_protocol::message::{Envelope, Payload};
-use crikey_native_protocol::transport::{self, Transport};
-use crikey_native_protocol::{Endpoint, ProtocolError};
-
 use crikey_core::result_presentation::{
     ExecutableSchemaBinding, ItemPresentation, ResultPresentation, Scope, ScopeId, Section, SectionId,
 };
@@ -25,6 +21,9 @@ use crikey_core::structured_arguments::{
 };
 use crikey_core::structured_view::TypedExecutionOutcome;
 use crikey_core::{CoreError, PageColor, PageFrame, PageInput, PageInputKind, Result};
+use crikey_native_protocol::message::{Envelope, Payload};
+use crikey_native_protocol::transport::{self, Transport};
+use crikey_native_protocol::{Endpoint, ProtocolError};
 use crikey_plugin_sdk::{
     serve, ActionBuilder, CatalogSink, ExecuteOutcome, ExecuteRequest, ItemBuilder, PageBuilder, PageCanvas,
     PagePalette, PageRect, PageRequest, Plugin, PluginContext, PluginResource, Query, ResourceKind, SdkError,
@@ -1157,8 +1156,8 @@ impl Plugin for ConformancePlugin {
             Mode::FailSuggest => Err(invalid("conformance fail-suggest requested")),
             Mode::Sequence => Err(invalid("sequence mode must be resolved before serving")),
             Mode::Icon => emit_final(sink, icon_items()),
-            Mode::IconSlow => emit_final(sink, vec![icon_item("icon-after-window", ICON_AFTER_WINDOW)]),
             Mode::IconGated => emit_final(sink, vec![icon_item("icon-gated", ICON_SERVED)]),
+            Mode::IconSlow => emit_final(sink, vec![icon_item("icon-after-window", ICON_AFTER_WINDOW)]),
             Mode::IconSilent => emit_final(
                 sink,
                 vec![icon_item(&format!("icon-never-{}", query.generation), ICON_NEVER)],
@@ -1323,6 +1322,14 @@ fn run() -> Result<(), SdkError> {
         Mode::Sequence => sequence_stage(),
         mode => mode,
     };
+    if matches!(mode, Mode::IconGated | Mode::IconSilent) {
+        let mut children = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("icon-child-pids")
+            .expect("per-package child receipt is writable");
+        writeln!(children, "{}", std::process::id()).expect("child PID receipt is writable");
+    }
     if matches!(mode, Mode::IconGated) {
         // Installed only after the eager query child is running. Thus the
         // resource child's cold startup holds its real supervisor mutex,
@@ -1362,8 +1369,13 @@ fn run() -> Result<(), SdkError> {
     config.capabilities.streaming_suggestions = true;
     config.capabilities.cancellation = true;
     let mut plugin = ConformancePlugin::new(mode);
-    if matches!(plugin.mode, Mode::IconSilent) {
-        if let Ok(path) = fs::read_to_string("icon-silent-gate") {
+    if matches!(plugin.mode, Mode::IconSilent | Mode::IconGated) {
+        let gate_file = if matches!(plugin.mode, Mode::IconGated) {
+            "icon-startup-gate"
+        } else {
+            "icon-silent-gate"
+        };
+        if let Ok(path) = fs::read_to_string(gate_file) {
             let endpoint = config
                 .endpoint
                 .as_ref()
@@ -1397,6 +1409,13 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("crikey-conformance-plugin: {error:?}");
         std::process::exit(1);
+    }
+    if matches!(parse_mode(&selected_mode()), Mode::IconGated | Mode::IconSilent) {
+        fs::write(
+            format!("icon-exit-{}", std::process::id()),
+            b"SDK returned successfully",
+        )
+        .expect("successful SDK return receipt is writable");
     }
 }
 
