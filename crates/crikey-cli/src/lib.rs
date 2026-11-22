@@ -943,13 +943,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             // change on its next event — which is before it answers the query
             // the user is about to type, because the provider drivers take a
             // configuration publication ahead of a queued query.
-            if configuration.is_none() && configuration_retry.elapsed() >= Duration::from_millis(500) {
-                if preference_worker
+            if configuration.is_none()
+                && configuration_retry.elapsed() >= Duration::from_millis(500)
+                && preference_worker
                     .submit(command_preferences::Request::Poll)
                     .is_ok()
-                {
-                    configuration_retry = Instant::now();
-                }
+            {
+                configuration_retry = Instant::now();
             }
             if let Some(configuration) = configuration.as_mut() {
                 if let Some(state) = configuration.poll(Instant::now(), &preference_worker) {
@@ -1719,10 +1719,15 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                         .to_owned()
                                 })
                                 .and_then(|configuration| {
-                                    preference_worker.submit_mutation(
-                                        request_id, configuration.store.clone(), search.command_snapshot(),
-                                        expected_revision, reference, edit, false,
-                                    ).map_err(|(_, message)| message)
+                                    preference_worker.submit_mutation(command_preferences::MutationRequest {
+                                        request_id,
+                                        config: configuration.store.clone(),
+                                        registry: search.command_snapshot(),
+                                        expected_revision,
+                                        reference,
+                                        edit,
+                                        session: false,
+                                    }).map_err(|(_, message)| message)
                                 })
                             };
                         if let Err(message) = result {
@@ -3802,6 +3807,97 @@ fn measurement_failure(config: &BenchmarkConfig, report: &BenchmarkReport) -> Op
     None
 }
 
+fn publish_learning(
+    learning: command_history::Learning,
+    search: &mut SearchService,
+    writer: &command_history::HistoryWorker,
+    reset_pending: bool,
+    deferred: &mut Vec<command_history::Learning>,
+) -> Result<(), String> {
+    if reset_pending {
+        deferred.push(learning);
+        return Ok(());
+    }
+    learning.publish(search).map_err(str::to_owned)?;
+    writer.save(search.selection_history_snapshot())
+}
+
+fn compose_fallback_search(
+    query: &str,
+    view: crikey_ui::ViewId,
+    generation: Generation,
+    catalog: crikey_app::OrdinaryProviderState,
+    summaries: &[Option<crikey_app::OrdinarySearchSummary>],
+) -> Option<crikey_app::FallbackSearch> {
+    let mut states = vec![catalog];
+    for summary in summaries {
+        match summary {
+            Some(summary) if summary.view == view.get() && summary.generation == generation => {
+                states.extend(summary.providers.iter().map(|provider| provider.state));
+            }
+            _ => states.push(crikey_app::OrdinaryProviderState::Pending),
+        }
+    }
+    let mut search = crikey_app::FallbackSearch::new(query.to_owned(), states.len()).ok()?;
+    for (index, state) in states.into_iter().enumerate() {
+        search.update(index, state).ok()?;
+    }
+    Some(search)
+}
+
+fn publish_root_rows(
+    search: &SearchService,
+    configuration: Option<&ConfigStore>,
+    retained: &mut RetainedRows,
+    model: &mut LauncherViewModel,
+    generation: Generation,
+    query: &str,
+    fallback: Option<&crikey_app::FallbackSearch>,
+) {
+    if let Some(target) = retained.explicit_input.as_ref().map(|row| row.target.clone()) {
+        // Refresh presentation from the registry, but never run discovery or cap
+        // an explicitly requested input target (including hidden declarations).
+        retained.explicit_input = search
+            .command_management_rows()
+            .into_iter()
+            .find(|row| row.target == target);
+    }
+    let home = configuration
+        .and_then(|store| store.get("launcher.command-home"))
+        .unwrap_or("compact");
+    let mut context = crikey_app::CommandCompositionContext::root(generation, query);
+    context.compact = home == "compact";
+    context.include_favorites = matches!(home, "favorites" | "favorites-and-recent");
+    context.include_recent = matches!(home, "recent" | "favorites-and-recent");
+    context.fallback = fallback;
+    retained.set_commands(generation, search.compose_command_rows(context));
+    retained.alias_query = query.trim().to_lowercase();
+    model.publish(generation, retained.merged(), retained.pending());
+}
+
+/// Apply the current native intent after draining queued shortcuts. A newly
+/// admitted shortcut cannot borrow authority from before this command executes.
+fn apply_native_command(
+    model: &mut LauncherViewModel,
+    retained: &mut RetainedRows,
+    hotkey_intent: &mut u64,
+    command: crikey_ui::UiCommand,
+) -> Option<UiEffect> {
+    *hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
+    if matches!(
+        &command,
+        crikey_ui::UiCommand::SetQuery(_)
+            | crikey_ui::UiCommand::Cancel
+            | crikey_ui::UiCommand::Back
+            | crikey_ui::UiCommand::Dismiss
+            | crikey_ui::UiCommand::OpenSettings
+            | crikey_ui::UiCommand::CloseSettings
+    ) {
+        retained.explicit_input = None;
+    }
+    model.apply(command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5334,8 +5430,10 @@ mod tests {
         pipeline
             .register_plugin(owner.clone(), application_provider_policy())
             .unwrap();
-        let mut retained = RetainedRows::default();
-        retained.max_results = Some(1);
+        let mut retained = RetainedRows {
+            max_results: Some(1),
+            ..Default::default()
+        };
         let mut model = LauncherViewModel::new();
         model.activate();
         for (index, query) in ["a", "am", "amb", "a", "", "am", "no-match-at-all", "a"]
@@ -6219,8 +6317,10 @@ mod tests {
             .unwrap();
         let mut model = LauncherViewModel::new();
         model.activate();
-        let mut retained = RetainedRows::default();
-        retained.max_results = Some(0);
+        let mut retained = RetainedRows {
+            max_results: Some(0),
+            ..Default::default()
+        };
         let application_owner = PluginId(APPLICATION_CATALOG_PLUGIN.into());
         let mut catalog_pipeline = QueryPipeline::new(PipelineConfig::default());
         catalog_pipeline
@@ -6335,95 +6435,4 @@ mod tests {
         catalog.expect("next ordinary query still shares the catalog pipeline generation");
         assert!(next > refreshed);
     }
-}
-
-fn publish_learning(
-    learning: command_history::Learning,
-    search: &mut SearchService,
-    writer: &command_history::HistoryWorker,
-    reset_pending: bool,
-    deferred: &mut Vec<command_history::Learning>,
-) -> Result<(), String> {
-    if reset_pending {
-        deferred.push(learning);
-        return Ok(());
-    }
-    learning.publish(search).map_err(str::to_owned)?;
-    writer.save(search.selection_history_snapshot())
-}
-
-fn compose_fallback_search(
-    query: &str,
-    view: crikey_ui::ViewId,
-    generation: Generation,
-    catalog: crikey_app::OrdinaryProviderState,
-    summaries: &[Option<crikey_app::OrdinarySearchSummary>],
-) -> Option<crikey_app::FallbackSearch> {
-    let mut states = vec![catalog];
-    for summary in summaries {
-        match summary {
-            Some(summary) if summary.view == view.get() && summary.generation == generation => {
-                states.extend(summary.providers.iter().map(|provider| provider.state));
-            }
-            _ => states.push(crikey_app::OrdinaryProviderState::Pending),
-        }
-    }
-    let mut search = crikey_app::FallbackSearch::new(query.to_owned(), states.len()).ok()?;
-    for (index, state) in states.into_iter().enumerate() {
-        search.update(index, state).ok()?;
-    }
-    Some(search)
-}
-
-fn publish_root_rows(
-    search: &SearchService,
-    configuration: Option<&ConfigStore>,
-    retained: &mut RetainedRows,
-    model: &mut LauncherViewModel,
-    generation: Generation,
-    query: &str,
-    fallback: Option<&crikey_app::FallbackSearch>,
-) {
-    if let Some(target) = retained.explicit_input.as_ref().map(|row| row.target.clone()) {
-        // Refresh presentation from the registry, but never run discovery or cap
-        // an explicitly requested input target (including hidden declarations).
-        retained.explicit_input = search
-            .command_management_rows()
-            .into_iter()
-            .find(|row| row.target == target);
-    }
-    let home = configuration
-        .and_then(|store| store.get("launcher.command-home"))
-        .unwrap_or("compact");
-    let mut context = crikey_app::CommandCompositionContext::root(generation, query);
-    context.compact = home == "compact";
-    context.include_favorites = matches!(home, "favorites" | "favorites-and-recent");
-    context.include_recent = matches!(home, "recent" | "favorites-and-recent");
-    context.fallback = fallback;
-    retained.set_commands(generation, search.compose_command_rows(context));
-    retained.alias_query = query.trim().to_lowercase();
-    model.publish(generation, retained.merged(), retained.pending());
-}
-
-/// Apply the current native intent after draining queued shortcuts. A newly
-/// admitted shortcut cannot borrow authority from before this command executes.
-fn apply_native_command(
-    model: &mut LauncherViewModel,
-    retained: &mut RetainedRows,
-    hotkey_intent: &mut u64,
-    command: crikey_ui::UiCommand,
-) -> Option<UiEffect> {
-    *hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
-    if matches!(
-        &command,
-        crikey_ui::UiCommand::SetQuery(_)
-            | crikey_ui::UiCommand::Cancel
-            | crikey_ui::UiCommand::Back
-            | crikey_ui::UiCommand::Dismiss
-            | crikey_ui::UiCommand::OpenSettings
-            | crikey_ui::UiCommand::CloseSettings
-    ) {
-        retained.explicit_input = None;
-    }
-    model.apply(command)
 }

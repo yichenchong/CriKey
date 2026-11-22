@@ -13,6 +13,9 @@ use crate::plugin_page::PageUpdate;
 use crikey_core::{ActionId, CoreError, Item, ItemId, PageInput, PluginId, Result as CoreResult};
 use crikey_plugin_model::{permissions::admit_web_surface, FilesystemScope, Permissions};
 
+type CompletionCallback = Arc<dyn Fn() + Send + Sync>;
+type ActionItems = Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>;
+
 /// Exact provider publication backing an accepted canonical catalog.
 /// This is not a UI epoch or a live-worker requirement for command execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,7 +141,7 @@ pub(crate) fn validate_declared_command_item(
 /// Ring only after releasing the completion mailbox lock, so the receiver may
 /// drain immediately without blocking the producer.
 #[derive(Clone, Default)]
-pub(crate) struct CompletionWake(Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>);
+pub(crate) struct CompletionWake(Arc<Mutex<Option<CompletionCallback>>>);
 
 impl CompletionWake {
     pub(crate) fn install(&self, wake: Arc<dyn Fn() + Send + Sync>) {
@@ -265,8 +268,8 @@ pub(crate) fn resolve_action_item(
     plugin: &PluginId,
     item_id: &ItemId,
     live_origin: Option<u64>,
-    suggestions: &Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>,
-    catalog: &Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>,
+    suggestions: &ActionItems,
+    catalog: &ActionItems,
     static_catalog: &Mutex<BTreeMap<(PluginId, ItemId), Item>>,
 ) -> Option<(Item, Option<u64>)> {
     let key = (plugin.clone(), item_id.clone());

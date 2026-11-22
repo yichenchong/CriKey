@@ -874,7 +874,7 @@ mod tests {
             );
             assert!(model
                 .apply(UiCommand::OpenPreviewLink {
-                    target,
+                    target: Box::new(target),
                     url: "https://example.com/preview".into(),
                 })
                 .is_none());

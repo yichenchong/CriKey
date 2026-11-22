@@ -268,7 +268,7 @@ fn open_showing_actions(generation: Generation, ids: &[&str]) -> LauncherViewMod
     view_model.begin_generation(generation);
     view_model.publish(generation, rows_with_alternates(ids), false);
     assert!(
-        !expect_frame(&mut view_model).action_panel.is_some(),
+        expect_frame(&mut view_model).action_panel.is_none(),
         "a launcher opens with no action list"
     );
 
@@ -1591,7 +1591,7 @@ fn executing_closes_the_action_list_but_a_rejected_pick_leaves_it_open() {
         })
     );
     assert!(
-        !expect_frame(&mut view_model).action_panel.is_some(),
+        expect_frame(&mut view_model).action_panel.is_none(),
         "running a pick closes the list it was picked from"
     );
     assert!(
@@ -1610,7 +1610,7 @@ fn executing_closes_the_action_list_but_a_rejected_pick_leaves_it_open() {
             action: ActionId("run".to_owned()),
         })
     );
-    assert!(!expect_frame(&mut view_model).action_panel.is_some());
+    assert!(expect_frame(&mut view_model).action_panel.is_none());
     expect_idle(&mut view_model);
 }
 
@@ -1629,12 +1629,12 @@ fn dismissal_closes_the_action_list_and_the_next_session_opens_without_it() {
     assert!(!view_model.is_visible());
 
     view_model.activate();
-    assert!(!expect_frame(&mut view_model).action_panel.is_some());
+    assert!(expect_frame(&mut view_model).action_panel.is_none());
 
     view_model.begin_generation(second);
     view_model.publish(second, rows_with_alternates(&["alpha"]), false);
     assert!(
-        !expect_frame(&mut view_model).action_panel.is_some(),
+        expect_frame(&mut view_model).action_panel.is_none(),
         "the reopened launcher must not resurrect the closed session's overlay"
     );
 }
@@ -1651,7 +1651,7 @@ fn cancel_takes_three_presses_to_close_a_launcher_with_an_open_action_list() {
         "closing the action list schedules no host work"
     );
     let model = expect_frame(&mut view_model);
-    assert!(!model.action_panel.is_some());
+    assert!(model.action_panel.is_none());
     assert_eq!(
         model.query, FIXTURE_QUERY,
         "the first Cancel must not also clear the query"
@@ -1688,7 +1688,7 @@ fn cancel_closes_an_open_action_list_before_it_clears_the_query() {
         "the first Cancel spends itself on the action list, whatever else is showing"
     );
     let model = expect_frame(&mut view_model);
-    assert!(!model.action_panel.is_some());
+    assert!(model.action_panel.is_none());
     assert_eq!(model.query, FIXTURE_QUERY);
 
     assert_eq!(
@@ -2495,7 +2495,7 @@ fn preview_link_intent_cannot_follow_a_changed_selection() {
     model.apply(UiCommand::SelectNext);
     assert_eq!(
         model.apply(UiCommand::OpenPreviewLink {
-            target,
+            target: Box::new(target),
             url: "https://example.org/".into()
         }),
         None
@@ -3027,7 +3027,7 @@ fn command_enter_invokes_exact_reference_not_the_items_first_action() {
     assert_eq!(registry_revision, 9);
     assert_eq!(generation, Generation::from_raw(1));
     assert_eq!(query, "not an implicit argument");
-    assert!(matches!(model.apply(action_intent("shared-target", "run")), None));
+    assert!(model.apply(action_intent("shared-target", "run")).is_none());
 }
 
 #[test]

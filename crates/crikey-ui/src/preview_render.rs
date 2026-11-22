@@ -331,7 +331,7 @@ fn preview_link(
     {
         if let Some(target) = target {
             commands.push(UiCommand::OpenPreviewLink {
-                target: target.clone(),
+                target: Box::new(target.clone()),
                 url: url.to_owned(),
             });
         }

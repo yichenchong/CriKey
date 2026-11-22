@@ -255,14 +255,17 @@ pub fn serve_on(
             .host_capabilities
             .iter()
             .any(|name| name == crikey_core::command::COMMANDS_CAPABILITY);
+    let mut runtime = RequestRuntime {
+        transport: &transport,
+        input: &mut input,
+        cancellation: &cancellation,
+        credits: &mut credits,
+        context: &context,
+        metrics: &metrics,
+    };
     let result = serve_requests(
         plugin,
-        &transport,
-        &mut input,
-        &cancellation,
-        &mut credits,
-        &context,
-        &metrics,
+        &mut runtime,
         plugin_preview_negotiated(&ack),
         commands_negotiated,
     );
@@ -856,15 +859,16 @@ impl PluginContext for RuntimeContext {
 
 fn serve_requests(
     plugin: &mut dyn Plugin,
-    transport: &Arc<Mutex<Box<dyn Transport>>>,
-    input: &mut RuntimeInput,
-    cancellation: &Arc<CancellationState>,
-    credits: &mut CreditState,
-    context: &RuntimeContext,
-    metrics: &RuntimeMetrics,
+    runtime: &mut RequestRuntime<'_>,
     preview_negotiated: bool,
     commands_negotiated: bool,
 ) -> Result<(), SdkError> {
+    let transport = runtime.transport;
+    let input = &mut *runtime.input;
+    let cancellation = runtime.cancellation;
+    let credits = &mut *runtime.credits;
+    let context = runtime.context;
+    let metrics = runtime.metrics;
     loop {
         let envelope = match input.next() {
             Ok(envelope) => envelope,

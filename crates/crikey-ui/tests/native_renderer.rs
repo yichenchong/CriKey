@@ -3318,7 +3318,7 @@ fn formatted_preview_link_click_reports_host_intent_without_browser_output() {
     );
     assert!(clicked.output.platform_output.open_url.is_none());
     assert!(clicked.commands.contains(&UiCommand::OpenPreviewLink {
-        target,
+        target: Box::new(target),
         url: "https://example.org/".into()
     }));
 }
@@ -4202,7 +4202,7 @@ fn command_management_preserves_membership_controls_and_submits_exact_shortcut_e
                 let point = origin + egui::vec2(4.0, 4.0);
                 clipped.clip_rect.contains(point).then_some(point)
             })
-            .last()
+            .next_back()
             .expect("the editable value is visible inside the management scroll area");
         let _ = build_launcher_frame(&context, launcher_input(click_at(editor)), &view);
         let crikey_ui::ActionTarget::Command(reference) = &target else {
