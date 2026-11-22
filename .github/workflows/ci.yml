@@ -41,6 +41,7 @@ jobs:
         # tests failed with "no CPython interpreter found". `python-version`
         # matches the `python-sdk` job so both exercise the same interpreter.
         uses: actions/setup-python@v5
+        id: rust-python
         with:
           python-version: "3.12"
       - name: Install the X and GPU libraries the launcher loads at run time
@@ -92,6 +93,14 @@ jobs:
           echo "software rasterisers present: $icds and Mesa swrast"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Select the configured CPython for Windows consumer tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TEST_PYTHON: ${{ steps.rust-python.outputs.python-path }}
+        # Avoid a bounded scan of unrelated Windows Python installations.
+        # The normal override path still enforces each requires-python gate.
+        run: Add-Content -Path $env:GITHUB_ENV -Value "CRIKEY_PYTHON=$env:TEST_PYTHON" -Encoding utf8
       - run: cargo test --workspace --all-targets
       # `--all-targets` excludes doc tests, and several crates document their
       # contract with runnable examples. Without this step a doc example can
