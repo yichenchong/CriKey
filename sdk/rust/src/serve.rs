@@ -249,16 +249,15 @@ pub fn serve_on(
         remaining: ack.initial_credits,
         paused: false,
     };
-    let result = serve_requests(
-        plugin,
-        &transport,
-        &mut input,
-        &cancellation,
-        &mut credits,
-        &context,
-        &metrics,
-        plugin_preview_negotiated(&ack),
-    );
+    let mut runtime = RequestRuntime {
+        transport: &transport,
+        input: &mut input,
+        cancellation: &cancellation,
+        credits: &mut credits,
+        context: &context,
+        metrics: &metrics,
+    };
+    let result = serve_requests(plugin, &mut runtime, plugin_preview_negotiated(&ack));
     stop_reader(&reader_stop, reader);
     result
 }
@@ -845,14 +844,15 @@ impl PluginContext for RuntimeContext {
 
 fn serve_requests(
     plugin: &mut dyn Plugin,
-    transport: &Arc<Mutex<Box<dyn Transport>>>,
-    input: &mut RuntimeInput,
-    cancellation: &Arc<CancellationState>,
-    credits: &mut CreditState,
-    context: &RuntimeContext,
-    metrics: &RuntimeMetrics,
+    runtime: &mut RequestRuntime<'_>,
     preview_negotiated: bool,
 ) -> Result<(), SdkError> {
+    let transport = runtime.transport;
+    let input = &mut *runtime.input;
+    let cancellation = runtime.cancellation;
+    let credits = &mut *runtime.credits;
+    let context = runtime.context;
+    let metrics = runtime.metrics;
     loop {
         let envelope = match input.next() {
             Ok(envelope) => envelope,
