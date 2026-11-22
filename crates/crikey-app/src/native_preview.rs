@@ -4,6 +4,7 @@ use crate::plugin_preview::{
     PendingPreviews, PreviewDispatcher, PreviewIdentity, PreviewPublish, PreviewRequest, PreviewState,
     PreviewUpdate,
 };
+
 struct Job {
     request: PreviewRequest,
     publish: PreviewPublish,
@@ -30,7 +31,7 @@ impl std::fmt::Debug for NativePreviewEndpoint {
 impl NativePreviewEndpoint {
     pub(super) fn spawn(provider: &NativeProvider) -> Arc<Self> {
         let (sender, receiver) = mpsc::sync_channel::<Job>(1);
-        let pending = Arc::new(Mutex::new(Vec::<(PreviewIdentity, Arc<CallControl>)>::new()));
+        let pending: PendingPreviews<CallControl> = Arc::new(Mutex::new(Vec::new()));
         let stopped = Arc::new(AtomicBool::new(false));
         let thread_supervisors = provider.page_supervisors();
         let endpoint_gates = provider.action_gates();
