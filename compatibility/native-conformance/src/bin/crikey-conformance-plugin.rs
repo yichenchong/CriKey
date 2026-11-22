@@ -7,15 +7,22 @@
 
 use std::env;
 use std::fs;
+use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use crikey_native_protocol::message::{Envelope, Payload};
+use crikey_native_protocol::transport::{self, Transport};
+use crikey_native_protocol::{Endpoint, ProtocolError};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crikey_core::{CoreError, PageColor, PageFrame, PageInput, PageInputKind, Result};
 use crikey_plugin_sdk::{
-    serve, ActionBuilder, CatalogSink, ExecuteOutcome, ExecuteRequest, ItemBuilder, PageBuilder,
-    PageCanvas, PagePalette, PageRect, PageRequest, Plugin, PluginContext, PluginResource, Query,
-    ResourceKind, SdkError, ServeConfig, SuggestionSink,
+    serve, ActionBuilder, CatalogSink, ExecuteOutcome, ExecuteRequest, ItemBuilder, PageBuilder, PageCanvas,
+    PagePalette, PageRect, PageRequest, Plugin, PluginContext, PluginResource, Query, ResourceKind, SdkError,
+    ServeConfig, SuggestionSink,
 };
 
 const MODE_ENV: &str = "CRIKEY_CONFORMANCE_MODE";
@@ -24,6 +31,82 @@ const PLUGIN_ID: &str = "conformance";
 const PLUGIN_NAME: &str = "CriKey Native Conformance";
 const PLUGIN_VERSION: &str = "1.0.0";
 const SHARED_PLUGIN_ID: &str = "shared.identity";
+
+/// Observes real wire requests on the SDK's independent reader while its
+/// resource callback remains blocked. Every envelope is delegated unchanged.
+#[derive(Debug)]
+struct ObservedSilentTransport {
+    inner: Box<dyn Transport>,
+    gate: Arc<PathBuf>,
+    requests: Arc<AtomicUsize>,
+}
+
+impl ObservedSilentTransport {
+    fn observe(&self, envelope: &Envelope) -> std::result::Result<(), ProtocolError> {
+        if let Some(Payload::ResourceRequest(request)) = &envelope.payload {
+            let attempt = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
+            let name = format!("request-{attempt}");
+            let pending = self.gate.join(format!("{name}.pending"));
+            fs::write(
+                &pending,
+                format!(
+                    "{} {} {}",
+                    std::process::id(),
+                    envelope.request_id,
+                    request.reference
+                ),
+            )
+            .and_then(|()| fs::rename(pending, self.gate.join(name)))
+            .map_err(|error| ProtocolError::Io(error.to_string()))?;
+        }
+        if matches!(envelope.payload, Some(Payload::Shutdown(_))) {
+            fs::write(self.gate.join("shutdown"), std::process::id().to_string())
+                .and_then(|()| fs::write(self.gate.join("release"), b"real Shutdown received"))
+                .map_err(|error| ProtocolError::Io(error.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+impl Transport for ObservedSilentTransport {
+    fn send(&mut self, envelope: &Envelope) -> std::result::Result<(), ProtocolError> {
+        if matches!(envelope.payload, Some(Payload::ResourceResponse(_))) {
+            fs::write(self.gate.join("answered"), b"resource response observed")
+                .map_err(|error| ProtocolError::Io(error.to_string()))?;
+        }
+        self.inner.send(envelope)
+    }
+
+    fn recv(&mut self) -> std::result::Result<Envelope, ProtocolError> {
+        let envelope = self.inner.recv()?;
+        self.observe(&envelope)?;
+        Ok(envelope)
+    }
+
+    fn try_clone_handle(&self) -> std::result::Result<Box<dyn Transport>, ProtocolError> {
+        Ok(Box::new(Self {
+            inner: self.inner.try_clone_handle()?,
+            gate: Arc::clone(&self.gate),
+            requests: Arc::clone(&self.requests),
+        }))
+    }
+
+    fn supports_read_timeout(&self) -> bool {
+        self.inner.supports_read_timeout()
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::result::Result<(), ProtocolError> {
+        self.inner.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> std::result::Result<(), ProtocolError> {
+        self.inner.set_write_timeout(timeout)
+    }
+
+    fn close(&mut self) {
+        self.inner.close();
+    }
+}
 
 #[derive(Debug, Clone)]
 enum Mode {
@@ -41,6 +124,7 @@ enum Mode {
     Sequence,
     Icon,
     IconSlow,
+    IconGated,
     IconSilent,
     /// Publishes the interactive demo page and nothing else, so the surface a
     /// host draws is attributable to exactly one item.
@@ -76,6 +160,7 @@ fn parse_mode(spec: &str) -> Mode {
         "sequence" => Mode::Sequence,
         "icon" => Mode::Icon,
         "icon-slow" => Mode::IconSlow,
+        "icon-gated" => Mode::IconGated,
         "icon-silent" => Mode::IconSilent,
         "page" => Mode::Page,
         _ if spec.starts_with("stream:") => Mode::Stream(
@@ -292,10 +377,10 @@ const SWATCH_EDGE: u32 = 4;
 /// it into exactly this before building its frame: the host takes raw RGBA8
 /// and parses no image format.
 const SWATCH_RGBA: [u8; (SWATCH_EDGE * SWATCH_EDGE * 4) as usize] = [
-    0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF,
-    0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF,
-    0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF,
-    0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF,
+    0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0xE8,
+    0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0x30, 0x80,
+    0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0xE8, 0xAE, 0x58,
+    0xFF, 0x30, 0x80, 0xF0, 0xFF, 0xE8, 0xAE, 0x58, 0xFF, 0x30, 0x80, 0xF0, 0xFF,
 ];
 
 /// Columns the counter chart can show, and therefore the counter value at
@@ -430,13 +515,7 @@ impl PageState {
             // A placeholder is the page's own doing: the vocabulary has one
             // text colour per node, so an empty field says so in muted text
             // rather than the host inventing a hint it cannot know.
-            page = page.text(
-                36.0,
-                262.0,
-                "Type here and the page redraws",
-                0.0,
-                palette.muted,
-            );
+            page = page.text(36.0, 262.0, "Type here and the page redraws", 0.0, palette.muted);
         }
         let status = format!(
             "{} characters typed - the counter is {}",
@@ -726,8 +805,12 @@ impl Plugin for ConformancePlugin {
             Mode::FailSuggest => Err(invalid("conformance fail-suggest requested")),
             Mode::Sequence => Err(invalid("sequence mode must be resolved before serving")),
             Mode::Icon => emit_final(sink, icon_items()),
+            Mode::IconGated => emit_final(sink, vec![icon_item("icon-gated", ICON_SERVED)]),
             Mode::IconSlow => emit_final(sink, vec![icon_item("icon-after-window", ICON_AFTER_WINDOW)]),
-            Mode::IconSilent => emit_final(sink, vec![icon_item("icon-never", ICON_NEVER)]),
+            Mode::IconSilent => emit_final(
+                sink,
+                vec![icon_item(&format!("icon-never-{}", query.generation), ICON_NEVER)],
+            ),
             Mode::Page => emit_final(sink, vec![page_item()]),
         }
     }
@@ -788,8 +871,10 @@ impl Plugin for ConformancePlugin {
         reference: &str,
         _context: &dyn PluginContext,
     ) -> Result<Option<PluginResource>> {
-        if !matches!(self.mode, Mode::Icon | Mode::IconSlow | Mode::IconSilent)
-            || kind != ResourceKind::Icon
+        if !matches!(
+            self.mode,
+            Mode::Icon | Mode::IconSlow | Mode::IconGated | Mode::IconSilent
+        ) || kind != ResourceKind::Icon
         {
             return Ok(None);
         }
@@ -805,11 +890,35 @@ impl Plugin for ConformancePlugin {
                 icon_bytes(0)
             }
             ICON_NEVER => {
+                if let Ok(path) = fs::read_to_string("icon-silent-gate") {
+                    let gate = PathBuf::from(path);
+                    let pid = std::process::id().to_string();
+                    let release = gate.join("release");
+                    let probe = gate.join("probe");
+                    let mut witnessed_hold = false;
+                    fs::write(gate.join("entered"), &pid).expect("silent callback witness is writable");
+                    while !release.is_file() {
+                        if !witnessed_hold && probe.is_file() {
+                            fs::write(gate.join("held"), &pid).expect("silent callback hold is writable");
+                            witnessed_hold = true;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    // Admission has closed before release. Return through the
+                    // SDK so its missing response and queued Shutdown are
+                    // handled normally; do not exit ahead of host shutdown.
+                    return Ok(None);
+                }
                 thread::sleep(NEVER_ANSWERS);
                 icon_bytes(0)
             }
             _ => return Ok(None),
         };
+        if matches!(self.mode, Mode::IconGated) {
+            let path = fs::read_to_string("icon-startup-gate").expect("resource gate is configured");
+            fs::write(PathBuf::from(path).join("served"), std::process::id().to_string())
+                .expect("resource server witness is writable");
+        }
         Ok(Some(PluginResource {
             content,
             media_type: "image/svg+xml".to_owned(),
@@ -817,6 +926,15 @@ impl Plugin for ConformancePlugin {
     }
 
     fn stop(&mut self, _context: &dyn PluginContext) -> Result<()> {
+        if matches!(self.mode, Mode::IconSilent) {
+            if let Ok(path) = fs::read_to_string("icon-silent-gate") {
+                let gate = PathBuf::from(path);
+                let pid = std::process::id().to_string();
+                if fs::read_to_string(gate.join("shutdown")).is_ok_and(|value| value == pid) {
+                    fs::write(gate.join("stopped"), pid).expect("SDK resource stop witness is writable");
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -826,6 +944,39 @@ fn run() -> Result<(), SdkError> {
         Mode::Sequence => sequence_stage(),
         mode => mode,
     };
+    if matches!(mode, Mode::IconGated | Mode::IconSilent) {
+        let mut children = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("icon-children")
+            .expect("child startup record is writable");
+        writeln!(children, "{}", std::process::id()).expect("child PID is writable");
+    }
+    if matches!(mode, Mode::IconGated) {
+        // Installed only after the eager query child is running. Thus the
+        // resource child's cold startup holds its real supervisor mutex,
+        // without spending the subsequent resource-request deadline.
+        if let Ok(path) = fs::read_to_string("icon-startup-gate") {
+            let gate = PathBuf::from(path);
+            let pid = std::process::id().to_string();
+            let release = gate.join("release");
+            let probe = gate.join("probe");
+            let mut witnessed_hold = false;
+            fs::write(gate.join("entering"), &pid).expect("resource startup witness is writable");
+            fs::rename(gate.join("entering"), gate.join("entered"))
+                .expect("complete resource startup witness is publishable");
+            while !release.is_file() {
+                if !witnessed_hold && probe.is_file() {
+                    fs::write(gate.join("held"), &pid).expect("resource hold witness is writable");
+                    witnessed_hold = true;
+                }
+                // The existing supervisor startup deadline bounds this real
+                // child even if its test owner exits before releasing it.
+                thread::sleep(Duration::from_millis(1));
+            }
+            fs::write(gate.join("released"), &pid).expect("resource release witness is writable");
+        }
+    }
     let configured_id = if matches!(mode, Mode::SameId) {
         SHARED_PLUGIN_ID
     } else {
@@ -840,6 +991,32 @@ fn run() -> Result<(), SdkError> {
     config.capabilities.streaming_suggestions = true;
     config.capabilities.cancellation = true;
     let mut plugin = ConformancePlugin::new(mode);
+    let observer_gate = match plugin.mode {
+        Mode::IconSilent => Some("icon-silent-gate"),
+        Mode::IconGated => Some("icon-startup-gate"),
+        _ => None,
+    };
+    if let Some(gate_file) = observer_gate {
+        if let Ok(path) = fs::read_to_string(gate_file) {
+            let endpoint = config
+                .endpoint
+                .as_ref()
+                .expect("environment supplied an endpoint");
+            let inner = match endpoint {
+                Endpoint::Stdio => transport::stdio(),
+                endpoint => transport::connect(endpoint, None)?,
+            };
+            return crikey_plugin_sdk::serve_on(
+                &mut plugin,
+                Box::new(ObservedSilentTransport {
+                    inner,
+                    gate: Arc::new(PathBuf::from(path)),
+                    requests: Arc::new(AtomicUsize::new(0)),
+                }),
+                config,
+            );
+        }
+    }
     serve(&mut plugin, config)
 }
 
@@ -847,6 +1024,13 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("crikey-conformance-plugin: {error:?}");
         std::process::exit(1);
+    }
+    if matches!(parse_mode(&selected_mode()), Mode::IconGated | Mode::IconSilent) {
+        fs::write(
+            format!("icon-exit-{}", std::process::id()),
+            b"SDK returned successfully",
+        )
+        .expect("successful SDK return receipt is writable");
     }
 }
 
@@ -919,7 +1103,10 @@ mod tests {
             frame.focus_ring(),
             vec![NODE_DECREASE, NODE_INCREASE, NODE_ANNOUNCE, NODE_NOTE, NODE_CLOSE]
         );
-        assert_eq!(frame.focus_node, NODE_NOTE, "an opened page places the caret itself");
+        assert_eq!(
+            frame.focus_node, NODE_NOTE,
+            "an opened page places the caret itself"
+        );
         assert_eq!(
             frame.node(NODE_ANNOUNCE).map(|node| node.role),
             Some(NodeRole::Checkbox)
@@ -992,7 +1179,10 @@ mod tests {
         let mut state = PageState::default();
         draw(&mut state, 1, &[PageInput::new(PageInputKind::Opened)]);
         let frame = draw(&mut state, 2, &[activate(NODE_CLOSE)]);
-        assert!(frame.close, "the page must end itself rather than wait for Escape");
+        assert!(
+            frame.close,
+            "the page must end itself rather than wait for Escape"
+        );
     }
 
     #[test]
@@ -1001,11 +1191,7 @@ mod tests {
         let frame = draw(&mut state, 1, &[PageInput::new(PageInputKind::Opened)]);
         frame.validate().expect("a page carrying rasters stays drawable");
         let rasters = |frame: &PageFrame| -> Vec<crikey_core::PageImage> {
-            frame
-                .nodes
-                .iter()
-                .filter_map(|node| node.image.clone())
-                .collect()
+            frame.nodes.iter().filter_map(|node| node.image.clone()).collect()
         };
         let opening = rasters(&frame);
         assert_eq!(opening.len(), 2, "the swatch and the chart both reach the host");
