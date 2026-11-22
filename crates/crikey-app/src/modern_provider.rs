@@ -91,6 +91,8 @@ use crikey_core::result_presentation::ResultPresentation;
 use crikey_core::structured_arguments::{ArgumentValues, ExecutableKey, OwnedItem};
 use crikey_core::{PreviewContent, PreviewImage, PreviewText, PreviewValue, PreviewValueKind};
 
+type ModernStaticItemStore = Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>;
+
 struct ModernPreviewJob {
     request: PreviewRequest,
     publish: PreviewPublish,
@@ -104,7 +106,7 @@ struct ModernPreviewEndpoint {
     incarnations: Arc<Mutex<BTreeMap<PluginId, u64>>>,
     items: SharedOriginItems,
     catalog_items: SharedOriginItems,
-    static_catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    static_catalog_items: ModernStaticItemStore,
     accepted_commands: ModernAcceptedCommands,
     pending: PendingPreviews<AtomicBool>,
     stopped: AtomicBool,
@@ -896,7 +898,7 @@ struct ModernCatalogDispatcher {
     latest: BTreeMap<PluginId, u64>,
     next_id: u64,
     items: SharedOriginItems,
-    static_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    static_items: ModernStaticItemStore,
     commands: ModernCommands,
     accepted_commands: ModernAcceptedCommands,
     root: Arc<Mutex<RootSourceLedger>>,
@@ -3184,7 +3186,7 @@ struct ModernActionEndpoint {
     preview_pending: PendingPreviews<AtomicBool>,
     items: SharedOriginItems,
     catalog_items: SharedOriginItems,
-    static_catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    static_catalog_items: ModernStaticItemStore,
     accepted_commands: ModernAcceptedCommands,
     root: Arc<Mutex<RootSourceLedger>>,
     views: Arc<Mutex<crate::standard_view::ViewAuthority>>,
@@ -5726,9 +5728,11 @@ class Receipt(Plugin):
         }
         provider.execute_action_request(request).unwrap();
         let marker = package.join("executed");
-        assert_eq!(
-            fs::read_to_string(&marker).unwrap(),
-            "Receipt\n",
+        assert!(
+            matches!(
+                fs::read_to_string(&marker).unwrap().as_str(),
+                "Receipt\n" | "Receipt\r\n"
+            ),
             "the real callback received the admitted item, not replacement content"
         );
         let snapshot = provider.command_snapshot();
@@ -5746,9 +5750,11 @@ class Receipt(Plugin):
         let request = receiver.try_recv().unwrap();
         assert!(request.work.action_id().is_none());
         provider.execute_action_request(request).unwrap();
-        assert_eq!(
-            fs::read_to_string(&marker).unwrap(),
-            "Receipt\nActionless default\n",
+        assert!(
+            matches!(
+                fs::read_to_string(&marker).unwrap().as_str(),
+                "Receipt\nActionless default\n" | "Receipt\r\nActionless default\r\n"
+            ),
             "the real worker must receive an actionless callback with None"
         );
         assert!(endpoint
@@ -5773,10 +5779,10 @@ class Receipt(Plugin):
             .pool
             .fail(&key, "test retires the admitted dynamic origin".into());
         assert!(provider.execute_action_request(retired_request).is_err());
-        assert_eq!(
-            fs::read_to_string(marker).unwrap(),
-            "Receipt\nActionless default\n"
-        );
+        assert!(matches!(
+            fs::read_to_string(marker).unwrap().as_str(),
+            "Receipt\nActionless default\n" | "Receipt\r\nActionless default\r\n"
+        ));
     }
     fn password_values() -> ArgumentValues {
         use crikey_core::structured_arguments::{FieldId, Password, StructuredValue};

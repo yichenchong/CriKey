@@ -127,6 +127,7 @@ impl Transport for ObservedSilentTransport {
         self.inner.close();
     }
 }
+
 #[derive(Debug, Clone)]
 enum Mode {
     Echo,
@@ -1117,8 +1118,8 @@ impl Plugin for ConformancePlugin {
             Mode::FailSuggest => Err(invalid("conformance fail-suggest requested")),
             Mode::Sequence => Err(invalid("sequence mode must be resolved before serving")),
             Mode::Icon => emit_final(sink, icon_items()),
-            Mode::IconSlow => emit_final(sink, vec![icon_item("icon-after-window", ICON_AFTER_WINDOW)]),
             Mode::IconGated => emit_final(sink, vec![icon_item("icon-gated", ICON_SERVED)]),
+            Mode::IconSlow => emit_final(sink, vec![icon_item("icon-after-window", ICON_AFTER_WINDOW)]),
             Mode::IconSilent => emit_final(
                 sink,
                 vec![icon_item(&format!("icon-never-{}", query.generation), ICON_NEVER)],
