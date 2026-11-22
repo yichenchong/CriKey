@@ -3495,9 +3495,11 @@ class Receipt(Plugin):
         }
         provider.execute_action_request(request).unwrap();
         let marker = package.join("executed");
-        assert_eq!(
-            fs::read_to_string(&marker).unwrap(),
-            "Receipt\n",
+        assert!(
+            matches!(
+                fs::read_to_string(&marker).unwrap().as_str(),
+                "Receipt\n" | "Receipt\r\n"
+            ),
             "the real callback received the admitted item, not replacement content"
         );
         assert!(endpoint
@@ -3522,6 +3524,9 @@ class Receipt(Plugin):
             .pool
             .fail(&key, "test retires the admitted dynamic origin".into());
         assert!(provider.execute_action_request(retired_request).is_err());
-        assert_eq!(fs::read_to_string(marker).unwrap(), "Receipt\n");
+        assert!(matches!(
+            fs::read_to_string(marker).unwrap().as_str(),
+            "Receipt\n" | "Receipt\r\n"
+        ));
     }
 }

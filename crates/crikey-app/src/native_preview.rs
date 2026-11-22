@@ -508,10 +508,23 @@ mod tests {
                 .into_iter()
                 .find(|completion| completion.request_id == action)
         });
+        let refusal = completion
+            .outcome
+            .expect_err("a retired dynamic origin must not execute on its replacement");
         assert!(
-            matches!(completion.outcome, Ok(ActionEffect::Completed)),
-            "legacy native action semantics must still allow replacement: {:?}",
-            completion.outcome
+            refusal.to_string().contains("originating worker was replaced"),
+            "{refusal}"
+        );
+        assert!(
+            !supervisor
+                .lock()
+                .unwrap()
+                .live_worker(&old_item.plugin_id)
+                .unwrap()
+                .observations()
+                .iter()
+                .any(|event| event.kind == "execute"),
+            "refused stale admission must not send execution to the replacement"
         );
         let replacement = endpoint
             .incarnation(&old_item.plugin_id)
