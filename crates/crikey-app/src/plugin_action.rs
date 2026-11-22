@@ -137,6 +137,9 @@ pub(crate) fn validate_declared_command_item(
     Ok(selected.cloned())
 }
 
+type CompletionCallback = Arc<dyn Fn() + Send + Sync>;
+type ActionItems = Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>;
+
 /// Process-scoped terminal notification, independent of result/session wakes.
 /// Ring only after releasing the completion mailbox lock, so the receiver may
 /// drain immediately without blocking the producer.
