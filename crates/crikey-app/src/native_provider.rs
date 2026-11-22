@@ -68,6 +68,9 @@ use crate::{
 /// the key: two packages sharing an entrypoint still own separate processes.
 type WorkerKey = (String, String);
 
+/// Shared item snapshots paired with their producing worker connection identifier.
+type NativeItemStore = Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>;
+
 /// UI preview readers only inspect this snapshot. Background lifecycle polling
 /// updates idle workers as well as workers completing a query/action/preview.
 type NativeIncarnations = Arc<Mutex<BTreeMap<PluginId, u64>>>;
@@ -176,7 +179,7 @@ struct NativeCatalogDispatcher {
     tasks: BTreeMap<u64, NativeCatalogTask>,
     latest: BTreeMap<PluginId, u64>,
     next_id: u64,
-    items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
+    items: NativeItemStore,
     /// Canonical targets whose healthy static catalog producer was released.
     static_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
 }
@@ -665,7 +668,7 @@ pub struct NativeProvider {
     catalog_declarations: BTreeMap<PluginId, bool>,
     /// Current suggestion snapshots and their producing worker connection,
     /// published together before their rows enter the query pipeline.
-    action_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
+    action_items: NativeItemStore,
     incarnations: NativeIncarnations,
     collection_window: Duration,
     /// Answers taken off the completion channel that have not been published
@@ -1951,8 +1954,8 @@ struct NativeActionEndpoint {
     sender: SyncSender<NativeActionRequest>,
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
     budgets: BTreeMap<PluginId, PluginBudgetHandle>,
-    items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
-    catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
+    items: NativeItemStore,
+    catalog_items: NativeItemStore,
     static_catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     pending: Arc<Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>>,
     in_flight: Arc<AtomicUsize>,

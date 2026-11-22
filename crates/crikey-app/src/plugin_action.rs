@@ -14,11 +14,14 @@ use crikey_plugin_model::{permissions::admit_web_surface, FilesystemScope, Permi
 
 use crate::plugin_page::PageUpdate;
 
+type CompletionCallback = Arc<dyn Fn() + Send + Sync>;
+type ActionItems = Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>;
+
 /// Process-scoped terminal notification, independent of result/session wakes.
 /// Ring only after releasing the completion mailbox lock, so the receiver may
 /// drain immediately without blocking the producer.
 #[derive(Clone, Default)]
-pub(crate) struct CompletionWake(Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>);
+pub(crate) struct CompletionWake(Arc<Mutex<Option<CompletionCallback>>>);
 
 impl CompletionWake {
     pub(crate) fn install(&self, wake: Arc<dyn Fn() + Send + Sync>) {
@@ -145,8 +148,8 @@ pub(crate) fn resolve_action_item(
     plugin: &PluginId,
     item_id: &ItemId,
     live_origin: Option<u64>,
-    suggestions: &Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>,
-    catalog: &Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>,
+    suggestions: &ActionItems,
+    catalog: &ActionItems,
     static_catalog: &Mutex<BTreeMap<(PluginId, ItemId), Item>>,
 ) -> Option<(Item, Option<u64>)> {
     let key = (plugin.clone(), item_id.clone());

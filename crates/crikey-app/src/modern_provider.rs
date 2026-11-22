@@ -73,6 +73,10 @@ use crate::{
 };
 use crikey_core::{PreviewContent, PreviewImage, PreviewText, PreviewValue, PreviewValueKind};
 
+/// Shared item snapshots paired with their producing source epoch.
+type ModernItemStore = Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>;
+type ModernStaticItemStore = Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>;
+
 struct ModernPreviewJob {
     request: PreviewRequest,
     publish: PreviewPublish,
@@ -82,8 +86,8 @@ struct ModernPreviewJob {
 struct ModernPreviewEndpoint {
     sender: SyncSender<ModernPreviewJob>,
     incarnations: Arc<Mutex<BTreeMap<PluginId, u64>>>,
-    items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
-    catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
+    items: ModernItemStore,
+    catalog_items: ModernItemStore,
     pending: Mutex<Vec<(PreviewIdentity, Arc<AtomicBool>)>>,
     stopped: AtomicBool,
     wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -584,8 +588,8 @@ struct ModernCatalogDispatcher {
     tasks: BTreeMap<u64, ModernCatalogTask>,
     latest: BTreeMap<PluginId, u64>,
     next_id: u64,
-    items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
-    static_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    items: ModernItemStore,
+    static_items: ModernStaticItemStore,
 }
 
 impl Default for ModernCatalogDispatcher {
@@ -977,7 +981,7 @@ pub struct ModernProvider {
     /// Current async suggestion snapshots keyed by the owning plugin and item
     /// id, atomically paired with the incarnation that produced each suggestion.
     /// Stable item ids are only unique within an owner.
-    action_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
+    action_items: ModernItemStore,
     cancellation: Arc<ModernCancellation>,
     /// Intake stamp of the query currently being served, set by the supervisor
     /// before each `drive_query`. Zero when nothing drives this provider
@@ -2208,9 +2212,9 @@ struct ModernActionEndpoint {
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
     action_wake: crate::plugin_action::CompletionWake,
     budgets: BTreeMap<PluginId, PluginBudgetHandle>,
-    items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
-    catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>>,
-    static_catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    items: ModernItemStore,
+    catalog_items: ModernItemStore,
+    static_catalog_items: ModernStaticItemStore,
     incarnations: Arc<Mutex<BTreeMap<PluginId, u64>>>,
     pending: Arc<Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>>,
     in_flight: Arc<AtomicUsize>,
