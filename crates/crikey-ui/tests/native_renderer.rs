@@ -3836,12 +3836,13 @@ fn action_text_is_visible(frame: &crikey_ui::NativeUiFrame, label: &str) -> bool
 #[test]
 fn action_sheet_multihit_search_reveals_a_retained_selection_inside_its_clip() {
     let mut launcher = long_action_launcher();
+    let mut frames = Frames::new();
+    let _ = frames.settle(&launcher.frame().unwrap());
     for _ in 0..20 {
         let _ = launcher.apply(UiCommand::SelectNext);
     }
     let view = launcher.frame().unwrap();
     let selected = view.action_panel.as_ref().unwrap().selected().cloned();
-    let mut frames = Frames::new();
     assert!(action_text_is_visible(&frames.settle(&view), "Long action 20"));
     let typed = frames.draw(&view, vec![egui::Event::Text("Long action 2".into())]);
     for command in typed.commands {
@@ -3861,6 +3862,106 @@ fn action_sheet_multihit_search_reveals_a_retained_selection_inside_its_clip() {
         !action_text_is_visible(&frames.settle(&filtered), "Long action 20"),
         "a completed layout transition must not keep overriding later wheel scrolling"
     );
+}
+
+#[test]
+fn action_sheet_opening_does_not_synthesize_selection_navigation() {
+    use crikey_ui::action_panel::ActionIdentity;
+    let mut launcher = long_action_launcher();
+    let mut view = launcher.frame().unwrap();
+    let selected = ActionIdentity::Plugin(crikey_core::ActionId("long-39".into()));
+    assert!(Arc::make_mut(view.action_panel.as_mut().unwrap()).select(&selected));
+    let mut frames = Frames::new();
+    let opened = frames.settle(&view);
+    assert!(
+        action_text_is_visible(&opened, "Long action 00"),
+        "opening establishes a selection baseline without scheduling an animated scroll"
+    );
+    assert!(!action_text_is_visible(&opened, "Long action 39"));
+}
+
+#[test]
+fn action_sheet_reopening_starts_at_the_top_without_following_the_old_selection() {
+    let mut launcher = long_action_launcher();
+    let view = launcher.frame().unwrap();
+    let mut frames = Frames::new();
+    let opened = frames.settle(&view);
+    let _ = frames.draw(&view, wheel_over_action(&opened, "Long action 00"));
+    assert!(!action_text_is_visible(&frames.settle(&view), "Long action 00"));
+    let _ = launcher.apply(UiCommand::ActionBack);
+    let closed = launcher.frame().unwrap();
+    assert!(closed.action_panel.is_none());
+    let _ = frames.draw(&closed, Vec::new());
+    let _ = launcher.apply(UiCommand::ShowActions);
+    let reopened = launcher.frame().unwrap();
+    assert_eq!(
+        reopened.action_panel.as_ref().unwrap().selected(),
+        view.action_panel.as_ref().unwrap().selected()
+    );
+    let first = frames.draw(&reopened, Vec::new());
+    assert!(
+        action_text_is_visible(&first, "Long action 00"),
+        "a fresh sheet must start at the top, not inherit the retired sheet's viewport"
+    );
+    assert!(action_text_is_visible(
+        &frames.settle(&reopened),
+        "Long action 00"
+    ));
+    let _ = frames.draw(&reopened, wheel_over_action(&first, "Long action 00"));
+    assert!(
+        !action_text_is_visible(&frames.settle(&reopened), "Long action 00"),
+        "the reset must happen only on opening, not on subsequent stationary frames"
+    );
+}
+
+#[test]
+fn action_sheet_unchanged_provider_refresh_preserves_manual_scroll() {
+    let mut launcher = long_action_launcher();
+    let view = launcher.frame().unwrap();
+    let mut frames = Frames::new();
+    let opened = frames.settle(&view);
+    let _ = frames.draw(&view, wheel_over_action(&opened, "Long action 00"));
+    let scrolled = frames.settle(&view);
+    assert!(!action_text_is_visible(&scrolled, "Long action 00"));
+    let anchor = (1..40)
+        .map(|index| format!("Long action {index:02}"))
+        .find(|label| action_text_is_visible(&scrolled, label))
+        .expect("manual scrolling leaves a visible action to anchor");
+    let before = position_of(&scrolled, &anchor);
+    launcher.publish(Generation::from_raw(1), view.rows.to_vec(), false);
+    let refreshed = launcher.frame().unwrap();
+    assert_eq!(
+        refreshed.action_panel.as_ref().unwrap().selected(),
+        view.action_panel.as_ref().unwrap().selected()
+    );
+    let after = frames.settle(&refreshed);
+    assert!(!action_text_is_visible(&after, "Long action 00"));
+    assert!(action_text_is_visible(&after, &anchor));
+    assert!((position_of(&after, &anchor).y - before.y).abs() < 1.0);
+}
+
+#[test]
+fn action_sheet_changed_provider_layout_reveals_the_retained_identity() {
+    let mut launcher = long_action_launcher();
+    let mut frames = Frames::new();
+    let _ = frames.settle(&launcher.frame().unwrap());
+    for _ in 0..20 {
+        let _ = launcher.apply(UiCommand::SelectNext);
+    }
+    let view = launcher.frame().unwrap();
+    assert!(action_text_is_visible(&frames.settle(&view), "Long action 20"));
+    let mut rows = view.rows.to_vec();
+    rows[0].alternate_actions.rotate_left(20);
+    launcher.publish(Generation::from_raw(1), rows, false);
+    let refreshed = launcher.frame().unwrap();
+    assert_eq!(
+        refreshed.action_panel.as_ref().unwrap().selected(),
+        view.action_panel.as_ref().unwrap().selected()
+    );
+    assert!(action_text_is_visible(
+        &frames.settle(&refreshed),
+        "Long action 20"
+    ));
 }
 
 #[test]
