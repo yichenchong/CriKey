@@ -196,7 +196,10 @@ list only scrolls itself to follow a selection you moved.
 Dismissal clears the current query and results; reopening starts a fresh
 launcher session rather than resuming the previous view. Results still in flight
 from the dismissed session cannot populate the reopened launcher. Opening
-settings does not turn incoming search results into settings content.
+settings does not turn incoming search results into settings content. Returning
+refreshes the search and restores a deliberately selected result when it arrives,
+even after an initial partial result list. Navigating or editing the query
+supersedes that return selection; completion of the search ends restoration.
 
 Typing updates the visible query immediately. Local catalog search runs in the
 current UI frame; plugin results arrive incrementally and late results from an
