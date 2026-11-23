@@ -101,6 +101,11 @@ class HandoffPreview(Plugin):
 
     def suggest(self, query, context):
         from crikey_sdk import Action
+        import pathlib
+
+        # The host declares one private, sandbox-allowed scratch directory.
+        directory = pathlib.Path(__file__).with_name("preview-witness-directory")
+        self.witnesses = pathlib.Path(directory.read_text(encoding="utf-8"))
 
         self.producer = os.getpid()
         context.emit(Item(
@@ -111,10 +116,9 @@ class HandoffPreview(Plugin):
         ))
 
     def preview(self, item, context):
-        import pathlib
         import time
 
-        root = pathlib.Path(__file__).parent
+        root = self.witnesses
         (root / "preview-started").write_text(str(self.producer))
         while not (root / "preview-release").exists():
             if context.cancelled:
@@ -125,10 +129,9 @@ class HandoffPreview(Plugin):
 
     def execute(self, item, action_id, argument):
         import json
-        import pathlib
         import time
 
-        root = pathlib.Path(__file__).parent
+        root = self.witnesses
         if (root / "preview-started").exists():
             assert (root / "preview-terminal").exists(), "action overlapped preview"
         with (root / "executions").open("a") as log:

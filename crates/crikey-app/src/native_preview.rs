@@ -372,9 +372,24 @@ mod tests {
                     .join("../../target/preview-handoff-fixtures")
                     .join(format!("native-{}-{mode}", std::process::id())),
             );
+            let witnesses = Scratch(std::env::temp_dir().join(format!(
+                "crikey-native-preview-witness-{}-{mode}",
+                std::process::id()
+            )));
+            let mut directory = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                directory.mode(0o700);
+            }
+            directory.create(&witnesses.0).unwrap();
             let package = scratch.0.join("preview-demo");
             fs::create_dir_all(&package).unwrap();
-            fs::write(package.join("preview-hold"), "").unwrap();
+            fs::write(
+                package.join("preview-witness-directory"),
+                witnesses.0.to_str().unwrap(),
+            )
+            .unwrap();
             let executable = executable
                 .to_string_lossy()
                 .replace('\\', "\\\\")
@@ -417,7 +432,7 @@ mod tests {
                 )
                 .unwrap();
             wait_for("preview entered", || {
-                package.join("preview-started").exists().then_some(())
+                witnesses.0.join("preview-started").exists().then_some(())
             });
             if mode == "stale" {
                 driver
@@ -436,14 +451,14 @@ mod tests {
                 let refusal = admission.expect_err("a mismatched dynamic producer must refuse admission");
                 assert!(refusal.to_string().contains("no longer current"), "{refusal}");
                 assert_eq!(budget.in_flight(BudgetKind::Action), 1);
-                assert!(!package.join("preview-cancelled").exists());
-                assert!(!package.join("executions").exists());
+                assert!(!witnesses.0.join("preview-cancelled").exists());
+                assert!(!witnesses.0.join("executions").exists());
                 assert!(actions.poll_plugin_actions().is_empty());
                 previews.cancel(&identity);
                 wait_for("explicit stale-case preview cancellation", || {
-                    package.join("preview-cancelled").exists().then_some(())
+                    witnesses.0.join("preview-cancelled").exists().then_some(())
                 });
-                fs::write(package.join("preview-release"), "").unwrap();
+                fs::write(witnesses.0.join("preview-release"), "").unwrap();
                 assert!(matches!(
                     receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
                     PreviewState::Cancelled
@@ -454,18 +469,18 @@ mod tests {
             let request = admission.unwrap();
             assert!(before.elapsed() < Duration::from_secs(1), "UI waited for preview");
             wait_for("preview cancellation observed", || {
-                package.join("preview-cancelled").exists().then_some(())
+                witnesses.0.join("preview-cancelled").exists().then_some(())
             });
             assert_eq!(budget.in_flight(BudgetKind::Action), 1);
             assert!(
-                !package.join("executions").exists(),
+                !witnesses.0.join("executions").exists(),
                 "cancel is not callback retirement"
             );
             assert!(actions.submit_plugin_action(&owner, &item, action, None).is_err());
             if mode == "cancel" {
                 assert!(actions.cancel_plugin_action(&request));
             } else if mode == "execute" {
-                fs::write(package.join("action-hold"), "").unwrap();
+                fs::write(witnesses.0.join("action-hold"), "").unwrap();
                 driver
                     .action_endpoint
                     .items
@@ -477,15 +492,15 @@ mod tests {
                     .actions
                     .clear();
             }
-            fs::write(package.join("preview-release"), "").unwrap();
+            fs::write(witnesses.0.join("preview-release"), "").unwrap();
             if mode == "execute" {
                 wait_for("foreground callback entered", || {
-                    package.join("executions").exists().then_some(())
+                    witnesses.0.join("executions").exists().then_some(())
                 });
-                assert!(package.join("preview-terminal").exists());
+                assert!(witnesses.0.join("preview-terminal").exists());
                 assert_eq!(budget.in_flight(BudgetKind::Action), 1);
                 assert!(actions.submit_plugin_action(&owner, &item, action, None).is_err());
-                fs::write(package.join("action-release"), "").unwrap();
+                fs::write(witnesses.0.join("action-release"), "").unwrap();
             }
             let completion = wait_for("foreground completion", || {
                 actions.poll_plugin_actions().into_iter().next()
@@ -498,14 +513,14 @@ mod tests {
             ));
             assert_eq!(budget.in_flight(BudgetKind::Action), 0);
             if mode == "execute" {
-                let pid = fs::read_to_string(package.join("preview-started")).unwrap();
+                let pid = fs::read_to_string(witnesses.0.join("preview-started")).unwrap();
                 assert_eq!(
-                    fs::read_to_string(package.join("executions")).unwrap(),
+                    fs::read_to_string(witnesses.0.join("executions")).unwrap(),
                     format!("{pid}:slow:acknowledge\n")
                 );
                 assert_eq!(previews.incarnation(&owner), Some(origin));
             } else {
-                assert!(!package.join("executions").exists());
+                assert!(!witnesses.0.join("executions").exists());
             }
             assert!(actions.poll_plugin_actions().is_empty());
         }
