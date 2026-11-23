@@ -3056,12 +3056,14 @@ mod preview_origin_tests {
 
     impl Fixture {
         fn private_directory(path: &Path) {
-            let mut directory = fs::DirBuilder::new();
+            let directory = fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let directory = {
                 use std::os::unix::fs::DirBuilderExt;
+                let mut directory = directory;
                 directory.mode(0o700);
-            }
+                directory
+            };
             directory.create(path).unwrap();
         }
 
