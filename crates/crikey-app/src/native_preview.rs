@@ -376,12 +376,14 @@ mod tests {
                 "crikey-native-preview-witness-{}-{mode}",
                 std::process::id()
             )));
-            let mut directory = fs::DirBuilder::new();
+            let directory = fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let directory = {
                 use std::os::unix::fs::DirBuilderExt;
+                let mut directory = directory;
                 directory.mode(0o700);
-            }
+                directory
+            };
             directory.create(&witnesses.0).unwrap();
             let package = scratch.0.join("preview-demo");
             fs::create_dir_all(&package).unwrap();
