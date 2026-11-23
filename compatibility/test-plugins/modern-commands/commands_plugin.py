@@ -209,6 +209,8 @@ class HandoffCommands(Plugin):
     """Real cooperative preview and foreground occupancy witnesses."""
 
     def build_catalog(self):
+        directory = PACKAGE_ROOT / "preview-witness-directory"
+        self.witnesses = Path(directory.read_text(encoding="utf-8"))
         self.canonical = Item("handoff", "Canonical handoff", "frozen canonical",
                               actions=[Action("run", "Run", execution_policy="plugin")],
                               argument_policy="optional", preview_deferred=True)
@@ -220,31 +222,31 @@ class HandoffCommands(Plugin):
 
     def preview(self, item, context):
         if item.stable_id == "latest":
-            (PACKAGE_ROOT / "latest-preview").touch()
+            (self.witnesses / "latest-preview").touch()
             return Preview(text="Latest selection preview")
         assert item.stable_id == self.canonical.stable_id and item.target == self.canonical.target
-        (PACKAGE_ROOT / "preview-entered").touch()
+        (self.witnesses / "preview-entered").touch()
         deadline = time.monotonic() + 20
         while not context.cancelled:
             if time.monotonic() >= deadline:
                 raise RuntimeError("foreground cancellation not delivered")
             time.sleep(0.001)
-        (PACKAGE_ROOT / "preview-cancelled").touch()
-        while not (PACKAGE_ROOT / "preview-release").exists():
+        (self.witnesses / "preview-cancelled").touch()
+        while not (self.witnesses / "preview-release").exists():
             if time.monotonic() >= deadline:
                 raise RuntimeError("preview terminal release not delivered")
             time.sleep(0.001)
-        (PACKAGE_ROOT / "preview-terminal").touch()
+        (self.witnesses / "preview-terminal").touch()
         return None
 
     def execute(self, item, action_id, argument):
         assert item.stable_id == self.canonical.stable_id and item.target == self.canonical.target
         assert action_id == "run"
-        append_witness(PACKAGE_ROOT / "executions",
+        append_witness(self.witnesses / "executions",
                        {"target": item.target, "action": action_id, "argument": argument})
         deadline = time.monotonic() + 20
-        while ((PACKAGE_ROOT / "action-hold").exists()
-               and not (PACKAGE_ROOT / "action-release").exists()):
+        while ((self.witnesses / "action-hold").exists()
+               and not (self.witnesses / "action-release").exists()):
             if time.monotonic() >= deadline:
                 raise RuntimeError("foreground release not delivered")
             time.sleep(0.001)
