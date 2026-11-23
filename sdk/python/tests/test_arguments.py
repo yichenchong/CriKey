@@ -23,6 +23,16 @@ class ArgumentContractTests(unittest.TestCase):
         ]:
             self.assertEqual(schema.fingerprint(), expected)
 
+    def test_optional_empty_default_ignores_minimum_but_not_required_or_bounds(self):
+        field = TextField(id="text", label="Text", min_bytes=2, max_bytes=4, default="")
+        self.assertEqual(ArgumentSchema((field,)).to_wire()["fields"][0]["default"], "")
+        for default, required in (("", True), ("x", False), ("ééé", False)):
+            with self.subTest(default=default, required=required), self.assertRaises(ValueError):
+                ArgumentSchema((TextField(id="text", label="Text", min_bytes=2,
+                                          max_bytes=4, default=default, required=required),)).to_wire()
+        ArgumentSchema((TextField(id="text", label="Text", min_bytes=2,
+                                  max_bytes=4, default="é"),)).to_wire()
+
     def test_password_default_is_unrepresentable(self):
         with self.assertRaises(TypeError):
             PasswordField(id="password", label="Password", default="secret")

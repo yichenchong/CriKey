@@ -1243,7 +1243,12 @@ fn serve_requests(
                 }
             }
             Payload::TypedExecuteRequest(request) => {
+                cancellation.begin(CancellationKey {
+                    request_id,
+                    generation,
+                });
                 handle_typed_execute(plugin, request, &request_context, metrics, typed_negotiated)?;
+                cancellation.end();
             }
             Payload::Execute(request) => {
                 handle_execute(
@@ -1550,23 +1555,24 @@ fn handle_suggest(
         cancellation,
         credits,
     );
-    let presentation = invoke_callback(|| plugin.suggestion_presentation(&query, context))
-        .map_err(SdkError::Protocol)?
-        .map_err(|_| SdkError::Protocol("presentation callback failed".into()))?;
-    let wire = filtered_presentation(
-        &presentation,
-        runtime.typed_negotiated,
-        runtime.presentation_negotiated,
-    )?;
-    sink.publication = Publication {
-        metadata: presentation,
-        owner: context.plugin_id.clone(),
-        ..Default::default()
-    };
-    sink.presentation = wire;
     let callback_result = {
         let _in_flight = metrics.enter();
-        invoke_callback(|| plugin.suggest(query, context, &mut sink))
+        invoke_callback(|| {
+            let presentation = plugin.suggestion_presentation(&query, context)?;
+            let wire = filtered_presentation(
+                &presentation,
+                runtime.typed_negotiated,
+                runtime.presentation_negotiated,
+            )
+            .map_err(|_| CoreError::Invalid("invalid presentation".into()))?;
+            sink.publication = Publication {
+                metadata: presentation,
+                owner: context.plugin_id.clone(),
+                ..Default::default()
+            };
+            sink.presentation = wire;
+            plugin.suggest(query, context, &mut sink)
+        })
     };
     if sink.shutdown_received() {
         cancellation.end();
@@ -1654,23 +1660,24 @@ fn handle_catalog(
         cancellation,
         credits,
     );
-    let presentation = invoke_callback(|| plugin.catalog_presentation(context))
-        .map_err(SdkError::Protocol)?
-        .map_err(|_| SdkError::Protocol("presentation callback failed".into()))?;
-    let wire = filtered_presentation(
-        &presentation,
-        runtime.typed_negotiated,
-        runtime.presentation_negotiated,
-    )?;
-    sink.publication = Publication {
-        metadata: presentation,
-        owner: context.plugin_id.clone(),
-        ..Default::default()
-    };
-    sink.presentation = wire;
     let callback_result = {
         let _in_flight = metrics.enter();
-        invoke_callback(|| plugin.build_catalog(context, &mut sink))
+        invoke_callback(|| {
+            let presentation = plugin.catalog_presentation(context)?;
+            let wire = filtered_presentation(
+                &presentation,
+                runtime.typed_negotiated,
+                runtime.presentation_negotiated,
+            )
+            .map_err(|_| CoreError::Invalid("invalid presentation".into()))?;
+            sink.publication = Publication {
+                metadata: presentation,
+                owner: context.plugin_id.clone(),
+                ..Default::default()
+            };
+            sink.presentation = wire;
+            plugin.build_catalog(context, &mut sink)
+        })
     };
     if sink.shutdown_received() {
         cancellation.end();

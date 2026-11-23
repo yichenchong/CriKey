@@ -79,6 +79,50 @@ class Impl(Plugin):
                 self.assertEqual(replies[request_id]["code"], "failed")
             self.assertEqual(replies[9]["code"], "denied")
 
+    def test_optional_empty_text_and_password_match_core_lengths(self):
+        sdk = Path(__file__).resolve().parents[1]
+        from crikey_sdk import PasswordField
+        for field_type, kind in ((TextField, "text"), (PasswordField, "password")):
+            for required in (False, True):
+                with self.subTest(kind=kind, required=required), tempfile.TemporaryDirectory() as directory:
+                    schema = ArgumentSchema((field_type(id="value", label="Value", required=required,
+                                                       min_bytes=2, max_bytes=4),))
+                    Path(directory, "fixture.py").write_text(f'''
+from crikey_sdk import *
+SCHEMA = ArgumentSchema(({field_type.__name__}(id="value", label="Value", required={required!r}, min_bytes=2, max_bytes=4),))
+class Impl(Plugin):
+    def build_catalog(self):
+        return [Item("typed", "Typed", "typed")]
+    def catalog_presentation(self):
+        return ResultPresentation(schemas=(SchemaBinding("typed", SCHEMA),))
+    def execute_typed(self, item, action, values):
+        return TypedOutcome(code="denied")
+''', encoding="utf-8")
+                    item = dict(stable_id="typed", label="Typed", target="typed", category="plugin-defined",
+                                description="", icon_reference=None, score_hint=0, search_terms=[],
+                                metadata={}, actions=[], argument_policy="forbidden", hit_policy="recorded")
+                    frames = [dict(id=1, kind="handshake", protocol_version=1),
+                              dict(id=2, kind="build_catalog")]
+                    for request_id, value in enumerate(("", "x", "é", "éé", "ééé"), 3):
+                        frames.append(dict(id=request_id, kind="typed_execute", item=item, action_id=None,
+                                           schema_fingerprint=schema.fingerprint(),
+                                           values=[dict(field_id="value", kind=kind, value=value)]))
+                    frames.append(dict(id=8, kind="shutdown"))
+                    environment = dict(os.environ, PYTHONPATH=os.pathsep.join((directory, str(sdk))),
+                                       CRIKEY_MODERN_PLUGIN_ID="typed-length-test",
+                                       CRIKEY_MODERN_ENTRYPOINT="fixture:Impl",
+                                       CRIKEY_MODERN_PROTOCOL_VERSION="1")
+                    child = subprocess.run([sys.executable, "-S", str(sdk / "_crikey_modern_worker.py")],
+                                           input="\n".join(map(json.dumps, frames)) + "\n", capture_output=True,
+                                           text=True, encoding="utf-8", env=environment, timeout=15)
+                    self.assertEqual(child.returncode, 0, child.stderr)
+                    replies = {frame["id"]: frame for frame in map(json.loads, child.stdout.splitlines())}
+                    self.assertEqual(replies[3]["code"], "failed" if required else "denied")
+                    for request_id in (4, 7):
+                        self.assertEqual(replies[request_id]["code"], "failed")
+                    for request_id in (5, 6):
+                        self.assertEqual(replies[request_id]["code"], "denied")
+
 
 if __name__ == "__main__":
     unittest.main()
