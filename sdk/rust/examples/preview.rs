@@ -12,6 +12,7 @@ use crikey_plugin_sdk::{
 struct PreviewDemo {
     enabled: bool,
     prepared: bool,
+    witnesses: Option<std::path::PathBuf>,
 }
 fn items() -> Vec<crikey_core::Item> {
     ["text", "markdown", "long", "image", "slow", "empty", "error"]
@@ -27,6 +28,13 @@ fn items() -> Vec<crikey_core::Item> {
 
 impl Plugin for PreviewDemo {
     fn start(&mut self, _: &dyn PluginContext) -> Result<()> {
+        // Test consumers declare an exact scratch directory in this read-only
+        // package file; the installed package itself is never writable.
+        self.witnesses = match std::fs::read_to_string("preview-witness-directory") {
+            Ok(directory) => Some(directory.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(CoreError::Invalid(error.to_string())),
+        };
         Ok(())
     }
     fn stop(&mut self, _: &dyn PluginContext) -> Result<()> {
@@ -46,15 +54,15 @@ impl Plugin for PreviewDemo {
         sink.finish()
     }
     fn execute(&mut self, request: ExecuteRequest, _: &dyn PluginContext) -> Result<()> {
-        if std::path::Path::new("preview-hold").exists() {
+        if let Some(witnesses) = &self.witnesses {
             use std::io::Write as _;
-            if !std::path::Path::new("preview-terminal").exists() {
+            if !witnesses.join("preview-terminal").exists() {
                 return Err(CoreError::Invalid("action overlapped preview callback".into()));
             }
             let mut log = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("executions")
+                .open(witnesses.join("executions"))
                 .map_err(|error| CoreError::Invalid(error.to_string()))?;
             writeln!(
                 log,
@@ -64,9 +72,9 @@ impl Plugin for PreviewDemo {
                 request.action.as_ref().map_or("none", |action| action.0.as_str())
             )
             .map_err(|error| CoreError::Invalid(error.to_string()))?;
-            while std::path::Path::new("action-hold").exists()
-                && !std::path::Path::new("action-release").exists()
-            {
+            let hold = witnesses.join("action-hold");
+            let release = witnesses.join("action-release");
+            while hold.exists() && !release.exists() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
@@ -88,14 +96,16 @@ impl Plugin for PreviewDemo {
             return Err(CoreError::Invalid("demonstration preview failure".into()));
         }
         if item_id == "slow" {
-            if std::path::Path::new("preview-hold").exists() {
+            if let Some(witnesses) = &self.witnesses {
+                let pid = std::process::id().to_string();
                 let record = |name| {
-                    std::fs::write(name, std::process::id().to_string())
+                    std::fs::write(witnesses.join(name), &pid)
                         .map_err(|error| CoreError::Invalid(error.to_string()))
                 };
                 record("preview-started")?;
                 let mut observed_cancel = false;
-                while !std::path::Path::new("preview-release").exists() {
+                let release = witnesses.join("preview-release");
+                while !release.exists() {
                     if context.cancellation().is_cancelled() && !observed_cancel {
                         record("preview-cancelled")?;
                         observed_cancel = true;
@@ -176,6 +186,7 @@ fn main() {
         &mut PreviewDemo {
             enabled,
             prepared: false,
+            witnesses: None,
         },
         ServeConfig::new("preview-demo", "0.1.0"),
     ) {
