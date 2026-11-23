@@ -220,6 +220,12 @@ successful recent commands, without repeating favorites:
 command-home = "favorites-and-recent"
 ```
 
+Successful commands also earn recent-command and item-ranking credit when they
+open or replace a plugin view, even if their original launcher presentation has
+since changed. Errors and cancellation earn no credit; loading the opened view
+does not count as another command use. Typed arguments and process hotkeys do
+not add query recall or query-ranking affinity.
+
 Unavailable saved favorites remain visible in their saved order at home.
 Other unavailable saved preferences remain accessible in **Configure Commands**;
 removing a favorite or fallback membership does not erase its other preferences.
@@ -362,6 +368,13 @@ renderer; a form edits the same executable schema used by typed arguments.
 Lists use ordinary row navigation and `Ctrl/Cmd+K` or `Alt+Enter` for Actions.
 In a grid, Left/Right move within a row and Up/Down move spatially between rows;
 Page Up/Down move by pages of rows. Section headers never take selection.
+Double-click a grid tile to activate that exact item once, including a tile that
+was not selected. Keyboard navigation keeps its selection in view after a
+refresh; pointer scrolling, query anchors and Back restoration retain their own
+scroll positions rather than snapping back to the selected item.
+A tile's selection refresh keeps that grid visible for the second click. Its
+activation waits for the fresh definitions and is discarded if the executable
+changes or a newer input, Back, dismissal or view failure supersedes the gesture.
 Forms reuse the native typed editor: use **Run command**, Enter in a
 single-line/password field, or Ctrl/Cmd+Enter for multiline input. Required fields
 and fixed field failures follow the inline-input rules above.

@@ -48,6 +48,7 @@ pub enum NavigationRoute {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LogicalScroll {
     pub row: usize,
+    /// Pixels clipped above this row by the actual viewport, excluding paint margins.
     pub offset: f32,
 }
 /// Reusable host-view restoration payload. Secret drafts stay outside this
@@ -68,6 +69,8 @@ pub struct NavigationPresentation {
     pub standard_route: bool,
     pub standard_refresh_pending: bool,
     pub standard: Option<Arc<crate::standard_view::StandardSurface>>,
+    /// Original shared pointer-selection source; no per-frame route/descriptor copy.
+    pub standard_pointer_source: Option<Arc<crate::standard_view::StandardSurface>>,
     pub scopes: Arc<[crate::ScopeChoice]>,
     pub selected_scope: Option<crate::ScopeIdentity>,
     pub section_headers: Arc<[crate::SectionHeader]>,

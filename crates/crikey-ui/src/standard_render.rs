@@ -52,7 +52,8 @@ pub(super) fn draw(
         }
         return;
     };
-    if model.navigation.standard_refresh_pending {
+    let pending = model.navigation.standard_refresh_pending;
+    if pending && model.navigation.standard_pointer_source.is_none() {
         ui.label("Refreshing view…");
         return;
     }
@@ -91,14 +92,24 @@ pub(super) fn draw(
                 && ui.data(|data| data.get_temp::<u64>(restore_id)) != Some(model.navigation.restoration);
             ui.data_mut(|data| data.insert_temp(restore_id, model.navigation.restoration));
             let selection_id = ui.id().with("standard-grid-selection");
-            let selection = (surface.context.session.surface.get(), model.selected);
-            let follow = ui.data(|data| data.get_temp::<(u64, usize)>(selection_id)) != Some(selection);
+            let selection = (
+                surface.context.session.surface.get(),
+                surface.context.revision.get(),
+                model.selected,
+            );
+            let follow = ui.data(|data| data.get_temp::<(u64, u64, usize)>(selection_id)) != Some(selection);
             ui.data_mut(|data| data.insert_temp(selection_id, selection));
             let mut first_visible = None;
+            let restoration_spacing = ui.spacing().item_spacing.y;
             egui::ScrollArea::vertical()
                 .id_salt("standard-grid")
                 .max_height(body_height)
-                .show(ui, |ui| {
+                .show_viewport(ui, |ui, viewport| {
+                    let scroll_viewport = egui::Rect::from_min_size(
+                        ui.max_rect().min + viewport.min.to_vec2(),
+                        viewport.size(),
+                    )
+                    .intersect(ui.clip_rect());
                     let width = ((ui.available_width()
                         - ui.spacing().item_spacing.x * columns.saturating_sub(1) as f32)
                         / columns as f32)
@@ -148,10 +159,14 @@ pub(super) fn draw(
                                     },
                                 );
                                 let response = tile.inner;
-                                if first_visible.is_none() && tile.response.rect.intersects(ui.clip_rect()) {
+                                let visible_rect = tile.response.rect.intersect(scroll_viewport);
+                                if first_visible.is_none()
+                                    && visible_rect.width() > 0.0
+                                    && visible_rect.height() > 0.0
+                                {
                                     first_visible = Some(crate::LogicalScroll {
                                         row: index,
-                                        offset: (ui.clip_rect().top() - tile.response.rect.top()).max(0.0),
+                                        offset: (scroll_viewport.top() - tile.response.rect.top()).max(0.0),
                                     });
                                 }
                                 if restoring
@@ -163,27 +178,23 @@ pub(super) fn draw(
                                             .min(model.rows.len().saturating_sub(1))
                                 {
                                     ui.scroll_to_rect(
-                                        tile.response
-                                            .rect
-                                            .translate(egui::vec2(0.0, model.navigation.scroll.offset)),
+                                        tile.response.rect.translate(egui::vec2(
+                                            0.0,
+                                            model.navigation.scroll.offset + restoration_spacing,
+                                        )),
                                         Some(egui::Align::Min),
                                     );
                                 }
-                                if response.clicked() {
-                                    if let ActionTarget::Result { owner, item } = &row.target {
-                                        commands.push(UiCommand::StandardSelect {
-                                            context: surface.context.clone(),
-                                            target: OwnedItem {
-                                                owner: owner.clone(),
-                                                item: item.clone(),
-                                            },
-                                        });
-                                    }
-                                }
                                 if response.double_clicked() {
                                     if let ActionTarget::Result { owner, item } = &row.target {
-                                        commands.push(UiCommand::StandardActivate {
-                                            context: surface.context.clone(),
+                                        commands.push(UiCommand::StandardDoubleClick {
+                                            context: model
+                                                .navigation
+                                                .standard_pointer_source
+                                                .as_ref()
+                                                .unwrap_or(surface)
+                                                .context
+                                                .clone(),
                                             executable: ExecutableKey {
                                                 target: OwnedItem {
                                                     owner: owner.clone(),
@@ -193,6 +204,16 @@ pub(super) fn draw(
                                                     .default_action
                                                     .as_ref()
                                                     .map(|a| a.action_id.clone()),
+                                            },
+                                        });
+                                    }
+                                } else if response.clicked() && !pending {
+                                    if let ActionTarget::Result { owner, item } = &row.target {
+                                        commands.push(UiCommand::StandardSelect {
+                                            context: surface.context.clone(),
+                                            target: OwnedItem {
+                                                owner: owner.clone(),
+                                                item: item.clone(),
                                             },
                                         });
                                     }
@@ -219,6 +240,9 @@ pub(super) fn draw(
             preview_render::draw_standard_detail(ui, surface, detail, commands, body_height)
         }
         StandardView::Form(_) => {}
+    }
+    if pending {
+        return;
     }
     let selected = model
         .rows
