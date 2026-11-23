@@ -25,6 +25,67 @@ impl PartialEq for StandardSurface {
     }
 }
 impl LauncherViewModel {
+    /// Retire pointer gestures on a new user intent or launcher lifecycle transition.
+    pub fn clear_standard_activation(&mut self) {
+        self.standard_pointer_source = None;
+        self.standard_deferred_activation = None;
+        self.standard_ready_activation = None;
+    }
+
+    pub(crate) fn standard_activation_bytes(&self) -> usize {
+        let source = self
+            .standard_pointer_source
+            .as_ref()
+            .filter(|source| {
+                self.standard
+                    .as_ref()
+                    .is_none_or(|current| !Arc::ptr_eq(source, current))
+            })
+            .map_or(0, |source| standard_surface_bytes(source));
+        let deferred = self
+            .standard_deferred_activation
+            .as_ref()
+            .map_or(0, executable_bytes);
+        let ready = match &self.standard_ready_activation {
+            Some(UiCommand::StandardActivate { context, executable }) => {
+                std::mem::size_of::<UiCommand>() + context.route.0.capacity() + executable_bytes(executable)
+                    - std::mem::size_of::<ExecutableKey>()
+            }
+            _ => 0,
+        };
+        source + deferred + ready
+    }
+
+    /// Consume a revalidated deliberate gesture through ordinary execution admission.
+    pub fn take_standard_activation(&mut self) -> Option<UiEffect> {
+        if self.standard_refresh_pending {
+            return None;
+        }
+        let command = self.standard_ready_activation.take()?;
+        self.apply(command)
+    }
+
+    fn reconcile_standard_activation(&mut self) {
+        let source = self.standard_pointer_source.take();
+        let executable = self.standard_deferred_activation.take();
+        let (Some(source), Some(executable), Some(current)) = (source, executable, &self.standard) else {
+            return;
+        };
+        if source.owner == current.owner
+            && source.producer == current.producer
+            && source.context.session == current.context.session
+            && source.context.route == current.context.route
+            && source.context.revision < current.context.revision
+            && self.standard_selected_target().as_ref() == Some(&executable.target)
+            && unchanged_executable(&source.descriptor, &current.descriptor, &executable)
+        {
+            self.standard_ready_activation = Some(UiCommand::StandardActivate {
+                context: current.context.clone(),
+                executable,
+            });
+        }
+    }
+
     pub fn set_standard_refresh_pending(&mut self, pending: bool) {
         self.standard_refresh_pending = pending;
         self.dirty |= self.visible;
@@ -55,11 +116,20 @@ impl LauncherViewModel {
         });
         let mut entry = self.capture_entry();
         entry.admitted_descriptor = Some(candidate.admitted_descriptor.clone());
-        entry.render_standard = false;
+        entry.render_standard = self.standard_pointer_source.is_some();
         entry.transient_bytes = entry
             .transient_bytes
             .saturating_sub(current.owner.0.capacity() + current.context.route.0.capacity())
             .saturating_add(candidate.owner.0.capacity() + candidate.context.route.0.capacity());
+        if self
+            .standard_pointer_source
+            .as_ref()
+            .is_some_and(|source| Arc::ptr_eq(source, current))
+        {
+            entry.transient_bytes = entry
+                .transient_bytes
+                .saturating_add(standard_surface_bytes(current));
+        }
         if navigation::retained_bytes(self.navigation_stack.iter().chain(std::iter::once(&entry)))
             > navigation::MAX_NAVIGATION_BYTES
         {
@@ -77,7 +147,7 @@ impl LauncherViewModel {
         UiEffect::RefreshStandard(reason)
     }
 
-    fn select_standard(&mut self, index: usize) {
+    fn select_standard(&mut self, index: usize, follow: bool) {
         let target = self
             .rows
             .get(index.min(self.rows.len().saturating_sub(1)))
@@ -88,6 +158,8 @@ impl LauncherViewModel {
             self.inline_arguments = None;
         }
         self.select(index);
+        self.standard_follow_selection = follow;
+        self.preserve_scroll = !follow;
     }
     pub(crate) fn standard_selection_available(&self) -> bool {
         if self
@@ -137,6 +209,7 @@ impl LauncherViewModel {
             <= navigation::MAX_NAVIGATION_BYTES
     }
     pub fn standard_unavailable(&mut self) {
+        self.clear_standard_activation();
         let Some(surface) = self.standard.take() else {
             return;
         };
@@ -160,6 +233,25 @@ impl LauncherViewModel {
     }
     pub(crate) fn apply_standard_command(&mut self, command: &UiCommand) -> Option<Option<UiEffect>> {
         let surface = self.standard.as_ref()?;
+        if let UiCommand::StandardDoubleClick { context, executable } = command {
+            if self.standard_refresh_pending {
+                let source = self.standard_pointer_source.as_ref()?;
+                if context == &source.context
+                    && source.owner == surface.owner
+                    && source.producer == surface.producer
+                    && source.context.session == surface.context.session
+                    && source.context.route == surface.context.route
+                    && self.standard_selected_target().as_ref() == Some(&executable.target)
+                    && source.descriptor.executable(executable).is_some()
+                {
+                    self.standard_deferred_activation = Some(executable.clone());
+                    if !self.within_navigation_budget() {
+                        self.clear_standard_activation();
+                    }
+                }
+                return Some(None);
+            }
+        }
         if self.standard_refresh_pending
             && matches!(
                 command,
@@ -175,18 +267,38 @@ impl LauncherViewModel {
         }
         match command {
             UiCommand::StandardSelect { context, target } => {
-                if context != &surface.context {
+                if context != &surface.context || self.standard_refresh_pending {
                     return Some(None);
                 }
                 let index = self.rows.iter().position(|row| matches!(&row.target, ActionTarget::Result { owner, item } if owner == &target.owner && item == &target.item))?;
+                if index == self.selected {
+                    return Some(None);
+                }
+                let pointer_source =
+                    matches!(surface.descriptor.view, StandardView::Grid(_)).then(|| surface.clone());
                 self.restoration_target = None;
-                self.select_standard(index);
+                self.select_standard(index, false);
+                self.standard_pointer_source = pointer_source;
                 Some(Some(self.standard_refresh_effect(ViewRefreshReason::Selection)))
             }
-            UiCommand::StandardActivate { context, executable } => {
+            UiCommand::StandardActivate { context, executable }
+            | UiCommand::StandardDoubleClick { context, executable } => {
                 if context != &surface.context || executable.target.owner != surface.owner {
                     return Some(None);
                 }
+                // One deliberate pointer activation owns selection and execution.
+                // Validate the exact current executable before changing host state.
+                if surface.descriptor.executable(executable).is_none() {
+                    return Some(None);
+                }
+                if let Some(index) = self.rows.iter().position(|row| {
+                    matches!(&row.target, ActionTarget::Result { owner, item }
+                        if owner == &executable.target.owner && item == &executable.target.item)
+                }) {
+                    self.restoration_target = None;
+                    self.select_standard(index, false);
+                }
+                self.standard_ready_activation = None;
                 Some(self.activate_standard_executable(executable.clone()))
             }
             UiCommand::StandardLink { context, url } => {
@@ -208,11 +320,12 @@ impl LauncherViewModel {
                     if *forward { 1 } else { -1 },
                 );
                 self.restoration_target = None;
-                self.select_standard(index);
+                self.select_standard(index, true);
                 Some(Some(self.standard_refresh_effect(ViewRefreshReason::Selection)))
             }
             UiCommand::SetQuery(query) => {
                 self.query = query.clone();
+                self.standard_follow_selection = false;
                 self.inline_arguments = None;
                 self.dirty = true;
                 Some(Some(self.standard_refresh_effect(ViewRefreshReason::Query)))
@@ -225,6 +338,7 @@ impl LauncherViewModel {
                     return Some(None);
                 }
                 self.navigation_scope = scope.clone();
+                self.standard_follow_selection = false;
                 self.inline_arguments = None;
                 if !self.standard_selection_available() {
                     self.selected = usize::MAX;
@@ -258,7 +372,7 @@ impl LauncherViewModel {
                     } else {
                         self.rows.len().saturating_sub(1)
                     };
-                    self.select_standard(index);
+                    self.select_standard(index, true);
                     return Some(Some(self.standard_refresh_effect(ViewRefreshReason::Selection)));
                 }
                 let mut index = self.selected;
@@ -280,7 +394,7 @@ impl LauncherViewModel {
                     };
                 }
                 self.restoration_target = None;
-                self.select_standard(index);
+                self.select_standard(index, true);
                 Some(Some(self.standard_refresh_effect(ViewRefreshReason::Selection)))
             }
             _ => None,
@@ -301,6 +415,7 @@ impl LauncherViewModel {
             return None;
         }
         let restoring = self.reopening;
+        self.standard_follow_selection = false;
         self.set_standard_refresh_pending(false);
         let restored_collection = restoring
             && matches!(
@@ -546,11 +661,14 @@ impl LauncherViewModel {
                 offset: self.navigation_scroll.offset,
             })
             .unwrap_or_default();
-        self.preserve_scroll = true;
-        self.navigation_restore = self
-            .navigation_restore
-            .checked_add(1)
-            .expect("restoration identity exhausted");
+        self.preserve_scroll = !self.standard_follow_selection;
+        self.standard_follow_selection = false;
+        if self.preserve_scroll {
+            self.navigation_restore = self
+                .navigation_restore
+                .checked_add(1)
+                .expect("restoration identity exhausted");
+        }
         self.active = Some(Generation::from_raw(surface.context.revision.get()));
         self.published = self.active;
         self.publication_view = Some(self.view_id);
@@ -600,6 +718,7 @@ impl LauncherViewModel {
         }
         drop(old);
         self.action_panel = None;
+        self.reconcile_standard_activation();
         let entry = self.capture_entry();
         if navigation::retained_bytes(self.navigation_stack.iter().chain(std::iter::once(&entry)))
             > navigation::MAX_NAVIGATION_BYTES
@@ -746,6 +865,62 @@ impl LauncherViewModel {
             executable,
         })
     }
+}
+
+fn standard_surface_bytes(surface: &StandardSurface) -> usize {
+    std::mem::size_of::<StandardSurface>()
+        + 2 * std::mem::size_of::<usize>()
+        + surface.owner.0.capacity()
+        + surface.context.route.0.capacity()
+}
+
+fn executable_bytes(key: &ExecutableKey) -> usize {
+    std::mem::size_of::<ExecutableKey>()
+        + key.target.owner.0.capacity()
+        + key.target.item.0.capacity()
+        + key.action.as_ref().map_or(0, |action| action.0.capacity())
+}
+
+/// Compare the frozen executable's item, action and schema, not just its IDs.
+fn unchanged_executable(old: &ViewDescriptor, new: &ViewDescriptor, key: &ExecutableKey) -> bool {
+    let (Some((old_policy, old_binding)), Some((new_policy, new_binding))) =
+        (old.executable(key), new.executable(key))
+    else {
+        return false;
+    };
+    let (Some(old), Some(new)) = (old.definition(&key.target), new.definition(&key.target)) else {
+        return false;
+    };
+    let a = &old.item;
+    let b = &new.item;
+    a.stable_id == b.stable_id
+        && a.plugin_id == b.plugin_id
+        && a.category == b.category
+        && a.label == b.label
+        && a.description == b.description
+        && a.target == b.target
+        && a.search_terms == b.search_terms
+        && a.icon_reference == b.icon_reference
+        && a.argument_policy == b.argument_policy
+        && a.hit_policy == b.hit_policy
+        && a.score_hint == b.score_hint
+        && a.metadata == b.metadata
+        && a.actions.len() == b.actions.len()
+        && a.actions.iter().zip(&b.actions).all(|(a, b)| {
+            a.action_id == b.action_id
+                && a.label == b.label
+                && a.description == b.description
+                && a.applicable_categories == b.applicable_categories
+                && a.icon_reference == b.icon_reference
+                && a.execution_policy == b.execution_policy
+        })
+        && old.actionless_policy == new.actionless_policy
+        && old.primary_action == new.primary_action
+        && old_policy == new_policy
+        && old_binding.action == new_binding.action
+        && old_binding.schema == new_binding.schema
+        && old_binding.shortcut == new_binding.shortcut
+        && old_binding.destructive == new_binding.destructive
 }
 
 pub(crate) fn action_tree(

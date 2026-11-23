@@ -1523,3 +1523,551 @@ fn retired_explicit_scope_stays_unavailable_after_otherwise_valid_reply() {
     model.apply(UiCommand::OpenSettings);
     assert!(model.is_settings_open());
 }
+
+fn paint_route(
+    context: &egui::Context,
+    frame: &ViewModel,
+    time: f64,
+    events: Vec<egui::Event>,
+) -> NativeUiFrame {
+    build_launcher_frame(
+        context,
+        egui::RawInput {
+            time: Some(time),
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(720.0, 520.0),
+            )),
+            ..Default::default()
+        },
+        frame,
+    )
+}
+
+fn visible_label(output: &egui::FullOutput, label: &str) -> Option<egui::Rect> {
+    output.shapes.iter().find_map(|shape| {
+        let egui::epaint::Shape::Text(text) = &shape.shape else {
+            return None;
+        };
+        let rect = text.galley.rect.translate(text.pos.to_vec2());
+        (text.galley.text() == label && shape.clip_rect.contains_rect(rect)).then_some(rect)
+    })
+}
+
+fn route_click(position: egui::Pos2) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(position),
+        egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+#[test]
+fn grid_double_click_activates_exact_selected_or_unselected_target_once() {
+    for index in [0, 1] {
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        let mut context = open(&mut model, "double-click", descriptor(6));
+        let renderer = create_launcher_context();
+        let frame = model.frame().unwrap();
+        let first = paint_route(&renderer, &frame, 0.0, vec![]);
+        let position = visible_label(&first.output, &format!("Item {index}"))
+            .unwrap()
+            .center();
+        // Native window_event reports the physical press before egui recognizes release.
+        assert!(model.apply(UiCommand::PointerActivity).is_none());
+        let click = paint_route(&renderer, &frame, 0.1, route_click(position));
+        for command in click.commands {
+            let effect = model.apply(command);
+            assert!(
+                effect.is_none()
+                    || matches!(
+                        effect,
+                        Some(UiEffect::RefreshStandard(ViewRefreshReason::Selection))
+                    )
+            );
+        }
+        assert_eq!(model.standard_refresh_pending, index != 0);
+        let pending = model.frame().unwrap_or(frame);
+        // Redraw the actual pending surface before the second physical click.
+        let waiting = paint_route(&renderer, &pending, 0.15, vec![]);
+        assert!(visible_label(&waiting.output, &format!("Item {index}")).is_some());
+        assert!(model.apply(UiCommand::PointerActivity).is_none());
+        let double = paint_route(&renderer, &pending, 0.2, route_click(position));
+        assert_eq!(
+            double
+                .commands
+                .iter()
+                .filter(|command| matches!(command, UiCommand::StandardDoubleClick { .. }))
+                .count(),
+            1
+        );
+        assert!(!double
+            .commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::StandardSelect { .. })));
+        let mut executions = Vec::new();
+        for command in double.commands {
+            if let Some(UiEffect::ExecuteStandard {
+                context: actual,
+                executable,
+                ..
+            }) = model.apply(command)
+            {
+                executions.push((actual, executable.target));
+            }
+        }
+        if index != 0 {
+            assert!(executions.is_empty(), "pending definitions cannot execute");
+            let queued_bytes = model.standard_activation_bytes();
+            assert!(queued_bytes >= executable_bytes(model.standard_deferred_activation.as_ref().unwrap()));
+            assert!(model.take_standard_activation().is_none());
+            context.revision = NonZeroU64::new(12).unwrap();
+            assert!(model.adopt_standard_revision(
+                &owner(),
+                7,
+                ViewReply {
+                    context: context.clone(),
+                    descriptor: descriptor(6),
+                }
+            ));
+            assert!(
+                model.standard_activation_bytes()
+                    >= queued_bytes + standard_surface_bytes(model.standard_pointer_source.as_ref().unwrap())
+            );
+            assert!(model.take_standard_activation().is_none());
+            context.revision = NonZeroU64::new(13).unwrap();
+            assert!(model.publish_standard_view(
+                owner(),
+                7,
+                ViewReply {
+                    context: context.clone(),
+                    descriptor: descriptor(6),
+                }
+            ));
+            let Some(UiEffect::ExecuteStandard {
+                context: actual,
+                executable,
+                ..
+            }) = model.take_standard_activation()
+            else {
+                panic!("validated double-click did not execute");
+            };
+            executions.push((actual, executable.target));
+        }
+        assert_eq!(executions, vec![(context.clone(), target(index))]);
+        assert!(model.take_standard_activation().is_none());
+        assert_eq!(model.standard_host_state().selected, Some(target(index)));
+        let mut stale = context;
+        stale.revision = NonZeroU64::new(10).unwrap();
+        assert!(model
+            .apply(UiCommand::StandardDoubleClick {
+                context: stale,
+                executable: ExecutableKey {
+                    target: target(2),
+                    action: None
+                },
+            })
+            .is_none());
+        assert_eq!(model.standard_host_state().selected, Some(target(index)));
+    }
+}
+
+#[test]
+fn pending_grid_double_click_discards_changed_definitions_and_superseding_intent() {
+    for change in 0..11 {
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        let mut context = open(&mut model, "deferred", descriptor(6));
+        let renderer = create_launcher_context();
+        let frame = model.frame().unwrap();
+        let first = paint_route(&renderer, &frame, 0.0, vec![]);
+        let position = visible_label(&first.output, "Item 1").unwrap().center();
+        model.apply(UiCommand::PointerActivity);
+        for command in paint_route(&renderer, &frame, 0.1, route_click(position)).commands {
+            model.apply(command);
+        }
+        let pending = model.frame().unwrap();
+        paint_route(&renderer, &pending, 0.15, vec![]);
+        model.apply(UiCommand::PointerActivity);
+        for command in paint_route(&renderer, &pending, 0.2, route_click(position)).commands {
+            assert!(model.apply(command).is_none());
+        }
+        assert!(model.standard_deferred_activation.is_some());
+        let mut replacement = (*descriptor(6)).clone();
+        match change {
+            0 => Arc::make_mut(&mut replacement.definitions)[1].item.target = "replacement".into(),
+            1 => {
+                let ActionMenuEntry::Action(binding) =
+                    &mut Arc::make_mut(&mut replacement.definitions)[1].action_sections[0].entries[0]
+                else {
+                    unreachable!()
+                };
+                binding.schema = Some(text_schema());
+            }
+            2 => replacement = (*descriptor(1)).clone(),
+            3 => {
+                model.apply(UiCommand::SetQuery("newer".into()));
+            }
+            4 => {
+                model.apply(UiCommand::SelectNext);
+            }
+            5 => {
+                model.apply(UiCommand::Back);
+            }
+            6 => model.dismiss(),
+            7 => model.standard_unavailable(),
+            8 => {
+                model.apply(UiCommand::PointerActivity);
+            }
+            9 => {
+                model.apply(UiCommand::UserActivity);
+            }
+            _ => {
+                model.apply(UiCommand::OpenSettings);
+            }
+        }
+        context.revision = NonZeroU64::new(12).unwrap();
+        model.publish_standard_view(
+            owner(),
+            7,
+            ViewReply {
+                context,
+                descriptor: Arc::new(replacement),
+            },
+        );
+        assert!(
+            model.take_standard_activation().is_none(),
+            "changed source/intent must not replay: {change}"
+        );
+        assert!(model.standard_deferred_activation.is_none());
+        assert!(model.standard_pointer_source.is_none());
+    }
+}
+
+fn assert_selected_surface_visible(output: &egui::FullOutput, label: &str, clip_margin: f32) {
+    let label = visible_label(output, label).expect("selected label must be inside its viewport");
+    let selected = output
+        .shapes
+        .iter()
+        .find_map(|shape| {
+            let egui::epaint::Shape::Rect(rect) = &shape.shape else {
+                return None;
+            };
+            (rect.fill == theme::palette().accent_soft && rect.rect.contains(label.center()))
+                .then_some((rect.rect, shape.clip_rect))
+        })
+        .expect("selected row/tile background");
+    let viewport = selected.1.shrink(clip_margin);
+    assert!(
+        viewport.contains_rect(label),
+        "selected label must fit the actual viewport, not its expanded paint clip"
+    );
+    let visible = viewport.intersect(selected.0);
+    assert!(
+        visible.width() > 0.0 && visible.height() > 0.0,
+        "selected row/tile must have positive area inside its scroll viewport"
+    );
+}
+
+fn settle_route(
+    renderer: &egui::Context,
+    model: &mut LauncherViewModel,
+    frame: &ViewModel,
+    time: &mut f64,
+    events: Vec<egui::Event>,
+) -> NativeUiFrame {
+    let mut output = paint_route(renderer, frame, *time, events);
+    for _ in 0..24 {
+        for command in output.commands {
+            if let UiCommand::SetLogicalScroll(_) = command {
+                model.apply(command);
+            }
+        }
+        *time += 1.0 / 60.0;
+        output = paint_route(renderer, frame, *time, vec![]);
+    }
+    for command in &output.commands {
+        if let UiCommand::SetLogicalScroll(scroll) = command {
+            model.apply(UiCommand::SetLogicalScroll(scroll.clone()));
+        }
+    }
+    output
+}
+
+#[test]
+fn long_standard_collections_follow_keyboard_after_coalesced_refresh_but_preserve_pointer_and_query_scroll() {
+    for (grid, painted) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut view = (*descriptor(96)).clone();
+        if !grid {
+            let StandardView::Grid(original) = &view.view else {
+                unreachable!()
+            };
+            view.view = StandardView::List(original.collection.clone());
+        }
+        let view = Arc::new(view);
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        let mut context = open(&mut model, "long-collection", view.clone());
+        let renderer = create_launcher_context();
+        let mut time = 0.0;
+        let frame = model.frame().unwrap();
+        if painted {
+            settle_route(&renderer, &mut model, &frame, &mut time, vec![]);
+        }
+        let restoration = model.navigation_restore;
+        for _ in 0..3 {
+            model.apply(UiCommand::PageDown);
+        }
+        let selected = model.selected;
+        assert!(selected >= 24);
+        context.revision = NonZeroU64::new(12).unwrap();
+        assert!(model.adopt_standard_revision(
+            &owner(),
+            7,
+            ViewReply {
+                context: context.clone(),
+                descriptor: view.clone(),
+            }
+        ));
+        context.revision = NonZeroU64::new(13).unwrap();
+        assert!(model.publish_standard_view(
+            owner(),
+            7,
+            ViewReply {
+                context: context.clone(),
+                descriptor: view.clone(),
+            }
+        ));
+        let frame = model.frame().unwrap();
+        assert!(!frame.navigation.preserve_scroll);
+        assert_eq!(model.navigation_restore, restoration);
+        assert_eq!(frame.navigation.restoration, 0);
+        let output = settle_route(&renderer, &mut model, &frame, &mut time, vec![]);
+        assert_selected_surface_visible(
+            &output.output,
+            &format!("Item {selected}"),
+            renderer.style().visuals.clip_rect_margin,
+        );
+        // A real wheel gesture leaves the selected item behind, without a new selection.
+        let output = settle_route(
+            &renderer,
+            &mut model,
+            &frame,
+            &mut time,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(320.0, 200.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 900.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(visible_label(&output.output, &format!("Item {selected}")).is_none());
+        let manual = model.navigation_scroll.clone();
+        let anchor_label = format!("Item {}", manual.row + if grid { 3 } else { 1 });
+        let manual_rect = visible_label(&output.output, &anchor_label).unwrap();
+        model.apply(UiCommand::SetQuery("keep anchor".into()));
+        context.revision = NonZeroU64::new(14).unwrap();
+        assert!(model.publish_standard_view(
+            owner(),
+            7,
+            ViewReply {
+                context: context.clone(),
+                descriptor: view.clone(),
+            }
+        ));
+        let frame = model.frame().unwrap();
+        assert!(frame.navigation.preserve_scroll);
+        assert_eq!(frame.navigation.scroll, manual);
+        let output = settle_route(&renderer, &mut model, &frame, &mut time, vec![]);
+        assert!(visible_label(&output.output, &format!("Item {selected}")).is_none());
+        assert_eq!(model.navigation_scroll.row, manual.row);
+        assert!((model.navigation_scroll.offset - manual.offset).abs() < 0.01);
+        let restored_rect = visible_label(&output.output, &anchor_label).unwrap();
+        assert!(
+            (restored_rect.top() - manual_rect.top()).abs() < 0.01,
+            "query refresh must preserve actual painted row position"
+        );
+        // Back's captured scroll remains authoritative even over the selected row.
+        let saved = model.navigation_restoration();
+        open(&mut model, "cover", descriptor(1));
+        model.apply(UiCommand::Back);
+        let Some(NavigationRoute::Standard {
+            owner: plugin,
+            producer,
+            route,
+            ..
+        }) = model.take_page_reopen()
+        else {
+            panic!("missing long collection");
+        };
+        let request = model
+            .open_standard_route(plugin, producer, StructuredRouteOutcome::Replace(route))
+            .unwrap();
+        context.session = request.session;
+        context.route = request.route;
+        context.revision = NonZeroU64::new(15).unwrap();
+        assert!(model.publish_standard_view(
+            owner(),
+            7,
+            ViewReply {
+                context,
+                descriptor: view
+            }
+        ));
+        let frame = model.frame().unwrap();
+        assert!(frame.navigation.preserve_scroll);
+        assert_eq!(frame.navigation.scroll, saved.scroll);
+        let output = settle_route(&renderer, &mut model, &frame, &mut time, vec![]);
+        assert!(visible_label(&output.output, &format!("Item {selected}")).is_none());
+        assert_eq!(model.navigation_scroll.row, manual.row);
+        assert!((model.navigation_scroll.offset - manual.offset).abs() < 0.01);
+        let restored_rect = visible_label(&output.output, &anchor_label).unwrap();
+        assert!(
+            (restored_rect.top() - manual_rect.top()).abs() < 0.01,
+            "Back must preserve actual painted row position"
+        );
+    }
+}
+
+fn settle_route_on_requested_repaints(
+    renderer: &egui::Context,
+    model: &mut LauncherViewModel,
+    frame: &ViewModel,
+    time: &mut f64,
+) -> NativeUiFrame {
+    for _ in 0..64 {
+        let output = paint_route(renderer, frame, *time, vec![]);
+        for command in &output.commands {
+            if let UiCommand::SetLogicalScroll(scroll) = command {
+                model.apply(UiCommand::SetLogicalScroll(scroll.clone()));
+            }
+        }
+        let delay = output.output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        if delay > std::time::Duration::from_millis(50) {
+            return output;
+        }
+        *time += delay
+            .max(std::time::Duration::from_secs_f64(1.0 / 60.0))
+            .as_secs_f64();
+    }
+    panic!("grid follow did not settle its requested repaints");
+}
+
+#[test]
+fn image_grid_keyboard_follow_is_visible_on_next_paint_after_each_pending_refresh() {
+    let mut view = (*descriptor(120)).clone();
+    let StandardView::Grid(grid) = &mut view.view else {
+        unreachable!()
+    };
+    grid.collection.initial_selection = Some(target(2));
+    let image = Arc::new(crikey_core::preview::PreviewImage {
+        width: 2,
+        height: 2,
+        rgba: [40, 140, 210, 255].repeat(4),
+    });
+    for presentation in Arc::make_mut(&mut grid.collection.items) {
+        presentation.image = Some(image.clone());
+    }
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let mut context = open(&mut model, "native-paging", Arc::new(view.clone()));
+    let renderer = create_launcher_context();
+    let mut time = 0.0;
+    let frame = model.frame().unwrap();
+    settle_route_on_requested_repaints(&renderer, &mut model, &frame, &mut time);
+    let restoration = model.navigation_restore;
+    let mut current = frame;
+    for _ in 0..3 {
+        let previous = model.selected;
+        assert!(matches!(
+            model.apply(UiCommand::PageDown),
+            Some(UiEffect::RefreshStandard(ViewRefreshReason::Selection))
+        ));
+        assert!(model.selected > previous);
+        let pending = model.frame().unwrap();
+        assert!(pending.navigation.standard_refresh_pending);
+        let started = time;
+        for elapsed in [0.0, 0.3, 0.6] {
+            time = started + elapsed;
+            // Native PageDown press is a host command; its release reaches egui.
+            let events = if elapsed == 0.0 {
+                vec![egui::Event::Key {
+                    key: egui::Key::PageDown,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }]
+            } else {
+                vec![]
+            };
+            let output = paint_route(&renderer, &pending, time, events);
+            assert!(visible_label(&output.output, &format!("Item {}", model.selected)).is_none());
+        }
+        context.revision = NonZeroU64::new(context.revision.get() + 1).unwrap();
+        view.title = format!("Grid | selected item-{} | query (empty)", model.selected);
+        assert!(model.publish_standard_view(
+            owner(),
+            7,
+            ViewReply {
+                context: context.clone(),
+                descriptor: Arc::new(view.clone()),
+            }
+        ));
+        current = model.frame().unwrap();
+        assert!(!current.navigation.preserve_scroll);
+        assert_eq!(model.navigation_restore, restoration);
+        let published = paint_route(&renderer, &current, time, vec![]);
+        assert_eq!(
+            published.output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+            std::time::Duration::ZERO,
+            "publishing keyboard selection must request its immediate follow paint"
+        );
+        time += 1.0 / 60.0;
+        let output = paint_route(&renderer, &current, time, vec![]);
+        assert_selected_surface_visible(
+            &output.output,
+            &format!("Item {}", current.selected),
+            renderer.style().visuals.clip_rect_margin,
+        );
+        let output = settle_route_on_requested_repaints(&renderer, &mut model, &current, &mut time);
+        assert_selected_surface_visible(
+            &output.output,
+            &format!("Item {}", current.selected),
+            renderer.style().visuals.clip_rect_margin,
+        );
+    }
+    let output = settle_route(
+        &renderer,
+        &mut model,
+        &current,
+        &mut time,
+        vec![
+            egui::Event::PointerMoved(egui::pos2(320.0, 200.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 900.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(visible_label(&output.output, &format!("Item {}", current.selected)).is_none());
+    let manual = model.navigation_scroll.clone();
+    let output = settle_route_on_requested_repaints(&renderer, &mut model, &current, &mut time);
+    assert_eq!(model.navigation_scroll, manual);
+    assert!(visible_label(&output.output, &format!("Item {}", current.selected)).is_none());
+}

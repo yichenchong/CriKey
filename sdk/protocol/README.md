@@ -120,6 +120,9 @@ preserve absent versus present-empty; omitted limits normalize to min 0/max
 8192. Decoders share the existing frame allocation budget, tighten it for each
 schema before allocation and accumulate nested fragments/counts/unknown bytes.
 Producer preflight accounts for sidecars and rows before serialization.
+Empty optional text/password values (including text defaults) are valid even
+when the minimum is positive; nonempty values still obey both byte bounds.
+Required fields reject empty values.
 
 Typed requests contain item ID, explicit optional-action presence, exactly
 32 fingerprint bytes and typed field values, never a legacy argument.
@@ -136,6 +139,10 @@ codes, or a fixed failure code. They carry no callback error message.
 Legacy SDK dispatch refuses schema-only targets even when an older host cannot
 consume their metadata. Existing catalog/suggestion callbacks remain compatible
 through optional metadata callbacks.
+Recoverable presentation callback errors and panics finish the current result
+stream with its ordinary failure terminal, without closing the connection or
+publishing schema authority. Typed callbacks use the request context's
+cooperative cancellation token; cancellation does not require a host timeout.
 
 Every typed submission makes its physical incarnation diagnostically sensitive
 before writer admission. The transition clears retained diagnostics; later

@@ -92,6 +92,8 @@ With results visible, the footer shows the current primary action and
 cancel. In compact mode the optional hint line reads
 `Up/Down navigate   Tab complete   Esc cancel`. Hide optional hints with
 `launcher.show-hints = false`; Settings and action affordances remain available.
+Long action sheets can be scrolled without changing the selected action.
+Manual scrolling stays put until action navigation changes the selection.
 Settings normally advertises `Ctrl+,`; on a web page it shows only **Settings**,
 because that shortcut belongs to the document. Web-page hints read
 `Tab navigate page   Esc close page`.
@@ -240,6 +242,12 @@ successful recent commands, without repeating favorites:
 command-home = "favorites-and-recent"
 ```
 
+Successful commands also earn recent-command and item-ranking credit when they
+open or replace a plugin view, even if their original launcher presentation has
+since changed. Errors and cancellation earn no credit; loading the opened view
+does not count as another command use. Typed arguments and process hotkeys do
+not add query recall or query-ranking affinity.
+
 Unavailable saved favorites remain visible in their saved order at home.
 Other unavailable saved preferences remain accessible in **Configure Commands**;
 removing a favorite or fallback membership does not erase its other preferences.
@@ -382,6 +390,14 @@ renderer; a form edits the same executable schema used by typed arguments.
 Lists use ordinary row navigation and `Ctrl/Cmd+K` or `Alt+Enter` for Actions.
 In a grid, Left/Right move within a row and Up/Down move spatially between rows;
 Page Up/Down move by pages of rows. Section headers never take selection.
+Double-click a grid tile to activate that exact item once, including a tile that
+was not selected. After a refresh, a keyboard-selected grid item is brought into
+view on the next paint without another scroll animation or key. Pointer scrolling,
+query anchors and Back restoration retain their existing scroll behavior rather
+than snapping back to the selected item.
+A tile's selection refresh keeps that grid visible for the second click. Its
+activation waits for the fresh definitions and is discarded if the executable
+changes or a newer input, Back, dismissal or view failure supersedes the gesture.
 Forms reuse the native typed editor: use **Run command**, Enter in a
 single-line/password field, or Ctrl/Cmd+Enter for multiline input. Required fields
 and fixed field failures follow the inline-input rules above.
@@ -514,8 +530,9 @@ first leaves focused preview/typed editing or an action search/submenu/panel,
 then returns to the previous view, then clears/dismisses root as applicable.
 The host retains the root query,
 owner-qualified selection, logical scope and list scroll anchor. Returning
-issues a fresh search, reconciles the exact owner/item, and clamps safely if
-it disappeared. Navigation is bounded to 16 entries including the current view
+issues a fresh search and reconciles the exact owner/item across partial
+publications. Explicit navigation or query editing supersedes that return
+selection. Navigation is bounded to 16 entries including the current view
 and 8 MiB of retained host content; shared result/icon allocations count once.
 An excessive push is refused with a visible reason.
 

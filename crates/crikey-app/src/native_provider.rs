@@ -1039,10 +1039,25 @@ struct NativePageSource {
     plugin: PluginId,
     supervisor: Arc<Mutex<NativeSupervisor>>,
     incarnations: NativeIncarnations,
+    admission: Option<ForegroundActionAdmission>,
+    gate: Arc<PreviewActionGate>,
 }
 
 impl PageBackend for NativePageSource {
     fn draw(&mut self, draw: &PageDraw) -> Result<crikey_core::PageFrame, String> {
+        let admission = match self.admission.take() {
+            Some(admission) => admission,
+            None => self
+                .gate
+                .reserve_foreground()
+                .map_err(|error| error.to_string())?,
+        };
+        let _guard = admission
+            .acquire(
+                Instant::now() + Duration::from_millis(NATIVE_CALL_TIMEOUT_MS),
+                &AtomicBool::new(false),
+            )
+            .map_err(|error| error.to_string())?;
         let mut supervisor = self.supervisor.lock().unwrap_or_else(|error| error.into_inner());
         with_native_worker(&mut supervisor, &self.plugin, &self.incarnations, |worker| {
             worker.page(&NativePageRequest {
@@ -3280,6 +3295,23 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         }
         producer.is_some_and(|producer| authority.current(owner, context, producer))
     }
+    fn view_presentation_available(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+        producer: u64,
+        pending: Option<&ActionRequestId>,
+    ) -> bool {
+        if self.admission.state() != crate::runtime_control::PluginAdmission::Open {
+            return false;
+        }
+        let source = self.view_producer(owner);
+        let mut authority = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        if source.is_none() {
+            authority.retire(owner, context.session);
+        }
+        source == Some(producer) && authority.presentation_available(owner, context, producer, pending)
+    }
     fn validate_view_link(
         &self,
         owner: &PluginId,
@@ -3670,6 +3702,11 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
                 session.page_id()
             )));
         }
+        let admission = self
+            .gates
+            .get(plugin)
+            .ok_or_else(|| crikey_core::CoreError::Invalid("native page owner unavailable".into()))?
+            .reserve_foreground()?;
         let session = PageSession::open(
             PageOpen {
                 plugin: plugin.clone(),
@@ -3683,6 +3720,8 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
                 plugin: plugin.clone(),
                 supervisor,
                 incarnations: Arc::clone(&self.incarnations),
+                admission: Some(admission),
+                gate: Arc::clone(&self.gates[plugin]),
             }),
             self.wake.handle(),
         )
@@ -4943,6 +4982,34 @@ mod query_history_receipt_tests {
             .submit_declared_command_with_receipt(&declaration, &source, Some("secret"))
             .is_err());
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn closed_admission_revokes_published_refresh_presentation_grace() {
+        for terminal in [None, Some(true), Some(false)] {
+            let item = item();
+            let owner = item.plugin_id.clone();
+            let (endpoint, receiver) = endpoint(item);
+            // The shared root-action fixture seeds preview connection liveness,
+            // not physical view authority. Match refresh_incarnation's separate
+            // physical publication before admitting any standard-view request.
+            endpoint
+                .incarnations
+                .lock()
+                .unwrap()
+                .physical
+                .insert(owner.clone(), 1);
+            assert_eq!(endpoint.view_producer(&owner), Some(1));
+            let endpoint = Arc::new(endpoint);
+            crate::standard_view::assert_closed_presentation_admission(
+                endpoint.clone(),
+                &receiver,
+                &endpoint.views,
+                &endpoint.admission,
+                owner,
+                terminal,
+            );
+        }
     }
 
     fn endpoint(

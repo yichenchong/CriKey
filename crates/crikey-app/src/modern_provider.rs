@@ -295,6 +295,9 @@ impl ModernPreviewEndpoint {
                 "plugin":identity.plugin.0, "incarnation":identity.incarnation,
                 "item":identity.item.0, "selection":identity.selection, "request":identity.request,
             });
+            if job.cancelled.load(Ordering::Acquire) {
+                control.cancel();
+            }
             let was_live = worker.is_alive();
             let reply = catch_unwind(AssertUnwindSafe(|| {
                 worker.preview(&current, &wire_identity).inspect_err(|error| {
@@ -3532,14 +3535,6 @@ impl ModernActionEndpoint {
         producer: u64,
         operation: crate::standard_view::ViewOperation,
     ) -> crikey_core::Result<ActionRequestId> {
-        for (_, cancelled) in self
-            .preview_pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            cancelled.store(true, Ordering::Release);
-        }
         let request_id = crate::standard_view::enqueue(
             &self.sender,
             &self.cancellation.admission,
@@ -3554,6 +3549,14 @@ impl ModernActionEndpoint {
             ACTION_IN_FLIGHT_CAPACITY,
             ACTION_TIMEOUT_MS,
         )?;
+        for (_, cancelled) in self
+            .preview_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            cancelled.store(true, Ordering::Release);
+        }
         self.mailbox.1.notify_one();
         Ok(request_id)
     }
@@ -3824,6 +3827,20 @@ impl crate::PluginActionExecutor for ModernActionEndpoint {
             authority.retire(owner, context.session);
         }
         producer.is_some_and(|producer| authority.current(owner, context, producer))
+    }
+    fn view_presentation_available(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+        producer: u64,
+        pending: Option<&ActionRequestId>,
+    ) -> bool {
+        let source = self.view_producer(owner);
+        let mut authority = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        if source.is_none() {
+            authority.retire(owner, context.session);
+        }
+        source == Some(producer) && authority.presentation_available(owner, context, producer, pending)
     }
     fn validate_view_link(
         &self,
@@ -5114,9 +5131,31 @@ mod preview_origin_tests {
 
     struct Fixture {
         root: PathBuf,
+        witnesses: PathBuf,
     }
 
     impl Fixture {
+        fn private_directory(path: &Path) {
+            let directory = fs::DirBuilder::new();
+            #[cfg(unix)]
+            let directory = {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut directory = directory;
+                directory.mode(0o700);
+                directory
+            };
+            directory.create(path).unwrap();
+        }
+
+        fn declare_witnesses(package: &Path, witnesses: &Path) {
+            Self::private_directory(witnesses);
+            fs::write(
+                package.join("preview-witness-directory"),
+                witnesses.to_str().unwrap(),
+            )
+            .unwrap();
+        }
+
         fn load(class: &str) -> (Self, ModernProvider, QueryPipeline) {
             Self::load_source(
                 class,
@@ -5134,13 +5173,22 @@ mod preview_origin_tests {
             second_owner: bool,
         ) -> (Self, ModernProvider, QueryPipeline) {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "crikey-modern-lifecycle-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/preview-handoff-fixtures")
+                .join(format!(
+                    "crikey-modern-lifecycle-{}-{}",
+                    std::process::id(),
+                    sequence
+                ));
+            let witnesses = std::env::temp_dir().join(format!(
+                "crikey-modern-preview-witness-{}-{sequence}",
+                std::process::id()
             ));
+            Self::private_directory(&witnesses);
             let package = root.join("plugins/fixture");
             fs::create_dir_all(&package).unwrap();
+            Self::declare_witnesses(&package, &witnesses.join("fixture"));
             fs::write(package.join("preview_plugin.py"), source).unwrap();
             fs::write(
                 package.join("crikey.toml"),
@@ -5155,6 +5203,7 @@ mod preview_origin_tests {
             if second_owner {
                 let second = root.join("plugins/second");
                 fs::create_dir_all(&second).unwrap();
+                Self::declare_witnesses(&second, &witnesses.join("second"));
                 fs::write(second.join("preview_plugin.py"), source).unwrap();
                 let manifest = fs::read_to_string(package.join("crikey.toml")).unwrap();
                 fs::write(
@@ -5177,7 +5226,7 @@ mod preview_origin_tests {
                 "{:?}",
                 provider.unavailable()
             );
-            (Self { root }, provider, pipeline)
+            (Self { root, witnesses }, provider, pipeline)
         }
 
         fn catalog(provider: &mut ModernProvider) -> CatalogBuildResult {
@@ -5209,6 +5258,7 @@ mod preview_origin_tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+            let _ = fs::remove_dir_all(&self.witnesses);
         }
     }
     fn wait_for(mut condition: impl FnMut() -> bool) {
@@ -5252,7 +5302,9 @@ import os, pathlib, time
 from crikey_sdk import Item, Plugin, Preview
 class TreeFixture(Plugin):
     def build_catalog(self):
-        root = pathlib.Path(__file__).parent
+        root = pathlib.Path(
+            pathlib.Path(__file__).with_name("preview-witness-directory").read_text(encoding="utf-8")
+        )
         root.joinpath("root-pid").write_text(str(os.getpid()))
         child = os.fork()
         if child == 0:
@@ -5279,7 +5331,7 @@ class TreeFixture(Plugin):
             ));
             let key = provider.loaded[0].key.clone();
             let producer = provider.pool.live_mut(&key).unwrap().incarnation();
-            let root = fixture.root.join("plugins/fixture");
+            let root = fixture.witnesses.join("fixture");
             wait_for(|| {
                 fs::read_to_string(root.join("child-pid")).is_ok_and(|pid| pid.parse::<i32>().is_ok())
             });
@@ -5339,7 +5391,10 @@ class TreeFixture(Plugin):
             r#"
 import pathlib
 from crikey_sdk import Plugin
-pathlib.Path(__file__).with_name("child-created").touch()
+witnesses = pathlib.Path(
+    pathlib.Path(__file__).with_name("preview-witness-directory").read_text(encoding="utf-8")
+)
+witnesses.joinpath("child-created").touch()
 class StopLazy(Plugin):
     def suggest(self, query, context):
         return None
@@ -5365,7 +5420,7 @@ class StopLazy(Plugin):
         let proof = thread::spawn(move || ticket.wait()).join().unwrap().unwrap();
         assert_eq!(proof.owners(), &[owner]);
         assert!(!driver.cancellation.failed.load(Ordering::Acquire));
-        assert!(!fixture.root.join("plugins/fixture/child-created").exists());
+        assert!(!fixture.witnesses.join("fixture/child-created").exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -5380,9 +5435,12 @@ import os, pathlib, time
 from crikey_sdk import Plugin
 class StopCrash(Plugin):
     def suggest(self, query, context):
-        pathlib.Path(__file__).with_name("started").write_text(str(os.getpid()))
+        root = pathlib.Path(
+            pathlib.Path(__file__).with_name("preview-witness-directory").read_text(encoding="utf-8")
+        )
+        root.joinpath("started").write_text(str(os.getpid()))
         deadline = time.monotonic() + 5
-        while not pathlib.Path(__file__).with_name("release").exists():
+        while not root.joinpath("release").exists():
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.002)
@@ -5391,7 +5449,7 @@ class StopCrash(Plugin):
             );
             let driver = ModernDriver::spawn(provider, pipeline, |_| {});
             driver.submit(Generation::ZERO, "crash", 0, Vec::new(), false, 0);
-            let root = fixture.root.join("plugins/fixture");
+            let root = fixture.witnesses.join("fixture");
             let marker = root.join("started");
             wait_for(|| fs::read_to_string(&marker).is_ok_and(|pid| pid.parse::<u32>().is_ok()));
             let pid = fs::read_to_string(marker).unwrap();
@@ -5435,9 +5493,12 @@ class StopCrash(Plugin):
 class StopViews(ViewsPlugin):
     async def structured_view(self, request, context):
         import time
-        Path(__file__).with_name("started").write_text(str(os.getpid()))
+        root = Path(
+            Path(__file__).with_name("preview-witness-directory").read_text(encoding="utf-8")
+        )
+        root.joinpath("started").write_text(str(os.getpid()))
         deadline = time.monotonic() + 5
-        while not Path(__file__).with_name("release").exists():
+        while not root.joinpath("release").exists():
             if time.monotonic() >= deadline:
                 raise RuntimeError("view release barrier expired")
             time.sleep(0.002)
@@ -5471,7 +5532,7 @@ class StopViews(ViewsPlugin):
                 },
             )
             .unwrap();
-        let marker = fixture.root.join("plugins/fixture/started");
+        let marker = fixture.witnesses.join("fixture/started");
         wait_for(|| fs::read_to_string(&marker).is_ok_and(|pid| pid.parse::<u32>().is_ok()));
         let pid = fs::read_to_string(marker).unwrap();
         let ticket = driver
@@ -5484,7 +5545,7 @@ class StopViews(ViewsPlugin):
         );
         let wait = thread::spawn(move || ticket.wait());
         assert!(!wait.is_finished(), "view callback has not physically returned");
-        fs::write(fixture.root.join("plugins/fixture/release"), "").unwrap();
+        fs::write(fixture.witnesses.join("fixture/release"), "").unwrap();
         wait.join().unwrap().unwrap();
         assert!(!Path::new("/proc").join(pid).exists());
         let completions = endpoint.poll_plugin_actions();
@@ -5504,9 +5565,12 @@ class StopViews(ViewsPlugin):
 class StopPreview(PreviewPlugin):
     async def preview(self, item, context):
         import pathlib, time
-        pathlib.Path(__file__).with_name("started").write_text(str(os.getpid()))
+        root = pathlib.Path(
+            pathlib.Path(__file__).with_name("preview-witness-directory").read_text(encoding="utf-8")
+        )
+        root.joinpath("started").write_text(str(os.getpid()))
         deadline = time.monotonic() + 5
-        while not pathlib.Path(__file__).with_name("release").exists():
+        while not root.joinpath("release").exists():
             if time.monotonic() >= deadline:
                 raise RuntimeError("preview release barrier expired")
             time.sleep(0.002)
@@ -5548,7 +5612,7 @@ class StopPreview(PreviewPlugin):
                 }),
             )
             .unwrap();
-        let marker = fixture.root.join("plugins/fixture/started");
+        let marker = fixture.witnesses.join("fixture/started");
         wait_for(|| fs::read_to_string(&marker).is_ok_and(|pid| pid.parse::<u32>().is_ok()));
         let pid = fs::read_to_string(marker).unwrap();
         let ticket = driver
@@ -5561,7 +5625,7 @@ class StopPreview(PreviewPlugin):
         );
         let wait = thread::spawn(move || ticket.wait());
         assert!(!wait.is_finished());
-        fs::write(fixture.root.join("plugins/fixture/release"), "").unwrap();
+        fs::write(fixture.witnesses.join("fixture/release"), "").unwrap();
         wait.join().unwrap().unwrap();
         assert!(matches!(terminal.recv().unwrap().state, PreviewState::Cancelled));
         assert!(!Path::new("/proc").join(pid).exists());
@@ -5579,7 +5643,10 @@ import os, pathlib, time
 from crikey_sdk import Item, Plugin, Preview
 class StopFixture(Plugin):
     def build_catalog(self):
-        pathlib.Path(__file__).with_name("started").write_text(str(os.getpid()))
+        root = pathlib.Path(
+            pathlib.Path(__file__).with_name("preview-witness-directory").read_text(encoding="utf-8")
+        )
+        root.joinpath("started").write_text(str(os.getpid()))
         time.sleep(0.2)
         return [Item(stable_id="row", label="Row", target="row", preview_deferred={})]
     def preview(self, item, context):
@@ -5597,7 +5664,7 @@ class StopFixture(Plugin):
                 provider.pool.workers.get(&key),
                 Some(WorkerLifecycle::CatalogBusy)
             ));
-            let marker = fixture.root.join("plugins/fixture/started");
+            let marker = fixture.witnesses.join("fixture/started");
             wait_for(|| fs::read_to_string(&marker).is_ok_and(|pid| pid.parse::<u32>().is_ok()));
             let pid = fs::read_to_string(&marker).unwrap();
             assert!(Path::new("/proc").join(&pid).exists());
@@ -5665,7 +5732,10 @@ import os, pathlib, time
 from crikey_sdk import Item, Plugin
 class StopFixture(Plugin):
     def suggest(self, query, context):
-        pathlib.Path(__file__).with_name("started").write_text(str(os.getpid()))
+        root = pathlib.Path(
+            pathlib.Path(__file__).with_name("preview-witness-directory").read_text(encoding="utf-8")
+        )
+        root.joinpath("started").write_text(str(os.getpid()))
         time.sleep(0.2)
         context.emit(Item(stable_id="row", label="Row", target="row"))
 "#,
@@ -5673,7 +5743,7 @@ class StopFixture(Plugin):
         let owner = provider.loaded[0].plugin.clone();
         let driver = ModernDriver::spawn(provider, pipeline, |_| {});
         driver.submit(Generation::ZERO, "start", 0, Vec::new(), false, 0);
-        let marker = fixture.root.join("plugins/fixture/started");
+        let marker = fixture.witnesses.join("fixture/started");
         wait_for(|| fs::read_to_string(&marker).is_ok_and(|pid| pid.parse::<u32>().is_ok()));
         let pid = fs::read_to_string(marker).unwrap();
         let control = driver.control();
@@ -5750,7 +5820,7 @@ class StopFixture(Plugin):
             };
             let driver = ModernDriver::spawn(provider, pipeline, |_| {});
             let endpoint = driver.action_executor();
-            let root = fixture.root.join("plugins/fixture");
+            let root = fixture.witnesses.join("fixture");
             let preview_state = Arc::new(Mutex::new(None));
             let sink = Arc::clone(&preview_state);
             driver
@@ -5871,8 +5941,8 @@ class StopFixture(Plugin):
         let declaration = &snapshot.owners[&action_owner].declarations[0];
         let driver = ModernDriver::spawn(provider, pipeline, |_| {});
         let endpoint = driver.action_executor();
-        let root = fixture.root.join("plugins/fixture");
-        let second = fixture.root.join("plugins/second");
+        let root = fixture.witnesses.join("fixture");
+        let second = fixture.witnesses.join("second");
         let mut native_pipeline = QueryPipeline::new(crate::PipelineConfig::default());
         let native_provider =
             crate::NativeProvider::load(&mut native_pipeline, &[], &DisabledPlugins::default());
@@ -5952,6 +6022,271 @@ class StopFixture(Plugin):
         assert_eq!(executions.lines().count(), 1);
         let event: serde_json::Value = serde_json::from_str(executions.trim()).unwrap();
         assert_eq!(event["argument"], "other owner");
+    }
+
+    #[test]
+    fn other_owner_ordinary_action_cancels_preview_on_shared_supervisor() {
+        fn wait_for(mut ready: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !ready() {
+                assert!(
+                    Instant::now() < deadline,
+                    "cross-owner preview handoff did not settle"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let (fixture, mut provider, mut pipeline) = Fixture::load_sources(
+            "HandoffPreview",
+            include_str!("../../../compatibility/test-plugins/modern-preview/preview_plugin.py"),
+            true,
+        );
+        provider.drive_query(&mut pipeline, "handoff", 1).unwrap();
+        let preview_owner = PluginId("modern.fixture".into());
+        let action_owner = PluginId("modern.second".into());
+        let item_id = ItemId("handoff".into());
+        let (preview_item, preview_origin) =
+            provider.action_items.lock().unwrap()[&(preview_owner.clone(), item_id.clone())].clone();
+        let (action_item, action_origin) =
+            provider.action_items.lock().unwrap()[&(action_owner.clone(), item_id)].clone();
+        let preview_budget = pipeline.plugin_budget(&preview_owner).unwrap().clone();
+        let action_budget = pipeline.plugin_budget(&action_owner).unwrap().clone();
+        let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+        let actions = driver.action_executor();
+        let preview_package = fixture.witnesses.join("fixture");
+        let action_package = fixture.witnesses.join("second");
+        let (send, receive) = mpsc::channel();
+        driver
+            .preview_endpoint
+            .submit(
+                PreviewRequest {
+                    identity: PreviewIdentity {
+                        view: 1,
+                        query: Generation::from_raw(1),
+                        plugin: preview_owner.clone(),
+                        incarnation: preview_origin,
+                        target: crikey_ui::ActionTarget::Result {
+                            owner: preview_owner.clone(),
+                            item: preview_item.stable_id.clone(),
+                        },
+                        catalog_source: None,
+                        item: preview_item.stable_id,
+                        selection: 1,
+                        request: 1,
+                    },
+                },
+                Arc::new(move |update| send.send(update).unwrap()),
+            )
+            .unwrap();
+        wait_for(|| preview_package.join("preview-started").exists());
+        fs::write(action_package.join("action-hold"), "").unwrap();
+        let action = action_item.actions[0].action_id.clone();
+        let before = Instant::now();
+        let request = actions
+            .submit_plugin_action(&action_owner, &action_item, &action, Some("other owner"))
+            .unwrap();
+        assert!(
+            before.elapsed() < Duration::from_secs(1),
+            "UI waited for another owner's preview"
+        );
+        wait_for(|| preview_package.join("preview-cancelled").exists());
+        assert_eq!(preview_budget.in_flight(BudgetKind::Action), 1);
+        assert_eq!(action_budget.in_flight(BudgetKind::Action), 1);
+        assert!(!action_package.join("executions").exists());
+        assert!(actions
+            .submit_plugin_action(&action_owner, &action_item, &action, None)
+            .is_err());
+        fs::write(preview_package.join("preview-release"), "").unwrap();
+        wait_for(|| action_package.join("executions").exists());
+        assert!(preview_package.join("preview-terminal").exists());
+        assert_eq!(preview_budget.in_flight(BudgetKind::Action), 0);
+        assert_eq!(action_budget.in_flight(BudgetKind::Action), 1);
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
+            PreviewState::Cancelled
+        ));
+        fs::write(action_package.join("action-release"), "").unwrap();
+        let mut completions = Vec::new();
+        wait_for(|| {
+            completions.extend(actions.poll_plugin_actions());
+            !completions.is_empty()
+        });
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].request_id, request);
+        assert!(completions[0].outcome.is_ok(), "{:?}", completions[0].outcome);
+        let executions = fs::read_to_string(action_package.join("executions")).unwrap();
+        assert_eq!(executions.lines().count(), 1);
+        let event: serde_json::Value = serde_json::from_str(executions.trim()).unwrap();
+        assert_eq!(event["argument"], "other owner");
+        assert!(!preview_package.join("executions").exists());
+        assert_eq!(
+            driver.preview_endpoint.incarnation(&preview_owner),
+            Some(preview_origin)
+        );
+        assert_eq!(
+            driver.preview_endpoint.incarnation(&action_owner),
+            Some(action_origin)
+        );
+        assert_eq!(action_budget.in_flight(BudgetKind::Action), 0);
+    }
+
+    #[test]
+    fn blocked_modern_preview_yields_once_without_releasing_quota_or_retagging_origin() {
+        fn wait_for(mut ready: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !ready() {
+                assert!(Instant::now() < deadline, "preview handoff did not settle");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        for mode in ["primary", "alternate", "cancel", "stale", "changed"] {
+            let (fixture, mut provider, mut pipeline) = Fixture::load("HandoffPreview");
+            provider.drive_query(&mut pipeline, "handoff", 1).unwrap();
+            let owner = provider.loaded[0].plugin.clone();
+            let key = (owner.clone(), ItemId("handoff".into()));
+            let (item, origin) = provider.action_items.lock().unwrap()[&key].clone();
+            let budget = pipeline.plugin_budget(&owner).unwrap().clone();
+            let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+            let actions = driver.action_executor();
+            let package = fixture.witnesses.join("fixture");
+            let (send, receive) = mpsc::channel();
+            let identity = PreviewIdentity {
+                view: 1,
+                query: Generation::from_raw(1),
+                plugin: owner.clone(),
+                incarnation: origin,
+                target: crikey_ui::ActionTarget::Result {
+                    owner: owner.clone(),
+                    item: item.stable_id.clone(),
+                },
+                catalog_source: None,
+                item: item.stable_id.clone(),
+                selection: 1,
+                request: 1,
+            };
+            driver
+                .preview_endpoint
+                .submit(
+                    PreviewRequest {
+                        identity: identity.clone(),
+                    },
+                    Arc::new(move |update| send.send(update).unwrap()),
+                )
+                .unwrap();
+            wait_for(|| package.join("preview-started").exists());
+            if mode == "stale" {
+                driver
+                    .action_endpoint
+                    .items
+                    .lock()
+                    .unwrap()
+                    .get_mut(&key)
+                    .unwrap()
+                    .1 = origin + 1;
+            }
+            let action = ActionId(
+                if mode == "alternate" {
+                    "alternate"
+                } else {
+                    "primary"
+                }
+                .into(),
+            );
+            let before = Instant::now();
+            let admission = actions.submit_plugin_action(&owner, &item, &action, Some("literal argument"));
+            if mode == "stale" {
+                let refusal = admission.expect_err("a mismatched dynamic producer must refuse admission");
+                assert!(refusal.to_string().contains("no longer current"), "{refusal}");
+                assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+                assert!(!package.join("preview-cancelled").exists());
+                assert!(!package.join("executions").exists());
+                assert!(actions.poll_plugin_actions().is_empty());
+                driver.preview_endpoint.cancel(&identity);
+                wait_for(|| package.join("preview-cancelled").exists());
+                fs::write(package.join("preview-release"), "").unwrap();
+                assert!(matches!(
+                    receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
+                    PreviewState::Cancelled
+                ));
+                assert_eq!(budget.in_flight(BudgetKind::Action), 0);
+                continue;
+            }
+            let request = admission.unwrap();
+            assert!(before.elapsed() < Duration::from_secs(1), "UI waited for preview");
+            wait_for(|| package.join("preview-cancelled").exists());
+            assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+            assert!(
+                !package.join("executions").exists(),
+                "cancel is not callback retirement"
+            );
+            assert!(actions
+                .submit_plugin_action(&owner, &item, &action, None)
+                .is_err());
+            if mode == "cancel" {
+                assert!(actions.cancel_plugin_action(&request));
+            } else if mode == "primary" || mode == "alternate" {
+                fs::write(package.join("action-hold"), "").unwrap();
+            } else if mode == "changed" {
+                let mut items = driver.action_endpoint.items.lock().unwrap();
+                let replacement = &mut items.get_mut(&key).unwrap().0;
+                replacement.actions.clear();
+                replacement.target = "replacement target".into();
+            }
+            fs::write(package.join("preview-release"), "").unwrap();
+            if mode == "primary" || mode == "alternate" {
+                wait_for(|| package.join("executions").exists());
+                assert!(package.join("preview-terminal").exists());
+                assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+                assert!(actions
+                    .submit_plugin_action(&owner, &item, &action, None)
+                    .is_err());
+                fs::write(package.join("action-release"), "").unwrap();
+            }
+            let mut completions = Vec::new();
+            wait_for(|| {
+                completions.extend(actions.poll_plugin_actions());
+                !completions.is_empty()
+            });
+            assert_eq!(completions.len(), 1);
+            assert_eq!(completions[0].request_id, request);
+            if mode == "changed" {
+                assert!(
+                    completions[0]
+                        .outcome
+                        .as_ref()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("changed after admission"),
+                    "{:?}",
+                    completions[0].outcome
+                );
+            }
+            assert_eq!(
+                completions[0].outcome.is_ok(),
+                mode == "primary" || mode == "alternate"
+            );
+            assert!(matches!(
+                receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
+                PreviewState::Cancelled
+            ));
+            assert_eq!(budget.in_flight(BudgetKind::Action), 0);
+            if mode == "primary" || mode == "alternate" {
+                let executions = fs::read_to_string(package.join("executions")).unwrap();
+                assert_eq!(executions.lines().count(), 1);
+                let event: serde_json::Value = serde_json::from_str(executions.trim()).unwrap();
+                assert_eq!(
+                    event["pid"].to_string(),
+                    fs::read_to_string(package.join("preview-started")).unwrap()
+                );
+                assert_eq!(event["target"], "frozen target");
+                assert_eq!(event["action"], action.0);
+                assert_eq!(event["argument"], "literal argument");
+                assert_eq!(driver.preview_endpoint.incarnation(&owner), Some(origin));
+            } else {
+                assert!(!package.join("executions").exists());
+            }
+            assert!(actions.poll_plugin_actions().is_empty());
+        }
     }
 
     #[test]
@@ -6236,6 +6571,24 @@ mod query_history_receipt_tests {
         );
     }
 
+    #[test]
+    fn closed_admission_revokes_published_refresh_presentation_grace() {
+        for terminal in [None, Some(true), Some(false)] {
+            let item = item();
+            let owner = item.plugin_id.clone();
+            let (endpoint, receiver) = endpoint(item);
+            let endpoint = Arc::new(endpoint);
+            crate::standard_view::assert_closed_presentation_admission(
+                endpoint.clone(),
+                &receiver,
+                &endpoint.views,
+                &endpoint.cancellation.admission,
+                owner,
+                terminal,
+            );
+        }
+    }
+
     fn endpoint(
         item: Item,
     ) -> (
@@ -6281,6 +6634,83 @@ mod query_history_receipt_tests {
             },
             crate::standard_view::ActionReceiver(receiver),
         )
+    }
+
+    #[test]
+    fn full_view_mailbox_does_not_cancel_an_unreserved_cross_owner_preview() {
+        use crikey_core::structured_view::*;
+        use std::num::NonZeroU64;
+
+        let item = item();
+        let owner = item.plugin_id.clone();
+        let (mut endpoint, receiver) = endpoint(item);
+        let preview_owner = PluginId("modern.preview-owner".into());
+        let preview_budget = crikey_plugin_supervisor::shared_budget_from_section(&Default::default());
+        let preview_gate = PreviewActionGate::new(Arc::clone(&preview_budget));
+        endpoint
+            .gates
+            .insert(preview_owner.clone(), Arc::clone(&preview_gate));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let preview = preview_gate.try_preview(cancelled.clone()).unwrap();
+        endpoint.preview_pending.lock().unwrap().push((
+            PreviewIdentity {
+                view: 1,
+                query: Generation::ZERO,
+                plugin: preview_owner.clone(),
+                incarnation: 1,
+                item: ItemId("preview".into()),
+                target: crikey_ui::ActionTarget::Result {
+                    owner: preview_owner,
+                    item: ItemId("preview".into()),
+                },
+                catalog_source: None,
+                selection: 1,
+                request: 1,
+            },
+            Arc::clone(&cancelled),
+        ));
+        endpoint
+            .in_flight
+            .store(ACTION_IN_FLIGHT_CAPACITY, Ordering::Release);
+        let request = ViewRequest {
+            mode: ViewRequestMode::Open,
+            route: RouteId("gallery".into()),
+            session: ViewSessionIdentity {
+                logical_view: NonZeroU64::new(1).unwrap(),
+                surface: NonZeroU64::new(1).unwrap(),
+            },
+            previous_revision: None,
+            state: None,
+            query: String::new(),
+            scroll: None,
+            reason: ViewRefreshReason::Explicit,
+        };
+        assert_eq!(endpoint.view_producer(&owner), Some(1));
+        assert!(endpoint.gates.contains_key(&owner));
+        request.validate().unwrap();
+        // The helper intentionally shares unavailable() across refusal paths.
+        // This valid Open/owner/producer and the exhausted capacity counter,
+        // not the generic error text, establish the capacity-refusal path.
+        let error = endpoint
+            .enqueue_view(&owner, 1, crate::standard_view::ViewOperation::Request(request))
+            .expect_err("a full view mailbox must refuse before reserving foreground intent");
+        assert!(
+            matches!(&error, crikey_core::CoreError::Invalid(message)
+                if message == "standard view is unavailable"),
+            "{error}"
+        );
+        assert_eq!(
+            endpoint.in_flight.load(Ordering::Acquire),
+            ACTION_IN_FLIGHT_CAPACITY
+        );
+        assert!(!cancelled.load(Ordering::Acquire));
+        assert_eq!(preview_budget.in_flight(BudgetKind::Action), 1);
+        assert!(!preview_gate.has_foreground());
+        assert!(!endpoint.gates[&owner].has_foreground());
+        assert!(endpoint.pending.lock().unwrap().is_empty());
+        assert!(receiver.try_recv().is_err());
+        drop(preview);
+        assert_eq!(preview_budget.in_flight(BudgetKind::Action), 0);
     }
 
     #[test]

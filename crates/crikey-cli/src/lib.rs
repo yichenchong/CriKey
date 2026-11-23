@@ -880,6 +880,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     let mut action_activity = std::collections::BTreeMap::new();
     let mut view_actions = std::collections::BTreeSet::new();
     let mut live_standard: Option<std::sync::Arc<crikey_ui::standard_view::StandardSurface>> = None;
+    let mut standard_activation_session = None;
     let mut command_projection_dirty = true;
     let mut active_root_query = String::new();
     let mut pending_command_learning: std::collections::BTreeMap<
@@ -984,6 +985,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             let mut hotkey_receipts = hotkeys.drain_events();
             if quit_after_history_reset { hotkey_receipts.clear(); }
             if !hotkey_receipts.is_empty() {
+                view_model.clear_standard_activation();
+                standard_activation_session = None;
                 hotkey_intent = hotkey_intent.checked_add(1).expect("shortcut intent exhausted");
             }
             let mut page_failure_status = None;
@@ -1177,6 +1180,26 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     }
                     continue;
                 }
+                // Success evidence belongs to admission, not to the still-current
+                // presentation. Drain it once before any navigation/typed early exit.
+                if let Some(learning) = take_success_learning(
+                    &completion,
+                    &mut pending_command_learning,
+                    &mut pending_ordinary_learning,
+                    &mut pending_typed_items,
+                    || history_clock.advance(),
+                ) {
+                    command_projection_dirty = true;
+                    if let Err(message) = publish_learning(
+                        learning,
+                        &mut search,
+                        &history_writer,
+                        ranking_reset_pending,
+                        &mut deferred_learning,
+                    ) {
+                        view_model.set_navigation_notice(message);
+                    }
+                }
                 if let Ok(ActionEffect::Navigate { outcome, producer }) = &completion.outcome {
                     let activity = action_activity.remove(&completion.request_id);
                     let typed = typed_requests.remove(&completion.request_id);
@@ -1200,9 +1223,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             }
                         }
                     }
-                    pending_command_learning.remove(&completion.request_id);
-                    pending_ordinary_learning.remove(&completion.request_id);
-                    pending_typed_items.remove(&completion.request_id);
                     continue;
                 }
                 action_activity.remove(&completion.request_id);
@@ -1215,65 +1235,10 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             crikey_core::structured_arguments::SubmissionFailureCode::Failed,
                         ),
                     };
-                    let command_learning = pending_command_learning.remove(&completion.request_id);
-                    let item_learning = pending_typed_items.remove(&completion.request_id);
-                    if matches!(
-                        &outcome,
-                        crikey_core::structured_arguments::SubmissionOutcome::Completed
-                    ) {
-                        let time = history_clock.advance();
-                        let learning = command_learning
-                            .map(|learning| command_history::Learning::Command(learning, time))
-                            .or_else(|| {
-                                item_learning.map(|item| command_history::Learning::ItemSelection(item, time))
-                            });
-                        if let Some(learning) = learning {
-                            command_projection_dirty = true;
-                            if let Err(message) = publish_learning(
-                                learning,
-                                &mut search,
-                                &history_writer,
-                                ranking_reset_pending,
-                                &mut deferred_learning,
-                            ) {
-                                view_model.set_navigation_notice(message);
-                            }
-                        }
-                    }
                     if view_model.accepts_typed_draft(revision, draft_revision, view, generation) {
                         view_model.inline_arguments_completed(revision, draft_revision, outcome);
                     }
                     continue;
-                }
-                let command_learning = pending_command_learning.remove(&completion.request_id);
-                let ordinary_learning = pending_ordinary_learning.remove(&completion.request_id);
-                if matches!(
-                    &completion.outcome,
-                    Ok(ActionEffect::Completed
-                        | ActionEffect::ShowPage { .. }
-                        | ActionEffect::Typed(
-                            crikey_core::structured_arguments::SubmissionOutcome::Completed
-                        ))
-                ) {
-                    let time = history_clock.advance();
-                    let learning = command_learning
-                        .map(|evidence| command_history::Learning::Command(evidence, time))
-                        .or_else(|| {
-                            ordinary_learning
-                                .map(|evidence| command_history::Learning::Ordinary(evidence, time))
-                        });
-                    if let Some(learning) = learning {
-                        command_projection_dirty = true;
-                        if let Err(message) = publish_learning(
-                            learning,
-                            &mut search,
-                            &history_writer,
-                            ranking_reset_pending,
-                            &mut deferred_learning,
-                        ) {
-                            view_model.set_navigation_notice(message);
-                        }
-                    }
                 }
                 let origin = action_origins.remove(&completion.request_id).flatten();
                 let may_present = origin.is_some_and(|(view, session)| {
@@ -1353,8 +1318,10 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 report_status(&mut view_model, message);
             }
             if let Some(surface) = view_model.standard_surface() {
-                if !search.view_current(&surface.owner, &surface.context) {
-                    search.retire_view(&surface.owner, surface.context.session);
+                let pending = view_model.view().and_then(|(view, _)| {
+                    pending_standard_refresh(&view_requests, &surface.owner, surface.producer, view)
+                });
+                if search.retire_unavailable_view(&surface.owner, &surface.context, surface.producer, pending) {
                     view_model.standard_unavailable();
                 }
             }
@@ -1762,7 +1729,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             }
 
             let mut root_submission = false;
-            let (command_session, effect) = match event {
+            let (mut command_session, effect) = match event {
                 NativeLauncherEvent::Activated => {
                     // A rapid off/on hotkey pair may supersede the queued
                     // dismissal. Reset the old session before opening the new
@@ -1781,6 +1748,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     (None, None)
                 }
                 NativeLauncherEvent::Command { session, command } => {
+                    match &command {
+                        crikey_ui::UiCommand::StandardDoubleClick { .. } => standard_activation_session = Some(session),
+                        crikey_ui::UiCommand::SetLogicalScroll(_) => {}
+                        _ => standard_activation_session = None,
+                    }
                     root_submission = matches!(&command, crikey_ui::UiCommand::ExecuteDefault)
                         && (view_model.submitted_root_query().is_some()
                             || view_model.submitted_command_query().is_some());
@@ -1873,6 +1845,19 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 NativeLauncherEvent::ProviderAnswer => (None, None),
                 NativeLauncherEvent::ActionCompletion => (None, None),
             };
+
+            let effect = effect.or_else(|| {
+                let session = standard_activation_session?;
+                if !render_handle.is_visible_session(session) {
+                    return None;
+                }
+                let effect = view_model.take_standard_activation();
+                if effect.is_some() {
+                    command_session = Some(session);
+                    standard_activation_session = None;
+                }
+                effect
+            });
 
             // Read before the match consumes the effect: the window and the
             // process are one decision made in one place, so no arm can grow
@@ -4469,6 +4454,36 @@ fn measurement_failure(config: &BenchmarkConfig, report: &BenchmarkReport) -> Op
     None
 }
 
+/// Consume frozen evidence on every terminal completion, crediting only success.
+/// A route-open reply has its own request ID and cannot credit the invocation twice.
+fn take_success_learning(
+    completion: &crikey_app::PluginActionCompletion,
+    commands: &mut std::collections::BTreeMap<crikey_app::ActionRequestId, crikey_app::CommandLearning>,
+    ordinary: &mut std::collections::BTreeMap<crikey_app::ActionRequestId, crikey_app::SelectionLearning>,
+    typed_items: &mut std::collections::BTreeMap<crikey_app::ActionRequestId, Item>,
+    time: impl FnOnce() -> u64,
+) -> Option<command_history::Learning> {
+    let command = commands.remove(&completion.request_id);
+    let ordinary = ordinary.remove(&completion.request_id);
+    let typed_item = typed_items.remove(&completion.request_id);
+    if !matches!(
+        &completion.outcome,
+        Ok(ActionEffect::Completed
+            | ActionEffect::ShowPage { .. }
+            | ActionEffect::Navigate { .. }
+            | ActionEffect::Typed(crikey_core::structured_arguments::SubmissionOutcome::Completed))
+    ) {
+        return None;
+    }
+    if let Some(command) = command {
+        Some(command_history::Learning::Command(command, time()))
+    } else if let Some(ordinary) = ordinary {
+        Some(command_history::Learning::Ordinary(ordinary, time()))
+    } else {
+        typed_item.map(|item| command_history::Learning::ItemSelection(item, time()))
+    }
+}
+
 fn publish_learning(
     learning: command_history::Learning,
     search: &mut SearchService,
@@ -4610,6 +4625,19 @@ fn publish_projected_rows(
 // Correlation only: current query, selection, scope and drafts remain in P3.
 type PendingViewRequests =
     std::collections::BTreeMap<crikey_app::ActionRequestId, (PluginId, u64, crikey_ui::ViewId, u64)>;
+
+fn pending_standard_refresh<'a>(
+    pending: &'a PendingViewRequests,
+    owner: &PluginId,
+    producer: u64,
+    view: crikey_ui::ViewId,
+) -> Option<&'a crikey_app::ActionRequestId> {
+    pending
+        .iter()
+        .find_map(|(id, (target_owner, target_producer, target_view, _))| {
+            (target_owner == owner && *target_producer == producer && *target_view == view).then_some(id)
+        })
+}
 
 fn coalesce_standard_refresh(
     pending: &PendingViewRequests,
@@ -7495,12 +7523,229 @@ mod tests {
             .iter()
             .any(|choice| choice.identity == selected.identity));
     }
+
+    #[test]
+    fn navigation_success_learns_frozen_ordinary_typed_and_hotkey_evidence_after_presentation_is_superseded()
+    {
+        use crikey_core::structured_view::{
+            CollectionView, RouteId, StandardView, StructuredRouteOutcome, ViewDescriptor,
+            ViewExecutionContext, ViewReply, ViewSessionIdentity,
+        };
+        for replace in [false, true] {
+            for mode in 0..5 {
+                let mut search = ranked_service(&["Route command", "Replacement"]);
+                search.submit_query("Route").unwrap();
+                let item = application("Route command");
+                let mut reference = crikey_core::command::builtin_commands().remove(0).reference;
+                reference.provider_id = item.plugin_id.clone();
+                reference.command_id = "open-route".into();
+                let request = crikey_app::ActionRequestId {
+                    plugin: item.plugin_id.clone(),
+                    sequence: 1,
+                };
+                let mut commands = std::collections::BTreeMap::new();
+                let mut ordinary = std::collections::BTreeMap::new();
+                let mut typed_items = std::collections::BTreeMap::new();
+                if mode == 0 {
+                    ordinary.insert(
+                        request.clone(),
+                        search
+                            .selection_learning(&item.plugin_id, &item.stable_id)
+                            .unwrap(),
+                    );
+                } else if mode == 1 {
+                    typed_items.insert(request.clone(), item.clone());
+                } else {
+                    commands.insert(
+                        request.clone(),
+                        crikey_app::CommandLearning {
+                            reference: reference.clone(),
+                            item: item.clone(),
+                            // Typed/password and process-hotkey admissions carry no query text.
+                            query: (mode == 4).then(|| {
+                                search
+                                    .selection_learning(&item.plugin_id, &item.stable_id)
+                                    .unwrap()
+                                    .query
+                            }),
+                        },
+                    );
+                }
+                // The source row is gone; learning has no presentation-eligibility input.
+                search.submit_query("Replacement").unwrap();
+                let route = RouteId("opened".into());
+                let completion = crikey_app::PluginActionCompletion {
+                    request_id: request.clone(),
+                    plugin: item.plugin_id.clone(),
+                    item_id: item.stable_id.clone(),
+                    action_id: None,
+                    outcome: Ok(ActionEffect::Navigate {
+                        outcome: if replace {
+                            StructuredRouteOutcome::Replace(route)
+                        } else {
+                            StructuredRouteOutcome::Push(route)
+                        },
+                        producer: 7,
+                    }),
+                };
+                let learning = take_success_learning(
+                    &completion,
+                    &mut commands,
+                    &mut ordinary,
+                    &mut typed_items,
+                    || 100,
+                )
+                .unwrap();
+                let writer = command_history::HistoryWorker::spawn(None, || {}).unwrap();
+                publish_learning(learning, &mut search, &writer, false, &mut Vec::new()).unwrap();
+                let snapshot = search.selection_history_snapshot();
+                assert_eq!(snapshot.selections.len(), 1);
+                assert_eq!(snapshot.selections[0].item, item.stable_id);
+                assert_eq!(snapshot.selections[0].frequency, 1);
+                assert_eq!(snapshot.commands.len(), usize::from(mode >= 2));
+                if mode >= 2 {
+                    assert_eq!(snapshot.commands[0].reference, reference);
+                    assert_eq!(snapshot.commands[0].frequency, 1);
+                }
+                assert_eq!(
+                    snapshot.query_affinities.len(),
+                    usize::from(mode == 0 || mode == 4)
+                );
+                assert!(snapshot
+                    .query_affinities
+                    .iter()
+                    .all(|affinity| affinity.query == "route"));
+                // Re-draining or the separate route-open completion has no admission evidence.
+                assert!(take_success_learning(
+                    &completion,
+                    &mut commands,
+                    &mut ordinary,
+                    &mut typed_items,
+                    || panic!("duplicate credit")
+                )
+                .is_none());
+                let opened = crikey_app::PluginActionCompletion {
+                    request_id: crikey_app::ActionRequestId {
+                        sequence: 2,
+                        ..request
+                    },
+                    outcome: Ok(ActionEffect::View(ViewReply {
+                        context: ViewExecutionContext {
+                            route: RouteId("opened".into()),
+                            session: ViewSessionIdentity {
+                                logical_view: std::num::NonZeroU64::new(1).unwrap(),
+                                surface: std::num::NonZeroU64::new(2).unwrap(),
+                            },
+                            revision: std::num::NonZeroU64::new(1).unwrap(),
+                        },
+                        descriptor: Arc::new(ViewDescriptor {
+                            title: "Opened".into(),
+                            definitions: Arc::from([]),
+                            view: StandardView::List(CollectionView {
+                                items: Arc::from([]),
+                                sections: vec![],
+                                scopes: vec![],
+                                initial_selection: None,
+                                initial_scope: None,
+                            }),
+                        }),
+                    })),
+                    ..completion
+                };
+                assert!(take_success_learning(
+                    &opened,
+                    &mut commands,
+                    &mut ordinary,
+                    &mut typed_items,
+                    || panic!("route-open credit")
+                )
+                .is_none());
+                assert_eq!(search.selection_history_snapshot(), snapshot);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_or_cancelled_navigation_invocations_consume_evidence_without_learning() {
+        use crikey_core::structured_arguments::{SubmissionFailureCode, SubmissionOutcome};
+        for outcome in [
+            Err(crikey_core::CoreError::Invalid("failed".into())),
+            Ok(ActionEffect::Typed(SubmissionOutcome::Failed(
+                SubmissionFailureCode::Cancelled,
+            ))),
+            Ok(ActionEffect::Typed(SubmissionOutcome::Failed(
+                SubmissionFailureCode::Failed,
+            ))),
+        ] {
+            let item = application("Route command");
+            let request = crikey_app::ActionRequestId {
+                plugin: item.plugin_id.clone(),
+                sequence: 1,
+            };
+            let completion = crikey_app::PluginActionCompletion {
+                request_id: request.clone(),
+                plugin: item.plugin_id.clone(),
+                item_id: item.stable_id.clone(),
+                action_id: None,
+                outcome,
+            };
+            let mut commands = std::collections::BTreeMap::new();
+            let mut ordinary = std::collections::BTreeMap::new();
+            let mut typed_items = std::collections::BTreeMap::from([(request, item)]);
+            assert!(take_success_learning(
+                &completion,
+                &mut commands,
+                &mut ordinary,
+                &mut typed_items,
+                || panic!("failure advanced learning")
+            )
+            .is_none());
+            assert!(typed_items.is_empty());
+        }
+    }
 }
 
 #[cfg(test)]
 mod standard_refresh_coalescing_tests {
     use super::*;
     use crikey_core::structured_view::ViewRefreshReason;
+
+    #[test]
+    fn presentation_grace_uses_only_the_exact_owner_producer_and_logical_view() {
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        let root = model.view().unwrap().0;
+        let owner = PluginId("views".into());
+        model
+            .open_standard_route(
+                owner.clone(),
+                11,
+                crikey_core::structured_view::StructuredRouteOutcome::Push(
+                    crikey_core::structured_view::RouteId("list".into()),
+                ),
+            )
+            .unwrap();
+        let view = model.view().unwrap().0;
+        assert_ne!(root, view);
+        let request = crikey_app::ActionRequestId {
+            plugin: owner.clone(),
+            sequence: 7,
+        };
+        for (target_owner, producer, target_view) in [
+            (PluginId("other".into()), 11, view),
+            (owner.clone(), 12, view),
+            (owner.clone(), 11, root),
+        ] {
+            let pending =
+                PendingViewRequests::from([(request.clone(), (target_owner, producer, target_view, 1))]);
+            assert!(pending_standard_refresh(&pending, &owner, 11, view).is_none());
+        }
+        let pending = PendingViewRequests::from([(request.clone(), (owner.clone(), 11, view, 1))]);
+        assert_eq!(
+            pending_standard_refresh(&pending, &owner, 11, view),
+            Some(&request)
+        );
+    }
 
     #[test]
     fn rapid_refresh_intents_keep_one_correlation_and_only_the_latest_reason() {

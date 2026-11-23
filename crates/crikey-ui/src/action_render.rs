@@ -153,20 +153,24 @@ pub(super) fn draw(
             {
                 commands.push(UiCommand::ActivateSelectedAction);
             }
-            let scroll_id = egui::Id::new("crikey-action-scroll-selection");
-            let previous = ui
-                .ctx()
-                .data(|data| data.get_temp::<(u64, Option<ActionIdentity>)>(scroll_id));
-            let selection_changed = previous.as_ref().is_some_and(|(token, selected)| {
-                *token == panel.focus_token() && selected.as_ref() != panel.selected()
+            // Follow selection/layout changes, not repaints: wheel and scrollbar
+            // gestures must be free to leave the selected entry off screen.
+            let selection_changed = ui.ctx().data_mut(|data| {
+                let previous = data.get_temp_mut_or_default::<(u64, u64, Option<ActionIdentity>)>(
+                    egui::Id::new("crikey-action-scroll-selection"),
+                );
+                let changed = previous.0 != panel.focus_token()
+                    || previous.1 != panel.layout_revision()
+                    || previous.2.as_ref() != panel.selected();
+                if changed {
+                    *previous = (
+                        panel.focus_token(),
+                        panel.layout_revision(),
+                        panel.selected().cloned(),
+                    );
+                }
+                changed
             });
-            if previous.as_ref().is_none_or(|(token, selected)| {
-                *token != panel.focus_token() || selected.as_ref() != panel.selected()
-            }) {
-                ui.ctx().data_mut(|data| {
-                    data.insert_temp(scroll_id, (panel.focus_token(), panel.selected().cloned()))
-                });
-            }
             egui::ScrollArea::vertical()
                 .id_salt("crikey-action-entries")
                 .max_height(ui.available_height())
@@ -311,7 +315,8 @@ pub(super) fn draw(
                                 });
                             }
                         }
-                        if selection_changed && entry.selected && !response.rect.intersects(ui.clip_rect()) {
+                        if selection_changed && entry.selected && !ui.clip_rect().contains_rect(response.rect)
+                        {
                             response.scroll_to_me(None);
                         }
                     }

@@ -12,6 +12,7 @@ use crikey_plugin_sdk::{
 struct PreviewDemo {
     enabled: bool,
     prepared: bool,
+    witnesses: Option<std::path::PathBuf>,
 }
 fn items() -> Vec<crikey_core::Item> {
     ["text", "markdown", "long", "image", "slow", "empty", "error"]
@@ -27,6 +28,13 @@ fn items() -> Vec<crikey_core::Item> {
 
 impl Plugin for PreviewDemo {
     fn start(&mut self, _: &dyn PluginContext) -> Result<()> {
+        // Test consumers declare an exact scratch directory in this read-only
+        // package file; the installed package itself is never writable.
+        self.witnesses = match std::fs::read_to_string("preview-witness-directory") {
+            Ok(directory) => Some(directory.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(CoreError::Invalid(error.to_string())),
+        };
         Ok(())
     }
     fn stop(&mut self, _: &dyn PluginContext) -> Result<()> {
@@ -45,7 +53,31 @@ impl Plugin for PreviewDemo {
         sink.emit_batch(items())?;
         sink.finish()
     }
-    fn execute(&mut self, _: ExecuteRequest, _: &dyn PluginContext) -> Result<()> {
+    fn execute(&mut self, request: ExecuteRequest, _: &dyn PluginContext) -> Result<()> {
+        if let Some(witnesses) = &self.witnesses {
+            use std::io::Write as _;
+            if !witnesses.join("preview-terminal").exists() {
+                return Err(CoreError::Invalid("action overlapped preview callback".into()));
+            }
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(witnesses.join("executions"))
+                .map_err(|error| CoreError::Invalid(error.to_string()))?;
+            writeln!(
+                log,
+                "{}:{}:{}",
+                std::process::id(),
+                request.item.0,
+                request.action.as_ref().map_or("none", |action| action.0.as_str())
+            )
+            .map_err(|error| CoreError::Invalid(error.to_string()))?;
+            let hold = witnesses.join("action-hold");
+            let release = witnesses.join("action-release");
+            while hold.exists() && !release.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         Ok(())
     }
     fn supports_preview(&self) -> bool {
@@ -64,6 +96,30 @@ impl Plugin for PreviewDemo {
             return Err(CoreError::Invalid("demonstration preview failure".into()));
         }
         if item_id == "slow" {
+            if let Some(witnesses) = &self.witnesses {
+                let pid = std::process::id().to_string();
+                let record = |name| {
+                    std::fs::write(witnesses.join(name), &pid)
+                        .map_err(|error| CoreError::Invalid(error.to_string()))
+                };
+                record("preview-started")?;
+                let mut observed_cancel = false;
+                let release = witnesses.join("preview-release");
+                while !release.exists() {
+                    if context.cancellation().is_cancelled() && !observed_cancel {
+                        record("preview-cancelled")?;
+                        observed_cancel = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                record("preview-terminal")?;
+                // Deliberately return content even after cancellation. The
+                // consumer must reject it without inventing an early terminal.
+                return Ok(PreviewOutcome::Content(PreviewContent {
+                    text: Some(PreviewText::Plain("late speculative content".into())),
+                    ..Default::default()
+                }));
+            }
             // This real protocol record synchronizes the conformance consumer:
             // it may cancel only after this callback has actually begun.
             context.log(crikey_plugin_sdk::LogLevel::Debug, "preview callback started");
@@ -130,6 +186,7 @@ fn main() {
         &mut PreviewDemo {
             enabled,
             prepared: false,
+            witnesses: None,
         },
         ServeConfig::new("preview-demo", "0.1.0"),
     ) {

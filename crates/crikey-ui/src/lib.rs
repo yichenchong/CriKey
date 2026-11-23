@@ -523,6 +523,11 @@ pub enum UiCommand {
         context: crikey_core::structured_view::ViewExecutionContext,
         executable: crikey_core::structured_arguments::ExecutableKey,
     },
+    /// A deliberate grid gesture, deferrable only across its own selection refresh.
+    StandardDoubleClick {
+        context: crikey_core::structured_view::ViewExecutionContext,
+        executable: crikey_core::structured_arguments::ExecutableKey,
+    },
     StandardLink {
         context: crikey_core::structured_view::ViewExecutionContext,
         url: String,
@@ -579,6 +584,8 @@ pub enum UiCommand {
     CancelShortcutCapture,
     /// Native input owned by a focused editor still supersedes asynchronous presentation.
     UserActivity,
+    /// Pointer press may complete the grid's captured selection gesture.
+    PointerActivity,
     OpenPreviewLink {
         /// Rare link activation owns its large source identity off the hot command enum.
         target: Box<PreviewLinkTarget>,
@@ -929,6 +936,11 @@ pub struct LauncherViewModel {
     inline_arguments: Option<InlineArguments>,
     standard_restoring: bool,
     standard_refresh_pending: bool,
+    /// Keyboard follow survives intermediate admissions until final publication.
+    standard_follow_selection: bool,
+    standard_pointer_source: Option<Arc<standard_view::StandardSurface>>,
+    standard_deferred_activation: Option<crikey_core::structured_arguments::ExecutableKey>,
+    standard_ready_activation: Option<UiCommand>,
     scope_choices: Arc<[ScopeChoice]>,
     section_headers: Arc<[SectionHeader]>,
     actionless_targets: Arc<[crikey_core::structured_arguments::OwnedItem]>,
@@ -1000,6 +1012,10 @@ impl LauncherViewModel {
             restoration_target: None,
             navigation_title: Arc::from("Search"),
             preserve_scroll: false,
+            standard_follow_selection: false,
+            standard_pointer_source: None,
+            standard_deferred_activation: None,
+            standard_ready_activation: None,
         }
     }
     const INLINE_SOURCE_CHANGED_NOTICE: &str =
@@ -1341,7 +1357,8 @@ impl LauncherViewModel {
                 .as_ref()
                 .map(|surface| surface.admitted_descriptor.clone()),
             panel: self.action_panel.clone(),
-            render_standard: self.standard.is_some() && !self.standard_refresh_pending,
+            render_standard: self.standard.is_some()
+                && (!self.standard_refresh_pending || self.standard_pointer_source.is_some()),
             transient_pixels: navigation::transient_pixels(self.page.as_ref(), self.preview.status.as_ref()),
             transient_bytes: navigation::transient_bytes(self.page.as_ref(), self.preview.status.as_ref())
                 + self.standard.as_ref().map_or(0, |surface| {
@@ -1349,7 +1366,8 @@ impl LauncherViewModel {
                         + 2 * std::mem::size_of::<usize>()
                         + surface.owner.0.capacity()
                         + surface.context.route.0.capacity()
-                }),
+                })
+                + self.standard_activation_bytes(),
         }
     }
 
@@ -1455,6 +1473,7 @@ impl LauncherViewModel {
             settings_management: self.settings_management.clone(),
             standard: self.standard.clone(),
             standard_refresh_pending: self.standard_refresh_pending,
+            standard_pointer_source: self.standard_pointer_source.clone(),
             scopes: self.scope_choices.clone(),
             selected_scope: self.navigation_scope.clone(),
             section_headers: self.section_headers.clone(),
@@ -1473,7 +1492,12 @@ impl LauncherViewModel {
             title: self.navigation_title.clone(),
             can_go_back: !self.navigation_stack.is_empty(),
             scroll: self.navigation_scroll.clone(),
-            restoration: self.navigation_restore,
+            // A keyboard intent supersedes even an anchor not painted yet.
+            restoration: if self.preserve_scroll {
+                self.navigation_restore
+            } else {
+                0
+            },
             preserve_scroll: self.preserve_scroll,
             unavailable: self.navigation_unavailable.clone(),
             recall: self.recall.clone(),
@@ -1626,6 +1650,7 @@ impl LauncherViewModel {
     }
 
     fn change_view(&mut self) {
+        self.clear_standard_activation();
         self.standard_refresh_pending = false;
         self.view_id = ViewId(self.view_id.0.checked_add(1).expect("view identity exhausted"));
         self.recall = Arc::default();
@@ -1707,6 +1732,7 @@ impl LauncherViewModel {
             self.navigation_stack.clear();
         }
         self.inline_arguments = None;
+        self.clear_standard_activation();
         self.standard = None;
         self.page_reopen = None;
         self.navigation_scroll = LogicalScroll::default();
@@ -1882,6 +1908,18 @@ impl LauncherViewModel {
         if !self.visible && !matches!(command, UiCommand::ClosePage) {
             return None;
         }
+        if !matches!(
+            command,
+            UiCommand::StandardDoubleClick { .. }
+                | UiCommand::SetLogicalScroll(_)
+                | UiCommand::PointerActivity
+        ) {
+            self.clear_standard_activation();
+        }
+        if matches!(command, UiCommand::PointerActivity) {
+            self.standard_deferred_activation = None;
+            self.standard_ready_activation = None;
+        }
         if let Some(effect) = self.apply_standard_command(&command) {
             return effect;
         }
@@ -1900,6 +1938,7 @@ impl LauncherViewModel {
         }
         match command {
             UiCommand::StandardActivate { .. }
+            | UiCommand::StandardDoubleClick { .. }
             | UiCommand::StandardLink { .. }
             | UiCommand::StandardHorizontal(_)
             | UiCommand::StandardSelect { .. } => None,
@@ -2017,7 +2056,7 @@ impl LauncherViewModel {
                 }
                 None
             }
-            UiCommand::UserActivity => None,
+            UiCommand::UserActivity | UiCommand::PointerActivity => None,
             UiCommand::BeginShortcutCapture(key) => {
                 self.settings_focus = Some(format!("record:{key}"));
                 self.dirty = true;
@@ -2423,6 +2462,7 @@ impl LauncherViewModel {
             return None;
         }
         self.restore_selection = false;
+        self.restoration_target = None;
         self.preserve_scroll = false;
         self.navigation_scroll = LogicalScroll::default();
 
@@ -3131,6 +3171,8 @@ impl LauncherViewModel {
     fn select(&mut self, target: usize) {
         self.dirty |= self.preserve_scroll;
         self.preserve_scroll = false;
+        // Even a clamped navigation command supersedes a pending return choice.
+        self.restoration_target = None;
         let Some(last) = self.rows.len().checked_sub(1) else {
             return;
         };
@@ -3141,7 +3183,6 @@ impl LauncherViewModel {
         }
 
         self.selected = target;
-        self.restoration_target = None;
         self.preview_selection();
         // The only path a person's arrow or page key reaches, so this is where
         // a default becomes a choice.
@@ -3154,11 +3195,11 @@ impl LauncherViewModel {
 
     /// Where the selection lands once `incoming` replaces the current rows.
     ///
-    /// Within one generation the selection is anchored by [`ItemId`]: a
-    /// republish follows the selected item wherever it moved to and falls back
-    /// to the previous index clamped into range when the anchor is gone. The
-    /// first publish of a new generation is a new query state and starts at the
-    /// top, because the anchor lives inside one generation only.
+    /// Within one generation the selection is anchored by owner and [`ItemId`]:
+    /// a republish follows the selected item wherever it moved to and falls
+    /// back to the previous index clamped into range when the anchor is gone.
+    /// Return searches retain a separate target across partial publications;
+    /// an ordinary new query starts at the top.
     fn resolve_selection(&self, incoming: &[ResultRow], generation: Generation) -> usize {
         let Some(last) = incoming.len().checked_sub(1) else {
             return 0;
