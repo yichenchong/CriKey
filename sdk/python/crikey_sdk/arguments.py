@@ -113,7 +113,7 @@ class ArgumentSchema:
                     if field.default is not None:
                         size = len(_text(field.default))
                         charge(size)
-                        if not field.min_bytes <= size <= field.max_bytes or (field.required and not size):
+                        if size > field.max_bytes or (size and size < field.min_bytes) or (field.required and not size):
                             raise ValueError("invalid text default")
         # Materialize only after the complete shared storage budget passes.
         fields = []

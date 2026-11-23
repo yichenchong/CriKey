@@ -962,10 +962,25 @@ struct NativePageSource {
     plugin: PluginId,
     supervisor: Arc<Mutex<NativeSupervisor>>,
     incarnations: NativeIncarnations,
+    admission: Option<ForegroundActionAdmission>,
+    gate: Arc<PreviewActionGate>,
 }
 
 impl PageBackend for NativePageSource {
     fn draw(&mut self, draw: &PageDraw) -> Result<crikey_core::PageFrame, String> {
+        let admission = match self.admission.take() {
+            Some(admission) => admission,
+            None => self
+                .gate
+                .reserve_foreground()
+                .map_err(|error| error.to_string())?,
+        };
+        let _guard = admission
+            .acquire(
+                Instant::now() + Duration::from_millis(NATIVE_CALL_TIMEOUT_MS),
+                &AtomicBool::new(false),
+            )
+            .map_err(|error| error.to_string())?;
         let mut supervisor = self.supervisor.lock().unwrap_or_else(|error| error.into_inner());
         with_native_worker(&mut supervisor, &self.plugin, &self.incarnations, |worker| {
             worker.page(&NativePageRequest {
@@ -3488,6 +3503,11 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
                 session.page_id()
             )));
         }
+        let admission = self
+            .gates
+            .get(plugin)
+            .ok_or_else(|| crikey_core::CoreError::Invalid("native page owner unavailable".into()))?
+            .reserve_foreground()?;
         let session = PageSession::open(
             PageOpen {
                 plugin: plugin.clone(),
@@ -3501,6 +3521,8 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
                 plugin: plugin.clone(),
                 supervisor,
                 incarnations: Arc::clone(&self.incarnations),
+                admission: Some(admission),
+                gate: Arc::clone(&self.gates[plugin]),
             }),
             self.wake.handle(),
         )
