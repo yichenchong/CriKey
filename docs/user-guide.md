@@ -92,6 +92,10 @@ With results visible, the footer shows the current primary action and
 current host context; the default compact hint line is
 `Up/Down navigate   Tab complete   Esc cancel`. Hide optional hints with
 `launcher.show-hints = false`; Settings and action affordances remain available.
+Long action sheets can be scrolled without changing the selected action.
+Manual scrolling survives unchanged provider refreshes. Navigation, search and
+changed action layouts reveal the selection when needed. Each newly opened sheet
+starts at the top without manufacturing a selection-navigation intent.
 Settings normally advertises `Ctrl+,`; on a web page it shows only **Settings**,
 because that shortcut belongs to the document. Web-page hints read
 `Tab navigate page   Esc close page`. Remapping host navigation does not remap
@@ -339,6 +343,12 @@ successful recent commands, without repeating favorites:
 command-home = "favorites-and-recent"
 ```
 
+Successful commands also earn recent-command and item-ranking credit when they
+open or replace a plugin view, even if their original launcher presentation has
+since changed. Errors and cancellation earn no credit; loading the opened view
+does not count as another command use. Typed arguments and process hotkeys do
+not add query recall or query-ranking affinity.
+
 Unavailable saved favorites remain visible in their saved order at home.
 Other unavailable saved preferences remain accessible in **Configure Commands**;
 removing a favorite or fallback membership does not erase its other preferences.
@@ -491,6 +501,14 @@ and clipboard input also remain query editing. An eligible selection/page chord
 (Down by default, for example) returns to collection navigation, where Right
 again moves spatially. The query keeps its IME anchor throughout.
 
+Double-click a grid tile to activate that exact item once, including a tile that
+was not selected. After a refresh, a keyboard-selected grid item is brought into
+view on the next paint without another scroll animation or key. Pointer scrolling,
+query anchors and Back restoration retain their existing scroll behavior rather
+than snapping back to the selected item.
+A tile's selection refresh keeps that grid visible for the second click. Its
+activation waits for the fresh definitions and is discarded if the executable
+changes or a newer input, Back, dismissal or view failure supersedes the gesture.
 Forms reuse the native typed editor: use **Run command**, Enter in a
 single-line/password field, or Ctrl/Cmd+Enter for multiline input. Required fields
 and fixed field failures follow the inline-input rules above.
@@ -626,8 +644,9 @@ action search/submenu/panel, then returns to the previous view, then
 clears/dismisses root as applicable.
 The host retains the root query,
 owner-qualified selection, logical scope and list scroll anchor. Returning
-issues a fresh search, reconciles the exact owner/item, and clamps safely if
-it disappeared. Navigation is bounded to 16 entries including the current view
+issues a fresh search and reconciles the exact owner/item across partial
+publications. Explicit navigation or query editing supersedes that return
+selection. Navigation is bounded to 16 entries including the current view
 and 8 MiB of retained host content; shared result/icon allocations count once.
 An excessive push is refused with a visible reason.
 
@@ -787,12 +806,18 @@ longer be cancellable. Its terminal result reports the actual package/config
 state and whether another launch is required. Enable/disable is a serialized
 configuration change for the next launch, not live activation. Quit waits for
 running jobs and owned runtime teardown before releasing the launcher lock.
+An enable/disable failure acknowledges a saved configuration only when the write
+persisted but effective reload failed; lookup, load and save failures are not
+reported as saved.
 
 **Package details** inspects the selected local runtime/package identity,
 location and declared metadata without executing it or requiring an index.
 Index search/details and **Update index** use the configured index policy.
 Inspection and index operations do not stop running plugins; no configured
 index is reported explicitly rather than silently changing policy.
+**Diagnose** targets the selected local plugin's namespaced identity, even when
+different runtimes share a package id. Index-only rows retain their package-id
+lookup behavior.
 
 For package authors and operators, package operations are explicit:
 

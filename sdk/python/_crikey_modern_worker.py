@@ -1239,7 +1239,7 @@ class _Worker:
                         if kind == "dropdown":
                             if text not in {option["id"] for option in field["options"]}:
                                 raise ValueError("invalid selection")
-                        elif not field["min_bytes"] <= size <= field["max_bytes"]:
+                        elif size > field["max_bytes"] or (size and size < field["min_bytes"]):
                             raise ValueError("invalid length")
                         if field["required"] and not text:
                             raise ValueError("required value")

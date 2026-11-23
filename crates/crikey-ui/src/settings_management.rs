@@ -179,6 +179,15 @@ pub struct Package {
     pub installed: bool,
     pub enabled: Option<bool>,
 }
+
+fn package_diagnosis_request(package: &Package) -> Request {
+    Request::Diagnose(Some(
+        package
+            .plugin
+            .as_ref()
+            .map_or_else(|| package.id.clone(), |plugin| plugin.0.clone()),
+    ))
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub id: u64,
@@ -858,7 +867,7 @@ pub(crate) fn draw(
                                     }
                                 }
                                 if ui.button("Diagnose").clicked() {
-                                    send(Request::Diagnose(Some(package.id.clone())), commands);
+                                    send(package_diagnosis_request(package), commands);
                                 }
                                 if package.installed {
                                     if let Some(kind) = package.kind {
@@ -934,6 +943,39 @@ pub(crate) fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn package_diagnosis_uses_local_identity_and_retains_index_fallback() {
+        let mut package = Package {
+            id: "example".into(),
+            plugin: None,
+            kind: None,
+            name: String::new(),
+            version: String::new(),
+            summary: String::new(),
+            installed: false,
+            enabled: None,
+        };
+        assert_eq!(
+            package_diagnosis_request(&package),
+            Request::Diagnose(Some("example".into())),
+        );
+        for (kind, identity) in [
+            (PluginKind::Modern, "modern.example"),
+            (PluginKind::Native, "native.example"),
+        ] {
+            package.plugin = Some(PluginId(identity.into()));
+            package.kind = Some(kind);
+            // Discovered operator packages are local even when not managed installs.
+            for installed in [false, true] {
+                package.installed = installed;
+                assert_eq!(
+                    package_diagnosis_request(&package),
+                    Request::Diagnose(Some(identity.into())),
+                );
+            }
+        }
+    }
+
     fn paint(
         context: &egui::Context,
         panel: &Panel,

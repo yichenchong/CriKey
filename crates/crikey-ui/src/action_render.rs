@@ -183,22 +183,34 @@ pub(super) fn draw(
             }) {
                 commands.push(UiCommand::ActivateSelectedAction);
             }
-            let scroll_id = egui::Id::new("crikey-action-scroll-selection");
-            let previous = ui
-                .ctx()
-                .data(|data| data.get_temp::<(u64, Option<ActionIdentity>)>(scroll_id));
-            let selection_changed = previous.as_ref().is_some_and(|(token, selected)| {
-                *token == panel.focus_token() && selected.as_ref() != panel.selected()
+            // Follow selection/layout changes, not repaints: wheel and scrollbar
+            // gestures must be free to leave the selected entry off screen.
+            let (selection_changed, new_panel) = ui.ctx().data_mut(|data| {
+                let previous = data.get_temp_mut_or_default::<(u64, u64, Option<ActionIdentity>)>(
+                    egui::Id::new("crikey-action-scroll-selection"),
+                );
+                // Opening establishes a baseline, not a navigation intent.
+                // Management controls may intentionally precede the selection.
+                let same_panel = previous.0 == panel.focus_token();
+                let changed =
+                    previous.1 != panel.layout_revision() || previous.2.as_ref() != panel.selected();
+                if !same_panel || changed {
+                    *previous = (
+                        panel.focus_token(),
+                        panel.layout_revision(),
+                        panel.selected().cloned(),
+                    );
+                }
+                (same_panel && changed, !same_panel)
             });
-            if previous.as_ref().is_none_or(|(token, selected)| {
-                *token != panel.focus_token() || selected.as_ref() != panel.selected()
-            }) {
-                ui.ctx().data_mut(|data| {
-                    data.insert_temp(scroll_id, (panel.focus_token(), panel.selected().cloned()))
-                });
+            let scroll_salt = "crikey-action-entries";
+            if new_panel {
+                // Retire both the old offset and any in-flight scroll animation.
+                egui::scroll_area::State::default()
+                    .store(ui.ctx(), ui.make_persistent_id(egui::Id::new(scroll_salt)));
             }
             egui::ScrollArea::vertical()
-                .id_salt("crikey-action-entries")
+                .id_salt(scroll_salt)
                 .max_height(ui.available_height())
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -390,7 +402,8 @@ pub(super) fn draw(
                                 });
                             }
                         }
-                        if selection_changed && entry.selected && !response.rect.intersects(ui.clip_rect()) {
+                        if selection_changed && entry.selected && !ui.clip_rect().contains_rect(response.rect)
+                        {
                             response.scroll_to_me(None);
                         }
                     }

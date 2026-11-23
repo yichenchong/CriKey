@@ -4132,6 +4132,298 @@ fn rendered_action_search_executes_non_first_leaf_and_does_not_edit_launcher_que
     );
 }
 
+fn long_action_launcher() -> crikey_ui::LauncherViewModel {
+    use crikey_core::{Action, ActionId, ExecutionPolicy};
+    let mut row = result_row(0);
+    row.alternate_actions = (0..40)
+        .map(|index| Action {
+            action_id: ActionId(format!("long-{index}")),
+            label: format!("Long action {index:02}"),
+            description: String::new(),
+            applicable_categories: Vec::new(),
+            icon_reference: None,
+            execution_policy: ExecutionPolicy::Plugin,
+        })
+        .collect();
+    let mut launcher = crikey_ui::LauncherViewModel::new();
+    launcher.activate();
+    let _ = launcher.apply(UiCommand::SetQuery("fixture".into()));
+    launcher.begin_generation(Generation::from_raw(1));
+    launcher.publish(Generation::from_raw(1), vec![row], false);
+    let _ = launcher.apply(UiCommand::ShowActions);
+    launcher
+}
+
+fn wheel_over_action(frame: &crikey_ui::NativeUiFrame, label: &str) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(position_of(frame, label) + egui::vec2(2.0, 4.0)),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -400.0),
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+#[test]
+fn action_sheet_wheel_stays_scrolled_until_keyboard_selection_changes() {
+    let mut launcher = long_action_launcher();
+    let view = launcher.frame().unwrap();
+    let mut frames = Frames::new();
+    let first = frames.settle(&view);
+    assert!(painted(&first, "Long action 00"));
+    let _ = frames.draw(&view, wheel_over_action(&first, "Long action 00"));
+    let scrolled = frames.settle(&view);
+    assert!(
+        !painted(&scrolled, "Long action 00"),
+        "stationary frames must not undo scrolling away from the selection"
+    );
+    let keyboard = frames.draw(
+        &view,
+        vec![key_press(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+    );
+    assert!(keyboard.commands.contains(&UiCommand::SelectNext));
+    for command in keyboard.commands {
+        let _ = launcher.apply(command);
+    }
+    let moved = launcher.frame().unwrap();
+    assert_eq!(
+        moved.action_panel.as_ref().unwrap().selected(),
+        Some(&crikey_ui::action_panel::ActionIdentity::Plugin(
+            crikey_core::ActionId("long-1".into())
+        ))
+    );
+    assert!(painted(&frames.settle(&moved), "Long action 01"));
+}
+
+#[test]
+fn action_sheet_search_clamps_a_scrolled_viewport_and_restores_browse_selection() {
+    let mut launcher = long_action_launcher();
+    let view = launcher.frame().unwrap();
+    let mut frames = Frames::new();
+    let first = frames.settle(&view);
+    let _ = frames.draw(&view, wheel_over_action(&first, "Long action 00"));
+    assert!(!painted(&frames.settle(&view), "Long action 00"));
+    let typed = frames.draw(&view, vec![egui::Event::Text("Long action 39".into())]);
+    for command in typed.commands {
+        let _ = launcher.apply(command);
+    }
+    let filtered = launcher.frame().unwrap();
+    assert_eq!(filtered.action_panel.as_ref().unwrap().visible_entries().len(), 1);
+    assert!(painted(&frames.settle(&filtered), "Long action 39"));
+    let escape = frames.draw(
+        &filtered,
+        vec![key_press(egui::Key::Escape, egui::Modifiers::NONE)],
+    );
+    for command in escape.commands {
+        let _ = launcher.apply(command);
+    }
+    let restored = launcher.frame().unwrap();
+    assert_eq!(
+        restored.action_panel.as_ref().unwrap().selected(),
+        view.action_panel.as_ref().unwrap().selected()
+    );
+    assert!(painted(&frames.settle(&restored), "Long action 00"));
+}
+
+fn action_text_is_visible(frame: &crikey_ui::NativeUiFrame, label: &str) -> bool {
+    fn text_rect(shape: &egui::Shape, label: &str) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == label => {
+                Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, label)),
+            _ => None,
+        }
+    }
+    frame.output.shapes.iter().any(|clipped| {
+        text_rect(&clipped.shape, label).is_some_and(|rect| clipped.clip_rect.contains_rect(rect))
+    })
+}
+
+#[test]
+fn action_sheet_multihit_search_reveals_a_retained_selection_inside_its_clip() {
+    let mut launcher = long_action_launcher();
+    let mut frames = Frames::new();
+    let _ = frames.settle(&launcher.frame().unwrap());
+    for _ in 0..20 {
+        let _ = launcher.apply(UiCommand::SelectNext);
+    }
+    let view = launcher.frame().unwrap();
+    let selected = view.action_panel.as_ref().unwrap().selected().cloned();
+    assert!(action_text_is_visible(&frames.settle(&view), "Long action 20"));
+    let typed = frames.draw(&view, vec![egui::Event::Text("Long action 2".into())]);
+    for command in typed.commands {
+        let _ = launcher.apply(command);
+    }
+    let filtered = launcher.frame().unwrap();
+    let panel = filtered.action_panel.as_ref().unwrap();
+    assert_eq!(panel.selected(), selected.as_ref());
+    assert!(panel.visible_entries().len() > 1);
+    let revealed = frames.settle(&filtered);
+    assert!(
+        action_text_is_visible(&revealed, "Long action 20"),
+        "filtering must reveal a retained identity, not leave its galley clipped away"
+    );
+    let _ = frames.draw(&filtered, wheel_over_action(&revealed, "Long action 20"));
+    assert!(
+        !action_text_is_visible(&frames.settle(&filtered), "Long action 20"),
+        "a completed layout transition must not keep overriding later wheel scrolling"
+    );
+}
+
+#[test]
+fn action_sheet_opening_does_not_synthesize_selection_navigation() {
+    use crikey_ui::action_panel::ActionIdentity;
+    let mut launcher = long_action_launcher();
+    let mut view = launcher.frame().unwrap();
+    let selected = ActionIdentity::Plugin(crikey_core::ActionId("long-39".into()));
+    assert!(Arc::make_mut(view.action_panel.as_mut().unwrap()).select(&selected));
+    let mut frames = Frames::new();
+    let opened = frames.settle(&view);
+    assert!(
+        action_text_is_visible(&opened, "Long action 00"),
+        "opening establishes a selection baseline without scheduling an animated scroll"
+    );
+    assert!(!action_text_is_visible(&opened, "Long action 39"));
+}
+
+#[test]
+fn action_sheet_reopening_starts_at_the_top_without_following_the_old_selection() {
+    let mut launcher = long_action_launcher();
+    let view = launcher.frame().unwrap();
+    let mut frames = Frames::new();
+    let opened = frames.settle(&view);
+    let _ = frames.draw(&view, wheel_over_action(&opened, "Long action 00"));
+    assert!(!action_text_is_visible(&frames.settle(&view), "Long action 00"));
+    let _ = launcher.apply(UiCommand::ActionBack);
+    let closed = launcher.frame().unwrap();
+    assert!(closed.action_panel.is_none());
+    let _ = frames.draw(&closed, Vec::new());
+    let _ = launcher.apply(UiCommand::ShowActions);
+    let reopened = launcher.frame().unwrap();
+    assert_eq!(
+        reopened.action_panel.as_ref().unwrap().selected(),
+        view.action_panel.as_ref().unwrap().selected()
+    );
+    let first = frames.draw(&reopened, Vec::new());
+    assert!(
+        action_text_is_visible(&first, "Long action 00"),
+        "a fresh sheet must start at the top, not inherit the retired sheet's viewport"
+    );
+    assert!(action_text_is_visible(
+        &frames.settle(&reopened),
+        "Long action 00"
+    ));
+    let _ = frames.draw(&reopened, wheel_over_action(&first, "Long action 00"));
+    assert!(
+        !action_text_is_visible(&frames.settle(&reopened), "Long action 00"),
+        "the reset must happen only on opening, not on subsequent stationary frames"
+    );
+}
+
+#[test]
+fn action_sheet_unchanged_provider_refresh_preserves_manual_scroll() {
+    let mut launcher = long_action_launcher();
+    let view = launcher.frame().unwrap();
+    let mut frames = Frames::new();
+    let opened = frames.settle(&view);
+    let _ = frames.draw(&view, wheel_over_action(&opened, "Long action 00"));
+    let scrolled = frames.settle(&view);
+    assert!(!action_text_is_visible(&scrolled, "Long action 00"));
+    let anchor = (1..40)
+        .map(|index| format!("Long action {index:02}"))
+        .find(|label| action_text_is_visible(&scrolled, label))
+        .expect("manual scrolling leaves a visible action to anchor");
+    let before = position_of(&scrolled, &anchor);
+    launcher.publish(Generation::from_raw(1), view.rows.to_vec(), false);
+    let refreshed = launcher.frame().unwrap();
+    assert_eq!(
+        refreshed.action_panel.as_ref().unwrap().selected(),
+        view.action_panel.as_ref().unwrap().selected()
+    );
+    let after = frames.settle(&refreshed);
+    assert!(!action_text_is_visible(&after, "Long action 00"));
+    assert!(action_text_is_visible(&after, &anchor));
+    assert!((position_of(&after, &anchor).y - before.y).abs() < 1.0);
+}
+
+#[test]
+fn action_sheet_changed_provider_layout_reveals_the_retained_identity() {
+    let mut launcher = long_action_launcher();
+    let mut frames = Frames::new();
+    let _ = frames.settle(&launcher.frame().unwrap());
+    for _ in 0..20 {
+        let _ = launcher.apply(UiCommand::SelectNext);
+    }
+    let view = launcher.frame().unwrap();
+    assert!(action_text_is_visible(&frames.settle(&view), "Long action 20"));
+    let mut rows = view.rows.to_vec();
+    rows[0].alternate_actions.rotate_left(20);
+    launcher.publish(Generation::from_raw(1), rows, false);
+    let refreshed = launcher.frame().unwrap();
+    assert_eq!(
+        refreshed.action_panel.as_ref().unwrap().selected(),
+        view.action_panel.as_ref().unwrap().selected()
+    );
+    assert!(action_text_is_visible(
+        &frames.settle(&refreshed),
+        "Long action 20"
+    ));
+}
+
+#[test]
+fn action_sheet_submenu_back_reveals_the_exact_parent_selection() {
+    use crikey_ui::action_panel::{
+        ActionActivation, ActionEntry, ActionIdentity, ActionPanelNavigation, ActionPresentation,
+        ActionSection, ActionTree,
+    };
+    let mut launcher = long_action_launcher();
+    let mut view = launcher.frame().unwrap();
+    let leaf = |index: usize| ActionEntry::Plugin {
+        action: crikey_core::ActionId(format!("long-{index}")),
+        presentation: ActionPresentation {
+            label: format!("Long action {index:02}"),
+            ..Default::default()
+        },
+    };
+    let mut entries: Vec<_> = (0..39).map(leaf).collect();
+    entries.push(ActionEntry::Submenu {
+        id: "last-menu".into(),
+        presentation: ActionPresentation {
+            label: "Last submenu".into(),
+            ..Default::default()
+        },
+        entries: vec![leaf(39)],
+    });
+    let tree = ActionTree::new(
+        &view.rows[0],
+        vec![ActionSection {
+            id: "long".into(),
+            label: "Actions".into(),
+            entries,
+        }],
+    )
+    .unwrap();
+    view.action_panel = Some(Arc::new(crikey_ui::ActionPanel::new(tree)));
+    let mut frames = Frames::new();
+    let _ = frames.settle(&view);
+    let parent = ActionIdentity::Submenu("last-menu".into());
+    assert!(Arc::make_mut(view.action_panel.as_mut().unwrap()).select(&parent));
+    assert!(painted(&frames.settle(&view), "Last submenu"));
+    assert_eq!(
+        Arc::make_mut(view.action_panel.as_mut().unwrap()).activation(&view.rows[0]),
+        Ok(Some(ActionActivation::EnteredSubmenu))
+    );
+    assert!(painted(&frames.settle(&view), "Long action 39"));
+    assert_eq!(
+        Arc::make_mut(view.action_panel.as_mut().unwrap()).back(),
+        ActionPanelNavigation::Changed
+    );
+    assert_eq!(view.action_panel.as_ref().unwrap().selected(), Some(&parent));
+    assert!(painted(&frames.settle(&view), "Last submenu"));
+}
+
 #[test]
 fn discovery_shortcuts_do_not_steal_settings_page_or_composition_input() {
     for (key, modifiers, expected_keysym, expected_modifiers) in [

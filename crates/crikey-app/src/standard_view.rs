@@ -26,6 +26,7 @@ struct ActiveRoute {
     session: ViewSessionIdentity,
     reply: Option<ViewReply>,
     pending: Option<Arc<AtomicBool>>,
+    published_from: Option<(ViewExecutionContext, ActionRequestId)>,
 }
 
 /// Contains only the currently admitted descriptor, never editor values/drafts.
@@ -107,6 +108,26 @@ impl ViewAuthority {
                 && a.reply.as_ref().is_some_and(|r| &r.context == context)
         })
     }
+    /// Presentation grace is tied to the exact refresh whose completion the UI
+    /// has not drained. It never grants execution or link authority.
+    pub(crate) fn presentation_available(
+        &self,
+        owner: &PluginId,
+        context: &ViewExecutionContext,
+        producer: u64,
+        pending: Option<&ActionRequestId>,
+    ) -> bool {
+        self.current(owner, context, producer)
+            || self.active.as_ref().is_some_and(|active| {
+                &active.owner == owner
+                    && active.producer == producer
+                    && active.session == context.session
+                    && active
+                        .published_from
+                        .as_ref()
+                        .is_some_and(|(origin, request)| origin == context && Some(request) == pending)
+            })
+    }
     fn begin(
         &mut self,
         owner: &PluginId,
@@ -135,6 +156,7 @@ impl ViewAuthority {
                     session: request.session,
                     reply: None,
                     pending: Some(cancelled),
+                    published_from: None,
                 });
             }
             ViewRequestMode::Refresh => {
@@ -151,6 +173,7 @@ impl ViewAuthority {
                     return Err(unavailable());
                 }
                 active.pending = Some(cancelled);
+                active.published_from = None;
             }
         }
         Ok(())
@@ -192,7 +215,12 @@ impl ViewAuthority {
             return Err(unavailable());
         }
         let active = self.active.as_mut().ok_or_else(unavailable)?;
-        active.reply = Some(reply.clone());
+        let previous = active.reply.replace(reply.clone());
+        active.published_from = if request.mode == ViewRequestMode::Refresh {
+            previous.map(|previous| (previous.context, queued.request_id.clone()))
+        } else {
+            None
+        };
         active.pending = None;
         Ok(ActionEffect::View(reply))
     }
@@ -586,5 +614,331 @@ impl<T> ActionReceiver<T> {
             ForegroundRequest::Action(request) => request,
             ForegroundRequest::View(_) => panic!("expected an ordinary action"),
         })
+    }
+}
+
+/// Exercises real provider endpoints with a published Refresh awaiting drain.
+#[cfg(test)]
+pub(crate) fn assert_closed_presentation_admission<T>(
+    endpoint: Arc<dyn crate::PluginActionExecutor>,
+    receiver: &ActionReceiver<T>,
+    authority: &Arc<Mutex<ViewAuthority>>,
+    gate: &crate::runtime_control::AdmissionGate,
+    owner: PluginId,
+    terminal: Option<bool>,
+) {
+    use crikey_core::structured_view::*;
+    let producer = 1;
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    let descriptor = Arc::new(ViewDescriptor {
+        title: "Stop grace".into(),
+        definitions: vec![].into(),
+        view: StandardView::List(CollectionView {
+            items: vec![].into(),
+            sections: vec![],
+            scopes: vec![],
+            initial_selection: None,
+            initial_scope: None,
+        }),
+    });
+    let publish = |request: ViewRequest, revision| {
+        let context = ViewExecutionContext {
+            route: request.route.clone(),
+            session: request.session,
+            revision: NonZeroU64::new(revision).unwrap(),
+        };
+        let id = endpoint.request_view(&owner, producer, request).unwrap();
+        let ForegroundRequest::View(queued) = receiver.0.recv().unwrap() else {
+            panic!("expected real view admission");
+        };
+        assert_eq!(queued.request_id, id);
+        let ViewOperation::Request(request) = &queued.operation else {
+            unreachable!()
+        };
+        let effect = authority
+            .lock()
+            .unwrap()
+            .publish(
+                &queued,
+                request,
+                ViewReply {
+                    context,
+                    descriptor: descriptor.clone(),
+                },
+            )
+            .unwrap();
+        queued.completion(queued.finish(Ok(effect)))
+    };
+    let open = model
+        .open_standard_route(
+            owner.clone(),
+            producer,
+            StructuredRouteOutcome::Push(RouteId("list".into())),
+        )
+        .unwrap();
+    let seed = publish(open, 9);
+    let Ok(ActionEffect::View(old)) = seed.outcome else {
+        panic!("Open failed")
+    };
+    assert!(model.publish_standard_view(owner.clone(), producer, old.clone()));
+    let refresh = model
+        .standard_refresh_request(ViewRefreshReason::Explicit)
+        .unwrap();
+    let completion = publish(refresh, 10);
+    let Ok(ActionEffect::View(new)) = completion.outcome else {
+        panic!("Refresh failed")
+    };
+    let pending = Some(&completion.request_id);
+    // Positive proof first: neither an unsupported default nor stale authority
+    // can make the subsequent stopped-admission assertions pass accidentally.
+    assert!(!endpoint.view_current(&owner, &old.context));
+    assert!(endpoint.view_current(&owner, &new.context));
+    assert!(endpoint.view_presentation_available(&owner, &old.context, producer, pending));
+    assert!(endpoint.view_presentation_available(&owner, &new.context, producer, None));
+    let mut router = crate::PluginActionRouter::default();
+    router.register([owner.clone()], endpoint.clone()).unwrap();
+    let mut search = crate::SearchService::new(crate::App::new());
+    search.set_plugin_action_router(Arc::new(router));
+    assert!(!search.retire_unavailable_view(&owner, &old.context, producer, pending));
+    let epoch = NonZeroU64::new(41).unwrap();
+    gate.close(epoch).unwrap();
+    assert!(gate.close(NonZeroU64::new(42).unwrap()).is_err());
+    if let Some(success) = terminal {
+        gate.finish(epoch, success);
+    }
+    assert_ne!(gate.state(), crate::runtime_control::PluginAdmission::Open);
+    assert!(!endpoint.view_presentation_available(&owner, &old.context, producer, pending));
+    assert!(!endpoint.view_presentation_available(&owner, &new.context, producer, None));
+    assert!(!endpoint.view_current(&owner, &new.context));
+    assert!(search.retire_unavailable_view(&owner, &old.context, producer, pending));
+    assert!(!authority.lock().unwrap().current(&owner, &new.context, producer));
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use crate::{App, PluginActionExecutor, PluginActionRouter, SearchService};
+    use crikey_core::structured_view::*;
+    use crikey_ui::LauncherViewModel;
+
+    // Only the transport is absent: admission, publication, source retention,
+    // routing and the launcher's retirement consumer use their real authorities.
+    struct AuthorityEndpoint {
+        authority: Arc<Mutex<ViewAuthority>>,
+        producer: AtomicU64,
+    }
+    impl PluginActionExecutor for AuthorityEndpoint {
+        fn submit_plugin_action(
+            &self,
+            _: &PluginId,
+            _: &Item,
+            _: &crikey_core::ActionId,
+            _: Option<&str>,
+        ) -> Result<ActionRequestId> {
+            panic!("this test must not submit an unrelated root action")
+        }
+        fn retire_view(&self, owner: &PluginId, session: ViewSessionIdentity) {
+            self.authority.lock().unwrap().retire(owner, session);
+        }
+        fn view_presentation_available(
+            &self,
+            owner: &PluginId,
+            context: &ViewExecutionContext,
+            producer: u64,
+            pending: Option<&ActionRequestId>,
+        ) -> bool {
+            let source = self.producer.load(Ordering::Acquire);
+            let mut authority = self.authority.lock().unwrap();
+            authority.retain_source(|_| (source != 0).then_some(source));
+            source == producer && authority.presentation_available(owner, context, producer, pending)
+        }
+    }
+
+    #[test]
+    fn publication_before_completion_drain_retains_only_exact_refresh_presentation() {
+        for failure in [
+            "none",
+            "untracked",
+            "request",
+            "owner",
+            "producer",
+            "route",
+            "revision",
+            "logical-view",
+            "surface",
+            "retired-session",
+            "dead-producer",
+            "replaced-producer",
+            "replaced-session",
+        ] {
+            let owner = PluginId("publication".into());
+            let producer = 7;
+            let authority = Arc::new(Mutex::new(ViewAuthority::default()));
+            let endpoint = Arc::new(AuthorityEndpoint {
+                authority: authority.clone(),
+                producer: AtomicU64::new(producer),
+            });
+            let mut router = PluginActionRouter::default();
+            router.register([owner.clone()], endpoint.clone()).unwrap();
+            let mut search = SearchService::new(App::new());
+            search.set_plugin_action_router(Arc::new(router));
+            let mut model = LauncherViewModel::new();
+            model.activate();
+            let open = model
+                .open_standard_route(
+                    owner.clone(),
+                    producer,
+                    StructuredRouteOutcome::Push(RouteId("list".into())),
+                )
+                .unwrap();
+            let descriptor = Arc::new(ViewDescriptor {
+                title: "Publication".into(),
+                definitions: vec![].into(),
+                view: StandardView::List(CollectionView {
+                    items: vec![].into(),
+                    sections: vec![],
+                    scopes: vec![],
+                    initial_selection: None,
+                    initial_scope: None,
+                }),
+            });
+            let publish = |request: ViewRequest, revision: u64| {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                authority
+                    .lock()
+                    .unwrap()
+                    .begin(&owner, producer, &request, cancelled.clone())
+                    .unwrap();
+                let reply = ViewReply {
+                    context: ViewExecutionContext {
+                        route: request.route.clone(),
+                        session: request.session,
+                        revision: NonZeroU64::new(revision).unwrap(),
+                    },
+                    descriptor: descriptor.clone(),
+                };
+                let queued = QueuedView {
+                    request_id: ActionRequestId {
+                        plugin: owner.clone(),
+                        sequence: revision,
+                    },
+                    owner: owner.clone(),
+                    producer,
+                    operation: ViewOperation::Request(request),
+                    authority: authority.clone(),
+                    admission: None,
+                    cancelled,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                    before_send: None,
+                };
+                let ViewOperation::Request(request) = &queued.operation else {
+                    unreachable!()
+                };
+                let effect = authority
+                    .lock()
+                    .unwrap()
+                    .publish(&queued, request, reply)
+                    .unwrap();
+                queued.completion(queued.finish(Ok(effect)))
+            };
+            let seed = publish(open, 9);
+            let Ok(ActionEffect::View(old)) = seed.outcome else {
+                panic!("Open failed")
+            };
+            assert!(model.publish_standard_view(owner.clone(), producer, old.clone()));
+            let refresh = model
+                .standard_refresh_request(ViewRefreshReason::Selection)
+                .unwrap();
+            model.set_standard_refresh_pending(true);
+            // Deliberately publish authority before the UI drains the completion.
+            // No thread timing, sleeping or fabricated authority advancement.
+            let completion = publish(refresh, 10);
+            let request_id = completion.request_id.clone();
+            let mut context = old.context.clone();
+            let mut pending = Some(request_id.clone());
+            let mut presented_owner = owner.clone();
+            let mut presented_producer = producer;
+            match failure {
+                "none" => {}
+                "untracked" => pending = None,
+                "request" => pending.as_mut().unwrap().sequence += 1,
+                "owner" => presented_owner = PluginId("other".into()),
+                "producer" => presented_producer += 1,
+                "route" => context.route = RouteId("other".into()),
+                "revision" => context.revision = NonZeroU64::new(8).unwrap(),
+                "logical-view" => context.session.logical_view = NonZeroU64::new(99).unwrap(),
+                "surface" => context.session.surface = NonZeroU64::new(99).unwrap(),
+                "retired-session" => search.retire_view(&owner, context.session),
+                "dead-producer" => endpoint.producer.store(0, Ordering::Release),
+                "replaced-producer" => endpoint.producer.store(producer + 1, Ordering::Release),
+                "replaced-session" => {
+                    let replacement = ViewRequest {
+                        mode: ViewRequestMode::Open,
+                        route: context.route.clone(),
+                        session: ViewSessionIdentity {
+                            logical_view: NonZeroU64::new(99).unwrap(),
+                            surface: NonZeroU64::new(99).unwrap(),
+                        },
+                        previous_revision: None,
+                        state: None,
+                        query: String::new(),
+                        scroll: None,
+                        reason: ViewRefreshReason::Explicit,
+                    };
+                    authority
+                        .lock()
+                        .unwrap()
+                        .begin(&owner, producer, &replacement, Arc::new(AtomicBool::new(false)))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let retired = search.retire_unavailable_view(
+                &presented_owner,
+                &context,
+                presented_producer,
+                pending.as_ref(),
+            );
+            assert_eq!(retired, failure != "none", "{failure}");
+            if retired {
+                model.standard_unavailable();
+                assert!(model.standard_surface().is_none(), "{failure}");
+                continue;
+            }
+            assert!(model.standard_surface().is_some());
+            let state = HostViewState {
+                selected: None,
+                scope: None,
+                input: None,
+            };
+            let executable = ExecutableKey {
+                target: crikey_core::structured_arguments::OwnedItem {
+                    owner: owner.clone(),
+                    item: ItemId("absent".into()),
+                },
+                action: None,
+            };
+            let locked = authority.lock().unwrap();
+            assert!(!locked.current(&owner, &old.context, producer));
+            assert!(locked
+                .validate_execution(&owner, &old.context, &state, &executable, producer, false,)
+                .is_err());
+            assert!(locked
+                .validate_link(&owner, &old.context, &state, producer, "https://example.org/",)
+                .is_err());
+            drop(locked);
+            let Ok(ActionEffect::View(reply)) = completion.outcome else {
+                panic!("Refresh failed")
+            };
+            assert!(authority
+                .lock()
+                .unwrap()
+                .current(&owner, &reply.context, producer));
+            assert!(model.publish_standard_view(owner.clone(), producer, reply));
+            let surface = model.standard_surface().unwrap();
+            assert_eq!(surface.context.revision.get(), 10);
+            assert!(!search.retire_unavailable_view(&owner, &surface.context, producer, None));
+        }
     }
 }

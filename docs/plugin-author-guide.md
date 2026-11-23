@@ -571,6 +571,9 @@ definitions, schemas and links; old queued events cannot execute new definitions
 While Refresh is in flight, the host coalesces newer query/selection/scope
 changes and uses its successful revision for the next request. Do not assume
 every such edit cancels the callback; honor its deadline and cancellation token.
+The old frame may remain visible while the host drains that exact Refresh's
+completion, but it cannot execute or open links against the replacement revision.
+This presentation-only retention never survives producer or session loss.
 Hide, pop and owner loss still retire authority and cancel outstanding work.
 Retained selection, scroll and eligible draft state are bounded host intent, not
 requirements that the next descriptor preserve those items or schemas. The host
@@ -1361,6 +1364,11 @@ path. Both runtimes execute preview in the same originating worker instance as
 the item's catalog or suggestion publication, under its existing concurrency
 and call budgets. Catalog-only deferred items do not require suggestions.
 Preview must not assume that cancellation reverses any effects.
+Deliberate actions and native pages take priority over speculative previews.
+The host reserves one foreground intent and requests preview cancellation without
+blocking the UI. The preview retains its real action permit until its callback
+returns (or its worker is reaped); cancellation alone never frees concurrency.
+The waiting action uses the original item's worker, never a replacement process.
 Rows carry their exact `PluginId` separately from display names; preview
 selection and dispatch use `(PluginId, ItemId)`. Equal item IDs in different
 plugins must neither redirect callbacks nor suppress another owner's preview.

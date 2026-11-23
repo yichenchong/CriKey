@@ -2249,19 +2249,25 @@ where
             self.dispatch_command(event_loop, command);
         } else if matches!(
             &event,
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            } | WindowEvent::Touch(Touch {
+                phase: TouchPhase::Started,
+                ..
+            })
+        ) {
+            // The press precedes egui's double-click recognition on release.
+            self.dispatch_command(event_loop, UiCommand::PointerActivity);
+        } else if matches!(
+            &event,
             WindowEvent::KeyboardInput {
                 event: KeyEvent {
                     state: ElementState::Pressed,
                     ..
                 },
                 ..
-            } | WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                ..
-            } | WindowEvent::Touch(Touch {
-                phase: TouchPhase::Started,
-                ..
-            }) | WindowEvent::Ime(Ime::Commit(_))
+            } | WindowEvent::Ime(Ime::Commit(_))
         ) {
             // Editor/document-owned input does not execute a host shortcut, but
             // it still retires older deliberate page-presentation intent.
@@ -4158,6 +4164,8 @@ fn draw_results(
     let reserved =
         overlay + (colors.metrics.item_spacing_y + colors.metrics.space_3) + colors.metrics.footer_height;
     let list_height = body_height.unwrap_or_else(|| (ui.available_height() - reserved).max(0.0));
+    // Align::Min subtracts the ScrollArea parent's spacing. Logical anchors do not.
+    let restoration_spacing = ui.spacing().item_spacing.y;
     egui::ScrollArea::vertical()
         // Vertically the list is exactly as tall as its rows, up to the cap:
         // filling the cap regardless would put empty space between the last
@@ -4165,7 +4173,12 @@ fn draw_results(
         // look like a mostly empty window.
         .auto_shrink([false, true])
         .max_height(list_height)
-        .show(ui, |ui| {
+        .show_viewport(ui, |ui, viewport| {
+            // egui expands the paint clip for strokes; logical anchors use the
+            // actual viewport, or its extra margin changes the first row on restore.
+            let scroll_viewport =
+                egui::Rect::from_min_size(ui.max_rect().min + viewport.min.to_vec2(), viewport.size())
+                    .intersect(ui.clip_rect());
             ui.set_min_width(ui.available_width());
             // The gap between rows is exactly ROW_GAP, which the window height
             // is computed from. egui's own item spacing would be added on top
@@ -4185,12 +4198,12 @@ fn draw_results(
                 let response = draw_result_row(ui, row, model, index == model.selected, commands, colors);
                 record_collection_focus(ui.ctx(), model, &response);
                 if first_visible.is_none()
-                    && response.rect.max.y > ui.clip_rect().top()
-                    && response.rect.min.y < ui.clip_rect().bottom()
+                    && response.rect.max.y > scroll_viewport.top()
+                    && response.rect.min.y < scroll_viewport.bottom()
                 {
                     first_visible = Some(crate::LogicalScroll {
                         row: index,
-                        offset: (ui.clip_rect().top() - response.rect.top()).max(0.0),
+                        offset: (scroll_viewport.top() - response.rect.top()).max(0.0),
                     });
                 }
                 if restoring
@@ -4202,7 +4215,9 @@ fn draw_results(
                             .min(model.rows.len().saturating_sub(1))
                 {
                     ui.scroll_to_rect(
-                        response.rect.translate(vec2(0.0, model.navigation.scroll.offset)),
+                        response
+                            .rect
+                            .translate(vec2(0.0, model.navigation.scroll.offset + restoration_spacing)),
                         Some(Align::Min),
                     );
                 }
