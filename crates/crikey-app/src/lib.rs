@@ -990,6 +990,26 @@ impl SearchService {
             .as_ref()
             .is_some_and(|router| router.view_current(owner, context))
     }
+    /// Retires an unavailable presentation, allowing only the exact published
+    /// refresh still awaiting its tracked completion to retain the old frame.
+    /// Execution and links continue to require `view_current`.
+    pub fn retire_unavailable_view(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+        producer: u64,
+        pending: Option<&ActionRequestId>,
+    ) -> bool {
+        if self
+            .plugin_actions
+            .as_ref()
+            .is_some_and(|router| router.view_presentation_available(owner, context, producer, pending))
+        {
+            return false;
+        }
+        self.retire_view(owner, context.session);
+        true
+    }
     pub fn open_view_url(
         &self,
         owner: &PluginId,

@@ -1180,8 +1180,10 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 report_status(&mut view_model, message);
             }
             if let Some(surface) = view_model.standard_surface() {
-                if !search.view_current(&surface.owner, &surface.context) {
-                    search.retire_view(&surface.owner, surface.context.session);
+                let pending = view_model.view().and_then(|(view, _)| {
+                    pending_standard_refresh(&view_requests, &surface.owner, surface.producer, view)
+                });
+                if search.retire_unavailable_view(&surface.owner, &surface.context, surface.producer, pending) {
                     view_model.standard_unavailable();
                 }
             }
@@ -4386,6 +4388,19 @@ fn publish_projected_rows(
 type PendingViewRequests =
     std::collections::BTreeMap<crikey_app::ActionRequestId, (PluginId, u64, crikey_ui::ViewId, u64)>;
 
+fn pending_standard_refresh<'a>(
+    pending: &'a PendingViewRequests,
+    owner: &PluginId,
+    producer: u64,
+    view: crikey_ui::ViewId,
+) -> Option<&'a crikey_app::ActionRequestId> {
+    pending
+        .iter()
+        .find_map(|(id, (target_owner, target_producer, target_view, _))| {
+            (target_owner == owner && *target_producer == producer && *target_view == view).then_some(id)
+        })
+}
+
 fn coalesce_standard_refresh(
     pending: &PendingViewRequests,
     latest: &mut Option<(crikey_ui::ViewId, crikey_core::structured_view::ViewRefreshReason)>,
@@ -7456,6 +7471,43 @@ mod tests {
 mod standard_refresh_coalescing_tests {
     use super::*;
     use crikey_core::structured_view::ViewRefreshReason;
+
+    #[test]
+    fn presentation_grace_uses_only_the_exact_owner_producer_and_logical_view() {
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        let root = model.view().unwrap().0;
+        let owner = PluginId("views".into());
+        model
+            .open_standard_route(
+                owner.clone(),
+                11,
+                crikey_core::structured_view::StructuredRouteOutcome::Push(
+                    crikey_core::structured_view::RouteId("list".into()),
+                ),
+            )
+            .unwrap();
+        let view = model.view().unwrap().0;
+        assert_ne!(root, view);
+        let request = crikey_app::ActionRequestId {
+            plugin: owner.clone(),
+            sequence: 7,
+        };
+        for (target_owner, producer, target_view) in [
+            (PluginId("other".into()), 11, view),
+            (owner.clone(), 12, view),
+            (owner.clone(), 11, root),
+        ] {
+            let pending =
+                PendingViewRequests::from([(request.clone(), (target_owner, producer, target_view, 1))]);
+            assert!(pending_standard_refresh(&pending, &owner, 11, view).is_none());
+        }
+        let pending = PendingViewRequests::from([(request.clone(), (owner.clone(), 11, view, 1))]);
+        assert_eq!(
+            pending_standard_refresh(&pending, &owner, 11, view),
+            Some(&request)
+        );
+    }
 
     #[test]
     fn rapid_refresh_intents_keep_one_correlation_and_only_the_latest_reason() {

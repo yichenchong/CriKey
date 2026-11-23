@@ -559,6 +559,9 @@ definitions, schemas and links; old queued events cannot execute new definitions
 While Refresh is in flight, the host coalesces newer query/selection/scope
 changes and uses its successful revision for the next request. Do not assume
 every such edit cancels the callback; honor its deadline and cancellation token.
+The old frame may remain visible while the host drains that exact Refresh's
+completion, but it cannot execute or open links against the replacement revision.
+This presentation-only retention never survives producer or session loss.
 Hide, pop and owner loss still retire authority and cancel outstanding work.
 Retained selection, scroll and eligible draft state are bounded host intent, not
 requirements that the next descriptor preserve those items or schemas. The host

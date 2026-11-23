@@ -786,6 +786,15 @@ pub trait PluginActionExecutor: Send + Sync {
     fn view_current(&self, _owner: &PluginId, _context: &ViewExecutionContext) -> bool {
         false
     }
+    fn view_presentation_available(
+        &self,
+        _owner: &PluginId,
+        _context: &ViewExecutionContext,
+        _producer: u64,
+        _pending: Option<&ActionRequestId>,
+    ) -> bool {
+        false
+    }
     fn submit_actionless(
         &self,
         _owner: &PluginId,
@@ -1104,6 +1113,17 @@ impl PluginActionRouter {
         self.providers
             .get(owner)
             .is_some_and(|endpoint| endpoint.view_current(owner, context))
+    }
+    pub fn view_presentation_available(
+        &self,
+        owner: &PluginId,
+        context: &ViewExecutionContext,
+        producer: u64,
+        pending: Option<&ActionRequestId>,
+    ) -> bool {
+        self.providers
+            .get(owner)
+            .is_some_and(|endpoint| endpoint.view_presentation_available(owner, context, producer, pending))
     }
     pub fn validate_view_link(
         &self,

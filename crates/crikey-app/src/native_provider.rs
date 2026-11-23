@@ -3114,6 +3114,20 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         }
         producer.is_some_and(|producer| authority.current(owner, context, producer))
     }
+    fn view_presentation_available(
+        &self,
+        owner: &PluginId,
+        context: &crikey_core::structured_view::ViewExecutionContext,
+        producer: u64,
+        pending: Option<&ActionRequestId>,
+    ) -> bool {
+        let source = self.view_producer(owner);
+        let mut authority = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        if source.is_none() {
+            authority.retire(owner, context.session);
+        }
+        source == Some(producer) && authority.presentation_available(owner, context, producer, pending)
+    }
     fn validate_view_link(
         &self,
         owner: &PluginId,
