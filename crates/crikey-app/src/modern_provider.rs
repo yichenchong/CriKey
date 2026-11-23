@@ -3823,9 +3823,29 @@ mod preview_origin_tests {
 
     struct Fixture {
         root: PathBuf,
+        witnesses: PathBuf,
     }
 
     impl Fixture {
+        fn private_directory(path: &Path) {
+            let mut directory = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                directory.mode(0o700);
+            }
+            directory.create(path).unwrap();
+        }
+
+        fn declare_witnesses(package: &Path, witnesses: &Path) {
+            Self::private_directory(witnesses);
+            fs::write(
+                package.join("preview-witness-directory"),
+                witnesses.to_str().unwrap(),
+            )
+            .unwrap();
+        }
+
         fn load(class: &str) -> (Self, ModernProvider, QueryPipeline) {
             Self::load_source(
                 class,
@@ -3843,15 +3863,22 @@ mod preview_origin_tests {
             second_owner: bool,
         ) -> (Self, ModernProvider, QueryPipeline) {
             static NEXT: AtomicU64 = AtomicU64::new(0);
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
             let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target/preview-handoff-fixtures")
                 .join(format!(
                     "crikey-modern-lifecycle-{}-{}",
                     std::process::id(),
-                    NEXT.fetch_add(1, Ordering::Relaxed)
+                    sequence
                 ));
+            let witnesses = std::env::temp_dir().join(format!(
+                "crikey-modern-preview-witness-{}-{sequence}",
+                std::process::id()
+            ));
+            Self::private_directory(&witnesses);
             let package = root.join("plugins/fixture");
             fs::create_dir_all(&package).unwrap();
+            Self::declare_witnesses(&package, &witnesses.join("fixture"));
             fs::write(package.join("preview_plugin.py"), source).unwrap();
             fs::write(
                 package.join("crikey.toml"),
@@ -3866,6 +3893,7 @@ mod preview_origin_tests {
             if second_owner {
                 let second = root.join("plugins/second");
                 fs::create_dir_all(&second).unwrap();
+                Self::declare_witnesses(&second, &witnesses.join("second"));
                 fs::write(second.join("preview_plugin.py"), source).unwrap();
                 let manifest = fs::read_to_string(package.join("crikey.toml")).unwrap();
                 fs::write(
@@ -3888,7 +3916,7 @@ mod preview_origin_tests {
                 "{:?}",
                 provider.unavailable()
             );
-            (Self { root }, provider, pipeline)
+            (Self { root, witnesses }, provider, pipeline)
         }
 
         fn catalog(provider: &mut ModernProvider) -> CatalogBuildResult {
@@ -3920,6 +3948,7 @@ mod preview_origin_tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+            let _ = fs::remove_dir_all(&self.witnesses);
         }
     }
     fn wait_for(mut condition: impl FnMut() -> bool) {
@@ -3953,7 +3982,7 @@ mod preview_origin_tests {
             };
             let driver = ModernDriver::spawn(provider, pipeline, |_| {});
             let endpoint = driver.action_executor();
-            let root = fixture.root.join("plugins/fixture");
+            let root = fixture.witnesses.join("fixture");
             let preview_state = Arc::new(Mutex::new(None));
             let sink = Arc::clone(&preview_state);
             driver
@@ -4061,8 +4090,8 @@ mod preview_origin_tests {
         let declaration = &snapshot.owners[&action_owner].declarations[0];
         let driver = ModernDriver::spawn(provider, pipeline, |_| {});
         let endpoint = driver.action_executor();
-        let root = fixture.root.join("plugins/fixture");
-        let second = fixture.root.join("plugins/second");
+        let root = fixture.witnesses.join("fixture");
+        let second = fixture.witnesses.join("second");
         let mut native_pipeline = QueryPipeline::new(crate::PipelineConfig::default());
         let native_provider =
             crate::NativeProvider::load(&mut native_pipeline, &[], &DisabledPlugins::default());
@@ -4173,8 +4202,8 @@ mod preview_origin_tests {
         let action_budget = pipeline.plugin_budget(&action_owner).unwrap().clone();
         let driver = ModernDriver::spawn(provider, pipeline, |_| {});
         let actions = driver.action_executor();
-        let preview_package = fixture.root.join("plugins/fixture");
-        let action_package = fixture.root.join("plugins/second");
+        let preview_package = fixture.witnesses.join("fixture");
+        let action_package = fixture.witnesses.join("second");
         let (send, receive) = mpsc::channel();
         driver
             .preview_endpoint
@@ -4268,7 +4297,7 @@ mod preview_origin_tests {
             let budget = pipeline.plugin_budget(&owner).unwrap().clone();
             let driver = ModernDriver::spawn(provider, pipeline, |_| {});
             let actions = driver.action_executor();
-            let package = fixture.root.join("plugins/fixture");
+            let package = fixture.witnesses.join("fixture");
             let (send, receive) = mpsc::channel();
             let identity = PreviewIdentity {
                 view: 1,
