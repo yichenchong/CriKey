@@ -127,14 +127,14 @@ impl fmt::Display for ActionPanelRefusal {
 
 impl std::error::Error for ActionPanelRefusal {}
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct PreparedSection {
     id: String,
     label: String,
     children: Vec<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct PreparedEntry {
     identity: ActionIdentity,
     presentation: ActionPresentation,
@@ -535,7 +535,7 @@ impl ActionPanel {
             visible: Vec::with_capacity(MAX_ACTION_ENTRIES),
             invalidation: None,
         };
-        panel.rebuild();
+        panel.rebuild(true);
         panel
     }
 
@@ -583,7 +583,7 @@ impl ActionPanel {
         if was_searching && !searching {
             self.selected = self.browse_selection.take();
         }
-        self.rebuild();
+        self.rebuild(true);
         Ok(true)
     }
 
@@ -653,7 +653,7 @@ impl ActionPanel {
             return ActionPanelNavigation::Close;
         };
         self.selected = Some(parent);
-        self.rebuild();
+        self.rebuild(true);
         ActionPanelNavigation::Changed
     }
 
@@ -689,7 +689,7 @@ impl ActionPanel {
             Ok(None) => {
                 self.path.push(identity);
                 self.selected = None;
-                self.rebuild();
+                self.rebuild(true);
                 Ok(Some(ActionActivation::EnteredSubmenu))
             }
         }
@@ -709,6 +709,9 @@ impl ActionPanel {
             self.invalidate(ActionPanelInvalidation::ActionUnavailable);
             return Err(ActionPanelInvalidation::ActionUnavailable);
         }
+        // A new allocation/republication is not a new layout. Compare the
+        // bounded prepared data by value without cloning paint identities.
+        let layout_changed = self.tree.sections != tree.sections || self.tree.entries != tree.entries;
         self.tree = tree;
         // Validate the full parent chain; moved menus cannot silently redirect a path.
         let mut parent = None;
@@ -739,7 +742,7 @@ impl ActionPanel {
                 self.path.reverse();
             }
         }
-        self.rebuild();
+        self.rebuild(layout_changed);
         // Refresh may retain only the exact previously focused visible identity.
         // In particular, rebuild's browsing fallback must never revive focus
         // lost on an earlier refresh; only a user interaction may choose anew.
@@ -758,13 +761,15 @@ impl ActionPanel {
         self.visible.clear();
     }
 
-    fn rebuild(&mut self) {
-        // Search, submenu navigation and provider refreshes may move a retained
-        // identity. Repaints never rebuild, so manual scrolling stays independent.
-        self.layout_revision = self
-            .layout_revision
-            .checked_add(1)
-            .expect("action panel layout revision exhausted");
+    fn rebuild(&mut self, layout_changed: bool) {
+        // User search/path transitions and changed provider presentation may
+        // move a retained identity; an unchanged refresh must preserve scrolling.
+        if layout_changed {
+            self.layout_revision = self
+                .layout_revision
+                .checked_add(1)
+                .expect("action panel layout revision exhausted");
+        }
         self.visible.clear();
         if self.invalidation.is_some() {
             return;
