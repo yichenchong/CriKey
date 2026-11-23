@@ -674,12 +674,18 @@ longer be cancellable. Its terminal result reports the actual package/config
 state and whether another launch is required. Enable/disable is a serialized
 configuration change for the next launch, not live activation. Quit waits for
 running jobs and owned runtime teardown before releasing the launcher lock.
+An enable/disable failure acknowledges a saved configuration only when the write
+persisted but effective reload failed; lookup, load and save failures are not
+reported as saved.
 
 **Package details** inspects the selected local runtime/package identity,
 location and declared metadata without executing it or requiring an index.
 Index search/details and **Update index** use the configured index policy.
 Inspection and index operations do not stop running plugins; no configured
 index is reported explicitly rather than silently changing policy.
+**Diagnose** targets the selected local plugin's namespaced identity, even when
+different runtimes share a package id. Index-only rows retain their package-id
+lookup behavior.
 
 For package authors and operators, package operations are explicit:
 

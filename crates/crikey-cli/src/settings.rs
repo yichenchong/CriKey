@@ -758,59 +758,12 @@ impl Management {
             if let Some(outcome) = snapshot.outcome.as_ref() {
                 self.observe_package_outcome(outcome);
             }
-            use crikey_app::package_jobs::{JobOutcome, JobPhase};
-            let status = match snapshot.outcome.as_ref() {
-                Some(JobOutcome::Completed {
-                    report,
-                    restart_required,
-                    details_truncated,
-                    ..
-                }) => {
-                    if *details_truncated {
-                        self.panel.notice = "Job details truncated by the reporting limit".into();
-                    }
-                    if *restart_required {
-                        self.panel.notice = if matches!(snapshot.operation, "install" | "remove") {
-                            "Operation finished. Third-party runtimes remain closed until next launch"
-                        } else {
-                            "Configuration saved. The runtime change requires the next launch"
-                        }
-                        .into();
-                    }
-                    report.clone()
-                }
-                Some(JobOutcome::Failed {
-                    error,
-                    reconciliation,
-                    restart_required,
-                }) => {
-                    if *restart_required {
-                        self.panel.notice = if matches!(snapshot.operation, "install" | "remove") {
-                            "Package operation failed; third-party runtimes remain closed until next launch"
-                        } else {
-                            "Configuration was persisted but effective reload failed; next launch required"
-                        }
-                        .into();
-                    }
-                    if reconciliation.is_some() {
-                        self.panel.notice =
-                            "Reconciliation failed; plugin admission remains failed-closed".into();
-                    }
-                    error.detail.clone()
-                }
-                Some(JobOutcome::Cancelled) => "Cancelled".into(),
-                None => match snapshot.measured_progress {
-                    Some((done, total)) => format!("{:?}: {done}/{total}", snapshot.phase).into(),
-                    None => match snapshot.phase {
-                        JobPhase::Queued => "Queued",
-                        JobPhase::Working => "Working (indeterminate)",
-                        JobPhase::Commit => "Committing — not cancellable",
-                        JobPhase::Reconciling => "Reconciling actual disk/configuration state",
-                        JobPhase::Terminal => "Terminal",
-                    }
-                    .into(),
-                },
-            };
+            let status = self.package_job_status(
+                snapshot.operation,
+                snapshot.outcome.as_ref(),
+                snapshot.phase,
+                snapshot.measured_progress,
+            );
             self.jobs.insert(
                 id,
                 crikey_ui::settings_management::Job {
@@ -829,6 +782,67 @@ impl Management {
         }
         if jobs_changed {
             self.panel.jobs = self.jobs.values().cloned().collect::<Vec<_>>().into();
+        }
+    }
+
+    fn package_job_status(
+        &mut self,
+        operation: &str,
+        outcome: Option<&crikey_app::package_jobs::JobOutcome>,
+        phase: crikey_app::package_jobs::JobPhase,
+        progress: Option<(u64, u64)>,
+    ) -> Arc<str> {
+        use crikey_app::package_jobs::{JobOutcome, JobPhase};
+        match outcome {
+            Some(JobOutcome::Completed {
+                report,
+                restart_required,
+                details_truncated,
+                ..
+            }) => {
+                if *details_truncated {
+                    self.panel.notice = "Job details truncated by the reporting limit".into();
+                }
+                if *restart_required {
+                    self.panel.notice = if matches!(operation, "install" | "remove") {
+                        "Operation finished. Third-party runtimes remain closed until next launch"
+                    } else {
+                        "Configuration saved. The runtime change requires the next launch"
+                    }
+                    .into();
+                }
+                report.clone()
+            }
+            Some(JobOutcome::Failed {
+                error,
+                reconciliation,
+                restart_required,
+            }) => {
+                // Restart policy is not evidence of a successful configuration write.
+                self.panel.notice = if reconciliation.is_some() {
+                    "Reconciliation failed; plugin admission remains failed-closed"
+                } else if *restart_required && matches!(operation, "install" | "remove") {
+                    "Package operation failed; third-party runtimes remain closed until next launch"
+                } else if error.code == "configuration-persisted-reload" {
+                    "Configuration was persisted but effective reload failed; next launch required"
+                } else {
+                    "Operation failed; see job details"
+                }
+                .into();
+                error.detail.clone()
+            }
+            Some(JobOutcome::Cancelled) => "Cancelled".into(),
+            None => match progress {
+                Some((done, total)) => format!("{phase:?}: {done}/{total}").into(),
+                None => match phase {
+                    JobPhase::Queued => "Queued",
+                    JobPhase::Working => "Working (indeterminate)",
+                    JobPhase::Commit => "Committing — not cancellable",
+                    JobPhase::Reconciling => "Reconciling actual disk/configuration state",
+                    JobPhase::Terminal => "Terminal",
+                }
+                .into(),
+            },
         }
     }
     fn observe_package_outcome(&mut self, outcome: &crikey_app::package_jobs::JobOutcome) {
@@ -1096,6 +1110,74 @@ mod tests {
     use crikey_config::ConfigLayer;
     use crikey_platform::{DirectoryConvention, DirectoryEnvironment, StandardDirectories};
     use crikey_ui::UiCommand;
+
+    #[test]
+    fn package_failure_notice_requires_evidence_of_a_persisted_write() {
+        use crikey_app::package_jobs::{JobOutcome, JobPhase};
+        let mut management = Management::new();
+        for operation in ["enable", "disable"] {
+            for code in ["not-found", "configuration-load", "configuration-save"] {
+                // A previous successful write must not leave a saved acknowledgement
+                // visible for the new, pre-write failure.
+                management.panel.notice = "Configuration saved".into();
+                let outcome = JobOutcome::Failed {
+                    error: JobError::new(code, "original failure details"),
+                    reconciliation: None,
+                    restart_required: true,
+                };
+                let status =
+                    management.package_job_status(operation, Some(&outcome), JobPhase::Terminal, None);
+                assert_eq!(&*status, "original failure details");
+                assert_eq!(&*management.panel.notice, "Operation failed; see job details");
+            }
+            for restart_required in [false, true] {
+                let outcome = JobOutcome::Failed {
+                    error: JobError::new("configuration-persisted-reload", "reload failure details"),
+                    reconciliation: None,
+                    restart_required,
+                };
+                let status =
+                    management.package_job_status(operation, Some(&outcome), JobPhase::Terminal, None);
+                assert_eq!(&*status, "reload failure details");
+                assert_eq!(
+                    &*management.panel.notice,
+                    "Configuration was persisted but effective reload failed; next launch required",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn package_failure_notice_preserves_runtime_closure_and_reconciliation_priority() {
+        use crikey_app::package_jobs::{JobOutcome, JobPhase};
+        let mut management = Management::new();
+        for operation in ["install", "remove"] {
+            let outcome = JobOutcome::Failed {
+                error: JobError::new("install", "original package error"),
+                reconciliation: None,
+                restart_required: true,
+            };
+            let status = management.package_job_status(operation, Some(&outcome), JobPhase::Terminal, None);
+            assert_eq!(&*status, "original package error");
+            assert_eq!(
+                &*management.panel.notice,
+                "Package operation failed; third-party runtimes remain closed until next launch",
+            );
+        }
+        for operation in ["install", "remove", "enable", "disable"] {
+            let outcome = JobOutcome::Failed {
+                error: JobError::new("configuration-persisted-reload", "original operation error"),
+                reconciliation: Some(JobError::new("reconcile", "reconciliation details")),
+                restart_required: true,
+            };
+            let status = management.package_job_status(operation, Some(&outcome), JobPhase::Terminal, None);
+            assert_eq!(&*status, "original operation error");
+            assert_eq!(
+                &*management.panel.notice,
+                "Reconciliation failed; plugin admission remains failed-closed",
+            );
+        }
+    }
     #[test]
     fn operator_discovered_packages_remain_configurable_but_are_not_managed_targets() {
         use crikey_app::package_jobs::{JobOutcome, PackageRow};
