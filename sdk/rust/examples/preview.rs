@@ -45,7 +45,31 @@ impl Plugin for PreviewDemo {
         sink.emit_batch(items())?;
         sink.finish()
     }
-    fn execute(&mut self, _: ExecuteRequest, _: &dyn PluginContext) -> Result<()> {
+    fn execute(&mut self, request: ExecuteRequest, _: &dyn PluginContext) -> Result<()> {
+        if std::path::Path::new("preview-hold").exists() {
+            use std::io::Write as _;
+            if !std::path::Path::new("preview-terminal").exists() {
+                return Err(CoreError::Invalid("action overlapped preview callback".into()));
+            }
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("executions")
+                .map_err(|error| CoreError::Invalid(error.to_string()))?;
+            writeln!(
+                log,
+                "{}:{}:{}",
+                std::process::id(),
+                request.item.0,
+                request.action.as_ref().map_or("none", |action| action.0.as_str())
+            )
+            .map_err(|error| CoreError::Invalid(error.to_string()))?;
+            while std::path::Path::new("action-hold").exists()
+                && !std::path::Path::new("action-release").exists()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         Ok(())
     }
     fn supports_preview(&self) -> bool {
@@ -64,6 +88,28 @@ impl Plugin for PreviewDemo {
             return Err(CoreError::Invalid("demonstration preview failure".into()));
         }
         if item_id == "slow" {
+            if std::path::Path::new("preview-hold").exists() {
+                let record = |name| {
+                    std::fs::write(name, std::process::id().to_string())
+                        .map_err(|error| CoreError::Invalid(error.to_string()))
+                };
+                record("preview-started")?;
+                let mut observed_cancel = false;
+                while !std::path::Path::new("preview-release").exists() {
+                    if context.cancellation().is_cancelled() && !observed_cancel {
+                        record("preview-cancelled")?;
+                        observed_cancel = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                record("preview-terminal")?;
+                // Deliberately return content even after cancellation. The
+                // consumer must reject it without inventing an early terminal.
+                return Ok(PreviewOutcome::Content(PreviewContent {
+                    text: Some(PreviewText::Plain("late speculative content".into())),
+                    ..Default::default()
+                }));
+            }
             // This real protocol record synchronizes the conformance consumer:
             // it may cancel only after this callback has actually begun.
             context.log(crikey_plugin_sdk::LogLevel::Debug, "preview callback started");

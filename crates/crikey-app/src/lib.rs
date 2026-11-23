@@ -17,6 +17,7 @@ mod plugin_action;
 mod plugin_icons;
 mod plugin_page;
 mod plugin_preview;
+mod preview_action_budget;
 mod query_history_store;
 mod query_pipeline;
 pub use query_history_store::{

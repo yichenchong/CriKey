@@ -6,7 +6,10 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use crikey_core::{ActionId, ItemId, PluginId};
 
@@ -18,6 +21,8 @@ pub const MAX_ACTION_DEPTH: usize = 4;
 pub const MAX_ACTION_TEXT_BYTES: usize = 8 * 1024;
 pub const MAX_ACTION_TOTAL_TEXT_BYTES: usize = 256 * 1024;
 pub const MAX_ACTION_QUERY_BYTES: usize = 8 * 1024;
+
+static NEXT_PANEL_FOCUS: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ActionTarget {
@@ -505,6 +510,8 @@ pub enum ActionActivation {
 #[derive(Debug, Clone)]
 pub struct ActionPanel {
     tree: Arc<ActionTree>,
+    focus_token: u64,
+    layout_revision: u64,
     query: String,
     path: Vec<ActionIdentity>,
     selected: Option<ActionIdentity>,
@@ -516,6 +523,10 @@ pub struct ActionPanel {
 impl ActionPanel {
     pub fn new(tree: Arc<ActionTree>) -> Self {
         let mut panel = Self {
+            focus_token: NEXT_PANEL_FOCUS
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+                .expect("action panel identity exhausted"),
+            layout_revision: 0,
             tree,
             query: String::new(),
             path: Vec::with_capacity(MAX_ACTION_DEPTH),
@@ -526,6 +537,14 @@ impl ActionPanel {
         };
         panel.rebuild();
         panel
+    }
+
+    pub(crate) fn focus_token(&self) -> u64 {
+        self.focus_token
+    }
+
+    pub(crate) fn layout_revision(&self) -> u64 {
+        self.layout_revision
     }
 
     pub fn tree(&self) -> &Arc<ActionTree> {
@@ -740,6 +759,12 @@ impl ActionPanel {
     }
 
     fn rebuild(&mut self) {
+        // Search, submenu navigation and provider refreshes may move a retained
+        // identity. Repaints never rebuild, so manual scrolling stays independent.
+        self.layout_revision = self
+            .layout_revision
+            .checked_add(1)
+            .expect("action panel layout revision exhausted");
         self.visible.clear();
         if self.invalidation.is_some() {
             return;

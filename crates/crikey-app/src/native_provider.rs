@@ -42,6 +42,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::preview_action_budget::{ForegroundActionAdmission, PreviewActionGate, PreviewCancellation};
 use crikey_core::{ActionId, ArgumentPolicy, ExecutionPolicy, Generation, Item, ItemId, PageInput, PluginId};
 use crikey_input_scheduler::Millis;
 use crikey_native_host::{
@@ -49,7 +50,7 @@ use crikey_native_host::{
     NativeSupervisor, ResourceKind, ResourceOutcome, Suggestions, SupervisorConfig, WorkerOptions,
 };
 use crikey_plugin_model::{Manifest, Permissions, Runtime, Startup};
-use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
+use crikey_plugin_supervisor::{BudgetKind, PluginBudgetHandle};
 use crikey_ui::{ResultRow, ViewModel};
 
 use crate::plugin_icons::{
@@ -610,6 +611,12 @@ impl PluginResourceSource for NativeResourceSource {
     }
 }
 
+impl PreviewCancellation for CallControl {
+    fn cancel_preview(&self) {
+        self.cancel();
+    }
+}
+
 /// Serves one plugin's page frames from the worker that opened the page.
 ///
 /// Deliberately the query supervisor and not a child of its own, which is the
@@ -624,10 +631,25 @@ struct NativePageSource {
     plugin: PluginId,
     supervisor: Arc<Mutex<NativeSupervisor>>,
     incarnations: NativeIncarnations,
+    admission: Option<ForegroundActionAdmission>,
+    gate: Arc<PreviewActionGate>,
 }
 
 impl PageBackend for NativePageSource {
     fn draw(&mut self, draw: &PageDraw) -> Result<crikey_core::PageFrame, String> {
+        let admission = match self.admission.take() {
+            Some(admission) => admission,
+            None => self
+                .gate
+                .reserve_foreground()
+                .map_err(|error| error.to_string())?,
+        };
+        let _guard = admission
+            .acquire(
+                Instant::now() + Duration::from_millis(NATIVE_CALL_TIMEOUT_MS),
+                &AtomicBool::new(false),
+            )
+            .map_err(|error| error.to_string())?;
         let mut supervisor = self.supervisor.lock().unwrap_or_else(|error| error.into_inner());
         with_native_worker(&mut supervisor, &self.plugin, &self.incarnations, |worker| {
             worker.page(&NativePageRequest {
@@ -1292,7 +1314,7 @@ impl NativeProvider {
     /// Validates and executes one admitted plugin action on the exact native
     /// worker that owns the item's plugin id.
     fn execute_action_request(&mut self, request: NativeActionRequest) -> crikey_core::Result<ActionEffect> {
-        let _guard = request.guard;
+        let _guard = request.guard.acquire(request.deadline, &request.cancelled)?;
         let plugin = request.plugin;
         // Admission froze both validation and privacy evidence for this item.
         // Current ownership/liveness still come from the loaded runtime below;
@@ -1350,7 +1372,11 @@ impl NativeProvider {
             crikey_core::CoreError::Invalid(format!("native worker for `{}` is unavailable", plugin.0))
         })?;
         let mut supervisor = supervisor.lock().unwrap_or_else(|error| error.into_inner());
+        if request.cancelled.load(Ordering::Acquire) {
+            return Err(crikey_core::CoreError::Cancelled);
+        }
         let execute = |worker: &mut crikey_native_host::NativeWorker| {
+            worker.cancel_handle().reset();
             worker.execute(
                 &item.stable_id,
                 Some(&request.action_id),
@@ -1894,7 +1920,7 @@ struct NativeActionRequest {
     origin: Option<u64>,
     action_id: ActionId,
     argument: Option<String>,
-    guard: OwnedBudgetGuard,
+    guard: ForegroundActionAdmission,
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
 }
@@ -1953,7 +1979,7 @@ impl std::fmt::Debug for WakeSlot {
 struct NativeActionEndpoint {
     sender: SyncSender<NativeActionRequest>,
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
-    budgets: BTreeMap<PluginId, PluginBudgetHandle>,
+    gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
     items: NativeItemStore,
     catalog_items: NativeItemStore,
     static_catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
@@ -2036,7 +2062,7 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
                 "native action mailbox is full".to_owned(),
             ));
         }
-        let budget = match self.budgets.get(plugin) {
+        let budget = match self.gates.get(plugin) {
             Some(budget) => budget,
             None => {
                 self.in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -2046,14 +2072,11 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
                 )));
             }
         };
-        let guard = match budget.try_acquire_owned(BudgetKind::Action) {
-            Some(guard) => guard,
-            None => {
+        let guard = match budget.reserve_foreground() {
+            Ok(guard) => guard,
+            Err(error) => {
                 self.in_flight.fetch_sub(1, Ordering::AcqRel);
-                return Err(crikey_core::CoreError::Invalid(format!(
-                    "native plugin `{}` action budget is full",
-                    plugin.0
-                )));
+                return Err(error);
             }
         };
         let sequence = self
@@ -2208,6 +2231,11 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
                 session.page_id()
             )));
         }
+        let admission = self
+            .gates
+            .get(plugin)
+            .ok_or_else(|| crikey_core::CoreError::Invalid("native page owner unavailable".into()))?
+            .reserve_foreground()?;
         let session = PageSession::open(
             PageOpen {
                 plugin: plugin.clone(),
@@ -2221,6 +2249,8 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
                 plugin: plugin.clone(),
                 supervisor,
                 incarnations: Arc::clone(&self.incarnations),
+                admission: Some(admission),
+                gate: Arc::clone(&self.gates[plugin]),
             }),
             self.wake.handle(),
         )
@@ -2393,7 +2423,7 @@ impl NativeDriver {
         let action_endpoint = Arc::new(NativeActionEndpoint {
             sender: action_sender,
             completions: Arc::clone(&completion_mailbox),
-            budgets: provider.action_budgets(),
+            gates: preview_endpoint.gates.clone(),
             items: Arc::clone(&provider.action_items),
             catalog_items: Arc::clone(&provider.catalog.items),
             static_catalog_items: Arc::clone(&provider.catalog.static_items),
@@ -2840,7 +2870,7 @@ impl NativeDriver {
 
     /// Returns the exact plugin ids owned by this driver's action endpoint.
     pub fn plugins(&self) -> Vec<PluginId> {
-        self.action_endpoint.budgets.keys().cloned().collect()
+        self.action_endpoint.gates.keys().cloned().collect()
     }
     /// Manifest grants used by the host-mediated action boundary.
     pub fn permissions(&self) -> BTreeMap<PluginId, Permissions> {
@@ -2861,7 +2891,8 @@ impl NativeDriver {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        for (plugin, budget) in &self.action_endpoint.budgets {
+        for (plugin, gate) in &self.action_endpoint.gates {
+            let budget = gate.budget();
             if let Some((_, health)) = report.iter_mut().find(|(id, _)| id == plugin) {
                 health.concurrency_refusals = budget.refusals_snapshot();
             } else {
@@ -2934,9 +2965,11 @@ mod query_history_receipt_tests {
             NativeActionEndpoint {
                 sender,
                 completions: Arc::default(),
-                budgets: BTreeMap::from([(
+                gates: BTreeMap::from([(
                     owner.clone(),
-                    crikey_plugin_supervisor::shared_budget_from_section(&Default::default()),
+                    PreviewActionGate::new(crikey_plugin_supervisor::shared_budget_from_section(
+                        &Default::default(),
+                    )),
                 )]),
                 items: Arc::new(Mutex::new(BTreeMap::from([(
                     (owner, item.stable_id.clone()),
@@ -3173,7 +3206,11 @@ mod query_history_receipt_tests {
         endpoint.catalog_items = Arc::clone(&provider.catalog.items);
         endpoint.static_catalog_items = Arc::clone(&provider.catalog.static_items);
         endpoint.incarnations = Arc::clone(&provider.incarnations);
-        endpoint.budgets = provider.action_budgets();
+        endpoint.gates = provider
+            .action_budgets()
+            .into_iter()
+            .map(|(owner, budget)| (owner, PreviewActionGate::new(budget)))
+            .collect();
         let action = displayed.actions[0].action_id.clone();
         let receipt = endpoint
             .submit_plugin_action_with_receipt(&owner, &displayed, &action, None)

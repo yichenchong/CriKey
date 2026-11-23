@@ -39,6 +39,8 @@ pub(crate) trait PreviewDispatcher: Send + Sync {
     fn set_wake(&self, wake: Arc<dyn Fn() + Send + Sync>);
     fn submit(&self, request: PreviewRequest, publish: PreviewPublish) -> Result<(), String>;
     fn cancel(&self, identity: &PreviewIdentity);
+    /// A foreground reservation fences speculative work on the actual worker.
+    fn foreground_blocked(&self, owner: &PluginId) -> bool;
 }
 
 /// One active operation and one replace-latest selection. Terminal delivery
@@ -245,6 +247,10 @@ impl PreviewService {
         }
         if self.active.is_none() {
             if let Some((selection, endpoint, item, incarnation)) = self.pending.take() {
+                if self.endpoints[endpoint].foreground_blocked(&selection.plugin) {
+                    self.pending = Some((selection, endpoint, item, incarnation));
+                    return;
+                }
                 // The producing identity was captured atomically with the item.
                 // A busy provider must not drop this selection, and a restarted
                 // provider must not silently inherit its predecessor's item.
@@ -401,6 +407,9 @@ mod tests {
             panic!("these terminal-delivery fixtures have no pending request")
         }
         fn cancel(&self, _: &PreviewIdentity) {}
+        fn foreground_blocked(&self, _: &PluginId) -> bool {
+            false
+        }
     }
 
     fn active_preview() -> (PreviewService, LauncherViewModel, Arc<Endpoint>, PreviewIdentity) {
@@ -651,6 +660,9 @@ mod tests {
                 Ok(())
             }
             fn cancel(&self, _: &PreviewIdentity) {}
+            fn foreground_blocked(&self, _: &PluginId) -> bool {
+                false
+            }
         }
         let owners = ["native.first", "native.second", "modern.third"].map(|owner| PluginId(owner.into()));
         let items: Vec<_> = owners
