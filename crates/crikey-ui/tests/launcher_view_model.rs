@@ -44,11 +44,11 @@
 //!   text belongs to. Rows may still be the previous generation's while
 //!   `pending_plugins` is true; editing the query never blanks the list
 //!   (spec 6.5: no flicker from late responses).
-//! * Selection is anchored by `ItemId`. A republish within one generation keeps
-//!   the same item selected wherever it moved to; if the anchor is gone the
-//!   previous index is clamped into range. The first publish of a new
-//!   generation resets the selection to the first row. Navigation clamps at
-//!   both ends and never wraps.
+//! * Selection is anchored by owner and `ItemId`. A republish within one
+//!   generation follows that item, falling back to the previous index clamped
+//!   into range. A return search retains its original choice across partial
+//!   publications until completion or explicit navigation/query editing.
+//!   An ordinary new generation starts at the top. Navigation never wraps.
 //! * `PAGE_SIZE: usize` is the crate constant `PageDown`/`PageUp` move by.
 //! * `ViewModel::rows` is an `Arc<[ResultRow]>` shared with the model, so a
 //!   frame that changes only the query or the selection costs a refcount bump
@@ -2228,6 +2228,103 @@ fn settings_retire_root_publications_and_return_requests_one_fresh_search() {
         model.publish(old, rows(&["late-again"]), true);
         expect_idle(&mut model);
     }
+}
+
+/// Return to a deliberately selected asynchronous result, before any fresh
+/// publication. `plugin_name` carries the owner in this model's row contract.
+fn returning_to_selected_provider() -> (LauncherViewModel, Generation) {
+    let tracker = GenerationTracker::new();
+    let old = tracker.advance();
+    let mut model = open_showing(old, &["builtin", "shared"]);
+    let mut provider = row("shared");
+    provider.plugin_name = "provider".into();
+    model.publish(old, vec![row("builtin"), provider], false);
+    model.apply(UiCommand::SelectNext);
+    assert_eq!(expect_frame(&mut model).selected, 1);
+    model.apply(UiCommand::OpenSettings);
+    model.apply(UiCommand::CloseSettings);
+    assert_eq!(model.take_query_refresh().as_deref(), Some(FIXTURE_QUERY));
+    let fresh = tracker.advance();
+    model.begin_generation(fresh);
+    let _ = expect_frame(&mut model);
+    (model, fresh)
+}
+
+#[test]
+fn return_selection_survives_phased_publications_and_matches_the_exact_owner() {
+    let (mut model, fresh) = returning_to_selected_provider();
+    model.publish(fresh, rows(&["builtin"]), true);
+    assert_eq!(selected_id(&expect_frame(&mut model)), "builtin");
+
+    // An empty wave must not erase the return intent either.
+    model.publish(fresh, Vec::new(), true);
+    assert!(expect_frame(&mut model).rows.is_empty());
+    model.publish(fresh, rows(&["shared", "builtin"]), true);
+    assert_eq!(expect_frame(&mut model).selected, 0);
+
+    let mut provider = row("shared");
+    provider.plugin_name = "provider".into();
+    model.publish(fresh, vec![row("shared"), row("builtin"), provider], false);
+    let restored = expect_frame(&mut model);
+    assert_eq!(restored.selected, 2);
+    assert_eq!(restored.rows[restored.selected].plugin_name, "provider");
+    assert!(!restored.pending_plugins);
+}
+
+#[test]
+fn explicit_navigation_cancels_return_selection_even_when_clamped_or_empty() {
+    for command in [
+        UiCommand::SelectNext,
+        UiCommand::SelectPrevious,
+        UiCommand::PageDown,
+        UiCommand::PageUp,
+    ] {
+        for empty in [false, true] {
+            let (mut model, fresh) = returning_to_selected_provider();
+            model.publish(fresh, if empty { Vec::new() } else { rows(&["builtin"]) }, true);
+            let _ = expect_frame(&mut model);
+            model.apply(command.clone());
+            let mut provider = row("shared");
+            provider.plugin_name = "provider".into();
+            model.publish(fresh, vec![row("builtin"), provider], false);
+            assert_eq!(selected_id(&expect_frame(&mut model)), "builtin");
+        }
+    }
+    // A real move chooses a new anchor, not just a fallback index.
+    let (mut model, fresh) = returning_to_selected_provider();
+    model.publish(fresh, rows(&["first", "second"]), true);
+    let _ = expect_frame(&mut model);
+    model.apply(UiCommand::SelectPrevious);
+    let mut provider = row("shared");
+    provider.plugin_name = "provider".into();
+    model.publish(fresh, vec![row("second"), provider, row("first")], false);
+    assert_eq!(selected_id(&expect_frame(&mut model)), "first");
+}
+
+#[test]
+fn completed_return_search_retires_an_absent_restoration_target() {
+    let (mut model, fresh) = returning_to_selected_provider();
+    model.publish(fresh, rows(&["builtin"]), false);
+    let _ = expect_frame(&mut model);
+    let mut provider = row("shared");
+    provider.plugin_name = "provider".into();
+    model.publish(fresh, vec![row("builtin"), provider], false);
+    assert_eq!(selected_id(&expect_frame(&mut model)), "builtin");
+}
+
+#[test]
+fn query_completion_supersedes_the_pending_return_selection() {
+    let (mut model, fresh) = returning_to_selected_provider();
+    model.publish(fresh, rows(&["builtin"]), true);
+    let _ = expect_frame(&mut model);
+    assert_eq!(
+        model.apply(UiCommand::Complete),
+        Some(UiEffect::Query("BUILTIN".into()))
+    );
+    let mut provider = row("shared");
+    provider.plugin_name = "provider".into();
+    model.publish(fresh, vec![row("builtin"), provider], false);
+    assert_eq!(selected_id(&expect_frame(&mut model)), "builtin");
 }
 
 #[test]

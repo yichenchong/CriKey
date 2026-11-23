@@ -499,6 +499,9 @@ pub struct LauncherViewModel {
     publication_view: Option<ViewId>,
     query_refresh: bool,
     restore_selection: bool,
+    /// The return search's owner-qualified choice, independent of temporary
+    /// fallback rows. Kept until completion or an explicit user choice.
+    restoration_target: Option<(String, ItemId)>,
     /// Set by every accepted mutation and cleared by `frame`, so mutations
     /// between two frames coalesce into one view model (spec 25.5).
     dirty: bool,
@@ -581,6 +584,7 @@ impl LauncherViewModel {
             publication_view: None,
             query_refresh: false,
             restore_selection: false,
+            restoration_target: None,
             dirty: false,
             query: String::new(),
             rows: Arc::default(),
@@ -629,6 +633,12 @@ impl LauncherViewModel {
         }
         self.query_refresh = false;
         self.restore_selection = self.navigated;
+        if self.navigated && self.restoration_target.is_none() {
+            self.restoration_target = self
+                .rows
+                .get(self.selected)
+                .map(|row| (row.plugin_name.clone(), row.item.clone()));
+        }
         Some(self.query.clone())
     }
 
@@ -689,6 +699,7 @@ impl LauncherViewModel {
         self.publication_view = None;
         self.query_refresh = false;
         self.restore_selection = false;
+        self.restoration_target = None;
     }
 
     /// Makes `generation` the active one and marks results outstanding.
@@ -718,6 +729,7 @@ impl LauncherViewModel {
             self.restore_selection = false;
         } else {
             self.navigated = false;
+            self.restoration_target = None;
         }
         self.active = Some(generation);
         self.publication_view = Some(self.view_id);
@@ -752,6 +764,9 @@ impl LauncherViewModel {
         self.actions_open = false;
         self.pending_plugins = pending_plugins;
         self.published = Some(generation);
+        if !pending_plugins {
+            self.restoration_target = None;
+        }
         self.dirty = true;
     }
 
@@ -914,6 +929,7 @@ impl LauncherViewModel {
             return None;
         }
         self.restore_selection = false;
+        self.restoration_target = None;
 
         // Reuse the buffer rather than swapping it in: a keystroke on the hot
         // path must not allocate, and `text` is already owned by the effect.
@@ -938,6 +954,7 @@ impl LauncherViewModel {
             return None;
         }
         self.restore_selection = false;
+        self.restoration_target = None;
 
         self.query.clear();
         self.query.push_str(&row.label);
@@ -1325,6 +1342,8 @@ impl LauncherViewModel {
     /// Moves the selection to `target`, clamped into range. Navigation never
     /// wraps, and an empty list has nothing to move.
     fn select(&mut self, target: usize) {
+        // Even a clamped navigation command supersedes a pending return choice.
+        self.restoration_target = None;
         let Some(last) = self.rows.len().checked_sub(1) else {
             return;
         };
@@ -1346,16 +1365,24 @@ impl LauncherViewModel {
 
     /// Where the selection lands once `incoming` replaces the current rows.
     ///
-    /// Within one generation the selection is anchored by [`ItemId`]: a
-    /// republish follows the selected item wherever it moved to and falls back
-    /// to the previous index clamped into range when the anchor is gone. The
-    /// first publish of a new generation is a new query state and starts at the
-    /// top, because the anchor lives inside one generation only.
+    /// Within one generation the selection is anchored by owner and [`ItemId`]:
+    /// a republish follows the selected item wherever it moved to and falls
+    /// back to the previous index clamped into range when the anchor is gone.
+    /// Return searches retain a separate target across partial publications;
+    /// an ordinary new query starts at the top.
     fn resolve_selection(&self, incoming: &[ResultRow], generation: Generation) -> usize {
         let Some(last) = incoming.len().checked_sub(1) else {
             return 0;
         };
 
+        if let Some((owner, item)) = &self.restoration_target {
+            if let Some(index) = incoming
+                .iter()
+                .position(|row| row.plugin_name == *owner && row.item == *item)
+            {
+                return index;
+            }
+        }
         if self.published != Some(generation) {
             return 0;
         }
@@ -1368,13 +1395,13 @@ impl LauncherViewModel {
             return 0;
         }
 
-        let Some(anchor) = self.rows.get(self.selected).map(|row| &row.item) else {
+        let Some(anchor) = self.rows.get(self.selected) else {
             return 0;
         };
 
         incoming
             .iter()
-            .position(|row| row.item == *anchor)
+            .position(|row| row.plugin_name == anchor.plugin_name && row.item == anchor.item)
             .unwrap_or(self.selected.min(last))
     }
 }
