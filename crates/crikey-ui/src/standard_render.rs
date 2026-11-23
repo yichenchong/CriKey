@@ -99,11 +99,18 @@ pub(super) fn draw(
             );
             let follow = ui.data(|data| data.get_temp::<(u64, u64, usize)>(selection_id)) != Some(selection);
             ui.data_mut(|data| data.insert_temp(selection_id, selection));
+            let keyboard_follow = follow
+                && !restoring
+                && !model.navigation.preserve_scroll
+                && model.selected < model.rows.len();
             let mut first_visible = None;
             let restoration_spacing = ui.spacing().item_spacing.y;
             egui::ScrollArea::vertical()
                 .id_salt("standard-grid")
                 .max_height(body_height)
+                // A fresh host keyboard choice must be visible on the next paint,
+                // rather than spending another animation after the worker refresh.
+                .animated(!keyboard_follow)
                 .show_viewport(ui, |ui, viewport| {
                     let scroll_viewport = egui::Rect::from_min_size(
                         ui.max_rect().min + viewport.min.to_vec2(),
@@ -218,11 +225,7 @@ pub(super) fn draw(
                                         });
                                     }
                                 }
-                                if index == model.selected
-                                    && follow
-                                    && !restoring
-                                    && !model.navigation.preserve_scroll
-                                {
+                                if index == model.selected && keyboard_follow {
                                     response.scroll_to_me(None);
                                 }
                             }

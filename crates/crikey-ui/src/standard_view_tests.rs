@@ -1942,3 +1942,132 @@ fn long_standard_collections_follow_keyboard_after_coalesced_refresh_but_preserv
         );
     }
 }
+
+fn settle_route_on_requested_repaints(
+    renderer: &egui::Context,
+    model: &mut LauncherViewModel,
+    frame: &ViewModel,
+    time: &mut f64,
+) -> NativeUiFrame {
+    for _ in 0..64 {
+        let output = paint_route(renderer, frame, *time, vec![]);
+        for command in &output.commands {
+            if let UiCommand::SetLogicalScroll(scroll) = command {
+                model.apply(UiCommand::SetLogicalScroll(scroll.clone()));
+            }
+        }
+        let delay = output.output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        if delay > std::time::Duration::from_millis(50) {
+            return output;
+        }
+        *time += delay
+            .max(std::time::Duration::from_secs_f64(1.0 / 60.0))
+            .as_secs_f64();
+    }
+    panic!("grid follow did not settle its requested repaints");
+}
+
+#[test]
+fn image_grid_keyboard_follow_is_visible_on_next_paint_after_each_pending_refresh() {
+    let mut view = (*descriptor(120)).clone();
+    let StandardView::Grid(grid) = &mut view.view else {
+        unreachable!()
+    };
+    grid.collection.initial_selection = Some(target(2));
+    let image = Arc::new(crikey_core::preview::PreviewImage {
+        width: 2,
+        height: 2,
+        rgba: [40, 140, 210, 255].repeat(4),
+    });
+    for presentation in Arc::make_mut(&mut grid.collection.items) {
+        presentation.image = Some(image.clone());
+    }
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let mut context = open(&mut model, "native-paging", Arc::new(view.clone()));
+    let renderer = create_launcher_context();
+    let mut time = 0.0;
+    let frame = model.frame().unwrap();
+    settle_route_on_requested_repaints(&renderer, &mut model, &frame, &mut time);
+    let restoration = model.navigation_restore;
+    let mut current = frame;
+    for _ in 0..3 {
+        let previous = model.selected;
+        assert!(matches!(
+            model.apply(UiCommand::PageDown),
+            Some(UiEffect::RefreshStandard(ViewRefreshReason::Selection))
+        ));
+        assert!(model.selected > previous);
+        let pending = model.frame().unwrap();
+        assert!(pending.navigation.standard_refresh_pending);
+        let started = time;
+        for elapsed in [0.0, 0.3, 0.6] {
+            time = started + elapsed;
+            // Native PageDown press is a host command; its release reaches egui.
+            let events = if elapsed == 0.0 {
+                vec![egui::Event::Key {
+                    key: egui::Key::PageDown,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }]
+            } else {
+                vec![]
+            };
+            let output = paint_route(&renderer, &pending, time, events);
+            assert!(visible_label(&output.output, &format!("Item {}", model.selected)).is_none());
+        }
+        context.revision = NonZeroU64::new(context.revision.get() + 1).unwrap();
+        view.title = format!("Grid | selected item-{} | query (empty)", model.selected);
+        assert!(model.publish_standard_view(
+            owner(),
+            7,
+            ViewReply {
+                context: context.clone(),
+                descriptor: Arc::new(view.clone()),
+            }
+        ));
+        current = model.frame().unwrap();
+        assert!(!current.navigation.preserve_scroll);
+        assert_eq!(model.navigation_restore, restoration);
+        let published = paint_route(&renderer, &current, time, vec![]);
+        assert_eq!(
+            published.output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+            std::time::Duration::ZERO,
+            "publishing keyboard selection must request its immediate follow paint"
+        );
+        time += 1.0 / 60.0;
+        let output = paint_route(&renderer, &current, time, vec![]);
+        assert_selected_surface_visible(
+            &output.output,
+            &format!("Item {}", current.selected),
+            renderer.style().visuals.clip_rect_margin,
+        );
+        let output = settle_route_on_requested_repaints(&renderer, &mut model, &current, &mut time);
+        assert_selected_surface_visible(
+            &output.output,
+            &format!("Item {}", current.selected),
+            renderer.style().visuals.clip_rect_margin,
+        );
+    }
+    let output = settle_route(
+        &renderer,
+        &mut model,
+        &current,
+        &mut time,
+        vec![
+            egui::Event::PointerMoved(egui::pos2(320.0, 200.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 900.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(visible_label(&output.output, &format!("Item {}", current.selected)).is_none());
+    let manual = model.navigation_scroll.clone();
+    let output = settle_route_on_requested_repaints(&renderer, &mut model, &current, &mut time);
+    assert_eq!(model.navigation_scroll, manual);
+    assert!(visible_label(&output.output, &format!("Item {}", current.selected)).is_none());
+}
