@@ -604,6 +604,159 @@ mod tests {
     }
 
     #[test]
+    fn blocked_native_preview_yields_once_without_releasing_quota_or_retagging_origin() {
+        let executable = preview_executable().canonicalize().unwrap();
+        for mode in ["execute", "cancel", "stale"] {
+            let scratch = Scratch(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/preview-handoff-fixtures")
+                    .join(format!("native-{}-{mode}", std::process::id())),
+            );
+            let package = scratch.0.join("preview-demo");
+            fs::create_dir_all(&package).unwrap();
+            fs::write(package.join("preview-hold"), "").unwrap();
+            let executable = executable
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            fs::write(package.join("crikey.toml"), format!(
+                "manifest-version = 1\n[plugin]\nid = \"preview-demo\"\nname = \"Preview\"\nversion = \"0.1.0\"\nruntime = \"native\"\nentrypoint = \"{executable}\"\n"
+            )).unwrap();
+            let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+            let mut provider = NativeProvider::load_with_collection_window(
+                &mut pipeline,
+                &[scratch.0.clone()],
+                Duration::from_secs(10),
+                &DisabledPlugins::default(),
+            );
+            assert_eq!(provider.plugins().len(), 1, "{:?}", provider.unavailable());
+            provider.drive_query(&mut pipeline, "slow", 1).unwrap();
+            let owner = provider.plugins()[0].clone();
+            let key = (owner.clone(), ItemId("slow".into()));
+            let (item, origin) = provider.action_items.lock().unwrap()[&key].clone();
+            let budget = pipeline.plugin_budget(&owner).unwrap().clone();
+            let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| {}));
+            let previews = &driver.preview_endpoint;
+            let actions = driver.action_executor();
+            let (send, receive) = mpsc::channel();
+            let identity = PreviewIdentity {
+                view: 1,
+                query: Generation::from_raw(1),
+                plugin: owner.clone(),
+                incarnation: origin,
+                target: crikey_ui::ActionTarget::Result {
+                    owner: owner.clone(),
+                    item: item.stable_id.clone(),
+                },
+                catalog_source: None,
+                item: item.stable_id.clone(),
+                selection: 1,
+                request: 1,
+            };
+            previews
+                .submit(
+                    PreviewRequest {
+                        identity: identity.clone(),
+                    },
+                    Arc::new(move |update| send.send(update).unwrap()),
+                )
+                .unwrap();
+            wait_for("preview entered", || {
+                package.join("preview-started").exists().then_some(())
+            });
+            if mode == "stale" {
+                driver
+                    .action_endpoint
+                    .items
+                    .lock()
+                    .unwrap()
+                    .get_mut(&key)
+                    .unwrap()
+                    .1 = origin + 1;
+            }
+            let before = Instant::now();
+            let action = &item.actions[0].action_id;
+            let admission = actions.submit_plugin_action(&owner, &item, action, None);
+            if mode == "stale" {
+                let refusal = admission.expect_err("a mismatched dynamic producer must refuse admission");
+                assert!(refusal.to_string().contains("no longer current"), "{refusal}");
+                assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+                assert!(!package.join("preview-cancelled").exists());
+                assert!(!package.join("executions").exists());
+                assert!(actions.poll_plugin_actions().is_empty());
+                previews.cancel(&identity);
+                wait_for("explicit stale-case preview cancellation", || {
+                    package.join("preview-cancelled").exists().then_some(())
+                });
+                fs::write(package.join("preview-release"), "").unwrap();
+                assert!(matches!(
+                    receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
+                    PreviewState::Cancelled
+                ));
+                assert_eq!(budget.in_flight(BudgetKind::Action), 0);
+                continue;
+            }
+            let request = admission.unwrap();
+            assert!(before.elapsed() < Duration::from_secs(1), "UI waited for preview");
+            wait_for("preview cancellation observed", || {
+                package.join("preview-cancelled").exists().then_some(())
+            });
+            assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+            assert!(
+                !package.join("executions").exists(),
+                "cancel is not callback retirement"
+            );
+            assert!(actions.submit_plugin_action(&owner, &item, action, None).is_err());
+            if mode == "cancel" {
+                assert!(actions.cancel_plugin_action(&request));
+            } else if mode == "execute" {
+                fs::write(package.join("action-hold"), "").unwrap();
+                driver
+                    .action_endpoint
+                    .items
+                    .lock()
+                    .unwrap()
+                    .get_mut(&key)
+                    .unwrap()
+                    .0
+                    .actions
+                    .clear();
+            }
+            fs::write(package.join("preview-release"), "").unwrap();
+            if mode == "execute" {
+                wait_for("foreground callback entered", || {
+                    package.join("executions").exists().then_some(())
+                });
+                assert!(package.join("preview-terminal").exists());
+                assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+                assert!(actions.submit_plugin_action(&owner, &item, action, None).is_err());
+                fs::write(package.join("action-release"), "").unwrap();
+            }
+            let completion = wait_for("foreground completion", || {
+                actions.poll_plugin_actions().into_iter().next()
+            });
+            assert_eq!(completion.request_id, request);
+            assert_eq!(completion.outcome.is_ok(), mode == "execute");
+            assert!(matches!(
+                receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
+                PreviewState::Cancelled
+            ));
+            assert_eq!(budget.in_flight(BudgetKind::Action), 0);
+            if mode == "execute" {
+                let pid = fs::read_to_string(package.join("preview-started")).unwrap();
+                assert_eq!(
+                    fs::read_to_string(package.join("executions")).unwrap(),
+                    format!("{pid}:slow:acknowledge\n")
+                );
+                assert_eq!(previews.incarnation(&owner), Some(origin));
+            } else {
+                assert!(!package.join("executions").exists());
+            }
+            assert!(actions.poll_plugin_actions().is_empty());
+        }
+    }
+
+    #[test]
     fn retired_query_item_cannot_preview_in_action_replacement_but_fresh_item_can() {
         let executable = preview_executable().canonicalize().unwrap();
         static NEXT: AtomicU64 = AtomicU64::new(0);
