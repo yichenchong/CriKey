@@ -278,6 +278,9 @@ impl ModernPreviewEndpoint {
                 "plugin":identity.plugin.0, "incarnation":identity.incarnation,
                 "item":identity.item.0, "selection":identity.selection, "request":identity.request,
             });
+            if job.cancelled.load(Ordering::Acquire) {
+                control.cancel();
+            }
             let reply = worker.preview(&current, &wire_identity);
             control.finish();
             let _ = watcher.join();
@@ -3840,11 +3843,13 @@ mod preview_origin_tests {
             second_owner: bool,
         ) -> (Self, ModernProvider, QueryPipeline) {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "crikey-modern-lifecycle-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/preview-handoff-fixtures")
+                .join(format!(
+                    "crikey-modern-lifecycle-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
             let package = root.join("plugins/fixture");
             fs::create_dir_all(&package).unwrap();
             fs::write(package.join("preview_plugin.py"), source).unwrap();
@@ -4137,6 +4142,271 @@ mod preview_origin_tests {
         assert_eq!(executions.lines().count(), 1);
         let event: serde_json::Value = serde_json::from_str(executions.trim()).unwrap();
         assert_eq!(event["argument"], "other owner");
+    }
+
+    #[test]
+    fn other_owner_ordinary_action_cancels_preview_on_shared_supervisor() {
+        fn wait_for(mut ready: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !ready() {
+                assert!(
+                    Instant::now() < deadline,
+                    "cross-owner preview handoff did not settle"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let (fixture, mut provider, mut pipeline) = Fixture::load_sources(
+            "HandoffPreview",
+            include_str!("../../../compatibility/test-plugins/modern-preview/preview_plugin.py"),
+            true,
+        );
+        provider.drive_query(&mut pipeline, "handoff", 1).unwrap();
+        let preview_owner = PluginId("modern.fixture".into());
+        let action_owner = PluginId("modern.second".into());
+        let item_id = ItemId("handoff".into());
+        let (preview_item, preview_origin) =
+            provider.action_items.lock().unwrap()[&(preview_owner.clone(), item_id.clone())].clone();
+        let (action_item, action_origin) =
+            provider.action_items.lock().unwrap()[&(action_owner.clone(), item_id)].clone();
+        let preview_budget = pipeline.plugin_budget(&preview_owner).unwrap().clone();
+        let action_budget = pipeline.plugin_budget(&action_owner).unwrap().clone();
+        let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+        let actions = driver.action_executor();
+        let preview_package = fixture.root.join("plugins/fixture");
+        let action_package = fixture.root.join("plugins/second");
+        let (send, receive) = mpsc::channel();
+        driver
+            .preview_endpoint
+            .submit(
+                PreviewRequest {
+                    identity: PreviewIdentity {
+                        view: 1,
+                        query: Generation::from_raw(1),
+                        plugin: preview_owner.clone(),
+                        incarnation: preview_origin,
+                        target: crikey_ui::ActionTarget::Result {
+                            owner: preview_owner.clone(),
+                            item: preview_item.stable_id.clone(),
+                        },
+                        catalog_source: None,
+                        item: preview_item.stable_id,
+                        selection: 1,
+                        request: 1,
+                    },
+                },
+                Arc::new(move |update| send.send(update).unwrap()),
+            )
+            .unwrap();
+        wait_for(|| preview_package.join("preview-started").exists());
+        fs::write(action_package.join("action-hold"), "").unwrap();
+        let action = action_item.actions[0].action_id.clone();
+        let before = Instant::now();
+        let request = actions
+            .submit_plugin_action(&action_owner, &action_item, &action, Some("other owner"))
+            .unwrap();
+        assert!(
+            before.elapsed() < Duration::from_secs(1),
+            "UI waited for another owner's preview"
+        );
+        wait_for(|| preview_package.join("preview-cancelled").exists());
+        assert_eq!(preview_budget.in_flight(BudgetKind::Action), 1);
+        assert_eq!(action_budget.in_flight(BudgetKind::Action), 1);
+        assert!(!action_package.join("executions").exists());
+        assert!(actions
+            .submit_plugin_action(&action_owner, &action_item, &action, None)
+            .is_err());
+        fs::write(preview_package.join("preview-release"), "").unwrap();
+        wait_for(|| action_package.join("executions").exists());
+        assert!(preview_package.join("preview-terminal").exists());
+        assert_eq!(preview_budget.in_flight(BudgetKind::Action), 0);
+        assert_eq!(action_budget.in_flight(BudgetKind::Action), 1);
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
+            PreviewState::Cancelled
+        ));
+        fs::write(action_package.join("action-release"), "").unwrap();
+        let mut completions = Vec::new();
+        wait_for(|| {
+            completions.extend(actions.poll_plugin_actions());
+            !completions.is_empty()
+        });
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].request_id, request);
+        assert!(completions[0].outcome.is_ok(), "{:?}", completions[0].outcome);
+        let executions = fs::read_to_string(action_package.join("executions")).unwrap();
+        assert_eq!(executions.lines().count(), 1);
+        let event: serde_json::Value = serde_json::from_str(executions.trim()).unwrap();
+        assert_eq!(event["argument"], "other owner");
+        assert!(!preview_package.join("executions").exists());
+        assert_eq!(
+            driver.preview_endpoint.incarnation(&preview_owner),
+            Some(preview_origin)
+        );
+        assert_eq!(
+            driver.preview_endpoint.incarnation(&action_owner),
+            Some(action_origin)
+        );
+        assert_eq!(action_budget.in_flight(BudgetKind::Action), 0);
+    }
+
+    #[test]
+    fn blocked_modern_preview_yields_once_without_releasing_quota_or_retagging_origin() {
+        fn wait_for(mut ready: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !ready() {
+                assert!(Instant::now() < deadline, "preview handoff did not settle");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        for mode in ["primary", "alternate", "cancel", "stale", "changed"] {
+            let (fixture, mut provider, mut pipeline) = Fixture::load("HandoffPreview");
+            provider.drive_query(&mut pipeline, "handoff", 1).unwrap();
+            let owner = provider.loaded[0].plugin.clone();
+            let key = (owner.clone(), ItemId("handoff".into()));
+            let (item, origin) = provider.action_items.lock().unwrap()[&key].clone();
+            let budget = pipeline.plugin_budget(&owner).unwrap().clone();
+            let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+            let actions = driver.action_executor();
+            let package = fixture.root.join("plugins/fixture");
+            let (send, receive) = mpsc::channel();
+            let identity = PreviewIdentity {
+                view: 1,
+                query: Generation::from_raw(1),
+                plugin: owner.clone(),
+                incarnation: origin,
+                target: crikey_ui::ActionTarget::Result {
+                    owner: owner.clone(),
+                    item: item.stable_id.clone(),
+                },
+                catalog_source: None,
+                item: item.stable_id.clone(),
+                selection: 1,
+                request: 1,
+            };
+            driver
+                .preview_endpoint
+                .submit(
+                    PreviewRequest {
+                        identity: identity.clone(),
+                    },
+                    Arc::new(move |update| send.send(update).unwrap()),
+                )
+                .unwrap();
+            wait_for(|| package.join("preview-started").exists());
+            if mode == "stale" {
+                driver
+                    .action_endpoint
+                    .items
+                    .lock()
+                    .unwrap()
+                    .get_mut(&key)
+                    .unwrap()
+                    .1 = origin + 1;
+            }
+            let action = ActionId(
+                if mode == "alternate" {
+                    "alternate"
+                } else {
+                    "primary"
+                }
+                .into(),
+            );
+            let before = Instant::now();
+            let admission = actions.submit_plugin_action(&owner, &item, &action, Some("literal argument"));
+            if mode == "stale" {
+                let refusal = admission.expect_err("a mismatched dynamic producer must refuse admission");
+                assert!(refusal.to_string().contains("no longer current"), "{refusal}");
+                assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+                assert!(!package.join("preview-cancelled").exists());
+                assert!(!package.join("executions").exists());
+                assert!(actions.poll_plugin_actions().is_empty());
+                driver.preview_endpoint.cancel(&identity);
+                wait_for(|| package.join("preview-cancelled").exists());
+                fs::write(package.join("preview-release"), "").unwrap();
+                assert!(matches!(
+                    receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
+                    PreviewState::Cancelled
+                ));
+                assert_eq!(budget.in_flight(BudgetKind::Action), 0);
+                continue;
+            }
+            let request = admission.unwrap();
+            assert!(before.elapsed() < Duration::from_secs(1), "UI waited for preview");
+            wait_for(|| package.join("preview-cancelled").exists());
+            assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+            assert!(
+                !package.join("executions").exists(),
+                "cancel is not callback retirement"
+            );
+            assert!(actions
+                .submit_plugin_action(&owner, &item, &action, None)
+                .is_err());
+            if mode == "cancel" {
+                assert!(actions.cancel_plugin_action(&request));
+            } else if mode == "primary" || mode == "alternate" {
+                fs::write(package.join("action-hold"), "").unwrap();
+            } else if mode == "changed" {
+                let mut items = driver.action_endpoint.items.lock().unwrap();
+                let replacement = &mut items.get_mut(&key).unwrap().0;
+                replacement.actions.clear();
+                replacement.target = "replacement target".into();
+            }
+            fs::write(package.join("preview-release"), "").unwrap();
+            if mode == "primary" || mode == "alternate" {
+                wait_for(|| package.join("executions").exists());
+                assert!(package.join("preview-terminal").exists());
+                assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+                assert!(actions
+                    .submit_plugin_action(&owner, &item, &action, None)
+                    .is_err());
+                fs::write(package.join("action-release"), "").unwrap();
+            }
+            let mut completions = Vec::new();
+            wait_for(|| {
+                completions.extend(actions.poll_plugin_actions());
+                !completions.is_empty()
+            });
+            assert_eq!(completions.len(), 1);
+            assert_eq!(completions[0].request_id, request);
+            if mode == "changed" {
+                assert!(
+                    completions[0]
+                        .outcome
+                        .as_ref()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("changed after admission"),
+                    "{:?}",
+                    completions[0].outcome
+                );
+            }
+            assert_eq!(
+                completions[0].outcome.is_ok(),
+                mode == "primary" || mode == "alternate"
+            );
+            assert!(matches!(
+                receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
+                PreviewState::Cancelled
+            ));
+            assert_eq!(budget.in_flight(BudgetKind::Action), 0);
+            if mode == "primary" || mode == "alternate" {
+                let executions = fs::read_to_string(package.join("executions")).unwrap();
+                assert_eq!(executions.lines().count(), 1);
+                let event: serde_json::Value = serde_json::from_str(executions.trim()).unwrap();
+                assert_eq!(
+                    event["pid"].to_string(),
+                    fs::read_to_string(package.join("preview-started")).unwrap()
+                );
+                assert_eq!(event["target"], "frozen target");
+                assert_eq!(event["action"], action.0);
+                assert_eq!(event["argument"], "literal argument");
+                assert_eq!(driver.preview_endpoint.incarnation(&owner), Some(origin));
+            } else {
+                assert!(!package.join("executions").exists());
+            }
+            assert!(actions.poll_plugin_actions().is_empty());
+        }
     }
 
     #[test]

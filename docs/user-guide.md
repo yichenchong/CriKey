@@ -72,6 +72,8 @@ With results visible, the footer shows the current primary action and
 cancel. In compact mode the optional hint line reads
 `Up/Down navigate   Tab complete   Esc cancel`. Hide optional hints with
 `launcher.show-hints = false`; Settings and action affordances remain available.
+Long action sheets can be scrolled without changing the selected action.
+Manual scrolling stays put until action navigation changes the selection.
 Settings normally advertises `Ctrl+,`; on a web page it shows only **Settings**,
 because that shortcut belongs to the document. Web-page hints read
 `Tab navigate page   Esc close page`.
@@ -321,8 +323,9 @@ Settings and custom pages have a title and **Back**. Escape returns one level:
 preview focus/detail, an open action search/submenu/panel, the previous view,
 then root-query clearing and dismissal. The host retains the root query,
 owner-qualified selection, logical scope and list scroll anchor. Returning
-issues a fresh search, reconciles the exact owner/item, and clamps safely if
-it disappeared. Navigation is bounded to 16 entries including the current view
+issues a fresh search and reconciles the exact owner/item across partial
+publications. Explicit navigation or query editing supersedes that return
+selection. Navigation is bounded to 16 entries including the current view
 and 8 MiB of retained host content; shared result/icon allocations count once.
 An excessive push is refused with a visible reason.
 

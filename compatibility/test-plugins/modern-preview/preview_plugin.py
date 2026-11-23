@@ -94,3 +94,45 @@ class IdleExit(CatalogOnly):
 
         threading.Thread(target=exit_when_signalled, daemon=True).start()
         return super().build_catalog()
+
+
+class HandoffPreview(Plugin):
+    """Filesystem barriers expose real cancellation versus callback retirement."""
+
+    def suggest(self, query, context):
+        from crikey_sdk import Action
+
+        self.producer = os.getpid()
+        context.emit(Item(
+            stable_id="handoff", label="Handoff", target="frozen target",
+            preview_deferred=True, argument_policy="optional",
+            actions=[Action("primary", "Primary", execution_policy="plugin"),
+                     Action("alternate", "Alternate", execution_policy="plugin")],
+        ))
+
+    def preview(self, item, context):
+        import pathlib
+        import time
+
+        root = pathlib.Path(__file__).parent
+        (root / "preview-started").write_text(str(self.producer))
+        while not (root / "preview-release").exists():
+            if context.cancelled:
+                (root / "preview-cancelled").write_text(str(self.producer))
+            time.sleep(0.001)
+        (root / "preview-terminal").write_text(str(self.producer))
+        return Preview(text="late speculative content")
+
+    def execute(self, item, action_id, argument):
+        import json
+        import pathlib
+        import time
+
+        root = pathlib.Path(__file__).parent
+        if (root / "preview-started").exists():
+            assert (root / "preview-terminal").exists(), "action overlapped preview"
+        with (root / "executions").open("a") as log:
+            log.write(json.dumps({"pid": self.producer, "target": item.target,
+                                  "action": action_id, "argument": argument}) + "\n")
+        while (root / "action-hold").exists() and not (root / "action-release").exists():
+            time.sleep(0.001)
