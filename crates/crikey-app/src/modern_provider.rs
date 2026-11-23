@@ -49,13 +49,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::preview_action_budget::{ForegroundActionAdmission, PreviewActionGate};
 use crikey_core::{ActionId, ArgumentPolicy, ExecutionPolicy, Generation, Item, ItemId, PluginId};
 use crikey_input_scheduler::Millis;
 use crikey_package_manager::{
     resolve, EnvironmentInputs, EnvironmentStore, ImportPath, PackageError, PackageIndex,
 };
 use crikey_plugin_model::{Manifest, Permissions, Runtime, Startup};
-use crikey_plugin_supervisor::{BudgetKind, OwnedBudgetGuard, PluginBudgetHandle};
+use crikey_plugin_supervisor::{BudgetKind, PluginBudgetHandle};
 use crikey_python_host::{
     discover_interpreter, sdk_root, BatchState as WorkerBatchState, CancelHandle, ExecuteOutcome,
     Interpreter, ModernWorker, RequiresPython, RuntimeCatalog, SuggestRequest, WorkerOptions,
@@ -84,6 +85,8 @@ struct ModernPreviewJob {
 
 struct ModernPreviewEndpoint {
     sender: SyncSender<ModernPreviewJob>,
+    gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
+    action_in_flight: Arc<AtomicUsize>,
     incarnations: Mutex<BTreeMap<PluginId, u64>>,
     items: ModernItemStore,
     catalog_items: ModernItemStore,
@@ -102,6 +105,12 @@ impl ModernPreviewEndpoint {
     fn new(provider: &ModernProvider, sender: SyncSender<ModernPreviewJob>) -> Arc<Self> {
         let endpoint = Arc::new(Self {
             sender,
+            gates: provider
+                .action_budgets()
+                .into_iter()
+                .map(|(owner, budget)| (owner, PreviewActionGate::new(budget)))
+                .collect(),
+            action_in_flight: Arc::new(AtomicUsize::new(0)),
             incarnations: Mutex::new(BTreeMap::new()),
             items: Arc::clone(&provider.action_items),
             catalog_items: Arc::clone(&provider.catalog.items),
@@ -197,7 +206,7 @@ impl ModernPreviewEndpoint {
     fn execute(&self, provider: &mut ModernProvider, job: ModernPreviewJob) {
         let identity = &job.request.identity;
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<PreviewState, String> {
-            if job.cancelled.load(Ordering::Acquire) {
+            if job.cancelled.load(Ordering::Acquire) || self.action_in_flight.load(Ordering::Acquire) != 0 {
                 return Ok(PreviewState::Cancelled);
             }
             let loaded = provider
@@ -205,10 +214,16 @@ impl ModernPreviewEndpoint {
                 .iter()
                 .find(|loaded| loaded.plugin == identity.plugin)
                 .ok_or("modern preview owner unavailable")?;
-            let _guard = loaded
-                .budget
-                .try_acquire_owned(BudgetKind::Action)
-                .ok_or("modern preview concurrency budget is full")?;
+            let gate = self
+                .gates
+                .get(&loaded.plugin)
+                .ok_or("modern preview owner budget unavailable")?;
+            let Some(_guard) = gate.try_preview(job.cancelled.clone()) else {
+                return Ok(PreviewState::Cancelled);
+            };
+            if self.action_in_flight.load(Ordering::Acquire) != 0 {
+                return Ok(PreviewState::Cancelled);
+            }
             let worker = provider
                 .pool
                 .live_mut(&loaded.key)
@@ -249,6 +264,9 @@ impl ModernPreviewEndpoint {
                 "plugin":identity.plugin.0, "incarnation":identity.incarnation,
                 "item":identity.item.0, "selection":identity.selection, "request":identity.request,
             });
+            if job.cancelled.load(Ordering::Acquire) {
+                control.cancel();
+            }
             let reply = worker.preview(&current, &wire_identity);
             control.finish();
             let _ = watcher.join();
@@ -280,6 +298,9 @@ impl ModernPreviewEndpoint {
 }
 
 impl PreviewDispatcher for ModernPreviewEndpoint {
+    fn foreground_blocked(&self, _: &PluginId) -> bool {
+        self.action_in_flight.load(Ordering::Acquire) != 0
+    }
     fn lookup(&self, plugin: &PluginId, item: &ItemId) -> Option<(Item, u64)> {
         let key = (plugin.clone(), item.clone());
         let query = self
@@ -1686,18 +1707,9 @@ impl ModernProvider {
     /// the worker outcome is converted to `CoreResult` covers failures,
     /// cancellation, timeout and panic/unwind paths.
     fn execute_action_request(&mut self, request: ModernActionRequest) -> crikey_core::Result<()> {
-        let _guard = request.guard;
+        let _guard = request.guard.acquire(request.deadline, &request.cancelled)?;
         let plugin = request.plugin;
-        let item_id = request.item.stable_id.clone();
-        let item = self
-            .action_items
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&(plugin.clone(), item_id.clone()))
-            .map(|(item, _)| item.clone())
-            .ok_or_else(|| {
-                crikey_core::CoreError::Invalid("modern action item snapshot is no longer current".to_owned())
-            })?;
+        let item = request.item;
         if item.plugin_id != plugin {
             return Err(crikey_core::CoreError::Invalid(format!(
                 "modern action item `{}` is owned by `{}`, not `{}`",
@@ -1750,6 +1762,15 @@ impl ModernProvider {
         let worker = self.pool.live_mut(&key).ok_or_else(|| {
             crikey_core::CoreError::Invalid(format!("modern worker for `{}` is unavailable", plugin.0))
         })?;
+        if worker.incarnation() != request.origin {
+            return Err(crikey_core::CoreError::Invalid(
+                "modern action originating worker retired".into(),
+            ));
+        }
+        worker.cancel_handle().reset();
+        if request.cancelled.load(Ordering::Acquire) {
+            return Err(crikey_core::CoreError::Cancelled);
+        }
         if !worker.is_alive() {
             // Observing a dead child here retires the slot, exactly as the
             // suggestion path does: the plugin stays unavailable rather than
@@ -2170,9 +2191,10 @@ struct ModernActionRequest {
     request_id: ActionRequestId,
     plugin: PluginId,
     item: Item,
+    origin: u64,
     action_id: ActionId,
     argument: Option<String>,
-    guard: OwnedBudgetGuard,
+    guard: ForegroundActionAdmission,
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
 }
@@ -2192,7 +2214,8 @@ struct ModernActionEndpoint {
     sender: SyncSender<ModernActionRequest>,
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
     action_wake: crate::plugin_action::CompletionWake,
-    budgets: BTreeMap<PluginId, PluginBudgetHandle>,
+    gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
+    preview: Arc<ModernPreviewEndpoint>,
     items: ModernItemStore,
     pending: Arc<Mutex<BTreeMap<ActionRequestId, Arc<AtomicBool>>>>,
     in_flight: Arc<AtomicUsize>,
@@ -2214,12 +2237,12 @@ impl crate::PluginActionExecutor for ModernActionEndpoint {
             ));
         }
         let item_id = item.stable_id.clone();
-        let item = self
+        let (item, origin) = self
             .items
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(&(plugin.clone(), item_id))
-            .map(|(item, _)| item.clone())
+            .cloned()
             .ok_or_else(|| {
                 crikey_core::CoreError::Invalid(
                     "selected modern plugin result is no longer current".to_owned(),
@@ -2241,7 +2264,7 @@ impl crate::PluginActionExecutor for ModernActionEndpoint {
                 "modern action mailbox is full".to_owned(),
             ));
         }
-        let budget = match self.budgets.get(plugin) {
+        let budget = match self.gates.get(plugin) {
             Some(budget) => budget,
             None => {
                 self.in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -2251,16 +2274,24 @@ impl crate::PluginActionExecutor for ModernActionEndpoint {
                 )));
             }
         };
-        let guard = match budget.try_acquire_owned(BudgetKind::Action) {
-            Some(guard) => guard,
-            None => {
+        let guard = match budget.reserve_foreground() {
+            Ok(guard) => guard,
+            Err(error) => {
                 self.in_flight.fetch_sub(1, Ordering::AcqRel);
-                return Err(crikey_core::CoreError::Invalid(format!(
-                    "modern plugin `{}` action budget is full",
-                    plugin.0
-                )));
+                return Err(error);
             }
         };
+        // The modern supervisor is serial across owners; retire every queued
+        // speculative call only after reserving this foreground intent.
+        for (_, token) in self
+            .preview
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+        {
+            token.store(true, Ordering::Release);
+        }
         let sequence = self
             .next_id
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -2279,7 +2310,8 @@ impl crate::PluginActionExecutor for ModernActionEndpoint {
         let request = ModernActionRequest {
             request_id: request_id.clone(),
             plugin: plugin.clone(),
-            item: item.clone(),
+            item,
+            origin,
             action_id: action_id.clone(),
             argument: argument.map(str::to_owned),
             guard,
@@ -2461,10 +2493,11 @@ impl ModernDriver {
             sender: action_sender,
             completions: Arc::clone(&completion_mailbox),
             action_wake: crate::plugin_action::CompletionWake::default(),
-            budgets: provider.action_budgets(),
+            gates: preview_endpoint.gates.clone(),
+            preview: Arc::clone(&preview_endpoint),
             items: Arc::clone(&provider.action_items),
             pending: Arc::new(Mutex::new(BTreeMap::new())),
-            in_flight: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::clone(&preview_endpoint.action_in_flight),
             next_id: Arc::new(AtomicU64::new(0)),
             mailbox: Arc::clone(&mailbox),
         });
@@ -2836,7 +2869,7 @@ impl ModernDriver {
 
     /// Returns the exact plugin ids owned by this driver's action endpoint.
     pub fn plugins(&self) -> Vec<PluginId> {
-        self.action_endpoint.budgets.keys().cloned().collect()
+        self.action_endpoint.gates.keys().cloned().collect()
     }
     /// Manifest grants used by the host-mediated action boundary.
     pub fn permissions(&self) -> BTreeMap<PluginId, Permissions> {
@@ -2857,7 +2890,8 @@ impl ModernDriver {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        for (plugin, budget) in &self.action_endpoint.budgets {
+        for (plugin, gate) in &self.action_endpoint.gates {
+            let budget = gate.budget();
             if let Some((_, health)) = report.iter_mut().find(|(id, _)| id == plugin) {
                 health.concurrency_refusals = budget.refusals_snapshot();
             } else {
@@ -2918,6 +2952,8 @@ mod preview_origin_tests {
         let (sender, _receiver) = mpsc::sync_channel(2);
         let endpoint = ModernPreviewEndpoint {
             sender,
+            gates: BTreeMap::new(),
+            action_in_flight: Arc::new(AtomicUsize::new(0)),
             catalog_items: Arc::new(Mutex::new(BTreeMap::new())),
             incarnations: Mutex::new(BTreeMap::from([(plugin.clone(), 11)])),
             items: Arc::new(Mutex::new(BTreeMap::from([(
@@ -2960,12 +2996,18 @@ mod preview_origin_tests {
 
     impl Fixture {
         fn load(class: &str) -> (Self, ModernProvider, QueryPipeline) {
+            Self::load_owners(class, false)
+        }
+
+        fn load_owners(class: &str, second_owner: bool) -> (Self, ModernProvider, QueryPipeline) {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "crikey-modern-lifecycle-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/preview-handoff-fixtures")
+                .join(format!(
+                    "crikey-modern-lifecycle-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
             let package = root.join("plugins/fixture");
             fs::create_dir_all(&package).unwrap();
             fs::write(
@@ -2983,6 +3025,21 @@ mod preview_origin_tests {
                 ),
             )
             .unwrap();
+            if second_owner {
+                let second = root.join("plugins/second");
+                fs::create_dir_all(&second).unwrap();
+                fs::copy(
+                    package.join("preview_plugin.py"),
+                    second.join("preview_plugin.py"),
+                )
+                .unwrap();
+                let manifest = fs::read_to_string(package.join("crikey.toml")).unwrap();
+                fs::write(
+                    second.join("crikey.toml"),
+                    manifest.replace("id = \"fixture\"", "id = \"second\""),
+                )
+                .unwrap();
+            }
             let mut pipeline = QueryPipeline::new(crate::PipelineConfig::default());
             let provider = ModernProvider::load(
                 &mut pipeline,
@@ -2991,7 +3048,12 @@ mod preview_origin_tests {
                 root.join("cache"),
                 &DisabledPlugins::default(),
             );
-            assert_eq!(provider.loaded.len(), 1, "{:?}", provider.unavailable());
+            assert_eq!(
+                provider.loaded.len(),
+                if second_owner { 2 } else { 1 },
+                "{:?}",
+                provider.unavailable()
+            );
             (Self { root }, provider, pipeline)
         }
 
@@ -3024,6 +3086,227 @@ mod preview_origin_tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn other_owner_foreground_cancels_preview_on_the_shared_supervisor() {
+        fn wait_for(mut ready: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !ready() {
+                assert!(
+                    Instant::now() < deadline,
+                    "cross-owner preview handoff did not settle"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let (fixture, mut provider, mut pipeline) = Fixture::load_owners("HandoffPreview", true);
+        provider.drive_query(&mut pipeline, "handoff", 1).unwrap();
+        let preview_owner = PluginId("modern.fixture".into());
+        let action_owner = PluginId("modern.second".into());
+        let item_id = ItemId("handoff".into());
+        let (preview_item, preview_origin) =
+            provider.action_items.lock().unwrap()[&(preview_owner.clone(), item_id.clone())].clone();
+        let (action_item, action_origin) =
+            provider.action_items.lock().unwrap()[&(action_owner.clone(), item_id)].clone();
+        let preview_budget = pipeline.plugin_budget(&preview_owner).unwrap().clone();
+        let action_budget = pipeline.plugin_budget(&action_owner).unwrap().clone();
+        let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+        let actions = driver.action_executor();
+        let preview_package = fixture.root.join("plugins/fixture");
+        let action_package = fixture.root.join("plugins/second");
+        let (send, receive) = mpsc::channel();
+        driver
+            .preview_endpoint
+            .submit(
+                PreviewRequest {
+                    identity: PreviewIdentity {
+                        view: 1,
+                        query: Generation::from_raw(1),
+                        plugin: preview_owner.clone(),
+                        incarnation: preview_origin,
+                        item: preview_item.stable_id,
+                        selection: 1,
+                        request: 1,
+                    },
+                },
+                Arc::new(move |update| send.send(update).unwrap()),
+            )
+            .unwrap();
+        wait_for(|| preview_package.join("preview-started").exists());
+        fs::write(action_package.join("action-hold"), "").unwrap();
+        let action = action_item.actions[0].action_id.clone();
+        let before = Instant::now();
+        let request = actions
+            .submit_plugin_action(&action_owner, &action_item, &action, Some("other owner"))
+            .unwrap();
+        assert!(
+            before.elapsed() < Duration::from_secs(1),
+            "UI waited for another owner's preview"
+        );
+        wait_for(|| preview_package.join("preview-cancelled").exists());
+        assert_eq!(preview_budget.in_flight(BudgetKind::Action), 1);
+        assert_eq!(action_budget.in_flight(BudgetKind::Action), 1);
+        assert!(!action_package.join("executions").exists());
+        assert!(actions
+            .submit_plugin_action(&action_owner, &action_item, &action, None)
+            .is_err());
+        fs::write(preview_package.join("preview-release"), "").unwrap();
+        wait_for(|| action_package.join("executions").exists());
+        assert!(preview_package.join("preview-terminal").exists());
+        assert_eq!(preview_budget.in_flight(BudgetKind::Action), 0);
+        assert_eq!(action_budget.in_flight(BudgetKind::Action), 1);
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
+            PreviewState::Cancelled
+        ));
+        fs::write(action_package.join("action-release"), "").unwrap();
+        let mut completions = Vec::new();
+        wait_for(|| {
+            completions.extend(actions.poll_plugin_actions());
+            !completions.is_empty()
+        });
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].request_id, request);
+        assert!(completions[0].outcome.is_ok(), "{:?}", completions[0].outcome);
+        let executions = fs::read_to_string(action_package.join("executions")).unwrap();
+        assert_eq!(executions.lines().count(), 1);
+        let event: serde_json::Value = serde_json::from_str(executions.trim()).unwrap();
+        assert_eq!(event["argument"], "other owner");
+        assert!(!preview_package.join("executions").exists());
+        assert_eq!(
+            driver.preview_endpoint.incarnation(&preview_owner),
+            Some(preview_origin)
+        );
+        assert_eq!(
+            driver.preview_endpoint.incarnation(&action_owner),
+            Some(action_origin)
+        );
+        assert_eq!(action_budget.in_flight(BudgetKind::Action), 0);
+    }
+
+    #[test]
+    fn blocked_modern_preview_yields_once_without_releasing_quota_or_retagging_origin() {
+        fn wait_for(mut ready: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !ready() {
+                assert!(Instant::now() < deadline, "preview handoff did not settle");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        for mode in ["primary", "alternate", "cancel", "stale"] {
+            let (fixture, mut provider, mut pipeline) = Fixture::load("HandoffPreview");
+            provider.drive_query(&mut pipeline, "handoff", 1).unwrap();
+            let owner = provider.loaded[0].plugin.clone();
+            let key = (owner.clone(), ItemId("handoff".into()));
+            let (item, origin) = provider.action_items.lock().unwrap()[&key].clone();
+            let budget = pipeline.plugin_budget(&owner).unwrap().clone();
+            let driver = ModernDriver::spawn(provider, pipeline, |_| {});
+            let actions = driver.action_executor();
+            let package = fixture.root.join("plugins/fixture");
+            let (send, receive) = mpsc::channel();
+            driver
+                .preview_endpoint
+                .submit(
+                    PreviewRequest {
+                        identity: PreviewIdentity {
+                            view: 1,
+                            query: Generation::from_raw(1),
+                            plugin: owner.clone(),
+                            incarnation: origin,
+                            item: item.stable_id.clone(),
+                            selection: 1,
+                            request: 1,
+                        },
+                    },
+                    Arc::new(move |update| send.send(update).unwrap()),
+                )
+                .unwrap();
+            wait_for(|| package.join("preview-started").exists());
+            if mode == "stale" {
+                driver
+                    .action_endpoint
+                    .items
+                    .lock()
+                    .unwrap()
+                    .get_mut(&key)
+                    .unwrap()
+                    .1 = origin + 1;
+            }
+            let action = ActionId(
+                if mode == "alternate" {
+                    "alternate"
+                } else {
+                    "primary"
+                }
+                .into(),
+            );
+            let before = Instant::now();
+            let request = actions
+                .submit_plugin_action(&owner, &item, &action, Some("literal argument"))
+                .unwrap();
+            assert!(before.elapsed() < Duration::from_secs(1), "UI waited for preview");
+            wait_for(|| package.join("preview-cancelled").exists());
+            assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+            assert!(
+                !package.join("executions").exists(),
+                "cancel is not callback retirement"
+            );
+            assert!(actions
+                .submit_plugin_action(&owner, &item, &action, None)
+                .is_err());
+            if mode == "cancel" {
+                assert!(actions.cancel_plugin_action(&request));
+            } else if mode != "stale" {
+                fs::write(package.join("action-hold"), "").unwrap();
+                let mut items = driver.action_endpoint.items.lock().unwrap();
+                let replacement = &mut items.get_mut(&key).unwrap().0;
+                replacement.actions.clear();
+                replacement.target = "replacement target".into();
+            }
+            fs::write(package.join("preview-release"), "").unwrap();
+            if mode == "primary" || mode == "alternate" {
+                wait_for(|| package.join("executions").exists());
+                assert!(package.join("preview-terminal").exists());
+                assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+                assert!(actions
+                    .submit_plugin_action(&owner, &item, &action, None)
+                    .is_err());
+                fs::write(package.join("action-release"), "").unwrap();
+            }
+            let mut completions = Vec::new();
+            wait_for(|| {
+                completions.extend(actions.poll_plugin_actions());
+                !completions.is_empty()
+            });
+            assert_eq!(completions.len(), 1);
+            assert_eq!(completions[0].request_id, request);
+            assert_eq!(
+                completions[0].outcome.is_ok(),
+                mode == "primary" || mode == "alternate"
+            );
+            assert!(matches!(
+                receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
+                PreviewState::Cancelled
+            ));
+            assert_eq!(budget.in_flight(BudgetKind::Action), 0);
+            if mode == "primary" || mode == "alternate" {
+                let executions = fs::read_to_string(package.join("executions")).unwrap();
+                assert_eq!(executions.lines().count(), 1);
+                let event: serde_json::Value = serde_json::from_str(executions.trim()).unwrap();
+                assert_eq!(
+                    event["pid"].to_string(),
+                    fs::read_to_string(package.join("preview-started")).unwrap()
+                );
+                assert_eq!(event["target"], "frozen target");
+                assert_eq!(event["action"], action.0);
+                assert_eq!(event["argument"], "literal argument");
+                assert_eq!(driver.preview_endpoint.incarnation(&owner), Some(origin));
+            } else {
+                assert!(!package.join("executions").exists());
+            }
+            assert!(actions.poll_plugin_actions().is_empty());
         }
     }
 

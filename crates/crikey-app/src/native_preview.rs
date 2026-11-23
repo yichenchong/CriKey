@@ -14,6 +14,7 @@ struct Job {
 }
 pub(super) struct NativePreviewEndpoint {
     sender: SyncSender<Job>,
+    pub(super) gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
     incarnations: NativeIncarnations,
     items: NativeItemStore,
     catalog_items: NativeItemStore,
@@ -33,7 +34,12 @@ impl NativePreviewEndpoint {
         let pending: NativePreviewCalls = Arc::new(Mutex::new(Vec::new()));
         let stopped = Arc::new(AtomicBool::new(false));
         let thread_supervisors = provider.page_supervisors();
-        let budgets = provider.action_budgets();
+        let gates: BTreeMap<_, _> = provider
+            .action_budgets()
+            .into_iter()
+            .map(|(owner, budget)| (owner, PreviewActionGate::new(budget)))
+            .collect();
+        let endpoint_gates = gates.clone();
         let incarnations = Arc::clone(&provider.incarnations);
         let thread_incarnations = Arc::clone(&incarnations);
         let thread_pending = Arc::clone(&pending);
@@ -52,6 +58,12 @@ impl NativePreviewEndpoint {
                         if job.control.requested.load(Ordering::Acquire) {
                             return Ok(PreviewState::Cancelled);
                         }
+                        let Some(_guard) = gates
+                            .get(&identity.plugin)
+                            .and_then(|gate| gate.try_preview(job.control.clone()))
+                        else {
+                            return Ok(PreviewState::Cancelled);
+                        };
                         let supervisor = thread_supervisors
                             .get(&identity.plugin)
                             .ok_or("native preview owner unavailable")?;
@@ -80,10 +92,6 @@ impl NativePreviewEndpoint {
                                 "Preview originating worker retired".into(),
                             ));
                         }
-                        let _guard = budgets
-                            .get(&identity.plugin)
-                            .and_then(|budget| budget.try_acquire_owned(BudgetKind::Action))
-                            .ok_or("native preview concurrency budget is full")?;
                         worker.cancel_handle().reset();
                         job.control.install(worker.cancel_handle());
                         let control = Arc::clone(&job.control);
@@ -135,6 +143,7 @@ impl NativePreviewEndpoint {
         }
         Arc::new(Self {
             sender,
+            gates: endpoint_gates,
             incarnations,
             items: Arc::clone(&provider.action_items),
             catalog_items: Arc::clone(&provider.catalog.items),
@@ -168,6 +177,9 @@ impl NativePreviewEndpoint {
     }
 }
 impl PreviewDispatcher for NativePreviewEndpoint {
+    fn foreground_blocked(&self, owner: &PluginId) -> bool {
+        self.gates.get(owner).is_some_and(|gate| gate.has_foreground())
+    }
     fn lookup(&self, plugin: &PluginId, id: &ItemId) -> Option<(Item, u64)> {
         let key = (plugin.clone(), id.clone());
         let query = self
@@ -352,6 +364,133 @@ mod tests {
     }
 
     #[test]
+    fn blocked_native_preview_yields_once_without_releasing_quota_or_retagging_origin() {
+        let executable = preview_executable().canonicalize().unwrap();
+        for mode in ["execute", "cancel", "stale"] {
+            let scratch = Scratch(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/preview-handoff-fixtures")
+                    .join(format!("native-{}-{mode}", std::process::id())),
+            );
+            let package = scratch.0.join("preview-demo");
+            fs::create_dir_all(&package).unwrap();
+            fs::write(package.join("preview-hold"), "").unwrap();
+            let executable = executable
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            fs::write(package.join("crikey.toml"), format!(
+                "manifest-version = 1\n[plugin]\nid = \"preview-demo\"\nname = \"Preview\"\nversion = \"0.1.0\"\nruntime = \"native\"\nentrypoint = \"{executable}\"\n"
+            )).unwrap();
+            let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+            let mut provider = NativeProvider::load_with_collection_window(
+                &mut pipeline,
+                &[scratch.0.clone()],
+                Duration::from_secs(10),
+                &DisabledPlugins::default(),
+            );
+            assert_eq!(provider.plugins().len(), 1, "{:?}", provider.unavailable());
+            provider.drive_query(&mut pipeline, "slow", 1).unwrap();
+            let owner = provider.plugins()[0].clone();
+            let key = (owner.clone(), ItemId("slow".into()));
+            let (item, origin) = provider.action_items.lock().unwrap()[&key].clone();
+            let budget = pipeline.plugin_budget(&owner).unwrap().clone();
+            let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| {}));
+            let previews = &driver.preview_endpoint;
+            let actions = driver.action_executor();
+            let (send, receive) = mpsc::channel();
+            previews
+                .submit(
+                    PreviewRequest {
+                        identity: PreviewIdentity {
+                            view: 1,
+                            query: Generation::from_raw(1),
+                            plugin: owner.clone(),
+                            incarnation: origin,
+                            item: item.stable_id.clone(),
+                            selection: 1,
+                            request: 1,
+                        },
+                    },
+                    Arc::new(move |update| send.send(update).unwrap()),
+                )
+                .unwrap();
+            wait_for("preview entered", || {
+                package.join("preview-started").exists().then_some(())
+            });
+            if mode == "stale" {
+                driver
+                    .action_endpoint
+                    .items
+                    .lock()
+                    .unwrap()
+                    .get_mut(&key)
+                    .unwrap()
+                    .1 = origin + 1;
+            }
+            let before = Instant::now();
+            let action = &item.actions[0].action_id;
+            let request = actions.submit_plugin_action(&owner, &item, action, None).unwrap();
+            assert!(before.elapsed() < Duration::from_secs(1), "UI waited for preview");
+            wait_for("preview cancellation observed", || {
+                package.join("preview-cancelled").exists().then_some(())
+            });
+            assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+            assert!(
+                !package.join("executions").exists(),
+                "cancel is not callback retirement"
+            );
+            assert!(actions.submit_plugin_action(&owner, &item, action, None).is_err());
+            if mode == "cancel" {
+                assert!(actions.cancel_plugin_action(&request));
+            } else if mode == "execute" {
+                fs::write(package.join("action-hold"), "").unwrap();
+                driver
+                    .action_endpoint
+                    .items
+                    .lock()
+                    .unwrap()
+                    .get_mut(&key)
+                    .unwrap()
+                    .0
+                    .actions
+                    .clear();
+            }
+            fs::write(package.join("preview-release"), "").unwrap();
+            if mode == "execute" {
+                wait_for("foreground callback entered", || {
+                    package.join("executions").exists().then_some(())
+                });
+                assert!(package.join("preview-terminal").exists());
+                assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+                assert!(actions.submit_plugin_action(&owner, &item, action, None).is_err());
+                fs::write(package.join("action-release"), "").unwrap();
+            }
+            let completion = wait_for("foreground completion", || {
+                actions.poll_plugin_actions().into_iter().next()
+            });
+            assert_eq!(completion.request_id, request);
+            assert_eq!(completion.outcome.is_ok(), mode == "execute");
+            assert!(matches!(
+                receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
+                PreviewState::Cancelled
+            ));
+            assert_eq!(budget.in_flight(BudgetKind::Action), 0);
+            if mode == "execute" {
+                let pid = fs::read_to_string(package.join("preview-started")).unwrap();
+                assert_eq!(
+                    fs::read_to_string(package.join("executions")).unwrap(),
+                    format!("{pid}:slow:acknowledge\n")
+                );
+                assert_eq!(previews.incarnation(&owner), Some(origin));
+            } else {
+                assert!(!package.join("executions").exists());
+            }
+            assert!(actions.poll_plugin_actions().is_empty());
+        }
+    }
+
+    #[test]
     fn retired_query_item_cannot_preview_in_action_replacement_but_fresh_item_can() {
         let executable = preview_executable().canonicalize().unwrap();
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -508,10 +647,23 @@ mod tests {
                 .into_iter()
                 .find(|completion| completion.request_id == action)
         });
+        let refusal = completion
+            .outcome
+            .expect_err("a retired dynamic origin must not execute on its replacement");
         assert!(
-            matches!(completion.outcome, Ok(ActionEffect::Completed)),
-            "legacy native action semantics must still allow replacement: {:?}",
-            completion.outcome
+            refusal.to_string().contains("originating worker retired"),
+            "{refusal}"
+        );
+        assert!(
+            !supervisor
+                .lock()
+                .unwrap()
+                .live_worker(&old_item.plugin_id)
+                .unwrap()
+                .observations()
+                .iter()
+                .any(|event| event.kind == "execute"),
+            "refused stale admission must not send execution to the replacement"
         );
         let replacement = endpoint
             .incarnation(&old_item.plugin_id)
