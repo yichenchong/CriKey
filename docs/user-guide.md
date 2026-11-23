@@ -72,6 +72,8 @@ With results visible, the footer shows the current primary action and
 cancel. In compact mode the optional hint line reads
 `Up/Down navigate   Tab complete   Esc cancel`. Hide optional hints with
 `launcher.show-hints = false`; Settings and action affordances remain available.
+Long action sheets can be scrolled without changing the selected action.
+Manual scrolling stays put until action navigation changes the selection.
 Settings normally advertises `Ctrl+,`; on a web page it shows only **Settings**,
 because that shortcut belongs to the document. Web-page hints read
 `Tab navigate page   Esc close page`.
