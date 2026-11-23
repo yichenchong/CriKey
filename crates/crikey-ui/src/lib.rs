@@ -1803,6 +1803,7 @@ impl LauncherViewModel {
             return None;
         }
         self.restore_selection = false;
+        self.restoration_target = None;
         self.preserve_scroll = false;
         self.navigation_scroll = LogicalScroll::default();
 
@@ -2422,6 +2423,8 @@ impl LauncherViewModel {
     fn select(&mut self, target: usize) {
         self.dirty |= self.preserve_scroll;
         self.preserve_scroll = false;
+        // Even a clamped navigation command supersedes a pending return choice.
+        self.restoration_target = None;
         let Some(last) = self.rows.len().checked_sub(1) else {
             return;
         };
@@ -2432,7 +2435,6 @@ impl LauncherViewModel {
         }
 
         self.selected = target;
-        self.restoration_target = None;
         self.preview_selection();
         // The only path a person's arrow or page key reaches, so this is where
         // a default becomes a choice.
@@ -2445,11 +2447,11 @@ impl LauncherViewModel {
 
     /// Where the selection lands once `incoming` replaces the current rows.
     ///
-    /// Within one generation the selection is anchored by [`ItemId`]: a
-    /// republish follows the selected item wherever it moved to and falls back
-    /// to the previous index clamped into range when the anchor is gone. The
-    /// first publish of a new generation is a new query state and starts at the
-    /// top, because the anchor lives inside one generation only.
+    /// Within one generation the selection is anchored by owner and [`ItemId`]:
+    /// a republish follows the selected item wherever it moved to and falls
+    /// back to the previous index clamped into range when the anchor is gone.
+    /// Return searches retain a separate target across partial publications;
+    /// an ordinary new query starts at the top.
     fn resolve_selection(&self, incoming: &[ResultRow], generation: Generation) -> usize {
         let Some(last) = incoming.len().checked_sub(1) else {
             return 0;

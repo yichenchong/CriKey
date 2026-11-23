@@ -855,6 +855,11 @@ path. Both runtimes execute preview in the same originating worker instance as
 the item's catalog or suggestion publication, under its existing concurrency
 and call budgets. Catalog-only deferred items do not require suggestions.
 Preview must not assume that cancellation reverses any effects.
+Deliberate actions and native pages take priority over speculative previews.
+The host reserves one foreground intent and requests preview cancellation without
+blocking the UI. The preview retains its real action permit until its callback
+returns (or its worker is reaped); cancellation alone never frees concurrency.
+The waiting action uses the original item's worker, never a replacement process.
 Rows carry their exact `PluginId` separately from display names; preview
 selection and dispatch use `(PluginId, ItemId)`. Equal item IDs in different
 plugins must neither redirect callbacks nor suppress another owner's preview.
