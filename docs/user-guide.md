@@ -198,9 +198,10 @@ command-home = "favorites-and-recent"
 Unavailable saved favorites remain visible in their saved order at home.
 Other unavailable saved preferences remain accessible in **Configure Commands**;
 removing a favorite or fallback membership does not erase its other preferences.
-Hidden commands are excluded from ordinary command discovery but remain
-explicitly invokable from saved favorites and eligible saved fallbacks. Hiding a
-command does not hide an ordinary suggestion that happens to target the same item.
+Hidden commands are excluded from ordinary command discovery and automatic
+Recent home rows, without deleting their history. They remain explicitly
+invokable from saved favorites and eligible saved fallbacks. Hiding a command
+does not hide an ordinary suggestion that happens to target the same item.
 
 Fallback commands appear in saved order only for a nonblank query after every
 applicable ordinary provider successfully finishes with no matches. Pending,
