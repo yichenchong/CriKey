@@ -74,6 +74,197 @@ def worker(source):
 
 
 class PublicationContractTests(unittest.TestCase):
+    def test_successful_catalog_commits_despite_callback_cancellation_flag(self):
+        source = '''
+from crikey_sdk import Plugin, Item, ArgumentSchema, TextField, SchemaBinding, ResultPresentation
+SCHEMA = ArgumentSchema((TextField(id="text", label="Text"),))
+class Impl(Plugin):
+    def __init__(self):
+        self.calls = 0
+    def suggest(self, query, context):
+        self.cancel = context._is_cancelled.__self__
+    def catalog_presentation(self):
+        return ResultPresentation(schemas=(SchemaBinding("typed", SCHEMA),))
+    def build_catalog(self):
+        self.calls += 1
+        self.cancel.set()
+        if self.calls == 2:
+            raise RuntimeError("catalog failed with cancellation flag set")
+        return [Item("typed", "Dynamic", "dynamic"), Item("ordinary", "Dynamic", "dynamic")]
+    def execute_typed(self, item, action, values):
+        return None
+    def execute(self, item, action, argument):
+        return None
+'''
+        fingerprint = ArgumentSchema((TextField(id="text", label="Text"),)).fingerprint()
+        with worker(source) as (exchange, send):
+            request_id = 0
+            def call(kind, **fields):
+                nonlocal request_id
+                request_id += 1
+                return exchange(dict(id=request_id, kind=kind, **fields))
+            def item(target):
+                return dict(stable_id=target, label="Dynamic", target="dynamic")
+            def legacy(target):
+                return call("execute", item=item(target), action_id=None, argument=None)["status"]
+            def typed():
+                return call("typed_execute", item=item("typed"), action_id=None,
+                            schema_fingerprint=fingerprint,
+                            values=[dict(field_id="text", kind="text", value="value")])
+
+            call("handshake", protocol_version=1)
+            self.assertEqual(call("suggest", generation=1, text="", normalized="")["state"], "final")
+            published = call("build_catalog")
+            self.assertTrue(published["done"])
+            self.assertIsNone(published.get("error"))
+            self.assertEqual([entry["stable_id"] for entry in published["items"]],
+                             ["typed", "ordinary"])
+            self.assertEqual(published["presentation"]["schemas"][0]["item_id"], "typed")
+            send(dict(kind="set_cancel", cancelled=False))
+            self.assertEqual(typed()["status"], "completed")
+            self.assertEqual(legacy("typed"), "failed")
+            self.assertEqual(legacy("ordinary"), "ok")
+
+            failed = call("build_catalog")
+            self.assertTrue(failed["done"])
+            self.assertIsNotNone(failed.get("error"))
+            self.assertNotIn("presentation", failed)
+            send(dict(kind="set_cancel", cancelled=False))
+            self.assertEqual(typed()["code"], "unavailable")
+            self.assertEqual(legacy("typed"), "failed")
+            self.assertEqual(legacy("ordinary"), "failed")
+
+    def test_successive_publications_keep_bounded_current_legacy_admission(self):
+        source = '''
+from crikey_sdk import Plugin, Item, Action, ArgumentSchema, TextField, SchemaBinding, ResultPresentation
+SCHEMA = ArgumentSchema((TextField(id="text", label="Text"),))
+def item(target):
+    return Item(target, "Dynamic", "dynamic", category="custom",
+                metadata={"z": "last", "a": "first"},
+                actions=[Action("ordinary", "Ordinary", applicable_categories=("custom",),
+                                execution_policy="plugin"),
+                         Action("typed", "Typed")])
+class Impl(Plugin):
+    def __init__(self):
+        self.catalog_generation = 0
+    def build_catalog(self):
+        self.catalog_generation += 1
+        # This catalog precedes all schema declarations, and exceeds the
+        # schema bound without exceeding the independent host item bound.
+        return [item("catalog-" + str(self.catalog_generation) + "-" + str(n))
+                for n in range(4100)]
+    def suggestion_presentation(self, query):
+        if query.text == "ordinary-republish":
+            return ResultPresentation()
+        target = "newest" if query.text == "typed-original" else query.text
+        return ResultPresentation(schemas=(SchemaBinding(target, SCHEMA, action_id="typed"),))
+    def suggest(self, query, context):
+        target = "newest" if query.text in ("typed-original", "ordinary-republish") else query.text
+        context.emit(item(target))
+        context.emit(item("ordinary-" + query.text))
+        if query.text == "typed-original":
+            for n in range(32):
+                context.emit(item("successful-partial-" + str(n)))
+        if query.text in ("failed", "cancelled"):
+            # Force a real emitted partial before failure/cancellation.
+            for n in range(32):
+                context.emit(item("partial-" + query.text + "-" + str(n)))
+            if query.text == "failed":
+                raise RuntimeError("failed after partial")
+            context._is_cancelled.__self__.set()
+    def execute_typed(self, item, action, values):
+        return None
+    def execute(self, item, action, argument):
+        return None
+'''
+        fingerprint = ArgumentSchema((TextField(id="text", label="Text"),)).fingerprint()
+        with worker(source) as (exchange, send):
+            request_id = 0
+            def call(kind, **fields):
+                nonlocal request_id
+                request_id += 1
+                return exchange(dict(id=request_id, kind=kind, **fields))
+            def item(target):
+                return dict(stable_id=target, label="Dynamic", target="dynamic",
+                            category="plugin-defined:custom", metadata={"a": "first", "z": "last"},
+                            actions=[dict(action_id="ordinary", label="Ordinary",
+                                          applicable_categories=["plugin-defined:custom"],
+                                          execution_policy="plugin"),
+                                     dict(action_id="typed", label="Typed")])
+            def legacy(identity, action=None, **changes):
+                frozen = item(identity)
+                frozen.update(changes)
+                return call("execute", item=frozen, action_id=action, argument=None)["status"]
+            def typed(target):
+                return call("typed_execute", item=item(target), action_id="typed",
+                            schema_fingerprint=fingerprint,
+                            values=[dict(field_id="text", kind="text", value="value")])
+            def suggest(text):
+                return call("suggest", generation=request_id + 1, text=text, normalized=text)
+
+            call("handshake", protocol_version=1)
+            self.assertIsNone(call("build_catalog").get("error"))
+            for n in range(4097):
+                self.assertEqual(suggest("query-" + str(n))["state"], "final", n)
+            self.assertEqual(typed("query-4096")["status"], "completed")
+            self.assertEqual(typed("query-0")["code"], "unavailable")
+            self.assertEqual(legacy("query-0", "typed"), "failed")
+            self.assertEqual(legacy("query-0", "ordinary"), "failed")
+            self.assertEqual(legacy("query-4096", "typed"), "failed")
+            self.assertEqual(legacy("query-4096"), "failed")
+            self.assertEqual(legacy("query-4096", "ordinary"), "ok")
+            self.assertEqual(legacy("ordinary-query-4096"), "ok")
+            self.assertEqual(legacy("ordinary-query-4096", "ordinary"), "ok")
+            self.assertEqual(legacy("ordinary-query-4096", "missing"), "failed")
+            self.assertEqual(legacy("ordinary-query-4096", target="forged"), "failed")
+            self.assertEqual(legacy("never-published", "ordinary"), "failed")
+            self.assertEqual(legacy("catalog-1-0", "ordinary"), "ok")
+            self.assertEqual(legacy("catalog-1-4099"), "ok")
+
+            # Catalog replacement retires only catalog authority.
+            self.assertIsNone(call("build_catalog").get("error"))
+            self.assertEqual(legacy("catalog-1-0", "ordinary"), "failed")
+            self.assertEqual(legacy("catalog-2-0", "ordinary"), "ok")
+            self.assertEqual(legacy("ordinary-query-4096"), "ok")
+            self.assertEqual(typed("query-4096")["status"], "completed")
+
+            for state in ("failed", "cancelled"):
+                self.assertEqual(suggest(state)["state"], state)
+                send(dict(kind="set_cancel", cancelled=False))
+                for target in ("query-4096", state, "ordinary-" + state,
+                               "partial-" + state + "-0"):
+                    self.assertEqual(legacy(target, "ordinary"), "failed", target)
+                    self.assertEqual(typed(target)["code"], "unavailable", target)
+                self.assertEqual(legacy("catalog-2-0"), "ok")
+
+            self.assertEqual(suggest("typed-original")["state"], "final")
+            self.assertEqual(typed("newest")["status"], "completed")
+            self.assertEqual(legacy("successful-partial-0", "ordinary"), "ok")
+            self.assertEqual(legacy("newest", "typed"), "failed")
+            self.assertEqual(suggest("ordinary-republish")["state"], "final")
+            self.assertEqual(typed("newest")["code"], "unavailable")
+            self.assertEqual(legacy("newest"), "ok")
+            self.assertEqual(legacy("newest", "typed"), "ok")
+
+    def test_schema_free_plugins_keep_legacy_execution_compatibility(self):
+        source = '''
+from crikey_sdk import Plugin, Item
+class Impl(Plugin):
+    def suggest(self, query, context):
+        context.emit(Item(query.text, "Dynamic", "dynamic"))
+    def execute(self, item, action, argument):
+        if item.stable_id != "unpublished" or action != "undeclared" or argument != "legacy":
+            raise RuntimeError("legacy arguments changed")
+'''
+        with worker(source) as (exchange, _send):
+            exchange(dict(id=1, kind="handshake", protocol_version=1))
+            for request_id, target in ((2, "first"), (3, "replacement")):
+                self.assertEqual(exchange(dict(id=request_id, kind="suggest", generation=request_id,
+                                               text=target, normalized=target))["state"], "final")
+            reply = exchange(dict(id=4, kind="execute", item=dict(stable_id="unpublished"),
+                                  action_id="undeclared", argument="legacy"))
+            self.assertEqual(reply["status"], "ok")
+
     def test_failed_and_cancelled_publications_never_install_schema_authority(self):
         source = '''
 from crikey_sdk import Plugin, Item, ArgumentSchema, TextField, SchemaBinding, ResultPresentation, TypedOutcome
