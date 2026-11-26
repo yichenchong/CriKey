@@ -191,6 +191,7 @@ fn measurement_frame(generation: Generation) -> ViewModel {
         query: "measure-activation".to_owned(),
         rows: Arc::from(Vec::<ResultRow>::new()),
         selected: 0,
+        root_selection_revision: 0,
         pending_plugins: false,
         action_panel: None,
         settings_open: false,
