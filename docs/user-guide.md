@@ -713,6 +713,8 @@ running jobs and owned runtime teardown before releasing the launcher lock.
 An enable/disable failure acknowledges a saved configuration only when the write
 persisted but effective reload failed; lookup, load and save failures are not
 reported as saved.
+If package reconciliation also fails, the job details show both the operation
+error and the reconciliation error.
 
 **Package details** inspects the selected local runtime/package identity,
 location and declared metadata without executing it or requiring an index.
