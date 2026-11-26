@@ -1487,6 +1487,9 @@ impl LauncherViewModel {
     /// The completed text is an ordinary edit, so the host schedules a
     /// generation for it exactly as if the user had typed it.
     fn complete(&mut self) -> Option<UiEffect> {
+        if self.view().is_none_or(|(_, kind)| kind != ViewKind::RootList) {
+            return None;
+        }
         let row = self.rows.get(self.selected)?;
         if self.query == row.label {
             return None;

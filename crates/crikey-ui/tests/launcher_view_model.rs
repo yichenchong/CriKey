@@ -2918,6 +2918,27 @@ fn covered_page_retains_only_route_and_owner_loss_is_recoverable() {
 }
 
 #[test]
+fn unavailable_custom_route_cannot_complete_the_retained_root_query() {
+    let mut model = open_showing(fresh_generation(), &["hidden-root-result"]);
+    let root_query = model.frame().unwrap().query;
+    assert!(model.open_page(web_page_surface()));
+    model.open_settings(None);
+    model.close_settings();
+    let route = model.take_page_reopen().unwrap();
+    model.page_reopen_failed(route, "owner was removed".into());
+    let _ = model.frame();
+
+    // With no live page, the native Tab adapter emits Complete rather than
+    // routing a key to a plugin. The logical custom route still owns the view.
+    assert_eq!(model.apply(UiCommand::Complete), None);
+    assert_eq!(model.take_query_refresh(), None);
+    assert!(model.frame().is_none());
+    assert_eq!(model.navigation_restoration().query, root_query);
+    model.apply(UiCommand::Back);
+    assert_eq!(model.take_query_refresh(), Some(root_query));
+}
+
+#[test]
 fn navigation_refuses_depth_and_retained_content_excess_visibly() {
     let mut model = LauncherViewModel::new();
     model.activate();

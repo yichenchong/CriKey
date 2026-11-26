@@ -250,7 +250,8 @@ surface opens. Back opens its saved owner/page route with fresh request and
 surface identities; it does not execute the original action again. Arbitrary
 web-document state, display lists and engine pixels are not snapshots. A missing
 owner yields **Page unavailable** with a working Back rather than an endless
-loading surface. Settings and real custom pages exercise this navigation now;
+loading surface. Root query completion stays inactive on that unavailable route.
+Settings and real custom pages exercise this navigation now;
 worker-backed list/detail/form/grid flow verification is still required when
 those typed P6 views are introduced.
 
