@@ -1734,32 +1734,45 @@ fn handle_typed_execute(
             .schemas
             .lock()
             .map_err(|_| SdkError::Protocol("schema registry unavailable".into()))?;
-        registry
+        let mut selected = None;
+        for binding in registry
             .suggestions
             .schemas
             .iter()
             .chain(&registry.catalog.schemas)
-            .find(|binding| {
-                binding.executable.target.owner == context.plugin_id
-                    && binding.executable.target.item.0 == request.item_id
-                    && binding.executable.action.as_ref().map(|a| &a.0) == request.action_id.as_ref()
-            })
-            .map(|binding| Arc::clone(&binding.schema))
+        {
+            if binding.executable.target.owner == context.plugin_id
+                && binding.executable.target.item.0 == request.item_id
+                && binding.executable.action.as_ref().map(|a| &a.0) == request.action_id.as_ref()
+            {
+                // Both publications remain authoritative. Prefer the exact
+                // expected schema, not whichever inventory happens to be first.
+                let fingerprint = binding.schema.fingerprint().ok();
+                if fingerprint.as_ref().map(|v| v.as_slice()) == Some(request.expected_fingerprint.as_slice())
+                {
+                    selected = Some((binding, fingerprint));
+                    break;
+                }
+                selected.get_or_insert((binding, fingerprint));
+            }
+        }
+        selected.map(|(binding, fingerprint)| (Arc::clone(&binding.schema), fingerprint))
     };
     let empty = ArgumentSchema::default();
     let outcome = if !negotiated || !plugin.supports_typed_arguments() {
         SubmissionOutcome::Failed(SubmissionFailureCode::Unsupported)
-    } else if let Some(schema) = schema.as_deref() {
-        let fingerprint = schema.fingerprint().ok();
+    } else if let Some((schema, fingerprint)) = schema.as_ref() {
         if fingerprint.as_ref().map(|v| v.as_slice()) != Some(request.expected_fingerprint.as_slice()) {
             SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch)
         } else if schema.validate_values(&request.values).is_err() {
             SubmissionOutcome::Failed(SubmissionFailureCode::ProtocolViolation)
+        } else if context.cancellation().is_cancelled() {
+            SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled)
         } else {
             let expected_fingerprint =
                 fingerprint.ok_or_else(|| SdkError::Protocol("invalid schema".into()))?;
             let _in_flight = metrics.enter();
-            match invoke_callback(|| {
+            let callback = invoke_callback(|| {
                 plugin.execute_typed(
                     crate::TypedExecuteRequest {
                         request: RequestId(request_id),
@@ -1770,7 +1783,11 @@ fn handle_typed_execute(
                     },
                     context,
                 )
-            }) {
+            });
+            match callback {
+                _ if context.cancellation().is_cancelled() => {
+                    SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled)
+                }
                 Ok(Ok(outcome)) if outcome.validate(Some(schema)).is_ok() => outcome,
                 _ => SubmissionOutcome::Failed(SubmissionFailureCode::Failed),
             }
@@ -1778,8 +1795,12 @@ fn handle_typed_execute(
     } else {
         SubmissionOutcome::Failed(SubmissionFailureCode::Unavailable)
     };
-    let response = crikey_native_protocol::typed::to_response(outcome, schema.as_deref().unwrap_or(&empty))
-        .map_err(SdkError::from)?;
+    let response_schema = schema
+        .as_ref()
+        .map(|(schema, _)| schema.as_ref())
+        .unwrap_or(&empty);
+    let response =
+        crikey_native_protocol::typed::to_response(outcome, response_schema).map_err(SdkError::from)?;
     send_envelope(
         transport,
         Envelope {

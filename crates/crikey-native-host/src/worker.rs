@@ -1372,24 +1372,15 @@ impl NativeWorker {
                 .suggestion_presentation
                 .as_ref()
                 .and_then(|p| p.schema_for(&executable))
-                .is_none()
+                .is_none_or(|schema| schema.fingerprint().ok() != Some(expected_fingerprint))
         {
             self.build_catalog()?;
         }
-        let schema = self
-            .suggestion_presentation
-            .as_ref()
-            .and_then(|p| p.schema_for(&executable))
-            .or_else(|| {
-                self.catalog_presentation
-                    .as_ref()
-                    .and_then(|p| p.schema_for(&executable))
-            })
-            .cloned();
-        let Some(schema) = schema else {
-            return Ok(TypedPreparation::Refused(SubmissionFailureCode::SchemaMismatch));
-        };
-        if schema.fingerprint().ok() != Some(expected_fingerprint) {
+        let matches = [&self.suggestion_presentation, &self.catalog_presentation]
+            .into_iter()
+            .filter_map(|presentation| presentation.as_ref()?.schema_for(&executable))
+            .any(|schema| schema.fingerprint().ok() == Some(expected_fingerprint));
+        if !matches {
             return Ok(TypedPreparation::Refused(SubmissionFailureCode::SchemaMismatch));
         }
         Ok(TypedPreparation::Ready(ConfirmedTypedExecution {
@@ -1409,22 +1400,14 @@ impl NativeWorker {
         if confirmed.connection_id != self.link.connection_id {
             return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch));
         }
-        let schema = self
-            .suggestion_presentation
-            .as_ref()
-            .and_then(|p| p.schema_for(&confirmed.executable))
-            .or_else(|| {
-                self.catalog_presentation
-                    .as_ref()
-                    .and_then(|p| p.schema_for(&confirmed.executable))
-            })
+        let schema = [&self.suggestion_presentation, &self.catalog_presentation]
+            .into_iter()
+            .filter_map(|presentation| presentation.as_ref()?.schema_for(&confirmed.executable))
+            .find(|schema| schema.fingerprint().ok() == Some(confirmed.fingerprint))
             .cloned();
         let Some(schema) = schema else {
             return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch));
         };
-        if schema.fingerprint().ok() != Some(confirmed.fingerprint) {
-            return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::SchemaMismatch));
-        }
         if schema.validate_values(&values).is_err() {
             return Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Denied));
         }
