@@ -444,6 +444,10 @@ debounce, prompt replacement of obsolete work, serial callbacks, and
 `should_terminate()` cooperative cancellation. Empty-query and minimum-length
 behavior is a plugin declaration for modern plugins, not a hidden global rule.
 
+Once modern-plugin callbacks finish, the final answer includes every admitted
+result batch; intake budgeting does not leave a plugin's answer waiting for
+another keystroke.
+
 Catalog rows are fuzzy-matched by the host. Plugin suggestion batches are shown
 in the order the plugin publishes them; they are not host-fuzzy-matched or
 re-ranked by `score_hint`. This distinction is intentional (see
