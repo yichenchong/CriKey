@@ -1702,7 +1702,11 @@ fn a_superseded_lazy_startup_abandons_its_obsolete_target_list() {
         );
     }
 
-    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    // Force the synchronous answer to span intake turns: a one-shot present
+    // would strand two final batches even though all three children answered.
+    let mut config = PipelineConfig::default();
+    config.drain_budget.total_batches = 1;
+    let mut pipeline = QueryPipeline::new(config);
     let provider = ModernProvider::load(
         &mut pipeline,
         &[plugins_root.clone()],
@@ -1721,7 +1725,11 @@ fn a_superseded_lazy_startup_abandons_its_obsolete_target_list() {
     // Every published frame, with the plugins that contributed rows to it.
     let published: PublishedFrames = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&published);
+    let (pending_sender, pending_receiver) = std::sync::mpsc::channel();
     let driver = ModernDriver::spawn(provider, pipeline, move |frame| {
+        pending_sender
+            .send(frame.pending_plugins)
+            .expect("the publication observer is alive");
         sink.lock().expect("the publish sink is not poisoned").push((
             frame.generation,
             frame.rows.iter().map(|row| row.plugin_name.clone()).collect(),
@@ -1766,6 +1774,12 @@ fn a_superseded_lazy_startup_abandons_its_obsolete_target_list() {
         sleep(Duration::from_millis(5));
     }
     let newest_rows = newest_rows.expect("the newest generation must be the one that publishes");
+    assert!(
+        !pending_receiver
+            .try_recv()
+            .expect("the published frame reports whether any work remains"),
+        "a synchronous final answer must not leave plugin batches pending",
+    );
     for name in names {
         assert!(
             newest_rows.contains(&modern_plugin(name).0),
