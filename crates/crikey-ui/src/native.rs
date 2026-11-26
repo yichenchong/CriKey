@@ -3185,7 +3185,7 @@ fn egui_popup_open(context: &egui::Context) -> bool {
     })
 }
 
-fn translate_keyboard(
+pub(super) fn translate_keyboard(
     logical_key: Key<&str>,
     state: ElementState,
     modifiers: ModifiersState,
@@ -6055,8 +6055,23 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
                     commands.push(UiCommand::ShowActions);
                 }
                 if let Some(row) = model.rows.get(model.selected) {
-                    if row.has_primary_action() || actionless_primary(row, model) {
-                        let label = if matches!(row.target, crate::ActionTarget::Command(_)) {
+                    let form_submit = model.navigation.standard.as_ref().and_then(|surface| {
+                        let crikey_core::structured_view::StandardView::Form(form) = &surface.descriptor.view
+                        else {
+                            return None;
+                        };
+                        Some((surface, &form.submit))
+                    });
+                    if form_submit.is_some() || row.has_primary_action() || actionless_primary(row, model) {
+                        let label = if let Some((surface, submit)) = form_submit {
+                            submit
+                                .action
+                                .as_ref()
+                                .and_then(|action| {
+                                    surface.descriptor.definition(&submit.target)?.action(action)
+                                })
+                                .map_or("Run", |action| action.label.as_str())
+                        } else if matches!(row.target, crate::ActionTarget::Command(_)) {
                             "Invoke Command"
                         } else {
                             row.default_action

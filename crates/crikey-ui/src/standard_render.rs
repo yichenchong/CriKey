@@ -9,7 +9,9 @@ pub(super) fn primary_command(model: &ViewModel) -> Option<UiCommand> {
     if model.navigation.standard_refresh_pending {
         return None;
     }
-    let executable = if let Some(row) = model.rows.get(model.selected) {
+    let executable = if let StandardView::Form(form) = &surface.descriptor.view {
+        form.submit.clone()
+    } else if let Some(row) = model.rows.get(model.selected) {
         let ActionTarget::Result { owner, item } = &row.target else {
             return None;
         };
@@ -22,7 +24,6 @@ pub(super) fn primary_command(model: &ViewModel) -> Option<UiCommand> {
         }
     } else {
         match &surface.descriptor.view {
-            StandardView::Form(form) => form.submit.clone(),
             StandardView::Detail(detail) => {
                 let target = detail.target.clone()?;
                 let definition = surface.descriptor.definition(&target)?;

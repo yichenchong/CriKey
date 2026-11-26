@@ -383,6 +383,9 @@ changes or a newer input, Back, dismissal or view failure supersedes the gesture
 Forms reuse the native typed editor: use **Run command**, Enter in a
 single-line/password field, or Ctrl/Cmd+Enter for multiline input. Required fields
 and fixed field failures follow the inline-input rules above.
+Escape closes the form editor without changing its submit target. Enter or the
+footer reopens that exact submit schema, even when the item's primary action
+is different; unrelated actions cannot replace the form's editor.
 
 A plugin can **Push** a route onto the existing navigation stack or **Replace**
 the current entry. Back reopens the saved owner/route with a fresh surface and
