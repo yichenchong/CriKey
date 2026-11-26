@@ -2658,7 +2658,7 @@ impl ModernProvider {
     /// pipeline is ticked (advancing the modern debounce timer as needed) until
     /// its registered plugins are dispatched; each plugin's items are delivered
     /// as a [`ResultBatch`] under the pipeline generation and the request is
-    /// completed; `present` drains intake, ranks and coalesces one frame. Stale
+    /// completed; `present_drained` drains intake, ranks and coalesces one frame. Stale
     /// answers are refused at the pipeline's intake boundary because only the
     /// current generation is ever delivered.
     ///
@@ -2805,7 +2805,9 @@ impl ModernProvider {
             }
         }
 
-        let frame = pipeline.present(at);
+        // Every synchronous producer has returned its final batch. No later
+        // presentation tick will drain any answer left behind by a frame budget.
+        let frame = pipeline.present_drained(at);
         frame.filter(|frame| frame.generation == generation)
     }
 
