@@ -806,6 +806,7 @@ impl QueryPipeline {
             query: self.query.clone(),
             rows: Arc::clone(&self.rows),
             selected: 0,
+            root_selection_revision: 0,
             pending_plugins,
             action_panel: None,
             // A pipeline frame carries results, never the launcher's own
