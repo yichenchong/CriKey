@@ -235,8 +235,11 @@ preview focus/detail, an open action search/submenu/panel, the previous view,
 then root-query clearing and dismissal. The host retains the root query,
 owner-qualified selection, logical scope and list scroll anchor. Returning
 issues a fresh search and reconciles the exact owner/item across partial
-publications. Explicit navigation or query editing supersedes that return
-selection. Navigation is bounded to 16 entries including the current view
+publications. The saved viewport anchor stays pending until enough results
+arrive to restore it, or the search finishes and clamps it. Wheel input,
+explicit navigation or query editing supersedes pending viewport restoration.
+Explicit navigation or query editing also supersedes the return selection.
+Navigation is bounded to 16 entries including the current view
 and 8 MiB of retained host content; shared result/icon allocations count once.
 An excessive push is refused with a visible reason.
 

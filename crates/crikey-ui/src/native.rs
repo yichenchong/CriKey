@@ -3181,6 +3181,7 @@ fn draw_results(
     colors: theme::Palette,
     body_height: Option<f32>,
 ) {
+    let restoration_id = egui::Id::new("crikey.logical-scroll-restoration");
     // Nothing below the field until there is something to put there. The card
     // that used to stand here said "Searching" or "No matches" inside a
     // full-width box, so the moment a key was pressed the launcher grew into a
@@ -3197,11 +3198,10 @@ fn draw_results(
     };
     let previous = ui.data(|data| data.get_temp::<ScrollAnchor>(scroll_anchor_id()));
     ui.data_mut(|data| data.insert_temp(scroll_anchor_id(), anchor));
-    let restoration_id = egui::Id::new("crikey.logical-scroll-restoration");
     let previous_restoration = ui.data(|data| data.get_temp::<u64>(restoration_id));
-    let restoring =
-        model.navigation.restoration != 0 && previous_restoration != Some(model.navigation.restoration);
-    ui.data_mut(|data| data.insert_temp(restoration_id, model.navigation.restoration));
+    let mut restoring = model.navigation.preserve_scroll
+        && model.navigation.restoration != 0
+        && previous_restoration != Some(model.navigation.restoration);
 
     // What the list may occupy is what is left after everything drawn under
     // it, measured rather than guessed. This used to subtract a flat
@@ -3222,6 +3222,12 @@ fn draw_results(
     };
     let reserved = overlay + BLOCK_GAP + STATUS_BLOCK_HEIGHT;
     let list_height = body_height.unwrap_or_else(|| (ui.available_height() - reserved).max(0.0));
+    // ScrollArea's aligned target subtracts the parent UI's item spacing,
+    // not the zero spacing we give its row contents. Compensate so a logical
+    // row offset is restored exactly rather than acquiring that reveal margin.
+    let restoration_spacing = ui.spacing().item_spacing.y;
+    let mut requested_offset = None;
+    let mut reachable = false;
     egui::ScrollArea::vertical()
         // Vertically the list is exactly as tall as its rows, up to the cap:
         // filling the cap regardless would put empty space between the last
@@ -3229,23 +3235,33 @@ fn draw_results(
         // look like a mostly empty window.
         .auto_shrink([false, true])
         .max_height(list_height)
-        .show(ui, |ui| {
+        .show_viewport(ui, |ui, viewport| {
             ui.set_min_width(ui.available_width());
             // The gap between rows is exactly ROW_GAP, which the window height
             // is computed from. egui's own item spacing would be added on top
             // of it and put the arithmetic out by a few pixels per row.
             ui.spacing_mut().item_spacing.y = 0.0;
+            // A wheel gesture over this list supersedes an unfinished return,
+            // even if the short publication cannot scroll yet.
+            if ui.rect_contains_pointer(ui.clip_rect()) && ui.input(|input| input.raw_scroll_delta.y != 0.0) {
+                restoring = false;
+            }
+            let content_top = ui.next_widget_position().y;
+            // The paint clip includes egui's visual overflow margin; logical
+            // anchors must use the actual viewport or every return drifts.
+            let viewport = viewport.translate(vec2(0.0, content_top));
             let mut selected_row = None;
             let mut first_visible = None;
+            let mut restoration_rect = None;
             for (index, row) in model.rows.iter().enumerate() {
                 let response = draw_result_row(ui, row, index == model.selected, commands, colors);
                 if first_visible.is_none()
-                    && response.rect.max.y > ui.clip_rect().top()
-                    && response.rect.min.y < ui.clip_rect().bottom()
+                    && response.rect.max.y > viewport.top()
+                    && response.rect.min.y < viewport.bottom()
                 {
                     first_visible = Some(crate::LogicalScroll {
                         row: index,
-                        offset: (ui.clip_rect().top() - response.rect.top()).max(0.0),
+                        offset: (viewport.top() - response.rect.top()).max(0.0),
                     });
                 }
                 if restoring
@@ -3256,16 +3272,27 @@ fn draw_results(
                             .row
                             .min(model.rows.len().saturating_sub(1))
                 {
-                    ui.scroll_to_rect(
-                        response.rect.translate(vec2(0.0, model.navigation.scroll.offset)),
-                        Some(Align::Min),
-                    );
+                    requested_offset =
+                        Some(response.rect.top() - content_top + model.navigation.scroll.offset);
+                    restoration_rect =
+                        Some(response.rect.translate(vec2(0.0, model.navigation.scroll.offset)));
                 }
                 if index == model.selected {
                     selected_row = Some(response);
                 }
                 if index + 1 != model.rows.len() {
                     ui.add_space(theme::ROW_GAP);
+                }
+            }
+            if let Some(rect) = restoration_rect {
+                reachable = model.navigation.scroll.row < model.rows.len()
+                    && requested_offset.is_some_and(|offset| {
+                        offset <= (ui.min_rect().height() - viewport.height()).max(0.0)
+                    });
+                // An unreachable partial anchor must not start an animation
+                // that clamps to zero and requests another identical paint.
+                if !model.pending_plugins || reachable {
+                    ui.scroll_to_rect(rect.translate(vec2(0.0, restoration_spacing)), Some(Align::Min));
                 }
             }
             if !restoring {
@@ -3294,6 +3321,13 @@ fn draw_results(
                 response.scroll_to_me(None);
             }
         });
+    // A partial list may clamp the requested viewport. Keep the original
+    // model anchor, and retry on publication instead of reporting that clamp
+    // back through SetLogicalScroll. Only a reachable or terminal restoration
+    // consumes the token; no retained row snapshots or per-frame copies.
+    if !restoring || !model.pending_plugins || reachable {
+        ui.data_mut(|data| data.insert_temp(restoration_id, model.navigation.restoration));
+    }
 }
 
 #[path = "preview_render.rs"]
