@@ -351,6 +351,7 @@ mod linux {
             query: String::new(),
             rows: Arc::default(),
             selected: 0,
+            root_selection_revision: 0,
             pending_plugins: false,
             action_panel: None,
             settings_open: false,

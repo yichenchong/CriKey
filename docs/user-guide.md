@@ -641,8 +641,10 @@ affordance to open settings from a web page. Escape closes the page.
 With the default `compact` command home, an empty query shows only the query
 field; the launcher does not list the catalog at rest. Other command-home modes
 show saved favorites, successful recent commands, or both as described above.
-Scrolling the result list with the wheel stays where you put it; the list only
-scrolls itself to follow a selection you moved.
+Scrolling the result list with the wheel stays where you put it, including
+when the host republishes the same results or updates their display details.
+Keyboard navigation reveals the selected result, even at the first or last row;
+a new query or a changed selected target also follows the selection.
 
 ### Navigation, logical resume, and query recall
 
