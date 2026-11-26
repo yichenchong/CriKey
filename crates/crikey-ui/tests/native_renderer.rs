@@ -4375,37 +4375,41 @@ fn back_keeps_the_wheeled_anchor_across_later_provider_publication() {
     let view = state.frame().unwrap();
     let mut frames = Frames::new();
     let _ = frames.settle(&view);
-    let _ = frames.draw(&view, wheel_over_list());
+    let mut wheel = wheel_over_list();
+    if let egui::Event::MouseWheel { delta, .. } = &mut wheel[1] {
+        delta.y = -1087.0;
+    }
+    let _ = frames.draw(&view, wheel);
     let scrolled = frames.settle(&view);
     assert!(!painted(&scrolled, "row-0"));
     for command in scrolled.commands {
         let _ = state.apply(command);
     }
+    let anchor = state.navigation_restoration().scroll;
+    assert_eq!(anchor.row, 20);
+    assert!(anchor.offset > 0.0);
     state.open_settings(None);
     let settings = state.frame().unwrap();
     let _ = frames.settle(&settings);
     state.close_settings();
     state.take_query_refresh().unwrap();
     state.begin_generation(Generation::from_raw(2));
-    state.publish(Generation::from_raw(2), (0..40).map(result_row).collect(), true);
-    let back = state.frame().unwrap();
-    let restored = frames.settle(&back);
-    assert!(
-        !painted(&restored, "row-0"),
-        "Back restores the viewport, not the offscreen selected row"
-    );
-    let anchor = restored
-        .commands
-        .iter()
-        .find_map(|command| {
-            if let UiCommand::SetLogicalScroll(scroll) = command {
-                Some(scroll.clone())
-            } else {
-                None
-            }
-        })
-        .expect("the restored list reports its logical anchor");
-    state.publish(Generation::from_raw(2), (0..41).map(result_row).collect(), false);
+    state.publish(Generation::from_raw(2), (0..2).map(result_row).collect(), true);
+    let mut back = state.frame().unwrap();
+    for paint in 0..40 {
+        let partial = frames.draw(&back, Vec::new());
+        if paint > 20 {
+            assert!(painted(&partial, "row-0"));
+        }
+        for command in partial.commands {
+            let _ = state.apply(command);
+        }
+        assert_eq!(state.navigation_restoration().scroll, anchor);
+        if let Some(next) = state.frame() {
+            back = next;
+        }
+    }
+    state.publish(Generation::from_raw(2), (0..40).map(result_row).collect(), false);
     let refreshed = frames.settle(&state.frame().unwrap());
     assert!(
         !painted(&refreshed, "row-0"),
@@ -5108,4 +5112,154 @@ fn changing_a_pending_draft_back_to_submitted_text_still_requires_a_new_save() {
         context.data(|data| data.get_temp::<String>(draft_id)).as_deref(),
         Some("recent")
     );
+}
+
+fn pending_scroll_return() -> (crikey_ui::LauncherViewModel, Frames, ViewModel) {
+    let mut state = crikey_ui::LauncherViewModel::new();
+    state.activate();
+    state.apply(UiCommand::SetQuery("row".into()));
+    let mut restoration = state.navigation_restoration();
+    restoration.scroll = crikey_ui::LogicalScroll { row: 20, offset: 7.0 };
+    state.restore_navigation_state(restoration);
+    state.begin_generation(Generation::from_raw(1));
+    state.publish(Generation::from_raw(1), (0..2).map(result_row).collect(), true);
+    let view = state.frame().unwrap();
+    let mut frames = Frames::new();
+    for _ in 0..40 {
+        for command in frames.draw(&view, Vec::new()).commands {
+            let _ = state.apply(command);
+        }
+    }
+    assert_eq!(state.navigation_restoration().scroll.row, 20);
+    (state, frames, view)
+}
+
+#[test]
+fn terminal_short_return_clamps_once_without_reviving_the_saved_anchor() {
+    let (mut state, mut frames, _) = pending_scroll_return();
+    state.publish(Generation::from_raw(1), (0..2).map(result_row).collect(), false);
+    let terminal = frames.settle(&state.frame().unwrap());
+    for command in terminal.commands {
+        let _ = state.apply(command);
+    }
+    assert_eq!(state.navigation_restoration().scroll.row, 0);
+    state.begin_generation(Generation::from_raw(2));
+    state.publish(Generation::from_raw(2), (0..40).map(result_row).collect(), false);
+    let later = frames.settle(&state.frame().unwrap());
+    assert!(painted(&later, "row-0"));
+    assert!(!painted(&later, "row-20"));
+}
+
+#[test]
+fn explicit_input_supersedes_a_partial_return_scroll() {
+    for input in ["wheel", "navigation", "query"] {
+        let (mut state, mut frames, view) = pending_scroll_return();
+        match input {
+            "wheel" => {
+                let drawn = frames.settle(&view);
+                let position = position_of(&drawn, "row-0") + egui::vec2(4.0, 4.0);
+                let mut events = wheel_over_list();
+                events[0] = egui::Event::PointerMoved(position);
+                for command in frames.draw(&view, events).commands {
+                    let _ = state.apply(command);
+                }
+                assert_eq!(
+                    state.navigation_restoration().scroll,
+                    crikey_ui::LogicalScroll::default(),
+                    "a wheel over the short list supersedes the model's saved anchor immediately"
+                );
+                // egui smooths wheel input across paints, even when this short
+                // list cannot scroll. Finish that gesture while the provider
+                // is pending rather than asking the later full list to ignore it.
+                for command in frames.settle(&view).commands {
+                    let _ = state.apply(command);
+                }
+            }
+            "navigation" => {
+                state.apply(UiCommand::SelectNext);
+            }
+            "query" => {
+                state.apply(UiCommand::SetQuery("edited row".into()));
+            }
+            _ => unreachable!(),
+        }
+        state.begin_generation(Generation::from_raw(2));
+        state.publish(Generation::from_raw(2), (0..40).map(result_row).collect(), false);
+        let later = frames.settle(&state.frame().unwrap());
+        assert!(painted(&later, "row-0"), "{input} supersedes restoration");
+        assert!(!painted(&later, "row-20"), "{input} supersedes restoration");
+        for command in later.commands {
+            let _ = state.apply(command);
+        }
+        assert_eq!(state.navigation_restoration().scroll.row, 0);
+    }
+}
+
+#[test]
+fn a_reachable_partial_return_releases_the_original_scroll_intent() {
+    let (mut state, mut frames, _) = pending_scroll_return();
+    state.publish(Generation::from_raw(1), (0..40).map(result_row).collect(), true);
+    let view = state.frame().unwrap();
+    let restored = frames.settle(&view);
+    for command in restored.commands {
+        let _ = state.apply(command);
+    }
+    let anchor = state.navigation_restoration().scroll;
+    assert_eq!(anchor.row, 20);
+    assert!((anchor.offset - 7.0).abs() < 1.0);
+    let _ = frames.draw(&view, wheel_over_list());
+    for command in frames.settle(&view).commands {
+        let _ = state.apply(command);
+    }
+    let wheeled = state.navigation_restoration().scroll;
+    assert!(wheeled.row > anchor.row);
+    state.publish(Generation::from_raw(1), (0..41).map(result_row).collect(), false);
+    let completed = frames.settle(&state.frame().unwrap());
+    for command in completed.commands {
+        let _ = state.apply(command);
+    }
+    let completed = state.navigation_restoration().scroll;
+    assert_eq!(completed.row, wheeled.row);
+    assert!((completed.offset - wheeled.offset).abs() < 1.0);
+}
+
+fn assert_empty_return_scroll(pending_plugins: bool) {
+    let (mut state, mut frames, _) = pending_scroll_return();
+    let expected = if pending_plugins {
+        crikey_ui::LogicalScroll { row: 20, offset: 7.0 }
+    } else {
+        crikey_ui::LogicalScroll::default()
+    };
+    state.publish(Generation::from_raw(1), Vec::new(), pending_plugins);
+    let empty = state.frame().unwrap();
+    assert!(empty.rows.is_empty());
+    for command in frames.settle(&empty).commands {
+        let _ = state.apply(command);
+    }
+    assert_eq!(state.navigation_restoration().scroll, expected);
+    state.open_settings(None);
+    let _ = frames.settle(&state.frame().unwrap());
+    state.close_settings();
+    state.take_query_refresh().unwrap();
+    state.begin_generation(Generation::from_raw(2));
+    state.publish(Generation::from_raw(2), (0..40).map(result_row).collect(), false);
+    let returned = frames.settle(&state.frame().unwrap());
+    assert_eq!(painted(&returned, "row-0"), !pending_plugins);
+    assert_eq!(painted(&returned, "row-20"), pending_plugins);
+    for command in returned.commands {
+        let _ = state.apply(command);
+    }
+    let actual = state.navigation_restoration().scroll;
+    assert_eq!(actual.row, expected.row);
+    assert!((actual.offset - expected.offset).abs() < 1.0);
+}
+
+#[test]
+fn terminal_empty_return_clears_the_anchor_before_another_settings_back() {
+    assert_empty_return_scroll(false);
+}
+
+#[test]
+fn pending_empty_return_preserves_the_anchor_across_another_settings_back() {
+    assert_empty_return_scroll(true);
 }
