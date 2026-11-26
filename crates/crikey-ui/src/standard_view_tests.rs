@@ -116,6 +116,51 @@ fn grid_spatial_selection_and_actionless_execution_keep_exact_context() {
     assert_eq!(executable.target, target(4));
     assert!(executable.action.is_none());
 }
+
+#[test]
+fn grid_down_reaches_the_ragged_last_row_before_stopping() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let mut context = open(&mut model, "grid", descriptor(5));
+    model.apply(UiCommand::StandardSelect {
+        context: context.clone(),
+        target: target(2),
+    });
+    context.revision = NonZeroU64::new(12).unwrap();
+    assert!(model.publish_standard_view(
+        owner(),
+        7,
+        ViewReply {
+            context: context.clone(),
+            descriptor: descriptor(5),
+        }
+    ));
+    assert!(matches!(
+        model.apply(UiCommand::SelectNext),
+        Some(UiEffect::RefreshStandard(ViewRefreshReason::Selection))
+    ));
+    assert_eq!(model.standard_host_state().selected, Some(target(4)));
+    assert_eq!(
+        model
+            .standard_refresh_request(ViewRefreshReason::Selection)
+            .unwrap()
+            .state
+            .unwrap()
+            .selected,
+        Some(target(4))
+    );
+    context.revision = NonZeroU64::new(13).unwrap();
+    assert!(model.publish_standard_view(
+        owner(),
+        7,
+        ViewReply {
+            context,
+            descriptor: descriptor(5),
+        }
+    ));
+    model.apply(UiCommand::SelectNext);
+    assert_eq!(model.standard_host_state().selected, Some(target(4)));
+}
 #[test]
 fn refresh_retires_old_queued_actions_without_root_collision_lookup() {
     let mut model = LauncherViewModel::new();
@@ -574,6 +619,12 @@ fn grid_sections_start_new_spatial_rows_and_are_not_targets() {
     assert_eq!(grid_neighbor(3, 7, 3, &headers, -2), 1);
     assert_eq!(grid_neighbor(2, 7, 3, &headers, -1), 2);
     assert_eq!(grid_neighbor(4, 7, 3, &headers, 1), 4);
+    let ragged = vec![SectionHeader {
+        row: 5,
+        ..headers[0].clone()
+    }];
+    assert_eq!(grid_neighbor(2, 8, 3, &ragged, 2), 4);
+    assert_eq!(grid_neighbor(4, 8, 3, &ragged, 2), 6);
 }
 
 #[test]
