@@ -331,15 +331,11 @@ impl ProcessLauncher for CommandLauncher {
 /// The helper every freedesktop desktop ships to resolve a default handler.
 const XDG_OPEN: &str = "xdg-open";
 
-/// Opening a file or folder with the session's default handler (spec 18.2).
+/// Opening a file, folder or HTTP(S) URL with the session's default handler.
 ///
-/// `xdg-open` and nothing else. Unlike URI opening -- which
-/// [`CommandLauncher::open_uri`] still refuses, because choosing among the
-/// scheme handlers a session may or may not have installed would be a guess --
-/// handing a *path* to `xdg-open` is the documented, desktop-independent way
-/// to do exactly this, and xdg-utils is a dependency of every desktop this
-/// backend targets. It is still probed for rather than assumed: see
-/// [`Self::for_session`].
+/// Uses only `xdg-open`, probed rather than assumed: see [`Self::for_session`].
+/// Unlike general URI dispatch, HTTP(S) links have an explicit scheme allowlist;
+/// [`CommandLauncher::open_uri`] continues to refuse arbitrary schemes.
 ///
 /// The path travels as one `OsStr` argv entry. No shell is involved anywhere,
 /// which is not a stylistic preference: a file legitimately named
@@ -383,7 +379,7 @@ impl XdgOpener {
         })
     }
 
-    /// Runs the helper on one path, detached, and returns once it exists.
+    /// Runs the helper on one path or URL, detached, and returns once it exists.
     ///
     /// The same detachment [`ProcessLauncher::launch`] uses and for the same
     /// reasons: the handler outlives the launcher, standard streams are closed
@@ -419,6 +415,12 @@ impl FileOpener for XdgOpener {
     fn open_path(&self, path: &PlatformPath) -> Result<()> {
         let path = non_empty(path)?;
         self.run(&operand(path), path)
+    }
+
+    fn open_url(&self, url: &str) -> Result<()> {
+        crikey_platform::validate_web_url(url)?;
+        // Do not apply filesystem operand rewriting to a URL.
+        self.run(Path::new(url), Path::new(url))
     }
 
     /// Opens the *containing directory* with the default file manager.

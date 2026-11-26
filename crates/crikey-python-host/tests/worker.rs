@@ -705,6 +705,64 @@ fn suggest_collects_the_plugins_streamed_items_in_order() {
 }
 
 #[test]
+fn catalog_timeout_override_preserves_the_query_default() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("catalog-timeout-override");
+    let dir = write_plugin(&scratch, "catalog", WELL_BEHAVED);
+    // A zero default expires deterministically, even if a reply is queued.
+    // Catalog gets its own budget, without changing the next query's bound.
+    let opts = options("modern.catalog.override", &dir).with_call_timeout_ms(0);
+    let mut worker = ModernWorker::spawn(
+        &host_interpreter().expect("host interpreter was checked at test entry"),
+        opts,
+    )
+    .expect("a loadable plugin spawns a worker");
+
+    let items = worker
+        .build_catalog_with_timeout_ms(CALL_BUDGET_MS)
+        .expect("catalog uses the explicit budget, not the zero query default");
+    assert_eq!(items.len(), 2);
+    assert!(worker.is_alive());
+
+    let error = worker
+        .suggest(&suggest_request("anything"))
+        .expect_err("catalog must not extend the configured query deadline");
+    assert!(matches!(error, HostError::Timeout), "{error:?}");
+    assert!(!worker.is_alive(), "a timed-out query reaps the worker");
+    worker.shutdown();
+}
+
+#[test]
+fn catalog_honors_explicit_and_configured_zero_deadlines() {
+    require_host_interpreter!();
+    let scratch = Scratch::new("catalog-zero-deadlines");
+    let dir = write_plugin(&scratch, "catalog", WELL_BEHAVED);
+
+    for explicit in [false, true] {
+        let opts = options("modern.catalog.zero", &dir).with_call_timeout_ms(if explicit {
+            CALL_BUDGET_MS
+        } else {
+            0
+        });
+        let mut worker = ModernWorker::spawn(
+            &host_interpreter().expect("host interpreter was checked at test entry"),
+            opts,
+        )
+        .expect("a loadable plugin spawns a worker");
+
+        let result = if explicit {
+            worker.build_catalog_with_timeout_ms(0)
+        } else {
+            worker.build_catalog()
+        };
+        let error = result.expect_err("a zero catalog deadline expires deterministically");
+        assert!(matches!(error, HostError::Timeout), "{error:?}");
+        assert!(!worker.is_alive(), "a timed-out catalog reaps the worker");
+        worker.shutdown();
+    }
+}
+
+#[test]
 fn build_catalog_returns_the_plugins_catalog_with_fields_intact() {
     require_host_interpreter!();
     let scratch = Scratch::new("catalog");
@@ -1379,4 +1437,210 @@ fn dropping_a_worker_reaps_its_child_and_leaves_no_orphan() {
             "dropping a worker reaps its child; pid {pid} is still in the process table"
         );
     }
+}
+
+#[test]
+fn deferred_preview_negotiates_and_contains_callback_failures() {
+    let scratch = Scratch::new("preview-callback");
+    let interpreter = required_host_interpreter();
+    let dir = write_plugin(
+        &scratch,
+        "preview-callback",
+        r#"
+from crikey_sdk import Item, Plugin, Preview, PreviewImage
+class Fixture(Plugin):
+    def suggest(self, query, context):
+        self.details = {"selected": "Selected selected"}
+        context.emit(Item(stable_id="selected", label="Selected", target="selected", preview_deferred=True))
+    async def preview(self, item, context):
+        detail = self.details[item.stable_id]
+        if item.target == "error":
+            raise ValueError("preview failed visibly")
+        if item.target == "oversized":
+            return Preview(text="x" * (256 * 1024 + 1))
+        if item.target == "empty":
+            return None
+        return Preview(text=detail,
+                       image=PreviewImage(1, 1, bytes((1, 2, 3, 255))))
+"#,
+    );
+    let mut worker = ModernWorker::spawn(&interpreter, options("preview-callback", &dir))
+        .expect("the real preview worker starts");
+    assert!(worker.supports_preview());
+    let batch = worker
+        .suggest(&suggest_request("preview"))
+        .expect("ordinary suggestions work");
+    let mut item = batch.items[0].clone();
+    assert_eq!(
+        item.metadata.get("crikey.preview").map(String::as_str),
+        Some("deferred")
+    );
+    let identity = serde_json::json!({
+        "view":7,"query":9,"plugin":"modern.preview-callback","incarnation":11,
+        "item":"selected","selection":13,"request":17
+    });
+    let reply = worker.preview(&item, &identity).expect("preview transport works");
+    assert_eq!(reply["identity"], identity);
+    assert_eq!(reply["status"], "content");
+    assert_eq!(reply["content"]["text"], "Selected selected");
+    assert_eq!(
+        reply["content"]["image"]["rgba"],
+        serde_json::json!([1, 2, 3, 255])
+    );
+    for (target, expected) in [("error", "failed"), ("oversized", "failed"), ("empty", "empty")] {
+        item.target = target.into();
+        assert_eq!(
+            worker
+                .preview(&item, &identity)
+                .expect("contained callback reply")["status"],
+            expected
+        );
+    }
+    assert_eq!(
+        worker
+            .suggest(&suggest_request("still usable"))
+            .expect("preview failure preserves suggest")
+            .items
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn oversized_escaped_preview_is_a_visible_failure_and_preserves_the_same_worker() {
+    let scratch = Scratch::new("preview-budget");
+    let interpreter = required_host_interpreter();
+    let source = format!(
+        "{}\nFixture = PreviewPlugin\n",
+        include_str!("../../../compatibility/test-plugins/modern-preview/preview_plugin.py")
+    );
+    let dir = write_plugin(&scratch, "preview-budget", &source);
+    let mut worker = ModernWorker::spawn(&interpreter, options("modern.preview-fixture", &dir))
+        .expect("the real preview worker starts");
+    let first = worker
+        .suggest(&suggest_request("preview budget"))
+        .expect("suggestions work");
+    let pid = first.items[0].metadata["fixture.pid"].clone();
+    let identity = serde_json::json!({
+        "view":1,"query":1,"plugin":"modern.preview-fixture","incarnation":1,
+        "item":"aggregate","selection":1,"request":1
+    });
+    for (key, diagnostic) in [
+        ("aggregate", "preview aggregate text exceeds 256 KiB"),
+        ("escaped-log", "preview frame exceeds 8 MiB after JSON escaping"),
+    ] {
+        let item = first
+            .items
+            .iter()
+            .find(|item| item.stable_id.0 == key)
+            .expect("fixture row");
+        let mut selected = identity.clone();
+        selected["item"] = serde_json::json!(key);
+        let failure = worker
+            .preview(item, &selected)
+            .expect("invalid preview stays inside callback boundary");
+        assert_eq!(failure["identity"], selected);
+        assert_eq!(
+            failure["status"], "failed",
+            "the host must receive a visible error, not lose transport"
+        );
+        let detail = failure["detail"].as_str().expect("visible diagnostic");
+        assert!(detail.contains(diagnostic), "{detail}");
+        assert!(detail.len() <= 8192, "failure diagnostics stay bounded");
+        assert!(
+            failure.get("content").is_none(),
+            "invalid content is rejected, not truncated"
+        );
+        assert!(
+            worker.is_alive(),
+            "invalid previews must not stop the suggestion worker"
+        );
+
+        let next = worker
+            .suggest(&suggest_request("still the same worker"))
+            .expect("subsequent suggestions survive invalid preview");
+        assert!(
+            next.items.iter().all(|item| item.metadata["fixture.pid"] == pid),
+            "the original process, not a replacement, must answer"
+        );
+        let valid = next
+            .items
+            .iter()
+            .find(|item| item.stable_id.0 == "B")
+            .expect("valid row");
+        selected["item"] = serde_json::json!("B");
+        let reply = worker
+            .preview(valid, &selected)
+            .expect("subsequent preview transport works");
+        assert_eq!(reply["identity"], selected);
+        assert_eq!(reply["status"], "content");
+        assert_eq!(
+            reply["content"]["text"], "Selected B",
+            "preview retains the originating suggestion instance's state"
+        );
+    }
+}
+
+#[test]
+fn absent_preview_capability_is_explicit_and_preserves_suggestions() {
+    let scratch = Scratch::new("preview-unavailable");
+    let interpreter = required_host_interpreter();
+    let dir = write_plugin(
+        &scratch,
+        "preview-unavailable",
+        r#"
+from crikey_sdk import Item, Plugin
+class Fixture(Plugin):
+    def suggest(self, query, context):
+        context.emit(Item(stable_id="usable", label="Usable", target="usable"))
+"#,
+    );
+    let mut worker = ModernWorker::spawn(&interpreter, options("preview-unavailable", &dir))
+        .expect("the ordinary worker starts");
+    assert!(!worker.supports_preview());
+    let item = worker
+        .suggest(&suggest_request("usable"))
+        .expect("suggest works")
+        .items
+        .remove(0);
+    let identity = serde_json::json!({"view":1,"query":1,"selection":1,"request":1});
+    assert_eq!(
+        worker
+            .preview(&item, &identity)
+            .expect("unsupported is a normal reply")["status"],
+        "unsupported"
+    );
+    assert_eq!(
+        worker
+            .suggest(&suggest_request("again"))
+            .expect("suggest remains usable")
+            .items
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn idle_child_exit_is_observed_without_another_transport_call() {
+    let scratch = Scratch::new("idle-exit");
+    let interpreter = required_host_interpreter();
+    let source = format!(
+        "{}\nFixture = IdleExit\n",
+        include_str!("../../../compatibility/test-plugins/modern-preview/preview_plugin.py")
+    );
+    let dir = write_plugin(&scratch, "idle-exit", &source);
+    let mut worker = ModernWorker::spawn(&interpreter, options("modern.idle-exit", &dir))
+        .expect("idle-exit worker starts");
+    assert!(!worker.build_catalog().unwrap().is_empty());
+    assert!(worker.poll_alive());
+    fs::write(dir.join("exit-now"), "").unwrap();
+    let deadline = Instant::now() + RESPONSE_LIMIT;
+    while worker.poll_alive() {
+        assert!(Instant::now() < deadline, "idle exit was not observed");
+        thread::sleep(POLL_INTERVAL);
+    }
+    assert!(!worker.is_alive());
+    let exit = worker.shutdown();
+    assert_eq!(exit.code, Some(21), "poll preserves the real exit status");
+    assert!(!exit.hard_stopped, "an observed exit needs no hard stop");
 }

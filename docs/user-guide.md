@@ -148,6 +148,40 @@ The launcher is usable without a mouse. For query and result navigation:
 | Ctrl+, | Open the settings surface |
 | Escape | Close the settings surface, else cancel or dismiss the launcher |
 | 1–9 (actions open) | Choose that alternate action |
+| F6 | Focus the preview, or return to search |
+
+### Selected-result previews
+
+Typed preview content appears beside the selected result when available. The
+list and detail scroll independently. Up/Down still select results while the
+search field is focused; F6 enters the detail controls, where arrow/Page keys
+scroll, Tab reaches links, and F6 or Escape returns to search without changing
+the query or selection.
+
+Drag the divider to resize the panes. The remembered list proportion is
+`launcher.preview-split` (default `0.55`, range `0.3`–`0.7`), saved through the
+ordinary user-global configuration layer. Below 600 logical pixels of body
+width, use **Show detail** / F6 and **Back to results** / Escape rather than
+compressing both panes. A result without detail does not reserve a pane.
+
+Loading, empty, unavailable and failed previews have distinct messages; a
+preview failure does not disable the results. Changing the selection or query,
+opening settings/a custom page, or hiding the launcher retires the old answer.
+Only the selected result requests deferred worker content.
+
+Markdown headings, emphasis, code, lists and links are prepared off the paint
+thread. HTML/scripts and embedded assets are not supported. The renderer never
+fetches images or network resources: images arrive as bounded decoded pixels.
+HTTP/HTTPS links require deliberate activation, a current preview owner, and
+that owner's host-mediated document-opening (`process`) permission. Refusal is
+shown in the preview. Typed preview is independent of the single custom page;
+it never starts a second web surface.
+
+Native and modern Python workers can opt into deferred previews. Older workers
+continue to function without the capability. Legacy results use host-known
+description/provider/category metadata only, with no additional legacy callback.
+WASM and restricted C-ABI workers do not expose deferred preview callbacks.
+
 
 While a web page is open, keys other than Escape go to the document instead of
 performing launcher query/result actions. Tab navigates the document, and
@@ -185,6 +219,13 @@ Catalog rows are fuzzy-matched by the host. Plugin suggestion batches are shown
 in the order the plugin publishes them; they are not host-fuzzy-matched or
 re-ranked by `score_hint`. This distinction is intentional (see
 [architecture](../../notes/architecture.md#two-paths-two-matching-contracts)).
+
+Plugin-owned catalog entries keep their plugin identity in the host-ranked
+results. A live suggestion with the same plugin and item identity replaces its
+catalog copy, preserving the plugin's suggestion order; catalog-only entries
+remain visible. A failure in synchronous application-catalog intake is reported as
+`Application catalog intake failed`; it does not prevent asynchronous plugin or
+file queries from being dispatched.
 
 ## Plugins, signing, and diagnosis
 

@@ -299,6 +299,7 @@ mod linux {
 
     fn returned_row() -> ResultRow {
         ResultRow {
+            plugin: crikey_core::PluginId("wake-regression".into()),
             item: ItemId("return-query-result".to_owned()),
             label: "Returned provider result".to_owned(),
             description: String::new(),
@@ -329,6 +330,7 @@ mod linux {
             page: None,
             show_hints: true,
             rounded_corners: true,
+            preview: Default::default(),
         }
     }
 

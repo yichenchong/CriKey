@@ -445,6 +445,8 @@ pub enum Payload {
     LifecycleAck(LifecycleAck),
     PageRequest(PageRequest),
     PageFrame(PageFrame),
+    PreviewRequest(PreviewRequest),
+    PreviewResponse(PreviewResponse),
     // Host-to-host web surface traffic. Never sent to or by a plugin.
     OpenSurface(OpenSurface),
     RawInput(RawInput),
@@ -484,6 +486,8 @@ impl Payload {
             Self::LifecycleAck(_) => "lifecycle_ack",
             Self::PageRequest(_) => "page_request",
             Self::PageFrame(_) => "page_frame",
+            Self::PreviewRequest(_) => "preview_request",
+            Self::PreviewResponse(_) => "preview_response",
             Self::OpenSurface(_) => "open_surface",
             Self::RawInput(_) => "raw_input",
             Self::ImeEvent(_) => "ime_event",
@@ -548,6 +552,8 @@ impl Message for Envelope {
                 Payload::CaretArea(value) => put_message(40, value, &mut out),
                 Payload::LoadState(value) => put_message(41, value, &mut out),
                 Payload::Gone(value) => put_message(42, value, &mut out),
+                Payload::PreviewRequest(value) => put_message(43, value, &mut out),
+                Payload::PreviewResponse(value) => put_message(44, value, &mut out),
             }
         }
         finish(out, &self.unknown)
@@ -630,6 +636,8 @@ impl DecodeWithBudget for Envelope {
                 28 => value.payload = Some(Payload::ResourceResponse(nested(field, budget)?)),
                 29 => value.payload = Some(Payload::Lifecycle(nested(field, budget)?)),
                 30 => value.payload = Some(Payload::LifecycleAck(nested(field, budget)?)),
+                43 => merge_web_payload!(&mut value.payload, PreviewRequest, field, budget),
+                44 => merge_web_payload!(&mut value.payload, PreviewResponse, field, budget),
                 31 => value.payload = Some(Payload::PageRequest(nested(field, budget)?)),
                 // PageFrame carries the plugin's web declaration, so merge
                 // both its envelope occurrences and its nested `web` fields.
@@ -784,6 +792,83 @@ impl_simple!(HandshakeAck {
     5 => value.reject_reason = decode_string(field, budget)?,
     6 => value.max_frame_bytes = decode_field_varint(field)?,
     7 => value.initial_credits = decode_u32(field)?,
+});
+
+fn preview_string(
+    field: crate::wire::Field<'_>,
+    budget: &mut DecodeBudget,
+    max: usize,
+) -> Result<String, ProtocolError> {
+    if field.value.len() > max {
+        return Err(ProtocolError::Malformed("preview string exceeds bounds".into()));
+    }
+    decode_string(field, budget)
+}
+
+fn preview_bytes(field: crate::wire::Field<'_>, budget: &mut DecodeBudget) -> Result<Vec<u8>, ProtocolError> {
+    if field.value.len() > crikey_core::preview::MAX_PREVIEW_IMAGE_BYTES {
+        return Err(ProtocolError::Malformed("preview image exceeds bounds".into()));
+    }
+    decode_bytes(field, budget)
+}
+
+impl_simple!(PreviewRequest {
+    item_id: String = String::new()
+} repeated [] encode(this, out) {
+    if !this.item_id.is_empty() { put_string(1, &this.item_id, &mut out); }
+} decode(value, field, budget) {
+    1 => value.item_id = preview_string(field, budget, 256)?,
+});
+
+impl_simple!(PreviewValue {
+    label: String = String::new(),
+    value: String = String::new(),
+    kind: u32 = 0
+} repeated [] encode(this, out) {
+    if !this.label.is_empty() { put_string(1, &this.label, &mut out); }
+    if !this.value.is_empty() { put_string(2, &this.value, &mut out); }
+    if this.kind != 0 { put_varint(3, u64::from(this.kind), &mut out); }
+} decode(value, field, budget) {
+    1 => value.label = preview_string(field, budget, crikey_core::preview::MAX_PREVIEW_VALUE_BYTES)?,
+    2 => value.value = preview_string(field, budget, crikey_core::preview::MAX_PREVIEW_VALUE_BYTES)?,
+    3 => value.kind = decode_u32(field)?,
+});
+
+impl_simple!(PreviewResponse {
+    status: u32 = 0,
+    text: String = String::new(),
+    markdown: bool = false,
+    width: u32 = 0,
+    height: u32 = 0,
+    rgba: Vec<u8> = Vec::new(),
+    values: Vec<PreviewValue> = Vec::new(),
+    detail: String = String::new(),
+    encoded_png: Vec<u8> = Vec::new()
+} repeated [7] encode(this, out) {
+    if this.status != 0 { put_varint(1, u64::from(this.status), &mut out); }
+    if !this.text.is_empty() { put_string(2, &this.text, &mut out); }
+    if this.markdown { put_varint(3, 1, &mut out); }
+    if this.width != 0 { put_varint(4, u64::from(this.width), &mut out); }
+    if this.height != 0 { put_varint(5, u64::from(this.height), &mut out); }
+    if !this.rgba.is_empty() { put_bytes(6, &this.rgba, &mut out); }
+    for value in &this.values { put_message(7, value, &mut out); }
+    if !this.detail.is_empty() { put_string(8, &this.detail, &mut out); }
+    if !this.encoded_png.is_empty() { put_bytes(10, &this.encoded_png, &mut out); }
+} decode(value, field, budget) {
+    1 => value.status = decode_u32(field)?,
+    2 => value.text = preview_string(field, budget, crikey_core::preview::MAX_PREVIEW_TEXT_BYTES)?,
+    3 => value.markdown = decode_field_varint(field)? != 0,
+    4 => value.width = decode_u32(field)?,
+    5 => value.height = decode_u32(field)?,
+    6 => value.rgba = preview_bytes(field, budget)?,
+    7 => {
+        if value.values.len() >= crikey_core::preview::MAX_PREVIEW_VALUES {
+            return Err(ProtocolError::Malformed("too many preview metadata values".into()));
+        }
+        push_decoded(&mut value.values, nested(field, budget)?, budget)?;
+    },
+    8 => value.detail = preview_string(field, budget, crikey_core::preview::MAX_PREVIEW_VALUE_BYTES)?,
+    10 => value.encoded_png = preview_bytes(field, budget)?,
 });
 
 impl_simple!(Lifecycle {

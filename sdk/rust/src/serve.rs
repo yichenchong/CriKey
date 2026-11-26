@@ -199,7 +199,12 @@ pub fn serve_on(
         })?,
     };
     let mut transport = transport;
-    let (ack, connection_id) = handshake(&mut *transport, &config, &session_token)?;
+    let (ack, connection_id) = handshake(
+        &mut *transport,
+        &config,
+        &session_token,
+        plugin.supports_preview(),
+    )?;
     let reader_transport = transport.try_clone_handle().ok();
     let transport = Arc::new(Mutex::new(transport));
     let metrics = Arc::new(RuntimeMetrics::default());
@@ -244,15 +249,15 @@ pub fn serve_on(
         remaining: ack.initial_credits,
         paused: false,
     };
-    let result = serve_requests(
-        plugin,
-        &transport,
-        &mut input,
-        &cancellation,
-        &mut credits,
-        &context,
-        &metrics,
-    );
+    let mut runtime = RequestRuntime {
+        transport: &transport,
+        input: &mut input,
+        cancellation: &cancellation,
+        credits: &mut credits,
+        context: &context,
+        metrics: &metrics,
+    };
+    let result = serve_requests(plugin, &mut runtime, plugin_preview_negotiated(&ack));
     stop_reader(&reader_stop, reader);
     result
 }
@@ -261,12 +266,19 @@ fn handshake(
     transport: &mut dyn Transport,
     config: &ServeConfig,
     session_token: &str,
+    preview: bool,
 ) -> Result<(message::HandshakeAck, u64), SdkError> {
     let handshake = message::Handshake {
         protocol_version: PROTOCOL_VERSION,
         plugin_id: config.plugin_id.clone(),
         plugin_version: config.plugin_version.clone(),
-        capabilities: capability_names(&config.capabilities),
+        capabilities: {
+            let mut names = capability_names(&config.capabilities);
+            if preview {
+                names.push(crikey_core::PREVIEW_CAPABILITY.to_owned());
+            }
+            names
+        },
         session_token: session_token.to_owned(),
         plugin_name: config.plugin_name.clone(),
         sdk_version: config.sdk_version.clone(),
@@ -346,6 +358,12 @@ fn handshake(
         transport.set_read_timeout(None).map_err(SdkError::from)?;
     }
     Ok((ack, connection_id))
+}
+
+fn plugin_preview_negotiated(ack: &message::HandshakeAck) -> bool {
+    ack.host_capabilities
+        .iter()
+        .any(|s| s == crikey_core::PREVIEW_CAPABILITY)
 }
 
 fn capability_names(capabilities: &Capabilities) -> Vec<String> {
@@ -826,13 +844,15 @@ impl PluginContext for RuntimeContext {
 
 fn serve_requests(
     plugin: &mut dyn Plugin,
-    transport: &Arc<Mutex<Box<dyn Transport>>>,
-    input: &mut RuntimeInput,
-    cancellation: &Arc<CancellationState>,
-    credits: &mut CreditState,
-    context: &RuntimeContext,
-    metrics: &RuntimeMetrics,
+    runtime: &mut RequestRuntime<'_>,
+    preview_negotiated: bool,
 ) -> Result<(), SdkError> {
+    let transport = runtime.transport;
+    let input = &mut *runtime.input;
+    let cancellation = runtime.cancellation;
+    let credits = &mut *runtime.credits;
+    let context = runtime.context;
+    let metrics = runtime.metrics;
     loop {
         let envelope = match input.next() {
             Ok(envelope) => envelope,
@@ -867,6 +887,54 @@ fn serve_requests(
             Payload::Flow(flow) => credits.grant(&flow),
             Payload::Cancel(_) => {
                 cancellation.cancel((request_id, generation));
+            }
+            Payload::PreviewRequest(request) => {
+                cancellation.begin(CancellationKey {
+                    request_id,
+                    generation,
+                });
+                let started = Instant::now();
+                let callback = if !preview_negotiated || !plugin.supports_preview() {
+                    Ok(Ok(crikey_core::PreviewOutcome::Unsupported))
+                } else if request.item_id.is_empty() || request.item_id.len() > 256 {
+                    Ok(Err(CoreError::Invalid(
+                        "preview item identity exceeds bounds".into(),
+                    )))
+                } else {
+                    let _in_flight = metrics.enter();
+                    invoke_callback(|| plugin.preview(&request.item_id, &request_context))
+                };
+                let mut response = match callback {
+                    Ok(Ok(outcome)) => match crikey_native_protocol::preview::to_response(outcome) {
+                        Ok(response) => response,
+                        Err(error) => preview_failure(&error.to_string()),
+                    },
+                    Ok(Err(error)) => preview_failure(&error.to_string()),
+                    Err(detail) => preview_failure(&detail),
+                };
+                if request_context.cancellation().is_cancelled() {
+                    response = message::PreviewResponse {
+                        status: 4,
+                        ..Default::default()
+                    };
+                } else if deadline_ms != 0 && started.elapsed().as_millis() >= u128::from(deadline_ms) {
+                    response = preview_failure("preview deadline exceeded");
+                }
+                send_envelope(
+                    transport,
+                    Envelope {
+                        connection_id: request_context.connection_id,
+                        request_id,
+                        generation,
+                        deadline_ms: 0,
+                        payload: Some(Payload::PreviewResponse(response)),
+                        unknown: Default::default(),
+                    },
+                )?;
+                if let Some(error) = request_context.take_log_error() {
+                    return Err(error);
+                }
+                cancellation.end();
             }
             Payload::Suggest(request) => {
                 let mut runtime = RequestRuntime {
@@ -1102,6 +1170,18 @@ struct RequestRuntime<'a> {
     credits: &'a mut CreditState,
     context: &'a RuntimeContext,
     metrics: &'a RuntimeMetrics,
+}
+
+fn preview_failure(detail: &str) -> message::PreviewResponse {
+    let mut end = detail.len().min(crikey_core::preview::MAX_PREVIEW_VALUE_BYTES);
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    message::PreviewResponse {
+        status: 5,
+        detail: detail[..end].to_owned(),
+        ..Default::default()
+    }
 }
 
 fn handle_suggest(

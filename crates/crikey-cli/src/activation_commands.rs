@@ -200,6 +200,7 @@ fn measurement_frame(generation: Generation) -> ViewModel {
         show_hints: true,
         rounded_corners: true,
         page: None,
+        preview: Default::default(),
     }
 }
 

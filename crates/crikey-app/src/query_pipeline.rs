@@ -818,6 +818,7 @@ impl QueryPipeline {
             show_hints: true,
             rounded_corners: true,
             page: None,
+            preview: Default::default(),
         })
     }
 
@@ -855,7 +856,7 @@ impl QueryPipeline {
             let Some(reference) = row.icon_reference.as_deref() else {
                 continue;
             };
-            if let Some(image) = icons.resolve(&row.plugin_name, reference) {
+            if let Some(image) = icons.resolve(&row.plugin.0, reference) {
                 row.icon = Some(image);
                 changed = true;
             }
@@ -1300,6 +1301,7 @@ fn result_row(item: Item, icons: Option<&Arc<PluginIconResolver>>) -> ResultRow 
         .and_then(|(resolver, reference)| resolver.resolve(&item.plugin_id.0, reference));
 
     ResultRow {
+        plugin: item.plugin_id.clone(),
         item: item.stable_id,
         label: item.label,
         description: item.description,

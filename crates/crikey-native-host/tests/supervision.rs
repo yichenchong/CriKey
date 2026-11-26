@@ -118,6 +118,189 @@ fn request(text: &str, generation: u64) -> NativeSuggestRequest {
     }
 }
 
+#[test]
+fn catalog_timeout_override_is_per_call_and_preserves_default_deadlines() {
+    let (plugin, _) = conformance_binaries();
+    let spec = launch(&plugin, "catalog-deadline", "echo", &[]);
+    let mut worker = NativeWorker::spawn(spec.clone(), options(TransportKind::Stdio))
+        .expect("catalog deadline fixture completes handshake");
+    // Zero expires before consuming a response, regardless of child scheduling.
+    assert!(matches!(
+        worker.build_catalog_with_timeout_ms(0),
+        Err(HostError::Timeout { .. })
+    ));
+
+    for next_call in ["catalog", "suggest"] {
+        let mut worker = NativeWorker::spawn(
+            spec.clone(),
+            options(TransportKind::Stdio).with_call_timeout_ms(0),
+        )
+        .expect("catalog deadline fixture completes handshake");
+        assert!(!worker
+            .build_catalog_with_timeout_ms(CALL_TIMEOUT_MS)
+            .expect("catalog override is independent of the zero query default")
+            .is_empty());
+        let result = match next_call {
+            "catalog" => worker.build_catalog().map(|_| ()),
+            _ => worker.suggest(&request("default-deadline", 1)).map(|_| ()),
+        };
+        assert!(
+            matches!(result, Err(HostError::Timeout { .. })),
+            "{next_call} must retain its configured zero deadline after a catalog override"
+        );
+    }
+}
+
+#[test]
+fn graceful_catalog_release_preserves_registration_without_restart_accounting() {
+    let (executable, _) = conformance_binaries();
+    let plugin = PluginId("catalog-release".into());
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+    supervisor
+        .register(
+            launch(&executable, &plugin.0, "echo", &[]),
+            options(TransportKind::Stdio),
+        )
+        .expect("register catalog release fixture");
+    supervisor.release_worker(&plugin, 0);
+    let first_connection = {
+        let worker = supervisor.worker(&plugin, 0).expect("start catalog worker");
+        assert!(!worker
+            .build_catalog()
+            .expect("catalog completes before release")
+            .is_empty());
+        worker.connection_id()
+    };
+    let health = supervisor.health(&plugin);
+    let retry = supervisor.next_retry_at_ms(&plugin);
+    supervisor.release_worker(&plugin, 0);
+    supervisor.release_worker(&plugin, 0);
+    assert_eq!(supervisor.poll_live_connection(&plugin), None);
+    assert!(supervisor.live_worker(&plugin).is_none());
+    assert_eq!(supervisor.restarts(&plugin), 0);
+    assert!(supervisor.exits(&plugin).is_empty());
+    assert_eq!(supervisor.health(&plugin), health);
+    assert_eq!(supervisor.next_retry_at_ms(&plugin), retry);
+    let worker = supervisor
+        .worker(&plugin, 0)
+        .expect("released registration remains reusable");
+    assert_ne!(worker.connection_id(), first_connection);
+    assert_eq!(
+        worker.suggest(&request("after-release", 1)).unwrap().state,
+        BatchState::Final
+    );
+    assert_eq!(supervisor.restarts(&plugin), 0);
+    assert!(supervisor.exits(&plugin).is_empty());
+}
+
+#[test]
+fn failed_worker_release_records_policy_once_and_preserves_backoff_and_circuit() {
+    let (executable, misbehaving) = conformance_binaries();
+    for failure in ["timeout", "crash", "protocol"] {
+        let plugin = PluginId(format!("release-{failure}"));
+        let (binary, mode) = match failure {
+            "timeout" => (&executable, "echo"),
+            "crash" => (&executable, "crash-on-suggest"),
+            _ => (&misbehaving, "oversized"),
+        };
+        let mut supervisor = NativeSupervisor::new(SupervisorConfig {
+            max_restarts: 10,
+            restart_window_ms: 10_000,
+            base_backoff_ms: 25,
+            max_backoff_ms: 100,
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 2,
+                cooldown: Duration::from_millis(500),
+            },
+        });
+        supervisor
+            .register(
+                launch(binary, &plugin.0, mode, &[]),
+                options(TransportKind::Stdio),
+            )
+            .expect("register failure-release fixture");
+
+        for (attempt, start, failed_at, retry_at) in [(1, 0, 100, 125), (2, 126, 200, 700)] {
+            let worker = supervisor
+                .worker(&plugin, start)
+                .expect("worker starts at policy time");
+            let error = match failure {
+                // Zero expires before consuming any response, without sleeps.
+                "timeout" => worker.build_catalog_with_timeout_ms(0).unwrap_err(),
+                _ => worker.suggest(&request("failure-release", attempt)).unwrap_err(),
+            };
+            assert!(
+                matches!(
+                    (failure, error),
+                    ("timeout", HostError::Timeout { .. })
+                        | ("crash", HostError::Crashed { .. })
+                        | ("protocol", HostError::Protocol(_))
+                ),
+                "{failure} fixture must expose the expected operation failure"
+            );
+            supervisor.release_worker(&plugin, failed_at);
+            let health = supervisor.health(&plugin);
+            assert_eq!(
+                health.timeouts,
+                if failure == "timeout" { attempt as u32 } else { 0 }
+            );
+            assert_eq!(
+                health.crashes,
+                if failure == "crash" { attempt as u32 } else { 0 }
+            );
+            assert_eq!(
+                health.protocol_violations,
+                if failure == "protocol" { attempt as u32 } else { 0 }
+            );
+            assert_eq!(supervisor.restarts(&plugin), attempt as u32);
+            assert_eq!(supervisor.exits(&plugin).len(), attempt as usize);
+            assert_eq!(supervisor.poll_live_connection(&plugin), None);
+            assert_eq!(supervisor.next_retry_at_ms(&plugin), Some(retry_at));
+            assert_eq!(supervisor.is_suspended(&plugin, failed_at), attempt == 2);
+
+            supervisor.release_worker(&plugin, failed_at + 1);
+            supervisor
+                .worker(&plugin, retry_at - 1)
+                .expect_err("release must not bypass backoff or circuit cooldown");
+            assert_eq!(supervisor.health(&plugin), health);
+            assert_eq!(supervisor.restarts(&plugin), attempt as u32);
+            assert_eq!(supervisor.exits(&plugin).len(), attempt as usize);
+            assert_eq!(supervisor.next_retry_at_ms(&plugin), Some(retry_at));
+
+            if attempt == 1 && failure != "protocol" {
+                let replacement = supervisor
+                    .worker(&plugin, retry_at)
+                    .expect("retry starts at policy deadline");
+                let replacement_connection = replacement.connection_id();
+                // A healthy deliberate release must not reset the prior failure
+                // streak, counters, backoff, or registration, even after success.
+                replacement.build_catalog().expect("replacement catalog succeeds");
+                supervisor.release_worker(&plugin, retry_at + 1);
+                assert_eq!(supervisor.health(&plugin), health);
+                assert_eq!(supervisor.next_retry_at_ms(&plugin), Some(retry_at));
+                assert_eq!(supervisor.restarts(&plugin), attempt as u32);
+                assert_eq!(supervisor.exits(&plugin).len(), attempt as usize);
+                let next = supervisor
+                    .worker(&plugin, retry_at + 1)
+                    .expect("registration survives release");
+                assert_ne!(next.connection_id(), replacement_connection);
+            } else if attempt == 2 {
+                supervisor
+                    .worker(&plugin, retry_at)
+                    .expect("retry starts after circuit cooldown");
+            }
+            assert_eq!(
+                supervisor.health(&plugin),
+                health,
+                "starting must not record the failure twice"
+            );
+            assert_eq!(supervisor.restarts(&plugin), attempt as u32);
+            assert_eq!(supervisor.exits(&plugin).len(), attempt as usize);
+        }
+        supervisor.shutdown_all();
+    }
+}
+
 fn env_values(items: &[crikey_core::Item]) -> BTreeMap<String, String> {
     items
         .iter()
@@ -950,4 +1133,99 @@ fn a_worker_survives_the_thread_that_spawned_it() {
     assert_eq!(suggestions.state, BatchState::Final);
     assert!(!suggestions.items.is_empty());
     assert_eq!(worker.shutdown().kind, ExitKind::Clean);
+}
+
+/// The shell is the supervised process; its still-running plugin descendant
+/// holds stderr after the shell dies. Release it only after inspection returns,
+/// so a joining implementation cannot pass through scheduling luck.
+#[cfg(unix)]
+#[test]
+fn liveness_poll_publishes_dead_connection_before_retained_stderr_cleanup() {
+    use std::sync::mpsc;
+
+    struct ProcessGroup {
+        pid: String,
+        witness: PathBuf,
+    }
+    impl Drop for ProcessGroup {
+        fn drop(&mut self) {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", self.pid)])
+                .status();
+            let _ = fs::remove_file(&self.witness);
+        }
+    }
+
+    let (executable, _) = conformance_binaries();
+    let witness = std::env::temp_dir().join(format!(
+        "crikey-retained-stderr-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let plugin = PluginId("retained.stderr".into());
+    let mut spec = launch(Path::new("/bin/sh"), &plugin.0, "echo", &[]);
+    spec.arguments = vec![
+        "-c".into(),
+        "printf '%s' \"$$\" > \"$2\"; \"$1\" echo & wait".into(),
+        "retained-stderr".into(),
+        executable.to_str().expect("fixture path is UTF-8").into(),
+        witness.to_str().expect("witness path is UTF-8").into(),
+    ];
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+    supervisor
+        .register(spec, options(TransportKind::UnixSocket))
+        .unwrap();
+    assert_eq!(supervisor.poll_live_connection(&plugin), None);
+    let connection = supervisor.worker(&plugin, 0).unwrap().connection_id();
+    // Handshake proves the descendant has inherited stderr and connected.
+    let group = ProcessGroup {
+        pid: fs::read_to_string(&witness).unwrap(),
+        witness,
+    };
+    assert_eq!(supervisor.poll_live_connection(&plugin), Some(connection));
+    assert!(Command::new("kill")
+        .args(["-KILL", "--", &group.pid])
+        .status()
+        .unwrap()
+        .success());
+
+    let (published, received) = mpsc::sync_channel(1);
+    let inspector_plugin = plugin.clone();
+    let inspector = std::thread::spawn(move || {
+        while supervisor.poll_live_connection(&inspector_plugin).is_some() {
+            std::thread::yield_now();
+        }
+        published.send(()).unwrap();
+        supervisor
+    });
+    // A failure watchdog only: completion is driven by try_wait, never a sleep
+    // that guesses when the shell has exited. Keep the pipe open until this
+    // receive completes, including on the regression's blocking path.
+    let inspection = received.recv_timeout(Duration::from_secs(1));
+    drop(group);
+    assert!(
+        inspection.is_ok(),
+        "liveness inspection waited for retained stderr"
+    );
+    let mut supervisor = inspector.join().expect("inspection thread completes");
+    assert_eq!(supervisor.poll_live_connection(&plugin), None);
+    assert_eq!(supervisor.restarts(&plugin), 0);
+    assert!(
+        supervisor.exits(&plugin).is_empty(),
+        "inspection must defer cleanup/accounting"
+    );
+    assert_eq!(supervisor.next_retry_at_ms(&plugin), None);
+    // Normal lifecycle ownership is unchanged: cleanup and failure accounting
+    // happen once, before the caller-clock backoff rejects a replacement.
+    assert!(matches!(
+        supervisor.worker(&plugin, 100),
+        Err(HostError::ResourceLimit { .. })
+    ));
+    assert_eq!(supervisor.restarts(&plugin), 1);
+    assert_eq!(supervisor.health(&plugin).crashes, 1);
+    assert_eq!(supervisor.exits(&plugin).len(), 1);
+    assert!(supervisor
+        .next_retry_at_ms(&plugin)
+        .is_some_and(|retry| retry > 100));
+    supervisor.shutdown_all();
 }

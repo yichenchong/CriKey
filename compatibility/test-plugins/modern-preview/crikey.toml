@@ -1,0 +1,11 @@
+manifest-version = 1
+
+[plugin]
+id = "preview-fixture"
+name = "Modern Preview Fixture"
+version = "1.0.0"
+runtime = "python"
+entrypoint = "preview_plugin:PreviewPlugin"
+
+[python]
+requires-python = ">=3.12"

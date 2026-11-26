@@ -732,7 +732,23 @@ fn native_driver_refuses_a_superseded_generation_without_blocking_submit() {
     let plugins_root = scratch.subdir("plugins");
     // This fixture deliberately ignores cancellation, so the provider thread
     // has one call in flight while the mailbox receives several replacements.
-    write_native_plugin(&plugins_root, "slow", &conformance, "ignore-cancel:500");
+    let plugin_dir = write_native_plugin(&plugins_root, "slow", &conformance, "gated-ignore-cancel");
+    let manifest = plugin_dir.join("crikey.toml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    text.push_str("\n[performance]\nsuggest-hard-timeout-ms = 5000\n");
+    fs::write(manifest, text).unwrap();
+    let entered = plugin_dir.join("conformance-gate-entered");
+    let release = plugin_dir.join("conformance-gate-release");
+    let wait_for_callback = |expected: &str| {
+        let deadline = Instant::now() + ROW_DELIVERY_WINDOW;
+        loop {
+            if fs::read_to_string(&entered).ok().as_deref() == Some(expected) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "callback {expected:?} never entered");
+            std::thread::yield_now();
+        }
+    };
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
     let provider = NativeProvider::load(&mut pipeline, &[plugins_root], &DisabledPlugins::default());
@@ -742,15 +758,12 @@ fn native_driver_refuses_a_superseded_generation_without_blocking_submit() {
         provider.unavailable(),
     );
 
-    let published: Arc<Mutex<Vec<Generation>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&published);
+    let (published, publication_rx) = std::sync::mpsc::channel();
     let driver = NativeDriver::spawn(
         provider,
         pipeline,
         Box::new(move |frame: &ViewModel| {
-            sink.lock()
-                .expect("the publish sink is not poisoned")
-                .push(frame.generation);
+            let _ = published.send(frame.clone());
         }),
     );
     assert!(
@@ -759,9 +772,7 @@ fn native_driver_refuses_a_superseded_generation_without_blocking_submit() {
     );
 
     let older = Generation::from_raw(1);
-    let first_newer = Generation::from_raw(2);
-    let second_newer = Generation::from_raw(3);
-    let newest = Generation::from_raw(4);
+    let newest = Generation::from_raw(7);
     let submit_started = Instant::now();
     driver.submit(older, "report old", 17, Vec::new(), false, 0);
     let first_submit_elapsed = submit_started.elapsed();
@@ -770,49 +781,62 @@ fn native_driver_refuses_a_superseded_generation_without_blocking_submit() {
         "submitting a query must not wait on a slow native child (elapsed {first_submit_elapsed:?})"
     );
 
-    let mut observed_in_flight = false;
-    for _ in 0..10_000 {
-        if driver.is_busy() {
-            observed_in_flight = true;
+    wait_for_callback("report old\n");
+    // Observing the initial publication, while the callback is held at the
+    // gate, proves it outlived the collection window rather than racing a sleep.
+    let opening = publication_rx
+        .recv_timeout(ROW_DELIVERY_WINDOW)
+        .expect("the collection window publishes while the physical callback is occupied");
+    assert_eq!(opening.generation, older);
+    assert!(opening.pending_plugins);
+    for generation in 2..=7 {
+        driver.submit(
+            Generation::from_raw(generation),
+            &format!("report {generation}"),
+            17 + generation,
+            Vec::new(),
+            false,
+            0,
+        );
+    }
+    let deadline = Instant::now() + ROW_DELIVERY_WINDOW;
+    loop {
+        let frame = publication_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the newest query publishes without waiting for the old callback");
+        if frame.generation == newest {
+            assert!(
+                frame.pending_plugins,
+                "an occupied worker must retain the newest query"
+            );
+            assert!(!frame
+                .rows
+                .iter()
+                .any(|row| row.plugin_name == native_plugin("slow").0));
             break;
         }
-        std::thread::yield_now();
     }
-    assert!(
-        observed_in_flight,
-        "the first query must be observed in flight before mailbox replacement"
-    );
-
-    driver.submit(first_newer, "report first", 18, Vec::new(), false, 0);
-    driver.submit(second_newer, "report second", 19, Vec::new(), false, 0);
-    driver.submit(newest, "report newest", 20, Vec::new(), false, 0);
-    assert!(
-        driver.pending_replacements() >= 1,
-        "a single-slot mailbox replaces an older pending job when more than its capacity is submitted"
-    );
-
-    let mut seen_newest = false;
-    for _ in 0..2_000 {
-        if published
-            .lock()
-            .expect("the publish sink is not poisoned")
-            .contains(&newest)
+    fs::write(&release, "report old").expect("release the obsolete callback");
+    wait_for_callback("report old\nreport 7\n");
+    fs::write(&release, "report 7").expect("release the newest callback");
+    let deadline = Instant::now() + ROW_DELIVERY_WINDOW;
+    loop {
+        let frame = publication_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the newest actual callback must contribute a fresh native row");
+        assert_eq!(
+            frame.generation, newest,
+            "obsolete native frames must not publish"
+        );
+        if frame
+            .rows
+            .iter()
+            .any(|row| row.plugin_name == native_plugin("slow").0 && row.label == "report 7 (gated)")
         {
-            seen_newest = true;
+            assert!(!frame.pending_plugins);
             break;
         }
-        sleep(Duration::from_millis(5));
     }
-    assert!(seen_newest, "the newest native generation must be presented");
-
-    let generations = published
-        .lock()
-        .expect("the publish sink is not poisoned")
-        .clone();
-    assert!(
-        generations.iter().all(|generation| *generation == newest),
-        "only the newest generation is presented; saw {generations:?}"
-    );
 
     drop(driver);
 }
@@ -982,6 +1006,17 @@ fn native_healthy_worker_survives_repeated_queries() {
             .iter()
             .all(|row| row.plugin_name == native_plugin("healthy").0));
     }
+    // Inside the previous query's debounce interval, the direct API still
+    // waits for real eligibility and returns this query's rows synchronously.
+    let frame = provider
+        .drive_query(&mut pipeline, "repeat debounced", 301)
+        .expect("the synchronous provider waits out debounce");
+    assert_eq!(frame.rows.len(), 2);
+    assert!(frame
+        .rows
+        .iter()
+        .all(|row| row.label.starts_with("repeat debounced")));
+    assert!(!frame.pending_plugins);
     assert!(provider.dispatch_failures().is_empty());
     provider.shutdown(0);
 }
@@ -1553,22 +1588,31 @@ fn a_native_plugin_that_reports_failure_does_not_leave_the_query_outstanding() {
     provider.shutdown(180);
 }
 
-/// A plugin busy with the previous keystroke's call gets no new call for this
-/// one — and the request it never received must not be left outstanding.
-///
-/// `collect_suggestions` skips a plugin that already has a call in flight. That
-/// older call cannot answer the newer generation: when it finishes it is
-/// retired under the generation it belongs to. So nothing will ever arrive for
-/// the newer request, and leaving it active strands the newest frame as
-/// "Providers are still responding" forever. Typing fast into a launcher is the
-/// normal case, and this plugin ignores cancellation, which is the whole point:
-/// a plugin that misbehaves must not be able to wedge the UI.
+/// A physically occupied worker keeps the newest query pending, rather than
+/// manufacturing an empty final answer. Retirement of the old callback must
+/// admit that same newest generation on refresh, without another keystroke.
 #[test]
 fn a_plugin_busy_with_an_older_call_does_not_strand_the_newest_query() {
     let (conformance, _) = conformance_binaries();
     let scratch = Scratch::new("busy-older");
     let plugins_root = scratch.subdir("plugins");
-    write_native_plugin(&plugins_root, "stubborn", &conformance, "ignore-cancel:500");
+    let plugin_dir = write_native_plugin(&plugins_root, "stubborn", &conformance, "gated-ignore-cancel");
+    let manifest = plugin_dir.join("crikey.toml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    text.push_str("\n[performance]\nsuggest-hard-timeout-ms = 5000\n");
+    fs::write(manifest, text).unwrap();
+    let entered = plugin_dir.join("conformance-gate-entered");
+    let release = plugin_dir.join("conformance-gate-release");
+    let wait_for_callback = |expected: &str| {
+        let deadline = Instant::now() + ROW_DELIVERY_WINDOW;
+        loop {
+            if fs::read_to_string(&entered).ok().as_deref() == Some(expected) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "callback {expected:?} never entered");
+            std::thread::yield_now();
+        }
+    };
 
     let mut pipeline = QueryPipeline::new(PipelineConfig::default());
     // The production window: the point is that the first call is still running
@@ -1581,14 +1625,55 @@ fn a_plugin_busy_with_an_older_call_does_not_strand_the_newest_query() {
         provider.unavailable(),
     );
 
-    let _first = provider.drive_query(&mut pipeline, "first", 17);
-    let second = provider
-        .drive_query(&mut pipeline, "second", 18)
-        .expect("the newer generation is presented");
-    assert!(
-        !second.pending_plugins,
-        "the newest frame must not wait on a call that was never made for it"
-    );
+    let first = provider
+        .drive_query(&mut pipeline, "first", 17)
+        .expect("the first collection window publishes while its callback is held");
+    assert!(first.pending_plugins);
+    wait_for_callback("first\n");
 
-    provider.shutdown(180);
+    let (published, publication_rx) = std::sync::mpsc::channel();
+    let driver = NativeDriver::spawn(
+        provider,
+        pipeline,
+        Box::new(move |frame| {
+            let _ = published.send(frame.clone());
+        }),
+    );
+    let newest = Generation::from_raw(2);
+    driver.submit(newest, "second", 18, Vec::new(), false, 0);
+    let second = publication_rx
+        .recv_timeout(ROW_DELIVERY_WINDOW)
+        .expect("the newer generation is presented while the old callback is held");
+    assert_eq!(second.generation, newest);
+    assert!(
+        second.pending_plugins,
+        "the newest query is pending until the worker is available"
+    );
+    assert!(!second
+        .rows
+        .iter()
+        .any(|row| row.plugin_name == native_plugin("stubborn").0));
+
+    fs::write(&release, "first").expect("release the old callback");
+    wait_for_callback("first\nsecond\n");
+    fs::write(&release, "second").expect("release the newest actual callback");
+    let deadline = Instant::now() + ROW_DELIVERY_WINDOW;
+    loop {
+        let frame = publication_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the retained second query must publish its fresh native row");
+        assert_eq!(frame.generation, newest);
+        if frame
+            .rows
+            .iter()
+            .any(|row| row.plugin_name == native_plugin("stubborn").0 && row.label == "second (gated)")
+        {
+            assert!(
+                !frame.pending_plugins,
+                "the completed newest query is no longer pending"
+            );
+            break;
+        }
+    }
+    drop(driver);
 }

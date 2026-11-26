@@ -79,6 +79,9 @@ pub const KEY_SHOW_HINTS: &str = "launcher.show-hints";
 /// that could settle the question is the one that says nothing.
 pub const KEY_ROUNDED_CORNERS: &str = "launcher.rounded-corners";
 
+/// Remembered preview divider proportion; CLI validation enforces finite 0.3..=0.7.
+pub const KEY_PREVIEW_SPLIT: &str = "launcher.preview-split";
+
 /// The values the host itself supplies, forming [`ConfigLayer::BuiltInDefaults`].
 ///
 /// Only keys whose default this crate genuinely owns. A key defaulted by another
@@ -90,6 +93,7 @@ pub const BUILT_IN_DEFAULTS: &[(&str, &str)] = &[
     (KEY_ACTIVATION_HOTKEY, "Ctrl+Alt+Space"),
     (KEY_SHOW_HINTS, "true"),
     (KEY_ROUNDED_CORNERS, "true"),
+    (KEY_PREVIEW_SPLIT, "0.55"),
 ];
 /// Keys under this prefix are operator-pinned: a user may supply a source
 /// declaration, but cannot redirect one an administrator has specified.

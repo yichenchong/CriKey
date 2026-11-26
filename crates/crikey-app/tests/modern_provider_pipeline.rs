@@ -1185,6 +1185,119 @@ fn modern_catalog_build_uses_and_releases_the_catalog_budget() {
 }
 
 #[test]
+fn catalog_only_deferred_preview_keeps_the_actual_producer_after_empty_suggest() {
+    require_modern_interpreter();
+    let scratch = Scratch::new("catalog-preview-origin");
+    let root = scratch.subdir("plugins");
+    write_modern_plugin(
+        &root,
+        "catalog-preview",
+        "preview_plugin",
+        "CatalogOnly",
+        include_str!("../../../compatibility/test-plugins/modern-preview/preview_plugin.py"),
+    );
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let mut provider = ModernProvider::load(
+        &mut pipeline,
+        &[root],
+        Some(scratch.subdir("index")),
+        scratch.join("cache"),
+        &DisabledPlugins::default(),
+    );
+    let plugin = modern_plugin("catalog-preview");
+    assert!(
+        provider.plugins().contains(&plugin),
+        "{:?}",
+        provider.unavailable()
+    );
+    provider
+        .request_catalog_build(&plugin, 1, Generation::ZERO)
+        .unwrap();
+    // The slot is busy, not dead or startable: this query must not replace it.
+    assert!(provider
+        .drive_query(&mut pipeline, "empty", 1)
+        .unwrap()
+        .rows
+        .is_empty());
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let build = loop {
+        if let Some(result) = provider.take_catalog_results().into_iter().next() {
+            let CatalogBuildResult::Complete(build) = result else {
+                panic!("catalog must complete: {result:?}");
+            };
+            break build;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "catalog producer did not return"
+        );
+        sleep(Duration::from_millis(2));
+    };
+    let item = build
+        .items
+        .into_iter()
+        .find(|item| item.stable_id.0 == "B")
+        .unwrap();
+    let frame = provider.drive_query(&mut pipeline, "empty", 2).unwrap();
+    assert!(
+        frame.rows.is_empty(),
+        "catalog-only plugin must not manufacture suggestion state"
+    );
+    let modern = ModernDriver::spawn(provider, pipeline, |_| {});
+    let mut native_pipeline = QueryPipeline::new(PipelineConfig::default());
+    let native_provider =
+        crikey_app::NativeProvider::load(&mut native_pipeline, &[], &DisabledPlugins::default());
+    let native = crikey_app::NativeDriver::spawn(native_provider, native_pipeline, Box::new(|_| {}));
+    let mut service = crikey_app::PreviewService::new(&native, &modern, || {});
+    let search = crikey_app::SearchService::new(crikey_app::App::new());
+    let mut model = crikey_ui::LauncherViewModel::new();
+    model.activate();
+    let _ = model.apply(crikey_ui::UiCommand::SetQuery("empty".into()));
+    model.begin_generation(frame.generation);
+    model.publish(
+        frame.generation,
+        vec![crikey_ui::ResultRow {
+            plugin: item.plugin_id,
+            item: item.stable_id,
+            label: item.label,
+            description: item.description,
+            icon_reference: None,
+            icon: None,
+            category: String::new(),
+            plugin_name: String::new(),
+            highlights: Vec::new(),
+            argument_hint: None,
+            status: None,
+            default_action: None,
+            alternate_actions: Vec::new(),
+        }],
+        false,
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        service.synchronize(&mut model, &search);
+        match model.frame().and_then(|frame| frame.preview.status) {
+            Some(crikey_ui::PreviewStatus::Content(content)) => {
+                assert_eq!(
+                    content.content.text,
+                    Some(crikey_core::PreviewText::Plain("Selected B".into()))
+                );
+                break;
+            }
+            Some(crikey_ui::PreviewStatus::Error(reason) | crikey_ui::PreviewStatus::Unavailable(reason)) => {
+                panic!("catalog producer rejected its own preview: {reason}")
+            }
+            _ => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "catalog preview did not finish"
+        );
+        sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
 fn modern_action_submission_is_nonblocking_and_budgeted() {
     require_modern_interpreter();
 

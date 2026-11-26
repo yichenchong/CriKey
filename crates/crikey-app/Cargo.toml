@@ -27,6 +27,7 @@ crikey-query.workspace = true
 crikey-ranking.workspace = true
 crikey-result-aggregator.workspace = true
 crikey-ui.workspace = true
+serde_json.workspace = true
 # SHA-256 over a fetched remote catalog document (ADR-0016). The same algorithm
 # the package manager verifies a downloaded package with, for the same reason:
 # a digest that decides whether third-party content is admitted is a security

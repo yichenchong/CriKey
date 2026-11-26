@@ -109,6 +109,8 @@ pub struct PluginHandshake {
     pub sdk_version: String,
     pub protocol_version: u32,
     pub capabilities: Capabilities,
+    /// Optional preview capability intersected with host support.
+    pub preview: bool,
 }
 
 /// Bytes a plugin served in answer to one [`NativeWorker::request_resource`].
@@ -419,6 +421,12 @@ pub struct CancelHandle {
 }
 
 impl CancelHandle {
+    /// Returns the same bounded protocol observation ring as the worker, even
+    /// while another thread owns its blocking call.
+    pub fn observations(&self) -> Vec<ProtocolObservation> {
+        self.link.observations()
+    }
+
     /// Requests cooperative cancellation of the current call.
     pub fn cancel(&self) {
         self.link.send_cancel();
@@ -441,6 +449,9 @@ pub struct NativeWorker {
     stderr_tail: Arc<Mutex<StderrTail>>,
     stderr_reader: Option<JoinHandle<()>>,
     exit: Option<ExitRecord>,
+    // Exit observation is separate from pipe/process cleanup so snapshot
+    // refreshers never wait for descendants that retain a standard stream.
+    observed_exit: Option<Result<std::process::ExitStatus, ()>>,
     diagnostics: StreamDiagnostics,
     sandbox_report: crikey_sandbox::SandboxReport,
     next_request_id: u64,
@@ -730,6 +741,7 @@ impl NativeWorker {
             stderr_tail,
             stderr_reader: Some(stderr_reader),
             exit: None,
+            observed_exit: None,
             diagnostics: StreamDiagnostics::default(),
             sandbox_report,
             next_request_id: 1,
@@ -800,13 +812,19 @@ impl NativeWorker {
 
     /// Streams and folds the plugin catalog under aggregate bounds.
     pub fn build_catalog(&mut self) -> Result<Vec<Item>, HostError> {
+        self.build_catalog_with_timeout_ms(self.options.call_timeout_ms)
+    }
+
+    /// Streams the catalog with a per-call deadline without changing the
+    /// configured timeout used by subsequent catalog, query, or preview calls.
+    pub fn build_catalog_with_timeout_ms(&mut self, timeout_ms: u64) -> Result<Vec<Item>, HostError> {
         self.ensure_alive()?;
         let request_id = self.begin_request(0);
         let envelope = Envelope {
             connection_id: self.link.connection_id,
             request_id,
             generation: 0,
-            deadline_ms: self.options.call_timeout_ms,
+            deadline_ms: timeout_ms,
             payload: Some(Payload::CatalogRequest(message::CatalogRequest {
                 max_items: self.options.limits.max_catalog_items as u64,
                 unknown: Default::default(),
@@ -814,7 +832,7 @@ impl NativeWorker {
             unknown: Default::default(),
         };
         self.send_control(&envelope)?;
-        let end = deadline(self.options.call_timeout_ms);
+        let end = deadline(timeout_ms);
         let mut items = Vec::new();
         let mut batches = 0usize;
         let mut bytes = 0usize;
@@ -1162,6 +1180,97 @@ impl NativeWorker {
         }
     }
 
+    /// Produces only the selected item's preview using the ordinary worker
+    /// request/deadline/cancellation channel. Call from a provider endpoint.
+    pub fn preview(
+        &mut self,
+        item_id: &str,
+        generation: u64,
+    ) -> Result<crikey_core::PreviewOutcome, HostError> {
+        self.preview_with_cancel_latched(item_id, generation, &AtomicBool::new(false))
+    }
+
+    /// Preserves cancellation latched before this operation's wire identity
+    /// exists, replaying it after the request is queued and clearing it on a
+    /// terminal response. An already-set `cancelled` token returns without a
+    /// request. The caller sets that token before forwarding cancellation
+    /// through its installed CancelHandle.
+    pub fn preview_with_cancel_latched(
+        &mut self,
+        item_id: &str,
+        generation: u64,
+        cancelled: &AtomicBool,
+    ) -> Result<crikey_core::PreviewOutcome, HostError> {
+        // Consume cancellation installed before this call without letting it
+        // survive an early return into an unrelated callback.
+        let cancel_latched = self.link.cancel_latched.swap(false, Ordering::AcqRel);
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(crikey_core::PreviewOutcome::Cancelled);
+        }
+        self.ensure_alive()?;
+        if !self.handshake.preview {
+            return Ok(crikey_core::PreviewOutcome::Unsupported);
+        }
+        if item_id.is_empty() || item_id.len() > 256 {
+            return Err(HostError::Protocol("preview item identity exceeds bounds".into()));
+        }
+        if self.next_request_id == u64::MAX {
+            return Err(HostError::Protocol("preview request identity exhausted".into()));
+        }
+        let request_id = self.begin_request(generation);
+        self.send_control(&Envelope {
+            connection_id: self.link.connection_id,
+            request_id,
+            generation,
+            deadline_ms: self.options.call_timeout_ms,
+            payload: Some(Payload::PreviewRequest(message::PreviewRequest {
+                item_id: item_id.to_owned(),
+                ..Default::default()
+            })),
+            unknown: Default::default(),
+        })?;
+        // A handle may have cancelled the previous wire identity before
+        // begin_request, or the new identity before its request was queued.
+        // Replay only after the request so either ordering reaches the callback.
+        if cancel_latched
+            || self.link.cancel_latched.load(Ordering::Acquire)
+            || cancelled.load(Ordering::Acquire)
+        {
+            self.link.send_cancel();
+        }
+        let end = deadline(self.options.call_timeout_ms);
+        loop {
+            let event = self.next_event(end, request_id, generation)?;
+            let reply = match event {
+                ReaderEvent::Envelope(value) => value,
+                ReaderEvent::Failure(failure) => return Err(self.transport_error(failure)),
+            };
+            if reply.generation != generation {
+                return Err(self.protocol_failure("preview response generation did not match request"));
+            }
+            match reply.payload {
+                Some(Payload::PreviewResponse(response)) => {
+                    self.link.cancel_latched.store(false, Ordering::Release);
+                    let outcome =
+                        crikey_native_protocol::preview::from_response(response).map_err(|detail| {
+                            HostError::PluginFailed {
+                                plugin: self.spec.plugin.clone(),
+                                detail,
+                            }
+                        })?;
+                    self.mark_call_succeeded();
+                    return Ok(outcome);
+                }
+                Some(Payload::Log(log)) => self.record_log(log.message),
+                Some(Payload::Error(error)) => {
+                    self.link.cancel_latched.store(false, Ordering::Release);
+                    return Err(self.error_payload(error, request_id));
+                }
+                _ => return Err(self.protocol_failure("unexpected preview response")),
+            }
+        }
+    }
+
     /// Asks the plugin for the next frame of an open page (spec 32.3).
     ///
     /// Host-driven, exactly like [`Self::suggest`]: the plugin answers the
@@ -1373,20 +1482,40 @@ impl NativeWorker {
         }
     }
 
-    /// Returns whether the child process is still running.
+    /// Observes child exit without closing, draining, or joining any channel.
+    pub(crate) fn poll_alive(&mut self) -> bool {
+        if self.exit.is_some() || self.observed_exit.is_some() {
+            return false;
+        }
+        match self.child.as_mut().map(Child::try_wait) {
+            Some(Ok(None)) => true,
+            Some(Ok(Some(status))) => {
+                self.observed_exit = Some(Ok(status));
+                false
+            }
+            Some(Err(_)) => {
+                self.observed_exit = Some(Err(()));
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Returns whether the child process is still running, cleaning up on exit.
     pub fn is_alive(&mut self) -> bool {
+        if self.poll_alive() {
+            return true;
+        }
         if self.exit.is_some() {
             return false;
         }
-        let status = match self.child.as_mut() {
-            Some(child) => match child.try_wait() {
-                Ok(status) => status,
-                Err(_) => {
-                    self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::Crash);
-                    self.fail_and_reap(ExitKind::Crashed);
-                    return false;
-                }
-            },
+        let status = match self.observed_exit.take() {
+            Some(Ok(status)) => Some(status),
+            Some(Err(())) => {
+                self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::Crash);
+                self.fail_and_reap(ExitKind::Crashed);
+                return false;
+            }
             None => return false,
         };
         match status {
@@ -1414,6 +1543,9 @@ impl NativeWorker {
 
     /// Hard-stops and reaps the child.
     pub fn kill(&mut self) -> ExitRecord {
+        if self.observed_exit.is_some() {
+            self.is_alive();
+        }
         if let Some(exit) = &self.exit {
             return exit.clone();
         }
@@ -1904,6 +2036,9 @@ impl NativeWorker {
 
 impl Drop for NativeWorker {
     fn drop(&mut self) {
+        if self.observed_exit.is_some() {
+            self.is_alive();
+        }
         if self.exit.is_none() {
             self.fail_and_reap(ExitKind::Killed);
         }
@@ -2251,6 +2386,7 @@ fn legal_plugin_payload(envelope: &Envelope, page_request: u64) -> bool {
             | Some(Payload::Results(_))
             | Some(Payload::CatalogBatch(_))
             | Some(Payload::ExecuteResult(_))
+            | Some(Payload::PreviewResponse(_))
             | Some(Payload::Error(_))
             | Some(Payload::Log(_))
             | Some(Payload::HealthReport(_))
@@ -2338,6 +2474,7 @@ fn receive_handshake(
             "streaming_catalog".to_owned(),
             "streaming_suggestions".to_owned(),
             "cancellation".to_owned(),
+            crikey_core::PREVIEW_CAPABILITY.to_owned(),
         ],
         host_version: env!("CARGO_PKG_VERSION").to_owned(),
         accepted: rejection.is_none(),
@@ -2366,6 +2503,10 @@ fn receive_handshake(
         sdk_version: handshake.sdk_version,
         protocol_version: handshake.protocol_version,
         capabilities: capabilities_from_strings(&handshake.capabilities),
+        preview: handshake
+            .capabilities
+            .iter()
+            .any(|s| s == crikey_core::PREVIEW_CAPABILITY),
     })
 }
 

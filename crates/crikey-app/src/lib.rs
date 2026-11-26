@@ -16,6 +16,8 @@ mod native_provider;
 mod plugin_action;
 mod plugin_icons;
 mod plugin_page;
+mod plugin_preview;
+mod preview_action_budget;
 mod query_pipeline;
 mod remote_catalog;
 mod selection_history_store;
@@ -48,6 +50,7 @@ pub use plugin_icons::{
     IconFetch, PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
 };
 pub use plugin_page::PageUpdate;
+pub use plugin_preview::{PreviewIdentity, PreviewRequest, PreviewService, PreviewState, PreviewUpdate};
 pub use query_pipeline::{PipelineConfig, PipelineError, PipelineTick, QueryPipeline};
 pub use remote_catalog::{
     fetch_source, remote_owner, CatalogFetcher, DefaultCatalogFetcher, RemoteCatalogError,
@@ -1608,6 +1611,7 @@ impl SearchService {
                     ArgumentPolicy::Required => Some("argument required".to_owned()),
                 };
                 ResultRow {
+                    plugin: hit.item.plugin_id.clone(),
                     item: hit.item.stable_id.clone(),
                     label: hit.item.label.clone(),
                     description: hit.item.description.clone(),
@@ -1780,6 +1784,19 @@ impl SearchService {
             router.authorize(&item.plugin_id, capability)?;
         }
         run(&self.app, item).map(|()| ActionSubmission::Completed)
+    }
+
+    /// Only current preview intents reach this host permission boundary.
+    pub fn open_preview_url(&self, plugin: &PluginId, url: &str) -> CoreResult<()> {
+        crikey_core::preview::validate_preview_link(url)
+            .map_err(|error| crikey_core::CoreError::Invalid(error.to_string()))?;
+        self.plugin_actions
+            .as_ref()
+            .ok_or_else(|| {
+                crikey_core::CoreError::Invalid("Preview owner permission registry unavailable".into())
+            })?
+            .authorize(plugin, HostCapability::DocumentOpen)?;
+        self.app.file_opener()?.open_url(url)
     }
 
     pub fn poll_action_completions(&self) -> Vec<PluginActionCompletion> {

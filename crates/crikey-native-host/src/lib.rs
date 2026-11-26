@@ -9,6 +9,7 @@ mod stream;
 mod supervisor;
 mod worker;
 
+pub use crikey_core::PreviewOutcome;
 pub use launch::{
     LaunchSpec, LimitEnforcement, ResourceLimitReport, ResourceLimits, TransportKind, WorkerOptions,
 };
