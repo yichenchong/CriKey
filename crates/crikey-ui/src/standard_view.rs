@@ -354,11 +354,14 @@ impl LauncherViewModel {
                 Some(Some(self.standard_refresh_effect(ViewRefreshReason::Scope)))
             }
             UiCommand::ExecuteDefault => {
-                let action = self
-                    .rows
-                    .get(self.selected)
-                    .and_then(|row| row.default_action.as_ref())
-                    .map(|action| action.action_id.clone());
+                let action = if let StandardView::Form(form) = &self.standard.as_ref()?.descriptor.view {
+                    form.submit.action.clone()
+                } else {
+                    self.rows
+                        .get(self.selected)
+                        .and_then(|row| row.default_action.as_ref())
+                        .map(|action| action.action_id.clone())
+                };
                 Some(self.standard_execute(action))
             }
             UiCommand::SelectNext | UiCommand::SelectPrevious | UiCommand::PageDown | UiCommand::PageUp => {
@@ -808,7 +811,12 @@ impl LauncherViewModel {
 
     pub(crate) fn standard_execute(&mut self, action: Option<ActionId>) -> Option<UiEffect> {
         let surface = self.standard.as_ref()?;
-        let executable = if let Some(row) = self.rows.get(self.selected) {
+        let executable = if let StandardView::Form(form) = &surface.descriptor.view {
+            ExecutableKey {
+                target: form.submit.target.clone(),
+                action,
+            }
+        } else if let Some(row) = self.rows.get(self.selected) {
             if !self.standard_selection_available() {
                 return None;
             }
@@ -824,7 +832,6 @@ impl LauncherViewModel {
             }
         } else {
             match &surface.descriptor.view {
-                StandardView::Form(form) => form.submit.clone(),
                 StandardView::Detail(detail) => {
                     let target = detail.target.clone()?;
                     let definition = surface.descriptor.definition(&target)?;
@@ -841,6 +848,11 @@ impl LauncherViewModel {
 
     fn activate_standard_executable(&mut self, executable: ExecutableKey) -> Option<UiEffect> {
         let surface = self.standard.as_ref()?;
+        if let StandardView::Form(form) = &surface.descriptor.view {
+            if executable != form.submit {
+                return None;
+            }
+        }
         if self.standard_selected_target().as_ref() != Some(&executable.target) {
             return None;
         }

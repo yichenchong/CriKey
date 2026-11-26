@@ -646,7 +646,12 @@ impl Management {
                                     Some(crikey_app::launcher_settings::Control::Choice { options }) => {
                                         crikey_ui::SettingControl::Choice { options }
                                     }
-                                    _ if matches!(hit.control.as_str(), "boolean" | "bool") => {
+                                    // An optional plugin boolean without a value stays
+                                    // unset and uses the text editor until saved.
+                                    _ if matches!(hit.control.as_str(), "boolean" | "bool")
+                                        && (hit.key.starts_with("launcher.")
+                                            || matches!(row.value.as_str(), "true" | "false")) =>
+                                    {
                                         crikey_ui::SettingControl::Toggle {
                                             on: row.value != "false",
                                         }
@@ -1452,6 +1457,168 @@ mod tests {
                 }),
                 "direct category navigation must also expose the shared field: {key}"
             );
+        }
+        worker
+            .take_shutdown()
+            .expect("authority shutdown ticket")
+            .join()
+            .expect("authority shutdown");
+    }
+
+    #[test]
+    fn optional_plugin_boolean_stays_unset_until_saved_then_refreshes_as_a_toggle() {
+        use crate::command_preferences::{PreferenceWorker, SettingsOperation, SettingsTarget};
+        use crikey_app::CommandPreferencesStore;
+        use std::time::{Duration, Instant};
+
+        fn receive_projection(
+            management: &mut Management,
+            worker: &PreferenceWorker,
+            view: crikey_ui::ViewId,
+            wakes: &mpsc::Receiver<()>,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                while worker.take().is_some() {}
+                management.drain(Some((view, crikey_ui::ViewKind::Settings)), worker, None);
+                if !management.panel.loading {
+                    assert!(management.panel.authoritative);
+                    return;
+                }
+                wakes
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("real settings request and any post-save refresh must complete");
+            }
+        }
+
+        let directory = ConfigDir::new("optional-plugin-boolean");
+        let environment = [
+            "HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "CRIKEY_CONFIG_DIR",
+            "CRIKEY_DATA_DIR",
+            "CRIKEY_CACHE_DIR",
+            "CRIKEY_STATE_DIR",
+        ]
+        .into_iter()
+        .fold(DirectoryEnvironment::new(), |environment, variable| {
+            environment.set(variable, directory.root.as_os_str())
+        });
+        let directories = StandardDirectories::resolve(DirectoryConvention::current(), &environment)
+            .expect("isolated configuration directories");
+        let root = directory.root.join("packages");
+        let package = root.join("fixture");
+        std::fs::create_dir_all(&package).expect("plugin fixture directory");
+        std::fs::write(
+            package.join("crikey.toml"),
+            concat!(
+                include_str!("../../crikey-plugin-model/tests/data/spec-example.crikey.toml"),
+                "\n[[configuration.field]]\nname = \"optional\"\ntype = \"boolean\"\n",
+            ),
+        )
+        .expect("optional boolean declaration without a default");
+        let plugin = crikey_core::PluginId("native.dev.example.repositories".into());
+        let key = format!("plugins.{}.settings.optional", plugin.0);
+        let config = ConfigStore::load_with_policy(&directories, None).expect("real configuration");
+        assert_eq!(config.get(&key), None);
+        let (wake, wakes) = mpsc::channel();
+        let mut worker = PreferenceWorker::spawn(
+            Arc::new(Mutex::new(CommandPreferencesStore::empty())),
+            Some(config),
+            directories,
+            Vec::new(),
+            None,
+            vec![root],
+            move || {
+                let _ = wake.send(());
+            },
+        )
+        .expect("real configuration authority");
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        model.open_settings(None);
+        let view = model.view().expect("settings view").0;
+        let mut management = Management::new();
+        management.search(
+            view,
+            SettingsOperation::Search { text: String::new() },
+            &worker,
+            None,
+        );
+        receive_projection(&mut management, &worker, view, &wakes);
+        let field = management
+            .panel
+            .fields
+            .iter()
+            .find(|field| field.key == key)
+            .unwrap();
+        assert!(field.value_available);
+        assert_eq!(field.plugin.as_ref(), Some(&plugin));
+        assert_eq!(field.value, "");
+        assert_eq!(field.source, "unset");
+        assert_eq!(
+            field.control,
+            crikey_ui::SettingControl::Text,
+            "unset must expose the existing text editor and Save"
+        );
+        assert_eq!(
+            directory.store().get(&key),
+            None,
+            "viewing must not supply a value"
+        );
+        let launcher = management
+            .panel
+            .fields
+            .iter()
+            .find(|field| field.key == KEY_ROUNDED_CORNERS)
+            .unwrap();
+        assert_eq!(
+            launcher.control,
+            crikey_ui::SettingControl::Toggle { on: true },
+            "launcher defaults remain checkboxes"
+        );
+
+        // The first text edit can set true, rather than first having to uncheck
+        // a fabricated true value. The production save response triggers another
+        // authority search, which replaces the text editor with a checkbox.
+        for (setting, target, values) in [
+            (key.as_str(), Some(plugin.clone()), [true, false, true]),
+            (KEY_ROUNDED_CORNERS, None, [false, true, false]),
+        ] {
+            for value in values {
+                management.search(
+                    view,
+                    SettingsOperation::Edit {
+                        key: setting.to_owned(),
+                        target: target.clone().map_or(SettingsTarget::UserGlobal, |plugin| {
+                            SettingsTarget::PluginUser { plugin }
+                        }),
+                        draft: value.to_string(),
+                    },
+                    &worker,
+                    Some((management.panel.config, management.panel.schema)),
+                );
+                receive_projection(&mut management, &worker, view, &wakes);
+                assert!(management.panel.edit_notice.starts_with("Saved."));
+                let field = management
+                    .panel
+                    .fields
+                    .iter()
+                    .find(|field| field.key == setting)
+                    .unwrap();
+                assert_eq!(field.value, value.to_string());
+                assert_eq!(field.control, crikey_ui::SettingControl::Toggle { on: value });
+                assert_eq!(
+                    field.source,
+                    if target.is_some() {
+                        "user-plugin"
+                    } else {
+                        "user-global"
+                    }
+                );
+                assert_eq!(directory.store().get(setting), Some(value.to_string().as_str()));
+            }
         }
         worker
             .take_shutdown()
