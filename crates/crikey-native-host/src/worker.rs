@@ -4042,15 +4042,32 @@ fn prepare_group_reap(child: &Child) -> bool {
     if error == Some(libc::ESRCH) {
         return true;
     }
-    // Darwin skips zombies when signaling a group, so an exited, unreaped
-    // owned leader can cause EPERM even with no live members. This permits
-    // only its reap; the caller must still prove actual group absence after
-    // reaping, and must never signal that now-reusable group ID again.
     #[cfg(target_vendor = "apple")]
-    if error == Some(libc::EPERM) && matches!(child_exited(child), Ok(true)) {
+    {
+        prepare_darwin_group_reap(child, error)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    false
+}
+
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+#[allow(unsafe_code)]
+fn prepare_darwin_group_reap(child: &Child, group_error: Option<i32>) -> bool {
+    if group_error != Some(libc::EPERM) {
+        return false;
+    }
+    // XNU's group iterator can lose proc_find access during proc_refdrain,
+    // before exit publishes SZOMB to waitid. EPERM therefore does not imply
+    // that an instantaneous nonreaping exit observation is ready.
+    // See XNU kern_proc.c:pgrp_iterate and kern_exit.c:proc_exit.
+    // Signal only the still-owned, unreaped leader: its PID cannot be reused.
+    // A real permission error remains a failure. ESRCH permits the existing
+    // bounded reap, not settlement: strict post-reap group absence and pipe
+    // joins are still required, and the group must never be signalled again.
+    if unsafe { libc::kill(child.id() as i32, libc::SIGKILL) } == 0 {
         return true;
     }
-    false
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(unix)]
@@ -4686,6 +4703,72 @@ mod checked_native_ownership_tests {
         assert!(prepare_group_reap(&child));
         assert!(wait_child_after_termination(&mut child, Instant::now() + Duration::from_secs(5)).is_some());
         assert!(wait_group_absent(child.id()));
+    }
+
+    #[test]
+    fn darwin_group_error_retains_startup_ownership_until_the_real_group_is_absent() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "read value"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let stderr = spawn_stderr_drain(
+            child.stderr.take().unwrap(),
+            Arc::new(Mutex::new(StderrTail::default())),
+        )
+        .unwrap();
+        let mut owner = NativeStartupOwner {
+            plugin: PluginId("startup-group-error".into()),
+            child,
+            stderr: Some(stderr),
+            link: None,
+            signalled: false,
+            status: None,
+            exit: None,
+            thread_failure: None,
+        };
+        let mut member_command = Command::new("/bin/sh");
+        member_command
+            .args(["-c", "read value"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(owner.child.id() as i32);
+        let mut member = member_command.spawn().unwrap();
+        assert!(!child_exited(&owner.child).unwrap());
+        // These are platform-policy inputs, not mocked signal operations:
+        // unrecognized errors must leave the actual blocked child alive.
+        assert!(!prepare_darwin_group_reap(&owner.child, Some(libc::EACCES)));
+        assert!(!prepare_darwin_group_reap(&owner.child, None));
+        assert!(!child_exited(&owner.child).unwrap());
+        owner.signalled = prepare_darwin_group_reap(&owner.child, Some(libc::EPERM));
+        assert!(owner.signalled, "the fallback sends a real leader SIGKILL");
+        let failure = owner
+            .settle()
+            .expect_err("killing only the leader cannot settle a live group member");
+        assert!(matches!(
+            failure,
+            HostError::PluginFailed { detail, .. }
+                if detail == "native startup process group remains owned"
+        ));
+        assert!(owner.status.is_some(), "the actual leader was reaped");
+        assert!(owner.exit.is_none(), "physical settlement is not published");
+        assert!(!child_exited(&member).unwrap());
+        member.kill().unwrap();
+        member.wait().unwrap();
+        let exit = owner.settle().expect("the actual startup owner must settle");
+        assert_eq!(exit.signal, Some(libc::SIGKILL));
+        assert_eq!(
+            exit.failure_kind,
+            Some(crikey_plugin_supervisor::FailureKind::Startup)
+        );
+        assert!(owner.status.is_some());
+        assert!(owner.stderr.is_none());
+        assert!(wait_group_absent(owner.child.id()));
+        assert_eq!(owner.settle().unwrap().signal, exit.signal);
     }
 }
 
