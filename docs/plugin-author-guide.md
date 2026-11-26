@@ -305,6 +305,12 @@ A mismatch is a fixed refusal. Dynamic targets require their original live
 producer; never regenerate suggestions to retarget an old submission. Keep SDK
 schema bindings even with an older host so schema-only targets refuse legacy
 execution rather than silently discarding fields.
+Python replaces catalog and suggestion execution inventories independently on
+successful terminal publication; unsuccessful publications grant no new authority.
+After a root schema is declared, legacy execution requires a currently
+published ordinary item/action. Retired typed targets cannot fall back to legacy
+execution. The 4,096-schema bound applies to current bindings, not every target
+ever seen by a worker.
 
 ### Bounds, outcomes and privacy
 

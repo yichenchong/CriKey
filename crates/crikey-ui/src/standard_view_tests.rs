@@ -242,6 +242,250 @@ fn form_reuses_editor_and_restores_only_matching_nonsecret_drafts() {
         .all(|input| input.draft.values.is_empty()));
     assert_eq!(context.revision.get(), 11);
 }
+
+fn form_with_distinct_submit(submit: &ExecutableKey) -> Arc<ViewDescriptor> {
+    let mut form = (*descriptor(1)).clone();
+    form.view = StandardView::Form(FormView {
+        submit: submit.clone(),
+    });
+    let definition = &mut Arc::make_mut(&mut form.definitions)[0];
+    definition.actionless_policy = None;
+    definition.primary_action = Some(ActionId("primary".into()));
+    definition.item.actions = [("primary", "Primary"), ("submit", "Submit")]
+        .into_iter()
+        .map(|(id, label)| crikey_core::Action {
+            action_id: ActionId(id.into()),
+            label: label.into(),
+            description: String::new(),
+            applicable_categories: vec![],
+            icon_reference: None,
+            execution_policy: ExecutionPolicy::Plugin,
+        })
+        .collect();
+    let mut primary_schema = (*text_schema()).clone();
+    primary_schema.fields[0].id = FieldId("primary-only".into());
+    definition.action_sections[0].entries = vec![
+        ActionMenuEntry::Action(ExecutablePresentation {
+            action: Some(ActionId("primary".into())),
+            schema: Some(Arc::new(primary_schema)),
+            shortcut: None,
+            destructive: false,
+        }),
+        ActionMenuEntry::Action(ExecutablePresentation {
+            action: submit.action.clone(),
+            schema: Some(text_schema()),
+            shortcut: None,
+            destructive: false,
+        }),
+    ];
+    Arc::new(form)
+}
+
+#[test]
+fn form_menu_and_queued_non_submit_activation_preserve_submit_editor() {
+    let submit = ExecutableKey {
+        target: target(0),
+        action: Some(ActionId("submit".into())),
+    };
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let context = open(&mut model, "form", form_with_distinct_submit(&submit));
+    let original = model.inline_arguments().unwrap().clone();
+    for action in [
+        None,
+        Some(ActionId("primary".into())),
+        Some(ActionId("unknown".into())),
+    ] {
+        assert!(model
+            .apply(UiCommand::StandardActivate {
+                context: context.clone(),
+                executable: ExecutableKey {
+                    target: target(0),
+                    action,
+                },
+            })
+            .is_none());
+        assert_eq!(model.inline_arguments(), Some(&original));
+    }
+    let renderer = create_launcher_context();
+    let frame = model.frame().unwrap();
+    let idle = paint_route(&renderer, &frame, 0.0, vec![]);
+    let menu = visible_label(&idle.output, "Actions  Ctrl+K").expect("form action menu");
+    let opened = paint_route(&renderer, &frame, 0.1, route_click(menu.center()));
+    for command in opened.commands {
+        model.apply(command);
+    }
+    let popup = paint_route(&renderer, &frame, 0.2, vec![]);
+    let primary = visible_label(&popup.output, "Primary").expect("non-submit menu action");
+    let clicked = paint_route(&renderer, &frame, 0.3, route_click(primary.center()));
+    assert_eq!(
+        clicked
+            .commands
+            .iter()
+            .filter(|command| {
+                matches!(command, UiCommand::StandardActivate { context: actual, executable }
+                    if actual == &context && executable.action == Some(ActionId("primary".into())))
+            })
+            .count(),
+        1
+    );
+    for command in clicked.commands {
+        assert!(model.apply(command).is_none());
+    }
+    assert_eq!(model.inline_arguments(), Some(&original));
+    assert_eq!(model.inline_arguments().unwrap().executable, submit);
+}
+
+#[test]
+fn cancelled_form_keyboard_footer_and_reducer_reopen_distinct_submit_and_submit_exact_values() {
+    use crikey_core::structured_arguments::{
+        ActionSubmission, NonSecretValue, StructuredValue, SubmissionArguments,
+    };
+
+    for activation in ["keyboard", "footer", "reducer"] {
+        let submit = ExecutableKey {
+            target: target(0),
+            action: Some(ActionId("submit".into())),
+        };
+        let form = form_with_distinct_submit(&submit);
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        let context = open(&mut model, "form", form.clone());
+        let admission = RouteAdmission::worker(
+            RouteIdentity {
+                owner: owner(),
+                route: context.route.clone(),
+                incarnation: NonZeroU64::new(7).unwrap(),
+            },
+            context.surface(),
+        )
+        .unwrap();
+        form.validate(&admission).unwrap();
+        let original_revision = model.inline_arguments().unwrap().revision;
+        assert_eq!(model.rows.len(), 1);
+        assert_eq!(model.selected, 0);
+        assert_eq!(
+            model.rows[0].default_action.as_ref().unwrap().action_id,
+            ActionId("primary".into())
+        );
+
+        let renderer = create_launcher_context();
+        let mut frame = model.frame().unwrap();
+        for command in paint_route(&renderer, &frame, 0.0, vec![]).commands {
+            model.apply(command);
+        }
+        if let Some(updated) = model.frame() {
+            frame = updated;
+        }
+        let cancelled = paint_route(&renderer, &frame, 0.1, vec![press(egui::Key::Escape)]);
+        assert!(cancelled
+            .commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::Cancel)));
+        for command in cancelled.commands {
+            model.apply(command);
+        }
+        assert!(model.inline_arguments().is_none());
+        assert_eq!(model.standard.as_ref().unwrap().context, context);
+        for action in [
+            None,
+            Some(ActionId("primary".into())),
+            Some(ActionId("unknown".into())),
+        ] {
+            assert!(model.standard_execute(action).is_none());
+            assert!(
+                model.inline_arguments().is_none(),
+                "explicit non-submit action must not reopen submit"
+            );
+        }
+        let frame = model.frame().unwrap();
+        if activation == "reducer" {
+            assert!(model.apply(UiCommand::ExecuteDefault).is_none());
+        } else {
+            let idle = paint_route(&renderer, &frame, 0.2, vec![]);
+            assert!(visible_label(&idle.output, "Primary  Enter").is_none());
+            assert!(visible_label(&idle.output, "Submit  Enter").is_some());
+            let commands = if activation == "keyboard" {
+                // The native event loop intercepts Enter before forwarding
+                // unhandled events to egui; raw egui input bypasses that path.
+                vec![crate::native::translate_keyboard(
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
+                    winit::event::ElementState::Pressed,
+                    winit::keyboard::ModifiersState::empty(),
+                    Some(&frame),
+                    false,
+                )
+                .expect("native Enter must activate the cancelled form")]
+            } else {
+                let footer = visible_label(&idle.output, "Submit  Enter").expect("submit footer");
+                paint_route(&renderer, &frame, 0.3, route_click(footer.center())).commands
+            };
+            let activations = commands
+                .iter()
+                .filter(|command| {
+                    matches!(command, UiCommand::StandardActivate { context: actual, executable }
+                    if actual == &context && executable == &submit)
+                })
+                .count();
+            assert_eq!(
+                activations, 1,
+                "{activation} must activate form.submit exactly once"
+            );
+            for command in commands {
+                assert!(model.apply(command).is_none());
+            }
+        }
+        let input = model.inline_arguments().expect("submit editor reopened");
+        assert_ne!(input.revision, original_revision);
+        assert_eq!(input.executable, submit);
+        assert_eq!(input.view_context.as_ref(), Some(&context));
+        assert_eq!(input.schema.fields[0].id, FieldId("name".into()));
+        let mut editor = crate::typed_input::TypedEditor::default();
+        let editor_context = create_launcher_context();
+        let mut frame = model.frame().unwrap();
+        paint_restored_editor(&editor_context, &mut editor, &mut model, &mut frame, vec![]);
+        paint_restored_editor(
+            &editor_context,
+            &mut editor,
+            &mut model,
+            &mut frame,
+            vec![egui::Event::Text("exact form submission".into())],
+        );
+        let submission = paint_restored_editor(
+            &editor_context,
+            &mut editor,
+            &mut model,
+            &mut frame,
+            vec![press(egui::Key::Enter)],
+        )
+        .0
+        .expect("valid submit schema must emit a submission");
+        assert!(model.accepts_typed_draft(
+            submission.revision,
+            submission.draft_revision,
+            submission.view,
+            submission.generation,
+        ));
+        assert_eq!(submission.values.0.len(), 1);
+        assert!(matches!(submission.values.0.get(&FieldId("name".into())),
+            Some(StructuredValue::NonSecret(NonSecretValue::Text(value)))
+                if value == "exact form submission"));
+        let event = ViewEvent {
+            route: admission.identity().clone(),
+            surface: admission.surface(),
+            kind: ViewEventKind::Submit(ActionSubmission {
+                executable: model.inline_arguments().unwrap().executable.clone(),
+                arguments: SubmissionArguments::Structured(submission.values),
+            }),
+        };
+        form.validate_event(&admission, &model.standard_host_state(), &event)
+            .unwrap();
+        let ViewEventKind::Submit(dispatched) = event.kind else {
+            unreachable!()
+        };
+        assert_eq!(dispatched.executable, submit);
+    }
+}
 #[test]
 fn shared_descriptors_count_once_and_actual_capacity_refuses() {
     let shared = descriptor(4);

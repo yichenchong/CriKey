@@ -1836,6 +1836,12 @@ impl LauncherViewModel {
         self.published = Some(generation);
         if !pending_plugins {
             self.restoration_target = None;
+            if self.rows.is_empty() {
+                // Empty root results have no scroll renderer to report their
+                // clamp. Retire the anchor here before another route saves it.
+                self.navigation_scroll = LogicalScroll::default();
+                self.preserve_scroll = false;
+            }
         }
         self.dirty = true;
     }

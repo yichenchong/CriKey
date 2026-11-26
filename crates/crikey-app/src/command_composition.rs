@@ -797,6 +797,14 @@ impl SearchService {
             }
             if context.include_recent {
                 for record in self.history.recent_commands() {
+                    if preferences
+                        .preferences
+                        .records
+                        .iter()
+                        .any(|preference| preference.reference == record.reference && preference.hidden)
+                    {
+                        continue;
+                    }
                     if seen.insert(record.reference.clone()) {
                         rows.push(self.command_row(
                             &record.reference,
@@ -1547,6 +1555,52 @@ mod canonical_discovery_tests {
 #[cfg(test)]
 mod command_learning_privacy_tests {
     use super::*;
+
+    #[test]
+    fn hidden_recent_commands_require_an_explicit_favorite() {
+        let mut search = SearchService::new(crate::App::new());
+        let reference = crikey_core::command::builtin_commands().remove(0).reference;
+        search.record_host_command_success(&reference).unwrap();
+        let generation = search.app.generations().current();
+        let home = |include_favorites| CommandCompositionContext {
+            root: true,
+            generation,
+            query: "",
+            compact: false,
+            include_favorites,
+            include_recent: true,
+            fallback: None,
+        };
+        let rows = search.compose_command_rows(home(false));
+        assert_eq!(rows[0].target, ActionTarget::Command(reference.clone()));
+        assert!(rows[0].command_state.as_ref().unwrap().available);
+        Arc::make_mut(&mut search.command_preferences_snapshot)
+            .preferences
+            .records
+            .push(crikey_config::command_preferences::CommandPreference {
+                reference: reference.clone(),
+                hidden: true,
+                alias: None,
+                hotkey: None,
+            });
+        for include_favorites in [false, true] {
+            assert!(search.compose_command_rows(home(include_favorites)).is_empty());
+        }
+        let history = search.selection_history_snapshot();
+        assert_eq!(history.commands[0].reference, reference);
+        assert_eq!(history.commands[0].frequency, 1);
+        Arc::make_mut(&mut search.command_preferences_snapshot)
+            .preferences
+            .favorites
+            .push(reference.clone());
+        let rows = search.compose_command_rows(home(true));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target, ActionTarget::Command(reference));
+        let state = rows[0].command_state.as_ref().unwrap();
+        assert!(state.available && state.hidden);
+        assert_eq!(state.favorite, Some(0));
+        assert!(search.compose_command_rows(home(false)).is_empty());
+    }
 
     #[test]
     fn argument_bearing_root_never_reaches_persisted_affinity() {

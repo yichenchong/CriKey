@@ -23,6 +23,7 @@ alive to serve the next request.
 
 import asyncio
 import contextvars
+import hashlib
 import importlib
 import inspect
 import json
@@ -547,6 +548,35 @@ def _item_from_wire(payload):
     )
 
 
+def _item_digest(wire):
+    """Freeze the host's item shape without retaining plugin-owned objects."""
+    def category(tag):
+        if tag.startswith("plugin-defined:") or tag in (
+            "application", "file", "directory", "url", "command",
+            "expression", "keyword", "contact", "clipboard-item",
+        ):
+            return tag
+        return "plugin-defined:" + tag
+
+    normalized = _item_to_wire(_item_from_wire(wire))
+    normalized["category"] = category(normalized["category"])
+    if normalized["argument_policy"] not in ("optional", "required"):
+        normalized["argument_policy"] = "forbidden"
+    if normalized["hit_policy"] != "ignored":
+        normalized["hit_policy"] = "recorded"
+    for action in normalized["actions"]:
+        action["applicable_categories"] = [
+            category(tag) for tag in action["applicable_categories"]
+        ]
+        if action["execution_policy"] != "plugin":
+            action["execution_policy"] = "host-mediated"
+    digest = hashlib.sha256()
+    for chunk in json.JSONEncoder(sort_keys=True, ensure_ascii=True,
+                                  separators=(",", ":")).iterencode(normalized):
+        digest.update(chunk.encode("ascii"))
+    return digest.digest()
+
+
 
 def _generation_from_wire(frame):
     """Returns a protocol generation, rejecting values outside host ``u64``."""
@@ -760,7 +790,11 @@ class _Worker:
         self._query_schemas = {}
         self._pending_presentation = None
         self._pending_schemas = None
-        self._legacy_typed_targets = set()
+        self._catalog_items = set()
+        self._query_items = set()
+        self._pending_items = None
+        self._pending_item_count = 0
+        self._root_schemas_seen = False
         self._view = None
         self._host_structured = False
         # The cancel flag is set/cleared ONLY by the control-reader thread on a
@@ -1099,19 +1133,34 @@ class _Worker:
     def _begin_publication(self, catalog):
         if catalog:
             self._catalog_schemas = {}
+            self._catalog_items = set()
         else:
             self._query_schemas = {}
+            self._query_items = set()
         self._pending_presentation = None
         self._pending_schemas = None
+        self._pending_items = set()
+        self._pending_item_count = 0
 
     def _finish_publication(self, catalog, successful):
-        if successful and self._pending_schemas is not None:
+        if successful:
             if catalog:
-                self._catalog_schemas = self._pending_schemas
+                self._catalog_schemas = self._pending_schemas or {}
+                self._catalog_items = self._pending_items
             else:
-                self._query_schemas = self._pending_schemas
+                self._query_schemas = self._pending_schemas or {}
+                self._query_items = self._pending_items
         self._pending_presentation = None
         self._pending_schemas = None
+        self._pending_items = None
+
+    def _publication_item(self, item):
+        wire = _item_to_wire(item)
+        self._pending_item_count += 1
+        if self._pending_item_count > 100_000:
+            raise ValueError("publication exceeds 100000 items")
+        self._pending_items.add(_item_digest(wire))
+        return wire
 
     def _prepare_presentation(self, query):
         self._pending_presentation = None
@@ -1123,6 +1172,9 @@ class _Worker:
             result = self._loop.run_until_complete(result)
         if not isinstance(result, ResultPresentation):
             raise TypeError("metadata callback must return ResultPresentation")
+        if result.schemas:
+            # Even a failed declaration must never reopen legacy fallback.
+            self._root_schemas_seen = True
         if (len(result.sections) > 128 or len(result.scopes) > 128
             or len(result.items) > 4096 or len(result.schemas) > 4096):
             raise ValueError("presentation exceeds bounds")
@@ -1175,10 +1227,6 @@ class _Worker:
         other = self._query_schemas if query is None else self._catalog_schemas
         if len(other) + len(bindings) > 4096:
             raise ValueError("schema registry exceeds bound")
-        new_targets = set(bindings).difference(self._legacy_typed_targets)
-        if len(self._legacy_typed_targets) + len(new_targets) > 4096:
-            raise ValueError("legacy typed refusal registry exceeds bound")
-        self._legacy_typed_targets.update(new_targets)
         self._pending_schemas = bindings
         self._pending_presentation = dict(sections=sections, scopes=scopes,
                                           items=memberships, schemas=schemas)
@@ -1511,7 +1559,7 @@ class _Worker:
             with sink_lock:
                 if not active.is_set() or self._cancel.is_set():
                     return
-                buffer.append(_item_to_wire(item))
+                buffer.append(self._publication_item(item))
                 if len(buffer) >= _FLUSH_THRESHOLD:
                     if not self._emit_batch(request_id, generation, "partial", buffer, []):
                         active.clear()
@@ -1609,7 +1657,7 @@ class _Worker:
             # emitting; feed each through the same wire translation.
             if produced is not None:
                 for item in produced:
-                    buffer.append(_item_to_wire(item))
+                    buffer.append(self._publication_item(item))
                     if len(buffer) >= _FLUSH_THRESHOLD:
                         if not self._emit_catalog(request_id, buffer, False, []):
                             return
@@ -1654,8 +1702,21 @@ class _Worker:
             item = _item_from_wire(frame.get("item") or {})
             key = (item.stable_id, action_id)
             route_binding = self._route_binding(frame, item, action_id)
-            if route_binding is None and (key in self._legacy_typed_targets or (action_id is None and any(k[0] == item.stable_id for k in self._legacy_typed_targets))):
-                raise ValueError("typed target refuses legacy execution")
+            if route_binding is None and self._root_schemas_seen:
+                digest = _item_digest(_item_to_wire(item))
+                if digest not in self._catalog_items and digest not in self._query_items:
+                    raise ValueError("legacy target is not currently published")
+                if action_id is not None and not any(
+                    action.action_id == action_id for action in item.actions
+                ):
+                    raise ValueError("legacy action is not currently published")
+                if any(
+                    key in registry or (action_id is None and any(
+                        target[0] == item.stable_id for target in registry
+                    ))
+                    for registry in (self._catalog_schemas, self._query_schemas)
+                ):
+                    raise ValueError("typed target refuses legacy execution")
             context = WorkerContext(
                 self._cancel.is_set,
                 lambda _item: None,
