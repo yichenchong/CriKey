@@ -429,3 +429,82 @@ fn invalid_chord_errors_do_not_retain_submitted_components() {
         assert_eq!(scalar_error, NavigationError::InvalidChord);
     }
 }
+
+#[test]
+fn preview_document_keys_are_excluded_from_host_dispatch_and_hints() {
+    for key in [
+        "Down",
+        "Up",
+        "Left",
+        "Right",
+        "PageDown",
+        "PageUp",
+        "Home",
+        "End",
+        "Tab",
+        "Enter",
+        "Ctrl+Space",
+        "Shift+Tab",
+        "Ctrl+PageDown",
+    ] {
+        let json = format!(
+            r#"{{"next":[],"previous":[],"page-down":[],"page-up":[],"complete":[],"activate":[],"left":[],"right":[],"cancel":["{key}"]}}"#
+        );
+        let resolver = CompiledNavigation::compile(NavigationStyle::Default, &json).unwrap();
+        let preview = NavigationContext {
+            owner: NavigationOwner::Host,
+            ..context(NavigationScope::Preview)
+        };
+        assert_eq!(resolver.resolve(chord(key), preview), None, "{key}");
+        assert_eq!(
+            resolver.hints(NavigationAction::Cancel, preview).count(),
+            0,
+            "{key}"
+        );
+        assert_eq!(
+            resolver.resolve(
+                chord(key),
+                NavigationContext {
+                    scope: NavigationScope::Results,
+                    ..preview
+                }
+            ),
+            Some(NavigationAction::Cancel),
+            "{key}"
+        );
+    }
+    let resolver = CompiledNavigation::compile(
+        NavigationStyle::Default,
+        r#"{"cancel":["Escape","Ctrl+Q"],"toggle-preview":["F8"]}"#,
+    )
+    .unwrap();
+    let preview = NavigationContext {
+        owner: NavigationOwner::Host,
+        ..context(NavigationScope::Preview)
+    };
+    for (key, action) in [
+        ("Escape", NavigationAction::Cancel),
+        ("Ctrl+Q", NavigationAction::Cancel),
+        ("F8", NavigationAction::TogglePreview),
+    ] {
+        assert_eq!(resolver.resolve(chord(key), preview), Some(action));
+        assert_eq!(
+            resolver
+                .hints(action, preview)
+                .filter(|hint| *hint == key)
+                .count(),
+            1
+        );
+        assert_eq!(
+            resolver.resolve(
+                chord(key),
+                NavigationContext {
+                    composing: true,
+                    ..preview
+                }
+            ),
+            None
+        );
+    }
+    assert_eq!(resolver.resolve(chord("Shift+F8"), preview), None);
+}

@@ -10355,4 +10355,64 @@ mod popup_keyboard_tests {
             }
         }
     }
+
+    #[test]
+    fn native_preview_document_keys_bypass_remapped_host_actions() {
+        use crate::navigation::{CompiledNavigation, NavigationAction, NavigationStyle};
+        let navigation = Arc::new(CompiledNavigation::compile(
+            NavigationStyle::Default,
+            r#"{"toggle-preview":["PageDown","F8"],"page-down":[],"cancel":["Tab","Escape"],"complete":[]}"#,
+        ).unwrap());
+        let mut model = crate::LauncherViewModel::new();
+        model.activate();
+        let mut view = model.frame().unwrap();
+        view.preview.status = Some(crate::PreviewStatus::Loading);
+        view.preview.focused = true;
+        let context = create_launcher_context();
+        set_launcher_navigation(&context, navigation.clone());
+        let raw = || RawInput {
+            focused: true,
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(720.0, 520.0))),
+            ..Default::default()
+        };
+        build_launcher_frame(&context, raw(), &view);
+        build_launcher_frame(&context, raw(), &view);
+        let owner = navigation_owner(&context, Some(&view));
+        let route = navigation_context(&view, owner, false);
+        for (key, action) in [
+            (NamedKey::PageDown, NavigationAction::TogglePreview),
+            (NamedKey::Tab, NavigationAction::Cancel),
+        ] {
+            assert!(translate_keyboard(
+                Key::Named(key),
+                ElementState::Pressed,
+                ModifiersState::empty(),
+                Some(&view),
+                false,
+                &navigation,
+                owner,
+            )
+            .is_none());
+            let reserved = if action == NavigationAction::Cancel {
+                "Tab"
+            } else {
+                "PageDown"
+            };
+            assert!(!navigation.hints(action, route).any(|hint| hint == reserved));
+        }
+        for key in [NamedKey::Escape, NamedKey::F8] {
+            assert_eq!(
+                translate_keyboard(
+                    Key::Named(key),
+                    ElementState::Pressed,
+                    ModifiersState::empty(),
+                    Some(&view),
+                    false,
+                    &navigation,
+                    owner,
+                ),
+                Some(UiCommand::LeavePreview)
+            );
+        }
+    }
 }

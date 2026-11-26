@@ -514,7 +514,17 @@ impl NavigationContext {
     }
 
     fn admits_chord(self, action: NavigationAction, chord: crikey_platform::Accelerator) -> bool {
-        self.admits() && (self.owner != NavigationOwner::Query || !query_editing_chord(action, chord))
+        self.admits()
+            && (self.owner != NavigationOwner::Query || !query_editing_chord(action, chord))
+            // Focused preview documents keep scrolling, link traversal and
+            // activation keys even when a host action is remapped onto them.
+            // Runtime dispatch and displayed hints share this admission gate.
+            && !(self.scope == NavigationScope::Preview
+                && matches!(
+                    chord.key(),
+                    "Up" | "Down" | "Left" | "Right" | "PageUp" | "PageDown" | "Home" | "End"
+                        | "Tab" | "Enter" | "Space"
+                ))
     }
 }
 

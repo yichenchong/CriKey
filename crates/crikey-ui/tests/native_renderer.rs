@@ -6141,6 +6141,97 @@ fn focused_preview_returns_through_the_applied_toggle_binding() {
 }
 
 #[test]
+fn focused_preview_keeps_page_scrolling_when_toggle_is_remapped_to_page_down() {
+    use crikey_ui::navigation::{CompiledNavigation, NavigationStyle};
+    let mut view = scrollable_model(2, 0);
+    view.preview.status = Some(crikey_ui::PreviewStatus::Content(Arc::new(
+        crikey_ui::prepare_preview(Arc::new(crikey_core::PreviewContent {
+            text: Some(crikey_core::PreviewText::Plain(format!(
+                "PREVIEW_SCROLL_BEGIN\n{}",
+                "Long bounded detail line\n".repeat(150)
+            ))),
+            ..Default::default()
+        }))
+        .unwrap(),
+    )));
+    view.preview.focused = true;
+    let mut frames = Frames::new();
+    crikey_ui::set_launcher_navigation(
+        &frames.context,
+        Arc::new(
+            CompiledNavigation::compile(
+                NavigationStyle::Default,
+                r#"{"toggle-preview":["PageDown"],"page-down":[]}"#,
+            )
+            .unwrap(),
+        ),
+    );
+    let initial = frames.settle(&view);
+    let before = position_of(&initial, "PREVIEW_SCROLL_BEGIN");
+    let page = frames.draw(&view, vec![key_press(egui::Key::PageDown, egui::Modifiers::NONE)]);
+    assert!(!page.commands.contains(&UiCommand::LeavePreview));
+    let scrolled = frames.settle(&view);
+    assert!(position_of(&scrolled, "PREVIEW_SCROLL_BEGIN").y < before.y);
+    assert!(!painted(&scrolled, "PageDown"));
+}
+
+#[test]
+fn focused_preview_keeps_link_traversal_when_cancel_is_remapped_to_tab() {
+    use crikey_ui::navigation::{CompiledNavigation, NavigationStyle};
+    use crikey_ui::{LauncherViewModel, PreviewLinkTarget, PreviewStatus};
+    let mut state = LauncherViewModel::new();
+    state.activate();
+    state.apply(UiCommand::SetQuery("preview".into()));
+    state.begin_generation(Generation::from_raw(1));
+    state.publish(Generation::from_raw(1), vec![result_row(0)], false);
+    let selection = state.preview_selection().unwrap();
+    let target = PreviewLinkTarget {
+        selection: selection.clone(),
+        plugin: selection.plugin.clone(),
+        incarnation: 7,
+        request: 9,
+    };
+    state.publish_preview(
+        &selection,
+        PreviewStatus::Content(Arc::new(
+            crikey_ui::prepare_preview(Arc::new(crikey_core::PreviewContent {
+                text: Some(crikey_core::PreviewText::Markdown(
+                    "[Document link](https://example.org/)".into(),
+                )),
+                ..Default::default()
+            }))
+            .unwrap(),
+        )),
+    );
+    state.set_preview_link_target(target.clone());
+    let mut view = state.frame().unwrap();
+    view.preview.focused = true;
+    let mut frames = Frames::new();
+    crikey_ui::set_launcher_navigation(
+        &frames.context,
+        Arc::new(
+            CompiledNavigation::compile(
+                NavigationStyle::Default,
+                r#"{"cancel":["Tab","Escape"],"complete":[]}"#,
+            )
+            .unwrap(),
+        ),
+    );
+    frames.settle(&view);
+    let focused_before = frames.context.memory(|memory| memory.focused());
+    assert!(focused_before.is_some());
+    let tab = frames.draw(&view, vec![key_press(egui::Key::Tab, egui::Modifiers::NONE)]);
+    assert!(!tab.commands.contains(&UiCommand::LeavePreview));
+    assert_ne!(frames.context.memory(|memory| memory.focused()), focused_before);
+    let enter = frames.draw(&view, vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)]);
+    assert!(enter.commands.contains(&UiCommand::OpenPreviewLink {
+        target: Box::new(target),
+        url: "https://example.org/".into(),
+    }));
+    assert!(!enter.commands.contains(&UiCommand::LeavePreview));
+}
+
+#[test]
 fn applied_size_and_density_change_real_row_layout_without_changing_os_dpi() {
     use crikey_ui::appearance::{
         AppearanceCache, AppearancePreferences, InterfaceSize, ResultDensity, SystemTheme,
