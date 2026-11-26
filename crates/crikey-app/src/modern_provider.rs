@@ -2077,6 +2077,7 @@ impl ModernDriver {
                         query: job.query,
                         rows: rows.into(),
                         selected: job.selected,
+                        root_selection_revision: 0,
                         pending_plugins: pending,
                         actions_open: false,
                         settings_open: false,
