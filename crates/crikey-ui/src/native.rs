@@ -3050,6 +3050,68 @@ fn byte_offset_to_char_index(text: &str, byte: usize) -> u32 {
     offset
 }
 
+fn native_shortcut_capture(key: Key<&str>, modifiers: ModifiersState, target: &str) -> UiCommand {
+    if key == Key::Named(NamedKey::Escape) {
+        return UiCommand::CancelShortcutCapture;
+    }
+    let key_name = match key {
+        Key::Character(" ") => "Space".into(),
+        Key::Character(text) => text.to_uppercase(),
+        Key::Named(NamedKey::ArrowUp) => "Up".into(),
+        Key::Named(NamedKey::ArrowDown) => "Down".into(),
+        Key::Named(NamedKey::ArrowLeft) => "Left".into(),
+        Key::Named(NamedKey::ArrowRight) => "Right".into(),
+        Key::Named(named) => format!("{named:?}"),
+        _ => String::new(),
+    };
+    let mut chord = String::new();
+    for (pressed, name) in [
+        (modifiers.control_key(), "Ctrl+"),
+        (modifiers.alt_key(), "Alt+"),
+        (modifiers.shift_key(), "Shift+"),
+        (modifiers.super_key(), "Super+"),
+    ] {
+        if pressed {
+            chord.push_str(name);
+        }
+    }
+    chord.push_str(&key_name);
+    match crikey_platform::Accelerator::parse(&chord) {
+        Ok(chord) => UiCommand::RecordShortcut(chord.canonical()),
+        Err(_) => UiCommand::BeginShortcutCapture(target.into()),
+    }
+}
+
+#[cfg(test)]
+mod shortcut_capture_tests {
+    use super::*;
+
+    #[test]
+    fn native_space_shortcut_capture_reaches_edit_draft() {
+        for target in ["launcher.activation-hotkey", "command-key"] {
+            for key in [Key::Character(" "), Key::Named(NamedKey::Space)] {
+                let mut model = crate::LauncherViewModel::new();
+                model.activate();
+                model.apply(UiCommand::BeginShortcutCapture(target.into()));
+                let command =
+                    native_shortcut_capture(key, ModifiersState::CONTROL | ModifiersState::ALT, target);
+                assert!(
+                    matches!(&command, UiCommand::RecordShortcut(chord) if chord == "Ctrl+Alt+Space"),
+                    "native Space must produce a canonical recorded chord: {command:?}"
+                );
+                assert!(model.apply(command).is_none(), "recording must not execute");
+                assert_eq!(model.shortcut_capture(), None);
+                let frame = model.frame().expect("recorded shortcut draft");
+                assert!(frame.setting_edits.iter().any(|edit| {
+                    edit.key == format!("capture:{target}")
+                        && edit.value == "Ctrl+Alt+Space"
+                        && edit.status == crate::SettingEditStatus::Saved
+                }));
+            }
+        }
+    }
+}
+
 fn translate_keyboard(
     event: &KeyEvent,
     modifiers: ModifiersState,
@@ -3062,34 +3124,11 @@ fn translate_keyboard(
         .and_then(|model| model.settings_focus.as_deref())
         .and_then(|focus| focus.strip_prefix("record:"))
     {
-        if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
-            return Some(UiCommand::CancelShortcutCapture);
-        }
-        let key_name = match event.logical_key.as_ref() {
-            Key::Character(text) => text.to_uppercase(),
-            Key::Named(NamedKey::ArrowUp) => "Up".into(),
-            Key::Named(NamedKey::ArrowDown) => "Down".into(),
-            Key::Named(NamedKey::ArrowLeft) => "Left".into(),
-            Key::Named(NamedKey::ArrowRight) => "Right".into(),
-            Key::Named(named) => format!("{named:?}"),
-            _ => String::new(),
-        };
-        let mut chord = String::new();
-        for (pressed, name) in [
-            (modifiers.control_key(), "Ctrl+"),
-            (modifiers.alt_key(), "Alt+"),
-            (modifiers.shift_key(), "Shift+"),
-            (modifiers.super_key(), "Super+"),
-        ] {
-            if pressed {
-                chord.push_str(name);
-            }
-        }
-        chord.push_str(&key_name);
-        return Some(match crikey_platform::Accelerator::parse(&chord) {
-            Ok(chord) => UiCommand::RecordShortcut(chord.canonical()),
-            Err(_) => UiCommand::BeginShortcutCapture(key.into()),
-        });
+        return Some(native_shortcut_capture(
+            event.logical_key.as_ref(),
+            modifiers,
+            key,
+        ));
     }
     // While a page is open the plugin's surface owns the keyboard, exactly as
     // the settings surface does below: Enter presses the focused node, Tab

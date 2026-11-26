@@ -135,9 +135,10 @@ Exact command aliases lead alias prefixes, followed by ordinary results, even
 with a one-result ceiling. Aliases never execute automatically; typing an alias
 followed by a space does not implicitly supply arguments.
 
-Use **Record shortcut** (or **Record** on activation) to capture a chord, then
-Save it. Escape, focus loss and hiding stop recording. An already registered
-chord is captured instead of toggling the launcher or invoking its command.
+Use **Record shortcut** (or **Record** on activation) to capture a chord, including
+Space-based chords such as `Ctrl+Alt+Space`, then Save it. Escape, focus loss and
+hiding stop recording. An already registered chord is captured instead of
+toggling the launcher or invoking its command.
 Failed saves retain the draft, including newer edits made while saving.
 
 Saved desired shortcuts, their effective configuration layer and actual active
