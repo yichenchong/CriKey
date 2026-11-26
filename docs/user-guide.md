@@ -87,6 +87,10 @@ separately from a write that never persisted. Secret inputs are masked and
 retired on save, discard, category changes or leaving their editor; a stale
 schema closes private entry until metadata is refreshed.
 
+An optional plugin boolean without a default or configured value remains
+**unset**. Enter `true` or `false` and Save; once it has an effective value,
+its editor becomes a checkbox.
+
 With results visible, the footer shows the current primary action and
 **Actions**; result navigation remains Up/Down, Tab to complete and Escape to
 cancel. In compact mode the optional hint line reads
