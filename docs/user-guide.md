@@ -372,7 +372,8 @@ renderer; a form edits the same executable schema used by typed arguments.
 
 Lists use ordinary row navigation and `Ctrl/Cmd+K` or `Alt+Enter` for Actions.
 In a grid, Left/Right move within a row and Up/Down move spatially between rows;
-Page Up/Down move by pages of rows. Section headers never take selection.
+Page Up/Down move by pages of rows. Moving down into a shorter row selects its
+last tile before advancing to another section. Section headers never take selection.
 Double-click a grid tile to activate that exact item once, including a tile that
 was not selected. After a refresh, a keyboard-selected grid item is brought into
 view on the next paint without another scroll animation or key. Pointer scrolling,
