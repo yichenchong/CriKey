@@ -156,8 +156,18 @@ affordance to open settings from a web page. Escape closes the page.
 
 An empty query shows nothing but the query field: the launcher does not list
 the catalog at rest, and the window stays compact until there is something to
-show. Scrolling the result list with the wheel stays where you put it; the
-list only scrolls itself to follow a selection you moved.
+show. Scrolling the result list with the wheel stays where you put it, including
+when the host republishes the same results or updates their display details.
+Keyboard navigation reveals the selected result, even at the first or last row;
+a new query or a changed selected target also follows the selection.
+
+Dismissal clears the current query and results; reopening starts a fresh
+launcher session rather than resuming the previous view. Results still in flight
+from the dismissed session cannot populate the reopened launcher. Opening
+settings does not turn incoming search results into settings content. Returning
+refreshes the search and restores a deliberately selected result when it arrives,
+even after an initial partial result list. Navigating or editing the query
+supersedes that return selection; completion of the search ends restoration.
 
 Typing updates the visible query immediately. Local catalog search runs in the
 current UI frame; plugin results arrive incrementally and late results from an
@@ -166,6 +176,10 @@ activation policy. Unchanged legacy plugins use `legacy-strict`: no time
 debounce, prompt replacement of obsolete work, serial callbacks, and
 `should_terminate()` cooperative cancellation. Empty-query and minimum-length
 behavior is a plugin declaration for modern plugins, not a hidden global rule.
+
+Once modern-plugin callbacks finish, the final answer includes every admitted
+result batch; intake budgeting does not leave a plugin's answer waiting for
+another keystroke.
 
 Catalog rows are fuzzy-matched by the host. Plugin suggestion batches are shown
 in the order the plugin publishes them; they are not host-fuzzy-matched or

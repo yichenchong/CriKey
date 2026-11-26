@@ -308,6 +308,10 @@ pub struct ViewModel {
     pub query: String,
     pub rows: Arc<[ResultRow]>,
     pub selected: usize,
+    /// Changes on explicit selection intent or same-generation publication
+    /// that changes the selected owner/item or index. Query generations carry
+    /// query navigation separately; identical republications do not undo scrolling.
+    pub root_selection_revision: u64,
     /// True while at least one plugin is still working on this generation.
     pub pending_plugins: bool,
     /// True while the action list of the selected row is open (spec 6.3).
@@ -463,12 +467,27 @@ pub enum UiEffect {
     Quit,
 }
 
+/// Logical launcher surface, independent of any query or engine generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewKind {
+    RootList,
+    Settings,
+    CustomPage,
+}
+
+/// Process-local identity of a logical surface lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewId(u64);
+
 /// The renderer-free launcher state machine (spec 6.1 - 6.5; ADR-0002).
 ///
 /// Constructed once at startup and kept alive for the process lifetime:
 /// [`activate`](Self::activate) shows an object that already exists, so the
 /// hotkey path never pays construction cost, and [`dismiss`](Self::dismiss)
 /// empties the launcher without dropping it.
+///
+/// Logical view lifetimes are independent of query generations: covering the
+/// root retires its publications, and returning requests a fresh search.
 ///
 /// While hidden the model is completely inert — every command, generation
 /// change and publish is discarded and [`frame`](Self::frame) yields nothing —
@@ -480,6 +499,13 @@ pub enum UiEffect {
 #[derive(Debug)]
 pub struct LauncherViewModel {
     visible: bool,
+    view_id: ViewId,
+    publication_view: Option<ViewId>,
+    query_refresh: bool,
+    restore_selection: bool,
+    /// The return search's owner-qualified choice, independent of temporary
+    /// fallback rows. Kept until completion or an explicit user choice.
+    restoration_target: Option<(String, ItemId)>,
     /// Set by every accepted mutation and cleared by `frame`, so mutations
     /// between two frames coalesce into one view model (spec 25.5).
     dirty: bool,
@@ -489,6 +515,7 @@ pub struct LauncherViewModel {
     /// renderer is still holding must keep describing what it was given.
     rows: Arc<[ResultRow]>,
     selected: usize,
+    root_selection_revision: u64,
     /// Whether the user has moved the selection themselves within the current
     /// generation.
     ///
@@ -558,10 +585,16 @@ impl LauncherViewModel {
     pub fn new() -> Self {
         Self {
             visible: false,
+            view_id: ViewId(0),
+            publication_view: None,
+            query_refresh: false,
+            restore_selection: false,
+            restoration_target: None,
             dirty: false,
             query: String::new(),
             rows: Arc::default(),
             selected: 0,
+            root_selection_revision: 0,
             navigated: false,
             actions_open: false,
             pending_plugins: false,
@@ -581,6 +614,46 @@ impl LauncherViewModel {
         self.visible
     }
 
+    /// The current logical surface. Hidden launchers have no live view.
+    pub fn view(&self) -> Option<(ViewId, ViewKind)> {
+        self.visible.then_some((
+            self.view_id,
+            if self.settings_open {
+                ViewKind::Settings
+            } else if self.page.is_some() {
+                ViewKind::CustomPage
+            } else {
+                ViewKind::RootList
+            },
+        ))
+    }
+
+    /// Drains the fresh search owed after uncovering the root list.
+    ///
+    /// Separate from `UiEffect` because closing a page already owes the host
+    /// a lifecycle effect. The host drains this after applying commands and
+    /// asynchronous page transitions, through its ordinary query dispatch.
+    pub fn take_query_refresh(&mut self) -> Option<String> {
+        if !self.visible || self.settings_open || self.page.is_some() || !self.query_refresh {
+            return None;
+        }
+        self.query_refresh = false;
+        self.restore_selection = self.navigated;
+        if self.navigated && self.restoration_target.is_none() {
+            self.restoration_target = self
+                .rows
+                .get(self.selected)
+                .map(|row| (row.plugin_name.clone(), row.item.clone()));
+        }
+        Some(self.query.clone())
+    }
+
+    fn change_view(&mut self) {
+        self.view_id = ViewId(self.view_id.0.checked_add(1).expect("view identity exhausted"));
+        self.publication_view = None;
+        self.pending_plugins = false;
+    }
+
     /// Shows the launcher. Idempotent: activating an open one keeps its query,
     /// rows and selection untouched and produces no frame.
     pub fn activate(&mut self) {
@@ -589,6 +662,7 @@ impl LauncherViewModel {
         }
 
         self.visible = true;
+        self.change_view();
         self.dirty = true;
     }
 
@@ -628,6 +702,10 @@ impl LauncherViewModel {
         self.page = None;
         self.active = None;
         self.published = None;
+        self.publication_view = None;
+        self.query_refresh = false;
+        self.restore_selection = false;
+        self.restoration_target = None;
     }
 
     /// Makes `generation` the active one and marks results outstanding.
@@ -641,6 +719,8 @@ impl LauncherViewModel {
     /// editing the query must never flicker the list empty.
     pub fn begin_generation(&mut self, generation: Generation) {
         if !self.visible
+            || self.settings_open
+            || self.page.is_some()
             || generation == Generation::ZERO
             || self.floor.is_some_and(|floor| generation <= floor)
         {
@@ -648,10 +728,18 @@ impl LauncherViewModel {
         }
 
         self.floor = Some(generation);
-        // A new query is a new default. Whatever the user had chosen belonged
-        // to the answer they were choosing from.
-        self.navigated = false;
+        // An ordinary query starts at the top; a return search reconciles the
+        // existing user selection by item identity through fresh publications.
+        if self.restore_selection {
+            self.published = Some(generation);
+            self.restore_selection = false;
+        } else {
+            self.navigated = false;
+            self.restoration_target = None;
+        }
         self.active = Some(generation);
+        self.publication_view = Some(self.view_id);
+        self.query_refresh = false;
         self.pending_plugins = true;
         self.dirty = true;
     }
@@ -659,21 +747,36 @@ impl LauncherViewModel {
     /// Replaces the row set and the pending flag for `generation`.
     ///
     /// Accepted only when `generation` is exactly the accept target: the
-    /// generation begun in this session and not yet superseded. Older,
-    /// never-begun, pre-first-generation and pre-dismiss publishes are
-    /// discarded whole and never partially applied (spec 6.2.7).
+    /// generation begun in this session and not yet superseded or covered.
+    /// Older, never-begun, pre-first-generation and pre-dismiss publications
+    /// are discarded whole and never partially applied (spec 6.2.7).
     ///
     /// A publish that lands while the query is empty carries no rows at all,
     /// whatever the host ranked for it: an untyped launcher is the query field
     /// and nothing else, and dropping the rows here is what makes that true
     /// for every renderer instead of only for the one that remembers to check.
     pub fn publish(&mut self, generation: Generation, rows: Vec<ResultRow>, pending_plugins: bool) {
-        if !self.visible || self.active != Some(generation) {
+        if !self.visible || self.active != Some(generation) || self.publication_view != Some(self.view_id) {
             return;
         }
 
         let rows: Vec<ResultRow> = if self.query.is_empty() { Vec::new() } else { rows };
-        self.selected = self.resolve_selection(&rows, generation);
+        let selected = self.resolve_selection(&rows, generation);
+        // The first ordinary query publication replaces a prior generation,
+        // not a choice already painted for this query. Its generation/index
+        // already drive native follow, including direct provider first answers.
+        // Return searches deliberately retag `published` in `begin_generation`.
+        if self.published == Some(generation)
+            && (self.selected != selected
+                || self
+                    .rows
+                    .get(self.selected)
+                    .map(|row| (&row.plugin_name, &row.item))
+                    != rows.get(selected).map(|row| (&row.plugin_name, &row.item)))
+        {
+            self.root_selection_revision = self.root_selection_revision.wrapping_add(1);
+        }
+        self.selected = selected;
         // One move into a shared allocation per accepted publish; from here on
         // every frame of this result set is a refcount bump.
         self.rows = rows.into();
@@ -682,6 +785,9 @@ impl LauncherViewModel {
         self.actions_open = false;
         self.pending_plugins = pending_plugins;
         self.published = Some(generation);
+        if !pending_plugins {
+            self.restoration_target = None;
+        }
         self.dirty = true;
     }
 
@@ -704,6 +810,7 @@ impl LauncherViewModel {
             // A refcount bump, not a copy of the row set (spec 25.5).
             rows: Arc::clone(&self.rows),
             selected: self.selected,
+            root_selection_revision: self.root_selection_revision,
             pending_plugins: self.pending_plugins,
             actions_open: self.actions_open,
             settings_open: self.settings_open,
@@ -843,6 +950,8 @@ impl LauncherViewModel {
         if self.query == text {
             return None;
         }
+        self.restore_selection = false;
+        self.restoration_target = None;
 
         // Reuse the buffer rather than swapping it in: a keystroke on the hot
         // path must not allocate, and `text` is already owned by the effect.
@@ -866,6 +975,8 @@ impl LauncherViewModel {
         if self.query == row.label {
             return None;
         }
+        self.restore_selection = false;
+        self.restoration_target = None;
 
         self.query.clear();
         self.query.push_str(&row.label);
@@ -987,6 +1098,9 @@ impl LauncherViewModel {
             return false;
         }
 
+        if !self.settings_open {
+            self.change_view();
+        }
         let had_page = self.page.take().is_some();
         self.settings_open = true;
         self.settings_focus = focus;
@@ -994,8 +1108,9 @@ impl LauncherViewModel {
         had_page
     }
 
-    /// Hides the settings surface, leaving the query and the rows alone. An
-    /// already closed surface is not a change, so this produces no frame.
+    /// Hides settings while preserving root query and rows. The host must drain
+    /// [`Self::take_query_refresh`] to replace retired work with a fresh search.
+    /// An already closed surface is not a change.
     pub fn close_settings(&mut self) {
         if !self.settings_open {
             return;
@@ -1003,6 +1118,8 @@ impl LauncherViewModel {
 
         self.settings_open = false;
         self.settings_focus = None;
+        self.change_view();
+        self.query_refresh = self.visible;
         self.dirty |= self.visible;
     }
 
@@ -1030,6 +1147,7 @@ impl LauncherViewModel {
             return false;
         }
 
+        self.change_view();
         self.settings_open = false;
         self.settings_focus = None;
         self.page = Some(surface);
@@ -1202,6 +1320,8 @@ impl LauncherViewModel {
         if self.page.take().is_none() {
             return false;
         }
+        self.change_view();
+        self.query_refresh = self.visible;
 
         self.dirty |= self.visible;
         true
@@ -1244,37 +1364,48 @@ impl LauncherViewModel {
     /// Moves the selection to `target`, clamped into range. Navigation never
     /// wraps, and an empty list has nothing to move.
     fn select(&mut self, target: usize) {
+        // Even a clamped navigation command supersedes a pending return choice.
+        self.restoration_target = None;
         let Some(last) = self.rows.len().checked_sub(1) else {
             return;
         };
 
         let target = target.min(last);
-        if target == self.selected {
-            return;
+        // Only leaving the row retires its action list; a boundary key still
+        // reveals the same selected row without closing its actions.
+        if target != self.selected {
+            self.actions_open = false;
         }
 
         self.selected = target;
+        // A boundary key is still an explicit request to reveal this choice.
+        self.root_selection_revision = self.root_selection_revision.wrapping_add(1);
         // The only path a person's arrow or page key reaches, so this is where
         // a default becomes a choice.
         self.navigated = true;
-        // The action list belongs to the row it was opened over, so moving off
-        // that row closes it instead of silently retargeting it.
-        self.actions_open = false;
         self.dirty = true;
     }
 
     /// Where the selection lands once `incoming` replaces the current rows.
     ///
-    /// Within one generation the selection is anchored by [`ItemId`]: a
-    /// republish follows the selected item wherever it moved to and falls back
-    /// to the previous index clamped into range when the anchor is gone. The
-    /// first publish of a new generation is a new query state and starts at the
-    /// top, because the anchor lives inside one generation only.
+    /// Within one generation the selection is anchored by owner and [`ItemId`]:
+    /// a republish follows the selected item wherever it moved to and falls
+    /// back to the previous index clamped into range when the anchor is gone.
+    /// Return searches retain a separate target across partial publications;
+    /// an ordinary new query starts at the top.
     fn resolve_selection(&self, incoming: &[ResultRow], generation: Generation) -> usize {
         let Some(last) = incoming.len().checked_sub(1) else {
             return 0;
         };
 
+        if let Some((owner, item)) = &self.restoration_target {
+            if let Some(index) = incoming
+                .iter()
+                .position(|row| row.plugin_name == *owner && row.item == *item)
+            {
+                return index;
+            }
+        }
         if self.published != Some(generation) {
             return 0;
         }
@@ -1287,13 +1418,13 @@ impl LauncherViewModel {
             return 0;
         }
 
-        let Some(anchor) = self.rows.get(self.selected).map(|row| &row.item) else {
+        let Some(anchor) = self.rows.get(self.selected) else {
             return 0;
         };
 
         incoming
             .iter()
-            .position(|row| row.item == *anchor)
+            .position(|row| row.plugin_name == anchor.plugin_name && row.item == anchor.item)
             .unwrap_or(self.selected.min(last))
     }
 }

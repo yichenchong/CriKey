@@ -44,11 +44,11 @@
 //!   text belongs to. Rows may still be the previous generation's while
 //!   `pending_plugins` is true; editing the query never blanks the list
 //!   (spec 6.5: no flicker from late responses).
-//! * Selection is anchored by `ItemId`. A republish within one generation keeps
-//!   the same item selected wherever it moved to; if the anchor is gone the
-//!   previous index is clamped into range. The first publish of a new
-//!   generation resets the selection to the first row. Navigation clamps at
-//!   both ends and never wraps.
+//! * Selection is anchored by owner and `ItemId`. A republish within one
+//!   generation follows that item, falling back to the previous index clamped
+//!   into range. A return search retains its original choice across partial
+//!   publications until completion or explicit navigation/query editing.
+//!   An ordinary new generation starts at the top. Navigation never wraps.
 //! * `PAGE_SIZE: usize` is the crate constant `PageDown`/`PageUp` move by.
 //! * `ViewModel::rows` is an `Arc<[ResultRow]>` shared with the model, so a
 //!   frame that changes only the query or the selection costs a refcount bump
@@ -510,7 +510,7 @@ fn selection_moves_one_row_at_a_time_and_clamps_at_the_last_row() {
     }
 
     assert_eq!(view_model.apply(UiCommand::SelectNext), None);
-    expect_idle(&mut view_model);
+    assert_eq!(expect_frame(&mut view_model).selected, 2);
 
     assert_eq!(view_model.apply(UiCommand::SelectPrevious), None);
     assert_eq!(
@@ -527,7 +527,7 @@ fn selection_clamps_at_the_first_row() {
     let _ = expect_frame(&mut view_model);
 
     assert_eq!(view_model.apply(UiCommand::SelectPrevious), None);
-    expect_idle(&mut view_model);
+    assert_eq!(expect_frame(&mut view_model).selected, 0);
 
     select_index(&mut view_model, 1);
     let _ = expect_frame(&mut view_model);
@@ -560,14 +560,61 @@ fn page_navigation_moves_a_whole_page_and_clamps_without_wrapping() {
         assert_eq!(expect_frame(&mut view_model).selected, expected);
     }
     assert_eq!(view_model.apply(UiCommand::PageDown), None);
-    expect_idle(&mut view_model);
+    assert_eq!(expect_frame(&mut view_model).selected, last);
 
     for expected in [last - PAGE_SIZE, last - PAGE_SIZE * 2, 0] {
         assert_eq!(view_model.apply(UiCommand::PageUp), None);
         assert_eq!(expect_frame(&mut view_model).selected, expected);
     }
     assert_eq!(view_model.apply(UiCommand::PageUp), None);
-    expect_idle(&mut view_model);
+    assert_eq!(expect_frame(&mut view_model).selected, 0);
+}
+
+#[test]
+fn root_follow_revision_tracks_intent_and_identity_not_cosmetic_publication() {
+    let generations = GenerationTracker::new();
+    let generation = generations.advance();
+    let mut state = open_showing(generation, &["alpha", "beta", "gamma"]);
+    let first = expect_frame(&mut state);
+    let mut changed = first.rows.to_vec();
+    changed[0].label = "Updated title".into();
+    changed[0].description = "Updated description".into();
+    changed[0].status = Some("Updated status".into());
+    state.publish(generation, changed, false);
+    let cosmetic = expect_frame(&mut state);
+    assert!(!std::sync::Arc::ptr_eq(&first.rows, &cosmetic.rows));
+    assert_eq!(cosmetic.root_selection_revision, first.root_selection_revision);
+    assert_eq!(cosmetic.rows[0].label, "Updated title");
+    assert_eq!(cosmetic.rows[0].status.as_deref(), Some("Updated status"));
+
+    let mut changed = cosmetic.rows.to_vec();
+    changed[0].plugin_name = "another owner".into();
+    state.publish(generation, changed, false);
+    let owner = expect_frame(&mut state);
+    assert_eq!(owner.selected, 0);
+    assert_ne!(owner.root_selection_revision, cosmetic.root_selection_revision);
+
+    let _ = state.apply(UiCommand::SelectPrevious);
+    let boundary = expect_frame(&mut state);
+    assert_eq!(boundary.selected, 0);
+    assert_ne!(boundary.root_selection_revision, owner.root_selection_revision);
+    let _ = state.apply(UiCommand::SelectNext);
+    let _ = state.apply(UiCommand::SelectPrevious);
+    state.publish(generation, boundary.rows.to_vec(), false);
+    let coalesced = expect_frame(&mut state);
+    assert_eq!(coalesced.selected, 0);
+    assert_ne!(
+        coalesced.root_selection_revision,
+        boundary.root_selection_revision
+    );
+
+    let _ = state.apply(UiCommand::SetQuery("another query".into()));
+    let next = generations.advance();
+    state.begin_generation(next);
+    state.publish(next, coalesced.rows.to_vec(), false);
+    let queried = expect_frame(&mut state);
+    assert_eq!(queried.selected, 0);
+    assert_eq!(queried.root_selection_revision, coalesced.root_selection_revision);
 }
 
 #[test]
@@ -1427,12 +1474,14 @@ fn a_navigation_command_that_moves_nothing_leaves_the_action_list_open() {
         UiCommand::PageUp,
     ] {
         assert_eq!(view_model.apply(command.clone()), None, "{command:?}");
-        expect_idle(&mut view_model);
+        let model = expect_frame(&mut view_model);
+        assert_eq!(model.selected, 0);
+        assert_eq!(selected_id(&model), "alpha");
+        assert!(model.actions_open);
     }
 
-    // A query edit is not a rung of the ladder either; the publish answering it
-    // is what closes the list. Forcing a frame this way proves the list is
-    // still open rather than merely unreported.
+    // Editing the query also keeps these actions until replacement rows
+    // publish; navigation above must not have silently closed them.
     assert_eq!(
         view_model.apply(UiCommand::SetQuery("al".to_owned())),
         Some(UiEffect::Query("al".to_owned()))
@@ -1702,7 +1751,10 @@ fn navigation_stays_put_on_a_single_result() {
         UiCommand::PageUp,
     ] {
         assert_eq!(view_model.apply(command), None);
-        expect_idle(&mut view_model);
+        let model = expect_frame(&mut view_model);
+        assert_eq!(model.selected, 0);
+        assert_eq!(selected_id(&model), "only");
+        assert!(!model.actions_open);
     }
 
     assert_eq!(
@@ -2184,4 +2236,198 @@ fn a_web_caret_rejects_overflowing_endpoints_without_losing_the_valid_anchor() {
         model.page().expect("web page").web_caret_area,
         Some((4.0, 5.0, 2.0, 12.0))
     );
+}
+
+#[test]
+fn settings_retire_root_publications_and_return_requests_one_fresh_search() {
+    for close in [UiCommand::Cancel, UiCommand::CloseSettings] {
+        let tracker = GenerationTracker::new();
+        let old = tracker.advance();
+        let mut model = open_showing(old, &["alpha"]);
+        let root = model.view().expect("visible root");
+        assert_eq!(root.1, crikey_ui::ViewKind::RootList);
+        let _ = expect_frame(&mut model);
+
+        model.apply(UiCommand::OpenSettings);
+        let settings = model.view().expect("visible settings");
+        assert_ne!(settings.0, root.0);
+        assert_eq!(settings.1, crikey_ui::ViewKind::Settings);
+        let _ = expect_frame(&mut model);
+        model.publish(old, rows(&["late"]), true);
+        expect_idle(&mut model);
+        assert_eq!(model.take_query_refresh(), None);
+
+        assert_eq!(model.apply(close), None);
+        let returned = expect_frame(&mut model);
+        assert_eq!(row_ids(&returned), vec!["alpha"]);
+        assert!(!returned.pending_plugins);
+        model.publish(old, rows(&["still-late"]), true);
+        model.begin_generation(old);
+        expect_idle(&mut model);
+        assert_eq!(model.take_query_refresh().as_deref(), Some(FIXTURE_QUERY));
+        assert_eq!(model.take_query_refresh(), None);
+
+        let fresh = tracker.advance();
+        let returned_view = model.view();
+        model.begin_generation(fresh);
+        model.publish(fresh, rows(&["fresh"]), false);
+        assert_eq!(row_ids(&expect_frame(&mut model)), vec!["fresh"]);
+        assert_eq!(
+            model.view(),
+            returned_view,
+            "queries do not replace logical views"
+        );
+        model.publish(old, rows(&["late-again"]), true);
+        expect_idle(&mut model);
+    }
+}
+
+/// Return to a deliberately selected asynchronous result, before any fresh
+/// publication. `plugin_name` carries the owner in this model's row contract.
+fn returning_to_selected_provider() -> (LauncherViewModel, Generation) {
+    let tracker = GenerationTracker::new();
+    let old = tracker.advance();
+    let mut model = open_showing(old, &["builtin", "shared"]);
+    let mut provider = row("shared");
+    provider.plugin_name = "provider".into();
+    model.publish(old, vec![row("builtin"), provider], false);
+    model.apply(UiCommand::SelectNext);
+    assert_eq!(expect_frame(&mut model).selected, 1);
+    model.apply(UiCommand::OpenSettings);
+    model.apply(UiCommand::CloseSettings);
+    assert_eq!(model.take_query_refresh().as_deref(), Some(FIXTURE_QUERY));
+    let fresh = tracker.advance();
+    model.begin_generation(fresh);
+    let _ = expect_frame(&mut model);
+    (model, fresh)
+}
+
+#[test]
+fn return_selection_survives_phased_publications_and_matches_the_exact_owner() {
+    let (mut model, fresh) = returning_to_selected_provider();
+    model.publish(fresh, rows(&["builtin"]), true);
+    assert_eq!(selected_id(&expect_frame(&mut model)), "builtin");
+
+    // An empty wave must not erase the return intent either.
+    model.publish(fresh, Vec::new(), true);
+    assert!(expect_frame(&mut model).rows.is_empty());
+    model.publish(fresh, rows(&["shared", "builtin"]), true);
+    assert_eq!(expect_frame(&mut model).selected, 0);
+
+    let mut provider = row("shared");
+    provider.plugin_name = "provider".into();
+    model.publish(fresh, vec![row("shared"), row("builtin"), provider], false);
+    let restored = expect_frame(&mut model);
+    assert_eq!(restored.selected, 2);
+    assert_eq!(restored.rows[restored.selected].plugin_name, "provider");
+    assert!(!restored.pending_plugins);
+}
+
+#[test]
+fn explicit_navigation_cancels_return_selection_even_when_clamped_or_empty() {
+    for command in [
+        UiCommand::SelectNext,
+        UiCommand::SelectPrevious,
+        UiCommand::PageDown,
+        UiCommand::PageUp,
+    ] {
+        for empty in [false, true] {
+            let (mut model, fresh) = returning_to_selected_provider();
+            model.publish(fresh, if empty { Vec::new() } else { rows(&["builtin"]) }, true);
+            let _ = expect_frame(&mut model);
+            model.apply(command.clone());
+            let mut provider = row("shared");
+            provider.plugin_name = "provider".into();
+            model.publish(fresh, vec![row("builtin"), provider], false);
+            assert_eq!(selected_id(&expect_frame(&mut model)), "builtin");
+        }
+    }
+    // A real move chooses a new anchor, not just a fallback index.
+    let (mut model, fresh) = returning_to_selected_provider();
+    model.publish(fresh, rows(&["first", "second"]), true);
+    let _ = expect_frame(&mut model);
+    model.apply(UiCommand::SelectPrevious);
+    let mut provider = row("shared");
+    provider.plugin_name = "provider".into();
+    model.publish(fresh, vec![row("second"), provider, row("first")], false);
+    assert_eq!(selected_id(&expect_frame(&mut model)), "first");
+}
+
+#[test]
+fn completed_return_search_retires_an_absent_restoration_target() {
+    let (mut model, fresh) = returning_to_selected_provider();
+    model.publish(fresh, rows(&["builtin"]), false);
+    let _ = expect_frame(&mut model);
+    let mut provider = row("shared");
+    provider.plugin_name = "provider".into();
+    model.publish(fresh, vec![row("builtin"), provider], false);
+    assert_eq!(selected_id(&expect_frame(&mut model)), "builtin");
+}
+
+#[test]
+fn query_completion_supersedes_the_pending_return_selection() {
+    let (mut model, fresh) = returning_to_selected_provider();
+    model.publish(fresh, rows(&["builtin"]), true);
+    let _ = expect_frame(&mut model);
+    assert_eq!(
+        model.apply(UiCommand::Complete),
+        Some(UiEffect::Query("BUILTIN".into()))
+    );
+    let mut provider = row("shared");
+    provider.plugin_name = "provider".into();
+    model.publish(fresh, vec![row("builtin"), provider], false);
+    assert_eq!(selected_id(&expect_frame(&mut model)), "builtin");
+}
+
+#[test]
+fn leaving_custom_pages_retires_old_rows_and_preserves_close_effects() {
+    for close in [UiCommand::Cancel, UiCommand::ClosePage] {
+        let tracker = GenerationTracker::new();
+        let old = tracker.advance();
+        let mut model = open_showing(old, &["alpha"]);
+        let _ = expect_frame(&mut model);
+        assert!(model.open_page(web_page_surface()));
+        assert_eq!(model.view().unwrap().1, crikey_ui::ViewKind::CustomPage);
+        let _ = expect_frame(&mut model);
+        model.publish(old, rows(&["late"]), true);
+        expect_idle(&mut model);
+        assert_eq!(model.apply(close), Some(UiEffect::ClosePage));
+        assert_eq!(row_ids(&expect_frame(&mut model)), vec!["alpha"]);
+        model.publish(old, rows(&["after-close"]), true);
+        expect_idle(&mut model);
+        assert_eq!(model.take_query_refresh().as_deref(), Some(FIXTURE_QUERY));
+        assert_eq!(model.take_query_refresh(), None);
+        let fresh = tracker.advance();
+        model.begin_generation(fresh);
+        model.publish(fresh, rows(&["fresh"]), false);
+        assert_eq!(row_ids(&expect_frame(&mut model)), vec!["fresh"]);
+    }
+}
+
+#[test]
+fn dismissal_discards_an_unconsumed_return_search() {
+    let mut model = open_showing(fresh_generation(), &["alpha"]);
+    model.open_settings(None);
+    model.close_settings();
+    model.dismiss();
+    assert_eq!(model.view(), None);
+    assert_eq!(model.take_query_refresh(), None);
+    model.activate();
+    assert_eq!(model.take_query_refresh(), None);
+}
+
+#[test]
+fn a_return_search_reconciles_the_existing_user_selection() {
+    let tracker = GenerationTracker::new();
+    let old = tracker.advance();
+    let mut model = open_showing(old, &["alpha", "beta"]);
+    select_index(&mut model, 1);
+    model.open_settings(None);
+    model.close_settings();
+    assert_eq!(model.take_query_refresh().as_deref(), Some(FIXTURE_QUERY));
+    let fresh = tracker.advance();
+    model.begin_generation(fresh);
+    model.publish(fresh, rows(&["beta", "alpha"]), false);
+    let returned = expect_frame(&mut model);
+    assert_eq!(returned.rows[returned.selected].item, ItemId("beta".to_owned()));
 }

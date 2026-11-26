@@ -31,6 +31,11 @@
 //! * **Inert while hidden — live.** After the session is hidden, a call
 //!   delivers nothing: an answer belonging to a dismissed session must not
 //!   resurrect it, and must not be merged into whatever comes next.
+//! * **Covered return race — live.** During a host callback, a provider stores
+//!   a fresh answer and submits its frame while settings still cover the
+//!   mailbox. Only afterwards does the host publish the uncovered pending
+//!   frame. With no further input, the answer wake must drain that outcome,
+//!   expose its result row and clear pending.
 //! * **Coalescing — unit level.** That a burst of answers buys one wake is
 //!   asserted in `native.rs`'s `lifecycle_tests`, not here: how many of a burst
 //!   land before the loop consumes the first is a genuine race, and a live
@@ -61,9 +66,10 @@ mod linux {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use crikey_core::Generation;
+    use crikey_core::{Generation, GenerationTracker, ItemId};
     use crikey_ui::{
-        wgpu, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, NativeLauncherHandle, ViewModel,
+        wgpu, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent, NativeLauncherHandle, ResultRow,
+        ViewModel,
     };
 
     /// Ceiling on an `Xvfb` becoming connectable.
@@ -94,13 +100,17 @@ mod linux {
     pub fn run() {
         an_answer_reaches_an_idle_loop_and_stops_at_a_hidden_one();
         println!("ok  live  a provider answer wakes an idle event loop, and a hidden one ignores it");
+        println!("ok  live  a covered return-query answer reaches the host and clears pending");
     }
 
     /// What the host callback saw, in the order the event loop dispatched it.
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct Host {
         activations: usize,
         answers: usize,
+        return_query: bool,
+        completed: Option<ViewModel>,
+        model: ViewModel,
     }
 
     fn an_answer_reaches_an_idle_loop_and_stops_at_a_hidden_one() {
@@ -123,7 +133,13 @@ mod linux {
             )
         });
         let handle = launcher.handle();
-        let host = Arc::new(Mutex::new(Host::default()));
+        let host = Arc::new(Mutex::new(Host {
+            activations: 0,
+            answers: 0,
+            return_query: false,
+            completed: None,
+            model: empty_model(),
+        }));
 
         let (report, receive_report) = mpsc::channel();
         let driver_handle = handle.clone();
@@ -139,15 +155,46 @@ mod linux {
         let callback_handle = handle.clone();
         let callback_host = Arc::clone(&host);
         let render_result = launcher.run(move |event| {
-            {
+            let return_query = {
                 let mut state = lock(&callback_host);
                 match event {
                     NativeLauncherEvent::Activated => state.activations += 1,
-                    NativeLauncherEvent::ProviderAnswer => state.answers += 1,
+                    NativeLauncherEvent::ProviderAnswer => {
+                        state.answers += 1;
+                        if let Some(completed) = state.completed.take() {
+                            state.model = completed;
+                        }
+                    }
                     NativeLauncherEvent::Command { .. } => {}
                 }
+                std::mem::take(&mut state.return_query)
+            };
+            if return_query {
+                // The callback cannot consume another event until this block
+                // returns. Joining the provider forces its completion between
+                // the covered and uncovered host submissions, without sleeps.
+                let mut covered = empty_model();
+                covered.settings_open = true;
+                callback_handle.submit_frame(&covered).unwrap();
+                let mut pending = empty_model();
+                pending.generation = GenerationTracker::new().advance();
+                pending.query = "returned query".to_owned();
+                pending.pending_plugins = true;
+                let mut completed = pending.clone();
+                completed.pending_plugins = false;
+                completed.rows = Arc::from([returned_row()]);
+                let provider_handle = callback_handle.clone();
+                let provider_host = Arc::clone(&callback_host);
+                thread::spawn(move || {
+                    lock(&provider_host).completed = Some(completed.clone());
+                    provider_handle.submit_results(&completed).unwrap();
+                })
+                .join()
+                .expect("the return-query provider panicked");
+                lock(&callback_host).model = pending;
             }
-            let _ = callback_handle.submit_frame(&empty_model());
+            let model = lock(&callback_host).model.clone();
+            callback_handle.submit_frame(&model).unwrap();
         });
 
         let outcome = receive_report
@@ -203,6 +250,29 @@ mod linux {
             )
         })?;
 
+        // Ask the host to return from settings. The callback synchronizes the
+        // provider completion before it publishes the uncovered host frame.
+        lock(host).return_query = true;
+        handle
+            .request_provider_answer()
+            .map_err(|error| format!("the return-query trigger was refused: {error}"))?;
+        wait_for(UI_LIMIT, || {
+            let state = lock(host);
+            (state.answers == 4
+                && state.completed.is_none()
+                && state.model.query == "returned query"
+                && !state.model.pending_plugins
+                && state.model.rows.len() == 1
+                && state.model.rows[0].label == "Returned provider result")
+                .then_some(())
+        })
+        .ok_or_else(|| {
+            format!(
+                "the covered return-query outcome was not merged within {UI_LIMIT:?}; \
+                 rejecting its direct frame must not discard the host's answer wake"
+            )
+        })?;
+
         // A hidden launcher has no session to merge into. The announcement must
         // neither wake it nor be delivered to the host.
         handle
@@ -211,11 +281,14 @@ mod linux {
         handle
             .request_provider_answer()
             .map_err(|error| format!("the announcement to a hidden launcher errored: {error}"))?;
+        handle
+            .submit_results(&empty_model())
+            .map_err(|error| format!("the results submission to a hidden launcher errored: {error}"))?;
         thread::sleep(SILENCE);
         let answers = lock(host).answers;
-        if answers != 2 {
+        if answers != 4 {
             return Err(format!(
-                "a hidden session was told about a provider answer: expected 2 answers, saw \
+                "a hidden session was told about a provider answer: expected 4 answers, saw \
                  {answers}. An answer belonging to a dismissed activation must be dropped, not \
                  merged into whatever comes next"
             ));
@@ -224,12 +297,30 @@ mod linux {
         Ok(())
     }
 
+    fn returned_row() -> ResultRow {
+        ResultRow {
+            item: ItemId("return-query-result".to_owned()),
+            label: "Returned provider result".to_owned(),
+            description: String::new(),
+            icon_reference: None,
+            icon: None,
+            category: String::new(),
+            plugin_name: "Wake regression".to_owned(),
+            highlights: Vec::new(),
+            argument_hint: None,
+            status: None,
+            default_action: None,
+            alternate_actions: Vec::new(),
+        }
+    }
+
     fn empty_model() -> ViewModel {
         ViewModel {
             generation: Generation::ZERO,
             query: String::new(),
             rows: Arc::default(),
             selected: 0,
+            root_selection_revision: 0,
             pending_plugins: false,
             actions_open: false,
             settings_open: false,

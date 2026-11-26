@@ -380,6 +380,9 @@ struct FrameMailbox {
     /// reappearing over the next one, which has not published a host frame yet.
     overlay: Overlay,
     overlay_session: Option<u64>,
+    /// Root query floor and retired covered work, scoped by `overlay_session`.
+    host_generation: Option<crikey_core::Generation>,
+    retired_generation: Option<crikey_core::Generation>,
 }
 
 const VISIBLE_BIT: u64 = 1;
@@ -413,6 +416,7 @@ struct SharedState {
 /// hands.
 #[derive(Debug, Clone)]
 struct Overlay {
+    root_selection_revision: u64,
     settings_open: bool,
     settings: Arc<[SettingRow]>,
     settings_focus: Option<String>,
@@ -436,6 +440,7 @@ impl Default for Overlay {
     /// has said otherwise, and `false` is what the derive would supply.
     fn default() -> Self {
         Self {
+            root_selection_revision: 0,
             settings_open: false,
             settings: Arc::from([] as [SettingRow; 0]),
             settings_focus: None,
@@ -457,7 +462,19 @@ enum FrameSource {
 
 /// Remembers the host-owned half of a frame the host itself composed.
 fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
+    if mailbox.overlay_session != Some(session) {
+        mailbox.retired_generation = None;
+    }
+    mailbox.host_generation = Some(model.generation);
+    if model.settings_open || model.page.is_some() {
+        mailbox.retired_generation = Some(
+            mailbox
+                .retired_generation
+                .map_or(model.generation, |floor| floor.max(model.generation)),
+        );
+    }
     mailbox.overlay = Overlay {
+        root_selection_revision: model.root_selection_revision,
         settings_open: model.settings_open,
         settings: Arc::clone(&model.settings),
         settings_focus: model.settings_focus.clone(),
@@ -466,6 +483,20 @@ fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
         page: model.page.clone(),
     };
     mailbox.overlay_session = Some(session);
+}
+
+/// Results may refresh only an uncovered root with work newer than its last
+/// covered lifetime. Returning to the root requires a fresh query generation.
+fn admits_results(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> bool {
+    mailbox.overlay_session != Some(session)
+        || (!mailbox.overlay.settings_open
+            && mailbox.overlay.page.is_none()
+            && mailbox
+                .host_generation
+                .is_none_or(|floor| model.generation >= floor)
+            && mailbox
+                .retired_generation
+                .is_none_or(|floor| model.generation > floor))
 }
 
 /// Puts this session's retained host overlay back onto a provider's frame.
@@ -477,6 +508,7 @@ fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> View
         return model.clone();
     }
     ViewModel {
+        root_selection_revision: mailbox.overlay.root_selection_revision,
         settings_open: mailbox.overlay.settings_open,
         settings: Arc::clone(&mailbox.overlay.settings),
         settings_focus: mailbox.overlay.settings_focus.clone(),
@@ -771,13 +803,19 @@ impl NativeLauncherHandle {
 
     /// Publishes a results-only frame from a provider thread.
     ///
-    /// A provider driver builds its view model from a query and its own rows;
-    /// it has no idea whether the user has the settings surface open, and the
-    /// `false` it necessarily carries would close that surface mid-edit. This
-    /// session's retained host overlay is put back on as the frame is queued,
-    /// so a suggestion arriving during a settings edit updates the results
-    /// behind the panel instead of dismissing it.
+    /// A provider owns results, never settings or custom pages. Covered views
+    /// reject direct frames entirely. Returning to the root requires a fresh
+    /// generation, so queued pre-cover answers cannot overwrite the restored
+    /// list after Back either.
+    ///
+    /// Always announces the stored provider outcome to the host, even when the
+    /// renderer rejects this frame. A fresh return query can finish before the
+    /// host publishes its uncovered frame; only the host can merge that answer.
     pub fn submit_results(&self, model: &ViewModel) -> Result<(), RendererError> {
+        // Announce before taking the frame mailbox lock: rendering admission
+        // must not decide whether the host drains the stored outcome. The
+        // existing answer path keeps hidden sessions inert.
+        self.request_provider_answer()?;
         self.enqueue(model, FrameSource::Provider)
     }
 
@@ -804,7 +842,12 @@ impl NativeLauncherHandle {
                     record_overlay(&mut mailbox, session, model);
                     model.clone()
                 }
-                FrameSource::Provider => with_overlay(&mailbox, session, model),
+                FrameSource::Provider => {
+                    if !admits_results(&mailbox, session, model) {
+                        return Ok(());
+                    }
+                    with_overlay(&mailbox, session, model)
+                }
             };
             mailbox.latest = Some(PendingFrame { session, model });
             if mailbox.wake_session == Some(session) {
@@ -2879,21 +2922,18 @@ fn flatten_line_breaks(text: &mut String) {
     }
 }
 
-/// What the renderer last scrolled the result list to, kept per context.
+/// Logical selection intent and layout last painted by this renderer.
 ///
-/// Without it the selected row asks to be scrolled into view on every frame,
-/// which silently undoes the user's own mouse wheel on the very next repaint.
-/// The anchor is renderer state rather than view-model state because it is
-/// about where this list is currently scrolled, which no other renderer and no
-/// host can answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A fresh allocation is not navigation: host recomposition may publish the
+/// same choices while the user is reading farther down the list.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct ScrollAnchor {
-    /// Identity of the row set the anchor was taken from. The address of the
-    /// shared allocation, because `publish` replaces the row set wholesale:
-    /// a different address is a different list, and the same address is the
-    /// same list however the user has scrolled it.
-    rows: usize,
+    generation: crikey_core::Generation,
+    revision: u64,
     selected: usize,
+    /// Unscrolled row top and height, rounded to physical pixels so wheel
+    /// translation cannot masquerade as a layout change.
+    row_geometry: egui::Vec2,
 }
 
 fn scroll_anchor_id() -> egui::Id {
@@ -2910,13 +2950,6 @@ fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
     if model.rows.is_empty() {
         return;
     }
-
-    let anchor = ScrollAnchor {
-        rows: Arc::as_ptr(&model.rows).cast::<()>() as usize,
-        selected: model.selected,
-    };
-    let previous = ui.data(|data| data.get_temp::<ScrollAnchor>(scroll_anchor_id()));
-    ui.data_mut(|data| data.insert_temp(scroll_anchor_id(), anchor));
 
     // What the list may occupy is what is left after everything drawn under
     // it, measured rather than guessed. This used to subtract a flat
@@ -2972,19 +3005,27 @@ fn draw_results(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
             let Some(response) = selected_row else {
                 return;
             };
-            // Follow the selection, never the scroll position: a wheel gesture
-            // that leaves the selected row behind is exactly what the user
-            // asked for, and scrolling back would undo it on the next repaint.
-            // A list that was replaced under the selection is the one case
-            // where nobody asked for the current scroll offset, so there the
-            // row is fetched back if it landed out of sight.
-            let follow = match previous {
-                None => true,
-                Some(previous) if previous.selected != anchor.selected => true,
-                Some(previous) => {
-                    previous.rows != anchor.rows && !ui.clip_rect().contains_rect(response.rect)
-                }
+            let scale = ui.ctx().pixels_per_point();
+            let row_geometry = egui::vec2(
+                ((response.rect.top() - ui.min_rect().top()) * scale).round(),
+                (response.rect.height() * scale).round(),
+            );
+            let anchor = ScrollAnchor {
+                generation: model.generation,
+                revision: model.root_selection_revision,
+                selected: model.selected,
+                row_geometry,
             };
+            let previous = ui.data(|data| data.get_temp::<ScrollAnchor>(scroll_anchor_id()));
+            ui.data_mut(|data| data.insert_temp(scroll_anchor_id(), anchor));
+            // Follow explicit intent and real logical row layout changes,
+            // never a wheel offset or allocation-only host republication.
+            let follow = previous.is_none_or(|previous| {
+                previous.generation != anchor.generation
+                    || previous.revision != anchor.revision
+                    || previous.selected != anchor.selected
+                    || previous.row_geometry != anchor.row_geometry
+            });
             if follow {
                 response.scroll_to_me(None);
             }
@@ -5123,6 +5164,7 @@ mod transparency_tests {
             query: String::new(),
             rows: Arc::default(),
             selected: 0,
+            root_selection_revision: 0,
             pending_plugins: false,
             actions_open: false,
             settings_open: false,
@@ -5242,6 +5284,7 @@ mod lifecycle_tests {
                     query: String::new(),
                     rows: Arc::default(),
                     selected: 0,
+                    root_selection_revision: 0,
                     pending_plugins: false,
                     actions_open: false,
                     settings_open: false,
@@ -5352,6 +5395,7 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
                 query: String::new(),
                 rows: Arc::default(),
                 selected: 0,
+                root_selection_revision: 0,
                 pending_plugins: false,
                 actions_open: false,
                 settings_open: false,
@@ -5705,6 +5749,7 @@ mod window_geometry_tests {
             query: query.to_owned(),
             rows: Arc::default(),
             selected: 0,
+            root_selection_revision: 0,
             pending_plugins: false,
             actions_open: false,
             settings_open,
@@ -5749,6 +5794,7 @@ mod window_geometry_tests {
     fn a_provider_frame_inherits_the_settings_surface_the_host_last_published() {
         let mut mailbox = FrameMailbox::default();
         let mut host = view("", true);
+        host.root_selection_revision = 7;
         host.settings = vec![SettingRow {
             key: "launcher.activation-hotkey".to_owned(),
             label: "Activation hotkey".to_owned(),
@@ -5761,6 +5807,15 @@ mod window_geometry_tests {
         record_overlay(&mut mailbox, 7, &host);
 
         let published = with_overlay(&mailbox, 7, &view("term", false));
+        assert_eq!(
+            published.root_selection_revision, 7,
+            "provider defaults cannot replace host follow intent"
+        );
+        assert_eq!(
+            with_overlay(&mailbox, 8, &view("term", false)).root_selection_revision,
+            0,
+            "follow intent cannot cross activation sessions"
+        );
         assert!(
             published.settings_open,
             "a provider must not close the surface the user is editing"
@@ -5853,6 +5908,35 @@ mod window_geometry_tests {
             !with_overlay(&mailbox, 8, &view("term", false)).settings_open,
             "a new activation starts with no panel until its host says otherwise"
         );
+    }
+
+    #[test]
+    fn direct_provider_frames_cannot_cross_a_covered_root_lifetime() {
+        let tracker = crikey_core::GenerationTracker::new();
+        let old = tracker.advance();
+        let fresh = tracker.advance();
+        let mut root = view("term", false);
+        root.generation = old;
+        let mut mailbox = FrameMailbox::default();
+        record_overlay(&mut mailbox, 7, &root);
+        assert!(admits_results(&mailbox, 7, &root));
+
+        let mut covered = root.clone();
+        covered.settings_open = true;
+        record_overlay(&mut mailbox, 7, &covered);
+        assert!(!admits_results(&mailbox, 7, &root));
+        let mut next = root.clone();
+        next.generation = fresh;
+        assert!(!admits_results(&mailbox, 7, &next));
+
+        record_overlay(&mut mailbox, 7, &root);
+        assert!(!admits_results(&mailbox, 7, &root));
+        record_overlay(&mut mailbox, 7, &next);
+        assert!(admits_results(&mailbox, 7, &next));
+        assert!(!admits_results(&mailbox, 7, &root));
+
+        record_overlay(&mut mailbox, 8, &root);
+        assert!(admits_results(&mailbox, 8, &root), "retirement is session-local");
     }
 
     #[test]

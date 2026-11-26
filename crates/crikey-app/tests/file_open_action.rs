@@ -409,13 +409,20 @@ fn argv(recorded: &[u8]) -> Vec<Vec<u8>> {
 
 /// Writes an executable script, out of reach of the exec-time text-busy race.
 ///
-/// Staged under another name and renamed into place: this binary is
-/// multi-threaded, so a sibling test that forks between this file's `open` and
-/// `close` hands the child a writable descriptor, and the kernel then refuses
-/// to exec the path with ETXTBSY.
+/// Only a writer child opens the inode writable: a sibling test can fork while
+/// this multi-threaded parent is creating fixtures, inheriting any writable
+/// descriptors the parent holds. Renaming would not help: ETXTBSY tracks the
+/// inode, not its name. Waiting for the writer to exit closes its descriptors
+/// before the helper can be executed.
 fn write_program(path: &Path, body: &str) {
-    let staged = path.with_extension("staging");
-    fs::write(&staged, body).expect("fixture program is writable");
-    fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("fixture mode is settable");
-    fs::rename(&staged, path).expect("fixture program is movable into place");
+    let status = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("printf '%s' \"$2\" > \"$1\"")
+        .arg("write-program")
+        .arg(path)
+        .arg(body)
+        .status()
+        .expect("fixture writer is spawnable");
+    assert!(status.success(), "fixture writer must succeed");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("fixture mode is settable");
 }
