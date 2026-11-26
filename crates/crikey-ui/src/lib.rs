@@ -457,6 +457,10 @@ pub struct ViewModel {
     pub query: String,
     pub rows: Arc<[ResultRow]>,
     pub selected: usize,
+    /// Changes on explicit selection intent or same-generation publication
+    /// that changes the selected target or index. Query generations carry
+    /// query navigation separately; identical republications do not undo scrolling.
+    pub root_selection_revision: u64,
     /// True while at least one plugin is still working on this generation.
     pub pending_plugins: bool,
     /// True while the action list of the selected row is open (spec 6.3).
@@ -856,6 +860,7 @@ pub struct LauncherViewModel {
     /// renderer is still holding must keep describing what it was given.
     rows: Arc<[ResultRow]>,
     selected: usize,
+    root_selection_revision: u64,
     /// Whether the user has moved the selection themselves within the current
     /// generation.
     ///
@@ -977,6 +982,7 @@ impl LauncherViewModel {
             query: String::new(),
             rows: Arc::default(),
             selected: 0,
+            root_selection_revision: 0,
             navigated: false,
             action_panel: None,
             pending_plugins: false,
@@ -1820,7 +1826,19 @@ impl LauncherViewModel {
             return;
         }
 
-        self.selected = self.resolve_selection(&rows, generation);
+        let selected = self.resolve_selection(&rows, generation);
+        // The first ordinary query publication replaces a prior generation,
+        // not a choice already painted for this query. Its generation/index
+        // already drive native follow, including direct provider first answers.
+        // Return searches deliberately retag `published` in `begin_generation`.
+        if self.published == Some(generation)
+            && (self.selected != selected
+                || self.rows.get(self.selected).map(|row| &row.target)
+                    != rows.get(selected).map(|row| &row.target))
+        {
+            self.root_selection_revision = self.root_selection_revision.wrapping_add(1);
+        }
+        self.selected = selected;
         // One move into a shared allocation per accepted publish; from here on
         // every frame of this result set is a refcount bump.
         self.rows = rows.into();
@@ -1873,6 +1891,7 @@ impl LauncherViewModel {
             } else {
                 self.selected
             },
+            root_selection_revision: self.root_selection_revision,
             pending_plugins: self.pending_plugins,
             action_panel: self.action_panel.clone(),
             command_management: Arc::clone(&self.command_management),
@@ -3184,18 +3203,19 @@ impl LauncherViewModel {
         };
 
         let target = target.min(last);
-        if target == self.selected {
-            return;
+        // Only leaving the row retires its action list; a boundary key still
+        // reveals the same selected row without closing its actions.
+        if target != self.selected {
+            self.close_actions();
         }
 
         self.selected = target;
         self.preview_selection();
+        // A boundary key is still an explicit request to reveal this choice.
+        self.root_selection_revision = self.root_selection_revision.wrapping_add(1);
         // The only path a person's arrow or page key reaches, so this is where
         // a default becomes a choice.
         self.navigated = true;
-        // The action list belongs to the row it was opened over, so moving off
-        // that row closes it instead of silently retargeting it.
-        self.close_actions();
         self.dirty = true;
     }
 

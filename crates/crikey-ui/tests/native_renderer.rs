@@ -7,14 +7,14 @@ use std::{
 };
 
 use crikey_core::{
-    Generation, ItemId, NodeRole, NodeShape, PageColor, PageFrame, PageImage, PageInput, PageInputKind,
-    PageNode, PluginId,
+    Generation, GenerationTracker, ItemId, NodeRole, NodeShape, PageColor, PageFrame, PageImage, PageInput,
+    PageInputKind, PageNode, PluginId,
 };
 use crikey_platform::IconImage;
 use crikey_ui::{
-    build_launcher_frame, create_launcher_context, egui, ActivationLatencyTracker, NativeLauncher,
-    NativeLauncherConfig, NativeLauncherHandle, PageSurface, RendererError, ResultRow, SettingControl,
-    SettingRow, UiCommand, ViewModel, WebImeEvent, WebSurfaceFrame, WebSurfaceInput,
+    build_launcher_frame, create_launcher_context, egui, ActivationLatencyTracker, LauncherViewModel,
+    NativeLauncher, NativeLauncherConfig, NativeLauncherHandle, PageSurface, RendererError, ResultRow,
+    SettingControl, SettingRow, UiCommand, ViewModel, WebImeEvent, WebSurfaceFrame, WebSurfaceInput,
     ACTIVATION_SAMPLE_CAPACITY, WEB_MODIFIER_SHIFT,
 };
 
@@ -24,6 +24,7 @@ fn model(query: &str) -> ViewModel {
         query: query.to_owned(),
         rows: Arc::default(),
         selected: 0,
+        root_selection_revision: 0,
         pending_plugins: false,
         action_panel: None,
         settings_open: false,
@@ -634,6 +635,26 @@ impl Frames {
         }
         last
     }
+
+    /// Drives real paints and applies every emitted command to the model.
+    fn settle_model(
+        &mut self,
+        state: &mut LauncherViewModel,
+        view: &mut ViewModel,
+    ) -> crikey_ui::NativeUiFrame {
+        let mut last = None;
+        for _ in 0..41 {
+            let mut frame = self.draw(view, Vec::new());
+            for command in frame.commands.drain(..) {
+                let _ = state.apply(command);
+            }
+            if let Some(next) = state.frame() {
+                *view = next;
+            }
+            last = Some(frame);
+        }
+        last.expect("at least one consumer frame")
+    }
 }
 
 /// Reach inline action-sheet controls using its real, independently scrolling
@@ -726,7 +747,7 @@ fn moving_the_selection_scrolls_the_row_back_into_view() {
 }
 
 #[test]
-fn a_replaced_list_puts_the_selected_row_back_on_screen() {
+fn a_new_query_puts_the_selected_row_back_on_screen() {
     let mut frames = Frames::new();
     let view = scrollable_model(40, 0);
     let _ = frames.draw(&view, Vec::new());
@@ -734,16 +755,237 @@ fn a_replaced_list_puts_the_selected_row_back_on_screen() {
     let scrolled = frames.settle(&view);
     assert!(!painted(&scrolled, "row-0"));
 
-    // A republish hands over a different row set with the same selection.
-    // Nobody asked for the offset the old list was left at, so the selected
-    // row is fetched back into view.
-    let replaced = scrollable_model(40, 0);
+    // A new query is navigation even when its rows and index are identical.
+    let mut replaced = scrollable_model(40, 0);
+    replaced.generation = GenerationTracker::new().advance();
     let followed = frames.settle(&replaced);
 
     assert!(
         painted(&followed, "row-0"),
-        "a list that was replaced under the selection must show the selected row"
+        "a new query must show its selected row"
     );
+}
+
+/// Measures a full-width row against its actual paint viewport, not merely a
+/// text galley that egui may emit outside the viewport.
+fn root_row_geometry(frame: &crikey_ui::NativeUiFrame, label: &str) -> Option<(egui::Rect, egui::Rect)> {
+    fn origin(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == label => Some(text.pos),
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| origin(shape, label)),
+            _ => None,
+        }
+    }
+    fn row_at(shape: &egui::Shape, position: egui::Pos2) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::Rect(rect)
+                if rect.rect.width() > NativeLauncherConfig::default().width as f32 / 2.0
+                    && rect.rounding.nw > 0.0
+                    && rect.rect.contains(position) =>
+            {
+                Some(rect.rect)
+            }
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .filter_map(|shape| row_at(shape, position))
+                .min_by(|a, b| a.height().total_cmp(&b.height())),
+            _ => None,
+        }
+    }
+    let position = frame
+        .output
+        .shapes
+        .iter()
+        .find_map(|shape| origin(&shape.shape, label))?;
+    frame
+        .output
+        .shapes
+        .iter()
+        .filter_map(|shape| row_at(&shape.shape, position).map(|rect| (rect, shape.clip_rect)))
+        .min_by(|(a, _), (b, _)| a.height().total_cmp(&b.height()))
+}
+
+fn root_row_visible(frame: &crikey_ui::NativeUiFrame, label: &str) -> bool {
+    root_row_geometry(frame, label).is_some_and(|(row, viewport)| viewport.contains_rect(row))
+}
+
+fn root_state(generation: Generation) -> (LauncherViewModel, ViewModel) {
+    let mut state = LauncherViewModel::new();
+    state.activate();
+    let _ = state.apply(UiCommand::SetQuery("root".into()));
+    state.begin_generation(generation);
+    state.publish(generation, (0..40).map(result_row).collect(), false);
+    let view = state.frame().expect("initial root publication");
+    (state, view)
+}
+
+#[test]
+fn root_manual_scroll_survives_identical_and_cosmetic_publications() {
+    let generation = GenerationTracker::new().advance();
+    let (mut state, mut view) = root_state(generation);
+    let mut frames = Frames::new();
+    let first = frames.settle_model(&mut state, &mut view);
+    assert!(root_row_visible(&first, "row-0"));
+    let _ = frames.draw(&view, wheel_over_list());
+    let manual = frames.settle_model(&mut state, &mut view);
+    assert!(!root_row_visible(&manual, "row-0"));
+    let (anchor, before) = view
+        .rows
+        .iter()
+        .enumerate()
+        .find_map(|(index, row)| {
+            root_row_geometry(&manual, &row.label)
+                .filter(|(rect, viewport)| viewport.contains_rect(*rect))
+                .map(|(rect, _)| (index, rect))
+        })
+        .expect("manual viewport contains a complete result row");
+    let old_rows = Arc::clone(&view.rows);
+    let revision = view.root_selection_revision;
+    state.publish(generation, old_rows.to_vec(), true);
+    state.publish(generation, old_rows.to_vec(), false);
+    view = state.frame().expect("coalesced host republications");
+    assert!(
+        !Arc::ptr_eq(&old_rows, &view.rows),
+        "exercise a genuinely new allocation"
+    );
+    assert_eq!(view.root_selection_revision, revision);
+    let republished = frames.settle_model(&mut state, &mut view);
+    assert!(!root_row_visible(&republished, "row-0"));
+    assert_eq!(
+        root_row_geometry(&republished, &view.rows[anchor].label)
+            .unwrap()
+            .0,
+        before
+    );
+
+    // Preserving manual scroll must not discard changed display content.
+    let mut changed = view.rows.to_vec();
+    changed[anchor].label = "Updated visible result".into();
+    changed[anchor].description = "Updated description".into();
+    changed[anchor].icon = Some(solid_icon([17, 34, 51, 255]));
+    changed[anchor].status = Some("Updated status".into());
+    state.publish(generation, changed, false);
+    view = state.frame().expect("real cosmetic changes publish");
+    assert_eq!(view.root_selection_revision, revision);
+    assert_eq!(view.rows[anchor].status.as_deref(), Some("Updated status"));
+    let updated = frames.settle_model(&mut state, &mut view);
+    assert!(root_row_visible(&updated, "Updated visible result"));
+    assert_eq!(
+        root_row_geometry(&updated, "Updated visible result").unwrap().0,
+        before
+    );
+    assert!(!root_row_visible(&updated, "row-0"));
+}
+
+#[test]
+fn root_boundary_navigation_and_new_query_reveal_same_index_selection() {
+    let generations = GenerationTracker::new();
+    let generation = generations.advance();
+    let (mut state, mut view) = root_state(generation);
+    let mut frames = Frames::new();
+    let _ = frames.settle_model(&mut state, &mut view);
+    let _ = frames.draw(&view, wheel_over_list());
+    let manual = frames.settle_model(&mut state, &mut view);
+    assert!(!root_row_visible(&manual, "row-0"));
+    let revision = view.root_selection_revision;
+    let _ = state.apply(UiCommand::SelectPrevious);
+    state.publish(generation, view.rows.to_vec(), false);
+    view = state
+        .frame()
+        .expect("boundary navigation survives coalesced publication");
+    assert_eq!(view.selected, 0);
+    assert_ne!(view.root_selection_revision, revision);
+    let followed = frames.settle_model(&mut state, &mut view);
+    assert!(root_row_visible(&followed, "row-0"));
+
+    let _ = frames.draw(&view, wheel_over_list());
+    let manual = frames.settle_model(&mut state, &mut view);
+    assert!(!root_row_visible(&manual, "row-0"));
+    let _ = state.apply(UiCommand::SetQuery("another root query".into()));
+    let next = generations.advance();
+    state.begin_generation(next);
+    state.publish(next, view.rows.to_vec(), false);
+    view = state.frame().expect("new query with identical rows");
+    let queried = frames.settle_model(&mut state, &mut view);
+    assert_eq!(view.selected, 0);
+    assert!(root_row_visible(&queried, "row-0"));
+}
+
+#[test]
+fn root_keyboard_follow_survives_coalescing_and_same_index_target_replacement() {
+    let generation = GenerationTracker::new().advance();
+    let (mut state, mut view) = root_state(generation);
+    let mut frames = Frames::new();
+    let _ = frames.settle_model(&mut state, &mut view);
+    let _ = state.apply(UiCommand::PageDown);
+    let _ = state.apply(UiCommand::PageDown);
+    let _ = state.apply(UiCommand::PageDown);
+    state.publish(generation, view.rows.to_vec(), true);
+    state.publish(generation, view.rows.to_vec(), false);
+    view = state
+        .frame()
+        .expect("keyboard intent and host publications coalesce");
+    let selected = view.selected;
+    assert!(selected > 0);
+    let followed = frames.settle_model(&mut state, &mut view);
+    assert!(root_row_visible(&followed, &view.rows[selected].label));
+
+    let _ = frames.draw(&view, wheel_over_list());
+    let manual = frames.settle_model(&mut state, &mut view);
+    assert!(!root_row_visible(&manual, &view.rows[selected].label));
+    let revision = view.root_selection_revision;
+    let mut changed = view.rows.to_vec();
+    changed[selected] = result_row(1000 + selected);
+    changed[selected].label = "Replacement selected result".into();
+    state.publish(generation, changed, false);
+    view = state
+        .frame()
+        .expect("removed selection falls back at the same index");
+    assert_eq!(view.selected, selected);
+    assert_ne!(view.root_selection_revision, revision);
+    let replaced = frames.settle_model(&mut state, &mut view);
+    assert!(root_row_visible(&replaced, "Replacement selected result"));
+}
+
+#[test]
+fn root_first_provider_answer_follows_new_query_before_host_publication() {
+    let generations = GenerationTracker::new();
+    let (mut state, _) = root_state(generations.advance());
+    let _ = state.apply(UiCommand::PageDown);
+    let mut view = state.frame().expect("a nonzero choice in the previous query");
+    let mut frames = Frames::new();
+    let _ = frames.settle_model(&mut state, &mut view);
+    let _ = frames.draw(&view, wheel_over_list());
+    let manual = frames.settle_model(&mut state, &mut view);
+    assert!(!root_row_visible(&manual, "row-0"));
+
+    let _ = state.apply(UiCommand::SetQuery("next query".into()));
+    let generation = generations.advance();
+    state.begin_generation(generation);
+    let pending = state.frame().expect("pending host query frame");
+    assert_eq!(pending.root_selection_revision, view.root_selection_revision);
+    // Provider first-answer delivery can draw before the host merges its rows.
+    // Its host overlay carries the pending intent, not a fabricated new token.
+    let mut provider = scrollable_model(40, 0);
+    for (index, row) in Arc::make_mut(&mut provider.rows).iter_mut().enumerate() {
+        *row = result_row(40 + index);
+        row.label = format!("row-{index}");
+    }
+    provider.generation = generation;
+    provider.root_selection_revision = pending.root_selection_revision;
+    let answered = frames.settle(&provider);
+    assert!(root_row_visible(&answered, "row-0"));
+
+    // A subsequent identical first host merge is publication, not another
+    // navigation intent that can revoke a wheel gesture after the answer.
+    let _ = frames.draw(&provider, wheel_over_list());
+    let manual = frames.settle(&provider);
+    assert!(!root_row_visible(&manual, "row-0"));
+    state.publish(generation, provider.rows.to_vec(), false);
+    view = state.frame().expect("first host merge after provider answer");
+    assert_eq!(view.root_selection_revision, provider.root_selection_revision);
+    let merged = frames.settle_model(&mut state, &mut view);
+    assert!(!root_row_visible(&merged, "row-0"));
 }
 
 fn hotkey_settings_model() -> ViewModel {
