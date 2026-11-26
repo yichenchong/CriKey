@@ -557,7 +557,7 @@ fn selection_moves_one_row_at_a_time_and_clamps_at_the_last_row() {
     }
 
     assert_eq!(view_model.apply(UiCommand::SelectNext), None);
-    expect_idle(&mut view_model);
+    assert_eq!(expect_frame(&mut view_model).selected, 2);
 
     assert_eq!(view_model.apply(UiCommand::SelectPrevious), None);
     assert_eq!(
@@ -574,7 +574,7 @@ fn selection_clamps_at_the_first_row() {
     let _ = expect_frame(&mut view_model);
 
     assert_eq!(view_model.apply(UiCommand::SelectPrevious), None);
-    expect_idle(&mut view_model);
+    assert_eq!(expect_frame(&mut view_model).selected, 0);
 
     select_index(&mut view_model, 1);
     let _ = expect_frame(&mut view_model);
@@ -607,14 +607,82 @@ fn page_navigation_moves_a_whole_page_and_clamps_without_wrapping() {
         assert_eq!(expect_frame(&mut view_model).selected, expected);
     }
     assert_eq!(view_model.apply(UiCommand::PageDown), None);
-    expect_idle(&mut view_model);
+    assert_eq!(expect_frame(&mut view_model).selected, last);
 
     for expected in [last - PAGE_SIZE, last - PAGE_SIZE * 2, 0] {
         assert_eq!(view_model.apply(UiCommand::PageUp), None);
         assert_eq!(expect_frame(&mut view_model).selected, expected);
     }
     assert_eq!(view_model.apply(UiCommand::PageUp), None);
-    expect_idle(&mut view_model);
+    assert_eq!(expect_frame(&mut view_model).selected, 0);
+}
+
+#[test]
+fn root_follow_revision_tracks_intent_and_identity_not_cosmetic_publication() {
+    let generations = GenerationTracker::new();
+    let generation = generations.advance();
+    let mut state = open_showing(generation, &["alpha", "beta", "gamma"]);
+    let first = expect_frame(&mut state);
+    let mut changed = first.rows.to_vec();
+    changed[0].label = "Updated title".into();
+    changed[0].description = "Updated description".into();
+    changed[0].status = Some("Updated status".into());
+    state.publish(generation, changed, false);
+    let cosmetic = expect_frame(&mut state);
+    assert!(!std::sync::Arc::ptr_eq(&first.rows, &cosmetic.rows));
+    assert_eq!(cosmetic.root_selection_revision, first.root_selection_revision);
+    assert_eq!(cosmetic.rows[0].label, "Updated title");
+    assert_eq!(cosmetic.rows[0].status.as_deref(), Some("Updated status"));
+
+    let mut changed = cosmetic.rows.to_vec();
+    changed[0].target = crikey_ui::ActionTarget::Result {
+        owner: PluginId("another-owner".into()),
+        item: ItemId("alpha".into()),
+    };
+    changed[0].source.as_mut().expect("result source").owner = PluginId("another-owner".into());
+    state.publish(generation, changed, false);
+    let owner = expect_frame(&mut state);
+    assert_eq!(owner.selected, 0);
+    assert_ne!(owner.root_selection_revision, cosmetic.root_selection_revision);
+
+    let _ = state.apply(UiCommand::SelectPrevious);
+    let boundary = expect_frame(&mut state);
+    assert_eq!(boundary.selected, 0);
+    assert_ne!(boundary.root_selection_revision, owner.root_selection_revision);
+    let _ = state.apply(UiCommand::SelectNext);
+    let _ = state.apply(UiCommand::SelectPrevious);
+    state.publish(generation, boundary.rows.to_vec(), false);
+    let coalesced = expect_frame(&mut state);
+    assert_eq!(coalesced.selected, 0);
+    assert_ne!(
+        coalesced.root_selection_revision,
+        boundary.root_selection_revision
+    );
+
+    let _ = state.apply(UiCommand::SetQuery("another query".into()));
+    let next = generations.advance();
+    state.begin_generation(next);
+    state.publish(next, coalesced.rows.to_vec(), false);
+    let queried = expect_frame(&mut state);
+    assert_eq!(queried.selected, 0);
+    assert_eq!(queried.root_selection_revision, coalesced.root_selection_revision);
+
+    // Commands may share an ordinary source item without sharing identity.
+    state.publish(next, vec![command_row("first")], false);
+    let first_command = expect_frame(&mut state);
+    state.publish(next, vec![command_row("second")], false);
+    let second_command = expect_frame(&mut state);
+    assert_eq!(second_command.selected, 0);
+    assert_ne!(
+        first_command.root_selection_revision,
+        second_command.root_selection_revision
+    );
+    state.publish(next, vec![command_row("second")], false);
+    let identical_command = expect_frame(&mut state);
+    assert_eq!(
+        identical_command.root_selection_revision,
+        second_command.root_selection_revision
+    );
 }
 
 #[test]
@@ -1533,6 +1601,34 @@ fn vanished_owner_or_action_invalidates_and_never_revives_or_redirects() {
 }
 
 #[test]
+fn moving_to_the_same_root_row_preserves_action_search_and_activation() {
+    let mut model = open_showing_actions(fresh_generation(), &["alpha"]);
+    model.apply(UiCommand::SetActionQuery("reveal".into()));
+    let mut frame = expect_frame(&mut model);
+    for command in [
+        UiCommand::SelectNext,
+        UiCommand::SelectPrevious,
+        UiCommand::PageDown,
+        UiCommand::PageUp,
+    ] {
+        assert_eq!(model.apply(command), None);
+        if let Some(updated) = model.frame() {
+            frame = updated;
+        }
+        assert_eq!(selected_id(&frame), "alpha");
+        assert_eq!(frame.action_panel.as_ref().unwrap().query(), "reveal");
+    }
+    assert_eq!(
+        model.apply(UiCommand::ActivateSelectedAction),
+        Some(UiEffect::Execute {
+            owner: PluginId("core".into()),
+            item: ItemId("alpha".into()),
+            action: ActionId("reveal".into()),
+        })
+    );
+}
+
+#[test]
 fn nested_back_clears_search_then_returns_to_panel_without_touching_root() {
     let mut model = open_showing_actions(fresh_generation(), &["alpha"]);
     let frame = model.frame();
@@ -1814,7 +1910,10 @@ fn navigation_stays_put_on_a_single_result() {
         UiCommand::PageUp,
     ] {
         assert_eq!(view_model.apply(command), None);
-        expect_idle(&mut view_model);
+        let model = expect_frame(&mut view_model);
+        assert_eq!(model.selected, 0);
+        assert_eq!(selected_id(&model), "only");
+        assert!(model.action_panel.is_none());
     }
 
     assert_eq!(

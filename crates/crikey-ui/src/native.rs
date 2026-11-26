@@ -448,6 +448,7 @@ struct SharedState {
 /// hands.
 #[derive(Debug, Clone)]
 struct Overlay {
+    root_selection_revision: u64,
     settings_open: bool,
     settings: Arc<[SettingRow]>,
     setting_edits: Arc<[crate::SettingEditOutcome]>,
@@ -475,6 +476,7 @@ impl Default for Overlay {
     /// has said otherwise, and `false` is what the derive would supply.
     fn default() -> Self {
         Self {
+            root_selection_revision: 0,
             settings_open: false,
             settings: Arc::from([] as [SettingRow; 0]),
             setting_edits: Arc::default(),
@@ -512,6 +514,7 @@ fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
         );
     }
     mailbox.overlay = Overlay {
+        root_selection_revision: model.root_selection_revision,
         settings_open: model.settings_open,
         settings: Arc::clone(&model.settings),
         setting_edits: Arc::clone(&model.setting_edits),
@@ -549,6 +552,7 @@ fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> View
         return model.clone();
     }
     ViewModel {
+        root_selection_revision: mailbox.overlay.root_selection_revision,
         settings_open: mailbox.overlay.settings_open,
         settings: Arc::clone(&mailbox.overlay.settings),
         setting_edits: Arc::clone(&mailbox.overlay.setting_edits),
@@ -3407,21 +3411,18 @@ fn flatten_line_breaks(text: &mut String) {
     }
 }
 
-/// What the renderer last scrolled the result list to, kept per context.
+/// Logical selection intent and layout last painted by this renderer.
 ///
-/// Without it the selected row asks to be scrolled into view on every frame,
-/// which silently undoes the user's own mouse wheel on the very next repaint.
-/// The anchor is renderer state rather than view-model state because it is
-/// about where this list is currently scrolled, which no other renderer and no
-/// host can answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A fresh allocation is not navigation: host recomposition may publish the
+/// same choices while the user is reading farther down the list.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct ScrollAnchor {
-    /// Identity of the row set the anchor was taken from. The address of the
-    /// shared allocation, because `publish` replaces the row set wholesale:
-    /// a different address is a different list, and the same address is the
-    /// same list however the user has scrolled it.
-    rows: usize,
+    generation: crikey_core::Generation,
+    revision: u64,
     selected: usize,
+    /// Unscrolled row top and height, rounded to physical pixels so wheel
+    /// translation cannot masquerade as a layout change.
+    row_geometry: egui::Vec2,
 }
 
 fn scroll_anchor_id() -> egui::Id {
@@ -3446,12 +3447,6 @@ fn draw_results(
         return;
     }
 
-    let anchor = ScrollAnchor {
-        rows: Arc::as_ptr(&model.rows).cast::<()>() as usize,
-        selected: model.selected,
-    };
-    let previous = ui.data(|data| data.get_temp::<ScrollAnchor>(scroll_anchor_id()));
-    ui.data_mut(|data| data.insert_temp(scroll_anchor_id(), anchor));
     let previous_restoration = ui.data(|data| data.get_temp::<u64>(restoration_id));
     let mut restoring = model.navigation.preserve_scroll
         && model.navigation.restoration != 0
@@ -3558,19 +3553,27 @@ fn draw_results(
             let Some(response) = selected_row else {
                 return;
             };
-            // Follow the selection, never the scroll position: a wheel gesture
-            // that leaves the selected row behind is exactly what the user
-            // asked for, and scrolling back would undo it on the next repaint.
-            // A list that was replaced under the selection is the one case
-            // where nobody asked for the current scroll offset, so there the
-            // row is fetched back if it landed out of sight.
-            let follow = match previous {
-                None => true,
-                Some(previous) if previous.selected != anchor.selected => true,
-                Some(previous) => {
-                    previous.rows != anchor.rows && !ui.clip_rect().contains_rect(response.rect)
-                }
+            let scale = ui.ctx().pixels_per_point();
+            let row_geometry = egui::vec2(
+                ((response.rect.top() - ui.min_rect().top()) * scale).round(),
+                (response.rect.height() * scale).round(),
+            );
+            let anchor = ScrollAnchor {
+                generation: model.generation,
+                revision: model.root_selection_revision,
+                selected: model.selected,
+                row_geometry,
             };
+            let previous = ui.data(|data| data.get_temp::<ScrollAnchor>(scroll_anchor_id()));
+            ui.data_mut(|data| data.insert_temp(scroll_anchor_id(), anchor));
+            // Follow explicit intent and real logical row layout changes,
+            // never a wheel offset or allocation-only host republication.
+            let follow = previous.is_none_or(|previous| {
+                previous.generation != anchor.generation
+                    || previous.revision != anchor.revision
+                    || previous.selected != anchor.selected
+                    || previous.row_geometry != anchor.row_geometry
+            });
             if follow && !restoring && !model.navigation.preserve_scroll {
                 response.scroll_to_me(None);
             }
@@ -5879,6 +5882,7 @@ mod transparency_tests {
             query: String::new(),
             rows: Arc::default(),
             selected: 0,
+            root_selection_revision: 0,
             pending_plugins: false,
             action_panel: None,
             settings_open: false,
@@ -6162,6 +6166,7 @@ mod lifecycle_tests {
                     query: String::new(),
                     rows: Arc::default(),
                     selected: 0,
+                    root_selection_revision: 0,
                     pending_plugins: false,
                     action_panel: None,
                     settings_open: false,
@@ -6298,6 +6303,7 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
                 query: String::new(),
                 rows: Arc::default(),
                 selected: 0,
+                root_selection_revision: 0,
                 pending_plugins: false,
                 action_panel: None,
                 settings_open: false,
@@ -6673,6 +6679,7 @@ mod window_geometry_tests {
             query: query.to_owned(),
             rows: Arc::default(),
             selected: 0,
+            root_selection_revision: 0,
             pending_plugins: false,
             action_panel: None,
             settings_open,
@@ -6730,6 +6737,7 @@ mod window_geometry_tests {
     fn a_provider_frame_inherits_the_settings_surface_the_host_last_published() {
         let mut mailbox = FrameMailbox::default();
         let mut host = view("", true);
+        host.root_selection_revision = 7;
         host.settings = vec![SettingRow {
             key: "launcher.activation-hotkey".to_owned(),
             label: "Activation hotkey".to_owned(),
@@ -6742,6 +6750,15 @@ mod window_geometry_tests {
         record_overlay(&mut mailbox, 7, &host);
 
         let published = with_overlay(&mailbox, 7, &view("term", false));
+        assert_eq!(
+            published.root_selection_revision, 7,
+            "provider defaults cannot replace host follow intent"
+        );
+        assert_eq!(
+            with_overlay(&mailbox, 8, &view("term", false)).root_selection_revision,
+            0,
+            "follow intent cannot cross activation sessions"
+        );
         assert!(
             published.settings_open,
             "a provider must not close the surface the user is editing"
