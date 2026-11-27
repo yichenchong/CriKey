@@ -12,6 +12,11 @@ by `crates/crikey-legacy-compat/tests/compatibility_matrix.rs`. A row that
 overstates the layer, a documented API that is missing, a duplicate key or an
 unexplained caveat fails that suite.
 
+The separate [host-interface support matrix](host-interface-support.md) covers
+G01–G13 host behavior, independently negotiated runtime capabilities, platform
+evidence and delivery limits. It is prose, not additional `matrix.toml` data;
+host-interface features do not extend this Legacy API-symbol schema.
+
 ## Schema
 
 ```toml

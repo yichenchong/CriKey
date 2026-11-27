@@ -3758,6 +3758,33 @@ impl crate::PluginActionExecutor for NativeActionEndpoint {
         }
     }
 
+    fn plugin_page_session_id(&self) -> Option<crate::PageSessionId> {
+        let _admission = self.admission.admit().ok()?;
+        self.page
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(PageSession::id)
+    }
+
+    fn update_plugin_page_palette(
+        &self,
+        session: crate::PageSessionId,
+        palette: crikey_core::PagePalette,
+    ) -> crikey_core::Result<()> {
+        let _admission = self
+            .admission
+            .admit()
+            .map_err(|_| crikey_core::CoreError::Cancelled)?;
+        self.page
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .ok_or_else(|| crikey_core::CoreError::Invalid("no native page is open".to_owned()))?
+            .update_palette(session, palette)
+            .map_err(crikey_core::CoreError::Invalid)
+    }
+
     fn close_plugin_page(&self) {
         let Ok(_admission) = self.admission.admit() else {
             return;
@@ -4988,6 +5015,76 @@ mod query_history_receipt_tests {
             .submit_declared_command_with_receipt(&declaration, &source, Some("secret"))
             .is_err());
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn live_page_palette_route_preserves_stop_admission() {
+        struct Backend(mpsc::Sender<PageDraw>);
+        impl PageBackend for Backend {
+            fn draw(&mut self, draw: &PageDraw) -> Result<crikey_core::PageFrame, String> {
+                self.0.send(draw.clone()).unwrap();
+                Ok(crikey_core::PageFrame {
+                    generation: draw.generation,
+                    ..Default::default()
+                })
+            }
+        }
+        let (endpoint, _) = endpoint(item());
+        let endpoint = Arc::new(endpoint);
+        let owner = item().plugin_id;
+        let (seen, draws) = mpsc::channel();
+        *endpoint.page.lock().unwrap() = Some(
+            PageSession::open(
+                PageOpen {
+                    plugin: owner.clone(),
+                    page_id: "appearance".into(),
+                    width: 800,
+                    height: 600,
+                    deadlines: PageDeadlines::default(),
+                    palette: crikey_core::PagePalette::default(),
+                },
+                Box::new(Backend(seen)),
+                Arc::new(|| {}),
+            )
+            .unwrap(),
+        );
+        let first = draws.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut router = crate::PluginActionRouter::default();
+        router.register([owner.clone()], endpoint.clone()).unwrap();
+        let session = router.page_session_id(&owner).unwrap();
+        let palette = crikey_core::PagePalette {
+            surface: crikey_core::PageColor::from_u32(0xfafafaff),
+            ..Default::default()
+        };
+        router.update_page_palette(&owner, session, palette).unwrap();
+        let redraw = draws.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(redraw.palette, palette);
+        assert_eq!(redraw.generation, first.generation + 1);
+        assert_eq!((redraw.width, redraw.height), (800, 600));
+        endpoint
+            .admission
+            .close(std::num::NonZeroU64::new(1).unwrap())
+            .unwrap();
+        assert!(router.page_session_id(&owner).is_none());
+        assert!(matches!(
+            router.update_page_palette(&owner, session, crikey_core::PagePalette::default()),
+            Err(crikey_core::CoreError::Cancelled)
+        ));
+        // Cleanup follows the real retirement order: admission closes before
+        // the existing page is taken and its worker is settled.
+        let page = endpoint.page.lock().unwrap().take().unwrap();
+        let (_, closing) = page.close();
+        closing.settle_checked().unwrap();
+        let closed = draws.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            closed.events.last().unwrap().kind,
+            crikey_core::PageInputKind::Closed
+        );
+        assert_eq!(
+            closed.palette, palette,
+            "refused update never reached the session"
+        );
+        assert!(draws.try_recv().is_err());
     }
 
     #[test]

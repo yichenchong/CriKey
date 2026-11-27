@@ -252,13 +252,45 @@ pub enum NativeLauncherEvent {
     /// Process-scoped action terminals are ready to drain, including while
     /// hidden. This notification never activates or presents the launcher.
     ActionCompletion,
+    /// Applied host appearance, including an honest unknown-system fallback.
+    AppearanceChanged(crate::appearance::ResolvedAppearance),
 }
 
 /// Creates an egui context configured with the launcher's shared visual tokens.
 pub fn create_launcher_context() -> egui::Context {
     let context = egui::Context::default();
-    theme::install(&context);
+    set_launcher_appearance(&context, &crate::appearance::ResolvedAppearance::default());
+    context.data_mut(|data| {
+        data.insert_temp(
+            navigation_id(),
+            Arc::new(crate::navigation::CompiledNavigation::default()),
+        )
+    });
     context
+}
+
+fn observed_system_theme(theme: Option<winit::window::Theme>) -> crate::appearance::SystemTheme {
+    match theme {
+        Some(winit::window::Theme::Light) => crate::appearance::SystemTheme::Light,
+        Some(winit::window::Theme::Dark) => crate::appearance::SystemTheme::Dark,
+        None => crate::appearance::SystemTheme::Unknown,
+    }
+}
+
+fn appearance_id() -> egui::Id {
+    egui::Id::new("crikey-resolved-appearance")
+}
+
+/// Installs a changed immutable appearance; OS pixels-per-point remain independent.
+pub fn set_launcher_appearance(context: &egui::Context, appearance: &crate::appearance::ResolvedAppearance) {
+    theme::install(context, appearance);
+    context.data_mut(|data| data.insert_temp(appearance_id(), Arc::new(*appearance)));
+}
+
+fn resolved_appearance(context: &egui::Context) -> Arc<crate::appearance::ResolvedAppearance> {
+    context
+        .data(|data| data.get_temp(appearance_id()))
+        .expect("launcher context owns resolved appearance")
 }
 
 /// Retires the current frame's page, web, and typed-preview texture ownership.
@@ -316,6 +348,9 @@ struct DeferredActionInput {
     settings_owner: Option<crate::settings_management::FocusOwner>,
     typed_focus: Option<egui::Id>,
     events: Vec<egui::Event>,
+    navigation: Arc<crate::navigation::CompiledNavigation>,
+    focus: Option<egui::Id>,
+    focus_lifetime: Option<crate::ViewId>,
 }
 
 fn action_input_queue() -> egui::Id {
@@ -342,6 +377,9 @@ fn prepare_action_input(
     model: &ViewModel,
 ) -> (Option<UiCommand>, bool, bool) {
     let editor = egui::Id::new("crikey-action-search");
+    let navigation = context
+        .data(|data| data.get_temp::<Arc<crate::navigation::CompiledNavigation>>(navigation_id()))
+        .expect("launcher context owns compiled navigation");
     let focused = input.focused
         && !input
             .events
@@ -367,9 +405,14 @@ fn prepare_action_input(
                 || context.memory(|memory| memory.focused() == Some(editor))
         });
         let valid = focused
+            && pending.navigation == navigation
+            && (owner.view != pending.source.view
+                || owner.typed != pending.source.typed
+                || (pending.focus == context.memory(|memory| memory.focused())
+                    && pending.focus_lifetime == model.navigation.focus_lifetime))
             && editor_owned
             && (!model.settings_open
-                || !pending.focus_ready
+                || (owner.view != pending.source.view && !pending.focus_ready)
                 || crate::settings_management::focused_owner(context, &model.navigation.settings_management)
                     == pending.settings_owner)
             && (owner.typed.is_none()
@@ -412,7 +455,7 @@ fn prepare_action_input(
                 && model.page.is_none()
                 && !model.preview.focused
             {
-                context.memory_mut(|memory| memory.request_focus(egui::Id::new("crikey-root-search")));
+                context.memory_mut(|memory| memory.request_focus(query_edit_id()));
             }
             input.events = pending.events;
             resumed = true;
@@ -428,12 +471,14 @@ fn prepare_action_input(
                     && model.page.is_none()
                     && !model.preview.focused
                 {
-                    context.memory_mut(|memory| memory.request_focus(egui::Id::new("crikey-root-search")));
+                    context.memory_mut(|memory| memory.request_focus(query_edit_id()));
                 }
             }
         }
     }
-    if !focused || (model.action_panel.is_none() && !resumed) {
+    // Pages own teardown: their adapter delivers the prefix and discards the
+    // Escape suffix, which must never be acknowledged into the root view.
+    if !focused || model.navigation.inline_arguments.is_some() || model.page.is_some() {
         return (None, false, resumed);
     }
     if model.action_panel.is_some() && !context.memory(|memory| memory.focused() == Some(editor)) {
@@ -443,8 +488,23 @@ fn prepare_action_input(
         data.get_temp::<bool>(egui::Id::new("crikey-action-ime"))
             .unwrap_or(false)
     });
+    let altgr_text = input.events.iter().any(|event| {
+        matches!(event, egui::Event::Text(text) if text.chars().any(|character| !character.is_control()))
+    });
+    let mut owner = navigation_owner(context, Some(model));
+    let collection_query = is_standard_collection(model)
+        && model.action_panel.is_none()
+        && context.memory(|memory| memory.focused() == Some(query_edit_id()));
     let mut boundary = None;
     for (index, event) in input.events.iter().enumerate() {
+        if collection_query
+            && matches!(
+                event,
+                egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Ime(_)
+            )
+        {
+            owner = crate::navigation::NavigationOwner::Query;
+        }
         match event {
             egui::Event::Ime(egui::ImeEvent::Enabled) => composing = true,
             egui::Event::Ime(egui::ImeEvent::Preedit(text)) => composing |= !text.is_empty(),
@@ -455,31 +515,23 @@ fn prepare_action_input(
                 pressed: true,
                 ..
             } if !composing => {
-                let command = if model.action_panel.is_some() {
-                    if let Some(command @ (UiCommand::ShowActions | UiCommand::OpenSettings)) =
-                        deferred_root_key(*key, *modifiers, model)
-                    {
-                        command
-                    } else {
-                        if !modifiers.matches_logically(egui::Modifiers::NONE) {
-                            continue;
-                        }
-                        match key {
-                            // TextEdit owns Return and its existing suffix rule.
-                            egui::Key::Enter => break,
-                            egui::Key::ArrowDown => UiCommand::SelectNext,
-                            egui::Key::ArrowUp => UiCommand::SelectPrevious,
-                            egui::Key::PageDown => UiCommand::PageDown,
-                            egui::Key::PageUp => UiCommand::PageUp,
-                            egui::Key::Escape => UiCommand::ActionBack,
-                            _ => continue,
-                        }
-                    }
-                } else if let Some(command) = deferred_root_key(*key, *modifiers, model) {
-                    command
-                } else {
+                if modifiers.ctrl && modifiers.alt && altgr_text {
+                    continue;
+                }
+                let Some(command) =
+                    deferred_navigation_key(context, *key, *modifiers, model, &navigation, owner)
+                else {
                     continue;
                 };
+                // TextEdit admits the prefix and owns the activation suffix.
+                if matches!(
+                    command,
+                    UiCommand::ActivateSelectedAction
+                        | UiCommand::ExecuteDefault
+                        | UiCommand::StandardActivate { .. }
+                ) {
+                    break;
+                }
                 boundary = Some((index, command));
                 break;
             }
@@ -496,6 +548,13 @@ fn prepare_action_input(
         let token = NEXT_INPUT
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
             .expect("native input identity exhausted");
+        let focus = context.memory(|memory| memory.focused());
+        let settings_owner = model
+            .settings_open
+            .then(|| {
+                crate::settings_management::focused_owner(context, &model.navigation.settings_management)
+            })
+            .flatten();
         context.data_mut(|data| {
             data.insert_temp(action_input_queue(), token);
             data.insert_temp(
@@ -504,13 +563,12 @@ fn prepare_action_input(
                     token,
                     source: Arc::new(crate::ActionInputCheckpoint::of(model)),
                     focus_ready: false,
-                    settings_owner: None,
-                    typed_focus: model
-                        .navigation
-                        .inline_arguments
-                        .as_ref()
-                        .and_then(|_| context.memory(|memory| memory.focused())),
+                    settings_owner,
+                    typed_focus: model.navigation.inline_arguments.as_ref().and(focus),
                     events,
+                    navigation: navigation.clone(),
+                    focus,
+                    focus_lifetime: model.navigation.focus_lifetime,
                 }),
             );
         });
@@ -545,6 +603,11 @@ fn build_launcher_frame_with_transparency(
     }
     let (action_boundary, waiting_for_input, resumed_input) =
         prepare_action_input(context, &mut input, model);
+    // Continuations may transfer keyboard ownership from Actions back to the
+    // query before egui runs. Preserve that admitted owner, not the retired
+    // editor that held focus before the host receipt was consumed.
+    let input_focus = context.memory(|memory| memory.focused());
+    context.data_mut(|data| data.insert_temp(input_focus_id(), input_focus));
     let mut commands = Vec::new();
     let mut pass_commands = Vec::new();
     let mut first_pass = true;
@@ -640,7 +703,21 @@ fn build_launcher_frame_with_transparency(
     } else {
         let host_boundary = action_boundary.is_some();
         if let Some(command) = action_boundary {
+            collection_navigation_after_command(Some(context), Some(model), &command);
             commands.push(command);
+        }
+        if host_boundary {
+            // Source widgets may surrender focus during their last paint.
+            // Retain that completed pass's owner, not its pre-layout focus.
+            let focus = context.memory(|memory| memory.focused());
+            context.data_mut(|data| {
+                if let Some(Some(mut pending)) =
+                    data.remove_temp::<Option<DeferredActionInput>>(action_input_queue())
+                {
+                    pending.focus = focus;
+                    data.insert_temp(action_input_queue(), Some(pending));
+                }
+            });
         }
         let edited_action_query = model.action_panel.is_some()
             && commands.len() > 1
@@ -649,6 +726,7 @@ fn build_launcher_frame_with_transparency(
                 .any(|command| matches!(command, UiCommand::SetActionQuery(_)));
         let ordered = resumed_input
             || has_action_input(context)
+            || (host_boundary && commands.len() > 1)
             || (edited_action_query
                 && (host_boundary
                     || commands.iter().any(|command| {
@@ -682,6 +760,8 @@ enum NativeEvent {
     ActionCompletion,
     RepaintAfter(Duration),
     DriverError(String),
+    Appearance(crate::appearance::AppearancePreferences),
+    Navigation(Arc<crate::navigation::CompiledNavigation>),
     Exit,
 }
 
@@ -1140,6 +1220,20 @@ impl fmt::Debug for NativeLauncherHandle {
 }
 
 impl NativeLauncherHandle {
+    pub fn set_navigation(
+        &self,
+        navigation: Arc<crate::navigation::CompiledNavigation>,
+    ) -> Result<(), RendererError> {
+        self.proxy.send(NativeEvent::Navigation(navigation))
+    }
+    /// Applies validated logical appearance preferences without changing OS DPI.
+    pub fn set_appearance(
+        &self,
+        preferences: crate::appearance::AppearancePreferences,
+    ) -> Result<(), RendererError> {
+        self.proxy.send(NativeEvent::Appearance(preferences))
+    }
+
     /// Wakes the native event loop to show and focus the retained window.
     ///
     /// Repeated requests while already active are idempotent and do not start a
@@ -1657,6 +1751,8 @@ struct NativeApplication<F> {
     on_event: F,
     terminal_error: Option<RendererError>,
     exiting: bool,
+    appearance: crate::appearance::AppearanceCache,
+    navigation: Arc<crate::navigation::CompiledNavigation>,
 }
 
 impl<F> NativeApplication<F>
@@ -1686,6 +1782,8 @@ where
             on_event,
             terminal_error: None,
             exiting: false,
+            appearance: crate::appearance::AppearanceCache::default(),
+            navigation: Arc::new(crate::navigation::CompiledNavigation::default()),
         }
     }
 
@@ -1708,6 +1806,67 @@ where
             .get_or_init(|| x11rb::connect(None).ok().map(|(connection, _)| connection))
             .as_ref()
             .is_some_and(|connection| x11_focus_within(connection, window))
+    }
+
+    fn host_key_command(&self, event: &KeyEvent) -> Option<UiCommand> {
+        if self.active_session.is_none()
+            || self.ime.composing
+            || self.modifiers.control_key()
+                && self.modifiers.alt_key()
+                && event
+                    .text
+                    .as_ref()
+                    .is_some_and(|text| text.chars().any(|character| !character.is_control()))
+        {
+            return None;
+        }
+        if self
+            .graphics
+            .as_ref()
+            .is_some_and(|graphics| has_action_input(&graphics.egui_context))
+        {
+            return None;
+        }
+        translate_keyboard(
+            event.logical_key.as_ref(),
+            event.state,
+            self.modifiers,
+            self.frame.as_ref(),
+            self.graphics
+                .as_ref()
+                .is_some_and(|graphics| egui_popup_open(&graphics.egui_context)),
+            &self.navigation,
+            self.graphics
+                .as_ref()
+                .map_or(crate::navigation::NavigationOwner::Host, |graphics| {
+                    navigation_owner(&graphics.egui_context, self.frame.as_ref())
+                }),
+        )
+    }
+
+    fn update_appearance(
+        &mut self,
+        preferences: crate::appearance::AppearancePreferences,
+        system: crate::appearance::SystemTheme,
+    ) {
+        match self.appearance.update(preferences, system) {
+            Ok(changed) => {
+                if let Some(graphics) = self.graphics.as_ref().filter(|_| changed) {
+                    set_launcher_appearance(&graphics.egui_context, self.appearance.resolved());
+                    graphics.window.set_min_inner_size(Some(LogicalSize::new(
+                        f64::from(theme::MIN_WINDOW_WIDTH),
+                        f64::from(self.appearance.resolved().metrics().compact_window_height),
+                    )));
+                }
+                if changed {
+                    (self.on_event)(NativeLauncherEvent::AppearanceChanged(
+                        *self.appearance.resolved(),
+                    ));
+                    self.request_redraw();
+                }
+            }
+            Err(error) => eprintln!("crikey: appearance retained: {error}"),
+        }
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: RendererError) {
@@ -1736,6 +1895,7 @@ where
             return false;
         };
         if let Some(graphics) = self.graphics.as_mut() {
+            prepare_navigation_focus(&graphics.egui_context, &frame);
             graphics
                 .typed_editor
                 .retire_unless(frame.navigation.inline_arguments.as_ref());
@@ -2150,7 +2310,18 @@ where
 
         match GraphicsState::new(event_loop, &self.config, self.proxy.clone()) {
             Ok(graphics) => {
+                graphics
+                    .egui_context
+                    .data_mut(|data| data.insert_temp(navigation_id(), Arc::clone(&self.navigation)));
                 self.graphics = Some(graphics);
+                self.update_appearance(
+                    *self.appearance.preferences(),
+                    observed_system_theme(
+                        self.graphics
+                            .as_ref()
+                            .and_then(|graphics| graphics.window.theme()),
+                    ),
+                );
                 self.graphics_ready_at = Some(Instant::now());
                 if self.active_session.is_some() {
                     self.show();
@@ -2172,6 +2343,18 @@ where
             self.flush_inline_input(event_loop);
         }
         match event {
+            NativeEvent::Navigation(navigation) => {
+                self.navigation = navigation;
+                if let Some(graphics) = &self.graphics {
+                    graphics
+                        .egui_context
+                        .data_mut(|data| data.insert_temp(navigation_id(), Arc::clone(&self.navigation)));
+                }
+                self.request_redraw();
+            }
+            NativeEvent::Appearance(preferences) => {
+                self.update_appearance(preferences, self.appearance.system_theme());
+            }
             NativeEvent::Activate {
                 session,
                 requested_at,
@@ -2287,6 +2470,7 @@ where
         // Touch must cross the same immediate ownership boundary as native
         // keys and mouse input. Deferring it until redraw reorders a tap before
         // a key and can retarget queued contacts to a replacement document.
+
         let touch_commands = if self.active_session.is_some() {
             self.web_touch_commands(&event)
         } else {
@@ -2303,48 +2487,42 @@ where
                     event,
                     is_synthetic: false,
                     ..
-                } if self.active_session.is_some() && !self.ime.composing => {
-                    if self
-                        .graphics
-                        .as_ref()
-                        .is_some_and(|graphics| has_action_input(&graphics.egui_context))
-                    {
-                        None
-                    } else {
-                        translate_keyboard(
-                            event.logical_key.as_ref(),
-                            event.state,
-                            self.modifiers,
-                            self.frame.as_ref(),
-                            matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
-                                && self
-                                    .graphics
-                                    .as_ref()
-                                    .is_some_and(|graphics| egui_popup_open(&graphics.egui_context)),
-                        )
-                    }
-                }
+                } => self.host_key_command(event),
                 _ => None,
+            };
+        }
+        if command.is_some()
+            && !web_consumed
+            && self.frame.as_ref().is_some_and(|frame| frame.page.is_none())
+            && self
+                .graphics
+                .as_mut()
+                .is_some_and(|graphics| !graphics.egui_state.egui_input_mut().events.is_empty())
+        {
+            // Only a real semantic command is an ordering boundary. Ordinary
+            // typing remains coalesced; queued text precedes command execution.
+            self.redraw(event_loop);
+            command = match &event {
+                WindowEvent::KeyboardInput {
+                    event,
+                    is_synthetic: false,
+                    ..
+                } => self.host_key_command(event),
+                _ => command,
             };
         }
         // Linux does not forward preedit to egui. Fence composition-owned
         // launcher transient-control keys here, at their actual native event position, rather than
         // overwriting the renderer's batch-start state with the final IME state.
         let ime_owned_action_key = self.ime.composing
-            && self
-                .frame
-                .as_ref()
-                .is_some_and(|frame| !frame.settings_open && frame.page.is_none())
-            && matches!(&event,
-            WindowEvent::KeyboardInput { event, .. } if {
-                let discovery = matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Enter))
-                    && self.modifiers.alt_key()
-                    || matches!(event.logical_key.as_ref(), Key::Character(text) if text.eq_ignore_ascii_case("k"))
-                        && (self.modifiers.control_key() || self.modifiers.super_key());
-                discovery || self.frame.as_ref().is_some_and(|frame| frame.action_panel.is_some() || !frame.navigation.recall.is_empty() || frame.navigation.inline_arguments.is_some())
-                    && matches!(event.logical_key.as_ref(), Key::Named(
-                        NamedKey::Enter | NamedKey::Escape | NamedKey::ArrowUp | NamedKey::ArrowDown
-                        | NamedKey::PageUp | NamedKey::PageDown))
+            && !web_consumed
+            && matches!(&event, WindowEvent::KeyboardInput { event, .. } if {
+                matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Enter | NamedKey::Escape))
+                    || self.frame.as_ref().is_some_and(|model| {
+                        native_navigation_key(event.logical_key.as_ref()).and_then(|key| navigation_chord(&self.navigation, key, crikey_platform::Modifiers {
+                            ctrl: self.modifiers.control_key(), alt: self.modifiers.alt_key(), shift: self.modifiers.shift_key(), meta: self.modifiers.super_key(),
+                        })).is_some_and(|chord| self.navigation.resolve(chord, navigation_context(model, crate::navigation::NavigationOwner::Query, false)).is_some())
+                    })
             });
         {
             let Some(graphics) = self.graphics.as_mut() else {
@@ -2358,7 +2536,11 @@ where
                 let response = graphics
                     .egui_state
                     .on_window_event(graphics.window.as_ref(), &event);
-                if response.repaint && self.active_session.is_some() {
+                // RedrawRequested is serviced below, not another redraw request.
+                if response.repaint
+                    && !matches!(&event, WindowEvent::RedrawRequested)
+                    && self.active_session.is_some()
+                {
                     graphics.window.request_redraw();
                 }
             }
@@ -2419,6 +2601,12 @@ where
         }
 
         if let Some(command) = command {
+            collection_navigation_after_command(
+                self.graphics.as_ref().map(|graphics| &graphics.egui_context),
+                self.frame.as_ref(),
+                &command,
+            );
+
             self.dispatch_command(event_loop, command);
         } else if matches!(
             &event,
@@ -2448,6 +2636,9 @@ where
         }
 
         match event {
+            WindowEvent::ThemeChanged(theme) => {
+                self.update_appearance(*self.appearance.preferences(), observed_system_theme(Some(theme)))
+            }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
@@ -2581,7 +2772,7 @@ fn shows_results(model: &ViewModel) -> bool {
 /// lays real rows out and fails if the drawing and this sum disagree, and by
 /// `a_listed_window_leaves_the_status_line_room_to_be_read`, which fails if
 /// the sum below stops covering everything the frame actually draws.
-fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
+fn desired_window_height(model: &ViewModel, expanded_height: u32, metrics: &theme::Metrics) -> u32 {
     // A page and the settings surface are the two full-height surfaces, and
     // both get the whole window: the page's own extent is the plugin's to
     // choose, so there is nothing to compute it from, and a page laid out into
@@ -2599,8 +2790,11 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     {
         return expanded_height;
     }
+    let diagnostic_rows = model.navigation.interface_diagnostics.iter().flatten().count() as f32;
+    let compact_height =
+        metrics.compact_window_height + diagnostic_rows * (metrics.control_height + metrics.item_spacing_y);
     if !shows_results(model) {
-        return theme::COMPACT_WINDOW_HEIGHT;
+        return compact_height.ceil() as u32;
     }
     let rows = model.rows.len();
     // The list, plus the gap above it, added to the compact frame -- the field
@@ -2610,27 +2804,30 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     // line, and the panel's bottom margin under it is part of the compact
     // height, so a listed window is the compact one with a list inserted.
     //
-    // [`BLOCK_GAP`] is that insertion's own gap: the explicit space
+    // That insertion's gap combines the explicit space
     // [`draw_launcher`] puts above the list plus the item spacing egui adds
     // ahead of it. Leaving the implicit half out of the sum is how the frame
     // used to end lower than the window it was sized for.
     //
     // Saturating throughout: a result set large enough to overflow this is
     // clamped to the expanded height anyway.
-    let gaps = (rows.saturating_sub(1) as f32) * theme::ROW_GAP;
-    let list = (rows as f32) * theme::ROW_HEIGHT + gaps + BLOCK_GAP;
+    let gaps = (rows.saturating_sub(1) as f32) * metrics.row_gap;
+    let list = (rows as f32) * metrics.row_height + gaps + metrics.item_spacing_y + metrics.space_3;
     // The action list opens between the results and the status line, so it
     // needs room of its own. Without this a single result with alternates
     // opened its actions into a window sized for the list alone and pushed the
     // status line off the bottom -- the same clipping, from the other
     // direction, and one that a long result set hides because it is clamped.
     let actions = if model.action_panel.is_some() {
-        BLOCK_GAP + actions_overlay_height()
+        metrics.item_spacing_y + metrics.space_3 + metrics.scaled(actions_overlay_height())
     } else {
         0.0
     };
-    let total = f32::from(u16::try_from(theme::COMPACT_WINDOW_HEIGHT).unwrap_or(u16::MAX)) + list + actions;
-    (total.ceil().max(0.0) as u32).clamp(theme::COMPACT_WINDOW_HEIGHT, expanded_height)
+    let total = compact_height + list + actions;
+    (total.ceil().max(0.0) as u32).clamp(
+        compact_height.ceil() as u32,
+        expanded_height.max(compact_height.ceil() as u32),
+    )
 }
 
 /// The physical size the next frame must be built at, given the size the
@@ -3085,7 +3282,12 @@ impl GraphicsState {
     /// when the compositor lands on a different size after all, the event is
     /// still what corrects it.
     fn fit_window_height(&mut self, model: &ViewModel) -> PhysicalSize<u32> {
-        let desired = desired_window_height(model, self.expanded_height);
+        let appearance = resolved_appearance(&self.egui_context);
+        let desired = desired_window_height(
+            model,
+            (self.expanded_height as f32 * appearance.palette.metrics.scale).ceil() as u32,
+            &appearance.palette.metrics,
+        );
         let scale = self.window.scale_factor();
         let current = self.window.inner_size();
         let target = ((f64::from(desired) * scale).round() as u32).max(1);
@@ -3203,7 +3405,7 @@ impl GraphicsState {
             // The shape decides this, not the theme: whatever the canvas is
             // filled with, the corners the panel leaves unpainted keep whatever
             // was cleared here.
-            let color = clear_color(self.shaped);
+            let color = clear_color(self.shaped, &resolved_appearance(&self.egui_context).palette);
             let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("crikey launcher render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3513,15 +3715,6 @@ fn byte_offset_to_char_index(text: &str, byte: usize) -> u32 {
     offset
 }
 
-fn egui_popup_open(context: &egui::Context) -> bool {
-    context.memory(|memory| {
-        memory.any_popup_open()
-            || memory
-                .layer_ids()
-                .any(|layer| layer.order == egui::Order::Foreground && memory.areas().is_visible(&layer))
-    })
-}
-
 fn native_shortcut_capture(key: Key<&str>, modifiers: ModifiersState, target: &str) -> UiCommand {
     if key == Key::Named(NamedKey::Escape) {
         return UiCommand::CancelShortcutCapture;
@@ -3584,45 +3777,62 @@ mod shortcut_capture_tests {
     }
 }
 
+fn egui_popup_open(context: &egui::Context) -> bool {
+    context.memory(|memory| {
+        memory.any_popup_open()
+            || memory
+                .layer_ids()
+                .any(|layer| layer.order == egui::Order::Foreground && memory.areas().is_visible(&layer))
+    })
+}
+
 pub(super) fn translate_keyboard(
     logical_key: Key<&str>,
     state: ElementState,
     modifiers: ModifiersState,
     model: Option<&ViewModel>,
     popup_open: bool,
+    navigation: &crate::navigation::CompiledNavigation,
+    owner: crate::navigation::NavigationOwner,
 ) -> Option<UiCommand> {
     if state != ElementState::Pressed {
         return None;
     }
     // Native menus and combo popups own Escape before host Back/Settings.
     // Read egui's existing popup/layer ownership, never a navigation mirror.
-    if popup_open && matches!(logical_key, Key::Named(NamedKey::Escape)) {
+    if popup_open {
         return None;
     }
-    translate_logical_key(logical_key, modifiers, model)
+    if model.is_some_and(|model| model.action_panel.is_some() || !model.navigation.recall.is_empty()) {
+        return None;
+    }
+    translate_logical_key(logical_key, modifiers, model, navigation, owner)
 }
 
 fn translate_logical_key(
-    key: Key<&str>,
+    logical_key: Key<&str>,
     modifiers: ModifiersState,
     model: Option<&ViewModel>,
+    navigation: &crate::navigation::CompiledNavigation,
+    owner: crate::navigation::NavigationOwner,
 ) -> Option<UiCommand> {
     if let Some(target) = model
         .and_then(|model| model.settings_focus.as_deref())
         .and_then(|focus| focus.strip_prefix("record:"))
     {
-        return Some(native_shortcut_capture(key, modifiers, target));
+        return Some(native_shortcut_capture(logical_key, modifiers, target));
     }
     let command = if cfg!(target_os = "macos") {
         modifiers.super_key()
     } else {
         modifiers.control_key()
     };
-    if matches!(key, Key::Character(","))
+    if matches!(logical_key, Key::Character(","))
         && command
         && !modifiers.alt_key()
         && !modifiers.shift_key()
         && model.is_none_or(|model| model.page.as_ref().is_none_or(|page| page.frame.web.is_none()))
+        && model.is_none_or(|model| model.navigation.inline_arguments.is_none())
     {
         return Some(UiCommand::OpenSettings);
     }
@@ -3637,136 +3847,366 @@ fn translate_logical_key(
     // `None` -- so the page never sees the key that closes it and a plugin
     // cannot trap the user inside its own surface.
     if model.is_some_and(|model| model.page.is_some()) {
-        return matches!(key, Key::Named(NamedKey::Escape)).then_some(UiCommand::ClosePage);
+        return matches!(logical_key, Key::Named(NamedKey::Escape)).then_some(UiCommand::ClosePage);
     }
     // While the settings surface is open its editors own the keyboard: Enter
     // commits an edit and Tab walks between rows, so neither may still run a
     // result. Escape is the exception, because closing the surface is what it
     // means there.
     if model.is_some_and(|model| model.settings_open) {
-        return matches!(key, Key::Named(NamedKey::Escape)).then_some(UiCommand::Cancel);
+        return matches!(logical_key, Key::Named(NamedKey::Escape)).then_some(UiCommand::Cancel);
     }
-    if model.is_some_and(|model| {
-        model.navigation.inline_arguments.is_some() && !model.navigation.standard_refresh_pending
-    }) {
+    if model.is_some_and(|model| model.navigation.inline_arguments.is_some()) {
         return None;
     }
-    if matches!(key, Key::Named(NamedKey::Enter)) && modifiers.alt_key()
-        || matches!(key, Key::Character(text) if text.eq_ignore_ascii_case("k"))
-            && (modifiers.control_key() || modifiers.super_key())
-            && !modifiers.alt_key()
-    {
-        return Some(UiCommand::ShowActions);
-    }
-    if model.is_some_and(|model| model.action_panel.is_some() || !model.navigation.recall.is_empty()) {
-        // Keep action keys in the same egui event batch as search edits. In
-        // particular, raw Return must not run before queued text is admitted.
-        return None;
-    }
-    if model.is_some_and(|model| model.preview.status.is_some() || model.preview.focused) {
-        if matches!(key, Key::Named(NamedKey::F6)) {
-            return Some(if model.is_some_and(|model| model.preview.focused) {
-                UiCommand::LeavePreview
-            } else {
-                UiCommand::FocusPreview
-            });
-        }
-        if model.is_some_and(|model| model.preview.focused) {
-            return matches!(key, Key::Named(NamedKey::Escape)).then_some(UiCommand::LeavePreview);
-        }
-    }
-    if matches!(key, Key::Named(NamedKey::Enter)) {
-        if let Some(model) = model.filter(|model| model.navigation.standard.is_some()) {
-            return standard_render::primary_command(model);
-        }
-    }
-    match key {
-        Key::Named(NamedKey::ArrowLeft) if model.is_some_and(|m| m.navigation.standard.is_some()) => {
-            Some(UiCommand::StandardHorizontal(false))
-        }
-        Key::Named(NamedKey::ArrowRight) if model.is_some_and(|m| m.navigation.standard.is_some()) => {
-            Some(UiCommand::StandardHorizontal(true))
-        }
-        Key::Named(NamedKey::ArrowDown) => Some(UiCommand::SelectNext),
-        Key::Named(NamedKey::ArrowUp)
-            if model.is_some_and(|model| {
-                model.query.is_empty()
-                    && model.rows.is_empty()
-                    && model.navigation.recall.is_empty()
-                    && !model.settings_open
-                    && !model.navigation.can_go_back
-            }) =>
-        {
-            Some(UiCommand::RecallQuery)
-        }
-        Key::Named(NamedKey::ArrowUp) => Some(UiCommand::SelectPrevious),
-        Key::Named(NamedKey::PageDown) => Some(UiCommand::PageDown),
-        Key::Named(NamedKey::PageUp) => Some(UiCommand::PageUp),
-        Key::Named(NamedKey::Tab) => Some(UiCommand::Complete),
-        Key::Named(NamedKey::Escape) => Some(UiCommand::Cancel),
-        Key::Named(NamedKey::Enter) => Some(UiCommand::ExecuteDefault),
-        _ => None,
-    }
-}
-
-fn deferred_root_key(key: egui::Key, modifiers: egui::Modifiers, model: &ViewModel) -> Option<UiCommand> {
-    let key = match key {
-        egui::Key::ArrowDown => Key::Named(NamedKey::ArrowDown),
-        egui::Key::ArrowUp => Key::Named(NamedKey::ArrowUp),
-        egui::Key::ArrowLeft => Key::Named(NamedKey::ArrowLeft),
-        egui::Key::ArrowRight => Key::Named(NamedKey::ArrowRight),
-        egui::Key::PageDown => Key::Named(NamedKey::PageDown),
-        egui::Key::PageUp => Key::Named(NamedKey::PageUp),
-        egui::Key::Tab => Key::Named(NamedKey::Tab),
-        egui::Key::Escape => Key::Named(NamedKey::Escape),
-        egui::Key::Enter => Key::Named(NamedKey::Enter),
-        egui::Key::F6 => Key::Named(NamedKey::F6),
-        egui::Key::K => Key::Character("k"),
-        egui::Key::Comma => Key::Character(","),
-        egui::Key::Space => Key::Named(NamedKey::Space),
-        _ if model
-            .settings_focus
-            .as_deref()
-            .is_some_and(|focus| focus.starts_with("record:")) =>
-        {
-            Key::Character(key.name())
-        }
-        _ => return None,
+    let key = native_navigation_key(logical_key)?;
+    let modifiers = crikey_platform::Modifiers {
+        ctrl: modifiers.control_key(),
+        alt: modifiers.alt_key(),
+        shift: modifiers.shift_key(),
+        meta: modifiers.super_key(),
     };
-    let mut native = ModifiersState::empty();
-    native.set(ModifiersState::SHIFT, modifiers.shift);
-    // egui's portable COMMAND constant carries only the logical alias.
-    // Reify it for the shared native adapter, retaining explicit physical bits.
-    native.set(
-        ModifiersState::CONTROL,
-        modifiers.ctrl || (modifiers.command && !cfg!(target_os = "macos")),
-    );
-    native.set(ModifiersState::ALT, modifiers.alt);
-    native.set(
-        ModifiersState::SUPER,
-        modifiers.mac_cmd || (modifiers.command && cfg!(target_os = "macos")),
-    );
-    translate_logical_key(key, native, Some(model))
+    let chord = navigation_chord(navigation, key, modifiers)?;
+    let model = model?;
+    let action = navigation.resolve(chord, navigation_context(model, owner, false))?;
+    navigation_command(action, model)
 }
 
-fn canvas_fill(colors: theme::Palette, transparent: bool) -> egui::Color32 {
+fn is_standard_collection(model: &ViewModel) -> bool {
+    model.navigation.standard.as_ref().is_some_and(|surface| {
+        matches!(
+            surface.descriptor.view,
+            crikey_core::structured_view::StandardView::List(_)
+                | crikey_core::structured_view::StandardView::Grid(_)
+        )
+    })
+}
+
+fn collection_navigation_after_command(
+    context: Option<&egui::Context>,
+    model: Option<&ViewModel>,
+    command: &UiCommand,
+) {
+    if model.is_some_and(is_standard_collection)
+        && matches!(
+            command,
+            UiCommand::SelectNext
+                | UiCommand::SelectPrevious
+                | UiCommand::PageDown
+                | UiCommand::PageUp
+                | UiCommand::StandardHorizontal(_)
+        )
+    {
+        if let Some(context) = context {
+            context.data_mut(|data| data.insert_temp(query_edit_id().with("collection-navigation"), true));
+        }
+    }
+}
+
+fn record_collection_focus(context: &egui::Context, model: &ViewModel, response: &egui::Response) {
+    if is_standard_collection(model) && response.has_focus() {
+        context.data_mut(|data| {
+            data.insert_temp(egui::Id::new("crikey-collection-widget-focus"), response.id);
+            data.insert_temp(query_edit_id().with("collection-navigation"), true);
+        });
+    }
+}
+
+fn prepare_navigation_focus(context: &egui::Context, model: &ViewModel) {
+    let scope_id = egui::Id::new("crikey-collection-focus-scope");
+    let previous = context
+        .data(|data| data.get_temp::<Option<(u64, Option<crate::ViewId>)>>(scope_id))
+        .flatten();
+    let covered = model.settings_open || model.page.is_some() || model.navigation.inline_arguments.is_some();
+    let identity = if covered {
+        None
+    } else if is_standard_collection(model) {
+        model.navigation.standard.as_ref().map(|surface| {
+            (
+                surface.context.session.logical_view.get(),
+                model.navigation.focus_lifetime,
+            )
+        })
+    } else if model.navigation.standard.is_none()
+        && model.navigation.standard_route
+        && model.navigation.standard_refresh_pending
+    {
+        // A pending publication is not a new editor lifetime. This identity
+        // controls focus mode only; dispatch still requires the fresh session.
+        previous.filter(|(_, lifetime)| *lifetime == model.navigation.focus_lifetime)
+    } else {
+        None
+    };
+    if identity != previous {
+        context.data_mut(|data| {
+            data.insert_temp(scope_id, identity);
+            data.remove::<egui::Id>(egui::Id::new("crikey-collection-widget-focus"));
+            data.insert_temp(query_edit_id().with("collection-navigation"), identity.is_some());
+        });
+    }
+}
+
+fn native_navigation_key(logical: Key<&str>) -> Option<&str> {
+    Some(match logical {
+        Key::Character(" ") => "Space",
+        Key::Character(text) => text,
+        Key::Named(NamedKey::ArrowUp) => "Up",
+        Key::Named(NamedKey::ArrowDown) => "Down",
+        Key::Named(NamedKey::ArrowLeft) => "Left",
+        Key::Named(NamedKey::ArrowRight) => "Right",
+        Key::Named(NamedKey::PageUp) => "PageUp",
+        Key::Named(NamedKey::PageDown) => "PageDown",
+        Key::Named(NamedKey::Enter) => "Enter",
+        Key::Named(NamedKey::Escape) => "Escape",
+        Key::Named(NamedKey::Tab) => "Tab",
+        Key::Named(NamedKey::Space) => "Space",
+        Key::Named(NamedKey::Home) => "Home",
+        Key::Named(NamedKey::End) => "End",
+        Key::Named(NamedKey::Backspace) => "Backspace",
+        Key::Named(NamedKey::Delete) => "Delete",
+        Key::Named(NamedKey::Insert) => "Insert",
+        Key::Named(NamedKey::F1) => "F1",
+        Key::Named(NamedKey::F2) => "F2",
+        Key::Named(NamedKey::F3) => "F3",
+        Key::Named(NamedKey::F4) => "F4",
+        Key::Named(NamedKey::F5) => "F5",
+        Key::Named(NamedKey::F6) => "F6",
+        Key::Named(NamedKey::F7) => "F7",
+        Key::Named(NamedKey::F8) => "F8",
+        Key::Named(NamedKey::F9) => "F9",
+        Key::Named(NamedKey::F10) => "F10",
+        Key::Named(NamedKey::F11) => "F11",
+        Key::Named(NamedKey::F12) => "F12",
+        Key::Named(NamedKey::F13) => "F13",
+        Key::Named(NamedKey::F14) => "F14",
+        Key::Named(NamedKey::F15) => "F15",
+        Key::Named(NamedKey::F16) => "F16",
+        Key::Named(NamedKey::F17) => "F17",
+        Key::Named(NamedKey::F18) => "F18",
+        Key::Named(NamedKey::F19) => "F19",
+        Key::Named(NamedKey::F20) => "F20",
+        Key::Named(NamedKey::F21) => "F21",
+        Key::Named(NamedKey::F22) => "F22",
+        Key::Named(NamedKey::F23) => "F23",
+        Key::Named(NamedKey::F24) => "F24",
+        _ => return None,
+    })
+}
+
+fn navigation_owner(
+    context: &egui::Context,
+    model: Option<&ViewModel>,
+) -> crate::navigation::NavigationOwner {
+    navigation_owner_for_focus(context, model, context.memory(|memory| memory.focused()))
+}
+
+fn navigation_owner_for_focus(
+    context: &egui::Context,
+    model: Option<&ViewModel>,
+    focused: Option<egui::Id>,
+) -> crate::navigation::NavigationOwner {
+    use crate::navigation::NavigationOwner as O;
+    if egui_popup_open(context) {
+        return O::Popup;
+    }
+
+    let query = focused.is_some_and(|id| id == query_edit_id() || id == action_search_id());
+    if model.is_some_and(|model| model.action_panel.is_some()) {
+        return if query {
+            O::Query
+        } else if focused.is_some() {
+            O::Editor
+        } else {
+            O::Host
+        };
+    }
+    if model.is_some_and(is_standard_collection)
+        && (focused.is_none()
+            || focused == Some(query_edit_id())
+            || focused
+                == context
+                    .data(|data| data.get_temp::<egui::Id>(egui::Id::new("crikey-collection-widget-focus"))))
+        && context.data(|data| {
+            data.get_temp::<bool>(query_edit_id().with("collection-navigation"))
+                .unwrap_or(true)
+        })
+    {
+        return O::Host;
+    }
+    if query {
+        O::Query
+    } else if focused.is_some() && !model.is_some_and(|model| model.preview.focused) {
+        O::Editor
+    } else {
+        O::Host
+    }
+}
+/// Replaces the immutable compiled navigation map; call only when preferences or held grabs change.
+pub fn set_launcher_navigation(
+    context: &egui::Context,
+    navigation: Arc<crate::navigation::CompiledNavigation>,
+) {
+    context.data_mut(|data| data.insert_temp(navigation_id(), navigation));
+}
+
+fn query_edit_id() -> egui::Id {
+    egui::Id::new("crikey-query")
+}
+fn action_search_id() -> egui::Id {
+    egui::Id::new("crikey-action-search")
+}
+fn input_focus_id() -> egui::Id {
+    egui::Id::new("crikey-input-batch-focus")
+}
+
+fn navigation_id() -> egui::Id {
+    egui::Id::new("crikey-applied-navigation")
+}
+
+fn navigation_button(
+    ui: &mut egui::Ui,
+    model: &ViewModel,
+    label: &str,
+    action: crate::navigation::NavigationAction,
+) -> egui::Response {
+    let navigation = ui
+        .ctx()
+        .data(|data| data.get_temp::<Arc<crate::navigation::CompiledNavigation>>(navigation_id()))
+        .expect("launcher context owns compiled navigation");
+    let route = navigation_context(model, navigation_owner(ui.ctx(), Some(model)), false);
+    let mut button = egui::Button::new(label);
+    if let Some(hint) = navigation.hints(action, route).next() {
+        button = button.shortcut_text(hint);
+    }
+    ui.add(button)
+}
+
+fn draw_navigation_hint(ui: &mut egui::Ui, model: &ViewModel, action: crate::navigation::NavigationAction) {
+    let navigation = ui
+        .ctx()
+        .data(|data| data.get_temp::<Arc<crate::navigation::CompiledNavigation>>(navigation_id()))
+        .expect("launcher context owns compiled navigation");
+    let route = navigation_context(model, navigation_owner(ui.ctx(), Some(model)), false);
+    let hint = navigation.hints(action, route).next();
+    if let Some(hint) = hint {
+        ui.add(egui::Label::new(egui::RichText::new(hint).small()).truncate())
+            .on_hover_text(hint);
+    }
+}
+
+fn navigation_chord(
+    navigation: &crate::navigation::CompiledNavigation,
+    key: &str,
+    modifiers: crikey_platform::Modifiers,
+) -> Option<crikey_platform::Accelerator> {
+    navigation
+        .bindings()
+        .iter()
+        .find(|binding| {
+            binding.chord.key().eq_ignore_ascii_case(key) && binding.chord.modifiers() == modifiers
+        })
+        .map(|binding| binding.chord)
+}
+
+fn navigation_context(
+    model: &ViewModel,
+    owner: crate::navigation::NavigationOwner,
+    composing: bool,
+) -> crate::navigation::NavigationContext {
+    use crate::navigation::NavigationScope as S;
+    let scope = if model.settings_open {
+        S::Settings
+    } else if model.page.is_some() {
+        S::Page
+    } else if model.action_panel.is_some() {
+        S::Actions
+    } else if !model.navigation.recall.is_empty() {
+        S::Recall
+    } else if model.preview.focused {
+        S::Preview
+    } else if model.navigation.standard.is_some() {
+        S::Standard
+    } else {
+        S::Results
+    };
+    crate::navigation::NavigationContext {
+        scope,
+        owner,
+        composing,
+    }
+}
+
+fn navigation_command(action: crate::navigation::NavigationAction, model: &ViewModel) -> Option<UiCommand> {
+    use crate::navigation::NavigationAction as A;
+    Some(match action {
+        A::Next => UiCommand::SelectNext,
+        A::Previous
+            if model.query.is_empty()
+                && model.rows.is_empty()
+                && model.navigation.recall.is_empty()
+                && !model.navigation.can_go_back =>
+        {
+            UiCommand::RecallQuery
+        }
+        A::Previous => UiCommand::SelectPrevious,
+        A::PageDown => UiCommand::PageDown,
+        A::PageUp => UiCommand::PageUp,
+        A::Complete => UiCommand::Complete,
+        A::Activate if model.action_panel.is_some() => UiCommand::ActivateSelectedAction,
+        A::Activate if model.navigation.standard.is_some() => return standard_render::primary_command(model),
+        A::Activate => UiCommand::ExecuteDefault,
+        A::Cancel if model.action_panel.is_some() => UiCommand::ActionBack,
+        A::Cancel if model.preview.focused => UiCommand::LeavePreview,
+        A::Cancel if model.page.is_some() => UiCommand::ClosePage,
+        A::Cancel => UiCommand::Cancel,
+        A::ShowActions => UiCommand::ShowActions,
+        A::TogglePreview if model.preview.focused => UiCommand::LeavePreview,
+        A::TogglePreview if model.preview.status.is_some() => UiCommand::FocusPreview,
+        A::TogglePreview => return None,
+        A::Left => UiCommand::StandardHorizontal(false),
+        A::Right => UiCommand::StandardHorizontal(true),
+    })
+}
+
+fn deferred_navigation_key(
+    context: &egui::Context,
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+    model: &ViewModel,
+    navigation: &crate::navigation::CompiledNavigation,
+    owner: crate::navigation::NavigationOwner,
+) -> Option<UiCommand> {
+    if egui_popup_open(context) {
+        return None;
+    }
+    let platform = action_render::egui_navigation_modifiers(modifiers);
+    let mut native = ModifiersState::empty();
+    native.set(ModifiersState::CONTROL, platform.ctrl);
+    native.set(ModifiersState::ALT, platform.alt);
+    native.set(ModifiersState::SHIFT, platform.shift);
+    native.set(ModifiersState::SUPER, platform.meta);
+    let name = match key {
+        egui::Key::ArrowUp => "Up",
+        egui::Key::ArrowDown => "Down",
+        egui::Key::ArrowLeft => "Left",
+        egui::Key::ArrowRight => "Right",
+        other => other.name(),
+    };
+    let logical = match key {
+        egui::Key::Escape => Key::Named(NamedKey::Escape),
+        egui::Key::Comma => Key::Character(","),
+        _ => Key::Character(name),
+    };
+    translate_logical_key(logical, native, Some(model), navigation, owner)
+}
+
+fn canvas_fill(colors: &theme::Palette, transparent: bool) -> egui::Color32 {
     if transparent {
         egui::Color32::TRANSPARENT
     } else {
         colors.canvas
     }
 }
-
-/// The vertical distance [`draw_launcher`] puts between two of the blocks it
-/// stacks in the central panel, in logical pixels.
-///
-/// Two things make it up and both are drawn: the explicit
-/// [`theme::SPACE_3`] the panel body asks for, and the
-/// [`theme::ITEM_SPACING_Y`] egui puts ahead of the block that follows it,
-/// because every allocation in a vertical layout is preceded by item spacing.
-/// Reserving only the explicit gap is how [`draw_results`] used to end up
-/// short of where it thought it would.
-const BLOCK_GAP: f32 = theme::ITEM_SPACING_Y + theme::SPACE_3;
 
 /// Borrows the native editor and its move-only output for one egui pass.
 struct TypedInputPass<'a> {
@@ -3783,36 +4223,13 @@ fn draw_launcher(
     typed: TypedInputPass<'_>,
     native_web_input: bool,
 ) {
-    let colors = theme::palette();
+    let appearance = resolved_appearance(context);
+    let colors = &appearance.palette;
     if !preview_render::retains_image(model) {
         preview_render::release_texture(context);
     }
-    if model.navigation.inline_arguments.is_none() {
-        preview_render::keyboard(context, model, commands);
-    }
+    prepare_navigation_focus(context, model);
     action_render::keyboard(context, model, commands);
-    let recall_composing = context.data(|data| {
-        data.get_temp::<bool>(egui::Id::new("crikey-action-ime"))
-            .unwrap_or(false)
-    });
-    let recall_ime_batch = context.input(|input| {
-        input
-            .events
-            .iter()
-            .any(|event| matches!(event, egui::Event::Ime(_)))
-    });
-    if !recall_composing
-        && !recall_ime_batch
-        && model.query.is_empty()
-        && model.rows.is_empty()
-        && model.navigation.recall.is_empty()
-        && !model.settings_open
-        && model.page.is_none()
-        && !model.navigation.can_go_back
-        && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp))
-    {
-        commands.push(UiCommand::RecallQuery);
-    }
     // Ctrl+, is what every desktop means by "open preferences". It is consumed
     // from the egui frame rather than translated out of the raw key event so
     // that the headless frame builder answers to the shortcut exactly as the
@@ -3852,11 +4269,11 @@ fn draw_launcher(
                 // the silhouette rather than hiding a rounded one: there would
                 // be nothing behind the corners to show.
                 .rounding(Rounding::same(if model.rounded_corners {
-                    theme::RADIUS_WINDOW
+                    colors.metrics.radius_window
                 } else {
                     0.0
                 }))
-                .inner_margin(Margin::same(theme::PANEL_MARGIN)),
+                .inner_margin(Margin::same(colors.metrics.panel_margin)),
         )
         .show(context, |ui| {
             draw_query(ui, model, commands, colors);
@@ -3912,7 +4329,7 @@ fn draw_launcher(
             {
                 egui::ScrollArea::vertical()
                     .id_salt("inline-input")
-                    .max_height(240.0)
+                    .max_height(colors.metrics.scaled(240.0))
                     .show(ui, |ui| {
                         if let Some(submission) = typed.editor.draw(
                             ui,
@@ -3930,19 +4347,40 @@ fn draw_launcher(
                 && (model.navigation.can_go_back || model.navigation.unavailable.is_some())
             {
                 ui.horizontal(|ui| {
-                    if model.navigation.can_go_back && ui.button("Back  Esc").clicked() {
+                    if model.navigation.can_go_back
+                        && navigation_button(ui, model, "Back", crate::navigation::NavigationAction::Cancel)
+                            .clicked()
+                    {
                         commands.push(UiCommand::Back);
                     }
                     ui.label(model.navigation.title.as_ref());
                 });
             }
-            if let Some(reason) = &model.navigation.unavailable {
-                ui.label(reason);
+            if let Some(reason) = model
+                .navigation
+                .unavailable
+                .as_ref()
+                .filter(|_| !model.settings_open)
+            {
+                ui.add(egui::Label::new(reason).truncate()).on_hover_text(reason);
+            }
+            for diagnostic in model.navigation.interface_diagnostics.iter().flatten() {
+                let width = ui.available_width();
+                bounded_text(
+                    ui,
+                    RichText::new(diagnostic.as_ref())
+                        .text_style(TextStyle::Body)
+                        .color(colors.warning),
+                    width,
+                    colors.metrics.control_height,
+                    egui::Sense::hover(),
+                )
+                .on_hover_text(diagnostic.as_ref());
             }
             if !model.navigation.recall.is_empty() {
                 ui.label("Submitted searches");
                 egui::ScrollArea::vertical()
-                    .max_height((ui.available_height() - STATUS_BLOCK_HEIGHT).max(0.0))
+                    .max_height((ui.available_height() - colors.metrics.footer_height).max(0.0))
                     .show(ui, |ui| {
                         for (index, query) in model.navigation.recall.iter().enumerate() {
                             let response =
@@ -3961,16 +4399,17 @@ fn draw_launcher(
                 // below the query field, above the status line. The model
                 // keeps the two mutually exclusive, so this is a branch rather
                 // than a stack.
-                ui.add_space(theme::SPACE_3);
+                ui.add_space(colors.metrics.space_3);
                 draw_page(ui, page, commands, colors, native_web_input);
             } else if model.settings_open {
                 // The settings surface takes the result area rather than
                 // floating over it: the launcher is one column, and a list the
                 // user cannot reach behind a panel is only noise.
-                ui.add_space(theme::SPACE_3);
+                ui.add_space(colors.metrics.space_3);
                 ui.scope(|ui| {
                     ui.set_max_height(
-                        (ui.available_height() - theme::FOOTER_HEIGHT - theme::SPACE_3).max(0.0),
+                        (ui.available_height() - colors.metrics.footer_height - colors.metrics.space_3)
+                            .max(0.0),
                     );
                     draw_settings(ui, model, commands, colors);
                 });
@@ -3986,14 +4425,14 @@ fn draw_launcher(
                 // laid out in cannot disagree about whether there is a list --
                 // when they did, a search that matched nothing put the footer
                 // on the window's bottom edge.
-                ui.add_space(theme::SPACE_3);
+                ui.add_space(colors.metrics.space_3);
                 preview_render::draw_results_and_preview(ui, model, commands, colors);
                 if model.action_panel.is_some() {
-                    ui.add_space(theme::SPACE_3);
+                    ui.add_space(colors.metrics.space_3);
                     draw_actions(ui, model, commands, colors);
                 }
             }
-            ui.add_space(theme::SPACE_3);
+            ui.add_space(colors.metrics.space_3);
             draw_status(ui, model, commands, colors);
         });
     if open_settings && model.navigation.inline_arguments.is_some() {
@@ -4001,39 +4440,56 @@ fn draw_launcher(
     }
 }
 
-fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
+fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: &theme::Palette) {
     // One filled pill, no border: the field is the only thing on the canvas
     // above the list, and at [`theme::TEXT_QUERY`] the text says "type here"
     // more plainly than an outline would. The fill is a whole surface tier
     // above the canvas so that the pill is still unmistakably a field.
     Frame::default()
         .fill(colors.surface)
-        .rounding(Rounding::same(theme::RADIUS_MEDIUM))
+        .rounding(Rounding::same(colors.metrics.radius_medium))
         .show(ui, |ui| {
+            let query_id = query_edit_id();
+            let collection = is_standard_collection(model);
+            let query_interactive = (!model.navigation.standard_route || collection)
+                && !model.settings_open
+                && model.page.is_none()
+                && model.action_panel.is_none()
+                && model.navigation.inline_arguments.is_none()
+                && !model.preview.focused
+                && !egui_popup_open(ui.ctx())
+                && !(model.navigation.can_go_back && model.navigation.unavailable.is_some());
+            if collection
+                && query_interactive
+                && ui.input(|input| {
+                    input.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Ime(_)
+                        )
+                    })
+                })
+            {
+                ui.memory_mut(|memory| memory.request_focus(query_id));
+            }
             let mut query = model.query.clone();
             // The pill has no margin of its own: the editor's own padding is
             // the field's padding, which keeps [`theme::FIELD_HEIGHT`] the
             // height of what is actually drawn.
             let response = ui.add_sized(
-                [ui.available_width(), theme::FIELD_HEIGHT],
+                [ui.available_width(), colors.metrics.field_height],
                 TextEdit::singleline(&mut query)
-                    .id(egui::Id::new("crikey-root-search"))
+                    .id(query_edit_id())
                     .font(TextStyle::Heading)
                     .hint_text("Search apps, files, and actions")
                     .hint_text_font(TextStyle::Heading)
                     .desired_width(f32::INFINITY)
-                    .margin(Margin::symmetric(theme::SPACE_3, theme::SPACE_1))
+                    .margin(Margin::symmetric(colors.metrics.space_3, colors.metrics.space_1))
                     .frame(false)
-                    .interactive(
-                        !model.settings_open
-                            && model.page.is_none()
-                            && model.action_panel.is_none()
-                            && model.navigation.inline_arguments.is_none()
-                            && !(model.navigation.can_go_back && model.navigation.unavailable.is_some()),
-                    )
+                    .interactive(query_interactive)
                     .lock_focus(true),
             );
-            let recall_submitted = response.lost_focus();
+
             // The query field takes the keyboard back on every frame, which is
             // right for a launcher whose only job is typing -- except while the
             // settings surface or a page is open, where it would tear focus out
@@ -4044,20 +4500,15 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
             // and an editor that keeps it goes on swallowing every `Text`
             // event, so the user would type into a query they cannot see
             // instead of into the field the page is showing them.
-            if model.page.is_some()
-                || model.preview.focused
-                || model.action_panel.is_some()
-                || model.navigation.inline_arguments.is_some()
-                || (model.navigation.can_go_back && model.navigation.unavailable.is_some())
-            {
+            if !query_interactive {
                 if response.has_focus() {
                     response.surrender_focus();
                 }
-            } else if !model.settings_open
-                && !model.preview.focused
-                && model.navigation.inline_arguments.is_none()
-            {
+            } else {
                 response.request_focus();
+            }
+            if response.clicked() && collection {
+                ui.data_mut(|data| data.insert_temp(query_id.with("collection-navigation"), false));
             }
             if response.changed() {
                 flatten_line_breaks(&mut query);
@@ -4066,17 +4517,20 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
             // Recall acceptance shares the ordered single-line editor boundary
             // with Actions: preceding edits are emitted first; text after
             // Return is not allowed to replace the accepted picker entry.
-            if !model.navigation.recall.is_empty()
-                && recall_submitted
-                && ui.input(|input| {
-                    input.events.iter().any(|event| {
-                        matches!(event,
-                    egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. }
-                    if modifiers.matches_logically(egui::Modifiers::NONE))
-                    })
+            if !model.settings_open
+                && model.page.is_none()
+                && model.action_panel.is_none()
+                && model.navigation.inline_arguments.is_none()
+                && ui.ctx().data(|data| {
+                    data.get_temp::<bool>(egui::Id::new("crikey-navigation-activate"))
+                        .unwrap_or(false)
                 })
             {
-                commands.push(UiCommand::ExecuteDefault);
+                if let Some(command) =
+                    navigation_command(crate::navigation::NavigationAction::Activate, model)
+                {
+                    commands.push(command);
+                }
             }
         });
 }
@@ -4117,7 +4571,7 @@ fn draw_results(
     ui: &mut egui::Ui,
     model: &ViewModel,
     commands: &mut Vec<UiCommand>,
-    colors: theme::Palette,
+    colors: &theme::Palette,
     body_height: Option<f32>,
 ) {
     let restoration_id = egui::Id::new("crikey.logical-scroll-restoration");
@@ -4149,11 +4603,13 @@ fn draw_results(
     // The bounded sheet scrolls internally and reserves the same geometry even
     // when its target has disappeared and it displays an invalidation.
     let overlay = if model.action_panel.is_some() {
-        BLOCK_GAP + actions_overlay_height()
+        (colors.metrics.item_spacing_y + colors.metrics.space_3)
+            + colors.metrics.scaled(actions_overlay_height())
     } else {
         0.0
     };
-    let reserved = overlay + BLOCK_GAP + STATUS_BLOCK_HEIGHT;
+    let reserved =
+        overlay + (colors.metrics.item_spacing_y + colors.metrics.space_3) + colors.metrics.footer_height;
     let list_height = body_height.unwrap_or_else(|| (ui.available_height() - reserved).max(0.0));
     // ScrollArea's aligned target subtracts the parent UI's item spacing,
     // not the zero spacing we give its row contents. Compensate so a logical
@@ -4198,6 +4654,7 @@ fn draw_results(
                     ui.add_sized([ui.available_width(), 24.0], egui::Label::new(&header.label));
                 }
                 let response = draw_result_row(ui, row, model, index == model.selected, commands, colors);
+                record_collection_focus(ui.ctx(), model, &response);
                 if first_visible.is_none()
                     && response.rect.max.y > scroll_viewport.top()
                     && response.rect.min.y < scroll_viewport.bottom()
@@ -4224,7 +4681,7 @@ fn draw_results(
                     selected_row = Some(response);
                 }
                 if index + 1 != model.rows.len() {
-                    ui.add_space(theme::ROW_GAP);
+                    ui.add_space(colors.metrics.row_gap);
                 }
             }
             if let Some(rect) = restoration_rect {
@@ -4327,7 +4784,7 @@ fn draw_result_row(
     model: &ViewModel,
     selected: bool,
     commands: &mut Vec<UiCommand>,
-    colors: theme::Palette,
+    colors: &theme::Palette,
 ) -> egui::Response {
     // Only the selected row is a shape at all. A fill and a border on every
     // row is what made the list read as a stack of cards, and it left the
@@ -4342,8 +4799,11 @@ fn draw_result_row(
     let frame = Frame::default()
         .fill(fill)
         .stroke(stroke)
-        .rounding(Rounding::same(theme::RADIUS_SMALL))
-        .inner_margin(Margin::symmetric(theme::ROW_PAD_X, theme::ROW_PAD_Y))
+        .rounding(Rounding::same(colors.metrics.radius_small))
+        .inner_margin(Margin::symmetric(
+            colors.metrics.row_pad_x,
+            colors.metrics.row_pad_y,
+        ))
         .show(ui, |ui| {
             // Every row is as wide as the list, not as wide as its own text.
             // An egui frame shrinks to its content, so without this the rows
@@ -4355,27 +4815,27 @@ fn draw_result_row(
             // And exactly as tall as every other row, description or not, so
             // the list is a regular column and the window can be sized from the
             // row count. The padding is outside this, hence the subtraction.
-            ui.set_min_height(theme::ROW_HEIGHT - 2.0 * theme::ROW_PAD_Y);
+            ui.set_min_height(colors.metrics.row_height - 2.0 * colors.metrics.row_pad_y);
             // Horizontally the icon stands away from the text; vertically the
             // label and the line under it are one thing, so they are set
             // tighter than anything else in the window.
-            ui.spacing_mut().item_spacing = vec2(theme::SPACE_2, theme::ROW_LINE_GAP);
+            ui.spacing_mut().item_spacing = vec2(colors.metrics.space_2, colors.metrics.row_line_gap);
             ui.horizontal(|ui| {
-                draw_row_icon(ui, row);
+                draw_row_icon(ui, row, colors);
                 ui.vertical(|ui| {
                     // Truncated rather than wrapped: a row that grew a second
                     // line for a long path would break the row arithmetic the
                     // window height is computed from.
                     ui.add(egui::Label::new(highlighted_label(row, colors)).truncate());
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = theme::SPACE_1;
+                        ui.spacing_mut().item_spacing.x = colors.metrics.space_1;
                         if let Some(status) = &row.status {
                             // Failure feedback replaces metadata, rather than
                             // losing its entire width to a long description.
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(status)
-                                        .size(theme::TEXT_SMALL)
+                                        .size(colors.metrics.text_small)
                                         .color(colors.warning),
                                 )
                                 .truncate(),
@@ -4385,13 +4845,17 @@ fn draw_result_row(
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(row_metadata(row))
-                                        .size(theme::TEXT_SMALL)
+                                        .size(colors.metrics.text_small)
                                         .color(colors.text_muted),
                                 )
                                 .truncate(),
                             );
                             if let Some(hint) = &row.argument_hint {
-                                ui.label(RichText::new(hint).size(theme::TEXT_SMALL).color(colors.accent));
+                                ui.label(
+                                    RichText::new(hint)
+                                        .size(colors.metrics.text_small)
+                                        .color(colors.accent),
+                                );
                             }
                             if let Some(state) = &row.command_state {
                                 for alias in &state.aliases {
@@ -4410,7 +4874,7 @@ fn draw_result_row(
                             commands.push(UiCommand::ShowActions);
                         }
                         if (row.has_primary_action() || actionless_primary(row, model))
-                            && ui.button("Run  Enter").clicked()
+                            && ui.button("Run").clicked()
                         {
                             if let Some(command) = root_primary_command(row, model) {
                                 commands.push(command);
@@ -4498,8 +4962,8 @@ impl fmt::Debug for IconTextures {
 /// whose rows shift sideways because one icon is missing, still loading or
 /// undecodable is worse than one with no icons at all. "Absent", "not found" and
 /// "failed to decode" all arrive here as `None` and are drawn identically.
-fn draw_row_icon(ui: &mut egui::Ui, row: &ResultRow) {
-    let slot = vec2(theme::ICON_SIZE, theme::ICON_SIZE);
+fn draw_row_icon(ui: &mut egui::Ui, row: &ResultRow, colors: &theme::Palette) {
+    let slot = vec2(colors.metrics.icon_size, colors.metrics.icon_size);
     match &row.icon {
         Some(icon) => {
             let texture = icon_texture(ui.ctx(), icon);
@@ -4561,14 +5025,14 @@ fn display_label(row: &ResultRow) -> &str {
     }
 }
 
-fn highlighted_label(row: &ResultRow, colors: theme::Palette) -> LayoutJob {
+fn highlighted_label(row: &ResultRow, colors: &theme::Palette) -> LayoutJob {
     let regular = TextFormat {
-        font_id: FontId::new(theme::TEXT_LABEL, FontFamily::Proportional),
+        font_id: FontId::new(colors.metrics.text_label, FontFamily::Proportional),
         color: colors.text,
         ..Default::default()
     };
     let highlighted = TextFormat {
-        font_id: FontId::new(theme::TEXT_LABEL, FontFamily::Proportional),
+        font_id: FontId::new(colors.metrics.text_label, FontFamily::Proportional),
         color: colors.accent,
         ..Default::default()
     };
@@ -4607,7 +5071,12 @@ fn actions_overlay_height() -> f32 {
 #[path = "action_render.rs"]
 mod action_render;
 
-fn draw_actions(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
+fn draw_actions(
+    ui: &mut egui::Ui,
+    model: &ViewModel,
+    commands: &mut Vec<UiCommand>,
+    colors: &theme::Palette,
+) {
     action_render::draw(ui, model, commands, colors);
 }
 
@@ -4626,24 +5095,6 @@ fn draw_actions(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComma
 /// thing a plugin will do, by accident or otherwise, and without the clip it
 /// would paint over the query field or the status line -- the one place the
 /// user can read whose surface they are looking at.
-/// The launcher's own surface colours, in the host-neutral form a plugin is
-/// given with every frame request.
-///
-/// Exported because the transport is what puts them on the wire and it cannot
-/// see the theme: a page that had to guess would stop matching the launcher
-/// the moment the palette changed.
-pub fn page_palette() -> crikey_core::PagePalette {
-    let colors = theme::palette();
-    let convert =
-        |colour: egui::Color32| crikey_core::PageColor::rgba(colour.r(), colour.g(), colour.b(), colour.a());
-    crikey_core::PagePalette {
-        surface: convert(colors.surface),
-        text: convert(colors.text),
-        accent: convert(colors.accent),
-        muted: convert(colors.text_muted),
-    }
-}
-
 /// The page area a window of this size will roughly offer, used only to open
 /// a page before anything has been drawn.
 ///
@@ -4653,12 +5104,18 @@ pub fn page_palette() -> crikey_core::PagePalette {
 /// what the plugin's very first display list is laid out against and nothing
 /// more. Getting it close matters anyway - a first frame laid out for the
 /// wrong width is a visible jump.
-pub fn initial_page_viewport(window_width: u32, window_height: u32) -> (u32, u32) {
-    let margins = (theme::PANEL_MARGIN * 2.0).round() as u32;
-    let chrome = theme::COMPACT_WINDOW_HEIGHT;
+pub fn initial_page_viewport(
+    window_width: u32,
+    window_height: u32,
+    appearance: &crate::appearance::ResolvedAppearance,
+) -> (u32, u32) {
+    let margins = (appearance.metrics().panel_margin * 2.0).round() as u32;
+    let chrome = appearance.metrics().compact_window_height.ceil() as u32;
     (
         window_width.saturating_sub(margins).max(1),
-        window_height.saturating_sub(chrome).max(1),
+        ((window_height as f32 * appearance.metrics().scale).ceil() as u32)
+            .saturating_sub(chrome)
+            .max(1),
     )
 }
 
@@ -4694,7 +5151,7 @@ fn draw_page(
     ui: &mut egui::Ui,
     page: &PageSurface,
     commands: &mut Vec<UiCommand>,
-    colors: theme::Palette,
+    colors: &theme::Palette,
     native_web_input: bool,
 ) {
     // What the page may occupy is what is left after the footer and the gap
@@ -4704,7 +5161,9 @@ fn draw_page(
     // everything left would push the status line onto the window's bottom
     // edge, which is the same footer bug a matchless query used to cause from
     // the other direction.
-    let room = (ui.available_height() - (BLOCK_GAP + STATUS_BLOCK_HEIGHT)).max(0.0);
+    let room = (ui.available_height()
+        - ((colors.metrics.item_spacing_y + colors.metrics.space_3) + colors.metrics.footer_height))
+        .max(0.0);
     let (_, rect) = ui.allocate_space(vec2(ui.available_width(), room));
 
     // Intersected with the clip already in force rather than replacing it, so
@@ -4720,7 +5179,7 @@ fn draw_page(
     // launcher.
     page_ui
         .painter()
-        .rect_filled(rect, Rounding::same(theme::RADIUS_MEDIUM), colors.surface);
+        .rect_filled(rect, Rounding::same(colors.metrics.radius_medium), colors.surface);
 
     // A page that has never been answered is a bare sheet, and the only sign
     // that anything is happening sits in the footer -- which is not where the
@@ -4747,7 +5206,7 @@ fn draw_page(
         None => page.stale && !page.answered,
     };
     if loading {
-        let size = theme::ICON_SIZE;
+        let size = colors.metrics.icon_size;
         let centre = egui::Rect::from_center_size(rect.center(), vec2(size, size));
         page_ui.put(centre, egui::Spinner::new().size(size).color(colors.text_muted));
     }
@@ -4814,7 +5273,7 @@ fn draw_page(
         if let Some(texture) = web_texture(page_ui.ctx(), frame) {
             page_ui.painter().add(egui::epaint::RectShape {
                 rect,
-                rounding: Rounding::same(theme::RADIUS_MEDIUM),
+                rounding: Rounding::same(colors.metrics.radius_medium),
                 fill: egui::Color32::WHITE,
                 stroke: Stroke::NONE,
                 blur_width: 0.0,
@@ -4845,7 +5304,13 @@ fn draw_page(
 
     for (index, node) in page.frame.nodes.iter().enumerate() {
         let node_rect = node_rect(rect.min, node);
-        paint_node(page_ui.painter(), node, node_rect, textures.get(&index).copied());
+        paint_node(
+            page_ui.painter(),
+            node,
+            node_rect,
+            textures.get(&index).copied(),
+            colors.metrics.text_body,
+        );
         page_node_semantics(&page_ui, index, node, node_rect, focus, commands);
     }
 
@@ -5436,11 +5901,11 @@ fn egui_web_keysym(key: egui::Key, modifiers: egui::Modifiers) -> Option<u32> {
 /// spells as the host's body size: a page that wants to look like the launcher
 /// must not have to know the launcher's type scale, and one that hard coded
 /// this number would stop matching the moment the scale moved.
-fn node_text_size(node: &PageNode) -> f32 {
+fn node_text_size(node: &PageNode, default_size: f32) -> f32 {
     if node.text_size > 0.0 {
         node.text_size
     } else {
-        theme::TEXT_BODY
+        default_size
     }
 }
 
@@ -5571,7 +6036,13 @@ fn raster_key(image: &PageImage) -> u64 {
 ///
 /// `texture` is the raster an [`NodeShape::Image`] node draws, already
 /// uploaded by [`page_textures`]; every other shape ignores it.
-fn paint_node(painter: &egui::Painter, node: &PageNode, rect: egui::Rect, texture: Option<egui::TextureId>) {
+fn paint_node(
+    painter: &egui::Painter,
+    node: &PageNode,
+    rect: egui::Rect,
+    texture: Option<egui::TextureId>,
+    default_text_size: f32,
+) {
     match node.shape {
         // A node that paints nothing is still a node: it carries a rect, a
         // role and a name, which is how an invisible hit target or a region
@@ -5601,7 +6072,7 @@ fn paint_node(painter: &egui::Painter, node: &PageNode, rect: egui::Rect, textur
                     rect.min,
                     Align2::LEFT_TOP,
                     &node.text,
-                    FontId::proportional(node_text_size(node)),
+                    FontId::proportional(node_text_size(node, default_text_size)),
                     node_color(node.fill),
                 );
             }
@@ -6016,12 +6487,12 @@ fn draw_settings(
     ui: &mut egui::Ui,
     model: &ViewModel,
     commands: &mut Vec<UiCommand>,
-    colors: theme::Palette,
+    colors: &theme::Palette,
 ) {
     Frame::default()
         .fill(colors.surface)
-        .rounding(Rounding::same(theme::RADIUS_MEDIUM))
-        .inner_margin(Margin::same(theme::SPACE_3))
+        .rounding(Rounding::same(colors.metrics.radius_medium))
+        .inner_margin(Margin::same(colors.metrics.space_3))
         .show(ui, |ui| {
             ui.set_max_width(ui.available_width());
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
@@ -6039,17 +6510,19 @@ fn draw_settings(
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Settings")
-                        .size(theme::TEXT_LABEL)
+                        .size(colors.metrics.text_label)
                         .strong()
                         .color(colors.text),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Back  Esc").clicked() {
+                    if navigation_button(ui, model, "Back", crate::navigation::NavigationAction::Cancel)
+                        .clicked()
+                    {
                         commands.push(UiCommand::CloseSettings);
                     }
                 });
             });
-            ui.add_space(theme::SPACE_2);
+            ui.add_space(colors.metrics.space_2);
             let category = model.navigation.settings_management.category;
             if model.settings_focus.as_deref().is_none_or(|focus| {
                 !focus
@@ -6062,15 +6535,75 @@ fn draw_settings(
                 });
             }
             crate::settings_management::draw_categories(ui, &model.navigation.settings_management, commands);
-            ui.add_space(theme::SPACE_2);
+            ui.add_space(colors.metrics.space_2);
             // Only the body scrolls. The Back header and Quit footer remain
             // reachable regardless of report length or editor content.
-            let quit_height = ui.spacing().interact_size.y + theme::SPACE_2 + theme::SPACE_1;
+            let quit_height = ui.spacing().interact_size.y + colors.metrics.space_2 + colors.metrics.space_1;
             egui::ScrollArea::vertical()
                 .id_salt("settings-scroll")
                 .max_height((ui.available_height() - quit_height).max(0.0))
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
+                    let applied = resolved_appearance(ui.ctx());
+                    ui.small(match (applied.status, applied.theme) {
+                        (crate::appearance::ThemeStatus::SystemFallback, _) => {
+                            "Applied appearance: Dark · system theme unavailable; using dark fallback"
+                        }
+                        (_, crate::appearance::ResolvedTheme::Light) => "Applied appearance: Light",
+                        (_, crate::appearance::ResolvedTheme::Dark) => "Applied appearance: Dark",
+                    });
+                    if let Some(reason) = &model.navigation.unavailable {
+                        ui.add(egui::Label::new(reason).wrap());
+                    }
+                    egui::CollapsingHeader::new("Applied navigation shortcuts")
+                        .id_salt("applied-navigation-shortcuts")
+                        .show(ui, |ui| {
+                            let navigation = ui
+                                .ctx()
+                                .data(|data| {
+                                    data.get_temp::<Arc<crate::navigation::CompiledNavigation>>(
+                                        navigation_id(),
+                                    )
+                                })
+                                .expect("launcher context owns compiled navigation");
+                            let viewport_width = ui.available_width().min(ui.clip_rect().width()).max(0.0);
+                            let action_width = (viewport_width * 0.42)
+                                .clamp(colors.metrics.scaled(140.0), colors.metrics.scaled(200.0));
+                            let table_width = viewport_width.max(620.0 * colors.metrics.scale);
+                            let chord_width = table_width - action_width - ui.spacing().item_spacing.x;
+                            let row_height = ui.spacing().interact_size.y;
+                            egui::ScrollArea::horizontal()
+                                .id_salt("applied-navigation-values")
+                                .max_width(viewport_width)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.set_width(table_width);
+                                    for binding in navigation.bindings() {
+                                        ui.horizontal(|ui| {
+                                            ui.allocate_ui_with_layout(
+                                                vec2(action_width, row_height),
+                                                Layout::left_to_right(Align::Center),
+                                                |ui| {
+                                                    ui.set_min_size(vec2(action_width, row_height));
+                                                    ui.add(egui::Label::new(binding.action.name()).truncate())
+                                                },
+                                            )
+                                            .inner
+                                            .on_hover_text(binding.action.name());
+                                            ui.allocate_ui_with_layout(
+                                                vec2(chord_width, row_height),
+                                                Layout::left_to_right(Align::Center),
+                                                |ui| {
+                                                    ui.set_min_size(vec2(chord_width, row_height));
+                                                    ui.add(egui::Label::new(binding.hint.as_str()).truncate())
+                                                },
+                                            )
+                                            .inner
+                                            .on_hover_text(binding.hint.as_str());
+                                        });
+                                    }
+                                });
+                        });
                     crate::settings_management::draw(
                         ui,
                         &model.navigation.settings_management,
@@ -6154,7 +6687,7 @@ fn draw_settings(
                                         .open(focused.then_some(true))
                                         .show(ui, |ui| {
                                             action_render::draw_command_controls(
-                                                ui, row, model, commands, false,
+                                                ui, row, model, commands, false, colors,
                                             )
                                         });
                                         if focused && reveal_command {
@@ -6178,7 +6711,7 @@ fn draw_settings(
                     {
                         ui.label(
                             RichText::new("The launcher host published no settings.")
-                                .size(theme::TEXT_SMALL)
+                                .size(colors.metrics.text_small)
                                 .color(colors.text_muted),
                         );
                     }
@@ -6194,18 +6727,18 @@ fn draw_settings(
                             commands,
                             colors,
                         );
-                        ui.add_space(theme::SPACE_1);
+                        ui.add_space(colors.metrics.space_1);
                     }
-                    ui.add_space(theme::SPACE_2);
+                    ui.add_space(colors.metrics.space_2);
                     if let Some(hint) = commit_hint(&model.settings) {
                         ui.label(
                             RichText::new(hint)
-                                .size(theme::TEXT_SMALL)
+                                .size(colors.metrics.text_small)
                                 .color(colors.text_muted),
                         );
                     }
                 });
-            ui.add_space(theme::SPACE_2);
+            ui.add_space(colors.metrics.space_2);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Quit CriKey").clicked() {
@@ -6230,6 +6763,12 @@ fn draw_settings(
 /// teaches people to stop reading legends. `None` when there is nothing to
 /// commit, where the empty-state sentence above has already said so.
 fn commit_hint(settings: &[SettingRow]) -> Option<&'static str> {
+    if settings
+        .iter()
+        .any(|row| matches!(row.control, SettingControl::Choice { .. }))
+    {
+        return Some("Choose a value, then Save; Enter or Save commits text edits");
+    }
     let switches = settings
         .iter()
         .any(|row| matches!(row.control, SettingControl::Toggle { .. }));
@@ -6268,7 +6807,7 @@ fn draw_setting_row(
     outcomes: &[crate::SettingEditOutcome],
     focus_key: Option<&str>,
     commands: &mut Vec<UiCommand>,
-    colors: theme::Palette,
+    colors: &theme::Palette,
 ) {
     let draft_id = egui::Id::new(("crikey-setting-draft", row.key.as_str()));
     let state_id = draft_id.with("state");
@@ -6311,20 +6850,43 @@ fn draw_setting_row(
     let mut draft = stored.unwrap_or_else(|| row.value.clone());
     let mut committed = false;
     let mut cancelled = false;
-    ui.horizontal(|ui| {
+    ui.vertical(|ui| {
         ui.vertical(|ui| {
             ui.label(
                 RichText::new(&row.label)
-                    .size(theme::TEXT_BODY)
+                    .size(colors.metrics.text_body)
                     .color(colors.text),
             );
             ui.label(
                 RichText::new(format!("{}  ({})", row.key, row.source))
-                    .size(theme::TEXT_SMALL)
+                    .size(colors.metrics.text_small)
                     .color(colors.text_muted),
             );
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if let SettingControl::Choice { options } = row.control {
+                let selected = options.iter().find(|(value, _)| *value == draft.as_str());
+                let response = egui::ComboBox::from_id_salt(("setting-choice", &row.key))
+                    .selected_text(selected.map_or(row.value.as_str(), |(_, label)| *label))
+                    .width(160.0_f32.min(ui.available_width()))
+                    .show_ui(ui, |ui| {
+                        for &(value, label) in options {
+                            if ui.selectable_label(draft.as_str() == value, label).clicked()
+                                && draft.as_str() != value
+                            {
+                                draft.clear();
+                                draft.push_str(value);
+                                ui.close_menu();
+                                state.revision = state
+                                    .revision
+                                    .checked_add(1)
+                                    .expect("setting draft revision exhausted");
+                                ui.data_mut(|data| data.insert_temp(draft_id, draft.clone()));
+                            }
+                        }
+                    });
+                focus_once(ui, &response.response, row, focus_key);
+            }
             if let SettingControl::Toggle { on } = row.control {
                 // No draft and no Save: a switch has no half-typed state to
                 // keep, so it commits the moment it moves. Offering a Save
@@ -6358,23 +6920,30 @@ fn draw_setting_row(
             if row.key == "launcher.activation-hotkey" && ui.button("Record").clicked() {
                 commands.push(UiCommand::BeginShortcutCapture(row.key.clone()));
             }
-            // TextEdit may consume Return; retain its presence before dispatch.
-            let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
-            let response = ui.add(
-                TextEdit::singleline(&mut draft)
-                    .id(draft_id.with("editor"))
-                    .desired_width(theme::SPACE_8 * 6.0),
-            );
-            focus_once(ui, &response, row, focus_key);
-            if response.changed() {
-                state.revision = state
-                    .revision
-                    .checked_add(1)
-                    .expect("setting draft revision exhausted");
-                ui.data_mut(|data| data.insert_temp(draft_id, draft.clone()));
-            }
-            if response.lost_focus() && enter_pressed {
-                committed = true;
+            if matches!(row.control, SettingControl::Text) {
+                // TextEdit may consume Return; retain its presence before dispatch.
+                let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                let response = ui.add(
+                    TextEdit::singleline(&mut draft)
+                        .id(draft_id.with("editor"))
+                        .desired_width((colors.metrics.space_8 * 6.0).min(ui.available_width()).max(24.0))
+                        .char_limit(if row.key == "launcher.navigation-bindings" {
+                            8192
+                        } else {
+                            4096
+                        }),
+                );
+                focus_once(ui, &response, row, focus_key);
+                if response.changed() {
+                    state.revision = state
+                        .revision
+                        .checked_add(1)
+                        .expect("setting draft revision exhausted");
+                    ui.data_mut(|data| data.insert_temp(draft_id, draft.clone()));
+                }
+                if response.lost_focus() && enter_pressed {
+                    committed = true;
+                }
             }
         });
     });
@@ -6399,7 +6968,7 @@ fn draw_setting_row(
         });
         ui.data_mut(|data| data.insert_temp(draft_id, draft));
     }
-    if matches!(row.control, SettingControl::Text) {
+    if matches!(row.control, SettingControl::Text | SettingControl::Choice { .. }) {
         ui.data_mut(|data| data.insert_temp(state_id, state));
     }
 }
@@ -6417,10 +6986,10 @@ fn draw_setting_row(
 /// host focused is operable with the space bar, and it paints a ring when it
 /// has the keyboard -- a launcher this keyboard-driven cannot have a control
 /// whose focus is invisible.
-fn draw_switch(ui: &mut egui::Ui, on: &mut bool, colors: theme::Palette) -> egui::Response {
+fn draw_switch(ui: &mut egui::Ui, on: &mut bool, colors: &theme::Palette) -> egui::Response {
     // Two thirds of a control tall and twice that wide: enough to read as a
     // track with travel in it, and no taller than the row it sits in.
-    let height = theme::FOOTER_HEIGHT;
+    let height = colors.metrics.footer_height;
     let size = vec2(height * 2.0, height);
     let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
     if response.clicked() || (response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Space))) {
@@ -6478,13 +7047,13 @@ fn focus_once(ui: &egui::Ui, response: &egui::Response, row: &SettingRow, focus_
 }
 
 /// The vertical room [`draw_status`] needs, in logical pixels: one status row,
-/// which is [`theme::CONTROL_HEIGHT`] tall because the `Settings  Ctrl+,`
+/// which is [`theme::CONTROL_HEIGHT`] tall because the `Settings`
 /// button's `interact_size` decides the row's height rather than the small
 /// text beside it.
 ///
 /// There is no rule above it any more. The footer used to open with a
 /// `Separator` drawn edge to edge, which is a border across the one part of
-/// the window that should recede; the [`BLOCK_GAP`] over it already says the
+/// the window that should recede; the spacing above it already says the
 /// same thing.
 ///
 /// [`draw_results`] subtracts this from the room the result list may take, so
@@ -6494,182 +7063,319 @@ fn focus_once(ui: &egui::Ui, response: &egui::Response, row: &SettingRow, focus_
 /// clamped frame out and fails if the status row stops matching this, which is
 /// what let a 120-result list push the "120 results" line off the bottom of
 /// the window.
+#[cfg(test)]
 const STATUS_BLOCK_HEIGHT: f32 = theme::FOOTER_HEIGHT;
 
-fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
-    // A horizontal row is at least one interactive control tall, because that
-    // is the touch target egui reserves for the widgets it usually holds. This
-    // row holds text, and the launcher's height is arithmetic over
-    // `STATUS_BLOCK_HEIGHT`, so leaving the default would put a strip of empty
-    // canvas under the hint line in every window the launcher opens.
-    ui.spacing_mut().interact_size.y = theme::FOOTER_HEIGHT;
+fn bounded_text(
+    ui: &mut egui::Ui,
+    text: RichText,
+    width: f32,
+    height: f32,
+    sense: egui::Sense,
+) -> egui::Response {
+    let width = width.max(0.0).min(ui.available_width().max(0.0));
+    let (rect, allocation) = ui.allocate_exact_size(vec2(width, height), egui::Sense::hover());
+    let response = ui.interact(rect, allocation.id.with("bounded-text"), sense);
+    let clip = ui.clip_rect().intersect(rect);
+    // egui 0.29's GalleyCache rounds wrap widths to whole logical points,
+    // regardless of DPI. Round inward first so truncation stays in its slot.
+    let text_width = clip.width().max(0.0).floor();
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        text_width,
+        TextStyle::Small,
+    );
+    let centered = rect.center() - galley.size() / 2.0;
+    let position = egui::pos2(
+        centered
+            .x
+            .max(clip.left())
+            .min((clip.right() - galley.size().x).max(clip.left())),
+        centered
+            .y
+            .max(clip.top())
+            .min((clip.bottom() - galley.size().y).max(clip.top())),
+    );
+    ui.painter()
+        .with_clip_rect(clip)
+        .galley(position, galley, ui.visuals().text_color());
+    response
+}
+
+fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: &theme::Palette) {
+    ui.spacing_mut().interact_size.y = colors.metrics.footer_height;
     let web_page = model.page.as_ref().is_some_and(|page| page.frame.web.is_some());
     if web_page {
-        // The fallback frame builder also feeds keys through egui. Retire any
-        // host focus before its footer can interpret document Enter/Space as
-        // a click, including focus retained from a previous pointer click.
         ui.memory_mut(|memory| {
             if let Some(focused) = memory.focused() {
                 memory.surrender_focus(focused);
             }
         });
     }
-    ui.horizontal(|ui| {
+    let available = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    let (allocated, _) = ui.allocate_exact_size(
+        vec2(available.width().max(0.0), colors.metrics.footer_height),
+        egui::Sense::hover(),
+    );
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(available.left(), allocated.top()),
+        vec2(available.width().max(0.0), colors.metrics.footer_height),
+    )
+    .intersect(ui.clip_rect());
+    let status_width = if model.page.is_some() || model.pending_plugins {
+        colors.metrics.scaled(180.0).min(rect.width() * 0.4)
+    } else if !model.query.is_empty() {
+        colors.metrics.scaled(90.0).min(rect.width() * 0.25)
+    } else {
+        0.0
+    };
+    let status_gap = if status_width > 0.0 {
+        ui.spacing().item_spacing.x
+    } else {
+        0.0
+    };
+    let controls_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            (rect.left() + status_width + status_gap).min(rect.right()),
+            rect.top(),
+        ),
+        rect.max,
+    );
+    let status_rect = egui::Rect::from_min_size(rect.min, vec2(status_width, rect.height()));
+    let mut status = ui.new_child(
+        UiBuilder::new()
+            .id_salt("footer-status")
+            .max_rect(status_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    status.set_clip_rect(status_rect);
+    let mut controls = ui.new_child(
+        UiBuilder::new()
+            .id_salt("footer-controls")
+            .max_rect(controls_rect)
+            .layout(Layout::right_to_left(Align::Center)),
+    );
+    controls.set_clip_rect(controls_rect);
+    let ui = &mut controls;
+    // Mandatory controls claim their bounded space before any optional hint.
+    let settings = bounded_text(
+        ui,
+        RichText::new("Settings").small().color(colors.text),
+        colors.metrics.scaled(58.0),
+        colors.metrics.footer_height,
+        egui::Sense {
+            focusable: !web_page,
+            ..egui::Sense::click()
+        },
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    .on_hover_text(if web_page {
+        "Open Settings"
+    } else {
+        "Open Settings (Ctrl+,)"
+    });
+    if settings.hovered() {
+        ui.painter().line_segment(
+            [settings.rect.left_bottom(), settings.rect.right_bottom()],
+            Stroke::new(1.0, colors.text),
+        );
+    }
+    if settings.clicked() {
+        commands.push(UiCommand::OpenSettings);
+    }
+    if model.page.as_ref().is_some_and(|page| page.stale) {
+        bounded_text(
+            ui,
+            RichText::new("Waiting for the plugin")
+                .small()
+                .color(colors.warning),
+            colors.metrics.scaled(140.0),
+            colors.metrics.footer_height,
+            egui::Sense::hover(),
+        )
+        .on_hover_text("Waiting for the plugin");
+    }
+    let result_controls = !model.settings_open
+        && model.page.is_none()
+        && !model.rows.is_empty()
+        && model.navigation.inline_arguments.is_none();
+    if result_controls {
+        if bounded_text(
+            ui,
+            RichText::new("Actions").small(),
+            colors.metrics.scaled(48.0),
+            colors.metrics.footer_height,
+            egui::Sense::click(),
+        )
+        .on_hover_text("Discover actions")
+        .clicked()
+        {
+            commands.push(UiCommand::ShowActions);
+        }
+        let form_submit = model.navigation.standard.as_ref().and_then(|surface| {
+            let crikey_core::structured_view::StandardView::Form(form) = &surface.descriptor.view else {
+                return None;
+            };
+            Some((surface, &form.submit))
+        });
+        let primary = model.rows.get(model.selected).filter(|row| {
+            form_submit.is_some() || row.has_primary_action() || actionless_primary(row, model)
+        });
+        if let Some(row) = primary {
+            let label = if let Some((surface, submit)) = form_submit {
+                submit
+                    .action
+                    .as_ref()
+                    .and_then(|action| surface.descriptor.definition(&submit.target)?.action(action))
+                    .map_or("Run", |action| action.label.as_str())
+            } else if matches!(row.target, crate::ActionTarget::Command(_)) {
+                "Invoke Command"
+            } else {
+                row.default_action
+                    .as_ref()
+                    .map_or("Run", |action| action.label.as_str())
+            };
+            let width = colors.metrics.scaled(110.0).min(ui.available_width()).max(0.0);
+            if bounded_text(
+                ui,
+                RichText::new(label).small(),
+                width,
+                colors.metrics.footer_height,
+                egui::Sense::click(),
+            )
+            .on_hover_text(label)
+            .clicked()
+            {
+                if let Some(command) = root_primary_command(row, model) {
+                    commands.push(command);
+                }
+            }
+        }
+        let navigation = ui
+            .ctx()
+            .data(|data| data.get_temp::<Arc<crate::navigation::CompiledNavigation>>(navigation_id()))
+            .expect("launcher context owns compiled navigation");
+        let route = navigation_context(model, navigation_owner(ui.ctx(), Some(model)), false);
+        let actions = [
+            Some(crate::navigation::NavigationAction::ShowActions),
+            (primary.is_some() && model.action_panel.is_none())
+                .then_some(crate::navigation::NavigationAction::Activate),
+        ];
+        let count = actions
+            .iter()
+            .flatten()
+            .filter(|action| navigation.hints(**action, route).next().is_some())
+            .count();
+        if count != 0 {
+            let width = ((ui.available_width()
+                - ui.spacing().item_spacing.x * count.saturating_sub(1) as f32)
+                .max(0.0)
+                / count as f32)
+                .min(colors.metrics.scaled(140.0));
+            if width >= colors.metrics.scaled(12.0) {
+                for action in actions.into_iter().flatten() {
+                    if let Some(hint) = navigation.hints(action, route).next() {
+                        bounded_text(
+                            ui,
+                            RichText::new(hint).small(),
+                            width,
+                            colors.metrics.footer_height,
+                            egui::Sense::hover(),
+                        )
+                        .on_hover_text(hint);
+                    }
+                }
+            }
+        }
+    } else if model.show_hints {
+        if web_page || model.settings_open {
+            if web_page {
+                // These keys belong to the web transport, not host navigation.
+                let legend = "Tab navigate page   Esc close page";
+                ui.add(egui::Label::new(RichText::new(legend).small()).truncate())
+                    .on_hover_text(legend);
+            } else {
+                draw_navigation_hint(ui, model, crate::navigation::NavigationAction::Cancel);
+                ui.small("close settings");
+            }
+        } else if model.page.is_none() {
+            draw_navigation_hint(ui, model, crate::navigation::NavigationAction::Next);
+            ui.small("navigate");
+            draw_navigation_hint(ui, model, crate::navigation::NavigationAction::Complete);
+            ui.small("complete");
+            draw_navigation_hint(ui, model, crate::navigation::NavigationAction::Cancel);
+            ui.small("cancel");
+        }
+    }
+    // Status occupies a separate bounded left slot, never a control's space.
+    if status_width > 0.0 {
+        let ui = &mut status;
         if let Some(page) = &model.page {
-            // A surface that takes the whole result area has to say whose it
-            // is. The page's own title leads and the owning plugin follows it
-            // in muted type: a page cannot be trusted to name itself honestly,
-            // and the user is about to type into it.
             let title = if page.frame.title.is_empty() {
                 page.page_id.as_str()
             } else {
                 page.frame.title.as_str()
             };
-            ui.label(RichText::new(title).small().color(colors.text));
-            ui.label(RichText::new(&page.plugin_name).small().color(colors.text_muted));
-            // A stale page is the previous frame still standing while the host
-            // waits for an answer. It keeps being drawn rather than blanked --
-            // blanking would flicker every page that redraws on a timer -- so
-            // this is the only thing telling the user that what they are
-            // looking at is not the answer to what they just did.
+            let gap = ui.spacing().item_spacing.x;
+            let spinner_width = if page.stale {
+                colors.metrics.footer_height + gap
+            } else {
+                0.0
+            };
+            let content_width = (ui.available_width() - spinner_width).max(0.0);
+            let title_width = if page.plugin_name.is_empty() {
+                content_width
+            } else {
+                (content_width - gap).max(0.0) * 0.6
+            };
+            bounded_text(
+                ui,
+                RichText::new(title).small().color(colors.text),
+                title_width,
+                colors.metrics.footer_height,
+                egui::Sense::hover(),
+            )
+            .on_hover_text(title);
+            if !page.plugin_name.is_empty() {
+                bounded_text(
+                    ui,
+                    RichText::new(&page.plugin_name).small().color(colors.text_muted),
+                    (content_width - title_width - gap).max(0.0),
+                    colors.metrics.footer_height,
+                    egui::Sense::hover(),
+                )
+                .on_hover_text(&page.plugin_name);
+            }
             if page.stale {
-                ui.add(egui::Spinner::new().size(theme::FOOTER_HEIGHT));
-                ui.label(
-                    RichText::new("Waiting for the plugin")
-                        .small()
-                        .color(colors.warning),
-                );
+                ui.add(egui::Spinner::new().size(colors.metrics.footer_height))
+                    .on_hover_text("Waiting for plugin");
             }
         } else if model.pending_plugins {
-            // Sized to the line it sits on. At its default size the spinner is
-            // a whole control tall, which would make the footer grow by six
-            // pixels for as long as a provider is answering -- and the window
-            // is sized from the footer, so the whole launcher would twitch.
-            ui.add(egui::Spinner::new().size(theme::FOOTER_HEIGHT));
-            ui.label(
-                RichText::new("Providers are still responding")
-                    .small()
-                    .color(colors.warning),
-            );
-        } else if !model.query.is_empty() {
-            // There is nothing to count before the user has typed, and a
-            // "0 results" under an empty field reads as a failed search.
+            ui.add(egui::Spinner::new().size(colors.metrics.footer_height));
+            ui.add(
+                egui::Label::new(
+                    RichText::new("Providers are still responding")
+                        .small()
+                        .color(colors.warning),
+                )
+                .truncate(),
+            )
+            .on_hover_text("Providers are still responding");
+        } else {
             let count = model.rows.len();
             let suffix = if count == 1 { "result" } else { "results" };
-            ui.label(
-                RichText::new(format!("{count} {suffix}"))
-                    .small()
-                    .color(colors.text_muted),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{count} {suffix}"))
+                        .small()
+                        .color(colors.text_muted),
+                )
+                .truncate(),
             );
         }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            // The footer remains the pointer/accessibility route into host
-            // settings. A web document owns Ctrl+, Tab, Enter and Space: never
-            // advertise the shortcut or admit host keyboard focus here.
-            let settings = ui
-                .add(
-                    egui::Label::new(
-                        RichText::new(if web_page { "Settings" } else { "Settings  Ctrl+," })
-                            .small()
-                            .color(colors.text),
-                    )
-                    .sense(egui::Sense {
-                        focusable: !web_page,
-                        ..egui::Sense::click()
-                    }),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            // Drawn in the same frame the hover is detected in, so the
-            // underline is the answer to this pointer position rather than to
-            // the last one. Recolouring the text instead would paint a frame
-            // late, because the glyphs are already laid out by here.
-            if settings.hovered() {
-                let edge = settings.rect;
-                ui.painter().line_segment(
-                    [edge.left_bottom(), edge.right_bottom()],
-                    Stroke::new(1.0, colors.text),
-                );
-            }
-            if settings.clicked() {
-                commands.push(UiCommand::OpenSettings);
-            }
-            if !model.settings_open
-                && model.page.is_none()
-                && !model.rows.is_empty()
-                && model.navigation.inline_arguments.is_none()
-            {
-                let actions = ui
-                    .add(
-                        egui::Label::new(RichText::new("Actions  Ctrl/Cmd+K").small())
-                            .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text("Discover actions: Ctrl/Cmd+K or Alt+Enter");
-                if actions.clicked() {
-                    commands.push(UiCommand::ShowActions);
-                }
-                if let Some(row) = model.rows.get(model.selected) {
-                    let form_submit = model.navigation.standard.as_ref().and_then(|surface| {
-                        let crikey_core::structured_view::StandardView::Form(form) = &surface.descriptor.view
-                        else {
-                            return None;
-                        };
-                        Some((surface, &form.submit))
-                    });
-                    if form_submit.is_some() || row.has_primary_action() || actionless_primary(row, model) {
-                        let label = if let Some((surface, submit)) = form_submit {
-                            submit
-                                .action
-                                .as_ref()
-                                .and_then(|action| {
-                                    surface.descriptor.definition(&submit.target)?.action(action)
-                                })
-                                .map_or("Run", |action| action.label.as_str())
-                        } else if matches!(row.target, crate::ActionTarget::Command(_)) {
-                            "Invoke Command"
-                        } else {
-                            row.default_action
-                                .as_ref()
-                                .map_or("Run", |action| action.label.as_str())
-                        };
-                        let primary = ui
-                            .add_sized(
-                                [110.0, theme::FOOTER_HEIGHT],
-                                egui::Label::new(RichText::new(format!("{}  Enter", label)).small())
-                                    .truncate()
-                                    .sense(egui::Sense::click()),
-                            )
-                            .on_hover_text(label);
-                        if primary.clicked() {
-                            if let Some(command) = root_primary_command(row, model) {
-                                commands.push(command);
-                            }
-                        }
-                    }
-                }
-            }
-            // Only the legend is optional; the `Settings  Ctrl+,` control above
-            // is drawn unconditionally, because it is the one mouse route into
-            // the settings surface and hiding it would make the setting that
-            // hid it unreachable by anything but the command line. The row's
-            // height is unaffected either way: it is set from
-            // `interact_size.y` above, and what remains is the same one line of
-            // small text the window arithmetic in `STATUS_BLOCK_HEIGHT` is
-            // measured against.
-            if model.show_hints && (model.rows.is_empty() || model.page.is_some() || model.settings_open) {
-                ui.label(
-                    RichText::new(if web_page {
-                        "Tab navigate page   Esc close page"
-                    } else {
-                        "Up/Down navigate   Tab complete   Esc cancel"
-                    })
-                    .small()
-                    .color(colors.text_muted),
-                );
-            }
-        });
-    });
+    }
 }
-
 /// What the window is cleared to underneath everything the launcher draws.
 ///
 /// `shaped` is whether the surface can carry alpha. When it can, the clear is
@@ -6677,7 +7383,7 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
 /// show the desktop. When it cannot, clearing to nothing would present as
 /// solid black, so the canvas colour is used instead and the window reads as
 /// the square it is being forced to be.
-fn clear_color(shaped: bool) -> wgpu::Color {
+fn clear_color(shaped: bool, colors: &theme::Palette) -> wgpu::Color {
     // A surface carrying alpha is composited premultiplied, where the colour
     // channels are already scaled by alpha: at alpha zero every other channel
     // must be zero too, or the desktop showing through gets the canvas colour
@@ -6686,7 +7392,7 @@ fn clear_color(shaped: bool) -> wgpu::Color {
         return wgpu::Color::TRANSPARENT;
     }
 
-    let [red, green, blue, alpha] = theme::palette().canvas.to_array();
+    let [red, green, blue, alpha] = colors.canvas.to_array();
     const BYTE_MAX: f64 = u8::MAX as f64;
     wgpu::Color {
         r: f64::from(red) / BYTE_MAX,
@@ -6764,7 +7470,7 @@ mod transparency_tests {
             &mut crate::typed_input::TypedEditor::default(),
             &mut Vec::new(),
         );
-        let colors = theme::palette();
+        let colors = &crate::appearance::ResolvedAppearance::default().palette;
 
         assert!(opaque
             .output
@@ -6783,15 +7489,18 @@ mod transparency_tests {
     /// nothing.
     #[test]
     fn an_unshaped_surface_is_cleared_to_the_canvas_rather_than_to_nothing() {
-        let squared = clear_color(false);
-        let canvas = theme::palette().canvas;
+        let squared = clear_color(false, &crate::appearance::ResolvedAppearance::default().palette);
+        let canvas = crate::appearance::ResolvedAppearance::default().palette.canvas;
         assert_eq!(squared.a, 1.0);
         assert_eq!(squared.r, f64::from(canvas.r()) / 255.0);
 
         // Premultiplied compositing adds the clear colour straight onto the
         // desktop, so the pixels outside the shape must be zero in every
         // channel and not merely zero in alpha.
-        assert_eq!(clear_color(true), wgpu::Color::TRANSPARENT);
+        assert_eq!(
+            clear_color(true, &crate::appearance::ResolvedAppearance::default().palette),
+            wgpu::Color::TRANSPARENT
+        );
     }
 
     #[test]
@@ -7259,7 +7968,10 @@ mod label_tests {
             alternate_actions: Vec::new(),
         };
 
-        assert_eq!(highlighted_label(&row, theme::palette()).text, "(unnamed result)");
+        assert_eq!(
+            highlighted_label(&row, &crate::appearance::ResolvedAppearance::default().palette).text,
+            "(unnamed result)"
+        );
     }
 
     #[test]
@@ -7288,7 +8000,10 @@ mod label_tests {
             alternate_actions: Vec::new(),
         };
 
-        assert_eq!(highlighted_label(&row, theme::palette()).text, "café");
+        assert_eq!(
+            highlighted_label(&row, &crate::appearance::ResolvedAppearance::default().palette).text,
+            "café"
+        );
     }
 }
 
@@ -8017,18 +8732,30 @@ mod window_geometry_tests {
         let expanded = theme::DEFAULT_WINDOW_HEIGHT;
 
         assert_eq!(
-            desired_window_height(&view("", false), expanded),
+            desired_window_height(
+                &view("", false),
+                expanded,
+                &crate::appearance::ResolvedAppearance::default().palette.metrics
+            ),
             theme::COMPACT_WINDOW_HEIGHT,
             "an untyped launcher must not stand at list height over the desktop"
         );
         assert_eq!(
-            desired_window_height(&view("q", false), expanded),
+            desired_window_height(
+                &view("q", false),
+                expanded,
+                &crate::appearance::ResolvedAppearance::default().palette.metrics
+            ),
             theme::COMPACT_WINDOW_HEIGHT,
             "typing is not a result: the field must not grow an empty panel under \
              itself while the providers are still answering"
         );
         assert_eq!(
-            desired_window_height(&view("", true), expanded),
+            desired_window_height(
+                &view("", true),
+                expanded,
+                &crate::appearance::ResolvedAppearance::default().palette.metrics
+            ),
             expanded,
             "the settings surface needs the room even with nothing typed"
         );
@@ -8046,7 +8773,11 @@ mod window_geometry_tests {
             web_caret_area: None,
         });
         assert_eq!(
-            desired_window_height(&page, expanded),
+            desired_window_height(
+                &page,
+                expanded,
+                &crate::appearance::ResolvedAppearance::default().palette.metrics
+            ),
             expanded,
             "a page's extent is the plugin's to choose, so it gets the whole window"
         );
@@ -8056,8 +8787,16 @@ mod window_geometry_tests {
     fn a_listed_window_is_as_tall_as_its_rows_and_no_taller() {
         let expanded = theme::DEFAULT_WINDOW_HEIGHT;
 
-        let one = desired_window_height(&view_with_rows(1), expanded);
-        let two = desired_window_height(&view_with_rows(2), expanded);
+        let one = desired_window_height(
+            &view_with_rows(1),
+            expanded,
+            &crate::appearance::ResolvedAppearance::default().palette.metrics,
+        );
+        let two = desired_window_height(
+            &view_with_rows(2),
+            expanded,
+            &crate::appearance::ResolvedAppearance::default().palette.metrics,
+        );
         assert_eq!(
             two - one,
             (theme::ROW_HEIGHT + theme::ROW_GAP) as u32,
@@ -8068,7 +8807,11 @@ mod window_geometry_tests {
             "a single result neither leaves the window compact nor fills it: {one}"
         );
         assert_eq!(
-            desired_window_height(&view_with_rows(500), expanded),
+            desired_window_height(
+                &view_with_rows(500),
+                expanded,
+                &crate::appearance::ResolvedAppearance::default().palette.metrics
+            ),
             expanded,
             "a long list scrolls inside the window rather than covering the screen"
         );
@@ -8114,7 +8857,7 @@ mod window_geometry_tests {
 
     /// The lowest pixel `frame` draws.
     fn frame_bottom(frame: &NativeUiFrame) -> f32 {
-        let canvas = theme::palette().canvas;
+        let canvas = crate::appearance::ResolvedAppearance::default().palette.canvas;
         frame
             .output
             .shapes
@@ -8253,7 +8996,7 @@ mod window_geometry_tests {
         rows.sort_by(|left, right| left.rect.min.y.total_cmp(&right.rect.min.y));
         assert_eq!(rows.len(), 3, "three results are three rows");
 
-        let colors = theme::palette();
+        let colors = &crate::appearance::ResolvedAppearance::default().palette;
         for (index, row) in rows.iter().enumerate() {
             if index == model.selected {
                 assert_eq!(
@@ -8291,7 +9034,11 @@ mod window_geometry_tests {
     fn a_listed_window_leaves_the_status_line_room_to_be_read() {
         for rows in 1_usize..=3 {
             let model = view_with_rows(rows);
-            let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
+            let height = desired_window_height(
+                &model,
+                theme::DEFAULT_WINDOW_HEIGHT,
+                &crate::appearance::ResolvedAppearance::default().palette.metrics,
+            );
             let bottom = frame_bottom(&frame_at(&model, height));
 
             let needed = bottom + theme::PANEL_MARGIN;
@@ -8321,7 +9068,11 @@ mod window_geometry_tests {
     fn a_compact_window_leaves_room_for_the_field_and_the_footer() {
         let model = view("", false);
         assert_eq!(
-            desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT),
+            desired_window_height(
+                &model,
+                theme::DEFAULT_WINDOW_HEIGHT,
+                &crate::appearance::ResolvedAppearance::default().palette.metrics
+            ),
             theme::COMPACT_WINDOW_HEIGHT,
             "an untyped launcher is the compact window, or this tests the wrong height"
         );
@@ -8348,7 +9099,7 @@ mod window_geometry_tests {
     ///
     /// The footer's height is what [`STATUS_BLOCK_HEIGHT`] and therefore
     /// [`theme::COMPACT_WINDOW_HEIGHT`] are measured against, and the row still
-    /// holds the `Settings  Ctrl+,` control -- the same one line of small text
+    /// holds the `Settings` control -- the same one line of small text
     /// the hint label was. If dropping the label were ever to shrink the row,
     /// every window the launcher opens would carry a strip of dead canvas under
     /// its footer, and nothing about the setting itself would say why.
@@ -8359,8 +9110,16 @@ mod window_geometry_tests {
         hidden.show_hints = false;
 
         assert_eq!(
-            desired_window_height(&hidden, theme::DEFAULT_WINDOW_HEIGHT),
-            desired_window_height(&shown, theme::DEFAULT_WINDOW_HEIGHT),
+            desired_window_height(
+                &hidden,
+                theme::DEFAULT_WINDOW_HEIGHT,
+                &crate::appearance::ResolvedAppearance::default().palette.metrics
+            ),
+            desired_window_height(
+                &shown,
+                theme::DEFAULT_WINDOW_HEIGHT,
+                &crate::appearance::ResolvedAppearance::default().palette.metrics
+            ),
             "the hint line is not part of any height the launcher computes"
         );
         assert_eq!(
@@ -8415,7 +9174,11 @@ mod window_geometry_tests {
     #[test]
     fn a_search_that_found_nothing_keeps_the_margin_under_the_footer() {
         let model = view("no such thing", false);
-        let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
+        let height = desired_window_height(
+            &model,
+            theme::DEFAULT_WINDOW_HEIGHT,
+            &crate::appearance::ResolvedAppearance::default().palette.metrics,
+        );
         assert_eq!(
             height,
             theme::COMPACT_WINDOW_HEIGHT,
@@ -8474,7 +9237,11 @@ mod window_geometry_tests {
                 crate::action_tree(&model.rows[model.selected], &model.command_management).unwrap(),
             )));
 
-            let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
+            let height = desired_window_height(
+                &model,
+                theme::DEFAULT_WINDOW_HEIGHT,
+                &crate::appearance::ResolvedAppearance::default().palette.metrics,
+            );
             let bottom = frame_bottom(&frame_at(&model, height));
 
             let needed = bottom + theme::PANEL_MARGIN;
@@ -8541,7 +9308,11 @@ mod window_geometry_tests {
                 ))
             });
 
-            let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
+            let height = desired_window_height(
+                &model,
+                theme::DEFAULT_WINDOW_HEIGHT,
+                &crate::appearance::ResolvedAppearance::default().palette.metrics,
+            );
             assert_eq!(
                 height,
                 theme::DEFAULT_WINDOW_HEIGHT,
@@ -8552,7 +9323,7 @@ mod window_geometry_tests {
             for clipped in &frame.output.shapes {
                 leaves(&clipped.shape, &mut shapes);
             }
-            let canvas = theme::palette().canvas;
+            let canvas = crate::appearance::ResolvedAppearance::default().palette.canvas;
             // Every rectangle the frame paints except the panel's own
             // background, which is the window and would answer every question
             // here with the window's own edges.
@@ -8633,7 +9404,7 @@ mod window_geometry_tests {
                 // the list, the action overlay. Neither is outlined any more,
                 // so they are found by fill and radius, and the overlay is the
                 // lower of the two.
-                let surface = theme::palette().surface;
+                let surface = crate::appearance::ResolvedAppearance::default().palette.surface;
                 let mut sheets: Vec<egui::Rect> = shapes
                     .iter()
                     .filter_map(|shape| match shape {
@@ -9755,13 +10526,14 @@ mod popup_keyboard_tests {
             .output
             .shapes
             .iter()
-            .find_map(|shape| {
+            .filter_map(|shape| {
                 let egui::epaint::Shape::Text(text) = &shape.shape else {
                     return None;
                 };
-                (text.galley.text() == "Actions  Ctrl+K")
-                    .then(|| text.galley.rect.translate(text.pos.to_vec2()).center())
+                let center = text.galley.rect.translate(text.pos.to_vec2()).center();
+                (text.galley.text() == "Actions" && shape.clip_rect.contains(center)).then_some(center)
             })
+            .min_by(|left, right| left.y.total_cmp(&right.y))
             .expect("route actions menu");
         build_launcher_frame(
             &renderer,
@@ -9788,7 +10560,9 @@ mod popup_keyboard_tests {
             ElementState::Pressed,
             ModifiersState::empty(),
             Some(&frame),
-            egui_popup_open(&renderer)
+            egui_popup_open(&renderer),
+            &crate::navigation::CompiledNavigation::default(),
+            crate::navigation::NavigationOwner::Host
         )
         .is_none());
         let closed = build_launcher_frame(
@@ -9821,6 +10595,8 @@ mod popup_keyboard_tests {
             ModifiersState::empty(),
             Some(&frame),
             egui_popup_open(&renderer),
+            &crate::navigation::CompiledNavigation::default(),
+            crate::navigation::NavigationOwner::Host,
         )
         .unwrap();
         model.apply(right);
@@ -9829,5 +10605,458 @@ mod popup_keyboard_tests {
             logical
         );
         assert_eq!(model.standard_host_state().selected.unwrap().item.0, "item-1");
+    }
+    #[test]
+    fn actual_form_keeps_text_password_and_ime_ownership_with_remapped_navigation() {
+        use crate::navigation::{CompiledNavigation, NavigationStyle};
+        use crikey_core::structured_arguments::{
+            ArgumentField, ArgumentSchema, ExecutableKey, FieldId, FieldKind, NonSecretValue, OwnedItem,
+            StructuredValue,
+        };
+        use crikey_core::structured_view::{
+            ActionMenuEntry, FormView, StandardView, StructuredRouteOutcome, ViewExecutionContext, ViewReply,
+        };
+        let mut descriptor = (*crate::standard_view::tests::descriptor(1)).clone();
+        let owner = descriptor.definitions[0].item.plugin_id.clone();
+        let target = OwnedItem {
+            owner: owner.clone(),
+            item: descriptor.definitions[0].item.stable_id.clone(),
+        };
+        descriptor.view = StandardView::Form(FormView {
+            submit: ExecutableKey { target, action: None },
+        });
+        let fields = vec![
+            ArgumentField {
+                id: FieldId("name".into()),
+                label: "Name".into(),
+                required: false,
+                placeholder: None,
+                validation_message: None,
+                kind: FieldKind::Text {
+                    min_bytes: 0,
+                    max_bytes: 128,
+                    multiline: false,
+                    default: None,
+                },
+            },
+            ArgumentField {
+                id: FieldId("password".into()),
+                label: "Password".into(),
+                required: true,
+                placeholder: None,
+                validation_message: None,
+                kind: FieldKind::Password {
+                    min_bytes: 1,
+                    max_bytes: 128,
+                },
+            },
+        ];
+        let ActionMenuEntry::Action(binding) =
+            &mut Arc::make_mut(&mut descriptor.definitions)[0].action_sections[0].entries[0]
+        else {
+            unreachable!()
+        };
+        binding.schema = Some(Arc::new(ArgumentSchema { fields }));
+        let mut model = crate::LauncherViewModel::new();
+        model.activate();
+        let request = model
+            .open_standard_route(
+                owner.clone(),
+                7,
+                StructuredRouteOutcome::Push(crikey_core::structured_view::RouteId("real-form".into())),
+            )
+            .unwrap();
+        assert!(model.publish_standard_view(
+            owner,
+            7,
+            ViewReply {
+                context: ViewExecutionContext {
+                    route: request.route,
+                    session: request.session,
+                    revision: std::num::NonZeroU64::new(11).unwrap()
+                },
+                descriptor: Arc::new(descriptor),
+            }
+        ));
+        let context = create_launcher_context();
+        set_launcher_navigation(
+            &context,
+            Arc::new(
+                CompiledNavigation::compile(
+                    NavigationStyle::Default,
+                    r#"{"activate":["F8"],"next":["Alt+J"]}"#,
+                )
+                .unwrap(),
+            ),
+        );
+        let mut editor = crate::typed_input::TypedEditor::default();
+        let mut submissions = Vec::new();
+        let mut view = model.frame().unwrap();
+        fn paint(
+            context: &egui::Context,
+            editor: &mut crate::typed_input::TypedEditor,
+            model: &mut crate::LauncherViewModel,
+            view: &mut ViewModel,
+            submissions: &mut Vec<crate::TypedInputSubmission>,
+            events: Vec<egui::Event>,
+        ) -> NativeUiFrame {
+            if let Some(current) = model.frame() {
+                *view = current;
+            }
+            let frame = build_launcher_frame_with_transparency(
+                context,
+                RawInput {
+                    focused: true,
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(720.0, 720.0))),
+                    ..Default::default()
+                },
+                view,
+                false,
+                false,
+                editor,
+                submissions,
+            );
+            assert!(!frame.commands.iter().any(|command| matches!(
+                command,
+                UiCommand::SetQuery(_)
+                    | UiCommand::SelectNext
+                    | UiCommand::ExecuteDefault
+                    | UiCommand::ActivateSelectedAction
+            )));
+            for command in &frame.commands {
+                model.apply(command.clone());
+            }
+            frame
+        }
+        let key = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        paint(
+            &context,
+            &mut editor,
+            &mut model,
+            &mut view,
+            &mut submissions,
+            vec![],
+        );
+        paint(
+            &context,
+            &mut editor,
+            &mut model,
+            &mut view,
+            &mut submissions,
+            vec![],
+        );
+        paint(
+            &context,
+            &mut editor,
+            &mut model,
+            &mut view,
+            &mut submissions,
+            vec![
+                egui::Event::Text("jk".into()),
+                key(egui::Key::ArrowLeft, egui::Modifiers::NONE),
+                egui::Event::Text("x".into()),
+                key(egui::Key::F8, egui::Modifiers::NONE),
+                key(
+                    egui::Key::J,
+                    egui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+        paint(
+            &context,
+            &mut editor,
+            &mut model,
+            &mut view,
+            &mut submissions,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("字".into())),
+            ],
+        );
+        let name = paint(
+            &context,
+            &mut editor,
+            &mut model,
+            &mut view,
+            &mut submissions,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Commit("字".into())),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+            ],
+        );
+        let password = name
+            .output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Enter password" => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .expect("the actual private form control is visible");
+        paint(
+            &context,
+            &mut editor,
+            &mut model,
+            &mut view,
+            &mut submissions,
+            vec![
+                egui::Event::PointerMoved(password),
+                egui::Event::PointerButton {
+                    pos: password,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: password,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        paint(
+            &context,
+            &mut editor,
+            &mut model,
+            &mut view,
+            &mut submissions,
+            vec![
+                egui::Event::Text("canary".into()),
+                key(egui::Key::F8, egui::Modifiers::NONE),
+                key(
+                    egui::Key::J,
+                    egui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+        paint(
+            &context,
+            &mut editor,
+            &mut model,
+            &mut view,
+            &mut submissions,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("密".into())),
+            ],
+        );
+        paint(
+            &context,
+            &mut editor,
+            &mut model,
+            &mut view,
+            &mut submissions,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Commit("密".into())),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+            ],
+        );
+        assert!(
+            submissions.is_empty(),
+            "host remaps cannot submit editor-owned fields"
+        );
+        paint(
+            &context,
+            &mut editor,
+            &mut model,
+            &mut view,
+            &mut submissions,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert_eq!(submissions.len(), 1);
+        let submitted = submissions.pop().unwrap();
+        assert!(matches!(submitted.values.0.get(&FieldId("name".into())),
+            Some(StructuredValue::NonSecret(NonSecretValue::Text(name))) if name == "jx字k"));
+        assert!(matches!(submitted.values.0.get(&FieldId("password".into())),
+            Some(StructuredValue::Password(password)) if password.expose_plaintext() == "canary密"));
+        assert!(model.query.is_empty());
+    }
+    #[test]
+    fn compact_root_budgets_two_bounded_diagnostics_without_losing_footer_at_any_size_or_dpi() {
+        use crate::appearance::{AppearanceCache, AppearancePreferences, InterfaceSize, SystemTheme};
+        for size in [InterfaceSize::Small, InterfaceSize::Default, InterfaceSize::Large] {
+            for dpi in [1.0, 2.0] {
+                let appearance = AppearanceCache::new(
+                    AppearancePreferences {
+                        interface_size: size,
+                        ..Default::default()
+                    },
+                    SystemTheme::Dark,
+                )
+                .unwrap();
+                let metrics = appearance.resolved().metrics();
+                let mut model = crate::LauncherViewModel::new();
+                model.activate();
+                let initial = model.frame().unwrap();
+                let expanded = metrics.default_window_height.ceil() as u32;
+                assert_eq!(
+                    desired_window_height(&initial, expanded, metrics),
+                    metrics.compact_window_height.ceil() as u32
+                );
+                let preferences = "Invalid desired preference; last-good appearance retained. ".repeat(20);
+                let shortcuts =
+                    "An actually-held shortcut is unavailable; other bindings remain active. ".repeat(20);
+                model.set_interface_diagnostic(
+                    crate::InterfaceDiagnosticSource::Preferences,
+                    Some(preferences.clone()),
+                );
+                model.set_interface_diagnostic(
+                    crate::InterfaceDiagnosticSource::Shortcuts,
+                    Some(shortcuts.clone()),
+                );
+                let view = model.frame().unwrap();
+                let height = desired_window_height(&view, expanded, metrics);
+                assert_eq!(
+                    height,
+                    (metrics.compact_window_height + 2.0 * (metrics.control_height + metrics.item_spacing_y))
+                        .ceil() as u32
+                );
+                let context = create_launcher_context();
+                set_launcher_appearance(&context, appearance.resolved());
+                let draw = |events| {
+                    let mut input = RawInput {
+                        focused: true,
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(480.0, height as f32),
+                        )),
+                        ..Default::default()
+                    };
+                    input
+                        .viewports
+                        .entry(egui::ViewportId::ROOT)
+                        .or_default()
+                        .native_pixels_per_point = Some(dpi);
+                    build_launcher_frame(&context, input, &view)
+                };
+                draw(vec![]);
+                let frame = draw(vec![]);
+                let mut settings = None;
+                for label in [preferences.as_str(), shortcuts.as_str(), "Settings"] {
+                    let (shape, text) = frame
+                        .output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.text() == label => Some((shape, text)),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("the bounded diagnostic/footer control is painted: {label}")
+                        });
+                    let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                    assert!(
+                        shape.clip_rect.contains_rect(rect),
+                        "{size:?} {dpi}x text={label:?} rect={rect:?} clip={:?}",
+                        shape.clip_rect
+                    );
+                    assert!(rect.left() >= 0.0 && rect.right() <= 480.0 && rect.bottom() <= height as f32);
+                    assert_eq!(text.galley.rows.len(), 1);
+                    if label == "Settings" {
+                        settings = Some(rect.center());
+                    } else {
+                        assert!(text.galley.elided);
+                    }
+                }
+                let position = settings.unwrap();
+                let clicked = draw(vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+                assert!(
+                    clicked.commands.contains(&UiCommand::OpenSettings),
+                    "{size:?} {dpi}x: {:?}",
+                    clicked.commands
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_preview_document_keys_bypass_remapped_host_actions() {
+        use crate::navigation::{CompiledNavigation, NavigationAction, NavigationStyle};
+        let navigation = Arc::new(CompiledNavigation::compile(
+            NavigationStyle::Default,
+            r#"{"toggle-preview":["PageDown","F8"],"page-down":[],"cancel":["Tab","Escape"],"complete":[]}"#,
+        ).unwrap());
+        let mut model = crate::LauncherViewModel::new();
+        model.activate();
+        let mut view = model.frame().unwrap();
+        view.preview.status = Some(crate::PreviewStatus::Loading);
+        view.preview.focused = true;
+        let context = create_launcher_context();
+        set_launcher_navigation(&context, navigation.clone());
+        let raw = || RawInput {
+            focused: true,
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(720.0, 520.0))),
+            ..Default::default()
+        };
+        build_launcher_frame(&context, raw(), &view);
+        build_launcher_frame(&context, raw(), &view);
+        let owner = navigation_owner(&context, Some(&view));
+        let route = navigation_context(&view, owner, false);
+        for (key, action) in [
+            (NamedKey::PageDown, NavigationAction::TogglePreview),
+            (NamedKey::Tab, NavigationAction::Cancel),
+        ] {
+            assert!(translate_keyboard(
+                Key::Named(key),
+                ElementState::Pressed,
+                ModifiersState::empty(),
+                Some(&view),
+                false,
+                &navigation,
+                owner,
+            )
+            .is_none());
+            let reserved = if action == NavigationAction::Cancel {
+                "Tab"
+            } else {
+                "PageDown"
+            };
+            assert!(!navigation.hints(action, route).any(|hint| hint == reserved));
+        }
+        for key in [NamedKey::Escape, NamedKey::F8] {
+            assert_eq!(
+                translate_keyboard(
+                    Key::Named(key),
+                    ElementState::Pressed,
+                    ModifiersState::empty(),
+                    Some(&view),
+                    false,
+                    &navigation,
+                    owner,
+                ),
+                Some(UiCommand::LeavePreview)
+            );
+        }
     }
 }

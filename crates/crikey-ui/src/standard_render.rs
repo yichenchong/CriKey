@@ -45,7 +45,7 @@ pub(super) fn draw(
     ui: &mut egui::Ui,
     model: &ViewModel,
     commands: &mut Vec<UiCommand>,
-    colors: theme::Palette,
+    colors: &theme::Palette,
 ) {
     let Some(surface) = &model.navigation.standard else {
         if model.navigation.standard_route && model.navigation.unavailable.is_none() {
@@ -58,12 +58,27 @@ pub(super) fn draw(
         ui.label("Refreshing view…");
         return;
     }
+    if matches!(
+        surface.descriptor.view,
+        StandardView::List(_) | StandardView::Grid(_)
+    ) {
+        let host = ui.ctx().data(|data| {
+            data.get_temp::<bool>(query_edit_id().with("collection-navigation"))
+                .unwrap_or(true)
+        });
+        ui.small(if host {
+            "Collection navigation · type to search"
+        } else {
+            "Editing query · selection navigation returns to collection"
+        });
+    }
     let body_height = (ui.available_height()
-        - STATUS_BLOCK_HEIGHT
-        - BLOCK_GAP * 3.0
-        - theme::CONTROL_HEIGHT
+        - colors.metrics.footer_height
+        - (colors.metrics.item_spacing_y + colors.metrics.space_3) * 3.0
+        - colors.metrics.control_height
         - if model.action_panel.is_some() {
-            actions_overlay_height() + BLOCK_GAP
+            colors.metrics.scaled(actions_overlay_height())
+                + (colors.metrics.item_spacing_y + colors.metrics.space_3)
         } else {
             0.0
         })
@@ -144,7 +159,10 @@ pub(super) fn draw(
                                 let index = start + offset;
                                 let presentation = presentations.next();
                                 let tile = ui.allocate_ui_with_layout(
-                                    egui::vec2(width, 140.0),
+                                    egui::vec2(
+                                        width,
+                                        colors.metrics.row_height + colors.metrics.scaled(88.0),
+                                    ),
                                     egui::Layout::top_down(egui::Align::Center),
                                     |ui| {
                                         if let Some(image) = presentation.and_then(|p| p.image.as_ref()) {
@@ -156,7 +174,7 @@ pub(super) fn draw(
                                                         *texture,
                                                         egui::vec2(image.width as f32, image.height as f32),
                                                     ))
-                                                    .max_size(egui::vec2(width, 96.0)),
+                                                    .max_size(egui::vec2(width, colors.metrics.scaled(96.0))),
                                                 );
                                             }
                                         }
@@ -167,6 +185,7 @@ pub(super) fn draw(
                                     },
                                 );
                                 let response = tile.inner;
+                                record_collection_focus(ui.ctx(), model, &response);
                                 let visible_rect = tile.response.rect.intersect(scroll_viewport);
                                 if first_visible.is_none()
                                     && visible_rect.width() > 0.0
@@ -241,7 +260,7 @@ pub(super) fn draw(
             }
         }
         StandardView::Detail(detail) => {
-            preview_render::draw_standard_detail(ui, surface, detail, commands, body_height)
+            preview_render::draw_standard_detail(ui, surface, detail, commands, body_height, &colors.metrics)
         }
         StandardView::Form(_) => {}
     }
@@ -269,11 +288,14 @@ pub(super) fn draw(
             .iter()
             .find(|definition| &definition.item.plugin_id == owner && &definition.item.stable_id == item)
         {
-            ui.menu_button("Actions  Ctrl+K", |ui| {
-                for section in &definition.action_sections {
-                    ui.strong(&section.label);
-                    menu(ui, surface, definition, &section.entries, commands);
-                }
+            ui.horizontal(|ui| {
+                ui.menu_button("Actions", |ui| {
+                    for section in &definition.action_sections {
+                        ui.strong(&section.label);
+                        menu(ui, surface, definition, &section.entries, commands);
+                    }
+                });
+                draw_navigation_hint(ui, model, crate::navigation::NavigationAction::ShowActions);
             });
         }
     }

@@ -247,6 +247,7 @@ struct ReaderContext {
     closed: Arc<AtomicBool>,
     protocol_violation: Arc<AtomicBool>,
     resource_limit: Arc<AtomicBool>,
+    terminal_failure: Arc<Mutex<Option<ReaderFailure>>>,
     connection_id: u64,
     handshake_seen: Arc<AtomicBool>,
     observations: Arc<Mutex<VecDeque<ProtocolObservation>>>,
@@ -261,7 +262,7 @@ struct ReaderContext {
     page_request: Arc<AtomicU64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ReaderFailure {
     error: ProtocolError,
     protocol_violation: bool,
@@ -285,6 +286,7 @@ struct WorkerLink {
     closed: Arc<AtomicBool>,
     protocol_violation: Arc<AtomicBool>,
     resource_limit: Arc<AtomicBool>,
+    terminal_failure: Arc<Mutex<Option<ReaderFailure>>>,
     cancel_latched: AtomicBool,
     current_request: AtomicU64,
     current_generation: AtomicU64,
@@ -315,6 +317,32 @@ impl WorkerLink {
         lock_unpoisoned(&self.mismatch).clone()
     }
 
+    fn terminal_failure(&self) -> Option<ReaderFailure> {
+        let mut failure = lock_unpoisoned(&self.terminal_failure).clone()?;
+        // A sensitive incarnation can begin after the reader retained its cause.
+        if lock_unpoisoned(&self.privacy).sensitive {
+            failure.error = ProtocolError::Closed;
+        }
+        Some(failure)
+    }
+
+    fn terminal_error(&self) -> Option<HostError> {
+        let failure = self.terminal_failure()?;
+        Some(if failure.resource_limit {
+            HostError::ResourceLimit {
+                plugin: self.plugin.clone(),
+                detail: format!("reader queue resource limit: {:?}", failure.error),
+            }
+        } else if failure.protocol_violation {
+            HostError::Protocol(format!("transport violation: {:?}", failure.error))
+        } else {
+            HostError::Crashed {
+                plugin: self.plugin.clone(),
+                detail: format!("transport closed: {:?}", failure.error),
+            }
+        })
+    }
+
     fn send(&self, envelope: Envelope) -> Result<(), HostError> {
         let end = Instant::now()
             .checked_add(Duration::from_millis(CONTROL_WRITE_TIMEOUT_MS))
@@ -327,7 +355,7 @@ impl WorkerLink {
             return Err(HostError::Closed);
         }
         if self.closed.load(Ordering::Acquire) {
-            return Err(HostError::Closed);
+            return Err(self.terminal_error().unwrap_or(HostError::Closed));
         }
         if message::validate_outbound(&envelope).is_err() {
             self.resource_limit.store(true, Ordering::Release);
@@ -366,7 +394,7 @@ impl WorkerLink {
                 loop {
                     if self.closed.load(Ordering::Acquire) {
                         pending.fetch_sub(1, Ordering::AcqRel);
-                        return Err(HostError::Closed);
+                        return Err(self.terminal_error().unwrap_or(HostError::Closed));
                     }
                     match sender.try_send(value) {
                         Ok(()) => return Ok(()),
@@ -396,6 +424,9 @@ impl WorkerLink {
     }
 
     fn write_error(&self, kind: &'static str, error: ProtocolError) -> HostError {
+        if let Some(error) = self.terminal_error() {
+            return error;
+        }
         let detail = format!("failed to write {kind} frame: {error:?}");
         if self.protocol_violation() {
             HostError::Protocol(detail)
@@ -738,6 +769,7 @@ impl NativeWorker {
         let closed = Arc::new(AtomicBool::new(false));
         let protocol_violation = Arc::new(AtomicBool::new(false));
         let resource_limit = Arc::new(AtomicBool::new(false));
+        let terminal_failure = Arc::new(Mutex::new(None));
         let handshake_seen = Arc::new(AtomicBool::new(false));
         let observations = Arc::new(Mutex::new(VecDeque::with_capacity(OBSERVATION_CAPACITY)));
         let mismatch = Arc::new(Mutex::new(None));
@@ -823,6 +855,7 @@ impl NativeWorker {
             closed: Arc::clone(&closed),
             protocol_violation: Arc::clone(&protocol_violation),
             resource_limit: Arc::clone(&resource_limit),
+            terminal_failure: Arc::clone(&terminal_failure),
             connection_id,
             handshake_seen: Arc::clone(&handshake_seen),
             observations: Arc::clone(&observations),
@@ -840,6 +873,7 @@ impl NativeWorker {
             closed,
             protocol_violation,
             resource_limit,
+            terminal_failure,
             cancel_latched: AtomicBool::new(false),
             current_request: AtomicU64::new(0),
             current_generation: AtomicU64::new(0),
@@ -1466,6 +1500,9 @@ impl NativeWorker {
             privacy.sensitive = true;
             self.link.sensitive.store(true, Ordering::Release);
             privacy.bytes.clear();
+            if let Some(failure) = lock_unpoisoned(&self.link.terminal_failure).as_mut() {
+                failure.error = ProtocolError::Closed;
+            }
             lock_unpoisoned(&self.link.observations).clear();
             *lock_unpoisoned(&self.link.mismatch) = None;
         }
@@ -2330,6 +2367,13 @@ impl NativeWorker {
 
     fn send_control(&mut self, envelope: Envelope) -> Result<(), HostError> {
         let result = self.link.send(envelope);
+        let result = match result {
+            Err(error) => match self.link.terminal_failure() {
+                Some(failure) => return Err(self.transport_error(failure)),
+                None => Err(error),
+            },
+            result => result,
+        };
         if let Err(error) = &result {
             match error {
                 HostError::ResourceLimit { .. } => {
@@ -2388,6 +2432,8 @@ impl NativeWorker {
     fn ensure_alive(&mut self) -> Result<(), HostError> {
         if self.is_alive() {
             Ok(())
+        } else if let Some(error) = self.link.terminal_error() {
+            Err(error)
         } else if self.link.protocol_violation() || self.retirement_kind == Some(ExitKind::ProtocolViolation)
         {
             // An asynchronous reader rejection can precede callback entry.
@@ -2579,6 +2625,7 @@ impl NativeWorker {
         if revoked != 0 && revoked == self.link.current_request.load(Ordering::Acquire) {
             return HostError::Closed;
         }
+        let failure = self.link.terminal_failure().unwrap_or(failure);
         let failure = if self.is_sensitive() {
             ReaderFailure {
                 error: ProtocolError::Closed,
@@ -2606,6 +2653,9 @@ impl NativeWorker {
     }
 
     fn timeout_and_kill(&mut self) -> HostError {
+        if let Some(failure) = self.link.terminal_failure() {
+            return self.transport_error(failure);
+        }
         if self.link.protocol_violation() {
             self.failure_kind = Some(crikey_plugin_supervisor::FailureKind::ProtocolViolation);
             self.fail_and_reap(ExitKind::ProtocolViolation);
@@ -2831,7 +2881,6 @@ fn spawn_blocking_reader(
             match transport.recv_with_diagnostics(&context.sensitive) {
                 Ok(envelope) => {
                     if !validate_inbound(&envelope, &context) {
-                        context.protocol_violation.store(true, Ordering::Release);
                         let failure = ReaderEvent::Failure(ReaderFailure {
                             error: ProtocolError::Malformed("illegal plugin-to-host envelope".to_owned()),
                             protocol_violation: true,
@@ -2842,7 +2891,6 @@ fn spawn_blocking_reader(
                         break;
                     }
                     if !accept_credit(&envelope, &context.credits) {
-                        context.protocol_violation.store(true, Ordering::Release);
                         let failure = ReaderEvent::Failure(ReaderFailure {
                             error: ProtocolError::Malformed("plugin sent a batch without credit".to_owned()),
                             protocol_violation: true,
@@ -2859,9 +2907,6 @@ fn spawn_blocking_reader(
                 }
                 Err(error) => {
                     let violation = is_protocol_violation_error(&error);
-                    if violation {
-                        context.protocol_violation.store(true, Ordering::Release);
-                    }
                     let _ = enqueue_reader_event(
                         &context,
                         ReaderEvent::Failure(ReaderFailure {
@@ -2930,7 +2975,6 @@ fn spawn_multiplex_reader(
                 match transport.recv_with_diagnostics(&context.sensitive) {
                     Ok(envelope) => {
                         if !validate_inbound(&envelope, &context) {
-                            context.protocol_violation.store(true, Ordering::Release);
                             let _ = enqueue_reader_event(
                                 &context,
                                 ReaderEvent::Failure(ReaderFailure {
@@ -2945,7 +2989,6 @@ fn spawn_multiplex_reader(
                             return;
                         }
                         if !accept_credit(&envelope, &context.credits) {
-                            context.protocol_violation.store(true, Ordering::Release);
                             let _ = enqueue_reader_event(
                                 &context,
                                 ReaderEvent::Failure(ReaderFailure {
@@ -2967,9 +3010,6 @@ fn spawn_multiplex_reader(
                     Err(ProtocolError::Timeout) => {}
                     Err(error) => {
                         let violation = is_protocol_violation_error(&error);
-                        if violation {
-                            context.protocol_violation.store(true, Ordering::Release);
-                        }
                         let _ = enqueue_reader_event(
                             &context,
                             ReaderEvent::Failure(ReaderFailure {
@@ -3041,6 +3081,25 @@ fn enqueue_reader_event(context: &ReaderContext, event: ReaderEvent) -> bool {
         return true;
     }
     sanitize_event(&mut event, &context.privacy);
+    if let ReaderEvent::Failure(failure) = &event {
+        // Publish the bounded first cause before retiring admission. Otherwise
+        // callback entry can observe retirement and lose the queued diagnosis.
+        let privacy = lock_unpoisoned(&context.privacy);
+        let mut terminal = lock_unpoisoned(&context.terminal_failure);
+        if terminal.is_none() {
+            let mut retained = failure.clone();
+            if privacy.sensitive {
+                retained.error = ProtocolError::Closed;
+            }
+            *terminal = Some(retained);
+        }
+        if failure.protocol_violation {
+            context.protocol_violation.store(true, Ordering::Release);
+        }
+        if failure.resource_limit {
+            context.resource_limit.store(true, Ordering::Release);
+        }
+    }
     let bytes = reader_event_size(&event);
     if bytes > READER_QUEUE_MAX_BYTES {
         context.resource_limit.store(true, Ordering::Release);
@@ -4448,6 +4507,202 @@ mod typed_privacy {
         assert!(matches!(failure.error, ProtocolError::Closed));
         assert!(failure.protocol_violation);
         assert!(!failure.resource_limit);
+    }
+}
+
+#[cfg(test)]
+mod terminal_reader_cause {
+    use super::*;
+
+    // No process or scheduler is involved: publish the real framing rejection
+    // before entering the same catalog admission gate used by the inspector.
+    fn worker() -> (NativeWorker, ReaderContext, Receiver<Envelope>) {
+        let plugin = PluginId("terminal-cause".into());
+        let (sender, outgoing) = mpsc::sync_channel(4);
+        let (events, receiver) = mpsc::sync_channel(READER_QUEUE_CAPACITY);
+        let privacy = Arc::new(Mutex::new(StderrTail::default()));
+        let link = Arc::new(WorkerLink {
+            plugin: plugin.clone(),
+            writer: WriterKind::Queued {
+                sender,
+                pending: Arc::new(AtomicUsize::new(0)),
+            },
+            write_mutex: Mutex::new(()),
+            events: Mutex::new(receiver),
+            closed: Arc::new(AtomicBool::new(false)),
+            protocol_violation: Arc::new(AtomicBool::new(false)),
+            resource_limit: Arc::new(AtomicBool::new(false)),
+            terminal_failure: Arc::new(Mutex::new(None)),
+            cancel_latched: AtomicBool::new(false),
+            current_request: AtomicU64::new(0),
+            current_generation: AtomicU64::new(0),
+            connection_id: 1,
+            credits: Arc::new(AtomicI64::new(0)),
+            queued_events: Arc::new(AtomicUsize::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            peak_queue_depth: Arc::new(AtomicUsize::new(0)),
+            observations: Arc::new(Mutex::new(VecDeque::new())),
+            mismatch: Arc::new(Mutex::new(None)),
+            privacy: Arc::clone(&privacy),
+            sensitive: Arc::new(AtomicBool::new(false)),
+            page_request: Arc::new(AtomicU64::new(0)),
+            view_request: Arc::new(AtomicU64::new(0)),
+            reader: Mutex::new(None),
+            writer_thread: Mutex::new(None),
+            admission: NativeAdmission::default(),
+            revoked_request: Arc::new(AtomicU64::new(0)),
+        });
+        let context = ReaderContext {
+            sender: events,
+            credits: Arc::clone(&link.credits),
+            queue: Arc::clone(&link.queued_events),
+            queued_bytes: Arc::clone(&link.queued_bytes),
+            peak: Arc::clone(&link.peak_queue_depth),
+            closed: Arc::clone(&link.closed),
+            protocol_violation: Arc::clone(&link.protocol_violation),
+            resource_limit: Arc::clone(&link.resource_limit),
+            terminal_failure: Arc::clone(&link.terminal_failure),
+            connection_id: link.connection_id,
+            handshake_seen: Arc::new(AtomicBool::new(true)),
+            observations: Arc::clone(&link.observations),
+            mismatch: Arc::clone(&link.mismatch),
+            privacy: Arc::clone(&privacy),
+            sensitive: Arc::clone(&link.sensitive),
+            view_request: Arc::clone(&link.view_request),
+            page_request: Arc::clone(&link.page_request),
+        };
+        let worker = NativeWorker {
+            spec: LaunchSpec {
+                plugin,
+                executable: Default::default(),
+                arguments: Vec::new(),
+                working_dir: None,
+                environment: Vec::new(),
+                inherit_environment: false,
+            },
+            incarnation: 1,
+            options: WorkerOptions::new(),
+            handshake: PluginHandshake {
+                plugin_id: "terminal-cause".into(),
+                plugin_name: String::new(),
+                plugin_version: String::new(),
+                sdk_version: String::new(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: Capabilities::default(),
+                preview: false,
+                commands: false,
+                typed_arguments: false,
+                result_presentation: false,
+                structured_view: false,
+            },
+            link,
+            child: None,
+            stderr_tail: privacy,
+            stderr_reader: None,
+            exit: None,
+            observed_exit: None,
+            process_status: None,
+            containment_reap_ready: false,
+            thread_failure: None,
+            retirement_kind: None,
+            closing_failure: None,
+            diagnostics: StreamDiagnostics::default(),
+            sandbox_report: crikey_sandbox::SandboxReport {
+                filesystem_write: crikey_sandbox::Enforcement::NotRequested,
+                tcp_network: crikey_sandbox::Enforcement::NotRequested,
+                writable: Vec::new(),
+                skipped: Vec::new(),
+            },
+            next_request_id: 1,
+            call_succeeded: false,
+            catalog_initialized: false,
+            failure_kind: None,
+            catalog_presentation: None,
+            suggestion_presentation: None,
+            view: None,
+            #[cfg(windows)]
+            job: None,
+        };
+        (worker, context, outgoing)
+    }
+
+    fn reject_prefix(context: &ReaderContext) {
+        let declared = crikey_native_protocol::MAX_FRAME_BYTES + 1;
+        let prefix = u32::try_from(declared).unwrap().to_be_bytes();
+        let error = read_frame(&mut std::io::Cursor::new(prefix), &mut Vec::new()).unwrap_err();
+        assert_eq!(error, ProtocolError::FrameTooLarge(declared));
+        assert!(enqueue_reader_event(
+            context,
+            ReaderEvent::Failure(ReaderFailure {
+                error,
+                protocol_violation: true,
+                resource_limit: false,
+            })
+        ));
+    }
+
+    fn assert_frame_error(error: HostError) {
+        assert_eq!(
+            error,
+            HostError::Protocol(format!(
+                "transport violation: FrameTooLarge({})",
+                crikey_native_protocol::MAX_FRAME_BYTES + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn oversized_prefix_before_catalog_admission_retains_consumer_diagnosis() {
+        let (mut worker, context, outgoing) = worker();
+        reject_prefix(&context);
+        assert!(worker.link.protocol_violation());
+        assert_frame_error(worker.build_catalog().unwrap_err());
+        assert!(matches!(outgoing.try_recv(), Err(TryRecvError::Empty)));
+        // Admission did not drain the queued terminal to recover its cause.
+        assert_eq!(worker.link.queued_events.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn terminal_cause_survives_send_failure_receive_and_later_disconnect() {
+        let (mut worker, context, outgoing) = worker();
+        reject_prefix(&context);
+        drop(outgoing);
+        let request = Envelope {
+            connection_id: 1,
+            request_id: 1,
+            payload: Some(Payload::CatalogRequest(message::CatalogRequest::default())),
+            ..Default::default()
+        };
+        assert_frame_error(worker.send_control(request).unwrap_err());
+        let ReaderEvent::Failure(failure) = worker.next_event(deadline(100), 1, 0).unwrap() else {
+            panic!("lost terminal event");
+        };
+        assert_frame_error(worker.transport_error(failure));
+        drop(context);
+        assert_frame_error(worker.next_event(deadline(100), 1, 0).unwrap_err());
+        assert_eq!(
+            worker.sticky_exit_kind(ExitKind::Crashed),
+            ExitKind::ProtocolViolation
+        );
+    }
+
+    #[test]
+    fn sensitive_activation_scrubs_already_retained_terminal_details() {
+        let (mut worker, context, _) = worker();
+        assert!(enqueue_reader_event(
+            &context,
+            ReaderEvent::Failure(ReaderFailure {
+                error: ProtocolError::Malformed("private callback text".into()),
+                protocol_violation: true,
+                resource_limit: false,
+            })
+        ));
+        let error = worker.mark_sensitive().unwrap_err();
+        assert_eq!(error, HostError::Protocol("transport violation: Closed".into()));
+        let terminal = lock_unpoisoned(&worker.link.terminal_failure);
+        let failure = terminal.as_ref().unwrap();
+        assert_eq!(failure.error, ProtocolError::Closed);
+        assert!(failure.protocol_violation);
     }
 }
 

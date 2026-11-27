@@ -80,6 +80,7 @@ struct SettingsAuthority {
     schemas: Vec<DiscoveredSchema>,
     config_revision: u64,
     schema_revision: u64,
+    validation_error: Option<String>,
 }
 
 struct PackageConfigurationClient {
@@ -212,6 +213,9 @@ impl PreferenceWorker {
                             if matches!(&result, Err(SettingsFailure::PersistedReload)) {
                                 completion = state.persisted_reload(completion.based_on.clone());
                             }
+                            if matches!(&result, Err(SettingsFailure::Invalid)) {
+                                completion.report = state.settings.validation_error.take().or(completion.report);
+                            }
                             let response = SettingsResponse {
                                 view: request.view,
                                 request_id: request.request_id,
@@ -338,10 +342,10 @@ impl PreferenceWorker {
                             let mut saved = false;
                             let mut completion = if !state.accepts(&config) {
                                 state.conflict(&store)
-                            } else if validate_setting_edit(&config, &key, &value).is_err() {
-                                state.completion(based_on, None, Some("Setting edit is invalid".into()))
                             } else {
-                                match crate::settings::persist_typed(&mut config, &key, &value) {
+                                match launcher_settings::validate_edit(&config, &key, &value) {
+                                    Err(error) => state.completion(based_on, None, Some(error)),
+                                    Ok(receipts) => match crate::settings::persist_typed(&mut config, &key, &value, &receipts) {
                                     Ok(report) => {
                                         let result = store
                                             .lock()
@@ -360,6 +364,7 @@ impl PreferenceWorker {
                                         state.persisted_reload(based_on)
                                     }
                                     Err(_) => state.completion(based_on, None, Some("Configuration could not be saved".into())),
+                                }
                                 }
                             };
                             completion.setting_edit = Some(crikey_ui::SettingEditOutcome {
@@ -404,7 +409,9 @@ impl PreferenceWorker {
             SettingsOperation::BrowsePlugin { plugin } => plugin.0.len() <= 1024,
             SettingsOperation::Edit { key, draft, target } => {
                 key.len() <= 4096
-                    && draft.len() <= 4096
+                    && draft.len()
+                        <= launcher_settings::declaration(key)
+                            .map_or(4096, |setting| setting.max_edit_bytes())
                     && match target {
                         SettingsTarget::UserGlobal => true,
                         SettingsTarget::PluginUser { plugin } => plugin.0.len() <= 1024,
@@ -546,7 +553,12 @@ impl WorkerConfiguration {
         if key.len() > 4096 {
             return Err(SettingsFailure::Invalid);
         }
-        let value_available = secret || value.len() <= 8192 - key.len();
+        let row_limit = if key == crikey_config::KEY_NAVIGATION_BINDINGS {
+            12288
+        } else {
+            8192
+        };
+        let value_available = secret || value.len() <= row_limit - key.len();
         Ok(SettingsRow {
             key: key.to_owned(),
             value: if value_available {
@@ -565,6 +577,7 @@ impl WorkerConfiguration {
     }
 
     fn settings_request(&mut self, request: &SettingsRequest) -> Result<SettingsPayload, SettingsFailure> {
+        self.settings.validation_error = None;
         if !self.authoritative {
             return Err(SettingsFailure::Unavailable);
         }
@@ -663,7 +676,12 @@ impl WorkerConfiguration {
                 Ok(SettingsPayload::Search { results, rows })
             }
             SettingsOperation::Edit { key, target, draft } => {
-                if key.len() > 4096 || draft.len() > 4096 {
+                let draft_limit =
+                    launcher_settings::declaration(key).map_or(4096, |setting| setting.max_edit_bytes());
+                if key.len() > 4096 || draft.len() > draft_limit {
+                    self.settings.validation_error = Some(format!(
+                        "Setting key must fit 4096 bytes and this draft must fit {draft_limit} bytes"
+                    ));
                     return Err(SettingsFailure::Invalid);
                 }
                 if request.expected_schema != self.settings.schema_revision {
@@ -681,9 +699,13 @@ impl WorkerConfiguration {
                     SettingsTarget::UserGlobal => {
                         let declaration =
                             launcher_settings::declaration(key).ok_or(SettingsFailure::Invalid)?;
-                        validate_setting_edit(config, key, draft).map_err(|_| SettingsFailure::Invalid)?;
+                        let receipts =
+                            launcher_settings::validate_edit(config, key, draft).map_err(|error| {
+                                self.settings.validation_error = Some(error);
+                                SettingsFailure::Invalid
+                            })?;
                         (
-                            config.commit_user_global(key, draft, &expected),
+                            config.commit_user_global_checked(key, draft, &expected, &receipts),
                             declaration.restart == launcher_settings::Restart::Required,
                             false,
                         )
@@ -967,18 +989,6 @@ fn edit_status(saved: bool, state: CompletionState) -> crikey_ui::SettingEditSta
     }
 }
 
-fn validate_setting_edit(config: &ConfigStore, key: &str, value: &str) -> Result<(), String> {
-    launcher_settings::validate(key, value)?;
-    if key == crikey_config::KEY_ACTIVATION_HOTKEY {
-        let (current, retained) = config
-            .project_user_global_candidates(key, value)
-            .map_err(|_| "Configuration could not be projected".to_owned())?;
-        current.validate_command_hotkey_conflicts()?;
-        retained.validate_command_hotkey_conflicts()?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1145,6 +1155,130 @@ mod authority_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn public_settings_admission_accepts_full_budget_and_redacts_invalid_chord_diagnostics() {
+        use std::time::Duration;
+        let scratch = Scratch::new();
+        let directories = StandardDirectories::resolve(
+            DirectoryConvention::current(),
+            &DirectoryEnvironment::new()
+                .set("HOME", &scratch.0)
+                .set("APPDATA", &scratch.0)
+                .set("LOCALAPPDATA", &scratch.0)
+                .set("CRIKEY_CONFIG_DIR", &scratch.0),
+        )
+        .unwrap();
+        let config = ConfigStore::load_with_policy(&directories, None).unwrap();
+        let worker = PreferenceWorker::spawn(
+            Arc::new(Mutex::new(CommandPreferencesStore::empty())),
+            Some(config),
+            directories,
+            Vec::new(),
+            None,
+            Vec::new(),
+            || {},
+        )
+        .unwrap();
+        worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut model = crikey_ui::LauncherViewModel::new();
+        model.activate();
+        let view = model.view().unwrap().0;
+        worker
+            .submit_settings(SettingsRequest {
+                view,
+                request_id: 1,
+                expected_config: 0,
+                expected_schema: 0,
+                operation: SettingsOperation::Search { text: String::new() },
+            })
+            .unwrap();
+        let mut response = worker
+            .settings
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        worker
+            .submit_settings(SettingsRequest {
+                view,
+                request_id: 2,
+                expected_config: response.config_revision,
+                expected_schema: response.schema_revision,
+                operation: SettingsOperation::Edit {
+                    key: crikey_config::KEY_NAVIGATION_BINDINGS.into(),
+                    target: SettingsTarget::UserGlobal,
+                    draft: format!("{{}}{}", " ".repeat(8190)),
+                },
+            })
+            .unwrap();
+        response = worker
+            .settings
+            .as_ref()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let SettingsPayload::Saved { row } = response.result.as_ref().unwrap() else {
+            panic!("saved full-budget navigation override")
+        };
+        assert_eq!(row.value.len(), 8192);
+        assert!(row.value_available);
+        assert!(!row.requires_restart);
+        let saved = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .config
+            .unwrap();
+        let before = std::fs::read(saved.config_path()).unwrap();
+        let revision = saved.revision();
+        for (index, chord, reason) in [
+            (3, "Ctrl+Alt+Space", "activation"),
+            (4, "Ctrl+PRIVATE_CHORD_CANARY", "known"),
+            (5, "Ctrl+J+PRIVATE_CHORD_CANARY", "known"),
+        ] {
+            worker
+                .submit_settings(SettingsRequest {
+                    view,
+                    request_id: index,
+                    expected_config: response.config_revision,
+                    expected_schema: response.schema_revision,
+                    operation: SettingsOperation::Edit {
+                        key: crikey_config::KEY_NAVIGATION_BINDINGS.into(),
+                        target: SettingsTarget::UserGlobal,
+                        draft: format!(r#"{{"next":["{chord}"]}}"#),
+                    },
+                })
+                .unwrap();
+            response = worker
+                .settings
+                .as_ref()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            assert!(matches!(response.result, Err(SettingsFailure::Invalid)));
+            let completion = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            let error = completion.report.as_deref().unwrap();
+            assert!(error.contains(reason), "{error}");
+            assert!(!error.contains("PRIVATE_CHORD_CANARY"), "{error}");
+            assert_eq!(completion.config.as_ref().unwrap().revision(), revision);
+            assert_eq!(std::fs::read(saved.config_path()).unwrap(), before);
+        }
+        assert!(worker
+            .submit_settings(SettingsRequest {
+                view,
+                request_id: 6,
+                expected_config: response.config_revision,
+                expected_schema: response.schema_revision,
+                operation: SettingsOperation::Edit {
+                    key: crikey_config::KEY_NAVIGATION_BINDINGS.into(),
+                    target: SettingsTarget::UserGlobal,
+                    draft: format!("{{}}{}", " ".repeat(8191)),
+                },
+            })
+            .is_err());
     }
 
     #[test]

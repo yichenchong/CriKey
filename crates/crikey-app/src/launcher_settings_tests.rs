@@ -161,6 +161,166 @@ fn validator_boundaries_reject_unusable_values_without_restricting_valid_names()
 }
 
 #[test]
+fn appearance_and_navigation_use_canonical_parsers_and_explicit_invalid_projection() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    assert!(configured_appearance(None).is_ok());
+    assert!(configured_navigation(None).is_ok());
+    for (key, value) in [
+        (KEY_THEME, "sepia"),
+        (KEY_INTERFACE_SIZE, "huge"),
+        (KEY_RESULT_DENSITY, "dense"),
+        (KEY_THEME_OVERRIDES, r##"{"unknown":"#123456"}"##),
+        (KEY_THEME_OVERRIDES, r##"{"text":"#ffffff","text":"#000000"}"##),
+        (KEY_NAVIGATION_STYLE, "custom"),
+        (KEY_NAVIGATION_BINDINGS, r#"{"unknown":["Ctrl+Alt+J"]}"#),
+        (KEY_NAVIGATION_BINDINGS, r#"{"next":["j"]}"#),
+        (KEY_NAVIGATION_BINDINGS, "[]"),
+    ] {
+        assert!(validate(key, value).is_err(), "{key}={value}");
+    }
+    let unreadable = r##"{"canvas":"#111111","text":"#111111"}"##;
+    // Syntax alone cannot establish cross-role readability.
+    assert!(validate(KEY_THEME_OVERRIDES, unreadable).is_ok());
+    assert!(validate_edit(&store, KEY_THEME_OVERRIDES, unreadable).is_err());
+    assert_eq!(store.get(KEY_THEME_OVERRIDES), Some("{}"));
+    store.set_session_override(KEY_THEME_OVERRIDES, unreadable);
+    assert!(configured_appearance(Some(&store)).is_err());
+    assert_eq!(
+        declaration(KEY_THEME_OVERRIDES)
+            .unwrap()
+            .read(Some(&store))
+            .source,
+        "session-override"
+    );
+    assert_eq!(
+        declaration(KEY_THEME_OVERRIDES).unwrap().read(Some(&store)).value,
+        unreadable
+    );
+    store.set_session_override(
+        KEY_NAVIGATION_BINDINGS,
+        r#"{"next":["Ctrl+Alt+J"],"previous":["Ctrl+Alt+J"]}"#,
+    );
+    assert!(configured_navigation(Some(&store)).is_err());
+}
+
+#[test]
+fn candidate_shortcut_conflicts_include_session_hidden_restart_preferences() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    store.set_user_global(KEY_ACTIVATION_HOTKEY, "Ctrl+Alt+J");
+    store.save().unwrap();
+    store.set_session_override(KEY_NAVIGATION_BINDINGS, "{}");
+    let draft = r#"{"next":["Ctrl+Alt+J"]}"#;
+    let error = validate_edit(&store, KEY_NAVIGATION_BINDINGS, draft).unwrap_err();
+    assert!(error.contains("Restart configuration"), "{error}");
+    assert!(error.contains("activation"), "{error}");
+    assert_eq!(store.get(KEY_NAVIGATION_BINDINGS), Some("{}"));
+    let preferences = crikey_config::command_preferences::CommandPreferences {
+        records: vec![crikey_config::command_preferences::CommandPreference {
+            reference: crikey_core::command::builtin_commands().remove(0).reference,
+            hidden: false,
+            alias: None,
+            hotkey: Some("Ctrl+Alt+K".into()),
+        }],
+        ..Default::default()
+    };
+    store.set_session_override(
+        crikey_config::command_preferences::KEY_COMMAND_PREFERENCES,
+        &preferences.encode().unwrap(),
+    );
+    store.set_session_override(KEY_NAVIGATION_BINDINGS, r#"{"next":["Ctrl+Alt+K"]}"#);
+    let error = validate_configuration(&store).unwrap_err();
+    assert!(error.contains("Saved command"), "{error}");
+    store.set_session_override(KEY_NAVIGATION_BINDINGS, "{}");
+    assert!(validate_configuration(&store).is_ok());
+}
+
+#[test]
+fn closed_preferences_expose_live_choices_and_builtin_provenance() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    for (key, options) in [
+        (KEY_THEME, THEME_OPTIONS),
+        (KEY_INTERFACE_SIZE, INTERFACE_SIZE_OPTIONS),
+        (KEY_RESULT_DENSITY, RESULT_DENSITY_OPTIONS),
+        (KEY_NAVIGATION_STYLE, NAVIGATION_STYLE_OPTIONS),
+    ] {
+        let declaration = declaration(key).unwrap();
+        assert_eq!(declaration.restart, Restart::Live);
+        assert_eq!(
+            declaration.read(Some(&store)).source,
+            ConfigLayer::BuiltInDefaults.as_str()
+        );
+        assert_eq!(
+            declaration.row(Some(&store)).control,
+            SettingControl::Choice { options }
+        );
+        for (value, _) in options {
+            assert!(declaration.validate(value).is_ok(), "{key}={value}");
+        }
+    }
+}
+
+#[test]
+fn independent_preference_groups_do_not_block_each_others_repairs() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    store.set_user_global(KEY_THEME_OVERRIDES, r##"{"canvas":"#111111","text":"#111111"}"##);
+    store.set_user_global(KEY_NAVIGATION_BINDINGS, r#"{"next":["Ctrl+Alt+Space"]}"#);
+    store.save().unwrap();
+    assert!(validate_edit(&store, KEY_THEME_OVERRIDES, "{}").is_ok());
+    assert!(validate_edit(&store, KEY_NAVIGATION_BINDINGS, "{}").is_ok());
+}
+
+#[test]
+fn prospective_profile_change_after_validation_refuses_persistence() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    store.set_user_global(KEY_THEME, "dark");
+    store.save().unwrap();
+    let profiles = fixture.0.join(crikey_config::PROFILE_DIRECTORY);
+    std::fs::create_dir_all(&profiles).unwrap();
+    let prospective = profiles.join("next.toml");
+    std::fs::write(&prospective, "[launcher]\ntheme = \"light\"\n").unwrap();
+    let receipts = validate_edit(&store, KEY_PROFILE, "next").unwrap();
+    let expected = store.revision();
+    let before = std::fs::read(store.config_path()).unwrap();
+    std::fs::write(&prospective, "[launcher]\ntheme = \"invalid\"\n").unwrap();
+    assert!(matches!(
+        store.commit_user_global_checked(KEY_PROFILE, "next", &expected, &receipts),
+        Err(crikey_config::ConfigError::Conflict)
+    ));
+    assert_eq!(store.revision(), expected);
+    assert_eq!(store.get(KEY_PROFILE), None);
+    assert_eq!(std::fs::read(store.config_path()).unwrap(), before);
+}
+
+#[test]
+fn profile_selector_validates_the_selected_profile_not_the_previous_layer() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let profiles = fixture.0.join(crikey_config::PROFILE_DIRECTORY);
+    std::fs::create_dir_all(&profiles).unwrap();
+    for (profile, contents, reason) in [
+        ("invalid-theme", "[launcher]\ntheme = \"sepia\"\n", "theme"),
+        (
+            "invalid-navigation",
+            "[launcher]\nnavigation-bindings = '{\"next\":[\"Ctrl+Alt+Space\"]}'\n",
+            "activation",
+        ),
+    ] {
+        std::fs::write(profiles.join(format!("{profile}.toml")), contents).unwrap();
+        let error = validate_edit(&store, KEY_PROFILE, profile).unwrap_err();
+        assert!(error.contains("Current configuration"), "{error}");
+        assert!(error.to_lowercase().contains(reason), "{error}");
+        assert_eq!(store.get(KEY_PROFILE), None);
+        assert!(configured_appearance(Some(&store)).is_ok());
+        assert!(configured_navigation(Some(&store)).is_ok());
+    }
+}
+
+#[test]
 fn display_provenance_and_boolean_behaviour_do_not_parse_each_other() {
     let fixture = Fixture::new();
     let mut store = fixture.store();

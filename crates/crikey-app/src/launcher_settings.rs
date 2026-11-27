@@ -8,7 +8,15 @@ use crikey_config::{
     ConfigStore, BUILT_IN_DEFAULTS, KEY_ACTIVATION_HOTKEY, KEY_MAX_RESULTS, KEY_PROFILE, KEY_ROUNDED_CORNERS,
     KEY_SHOW_HINTS,
 };
+use crikey_config::{
+    KEY_INTERFACE_SIZE, KEY_NAVIGATION_BINDINGS, KEY_NAVIGATION_STYLE, KEY_RESULT_DENSITY, KEY_THEME,
+    KEY_THEME_OVERRIDES,
+};
 use crikey_platform::Accelerator;
+use crikey_ui::appearance::{
+    AppearancePreferences, InterfaceSize, ResultDensity, ThemeOverrides, ThemePreference,
+};
+use crikey_ui::navigation::{CompiledNavigation, NavigationStyle, ShortcutSource};
 use crikey_ui::{SettingControl, SettingRow};
 
 use crate::settings_search::SettingDefinition;
@@ -21,6 +29,9 @@ pub enum Control {
     Text,
     /// Existing launcher semantics: only the exact text `false` disables it.
     Toggle,
+    Choice {
+        options: &'static [(&'static str, &'static str)],
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +50,12 @@ pub enum Validator {
     Milliseconds,
     QueryHistory,
     CommandHome,
+    Theme,
+    InterfaceSize,
+    ResultDensity,
+    ThemeOverrides,
+    NavigationStyle,
+    NavigationBindings,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,7 +75,18 @@ pub struct LauncherSetting {
     fallback: Option<&'static str>,
 }
 
-/// The nine user-facing declarations, in the existing panel/CLI order.
+pub const THEME_OPTIONS: &[(&str, &str)] = &[("system", "System"), ("light", "Light"), ("dark", "Dark")];
+pub const INTERFACE_SIZE_OPTIONS: &[(&str, &str)] =
+    &[("small", "Small"), ("default", "Default"), ("large", "Large")];
+pub const RESULT_DENSITY_OPTIONS: &[(&str, &str)] = &[
+    ("compact", "Compact"),
+    ("default", "Default"),
+    ("comfortable", "Comfortable"),
+];
+pub const NAVIGATION_STYLE_OPTIONS: &[(&str, &str)] =
+    &[("default", "Default"), ("emacs", "Emacs"), ("vim", "Vim")];
+
+/// The user-facing declarations, in the shared panel/CLI order.
 /// Operator-only configuration publication timing remains outside this surface.
 pub const LAUNCHER_SETTINGS: &[LauncherSetting] = &[
     LauncherSetting {
@@ -169,9 +197,89 @@ pub const LAUNCHER_SETTINGS: &[LauncherSetting] = &[
         validator: Validator::CommandHome,
         fallback: Some("compact"),
     },
+    LauncherSetting {
+        key: KEY_THEME,
+        label: "Theme (system, light, dark)",
+        description: "Follow the system theme or choose light or dark; an unknown system theme uses dark.",
+        category: "Appearance",
+        control: Control::Choice { options: THEME_OPTIONS },
+        navigation_target: KEY_THEME,
+        platforms: &[],
+        restart: Restart::Live,
+        validator: Validator::Theme,
+        fallback: Some("system"),
+    },
+    LauncherSetting {
+        key: KEY_INTERFACE_SIZE,
+        label: "Interface size (small, default, large)",
+        description: "Scale logical interface geometry independently of operating-system display scaling.",
+        category: "Appearance",
+        control: Control::Choice { options: INTERFACE_SIZE_OPTIONS },
+        navigation_target: KEY_INTERFACE_SIZE,
+        platforms: &[],
+        restart: Restart::Live,
+        validator: Validator::InterfaceSize,
+        fallback: Some("default"),
+    },
+    LauncherSetting {
+        key: KEY_RESULT_DENSITY,
+        label: "Result density (compact, default, comfortable)",
+        description: "Choose result-row spacing without changing display scaling.",
+        category: "Appearance",
+        control: Control::Choice { options: RESULT_DENSITY_OPTIONS },
+        navigation_target: KEY_RESULT_DENSITY,
+        platforms: &[],
+        restart: Restart::Live,
+        validator: Validator::ResultDensity,
+        fallback: Some("default"),
+    },
+    LauncherSetting {
+        key: KEY_THEME_OVERRIDES,
+        label: "Theme color overrides (JSON object)",
+        description: "Atomic role-to-#RRGGBB colors, at most 4096 bytes; combined colors must retain readable contrast.",
+        category: "Appearance",
+        control: Control::Text,
+        navigation_target: KEY_THEME_OVERRIDES,
+        platforms: &[],
+        restart: Restart::Live,
+        validator: Validator::ThemeOverrides,
+        fallback: Some("{}"),
+    },
+    LauncherSetting {
+        key: KEY_NAVIGATION_STYLE,
+        label: "Navigation style (default, emacs, vim)",
+        description: "Choose semantic navigation chords; ordinary typing and owned editors retain their keys.",
+        category: "Keyboard",
+        control: Control::Choice { options: NAVIGATION_STYLE_OPTIONS },
+        navigation_target: KEY_NAVIGATION_STYLE,
+        platforms: &[],
+        restart: Restart::Live,
+        validator: Validator::NavigationStyle,
+        fallback: Some("default"),
+    },
+    LauncherSetting {
+        key: KEY_NAVIGATION_BINDINGS,
+        label: "Navigation bindings (JSON object)",
+        description: "Atomic action-to-chord-array overrides, at most 8192 bytes; overlapping shortcuts are rejected.",
+        category: "Keyboard",
+        control: Control::Text,
+        navigation_target: KEY_NAVIGATION_BINDINGS,
+        platforms: &[],
+        restart: Restart::Live,
+        validator: Validator::NavigationBindings,
+        fallback: Some("{}"),
+    },
 ];
 
 impl LauncherSetting {
+    /// Shared editor/admission budget for this declaration's serialized value.
+    pub fn max_edit_bytes(&self) -> usize {
+        match self.validator {
+            Validator::NavigationBindings => crikey_ui::navigation::MAX_NAVIGATION_BINDINGS_BYTES,
+            _ => 4096,
+        }
+    }
+
     pub fn search_definition(&self) -> SettingDefinition<'static> {
         SettingDefinition {
             key: self.key,
@@ -182,6 +290,7 @@ impl LauncherSetting {
             control: match self.control {
                 Control::Text => "text",
                 Control::Toggle => "boolean",
+                Control::Choice { .. } => "choice",
             },
             requires_restart: self.restart == Restart::Required,
             secret: false,
@@ -219,6 +328,7 @@ impl LauncherSetting {
                 Control::Toggle => SettingControl::Toggle {
                     on: read_boolean(store, self.key),
                 },
+                Control::Choice { options } => SettingControl::Choice { options },
             },
         }
     }
@@ -268,8 +378,172 @@ impl LauncherSetting {
                 "compact" | "favorites" | "recent" | "favorites-and-recent" => Ok(()),
                 _ => Err("Command home must be compact, favorites, recent, or favorites-and-recent".into()),
             },
+            Validator::Theme => value
+                .parse::<ThemePreference>()
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Validator::InterfaceSize => value
+                .parse::<InterfaceSize>()
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Validator::ResultDensity => value
+                .parse::<ResultDensity>()
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Validator::ThemeOverrides => ThemeOverrides::parse(value)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Validator::NavigationStyle => NavigationStyle::parse(value)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Validator::NavigationBindings => {
+                crikey_ui::navigation::validate_bindings_json(value).map_err(|error| error.to_string())
+            }
         }
     }
+}
+
+/// Parses the effective appearance atomically. Invalid external values return
+/// an error: retain last-good preferences (defaults at startup) with a diagnostic.
+/// Raw settings metadata reports provenance, never applied state.
+pub fn configured_appearance(store: Option<&ConfigStore>) -> Result<AppearancePreferences, String> {
+    let value = |key| {
+        declaration(key)
+            .expect("appearance declaration")
+            .read(store)
+            .value
+    };
+    let preferences = AppearancePreferences {
+        theme: value(KEY_THEME)
+            .parse::<ThemePreference>()
+            .map_err(|error| error.to_string())?,
+        interface_size: value(KEY_INTERFACE_SIZE)
+            .parse::<InterfaceSize>()
+            .map_err(|error| error.to_string())?,
+        result_density: value(KEY_RESULT_DENSITY)
+            .parse::<ResultDensity>()
+            .map_err(|error| error.to_string())?,
+        overrides: ThemeOverrides::parse(value(KEY_THEME_OVERRIDES)).map_err(|error| error.to_string())?,
+    };
+    preferences.validate().map_err(|error| error.to_string())?;
+    Ok(preferences)
+}
+
+/// Compiles one effective profile/override pair. Errors must never be presented
+/// as applied bindings. Actual OS registrations remain runtime authority.
+pub fn configured_navigation(store: Option<&ConfigStore>) -> Result<CompiledNavigation, String> {
+    let style = declaration(KEY_NAVIGATION_STYLE)
+        .expect("navigation declaration")
+        .read(store)
+        .value;
+    let bindings = declaration(KEY_NAVIGATION_BINDINGS)
+        .expect("navigation declaration")
+        .read(store)
+        .value;
+    let navigation = CompiledNavigation::compile(
+        NavigationStyle::parse(style).map_err(|error| error.to_string())?,
+        bindings,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(config) = store {
+        validate_navigation_shortcuts(config, &navigation)?;
+    }
+    Ok(navigation)
+}
+
+/// Validates a complete desired snapshot, never claims that OS grabs succeeded.
+/// Runtime consumers separately diagnose AppliedActivation/AppliedCommand
+/// against registrations actually held after failed replacement.
+pub fn validate_configuration(config: &ConfigStore) -> Result<(), String> {
+    configured_appearance(Some(config))?;
+    configured_navigation(Some(config))?;
+    Ok(())
+}
+
+fn validate_navigation_shortcuts(
+    config: &ConfigStore,
+    navigation: &CompiledNavigation,
+) -> Result<(), String> {
+    let activation = Accelerator::parse(
+        config
+            .get(KEY_ACTIVATION_HOTKEY)
+            .ok_or("Launcher activation is unavailable")?,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(conflict) = navigation.conflict(activation, ShortcutSource::DesiredActivation) {
+        return Err(format!(
+            "Launcher activation conflicts with navigation: {conflict:?}"
+        ));
+    }
+    let preferences = config
+        .get(crikey_config::command_preferences::KEY_COMMAND_PREFERENCES)
+        .map(crikey_config::command_preferences::CommandPreferences::decode)
+        .transpose()?
+        .unwrap_or_default();
+    for record in preferences.records {
+        if let Some(hotkey) = record.hotkey {
+            let chord = Accelerator::parse(&hotkey).map_err(|error| error.to_string())?;
+            if chord == activation {
+                return Err(
+                    "This shortcut is assigned to launcher activation and a command; unassign it first"
+                        .into(),
+                );
+            }
+            if let Some(conflict) = navigation.conflict(chord, ShortcutSource::SavedCommand) {
+                return Err(format!(
+                    "Saved command shortcut conflicts with navigation: {conflict:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Shared CLI/GUI validation through real current AND restart precedence.
+/// Carry returned source receipts into `commit_user_global_checked`; discarding
+/// them would drop prospective profiles from the final atomic source check.
+pub fn validate_edit(
+    config: &ConfigStore,
+    key: &str,
+    value: &str,
+) -> Result<[crikey_config::ConfigRevision; 2], String> {
+    let mut receipts = Default::default();
+    validate(key, value)?;
+    if matches!(
+        key,
+        KEY_THEME
+            | KEY_INTERFACE_SIZE
+            | KEY_RESULT_DENSITY
+            | KEY_THEME_OVERRIDES
+            | KEY_NAVIGATION_STYLE
+            | KEY_NAVIGATION_BINDINGS
+            | KEY_ACTIVATION_HOTKEY
+            | KEY_PROFILE
+    ) {
+        let (current, restart) = config
+            .project_user_global_candidates(key, value)
+            .map_err(|error| format!("Configuration could not be projected: {error}"))?;
+        for (context, candidate) in [("Current", &current), ("Restart", &restart)] {
+            // Validate the entire affected group, but do not make an unrelated
+            // invalid group prevent a repair. Profiles can change both groups.
+            let result = match key {
+                KEY_THEME | KEY_INTERFACE_SIZE | KEY_RESULT_DENSITY | KEY_THEME_OVERRIDES => {
+                    configured_appearance(Some(candidate)).map(|_| ())
+                }
+                KEY_NAVIGATION_STYLE | KEY_NAVIGATION_BINDINGS | KEY_ACTIVATION_HOTKEY => {
+                    configured_navigation(Some(candidate)).map(|_| ())
+                }
+                KEY_PROFILE => validate_configuration(candidate),
+                _ => unreachable!("validated preference group"),
+            };
+            result.map_err(|error| format!("{context} configuration: {error}"))?;
+        }
+        receipts = [
+            current.additional_source_revision(config),
+            restart.additional_source_revision(config),
+        ];
+    }
+    Ok(receipts)
 }
 
 /// Borrowed, redacted display/provenance; no second configuration store.

@@ -49,8 +49,8 @@ use crikey_legacy_compat::LegacyDeadlines;
 use crikey_package_manager::LauncherLock;
 use crikey_platform::{DirectoryConvention, PluginKind, StandardDirectories};
 use crikey_ui::{
-    initial_page_viewport, page_palette, LauncherViewModel, NativeLauncher, NativeLauncherConfig,
-    NativeLauncherEvent, PageSurface, UiEffect, ViewModel,
+    initial_page_viewport, LauncherViewModel, NativeLauncher, NativeLauncherConfig, NativeLauncherEvent,
+    PageSurface, UiEffect, ViewModel,
 };
 use file_provider::{file_provider_policy, FileSearchDriver, FILE_SEARCH_PLUGIN};
 use std::cell::RefCell;
@@ -344,6 +344,9 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     let page_window = (window.width, window.height);
     let launcher = NativeLauncher::new(window).map_err(|error| error.to_string())?;
     let render_handle = launcher.handle();
+    let mut applied_appearance = crikey_ui::appearance::ResolvedAppearance::default();
+    let mut applied_navigation = Arc::new(crikey_ui::navigation::CompiledNavigation::default());
+    let mut navigation_dirty = true;
     let mut search = SearchService::new(app);
     if let Some(configuration) = configuration.as_ref() {
         search.set_aliases(configured_aliases(&configuration.store));
@@ -735,6 +738,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     let query_clock = Instant::now();
 
     let activation_handle = render_handle.clone();
+    let mut view_model = LauncherViewModel::new();
+    apply_interface_preferences(
+        configuration.as_ref().map(|configuration| &configuration.store),
+        &render_handle,
+        &mut view_model,
+        &mut applied_navigation,
+    );
     activation_handle
         .request_activation()
         .map_err(|error| error.to_string())?;
@@ -742,7 +752,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     // later, in the event loop's `resumed`, and can still fail terminally
     // there. Readiness is therefore recorded by the callback below, on the
     // first event the loop actually delivers - see `ready_on_first_event`.
-    let mut view_model = LauncherViewModel::new();
     let history_expiry = Duration::from_secs(24 * 60 * 60);
     let mut query_history = per_user_state_dir().map_or_else(
         || crikey_app::QueryHistoryStore::session(history_expiry),
@@ -819,7 +828,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
         WebPageRuntime::new(
             directories.data_dir().join("web-storage"),
             web_wake,
-            initial_page_viewport(page_window.0, page_window.1),
+            initial_page_viewport(page_window.0, page_window.1, &applied_appearance),
         )
     };
     #[cfg(not(target_os = "linux"))]
@@ -1098,6 +1107,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     publish_configuration(&modern_driver, &native_driver, state);
                 }
                 if configuration.take_reloaded() {
+                    navigation_dirty |= apply_interface_preferences(Some(&configuration.store), &render_handle, &mut view_model, &mut applied_navigation);
                     command_projection_dirty |= retained.configure(&configuration.store);
                     view_model.set_settings(crikey_app::launcher_settings::rows(Some(&configuration.store)));
                     view_model.set_show_hints(crikey_app::launcher_settings::configured_show_hints(Some(&configuration.store)));
@@ -1299,7 +1309,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             &completion.plugin,
                             &page_id,
                             page_window,
-                        ) {
+                        &applied_appearance) {
                             Ok(()) => continue,
                             Err(error) => {
                                 format!("Page failed ({} / {page_id}): {error}", completion.plugin.0)
@@ -1553,7 +1563,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             status.requested, status.active
                         );
                         eprintln!("crikey: {message}");
-                        view_model.set_navigation_notice(message);
                         if *owner == crikey_app::BindingOwner::Launcher && status.active.is_none() {
                             let diagnostic = settings::surface_hotkey_failure(
                                 &mut view_model,
@@ -1565,12 +1574,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             }
                         }
                     }
-                }
-                for failure in &report.cleanup_failures {
-                    view_model.set_navigation_notice(format!(
-                        "Shortcut cleanup {}: {}",
-                        failure.accelerator, failure.error
-                    ));
                 }
                 let mut rows = crikey_app::launcher_settings::rows(configuration.as_ref().map(|config| &config.store));
                 if let Some(row) = rows
@@ -1590,7 +1593,17 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 settings_management.panel.activation = report.bindings.get(&crikey_app::BindingOwner::Launcher)
                     .and_then(|status| status.active.as_deref()).unwrap_or("none").into();
                 hotkey_report = report;
+                navigation_dirty = true;
                 command_management_revision = None;
+            }
+            if navigation_dirty {
+                navigation_dirty = false;
+                let (applied, mut diagnostics) = project_applied_navigation(&hotkey_report, &applied_navigation);
+                if let Err(error) = render_handle.set_navigation(applied) {
+                    diagnostics.push(format!("Navigation retained: {error}"));
+                }
+                view_model.set_interface_diagnostic(crikey_ui::InterfaceDiagnosticSource::Shortcuts,
+                    (!diagnostics.is_empty()).then(|| diagnostics.join("; ")));
             }
             revalidate_root_inline_arguments(&search, &mut view_model);
             let mut shortcut_root_query = None;
@@ -1846,6 +1859,15 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 // for — draining the drivers and republishing — happened
                 // above, before the match, exactly as it does for every other
                 // event; there is no command and no effect.
+                NativeLauncherEvent::AppearanceChanged(appearance) => {
+                    applied_appearance = appearance;
+                    if let Some(identity) = search.page_session_id() {
+                        if let Err(error) = search.update_page_palette(identity, appearance.page_palette()) {
+                            view_model.set_navigation_notice(format!("Page palette update refused: {error}"));
+                        }
+                    }
+                    (None, None)
+                }
                 NativeLauncherEvent::ProviderAnswer => (None, None),
                 NativeLauncherEvent::ActionCompletion => (None, None),
             };
@@ -2484,7 +2506,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             }
                         }
                         crikey_ui::NavigationRoute::CustomPage { plugin, page_id, .. } => {
-                            if let Err(reason) = open_plugin_page(&mut search, &mut view_model, &mut web_page, plugin, page_id, page_window) {
+                            if let Err(reason) = open_plugin_page(&mut search, &mut view_model, &mut web_page, plugin, page_id, page_window, &applied_appearance) {
                                 view_model.page_reopen_failed(route, reason);
                             }
                         }
@@ -2960,6 +2982,101 @@ fn close_failed_web_page(
     format!("Page closed: {message}")
 }
 
+fn project_applied_navigation(
+    hotkey_report: &crikey_app::ReconcileReport,
+    applied_navigation: &crikey_ui::navigation::CompiledNavigation,
+) -> (Arc<crikey_ui::navigation::CompiledNavigation>, Vec<String>) {
+    let mut unavailable = Vec::new();
+    let mut diagnostics = hotkey_report
+        .bindings
+        .iter()
+        .filter_map(|(owner, status)| {
+            status.problem.as_ref().map(|problem| {
+                format!(
+                    "Shortcut {owner:?}: desired {:?}, active {:?}: {problem:?}",
+                    status.requested, status.active
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    diagnostics.extend(
+        hotkey_report
+            .cleanup_failures
+            .iter()
+            .map(|failure| format!("Shortcut cleanup {}: {}", failure.accelerator, failure.error)),
+    );
+    for (owner, status) in &hotkey_report.bindings {
+        if let Some(chord) = status
+            .active
+            .as_deref()
+            .and_then(|text| crikey_platform::Accelerator::parse(text).ok())
+        {
+            unavailable.push(chord);
+            let source = if *owner == crikey_app::BindingOwner::Launcher {
+                crikey_ui::navigation::ShortcutSource::AppliedActivation
+            } else {
+                crikey_ui::navigation::ShortcutSource::AppliedCommand
+            };
+            if let Some(conflict) = applied_navigation.conflict(chord, source) {
+                diagnostics.push(format!("Navigation shortcut {} unavailable: actually-held OS shortcut ({:?}); desired configuration is separate", chord.canonical(), conflict.source));
+            }
+        }
+    }
+    for failure in &hotkey_report.cleanup_failures {
+        if let Ok(chord) = crikey_platform::Accelerator::parse(&failure.accelerator) {
+            unavailable.push(chord);
+            if applied_navigation
+                .conflict(chord, crikey_ui::navigation::ShortcutSource::AppliedCommand)
+                .is_some()
+            {
+                diagnostics.push(format!("Navigation shortcut {} unavailable: OS grab cleanup failed; the previous grab may still be held", failure.accelerator));
+            }
+        }
+    }
+    (
+        Arc::new(applied_navigation.without_chords(&unavailable)),
+        diagnostics,
+    )
+}
+
+fn apply_interface_preferences(
+    store: Option<&ConfigStore>,
+    handle: &crikey_ui::NativeLauncherHandle,
+    model: &mut LauncherViewModel,
+    navigation: &mut Arc<crikey_ui::navigation::CompiledNavigation>,
+) -> bool {
+    let mut errors = Vec::new();
+    match crikey_app::launcher_settings::configured_appearance(store) {
+        Ok(preferences) => {
+            if let Err(error) = handle.set_appearance(preferences) {
+                errors.push(format!("Appearance retained: {error}"));
+            }
+        }
+        Err(error) => errors.push(format!(
+            "Appearance not applied; retaining last-good/default appearance: {error}"
+        )),
+    }
+    let changed = match crikey_app::launcher_settings::configured_navigation(store) {
+        Ok(compiled) if compiled != **navigation => {
+            *navigation = Arc::new(compiled);
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            errors.push(format!(
+                "Navigation not applied; retaining last-good/default bindings: {error}"
+            ));
+            false
+        }
+    };
+    let diagnostic = (!errors.is_empty()).then(|| errors.join("; "));
+    if let Some(diagnostic) = &diagnostic {
+        eprintln!("crikey: {diagnostic}");
+    }
+    model.set_interface_diagnostic(crikey_ui::InterfaceDiagnosticSource::Preferences, diagnostic);
+    changed
+}
+
 /// Opens a plugin-drawn page and puts it on screen.
 ///
 /// First admit the bounded logical route, then close old resources and open
@@ -2972,8 +3089,9 @@ fn open_plugin_page(
     plugin: &PluginId,
     page_id: &str,
     window: (u32, u32),
+    appearance: &crikey_ui::appearance::ResolvedAppearance,
 ) -> Result<(), String> {
-    let (width, height) = initial_page_viewport(window.0, window.1);
+    let (width, height) = initial_page_viewport(window.0, window.1, appearance);
     // The submission left "Action pending" on the row. The action did not stay
     // pending, it became a page; leaving the message there would go on telling
     // the user to wait after the page has opened and closed again.
@@ -3001,7 +3119,7 @@ fn open_plugin_page(
     // Admit the logical entry before retiring any live resource. Refusal at the
     // navigation bound must leave the existing page usable.
     web_page.begin_page((width, height));
-    if let Err(error) = search.open_page(plugin, page_id, width, height, page_palette()) {
+    if let Err(error) = search.open_page(plugin, page_id, width, height, appearance.page_palette()) {
         let reason = error.to_string();
         view_model.page_reopen_failed(
             crikey_ui::NavigationRoute::CustomPage {
@@ -4801,7 +4919,16 @@ mod tests {
         let mut web = web_page_runtime();
         let owner = PluginId("test.page".into());
         model.activate();
-        open_plugin_page(&mut search, &mut model, &mut web, &owner, "nested", (800, 600)).unwrap();
+        open_plugin_page(
+            &mut search,
+            &mut model,
+            &mut web,
+            &owner,
+            "nested",
+            (800, 600),
+            &crikey_ui::appearance::ResolvedAppearance::default(),
+        )
+        .unwrap();
         let old_view = model.view();
         assert_eq!(
             model.apply(crikey_ui::UiCommand::OpenSettings),
@@ -4817,7 +4944,16 @@ mod tests {
         else {
             panic!("expected custom route");
         };
-        open_plugin_page(&mut search, &mut model, &mut web, &plugin, &page_id, (800, 600)).unwrap();
+        open_plugin_page(
+            &mut search,
+            &mut model,
+            &mut web,
+            &plugin,
+            &page_id,
+            (800, 600),
+            &crikey_ui::appearance::ResolvedAppearance::default(),
+        )
+        .unwrap();
         assert_ne!(model.view(), old_view);
         assert_eq!(*runtime.opens.lock().unwrap(), 2);
         assert_eq!(search.page_owner(), Some((owner, "nested".into())));
@@ -4839,6 +4975,7 @@ mod tests {
             &PluginId("test.page".into()),
             "nested",
             (800, 600),
+            &crikey_ui::appearance::ResolvedAppearance::default(),
         )
         .unwrap();
         model.apply(crikey_ui::UiCommand::OpenSettings);
@@ -4856,7 +4993,8 @@ mod tests {
             &mut web,
             &plugin,
             &page_id,
-            (800, 600)
+            (800, 600),
+            &crikey_ui::appearance::ResolvedAppearance::default()
         )
         .is_err());
         let frame = model.frame().unwrap();
@@ -4950,6 +5088,7 @@ mod tests {
                 &PluginId("test.page".to_owned()),
                 "page",
                 (800, 600),
+                &crikey_ui::appearance::ResolvedAppearance::default(),
             )
             .expect("page opens");
             assert!(view_model.update_page(
@@ -4987,6 +5126,7 @@ mod tests {
             &PluginId("test.page".to_owned()),
             "page",
             (800, 600),
+            &crikey_ui::appearance::ResolvedAppearance::default(),
         )
         .expect("page opens");
         let declaration = PageWebSurface {
@@ -5031,6 +5171,7 @@ mod tests {
             &PluginId("test.page".to_owned()),
             "page",
             (800, 600),
+            &crikey_ui::appearance::ResolvedAppearance::default(),
         )
         .expect("a dismissed launcher is not a failure");
 
@@ -5058,6 +5199,7 @@ mod tests {
             &PluginId("test.page".to_owned()),
             "page",
             (800, 600),
+            &crikey_ui::appearance::ResolvedAppearance::default(),
         )
         .expect("the page opens");
 
@@ -5103,6 +5245,7 @@ mod tests {
             &PluginId("test.page".to_owned()),
             "page",
             (800, 600),
+            &crikey_ui::appearance::ResolvedAppearance::default(),
         )
         .expect("the page opens");
         let _ = view_model.frame();
@@ -5160,6 +5303,7 @@ mod tests {
             &plugin,
             "page",
             (800, 600),
+            &crikey_ui::appearance::ResolvedAppearance::default(),
         )
         .expect("the old session opens a page");
 
@@ -5191,6 +5335,7 @@ mod tests {
             &plugin,
             "replacement",
             (800, 600),
+            &crikey_ui::appearance::ResolvedAppearance::default(),
         )
         .expect("the replacement session can open its own page");
         assert_eq!(
@@ -7970,5 +8115,96 @@ mod standard_route_resume_tests {
                 .get(&FieldId("username".into())),
             Some(&NonSecretValue::Text("native-route-user".into()))
         );
+    }
+}
+
+#[cfg(test)]
+mod applied_navigation_report_tests {
+    use super::*;
+
+    #[test]
+    fn current_registration_recovery_clears_only_current_shortcut_diagnostics() {
+        use crikey_app::{BindingOwner, BindingStatus, HotkeyFailure, HotkeyProblem, ReconcileReport};
+        use crikey_ui::navigation::{CompiledNavigation, NavigationAction, NavigationStyle};
+        use crikey_ui::InterfaceDiagnosticSource;
+        let mut report = ReconcileReport {
+            publication: 1,
+            ..Default::default()
+        };
+        report.bindings.insert(
+            BindingOwner::Launcher,
+            BindingStatus {
+                requested: Some("Ctrl+Alt+Y".into()),
+                active: Some("Ctrl+Alt+Space".into()),
+                problem: Some(HotkeyProblem::Backend(vec![HotkeyFailure {
+                    accelerator: "Ctrl+Alt+Y".into(),
+                    operation: "register",
+                    error: "already held".into(),
+                }])),
+            },
+        );
+        let navigation =
+            CompiledNavigation::compile(NavigationStyle::Default, r#"{"next":["Ctrl+Alt+Space"]}"#).unwrap();
+        let mut model = LauncherViewModel::new();
+        model.activate();
+        model.set_interface_diagnostic(
+            InterfaceDiagnosticSource::Preferences,
+            Some("Invalid desired appearance; last-good appearance retained".into()),
+        );
+        let (applied, problems) = project_applied_navigation(&report, &navigation);
+        assert!(!applied
+            .bindings()
+            .iter()
+            .any(|binding| binding.action == NavigationAction::Next));
+        assert!(problems.iter().any(|problem| problem.contains("Ctrl+Alt+Y")));
+        model.set_interface_diagnostic(InterfaceDiagnosticSource::Shortcuts, Some(problems.join("; ")));
+        assert!(model.frame().unwrap().navigation.unavailable.is_none());
+
+        report.publication = 2;
+        report.bindings.insert(
+            BindingOwner::Launcher,
+            BindingStatus {
+                requested: Some("Ctrl+Alt+Space".into()),
+                active: Some("Ctrl+Alt+Space".into()),
+                problem: None,
+            },
+        );
+        let (applied, problems) = project_applied_navigation(&report, &navigation);
+        assert!(
+            !problems.is_empty(),
+            "the still-held navigation collision is independent of registration recovery"
+        );
+        assert!(
+            !problems.iter().any(|problem| problem.contains("Ctrl+Alt+Y")),
+            "a successful current report cannot retain the previous failed desired shortcut"
+        );
+        assert!(!applied
+            .bindings()
+            .iter()
+            .any(|binding| binding.action == NavigationAction::Next));
+        model.set_interface_diagnostic(InterfaceDiagnosticSource::Shortcuts, Some(problems.join("; ")));
+        assert!(!model.interface_diagnostics()[1]
+            .as_deref()
+            .unwrap()
+            .contains("Ctrl+Alt+Y"));
+
+        let (applied, problems) = project_applied_navigation(&report, &CompiledNavigation::default());
+        assert!(
+            problems.is_empty(),
+            "a recovered report and nonconflicting map have no current shortcut warning"
+        );
+        assert!(applied
+            .bindings()
+            .iter()
+            .any(|binding| binding.action == NavigationAction::Next));
+        model.set_interface_diagnostic(InterfaceDiagnosticSource::Shortcuts, None);
+        assert!(model.interface_diagnostics()[1].is_none());
+        assert_eq!(
+            model.interface_diagnostics()[0].as_deref(),
+            Some("Invalid desired appearance; last-good appearance retained")
+        );
+        let frame = model.frame().unwrap();
+        assert!(frame.navigation.unavailable.is_none());
+        assert!(!frame.navigation.can_go_back);
     }
 }

@@ -17,8 +17,8 @@ cargo run -p crikey-cli --bin crikey-launcher
 ```
 
 `crikey` with no arguments and `crikey-launcher` both start the resident
-launcher: the window opens, dismissing it with Escape only hides it, and the
-process stays running so the activation hotkey can bring it back. Quit it for
+launcher: the window opens, dismissing it with Escape (the default cancel key)
+only hides it, and the process stays running so the activation hotkey can bring it back. Quit it for
 good from the settings surface's Quit button. A subcommand — `crikey version`,
 `crikey plugin list` — is command-line output as before, and `crikey --help`
 lists them. `crikey run --help` documents the supported one-shot override:
@@ -53,8 +53,8 @@ crikey config layers [<key>]
 
 The launcher's own settings — the activation hotkey, the result ceiling, the
 selected profile, whether the footer shows its keyboard hints — also have a
-surface that does not require knowing a key name. Press `Ctrl+,` in the
-launcher outside a web page, or click `Settings` in the hint line along the
+surface that does not require knowing a key name. By default, press `Ctrl+,` in
+the launcher outside a web page, or click `Settings` in the hint line along the
 bottom, to edit them in place; the same rows are readable and writable from a
 terminal:
 
@@ -92,8 +92,8 @@ An optional plugin boolean without a default or configured value remains
 its editor becomes a checkbox.
 
 With results visible, the footer shows the current primary action and
-**Actions**; result navigation remains Up/Down, Tab to complete and Escape to
-cancel. In compact mode the optional hint line reads
+**Actions**. Navigation hints reflect the applied profile and overrides for the
+current host context; the default compact hint line is
 `Up/Down navigate   Tab complete   Esc cancel`. Hide optional hints with
 `launcher.show-hints = false`; Settings and action affordances remain available.
 Long action sheets can be scrolled without changing the selected action.
@@ -102,7 +102,8 @@ changed action layouts reveal the selection when needed. Each newly opened sheet
 starts at the top without manufacturing a selection-navigation intent.
 Settings normally advertises `Ctrl+,`; on a web page it shows only **Settings**,
 because that shortcut belongs to the document. Web-page hints read
-`Tab navigate page   Esc close page`.
+`Tab navigate page   Esc close page`. Remapping host navigation does not remap
+document keys.
 
 The launcher window is drawn with rounded corners where the desktop can
 composite them smoothly: a Wayland session, an X11 session with a compositing
@@ -116,10 +117,104 @@ ones, the launcher says why on startup; run `crikey run` from a terminal to
 read it.
 
 Secret fields are redacted. Configuration read errors are reported and a
-launcher run continues with built-in defaults; fix the reported file before
-relying on the setting. For isolated development, the standard-directory
+launcher run continues with built-in defaults. Invalid external appearance or
+navigation preferences retain the last-good applied state (or defaults at
+startup) and show a diagnostic, not a false applied confirmation. The effective
+value/source row describes configuration provenance, not proof that it was
+applied. Fix the reported file before relying on the setting. For isolated
+development, the standard-directory
 locations can be overridden with `CRIKEY_CONFIG_DIR`, `CRIKEY_DATA_DIR`,
 `CRIKEY_CACHE_DIR`, and `CRIKEY_STATE_DIR`.
+
+### Appearance and navigation preferences
+
+In **Settings → Appearance**, Theme offers **System**, **Light**, and **Dark**;
+Interface size offers **Small**, **Default**, and **Large**; Result density
+offers **Compact**, **Default**, and **Comfortable**. These are closed-choice
+drop-down controls, not free-form text. Selecting a choice creates a retained
+draft; **Save** applies it live. **Discard** abandons the draft, and
+**Rebase draft** adopts the current revision after a conflict. **System** follows
+observed OS theme changes; if the system theme is unavailable, the preference
+stays System and the interface explicitly reports its dark fallback.
+
+CLI and external file edits are checked when the resident launcher next handles
+a host interaction; there is no idle configuration watcher. Clicking a blank
+part of the launcher footer triggers that check without closing the current
+custom page. Reloading does not require restarting the launcher.
+
+Interface size changes logical UI geometry independently of OS display scaling
+and DPI. Result density changes result-row spacing. The default size and density
+preserve the existing metrics; neither changes the default compact command home
+into a catalog view.
+
+| Key | Default | Accepted values |
+| --- | --- | --- |
+| `launcher.theme` | `system` | `system`, `light`, `dark` |
+| `launcher.interface-size` | `default` | `small`, `default`, `large` |
+| `launcher.result-density` | `default` | `compact`, `default`, `comfortable` |
+| `launcher.theme-overrides` | `{}` | JSON object of color roles |
+| `launcher.navigation-style` | `default` | `default`, `emacs`, `vim` |
+| `launcher.navigation-bindings` | `{}` | JSON object of action-to-chord arrays |
+
+**Settings → Keyboard** offers **Default**, **Emacs**, and **Vim** navigation.
+Emacs adds `Ctrl+N` / `Ctrl+P` for next/previous and `Ctrl+Alt+N` /
+`Ctrl+Alt+P` for page down/up. The modified Vim profile adds `Alt+J` / `Alt+K`
+and `Alt+D` / `Alt+U`, respectively. Both retain the default navigation chords
+unless an override replaces them. Bare `j` and `k` remain query text.
+
+The advanced **Theme color overrides (JSON object)** and **Navigation bindings
+(JSON object)** rows use single-line text editors. Enter the complete JSON object,
+not TOML, then choose **Save** or press Enter; **Cancel edit** discards the draft.
+From a terminal:
+
+```sh
+crikey settings set launcher.theme dark
+crikey settings set launcher.interface-size large
+crikey settings set launcher.result-density comfortable
+crikey settings set launcher.theme-overrides '{"accent":"#A0C8FF"}'
+crikey settings set launcher.navigation-style emacs
+crikey settings set launcher.navigation-bindings '{"next":["Down","Ctrl+Alt+J"]}'
+```
+
+In `config.toml`, the override objects are JSON **strings**:
+
+```toml
+[launcher]
+theme = "dark"
+theme-overrides = '{"accent":"#A0C8FF"}'
+navigation-bindings = '{"next":["Down","Ctrl+Alt+J"]}'
+```
+
+Theme overrides are atomic, limited to 4,096 bytes and the 11 unique roles
+`canvas`, `surface`, `raised`, `input`, `border`, `text`, `text-muted`, `accent`,
+`accent-soft`, `warning`, and `error`. Colors must be opaque `#RRGGBB` strings;
+unknown or duplicate roles are rejected. Omitted roles keep the chosen theme's
+colors. Readability checks reject the whole edit with a reason naming the
+foreground/background pair, such as **Insufficient contrast between text and
+surface**. System-mode overrides must remain readable in both light and dark.
+Use `{}` to remove all role overrides.
+
+Navigation bindings are limited to 8,192 bytes, 11 unique known actions, four
+chords per action and 64 bytes per chord. Actions are `next`, `previous`,
+`page-down`, `page-up`, `complete`, `activate`, `cancel`, `show-actions`,
+`toggle-preview`, `left`, and `right`. Each array replaces that action's entire
+profile binding set; `[]` disables that action's host navigation binding.
+Omitted actions retain their profile bindings; `{}` restores the selected
+profile. Chords use the same accelerator syntax as shortcuts, with exact
+modifiers: extra modifiers do not silently match another action. Unknown or
+duplicate actions, overlapping chords (including retained profile bindings),
+and unmodified text/Space chords are rejected.
+
+Navigation edits also reject conflicts with desired activation and command
+shortcuts. Actually held OS registrations are checked separately: a refused
+replacement may leave the old grab active, so a saved desired shortcut is not
+proof it is active. A collision with an actually held grab makes that navigation
+chord unavailable and removes it from applied hints; it does not override OS
+authority. The diagnostic distinguishes the held shortcut from desired
+configuration. Resolve the shortcut/grab before relying on that chord.
+Profiles and overrides only govern eligible host navigation: editors, passwords,
+popups, IME composition, shortcut recording, preview documents, and web input
+retain their own keys. They do not turn text input into launcher commands.
 
 ### Aliases
 
@@ -194,7 +289,9 @@ Each root is followed by the corresponding per-user directory used by
 
 ## Keyboard and query behavior
 
-The launcher is usable without a mouse. For query and result navigation:
+The launcher is usable without a mouse. The following table lists **default**
+query/result bindings; applied profiles and overrides may change host navigation,
+and the current hints show the applicable chords:
 
 | Key | Action |
 | --- | --- |
@@ -211,19 +308,23 @@ The launcher is usable without a mouse. For query and result navigation:
 ### Discovering actions
 
 The footer shows the current primary action and **Actions**. Open Actions with
-`Ctrl/Cmd+K` or `Alt+Enter`, then type into its separate search field. Search
-flattens matching executable actions; clearing it restores sections. Up/Down
-and Page Up/Down move the action selection, not the result selection. Enter or
-clicking a row activates that exact action. Numeric keys are ordinary search
+its control or the current show-actions chord (by default `Ctrl/Cmd+K` or
+`Alt+Enter`), then type into its separate search field. Search flattens matching
+executable actions; clearing it restores sections. With default bindings,
+Up/Down and Page Up/Down move the action selection, not the result selection.
+Enter or clicking a row activates that exact action. Numeric keys are ordinary search
 text, not action indexes.
 
 **Launcher Settings → Open Settings** opens the real host settings surface.
-Escape/Back first clears action search, then leaves a submenu, then closes
-Actions; the launcher query is unchanged. Settings editors, custom pages and
-IME composition retain their own keyboard input.
+The cancel action (Escape by default) / Back first clears action search, then
+leaves a submenu, then closes Actions; the launcher query is unchanged.
+Settings editors, custom pages and IME composition retain their own keyboard
+input; their owned keys are not replaced by host navigation overrides.
 Text edits, action navigation and Back are applied in their input order, even
 when delivered together. A retained input suffix follows an intentional host
 view/focus transition, but is retired on focus loss, dismissal or a stale source.
+Retained keys keep the applied navigation bindings and editor ownership that
+admitted them; replacing either retires the old suffix rather than reinterpreting it.
 A query exceeding the UTF-8 byte limit refuses its whole submission, including
 a simultaneous Enter; it never runs the prior selected action instead.
 
@@ -401,10 +502,20 @@ display-list pages. A list presents ordinary rows and Actions; a grid presents
 bounded image tiles; detail uses the existing safe text/markdown/image/link
 renderer; a form edits the same executable schema used by typed arguments.
 
-Lists use ordinary row navigation and `Ctrl/Cmd+K` or `Alt+Enter` for Actions.
-In a grid, Left/Right move within a row and Up/Down move spatially between rows;
-Page Up/Down move by pages of rows. Moving down into a shorter row selects its
-last tile before advancing to another section. Section headers never take selection.
+Lists use the current row-navigation and show-actions bindings. By default,
+`Ctrl/Cmd+K` or `Alt+Enter` opens Actions; in a grid, Left/Right move within a row,
+Up/Down move spatially between rows, and Page Up/Down move by pages of rows.
+Moving down into a shorter row selects its last tile before advancing to another
+section. Section headers never take selection.
+
+Collections initially show **Collection navigation · type to search**, including
+after history restoration. Typing, pasting, IME composition or clicking the query
+switches to **Editing query · Up/Down returns to collection navigation**.
+Left/Right then move the query caret rather than the grid selection; deletion
+and clipboard input also remain query editing. An eligible selection/page chord
+(Down by default, for example) returns to collection navigation, where Right
+again moves spatially. The query keeps its IME anchor throughout.
+
 Double-click a grid tile to activate that exact item once, including a tile that
 was not selected. After a refresh, a keyboard-selected grid item is brought into
 view on the next paint without another scroll animation or key. Pointer scrolling,
@@ -503,16 +614,18 @@ keystroke; outcomes from dismissed or replaced views cannot reopen that view.
 ### Selected-result previews
 
 Typed preview content appears beside the selected result when available. The
-list and detail scroll independently. Up/Down still select results while the
-search field is focused; F6 enters the detail controls, where arrow/Page keys
-scroll, Tab reaches links, and F6 or Escape returns to search without changing
-the query or selection.
+list and detail scroll independently. With default bindings, Up/Down select
+results while search is focused and F6 enters the detail controls. Inside the
+document, arrow/Page keys scroll, Tab reaches links, and F6 or Escape returns to
+search without changing the query or selection. Host navigation remaps do not
+take over those document keys.
 
 Drag the divider to resize the panes. The remembered list proportion is
 `launcher.preview-split` (default `0.55`, range `0.3`–`0.7`), saved through the
 ordinary user-global configuration layer. Below 600 logical pixels of body
-width, use **Show detail** / F6 and **Back to results** / Escape rather than
-compressing both panes. A result without detail does not reserve a pane.
+width, use **Show detail** / the toggle-preview chord (F6 by default) and
+**Back to results** rather than compressing both panes. A result without detail
+does not reserve a pane.
 
 Loading, empty, unavailable and failed previews have distinct messages; a
 preview failure does not disable the results. Changing the selection or query,
@@ -548,9 +661,10 @@ a new query or a changed selected target also follows the selection.
 
 ### Navigation, logical resume, and query recall
 
-Settings, custom pages and standard views have a title and **Back**. Escape
-first leaves focused preview/typed editing or an action search/submenu/panel,
-then returns to the previous view, then clears/dismisses root as applicable.
+Settings, custom pages and standard views have a title and **Back**. With default
+navigation bindings, Escape first leaves focused preview/typed editing or an
+action search/submenu/panel, then returns to the previous view, then
+clears/dismisses root as applicable.
 The host retains the root query,
 owner-qualified selection, logical scope and list scroll anchor. Returning
 issues a fresh search and reconciles the exact owner/item across partial
@@ -595,10 +709,11 @@ owner/item entry; a retired suggestion cannot lend its old worker identity to
 a replacement process. Admission and execution consume the same frozen item,
 while current owner, permission and worker-liveness checks still apply.
 
-From an empty root query with no results, press Up to open
-the submitted-search picker, Up/Down to choose, and Enter or click to restore
-the text without executing it. Escape closes the picker. Up in populated
-results continues ordinary result navigation.
+With default navigation bindings, from an empty root query with no results,
+press Up to open the submitted-search picker, Up/Down to choose, and Enter or
+click to restore the text without executing it. Escape closes the picker.
+With remapped host navigation, use the corresponding previous/next/activate/cancel
+chords. In populated results, previous continues ordinary result navigation.
 
 Recall keeps at most 100 distinct submissions (4 KiB each, 256 KiB total),
 newest first, expiring after 24 hours of the current process's monotonic time.

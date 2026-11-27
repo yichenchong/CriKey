@@ -839,6 +839,16 @@ generation you were given: a frame answering an older generation is dropped,
 never drawn, and a resize advances the generation because your previous layout
 was for a different size.
 
+`PageRequest.palette` is the current host palette: `surface`, `text`, `accent`
+and `muted`. A changed palette requests a fresh display-list frame through the
+same live page session, advancing the draw generation even when the viewport is
+unchanged and your page has no redraw timer. Input events may be empty. Rebuild
+colours from that request rather than retaining the palette from page creation.
+Updates coalesce to the latest palette while a draw is in flight; an earlier
+in-flight frame can precede the updated frame. This uses the existing page
+protocol, not a new negotiated ABI capability; it does not reopen the page or
+grant a retired session new work.
+
 For a display-list page, return `redraw_after_ms` only if your page genuinely
 changes without input; `0` means static until the user acts, which is what a
 form should be. A shorter period than `MIN_PAGE_REDRAW_MS` (16 ms) is raised to
@@ -1028,6 +1038,13 @@ a claim of complete IME support: interoperability across real ibus/fcitx input
 methods has not been measured, and v1 has no surrounding-text or
 delete-surrounding operation for correction of already-committed text. Do not
 require CJK reconversion or IME-directed deletion to complete a form.
+
+Host appearance and web-document appearance are separate. The installed
+WPE 2.48.3/FDO engine exposes no preferred color-scheme setter, and the existing
+web transport carries no such preference. Recolouring host chrome or updating
+`PageRequest.palette` does **not** change a webpage's `prefers-color-scheme` or
+force its document theme. Web keys still follow the document-first route above;
+launcher navigation profiles and overrides do not take over document input.
 
 ### A worked page
 
@@ -1245,9 +1262,9 @@ you want Tab to visit them or set `focus_order` explicitly. A node with
 ring.
 
 These semantics are carried and correct today. They are not yet delivered to a
-screen reader — the workspace does not enable a platform accessibility tree —
-so they buy keyboard operability now and are the prerequisite for the rest
-(ADR-0002, ADR-0020).
+screen reader — AccessKit is disabled and the workspace does not enable a
+platform accessibility tree — so they buy keyboard operability now and are the
+prerequisite for the rest (ADR-0002, ADR-0020).
 
 ### Bounds and refusal
 
@@ -1433,6 +1450,13 @@ crikey config layers [KEY]
 crikey dev run --plugin DIR --query text
 crikey dev inspect-protocol --plugin EXE
 ```
+
+Native inspection reports individual defensive checks as well as an overall
+verdict. An oversized frame length is rejected before payload allocation and
+fails `frame-bounds`, even when the worker retires before catalog/query
+admission. Later requests preserve that first terminal diagnosis rather than
+replacing it with a generic closed-connection error; they do not revive the
+worker. Diagnostically sensitive failures remain redacted.
 
 If a plugin is absent, verify the relevant `CRIKEY_MODERN_PLUGIN_ROOTS` or
 `CRIKEY_NATIVE_PLUGIN_ROOTS` path and that `crikey.toml` is readable. Confirm

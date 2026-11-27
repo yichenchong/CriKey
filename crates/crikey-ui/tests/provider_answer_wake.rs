@@ -170,6 +170,7 @@ mod linux {
                     NativeLauncherEvent::Command { .. } => {}
                     NativeLauncherEvent::TypedInput { .. } => panic!("unexpected typed input in wake test"),
                     NativeLauncherEvent::ActionCompletion => state.action_completions += 1,
+                    NativeLauncherEvent::AppearanceChanged(_) => {}
                 }
                 std::mem::take(&mut state.return_query)
             };

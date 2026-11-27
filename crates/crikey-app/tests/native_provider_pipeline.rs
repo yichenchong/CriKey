@@ -44,9 +44,9 @@ const ROW_DELIVERY_WINDOW: Duration = Duration::from_secs(5);
 /// Windows and did not on macOS, which is the whole reason this is its own
 /// number.
 ///
-/// Its value asserts nothing; it only bounds how long a genuinely stuck run
-/// takes to say so. Isolation is witnessed by publication before an explicit
-/// resource release, independently of driver/OS scheduling latency.
+/// Its value asserts nothing. Resource isolation is proved by holding a real
+/// resource child behind a gate until the next query row has been published;
+/// this ceiling only decides when a genuinely stuck run reports failure.
 const RESOURCE_DELIVERY_WINDOW: Duration = Duration::from_secs(60);
 
 /// Liveness ceiling for an answer that is *deliberately* late, from a plugin

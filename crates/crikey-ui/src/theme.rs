@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use egui::{vec2, Color32, FontFamily, FontId, Margin, Rounding, Shadow, Stroke, Style, TextStyle, Visuals};
 
+use crate::appearance::{InterfaceSize, ResolvedAppearance, ResolvedTheme, ResultDensity};
+
 pub(crate) const DEFAULT_WINDOW_WIDTH: u32 = 720;
 pub(crate) const DEFAULT_WINDOW_HEIGHT: u32 = 520;
 pub(crate) const MIN_WINDOW_WIDTH: u32 = 480;
@@ -132,8 +134,9 @@ pub(crate) const TEXT_QUERY: f32 = 24.0;
 /// footer out and fails if the two ever disagree.
 pub(crate) const FOOTER_HEIGHT: f32 = 14.0;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Palette {
+    pub metrics: Metrics,
     pub canvas: Color32,
     pub surface: Color32,
     pub raised: Color32,
@@ -152,10 +155,28 @@ pub(crate) struct Palette {
 /// Three surface tiers and no borders: [`Palette::canvas`] is the window,
 /// [`Palette::surface`] is a sheet standing on it -- the query field, the
 /// action list, the settings surface -- and [`Palette::raised`] is a control
-/// standing on a sheet. Each tier is a visible step lighter than the one under
-/// it, which is what lets the chrome be fills rather than strokes.
-pub(crate) fn palette() -> Palette {
+/// standing on a sheet. Dark tiers get lighter; light tiers get darker, so
+/// chrome remains distinguishable without adding borders.
+pub(crate) fn base_palette(theme: ResolvedTheme) -> Palette {
+    let metrics = Metrics::new(InterfaceSize::Default, ResultDensity::Default);
+    if theme == ResolvedTheme::Light {
+        return Palette {
+            metrics,
+            canvas: Color32::from_rgb(247, 248, 250),
+            surface: Color32::from_rgb(237, 240, 244),
+            raised: Color32::from_rgb(225, 229, 235),
+            input: Color32::from_rgb(255, 255, 255),
+            border: Color32::from_rgb(151, 160, 173),
+            text: Color32::from_rgb(25, 30, 38),
+            text_muted: Color32::from_rgb(72, 81, 94),
+            accent: Color32::from_rgb(133, 76, 0),
+            accent_soft: Color32::from_rgb(245, 224, 190),
+            warning: Color32::from_rgb(133, 83, 0),
+            error: Color32::from_rgb(169, 42, 42),
+        };
+    }
     Palette {
+        metrics,
         canvas: Color32::from_rgb(20, 22, 26),
         surface: Color32::from_rgb(34, 38, 45),
         raised: Color32::from_rgb(46, 51, 59),
@@ -166,46 +187,54 @@ pub(crate) fn palette() -> Palette {
         accent: Color32::from_rgb(232, 174, 88),
         accent_soft: Color32::from_rgb(70, 56, 36),
         warning: Color32::from_rgb(226, 184, 102),
-        error: Color32::from_rgb(222, 112, 112),
+        error: Color32::from_rgb(240, 140, 140),
     }
 }
 
-pub(crate) fn install(context: &egui::Context) {
-    let colors = palette();
+/// Install only when the caller-owned resolved appearance changes.
+pub(crate) fn install(context: &egui::Context, resolved: &ResolvedAppearance) {
+    let colors = &resolved.palette;
+    let metrics = resolved.metrics();
     let mut style = Style {
         text_styles: BTreeMap::from([
             (
                 TextStyle::Small,
-                FontId::new(TEXT_SMALL, FontFamily::Proportional),
+                FontId::new(metrics.text_small, FontFamily::Proportional),
             ),
-            (TextStyle::Body, FontId::new(TEXT_BODY, FontFamily::Proportional)),
+            (
+                TextStyle::Body,
+                FontId::new(metrics.text_body, FontFamily::Proportional),
+            ),
             (
                 TextStyle::Button,
-                FontId::new(TEXT_BODY, FontFamily::Proportional),
+                FontId::new(metrics.text_body, FontFamily::Proportional),
             ),
             (
                 TextStyle::Heading,
-                FontId::new(TEXT_QUERY, FontFamily::Proportional),
+                FontId::new(metrics.text_query, FontFamily::Proportional),
             ),
             (
                 TextStyle::Monospace,
-                FontId::new(TEXT_SMALL, FontFamily::Monospace),
+                FontId::new(metrics.text_small, FontFamily::Monospace),
             ),
         ]),
         ..Style::default()
     };
-    style.spacing.item_spacing = vec2(SPACE_2, ITEM_SPACING_Y);
-    style.spacing.window_margin = Margin::same(PANEL_MARGIN);
-    style.spacing.button_padding = vec2(SPACE_2, SPACE_1);
-    style.spacing.interact_size = vec2(SPACE_8, CONTROL_HEIGHT);
-    style.spacing.text_edit_width = DEFAULT_WINDOW_WIDTH as f32 - SPACE_8;
+    style.spacing.item_spacing = vec2(metrics.space_2, metrics.item_spacing_y);
+    style.spacing.window_margin = Margin::same(metrics.panel_margin);
+    style.spacing.button_padding = vec2(metrics.space_2, metrics.space_1);
+    style.spacing.interact_size = vec2(metrics.space_8, metrics.control_height);
+    style.spacing.text_edit_width = metrics.default_window_width - metrics.space_8;
 
-    let mut visuals = Visuals::dark();
+    let mut visuals = match resolved.theme {
+        ResolvedTheme::Light => Visuals::light(),
+        ResolvedTheme::Dark => Visuals::dark(),
+    };
     visuals.override_text_color = Some(colors.text);
     visuals.panel_fill = colors.canvas;
     visuals.window_fill = colors.surface;
     visuals.window_stroke = Stroke::new(1.0_f32, colors.border);
-    visuals.window_rounding = Rounding::same(RADIUS_MEDIUM);
+    visuals.window_rounding = Rounding::same(metrics.radius_medium);
     visuals.window_shadow = Shadow::NONE;
     visuals.popup_shadow = Shadow::NONE;
     visuals.extreme_bg_color = colors.input;
@@ -223,20 +252,110 @@ pub(crate) fn install(context: &egui::Context) {
     visuals.widgets.noninteractive.weak_bg_fill = colors.surface;
     visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, colors.text);
-    visuals.widgets.noninteractive.rounding = Rounding::same(RADIUS_SMALL);
+    visuals.widgets.noninteractive.rounding = Rounding::same(metrics.radius_small);
     visuals.widgets.inactive.bg_fill = colors.raised;
     visuals.widgets.inactive.weak_bg_fill = colors.raised;
     visuals.widgets.inactive.bg_stroke = Stroke::NONE;
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, colors.text);
-    visuals.widgets.inactive.rounding = Rounding::same(RADIUS_SMALL);
+    visuals.widgets.inactive.rounding = Rounding::same(metrics.radius_small);
     visuals.widgets.hovered.bg_fill = colors.accent_soft;
     visuals.widgets.hovered.weak_bg_fill = colors.accent_soft;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, colors.accent);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, colors.text);
-    visuals.widgets.hovered.rounding = Rounding::same(RADIUS_SMALL);
+    visuals.widgets.hovered.rounding = Rounding::same(metrics.radius_small);
     visuals.widgets.active = visuals.widgets.hovered;
     visuals.widgets.open = visuals.widgets.hovered;
     style.visuals = visuals;
 
+    // The host resolver owns System handling too. Leaving egui in System mode
+    // lets a later RawInput observation select an unconfigured style slot.
+    context.set_theme(match resolved.theme {
+        ResolvedTheme::Light => egui::Theme::Light,
+        ResolvedTheme::Dark => egui::Theme::Dark,
+    });
     context.set_style(style);
+}
+
+/// Fully resolved logical geometry. OS DPI remains exclusively platform-owned.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Metrics {
+    pub scale: f32,
+    pub default_window_width: f32,
+    pub default_window_height: f32,
+    pub min_window_width: f32,
+    pub min_window_height: f32,
+    pub compact_window_height: f32,
+    pub space_1: f32,
+    pub space_2: f32,
+    pub space_3: f32,
+    pub space_8: f32,
+    pub item_spacing_y: f32,
+    pub panel_margin: f32,
+    pub field_height: f32,
+    pub control_height: f32,
+    pub row_height: f32,
+    pub row_gap: f32,
+    pub row_pad_x: f32,
+    pub row_pad_y: f32,
+    pub row_line_gap: f32,
+    pub radius_small: f32,
+    pub radius_medium: f32,
+    pub radius_window: f32,
+    pub icon_size: f32,
+    pub text_small: f32,
+    pub text_body: f32,
+    pub text_label: f32,
+    pub text_query: f32,
+    pub footer_height: f32,
+}
+impl Metrics {
+    pub(crate) fn new(size: InterfaceSize, density: ResultDensity) -> Self {
+        let scale = match size {
+            InterfaceSize::Small => 0.9,
+            InterfaceSize::Default => 1.0,
+            InterfaceSize::Large => 1.15,
+        };
+        let (row_pad_y, row_gap) = match density {
+            ResultDensity::Compact => (ROW_PAD_Y - 1.0, 0.0),
+            ResultDensity::Default => (ROW_PAD_Y, ROW_GAP),
+            ResultDensity::Comfortable => (ROW_PAD_Y + 4.0, ROW_GAP + 2.0),
+        };
+        // Font line boxes round conservatively in logical coordinates. Keep
+        // footer and frame reservations coherent without applying OS DPI here.
+        let footer_height = (FOOTER_HEIGHT * scale).ceil();
+        let footer_rounding = footer_height - FOOTER_HEIGHT * scale;
+        Self {
+            scale,
+            default_window_width: DEFAULT_WINDOW_WIDTH as f32 * scale,
+            default_window_height: DEFAULT_WINDOW_HEIGHT as f32 * scale,
+            min_window_width: MIN_WINDOW_WIDTH as f32 * scale,
+            min_window_height: MIN_WINDOW_HEIGHT as f32 * scale + footer_rounding,
+            compact_window_height: COMPACT_WINDOW_HEIGHT as f32 * scale + footer_rounding,
+            space_1: SPACE_1 * scale,
+            space_2: SPACE_2 * scale,
+            space_3: SPACE_3 * scale,
+            space_8: SPACE_8 * scale,
+            item_spacing_y: ITEM_SPACING_Y * scale,
+            panel_margin: PANEL_MARGIN * scale,
+            field_height: FIELD_HEIGHT * scale,
+            control_height: CONTROL_HEIGHT * scale,
+            row_height: (ROW_HEIGHT + 2.0 * (row_pad_y - ROW_PAD_Y)) * scale,
+            row_gap: row_gap * scale,
+            row_pad_x: ROW_PAD_X * scale,
+            row_pad_y: row_pad_y * scale,
+            row_line_gap: ROW_LINE_GAP * scale,
+            radius_small: RADIUS_SMALL * scale,
+            radius_medium: RADIUS_MEDIUM * scale,
+            radius_window: RADIUS_WINDOW * scale,
+            icon_size: ICON_SIZE * scale,
+            text_small: TEXT_SMALL * scale,
+            text_body: TEXT_BODY * scale,
+            text_label: TEXT_LABEL * scale,
+            text_query: TEXT_QUERY * scale,
+            footer_height,
+        }
+    }
+    pub(crate) fn scaled(&self, logical: f32) -> f32 {
+        logical * self.scale
+    }
 }

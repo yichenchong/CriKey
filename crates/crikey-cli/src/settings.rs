@@ -24,8 +24,10 @@ use std::fmt::Write as _;
 use std::process::ExitCode;
 
 #[cfg(test)]
-use crikey_app::launcher_settings::{configured_hotkey, configured_rounded_corners, configured_show_hints};
-use crikey_app::launcher_settings::{rows, validate};
+use crikey_app::launcher_settings::{
+    configured_hotkey, configured_rounded_corners, configured_show_hints, validate,
+};
+use crikey_app::launcher_settings::{rows, validate_edit};
 use crikey_config::{ConfigStore, KEY_ACTIVATION_HOTKEY};
 #[cfg(test)]
 use crikey_config::{KEY_MAX_RESULTS, KEY_ROUNDED_CORNERS, KEY_SHOW_HINTS};
@@ -64,8 +66,8 @@ const UNSET: &str = "unset";
 /// `crikey run --set` override outranks it, and a panel that reported its own
 /// write as effective would be lying about which chord the launcher answers to.
 pub(crate) fn persist(store: &mut ConfigStore, key: &str, value: &str) -> Result<String, String> {
-    validate(key, value)?;
-    persist_typed(store, key, value).map_err(|error| match error {
+    let receipts = validate_edit(store, key, value)?;
+    persist_typed(store, key, value, &receipts).map_err(|error| match error {
         crikey_config::ConfigError::Conflict => "Configuration changed; reload and retry this edit".into(),
         crikey_config::ConfigError::PersistedReload => {
             "Setting was saved, but the effective configuration could not be reloaded".into()
@@ -79,9 +81,10 @@ pub(crate) fn persist_typed(
     store: &mut ConfigStore,
     key: &str,
     value: &str,
+    validated_sources: &[crikey_config::ConfigRevision],
 ) -> Result<String, crikey_config::ConfigError> {
     let expected = store.revision();
-    store.commit_user_global(key, value, &expected)?;
+    store.commit_user_global_checked(key, value, &expected, validated_sources)?;
     let effective = store.get(key).unwrap_or_default();
     if effective == value {
         Ok(format!("{key} = {value}"))
@@ -637,14 +640,28 @@ impl Management {
                         .filter_map(|hit| {
                             let index = rows.iter().position(|row| row.key == hit.key)?;
                             let row = rows.swap_remove(index);
-                            // An optional plugin boolean without a value stays
-                            // unset and uses the text editor until saved.
-                            let toggle = (matches!(hit.control.as_str(), "boolean" | "bool")
-                                && !row.secret
-                                && row.value_available
-                                && (hit.key.starts_with("launcher.")
-                                    || matches!(row.value.as_str(), "true" | "false")))
-                            .then_some(row.value != "false");
+                            let declaration = crikey_app::launcher_settings::declaration(&hit.key);
+                            let max_bytes = declaration.map_or(4096, |setting| setting.max_edit_bytes());
+                            let control = if row.secret || !row.value_available {
+                                crikey_ui::SettingControl::Text
+                            } else {
+                                match declaration.map(|setting| setting.control) {
+                                    Some(crikey_app::launcher_settings::Control::Choice { options }) => {
+                                        crikey_ui::SettingControl::Choice { options }
+                                    }
+                                    // An optional plugin boolean without a value stays
+                                    // unset and uses the text editor until saved.
+                                    _ if matches!(hit.control.as_str(), "boolean" | "bool")
+                                        && (hit.key.starts_with("launcher.")
+                                            || matches!(row.value.as_str(), "true" | "false")) =>
+                                    {
+                                        crikey_ui::SettingControl::Toggle {
+                                            on: row.value != "false",
+                                        }
+                                    }
+                                    _ => crikey_ui::SettingControl::Text,
+                                }
+                            };
                             Some(crikey_ui::settings_management::Field {
                                 plugin: (!hit.key.starts_with("launcher."))
                                     .then_some(crikey_core::PluginId(hit.navigation_target)),
@@ -656,7 +673,8 @@ impl Management {
                                 source: row.source,
                                 restart: row.requires_restart,
                                 secret: row.secret,
-                                toggle,
+                                control,
+                                max_bytes,
                                 value_available: row.value_available,
                             })
                         })
@@ -695,8 +713,14 @@ impl Management {
                     let mut fields = self.panel.fields.to_vec();
                     if let Some(field) = fields.iter_mut().find(|field| field.key == row.key) {
                         field.value_available = row.value_available;
-                        if field.toggle.is_some() {
-                            field.toggle = row.value_available.then_some(row.value != "false");
+                        if matches!(field.control, crikey_ui::SettingControl::Toggle { .. }) {
+                            field.control = if row.value_available {
+                                crikey_ui::SettingControl::Toggle {
+                                    on: row.value != "false",
+                                }
+                            } else {
+                                crikey_ui::SettingControl::Text
+                            };
                         }
                         field.value = row.value;
                         field.source = row.source;
@@ -1398,6 +1422,12 @@ mod tests {
             ("launcher.resume-delay-ms", Category::Launcher),
             ("launcher.query-history", Category::PrivacyHistory),
             ("launcher.command-home", Category::Launcher),
+            (crikey_config::KEY_THEME, Category::Appearance),
+            (crikey_config::KEY_INTERFACE_SIZE, Category::Appearance),
+            (crikey_config::KEY_RESULT_DENSITY, Category::Appearance),
+            (crikey_config::KEY_THEME_OVERRIDES, Category::Appearance),
+            (crikey_config::KEY_NAVIGATION_STYLE, Category::Keyboard),
+            (crikey_config::KEY_NAVIGATION_BINDINGS, Category::Keyboard),
         ] {
             let declaration =
                 crikey_app::launcher_settings::declaration(key).expect("shared launcher declaration");
@@ -1413,6 +1443,20 @@ mod tests {
                 }),
                 "the deep-linked field must survive the selected category filter: {key}"
             );
+            let field = management
+                .panel
+                .fields
+                .iter()
+                .find(|field| field.key == key)
+                .unwrap();
+            assert_eq!(field.max_bytes, declaration.max_edit_bytes());
+            if let crikey_app::launcher_settings::Control::Choice { options } = declaration.control {
+                assert_eq!(field.control, crikey_ui::SettingControl::Choice { options });
+            }
+            if key == crikey_config::KEY_NAVIGATION_BINDINGS {
+                assert_eq!(field.control, crikey_ui::SettingControl::Text);
+                assert_eq!(field.max_bytes, 8192);
+            }
 
             management.select_category(view, destination, &worker);
             receive_projection(&mut management, &worker, view, &wakes);
@@ -1523,7 +1567,8 @@ mod tests {
         assert_eq!(field.value, "");
         assert_eq!(field.source, "unset");
         assert_eq!(
-            field.toggle, None,
+            field.control,
+            crikey_ui::SettingControl::Text,
             "unset must expose the existing text editor and Save"
         );
         assert_eq!(
@@ -1537,7 +1582,11 @@ mod tests {
             .iter()
             .find(|field| field.key == KEY_ROUNDED_CORNERS)
             .unwrap();
-        assert_eq!(launcher.toggle, Some(true), "launcher defaults remain checkboxes");
+        assert_eq!(
+            launcher.control,
+            crikey_ui::SettingControl::Toggle { on: true },
+            "launcher defaults remain checkboxes"
+        );
 
         // The first text edit can set true, rather than first having to uncheck
         // a fabricated true value. The production save response triggers another
@@ -1568,7 +1617,7 @@ mod tests {
                     .find(|field| field.key == setting)
                     .unwrap();
                 assert_eq!(field.value, value.to_string());
-                assert_eq!(field.toggle, Some(value));
+                assert_eq!(field.control, crikey_ui::SettingControl::Toggle { on: value });
                 assert_eq!(
                     field.source,
                     if target.is_some() {
@@ -1637,6 +1686,48 @@ mod tests {
     impl Drop for ConfigDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn terminal_appearance_and_navigation_edits_reject_full_candidate_without_writes() {
+        let directory = ConfigDir::new("appearance-navigation-validation");
+        let mut store = directory.store();
+        persist(&mut store, crikey_config::KEY_THEME, "dark").unwrap();
+        let before = std::fs::read(store.config_path()).unwrap();
+        let revision = store.revision();
+        for (key, value, reason) in [
+            (
+                crikey_config::KEY_THEME_OVERRIDES,
+                r##"{"canvas":"#111111","text":"#111111"}"##,
+                "contrast",
+            ),
+            (
+                crikey_config::KEY_NAVIGATION_BINDINGS,
+                r#"{"next":["Ctrl+Alt+J"],"previous":["Ctrl+Alt+J"]}"#,
+                "overlap",
+            ),
+            (KEY_ACTIVATION_HOTKEY, "Down", "navigation"),
+        ] {
+            let error = persist(&mut store, key, value).unwrap_err();
+            assert!(error.to_lowercase().contains(reason), "{error}");
+            assert_eq!(std::fs::read(store.config_path()).unwrap(), before);
+            assert_eq!(store.revision(), revision);
+        }
+    }
+
+    #[test]
+    fn terminal_invalid_chord_diagnostics_never_include_unknown_or_trailing_components() {
+        let directory = ConfigDir::new("navigation-redacted-diagnostics");
+        let mut store = directory.store();
+        persist(&mut store, crikey_config::KEY_THEME, "dark").unwrap();
+        let before = std::fs::read(store.config_path()).unwrap();
+        for chord in ["Ctrl+PRIVATE_CHORD_CANARY", "Ctrl+J+PRIVATE_CHORD_CANARY"] {
+            let draft = format!(r#"{{"next":["{chord}"]}}"#);
+            let error = persist(&mut store, crikey_config::KEY_NAVIGATION_BINDINGS, &draft).unwrap_err();
+            assert!(error.contains("known"), "{error}");
+            assert!(!error.contains("PRIVATE_CHORD_CANARY"), "{error}");
+            assert_eq!(std::fs::read(store.config_path()).unwrap(), before);
         }
     }
 

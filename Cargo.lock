@@ -903,6 +903,8 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "pollster",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "wgpu",
  "windows 0.61.3",

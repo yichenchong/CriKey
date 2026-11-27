@@ -21,6 +21,7 @@
 //! request. A burst of motion costs one round trip, and the plugin still sees
 //! every event in order.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -41,6 +42,12 @@ const MAX_PENDING_PAGE_EVENTS: usize = 256;
 /// Rings the host's event loop after a frame is published. A page draws on
 /// its own thread, so nothing else would notice the answer had arrived.
 pub(crate) type PageWake = Arc<dyn Fn() + Send + Sync>;
+
+/// Opaque identity of one page opening, never reused by a replacement session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageSessionId(u64);
+
+static NEXT_PAGE_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// One frame the host is willing to draw, and whether the session that
 /// produced it has ended.
@@ -111,6 +118,7 @@ impl Default for PageDeadlines {
 enum PageCommand {
     Input(Box<PageInput>),
     Resize { width: u32, height: u32 },
+    Palette,
     Close,
 }
 
@@ -128,6 +136,8 @@ struct PageMailbox {
     /// something to report it about; without this the surface would blink to
     /// empty on the way out whenever the caller had already polled.
     last_frame: PageFrame,
+    pending_palette: Option<PagePalette>,
+    closed: bool,
 }
 
 /// Everything a page needs before its first frame.
@@ -148,6 +158,7 @@ pub(crate) struct PageOpen {
 /// driving it.
 #[derive(Debug)]
 pub(crate) struct PageSession {
+    id: PageSessionId,
     plugin: PluginId,
     page_id: String,
     commands: Sender<PageCommand>,
@@ -172,6 +183,10 @@ impl PageSession {
         mut backend: Box<dyn PageBackend>,
         wake: PageWake,
     ) -> Result<Self, String> {
+        let id = NEXT_PAGE_SESSION_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .map(PageSessionId)
+            .map_err(|_| "page session identity space exhausted".to_owned())?;
         let PageOpen {
             plugin,
             page_id,
@@ -210,6 +225,7 @@ impl PageSession {
             })
             .map_err(|error| format!("page session thread did not start: {error}"))?;
         Ok(Self {
+            id,
             plugin,
             page_id,
             commands,
@@ -240,6 +256,27 @@ impl PageSession {
     /// a display list laid out for the old viewport is not the one to draw.
     pub(crate) fn resize(&self, width: u32, height: u32) {
         let _ = self.commands.send(PageCommand::Resize { width, height });
+    }
+
+    pub(crate) fn id(&self) -> PageSessionId {
+        self.id
+    }
+
+    /// Coalesces appearance changes without waiting for a guest round trip.
+    /// Identity is checked here too so a delayed caller cannot recolour a
+    /// replacement, even when plugin and page names have been reused.
+    pub(crate) fn update_palette(&self, id: PageSessionId, palette: PagePalette) -> Result<(), String> {
+        let mut mailbox = self.mailbox.lock().unwrap_or_else(|error| error.into_inner());
+        if id != self.id || mailbox.closed {
+            return Err("plugin page session is stale or closed".to_owned());
+        }
+        let queued = mailbox.pending_palette.replace(palette).is_some();
+        if !queued && self.commands.send(PageCommand::Palette).is_err() {
+            mailbox.pending_palette = None;
+            mailbox.closed = true;
+            return Err("plugin page session has ended".to_owned());
+        }
+        Ok(())
     }
 
     /// Takes the newest finished frame, if one is waiting.
@@ -284,7 +321,8 @@ impl PageSession {
     pub(crate) fn close(mut self) -> (Option<PageUpdate>, PageClosing) {
         let _ = self.commands.send(PageCommand::Close);
         let closing = PageClosing(self.worker.take());
-        let mailbox = self.mailbox.lock().unwrap_or_else(|error| error.into_inner());
+        let mut mailbox = self.mailbox.lock().unwrap_or_else(|error| error.into_inner());
+        mailbox.closed = true;
         let frame = mailbox.last_frame.clone();
         drop(mailbox);
         (
@@ -521,6 +559,21 @@ impl PageDriver {
                 self.redraw_at = Some(Instant::now());
                 Drained::Open
             }
+            PageCommand::Palette => {
+                let palette = self
+                    .mailbox
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .pending_palette
+                    .take();
+                if let Some(palette) = palette {
+                    if palette != self.palette {
+                        self.palette = palette;
+                        self.redraw_at = Some(Instant::now());
+                    }
+                }
+                Drained::Open
+            }
             PageCommand::Close => Drained::Closed,
         }
     }
@@ -585,6 +638,7 @@ impl PageDriver {
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         let mut mailbox = self.mailbox.lock().unwrap_or_else(|error| error.into_inner());
+        mailbox.closed |= closed;
         mailbox.last_frame = frame.clone();
         mailbox.update = Some(PageUpdate {
             frame,
@@ -630,6 +684,102 @@ mod tests {
         MIN_PAGE_REDRAW_MS,
     };
     use crikey_core::{PageFrame, PageInput, PageInputKind, PagePalette, PluginId};
+
+    #[test]
+    fn palette_only_change_redraws_the_same_viewport_and_advances_generation() {
+        let mut harness = Harness::open();
+        let first = harness.next_draw();
+        harness.reply(Ok(frame(first.generation)));
+        let _ = harness.next_update();
+        let palette = PagePalette {
+            surface: crikey_core::PageColor::from_u32(0xfafafaff),
+            ..PagePalette::default()
+        };
+        let id = harness.session().id();
+        harness.session().update_palette(id, palette).unwrap();
+        let redraw = harness.next_draw();
+        assert_eq!((redraw.width, redraw.height), (first.width, first.height));
+        assert_eq!(redraw.generation, first.generation + 1);
+        assert_eq!(redraw.palette, palette);
+        assert!(
+            redraw.events.is_empty(),
+            "palette travels in the existing draw contract"
+        );
+        harness.reply(Ok(frame(redraw.generation)));
+        assert_eq!(harness.next_update().frame.generation, redraw.generation);
+
+        harness.session().update_palette(id, palette).unwrap();
+        // A FIFO input barrier proves the identical palette did not advance
+        // the generation regardless of whether the worker was asleep.
+        harness
+            .session()
+            .send_input(PageInput::new(PageInputKind::PointerPressed))
+            .unwrap();
+        let next = harness.next_draw();
+        assert_eq!(next.generation, redraw.generation + 1);
+        assert_eq!(next.events.len(), 1);
+        harness.reply(Ok(frame(next.generation)));
+        let _ = harness.next_update();
+        harness.reply(Ok(PageFrame::default()));
+        let _ = harness.close();
+    }
+
+    #[test]
+    fn palette_updates_coalesce_while_a_draw_is_in_flight() {
+        let mut harness = Harness::open();
+        let first = harness.next_draw();
+        let id = harness.session().id();
+        let mut palette = PagePalette::default();
+        for value in 1..=128 {
+            palette.surface = crikey_core::PageColor::from_u32(value);
+            harness.session().update_palette(id, palette).unwrap();
+        }
+        {
+            let mailbox = harness.session().mailbox.lock().unwrap();
+            assert_eq!(mailbox.pending_palette, Some(palette));
+        }
+        harness.reply(Ok(frame(first.generation)));
+        let redraw = harness.next_draw();
+        assert_eq!(redraw.palette, palette);
+        assert_eq!(redraw.generation, first.generation + 1);
+        let _ = harness.next_update();
+        harness.reply(Ok(frame(redraw.generation)));
+        let _ = harness.next_update();
+        harness.reply(Ok(PageFrame::default()));
+        let _ = harness.close();
+    }
+
+    #[test]
+    fn stale_palette_identity_cannot_update_a_replacement_with_the_same_names() {
+        let mut old = Harness::open();
+        let first = old.next_draw();
+        old.reply(Ok(frame(first.generation)));
+        let _ = old.next_update();
+        let old_id = old.session().id();
+        old.reply(Ok(PageFrame::default()));
+        let _ = old.close();
+
+        let mut replacement = Harness::open();
+        let first = replacement.next_draw();
+        replacement.reply(Ok(frame(first.generation)));
+        let _ = replacement.next_update();
+        assert_ne!(old_id, replacement.session().id());
+        assert!(replacement
+            .session()
+            .update_palette(old_id, PagePalette::default())
+            .is_err());
+        replacement
+            .session()
+            .send_input(PageInput::new(PageInputKind::PointerPressed))
+            .unwrap();
+        let next = replacement.next_draw();
+        assert_eq!(next.generation, first.generation + 1);
+        assert_eq!(next.palette, PagePalette::default());
+        replacement.reply(Ok(frame(next.generation)));
+        let _ = replacement.next_update();
+        replacement.reply(Ok(PageFrame::default()));
+        let _ = replacement.close();
+    }
 
     /// A plugin that answers exactly what a test tells it to, and records what
     /// it was asked.
@@ -936,6 +1086,13 @@ mod tests {
             "deliberate closure is not unavailability"
         );
         assert_eq!(update.frame.generation, 1);
+        assert!(
+            harness
+                .session()
+                .update_palette(harness.session().id(), PagePalette::default())
+                .is_err(),
+            "a terminal session refuses palette work before it is polled away"
+        );
         let session = harness.session.take().expect("session is open");
         drop(session);
         assert!(

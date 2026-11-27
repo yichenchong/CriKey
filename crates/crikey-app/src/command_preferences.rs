@@ -216,7 +216,6 @@ impl CommandPreferencesStore {
                 }
             }
         }
-        let changes_hotkey = matches!(&mutation, PreferenceMutation::SetHotkey { hotkey: Some(_), .. });
         match mutation {
             PreferenceMutation::SetRecord(record) => {
                 if let Some(existing) = preferences
@@ -244,30 +243,43 @@ impl CommandPreferencesStore {
             PreferenceMutation::SetFallbacks(fallbacks) => preferences.fallbacks = fallbacks,
         }
         let encoded = preferences.encode().map_err(PreferenceError::Invalid)?;
-        if changes_hotkey {
-            if session {
-                let mut candidate = config.clone();
-                candidate.set_session_override(KEY_COMMAND_PREFERENCES, &encoded);
-                candidate
-                    .validate_command_hotkey_conflicts()
-                    .map_err(PreferenceError::Invalid)?;
-            } else {
-                let (current, retained) = config
-                    .project_user_global_candidates(KEY_COMMAND_PREFERENCES, &encoded)
-                    .map_err(|error| PreferenceError::Persistence(error.to_string()))?;
-                current
-                    .validate_command_hotkey_conflicts()
-                    .map_err(PreferenceError::Invalid)?;
-                retained
-                    .validate_command_hotkey_conflicts()
-                    .map_err(PreferenceError::Invalid)?;
-            }
-        }
+        // Every document mutation can replace inherited shortcuts, including
+        // record removal or a first alias/favorites-only target-layer document.
+        // Validate the complete candidate, not just SetHotkey(Some).
+        let validated_sources = if session {
+            let mut candidate = config.clone();
+            candidate.set_session_override(KEY_COMMAND_PREFERENCES, &encoded);
+            crate::launcher_settings::configured_navigation(Some(&candidate))
+                .map_err(PreferenceError::Invalid)?;
+            Default::default()
+        } else {
+            let (current, retained) = config
+                .project_user_global_candidates(KEY_COMMAND_PREFERENCES, &encoded)
+                .map_err(|error| PreferenceError::Persistence(error.to_string()))?;
+            crate::launcher_settings::configured_navigation(Some(&current))
+                .map_err(PreferenceError::Invalid)?;
+            crate::launcher_settings::configured_navigation(Some(&retained))
+                .map_err(PreferenceError::Invalid)?;
+            [
+                current.additional_source_revision(config),
+                retained.additional_source_revision(config),
+            ]
+        };
         let expected_config = self
             .config_revision
             .clone()
             .ok_or_else(|| PreferenceError::Persistence("configuration authority unavailable".into()))?;
-        match config.commit_command_preferences_if_revision(&preferences, session, &expected_config) {
+        let result = if session {
+            config.commit_command_preferences_if_revision(&preferences, true, &expected_config)
+        } else {
+            config.commit_user_global_checked(
+                KEY_COMMAND_PREFERENCES,
+                &encoded,
+                &expected_config,
+                &validated_sources,
+            )
+        };
+        match result {
             Ok(()) => {}
             Err(ConfigError::Conflict) => {
                 return Err(PreferenceError::Conflict {
@@ -677,6 +689,146 @@ mod shadowed_layer_tests {
         let directories = StandardDirectories::resolve(DirectoryConvention::current(), &environment).unwrap();
         let config = ConfigStore::load_with_policy(&directories, None).unwrap();
         (path, directories, config)
+    }
+
+    #[test]
+    fn durable_command_edits_validate_restart_profile_and_retain_its_source_receipt() {
+        let (path, _, mut config) = config("navigation-distinct-profiles");
+        let profiles = path.join(crikey_config::PROFILE_DIRECTORY);
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("session.toml"),
+            "[launcher]\nnavigation-bindings = '{}'\n",
+        )
+        .unwrap();
+        let restart_profile = profiles.join("restart.toml");
+        std::fs::write(
+            &restart_profile,
+            "[launcher]\nnavigation-bindings = '{\"next\":[\"Ctrl+Alt+J\"]}'\n",
+        )
+        .unwrap();
+        config.set_user_global(crikey_config::KEY_PROFILE, "restart");
+        config.save().unwrap();
+        config.set_session_override(crikey_config::KEY_PROFILE, "session");
+        config = config.reload().unwrap();
+        let registry = CommandRegistry::with_builtins();
+        let reference = registry.snapshot().commands.keys().next().unwrap().clone();
+        let record = CommandPreference {
+            reference,
+            hidden: false,
+            alias: None,
+            hotkey: Some("Ctrl+Alt+J".into()),
+        };
+        let mut store = CommandPreferencesStore::load(&config).unwrap();
+        let revision = store.snapshot().revision;
+        let before = std::fs::read(config.config_path()).unwrap();
+        assert!(matches!(
+            store.apply(&mut config, &registry, revision, PreferenceMutation::SetRecord(record.clone()), false),
+            Err(PreferenceError::Invalid(reason)) if reason.contains("navigation")
+        ));
+        let safe = CommandPreferences {
+            records: vec![CommandPreference {
+                hotkey: Some("Ctrl+Alt+Q".into()),
+                ..record
+            }],
+            ..Default::default()
+        }
+        .encode()
+        .unwrap();
+        let (current, restart) = config
+            .project_user_global_candidates(KEY_COMMAND_PREFERENCES, &safe)
+            .unwrap();
+        crate::launcher_settings::configured_navigation(Some(&current)).unwrap();
+        crate::launcher_settings::configured_navigation(Some(&restart)).unwrap();
+        let receipts = [
+            current.additional_source_revision(&config),
+            restart.additional_source_revision(&config),
+        ];
+        let expected = config.revision();
+        // The active session profile's original revision does not know this
+        // restart-only source. Its semantic validation receipt must protect it.
+        std::fs::write(
+            &restart_profile,
+            "[launcher]\nnavigation-bindings = '{\"next\":[\"Ctrl+Alt+Q\"]}'\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            config.commit_user_global_checked(KEY_COMMAND_PREFERENCES, &safe, &expected, &receipts),
+            Err(ConfigError::Conflict)
+        ));
+        assert_eq!(store.snapshot().revision, revision);
+        assert_eq!(config.revision(), expected);
+        assert_eq!(std::fs::read(config.config_path()).unwrap(), before);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn record_replacement_checks_navigation_hidden_until_restart() {
+        let (path, _, mut config) = config("navigation-restart-conflict");
+        config.set_user_global(
+            crikey_config::KEY_NAVIGATION_BINDINGS,
+            r#"{"next":["Ctrl+Alt+J"]}"#,
+        );
+        config.save().unwrap();
+        config.set_session_override(crikey_config::KEY_NAVIGATION_BINDINGS, "{}");
+        let registry = CommandRegistry::with_builtins();
+        let reference = registry.snapshot().commands.keys().next().unwrap().clone();
+        let mut store = CommandPreferencesStore::load(&config).unwrap();
+        let original = store.snapshot();
+        let before = std::fs::read(config.config_path()).unwrap();
+        let error = store
+            .apply(
+                &mut config,
+                &registry,
+                original.revision,
+                PreferenceMutation::SetRecord(CommandPreference {
+                    reference,
+                    hidden: false,
+                    alias: None,
+                    hotkey: Some("Ctrl+Alt+J".into()),
+                }),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(error, PreferenceError::Invalid(reason) if reason.contains("navigation")));
+        assert_eq!(std::fs::read(config.config_path()).unwrap(), before);
+        assert_eq!(store.snapshot().revision, original.revision);
+        assert_eq!(store.snapshot().preferences, original.preferences);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn conflicting_record_cleanup_is_not_blocked_by_unrelated_invalid_appearance() {
+        let (path, _, mut config) = config("navigation-cleanup");
+        let registry = CommandRegistry::with_builtins();
+        let reference = registry.snapshot().commands.keys().next().unwrap().clone();
+        let preferences = CommandPreferences {
+            records: vec![CommandPreference {
+                reference: reference.clone(),
+                hidden: false,
+                alias: None,
+                hotkey: Some("Down".into()),
+            }],
+            ..Default::default()
+        };
+        // Represents an externally written, conflicting configuration.
+        config.commit_command_preferences(&preferences, false).unwrap();
+        config.set_session_override(crikey_config::KEY_THEME, "invalid");
+        let mut store = CommandPreferencesStore::load(&config).unwrap();
+        let revision = store.snapshot().revision;
+        store
+            .apply(
+                &mut config,
+                &registry,
+                revision,
+                PreferenceMutation::RemoveRecord(reference),
+                false,
+            )
+            .unwrap();
+        assert!(store.snapshot().preferences.records.is_empty());
+        assert_eq!(config.get(crikey_config::KEY_THEME), Some("invalid"));
+        assert!(crate::launcher_settings::configured_navigation(Some(&config)).is_ok());
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
