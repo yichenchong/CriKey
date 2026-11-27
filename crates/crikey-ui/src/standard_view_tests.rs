@@ -1963,20 +1963,23 @@ fn actual_collection_renderer_preserves_type_to_search_caret_and_ordered_spatial
     draw(&view, vec![]);
     draw(&view, vec![]);
     let spatial = draw(&view, vec![key(egui::Key::ArrowRight), key(egui::Key::ArrowDown)]);
-    assert_eq!(
-        spatial
-            .commands
-            .iter()
-            .filter(|command| matches!(command, UiCommand::StandardHorizontal(_) | UiCommand::SelectNext))
-            .cloned()
-            .collect::<Vec<_>>(),
-        vec![UiCommand::StandardHorizontal(true), UiCommand::SelectNext]
-    );
+    assert!(apply_standard_frame_commands(&mut model, spatial.commands)
+        .contains(&UiEffect::RefreshStandard(ViewRefreshReason::Selection)));
+    assert_eq!(model.standard_selected_target(), Some(target(1)));
+    view = model.frame().unwrap();
+    assert!(view
+        .input_receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.accepted));
+    let continued = draw(&view, vec![]);
+    assert!(apply_standard_frame_commands(&mut model, continued.commands)
+        .contains(&UiEffect::RefreshStandard(ViewRefreshReason::Selection)));
+    assert_eq!(model.standard_selected_target(), Some(target(4)));
+    view = model.frame().unwrap();
     let typed = draw(&view, vec![egui::Event::Text("ab".into())]);
-    assert!(typed.commands.contains(&UiCommand::SetQuery("ab".into())));
-    for command in typed.commands {
-        model.apply(command);
-    }
+    assert!(apply_standard_frame_commands(&mut model, typed.commands)
+        .contains(&UiEffect::RefreshStandard(ViewRefreshReason::Query)));
+    assert_eq!(model.query, "ab");
     let pending = model.frame().unwrap();
     assert!(pending.navigation.standard_refresh_pending);
     assert!(
@@ -2001,30 +2004,33 @@ fn actual_collection_renderer_preserves_type_to_search_caret_and_ordered_spatial
     assert_eq!(view.navigation.focus_lifetime, lifetime);
     assert_ne!(view.navigation.restoration, pending.navigation.restoration);
     let caret = draw(&view, vec![key(egui::Key::ArrowLeft)]);
-    assert!(!caret
-        .commands
-        .iter()
-        .any(|command| matches!(command, UiCommand::StandardHorizontal(_))));
+    assert!(apply_standard_frame_commands(&mut model, caret.commands).is_empty());
+    assert_eq!(model.standard_selected_target(), Some(target(4)));
+    assert_eq!(model.query, "ab");
     let typed = draw(&view, vec![egui::Event::Text("Z".into())]);
-    assert!(typed.commands.contains(&UiCommand::SetQuery("aZb".into())));
-    for command in typed.commands {
-        model.apply(command);
-    }
+    assert!(apply_standard_frame_commands(&mut model, typed.commands)
+        .contains(&UiEffect::RefreshStandard(ViewRefreshReason::Query)));
+    assert_eq!(model.query, "aZb");
     view = model.frame().unwrap();
     let returned = draw(&view, vec![key(egui::Key::ArrowDown), key(egui::Key::ArrowRight)]);
-    assert_eq!(
-        returned
-            .commands
-            .iter()
-            .filter(|command| matches!(command, UiCommand::StandardHorizontal(_) | UiCommand::SelectNext))
-            .cloned()
-            .collect::<Vec<_>>(),
-        vec![UiCommand::SelectNext, UiCommand::StandardHorizontal(true)]
-    );
+    assert!(apply_standard_frame_commands(&mut model, returned.commands)
+        .contains(&UiEffect::RefreshStandard(ViewRefreshReason::Selection)));
+    // Down clamps on the last row; the retained Right then reaches its final column.
+    assert_eq!(model.standard_selected_target(), Some(target(4)));
+    view = model.frame().unwrap();
+    assert!(view
+        .input_receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.accepted));
+    let continued = draw(&view, vec![]);
+    assert!(apply_standard_frame_commands(&mut model, continued.commands)
+        .contains(&UiEffect::RefreshStandard(ViewRefreshReason::Selection)));
+    assert_eq!(model.standard_selected_target(), Some(target(5)));
+    view = model.frame().unwrap();
     let typed = draw(&view, vec![egui::Event::Text("!".into())]);
-    for command in typed.commands {
-        model.apply(command);
-    }
+    assert!(apply_standard_frame_commands(&mut model, typed.commands)
+        .contains(&UiEffect::RefreshStandard(ViewRefreshReason::Query)));
+    assert_eq!(model.query, "aZ!b");
     model.apply(UiCommand::OpenSettings);
     model.apply(UiCommand::CloseSettings);
     let Some(NavigationRoute::Standard {
@@ -2059,8 +2065,34 @@ fn actual_collection_renderer_preserves_type_to_search_caret_and_ordered_spatial
     let restored = model.frame().unwrap();
     assert_ne!(restored.navigation.focus_lifetime, lifetime);
     draw(&restored, vec![]);
-    let restored = draw(&restored, vec![key(egui::Key::ArrowRight)]);
-    assert!(restored.commands.contains(&UiCommand::StandardHorizontal(true)));
+    let moved = draw(&restored, vec![key(egui::Key::ArrowRight)]);
+    assert!(apply_standard_frame_commands(&mut model, moved.commands)
+        .contains(&UiEffect::RefreshStandard(ViewRefreshReason::Selection)));
+    assert_eq!(model.standard_selected_target(), Some(target(5)));
+    assert_eq!(model.query, "aZ!b");
+    let mut refreshed_context = restored_context;
+    refreshed_context.revision = NonZeroU64::new(12).unwrap();
+    assert!(model.publish_standard_view(
+        owner(),
+        7,
+        ViewReply {
+            context: refreshed_context.clone(),
+            descriptor: descriptor(6),
+        }
+    ));
+    let refreshed = model.frame().unwrap();
+    let activated = draw(&refreshed, vec![key(egui::Key::Enter)]);
+    assert_eq!(
+        apply_standard_frame_commands(&mut model, activated.commands),
+        vec![UiEffect::ExecuteStandard {
+            owner: owner(),
+            context: refreshed_context,
+            executable: ExecutableKey {
+                target: target(5),
+                action: None
+            },
+        }]
+    );
 }
 #[test]
 fn collection_action_command_editor_enter_never_executes_the_selected_action() {
@@ -2553,23 +2585,35 @@ fn nonfatal_applied_diagnostics_keep_live_collection_input_and_never_clear_route
     draw(&view, vec![]);
     draw(&view, vec![]);
     let typed = draw(&view, vec![egui::Event::Text("jk".into())]);
-    assert!(typed.commands.contains(&UiCommand::SetQuery("jk".into())));
-    for command in typed.commands {
-        model.apply(command);
-    }
+    assert!(apply_standard_frame_commands(&mut model, typed.commands)
+        .contains(&UiEffect::RefreshStandard(ViewRefreshReason::Query)));
+    assert_eq!(model.query, "jk");
     let view = model.frame().unwrap();
     let edited = draw(
         &view,
         vec![key(egui::Key::ArrowLeft), egui::Event::Text("x".into())],
     );
-    assert!(edited.commands.contains(&UiCommand::SetQuery("jxk".into())));
-    for command in edited.commands {
-        model.apply(command);
-    }
+    assert!(apply_standard_frame_commands(&mut model, edited.commands)
+        .contains(&UiEffect::RefreshStandard(ViewRefreshReason::Query)));
+    assert_eq!(model.query, "jxk");
     let view = model.frame().unwrap();
     let navigated = draw(&view, vec![key(egui::Key::ArrowDown), key(egui::Key::ArrowRight)]);
-    assert!(navigated.commands.contains(&UiCommand::SelectNext));
-    assert!(navigated.commands.contains(&UiCommand::StandardHorizontal(true)));
+    assert!(apply_standard_frame_commands(&mut model, navigated.commands)
+        .contains(&UiEffect::RefreshStandard(ViewRefreshReason::Selection)));
+    assert_eq!(model.standard_selected_target(), Some(target(3)));
+    let acknowledged = model.frame().unwrap();
+    assert!(acknowledged
+        .input_receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.accepted));
+    let continued = draw(&acknowledged, vec![]);
+    assert!(apply_standard_frame_commands(&mut model, continued.commands)
+        .contains(&UiEffect::RefreshStandard(ViewRefreshReason::Selection)));
+    assert_eq!(model.standard_selected_target(), Some(target(4)));
+    assert_eq!(model.query, "jxk");
+    let view = model.frame().unwrap();
+    assert!(view.navigation.unavailable.is_none());
+    assert_eq!(view.navigation.interface_diagnostics.iter().flatten().count(), 2);
     let modifiers = held.modifiers();
     let filtered = draw(
         &view,
@@ -2587,7 +2631,10 @@ fn nonfatal_applied_diagnostics_keep_live_collection_input_and_never_clear_route
             },
         }],
     );
-    assert!(!filtered.commands.contains(&UiCommand::ShowActions));
+    assert!(apply_standard_frame_commands(&mut model, filtered.commands).is_empty());
+    assert!(model.action_panel.is_none());
+    assert_eq!(model.query, "jxk");
+    assert_eq!(model.standard_selected_target(), Some(target(4)));
     model.apply(UiCommand::OpenSettings);
     model.set_interface_diagnostic(
         InterfaceDiagnosticSource::Shortcuts,
@@ -2634,11 +2681,12 @@ fn nonfatal_applied_diagnostics_keep_live_collection_input_and_never_clear_route
         .interface_diagnostics
         .iter()
         .all(Option::is_none));
+    let previous_query = model.query.clone();
     let refused = draw(&unavailable, vec![egui::Event::Text("must-not-edit".into())]);
-    assert!(!refused
-        .commands
-        .iter()
-        .any(|command| matches!(command, UiCommand::SetQuery(_))));
+    assert!(apply_standard_frame_commands(&mut model, refused.commands).is_empty());
+    assert_eq!(model.query, previous_query);
+    assert!(model.standard_selected_target().is_none());
+    assert!(model.navigation_unavailable.is_some());
 }
 
 #[test]

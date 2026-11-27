@@ -2274,7 +2274,9 @@ fn tab_walks_the_page_focus_ring_in_ring_order_and_wraps() {
     second.focus_order = 0;
     let mut third = page_control(NodeRole::Button, 30, 0.0, 60.0, 60.0, 20.0);
     third.focus_order = 1;
-    let view = page_view(vec![first, second, third]);
+    let mut launcher = page_launcher(page_view(vec![first, second, third]));
+    let view = launcher.frame().unwrap();
+    let mut generation = 1;
 
     let mut reached = Vec::new();
     for events in [
@@ -2285,14 +2287,21 @@ fn tab_walks_the_page_focus_ring_in_ring_order_and_wraps() {
         vec![key_press(egui::Key::Tab, egui::Modifiers::SHIFT)],
     ] {
         let frame = build_launcher_frame(&context, launcher_input(events), &view);
-        reached.extend(
-            events_of_kind(&frame, PageInputKind::FocusChanged)
-                .into_iter()
-                .map(|input| input.node_id),
-        );
+        let mut effects = Vec::new();
+        for command in frame.commands {
+            apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+        }
+        reached.extend(effects.iter().filter_map(|effect| match effect {
+            crikey_ui::UiEffect::PageInput(input) if input.kind == PageInputKind::FocusChanged => {
+                Some(input.node_id)
+            }
+            _ => None,
+        }));
         assert!(
-            events_of_kind(&frame, PageInputKind::KeyPressed).is_empty(),
-            "Tab is the host's key and must never be forwarded to the plugin"
+            !effects.iter().any(|effect| matches!(effect,
+                crikey_ui::UiEffect::PageInput(input) if input.kind == PageInputKind::KeyPressed
+            )),
+            "display-list Tab traverses host focus without forwarding a plugin key"
         );
     }
 
@@ -2312,22 +2321,30 @@ fn tab_walks_the_page_focus_ring_in_ring_order_and_wraps() {
 #[test]
 fn escape_closes_the_page_and_never_reaches_the_plugin() {
     let context = create_launcher_context();
-    let view = page_view(vec![page_control(NodeRole::Button, 1, 0.0, 0.0, 60.0, 20.0)]);
-
-    let frame = build_launcher_frame(
+    let mut launcher = page_launcher(page_view(vec![page_control(
+        NodeRole::Button,
+        1,
+        0.0,
+        0.0,
+        60.0,
+        20.0,
+    )]));
+    let (returned, effects) = drive_ordered_action_input(
         &context,
-        launcher_input(vec![key_press(egui::Key::Escape, egui::Modifiers::NONE)]),
-        &view,
+        &mut launcher,
+        vec![key_press(egui::Key::Escape, egui::Modifiers::NONE)],
     );
-
-    assert!(
-        frame.commands.contains(&UiCommand::ClosePage),
-        "Escape must close the page"
+    assert!(returned.page.is_none());
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| matches!(effect, crikey_ui::UiEffect::ClosePage))
+            .count(),
+        1
     );
-    assert!(
-        !page_inputs(&frame).iter().any(|input| input.key == "Escape"),
-        "Escape must not be reported to the plugin as a keystroke"
-    );
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, crikey_ui::UiEffect::PageInput(input) if input.key == "Escape")));
 }
 
 #[test]
@@ -2833,6 +2850,14 @@ fn painted_web_view(surface_id: u64, generation: u64, rgba8: &[u8]) -> ViewModel
         rgba8: Arc::from(rgba8),
     }));
     view
+}
+
+fn page_launcher(mut fixture: ViewModel) -> LauncherViewModel {
+    let mut launcher = action_launcher();
+    // A second selectable row makes a leaked post-close Down observable.
+    launcher.publish(Generation::from_raw(1), vec![result_row(0), result_row(1)], false);
+    assert!(launcher.open_page(fixture.page.take().expect("a real page surface")));
+    launcher
 }
 
 #[test]
@@ -3392,38 +3417,46 @@ fn web_escape_preserves_earlier_input_and_retires_the_rest_of_the_batch() {
         if multiple_passes {
             force_three_layout_passes(&context, false);
         }
-        let view = painted_web_view(41, 1, &[10; 8]);
-        let frame = build_launcher_frame(
+        let mut launcher = page_launcher(painted_web_view(41, 1, &[10; 8]));
+        let (returned, effects) = drive_ordered_action_input(
             &context,
-            launcher_input(vec![
+            &mut launcher,
+            vec![
                 egui::Event::Text("before".to_owned()),
                 key_press(egui::Key::Escape, egui::Modifiers::CTRL),
                 egui::Event::Text("after".to_owned()),
                 key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
-            ]),
-            &view,
+            ],
         );
-        let effects: Vec<_> = frame
-            .commands
-            .into_iter()
-            .filter(|command| {
+        let document: Vec<_> = effects
+            .iter()
+            .filter(|effect| {
                 matches!(
-                    command,
-                    UiCommand::WebInput(_) | UiCommand::WebIme(_) | UiCommand::ClosePage
+                    effect,
+                    crikey_ui::UiEffect::WebInput(_)
+                        | crikey_ui::UiEffect::WebIme(_)
+                        | crikey_ui::UiEffect::ClosePage
                 )
             })
+            .cloned()
             .collect();
         assert_eq!(
-            effects,
+            document,
             vec![
-                UiCommand::WebIme(WebImeEvent::Commit {
+                crikey_ui::UiEffect::WebIme(WebImeEvent::Commit {
                     surface_id: 41,
-                    text: "before".to_owned()
+                    text: "before".into()
                 }),
-                UiCommand::ClosePage,
-            ],
-            "input order must not deliver any document work after teardown"
+                crikey_ui::UiEffect::ClosePage,
+            ]
         );
+        assert!(returned.page.is_none());
+        assert_eq!(returned.query, "fixture");
+        assert_eq!(returned.selected, 0);
+        assert!(!returned.settings_open);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, crikey_ui::UiEffect::Query(query) if query != "fixture")));
     }
 }
 
@@ -3434,20 +3467,30 @@ fn an_unadmitted_web_declaration_still_answers_host_escape() {
     let page = view.page.as_mut().expect("page");
     page.web_surface_id = None;
     page.web_frame = None;
-    let frame = build_launcher_frame(
+    let mut launcher = page_launcher(view);
+    let (returned, effects) = drive_ordered_action_input(
         &context,
-        launcher_input(vec![key_press(egui::Key::Escape, egui::Modifiers::NONE)]),
-        &view,
+        &mut launcher,
+        vec![
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            egui::Event::Text("retired".into()),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+        ],
     );
+    assert!(returned.page.is_none());
+    assert_eq!(returned.query, "fixture");
+    assert_eq!(returned.selected, 0);
     assert_eq!(
-        frame
-            .commands
+        effects
             .iter()
-            .filter(|command| matches!(command, UiCommand::ClosePage))
+            .filter(|effect| matches!(effect, crikey_ui::UiEffect::ClosePage))
             .count(),
         1
     );
-    assert!(web_inputs(&frame).is_empty());
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        crikey_ui::UiEffect::WebInput(_) | crikey_ui::UiEffect::WebIme(_)
+    )));
 }
 
 #[test]
@@ -3497,57 +3540,77 @@ fn the_first_web_wheel_uses_the_previous_position_not_a_later_motion() {
 
 #[test]
 fn web_named_keys_and_text_reach_the_engine_but_escape_and_chrome_shortcuts_do_not_leak() {
-    let context = create_launcher_context();
-    let view = painted_web_view(41, 1, &[10; 8]);
-    let mut tab_release = key_press(egui::Key::Tab, egui::Modifiers::SHIFT);
-    if let egui::Event::Key { pressed, .. } = &mut tab_release {
-        *pressed = false;
-    }
-    let frame = build_launcher_frame(
-        &context,
-        launcher_input(vec![
-            key_press(egui::Key::Tab, egui::Modifiers::SHIFT),
-            tab_release,
-            egui::Event::Text("É".to_owned()),
-            key_press(egui::Key::Escape, egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
-            key_press(egui::Key::Comma, egui::Modifiers::COMMAND),
-        ]),
-        &view,
-    );
-    let keys: Vec<_> = web_inputs(&frame)
-        .into_iter()
-        .filter_map(|input| match input {
-            WebSurfaceInput::Key {
-                keysym,
-                pressed,
-                modifiers,
-                ..
-            } => Some((keysym, pressed, modifiers)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        keys,
-        vec![
-            (0xff09, true, WEB_MODIFIER_SHIFT),
-            (0xff09, false, WEB_MODIFIER_SHIFT)
-        ]
-    );
-    assert_eq!(
-        frame
-            .commands
+    for multiple_passes in [false, true] {
+        let context = create_launcher_context();
+        if multiple_passes {
+            force_three_layout_passes(&context, false);
+        }
+        let mut launcher = page_launcher(painted_web_view(41, 1, &[10; 8]));
+        let mut tab_release = key_press(egui::Key::Tab, egui::Modifiers::SHIFT);
+        if let egui::Event::Key { pressed, .. } = &mut tab_release {
+            *pressed = false;
+        }
+        let (returned, effects) = drive_ordered_action_input(
+            &context,
+            &mut launcher,
+            vec![
+                key_press(egui::Key::Tab, egui::Modifiers::SHIFT),
+                tab_release,
+                egui::Event::Text("É".to_owned()),
+                key_press(egui::Key::Escape, egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+                key_press(egui::Key::Comma, egui::Modifiers::COMMAND),
+            ],
+        );
+        let document: Vec<_> = effects
             .iter()
-            .filter(|command| matches!(command, UiCommand::ClosePage))
-            .count(),
-        1
-    );
-    assert!(frame.commands.iter().any(
-        |command| matches!(command, UiCommand::WebIme(WebImeEvent::Commit { text, .. }) if text == "É")
-    ));
-    assert!(!frame.commands.iter().any(|command| matches!(
-        command,
-        UiCommand::OpenSettings | UiCommand::PageInput(_) | UiCommand::SetQuery(_)
-    )));
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    crikey_ui::UiEffect::WebInput(_)
+                        | crikey_ui::UiEffect::WebIme(_)
+                        | crikey_ui::UiEffect::ClosePage
+                )
+            })
+            .collect();
+        assert_eq!(document.len(), 4);
+        assert!(matches!(
+            document[0],
+            crikey_ui::UiEffect::WebInput(WebSurfaceInput::Key {
+                surface_id: 41,
+                keysym: 0xff09,
+                pressed: true,
+                modifiers: WEB_MODIFIER_SHIFT,
+                ..
+            })
+        ));
+        assert!(matches!(
+            document[1],
+            crikey_ui::UiEffect::WebInput(WebSurfaceInput::Key {
+                surface_id: 41,
+                keysym: 0xff09,
+                pressed: false,
+                modifiers: WEB_MODIFIER_SHIFT,
+                ..
+            })
+        ));
+        assert!(
+            matches!(document[2], crikey_ui::UiEffect::WebIme(WebImeEvent::Commit {
+            surface_id: 41, text
+        }) if text == "É")
+        );
+        assert_eq!(document[3], &crikey_ui::UiEffect::ClosePage);
+        assert!(returned.page.is_none());
+        assert!(!returned.settings_open);
+        assert_eq!(returned.query, "fixture");
+        assert_eq!(returned.selected, 0);
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            crikey_ui::UiEffect::PageInput(_) | crikey_ui::UiEffect::ManageSettings(_)
+        )));
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, crikey_ui::UiEffect::Query(query) if query != "fixture")));
+    }
 }
 
 #[test]
@@ -3877,42 +3940,37 @@ fn preview_split_and_narrow_detail_keep_results_and_footer_in_bounds() {
 #[test]
 fn preview_focus_is_explicit_and_back_returns_typing_to_search() {
     let context = create_launcher_context();
-    let mut view = scrollable_model(2, 0);
-    view.preview.status = Some(crikey_ui::PreviewStatus::Loading);
-    let key = |key| egui::Event::Key {
-        key,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: egui::Modifiers::NONE,
-    };
-    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
-    let focus = build_launcher_frame(&context, launcher_input(vec![key(egui::Key::F6)]), &view);
-    assert!(focus.commands.contains(&UiCommand::FocusPreview));
-    view.preview.focused = true;
-    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
-    let preview_typing = build_launcher_frame(
+    let mut launcher = action_launcher();
+    let selection = launcher.preview_selection().unwrap();
+    launcher.publish_preview(&selection, crikey_ui::PreviewStatus::Loading);
+    let (focused, effects) = drive_ordered_action_input(
         &context,
-        launcher_input(vec![egui::Event::Text("x".into())]),
-        &view,
+        &mut launcher,
+        vec![key_press(egui::Key::F6, egui::Modifiers::NONE)],
     );
-    assert!(!preview_typing
-        .commands
-        .iter()
-        .any(|command| matches!(command, UiCommand::SetQuery(_))));
-    let leave = build_launcher_frame(&context, launcher_input(vec![key(egui::Key::Escape)]), &view);
-    assert!(leave.commands.contains(&UiCommand::LeavePreview));
-    view.preview.focused = false;
-    let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
-    let typing = build_launcher_frame(
+    assert!(focused.preview.focused);
+    assert!(effects.is_empty());
+    let (preview_typing, effects) = drive_ordered_frame_input(
         &context,
-        launcher_input(vec![egui::Event::Text("x".into())]),
-        &view,
+        &mut launcher,
+        focused,
+        vec![egui::Event::Text("x".into())],
     );
-    assert!(typing
-        .commands
-        .iter()
-        .any(|command| matches!(command, UiCommand::SetQuery(_))));
+    assert_eq!(preview_typing.query, "fixture");
+    assert!(effects.is_empty());
+    let (returned, effects) = drive_ordered_frame_input(
+        &context,
+        &mut launcher,
+        preview_typing,
+        vec![
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Text("replacement".into()),
+        ],
+    );
+    assert!(!returned.preview.focused);
+    assert_eq!(returned.query, "replacement");
+    assert_eq!(effects, vec![crikey_ui::UiEffect::Query("replacement".into())]);
 }
 
 #[test]
@@ -4324,8 +4382,10 @@ fn rendered_action_search_executes_non_first_leaf_and_does_not_edit_launcher_que
         launcher_input(vec![key_press(egui::Key::K, egui::Modifiers::COMMAND)]),
         &root,
     );
+    let mut generation = 1;
+    let mut effects = Vec::new();
     for command in discovery.commands {
-        let _ = launcher.apply(command);
+        apply_ordered_test_command(&mut launcher, command, &root.rows, &mut generation, &mut effects);
     }
     let open = launcher.frame().unwrap();
     let _ = build_launcher_frame(&context, launcher_input(vec![]), &open);
@@ -4334,19 +4394,12 @@ fn rendered_action_search_executes_non_first_leaf_and_does_not_edit_launcher_que
         launcher_input(vec![egui::Event::Text("Reveal".into())]),
         &open,
     );
-    assert!(typed
-        .commands
-        .iter()
-        .any(|command| matches!(command, UiCommand::SetActionQuery(query) if query == "Reveal")));
-    assert!(!typed
-        .commands
-        .iter()
-        .any(|command| matches!(command, UiCommand::SetQuery(_))));
     for command in typed.commands {
-        let _ = launcher.apply(command);
+        apply_ordered_test_command(&mut launcher, command, &root.rows, &mut generation, &mut effects);
     }
     let filtered = launcher.frame().unwrap();
     assert_eq!(filtered.query, "fixture");
+    assert_eq!(filtered.action_panel.as_ref().unwrap().query(), "Reveal");
     let painted = build_launcher_frame(&context, launcher_input(vec![]), &filtered);
     assert!(painted
         .output
@@ -4363,11 +4416,9 @@ fn rendered_action_search_executes_non_first_leaf_and_does_not_edit_launcher_que
         launcher_input(vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)]),
         &filtered,
     );
-    let effects: Vec<_> = execute
-        .commands
-        .into_iter()
-        .filter_map(|command| launcher.apply(command))
-        .collect();
+    for command in execute.commands {
+        apply_ordered_test_command(&mut launcher, command, &root.rows, &mut generation, &mut effects);
+    }
     assert_eq!(
         effects,
         vec![crikey_ui::UiEffect::Execute {
@@ -4428,10 +4479,12 @@ fn action_sheet_wheel_stays_scrolled_until_keyboard_selection_changes() {
         &view,
         vec![key_press(egui::Key::ArrowDown, egui::Modifiers::NONE)],
     );
-    assert!(keyboard.commands.contains(&UiCommand::SelectNext));
+    let mut generation = 1;
+    let mut effects = Vec::new();
     for command in keyboard.commands {
-        let _ = launcher.apply(command);
+        apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
     }
+    assert!(effects.is_empty());
     let moved = launcher.frame().unwrap();
     assert_eq!(
         moved.action_panel.as_ref().unwrap().selected(),
@@ -4451,8 +4504,10 @@ fn action_sheet_search_clamps_a_scrolled_viewport_and_restores_browse_selection(
     let _ = frames.draw(&view, wheel_over_action(&first, "Long action 00"));
     assert!(!painted(&frames.settle(&view), "Long action 00"));
     let typed = frames.draw(&view, vec![egui::Event::Text("Long action 39".into())]);
+    let mut generation = 1;
+    let mut effects = Vec::new();
     for command in typed.commands {
-        let _ = launcher.apply(command);
+        apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
     }
     let filtered = launcher.frame().unwrap();
     assert_eq!(filtered.action_panel.as_ref().unwrap().visible_entries().len(), 1);
@@ -4462,8 +4517,9 @@ fn action_sheet_search_clamps_a_scrolled_viewport_and_restores_browse_selection(
         vec![key_press(egui::Key::Escape, egui::Modifiers::NONE)],
     );
     for command in escape.commands {
-        let _ = launcher.apply(command);
+        apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
     }
+    assert!(effects.is_empty());
     let restored = launcher.frame().unwrap();
     assert_eq!(
         restored.action_panel.as_ref().unwrap().selected(),
@@ -5044,10 +5100,19 @@ fn drive_ordered_action_input(
     launcher: &mut crikey_ui::LauncherViewModel,
     events: Vec<egui::Event>,
 ) -> (ViewModel, Vec<crikey_ui::UiEffect>) {
+    let view = launcher.frame().unwrap();
+    drive_ordered_frame_input(context, launcher, view, events)
+}
+
+fn drive_ordered_frame_input(
+    context: &egui::Context,
+    launcher: &mut crikey_ui::LauncherViewModel,
+    mut view: ViewModel,
+    events: Vec<egui::Event>,
+) -> (ViewModel, Vec<crikey_ui::UiEffect>) {
     // Each host key consumes one boundary; a fresh Settings route needs one
     // ordinary focus-establishing paint. No sleeps or timing assumptions.
     let turns = events.len() + 2;
-    let mut view = launcher.frame().unwrap();
     let rows = view.rows.clone();
     let _ = build_launcher_frame(context, launcher_input(vec![]), &view);
     let mut input = launcher_input(events);
@@ -6288,37 +6353,42 @@ fn advanced_navigation_editor_preserves_the_full_advertised_byte_bound() {
 #[test]
 fn focused_preview_returns_through_the_applied_toggle_binding() {
     use crikey_ui::navigation::{CompiledNavigation, NavigationStyle};
-    let mut frames = Frames::new();
-    let mut view = scrollable_model(1, 0);
-    view.preview.status = Some(crikey_ui::PreviewStatus::Loading);
-    view.preview.focused = true;
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    let selection = launcher.preview_selection().unwrap();
+    launcher.publish_preview(&selection, crikey_ui::PreviewStatus::Loading);
+    launcher.apply(UiCommand::FocusPreview);
     crikey_ui::set_launcher_navigation(
-        &frames.context,
+        &context,
         Arc::new(
             CompiledNavigation::compile(NavigationStyle::Default, r#"{"toggle-preview":["F8"]}"#).unwrap(),
         ),
     );
-    frames.settle(&view);
-    let key = |key| egui::Event::Key {
-        key,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: egui::Modifiers::NONE,
-    };
-    assert!(!frames
-        .draw(&view, vec![key(egui::Key::F6)])
-        .commands
-        .contains(&UiCommand::LeavePreview));
-    assert!(frames
-        .draw(&view, vec![key(egui::Key::F8)])
-        .commands
-        .contains(&UiCommand::LeavePreview));
-    crikey_ui::set_launcher_navigation(&frames.context, Arc::new(CompiledNavigation::default()));
-    assert!(frames
-        .draw(&view, vec![key(egui::Key::F6)])
-        .commands
-        .contains(&UiCommand::LeavePreview));
+    let (unchanged, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![key_press(egui::Key::F6, egui::Modifiers::NONE)],
+    );
+    assert!(unchanged.preview.focused);
+    assert!(effects.is_empty());
+    let (returned, effects) = drive_ordered_frame_input(
+        &context,
+        &mut launcher,
+        unchanged,
+        vec![key_press(egui::Key::F8, egui::Modifiers::NONE)],
+    );
+    assert!(!returned.preview.focused);
+    assert_eq!(returned.query, "fixture");
+    assert!(effects.is_empty());
+    launcher.apply(UiCommand::FocusPreview);
+    crikey_ui::set_launcher_navigation(&context, Arc::new(CompiledNavigation::default()));
+    let (returned, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![key_press(egui::Key::F6, egui::Modifiers::NONE)],
+    );
+    assert!(!returned.preview.focused);
+    assert!(effects.is_empty());
 }
 
 #[test]

@@ -476,7 +476,9 @@ fn prepare_action_input(
             }
         }
     }
-    if !focused || model.navigation.inline_arguments.is_some() {
+    // Pages own teardown: their adapter delivers the prefix and discards the
+    // Escape suffix, which must never be acknowledged into the root view.
+    if !focused || model.navigation.inline_arguments.is_some() || model.page.is_some() {
         return (None, false, resumed);
     }
     if model.action_panel.is_some() && !context.memory(|memory| memory.focused() == Some(editor)) {
@@ -584,8 +586,6 @@ fn build_launcher_frame_with_transparency(
     typed_submissions: &mut Vec<crate::TypedInputSubmission>,
 ) -> NativeUiFrame {
     crate::settings_management::retire_editors(context, model);
-    let input_focus = context.memory(|memory| memory.focused());
-    context.data_mut(|data| data.insert_temp(input_focus_id(), input_focus));
     if !native_web_input
         && model.page.as_ref().is_some_and(|page| {
             page.frame.web.is_some() && page.web_surface_id.is_some_and(|surface_id| surface_id != 0)
@@ -603,6 +603,11 @@ fn build_launcher_frame_with_transparency(
     }
     let (action_boundary, waiting_for_input, resumed_input) =
         prepare_action_input(context, &mut input, model);
+    // Continuations may transfer keyboard ownership from Actions back to the
+    // query before egui runs. Preserve that admitted owner, not the retired
+    // editor that held focus before the host receipt was consumed.
+    let input_focus = context.memory(|memory| memory.focused());
+    context.data_mut(|data| data.insert_temp(input_focus_id(), input_focus));
     let mut commands = Vec::new();
     let mut pass_commands = Vec::new();
     let mut first_pass = true;
@@ -700,6 +705,19 @@ fn build_launcher_frame_with_transparency(
         if let Some(command) = action_boundary {
             collection_navigation_after_command(Some(context), Some(model), &command);
             commands.push(command);
+        }
+        if host_boundary {
+            // Source widgets may surrender focus during their last paint.
+            // Retain that completed pass's owner, not its pre-layout focus.
+            let focus = context.memory(|memory| memory.focused());
+            context.data_mut(|data| {
+                if let Some(Some(mut pending)) =
+                    data.remove_temp::<Option<DeferredActionInput>>(action_input_queue())
+                {
+                    pending.focus = focus;
+                    data.insert_temp(action_input_queue(), Some(pending));
+                }
+            });
         }
         let edited_action_query = model.action_panel.is_some()
             && commands.len() > 1
