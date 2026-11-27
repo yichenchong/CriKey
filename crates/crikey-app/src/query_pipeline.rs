@@ -972,6 +972,8 @@ impl QueryPipeline {
         self.presentation_dirty = false;
 
         Some(ViewModel {
+            view: None,
+            input_receipt: None,
             generation: self.generation,
             query: self.query.clone(),
             rows: Arc::clone(&self.rows),
