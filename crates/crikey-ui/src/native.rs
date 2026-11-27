@@ -498,7 +498,12 @@ fn prepare_action_input(
         && context.memory(|memory| memory.focused() == Some(query_edit_id()));
     let mut boundary = None;
     for (index, event) in input.events.iter().enumerate() {
-        if collection_query && matches!(event, egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Ime(_)) {
+        if collection_query
+            && matches!(
+                event,
+                egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Ime(_)
+            )
+        {
             owner = crate::navigation::NavigationOwner::Query;
         }
         match event {
@@ -514,11 +519,18 @@ fn prepare_action_input(
                 if modifiers.ctrl && modifiers.alt && altgr_text {
                     continue;
                 }
-                let Some(command) = deferred_navigation_key(context, *key, *modifiers, model, &navigation, owner) else {
+                let Some(command) =
+                    deferred_navigation_key(context, *key, *modifiers, model, &navigation, owner)
+                else {
                     continue;
                 };
                 // TextEdit admits the prefix and owns the activation suffix.
-                if matches!(command, UiCommand::ActivateSelectedAction | UiCommand::ExecuteDefault | UiCommand::StandardActivate { .. }) {
+                if matches!(
+                    command,
+                    UiCommand::ActivateSelectedAction
+                        | UiCommand::ExecuteDefault
+                        | UiCommand::StandardActivate { .. }
+                ) {
                     break;
                 }
                 boundary = Some((index, command));
@@ -537,12 +549,12 @@ fn prepare_action_input(
         let token = NEXT_INPUT
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
             .expect("native input identity exhausted");
-        let settings_owner = model.settings_open.then(|| {
-            crate::settings_management::focused_owner(
-                context,
-                &model.navigation.settings_management,
-            )
-        }).flatten();
+        let settings_owner = model
+            .settings_open
+            .then(|| {
+                crate::settings_management::focused_owner(context, &model.navigation.settings_management)
+            })
+            .flatten();
         context.data_mut(|data| {
             data.insert_temp(action_input_queue(), token);
             data.insert_temp(
@@ -1796,7 +1808,11 @@ where
         {
             return None;
         }
-        if self.graphics.as_ref().is_some_and(|graphics| has_action_input(&graphics.egui_context)) {
+        if self
+            .graphics
+            .as_ref()
+            .is_some_and(|graphics| has_action_input(&graphics.egui_context))
+        {
             return None;
         }
         translate_keyboard(
@@ -3794,9 +3810,15 @@ fn translate_logical_key(
     {
         return Some(native_shortcut_capture(logical_key, modifiers, target));
     }
-    let command = if cfg!(target_os = "macos") { modifiers.super_key() } else { modifiers.control_key() };
-    if matches!(logical_key, Key::Character(",")) && command
-        && !modifiers.alt_key() && !modifiers.shift_key()
+    let command = if cfg!(target_os = "macos") {
+        modifiers.super_key()
+    } else {
+        modifiers.control_key()
+    };
+    if matches!(logical_key, Key::Character(","))
+        && command
+        && !modifiers.alt_key()
+        && !modifiers.shift_key()
         && model.is_none_or(|model| model.page.as_ref().is_none_or(|page| page.frame.web.is_none()))
         && model.is_none_or(|model| model.navigation.inline_arguments.is_none())
     {
