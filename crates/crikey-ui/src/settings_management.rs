@@ -308,6 +308,25 @@ pub(crate) fn retire_editors(context: &egui::Context, model: &crate::ViewModel) 
         model.settings_open,
     );
 }
+
+/// Identifies the live focused control without retaining any editor contents.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct FocusOwner {
+    id: egui::Id,
+    category: Category,
+    query_reset: u64,
+    field: Option<(String, bool, u64)>,
+}
+
+pub(crate) fn focused_owner(context: &egui::Context, panel: &Panel) -> Option<FocusOwner> {
+    let id = context.memory(|memory| memory.focused())?;
+    let field = panel.fields.iter().find(|field| {
+        let editor = editor_id(panel.view, &field.key, field.secret);
+        id == editor.with("text")
+            || context.data(|data| data.get_temp::<egui::Id>(editor.with("private-focus"))) == Some(id)
+    }).map(|field| (field.key.clone(), field.secret, if field.secret { panel.schema } else { 0 }));
+    Some(FocusOwner { id, category: panel.category, query_reset: panel.query_reset, field })
+}
 fn draw_input(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -526,6 +545,7 @@ pub(crate) fn draw(
     if ui
         .add(
             egui::TextEdit::singleline(&mut query)
+                .id(search_id)
                 .char_limit(4096)
                 .hint_text("Search settings by name, description, or plugin"),
         )
@@ -675,7 +695,7 @@ pub(crate) fn draw(
                 }
             }
             let max_bytes = field_limit.min(retained_limit);
-            ui.group(|ui| {
+            ui.push_id(id, |ui| ui.group(|ui| {
                 ui.label(&field.label);
                 ui.small(&field.description);
                 ui.small(format!("{} · {}{}", field.key, field.source, if field.restart { " · Next launch required" } else { "" }));
@@ -741,7 +761,7 @@ pub(crate) fn draw(
                         }
                     }
                 });
-            });
+            }));
             retained_bytes = retained_bytes.saturating_add(draft.text.len());
             ui.data_mut(|data| data.insert_temp(id, draft));
         }
@@ -943,6 +963,25 @@ pub(crate) fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn continuation_owner_tracks_focus_not_configuration_arrival() {
+        let context = egui::Context::default();
+        let search = egui::Id::new("settings-search-test");
+        context.memory_mut(|memory| memory.request_focus(search));
+        let mut panel = Panel::default();
+        let owner = focused_owner(&context, &panel);
+        assert!(owner.is_some());
+        panel.config = 4;
+        panel.schema = 8;
+        panel.loading = false;
+        assert!(focused_owner(&context, &panel) == owner);
+        context.memory_mut(|memory| memory.request_focus(egui::Id::new("replacement")));
+        assert!(focused_owner(&context, &panel) != owner);
+        context.memory_mut(|memory| memory.request_focus(search));
+        panel.query_reset += 1;
+        assert!(focused_owner(&context, &panel) != owner);
+    }
+
     #[test]
     fn package_diagnosis_uses_local_identity_and_retains_index_fallback() {
         let mut package = Package {

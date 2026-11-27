@@ -99,14 +99,14 @@ impl Plugin for Fixture {
         _: TypedExecuteRequest,
         context: &dyn PluginContext,
     ) -> Result<TypedExecutionOutcome> {
+        self.entered.send(()).unwrap();
         if self.cancel_typed {
             self.cancel_typed = false;
-            self.entered.send(()).unwrap();
             wait_for_cancel(context)?;
-            Ok(SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled).into())
-        } else {
-            Ok(SubmissionOutcome::Completed.into())
         }
+        // Completion racing with cancellation must not become a successful
+        // submission merely because the callback returns normally.
+        Ok(SubmissionOutcome::Completed.into())
     }
 }
 fn frame(id: u64, payload: Payload) -> Envelope {
@@ -284,5 +284,25 @@ fn typed_callback_observes_cancel_without_host_timeout() {
     );
     host.send(&frame(3, typed())).unwrap();
     assert_eq!(typed_outcome(&mut *host), SubmissionOutcome::Completed.into());
+    stop(&mut *host, worker);
+}
+
+#[test]
+fn already_cancelled_typed_request_never_enters_callback() {
+    let (mut host, worker, entered) = start(None, false);
+    // The catalog round trip is a barrier: the runtime has processed this
+    // cancellation before the later request begins, without timing assumptions.
+    host.send(&frame(2, Payload::Cancel(Default::default()))).unwrap();
+    host.send(&frame(1, request(false))).unwrap();
+    terminal(&mut *host, 1, false, false, false);
+    host.send(&frame(2, typed())).unwrap();
+    assert_eq!(
+        typed_outcome(&mut *host),
+        SubmissionOutcome::Failed(SubmissionFailureCode::Cancelled).into()
+    );
+    assert!(matches!(entered.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    host.send(&frame(3, typed())).unwrap();
+    assert_eq!(typed_outcome(&mut *host), SubmissionOutcome::Completed.into());
+    entered.recv_timeout(Duration::from_secs(3)).unwrap();
     stop(&mut *host, worker);
 }

@@ -956,7 +956,11 @@ impl Plugin for ConformancePlugin {
                 typed_presentation(context, false, true)
             }
             Mode::Typed { changed } if query.selected_scope_id.as_deref().is_none_or(|s| s == "secure") => {
-                typed_presentation(context, changed, true)
+                if query.text == "catalog-overlap" {
+                    typed_presentation(context, !changed, false)
+                } else {
+                    typed_presentation(context, changed, true)
+                }
             }
             _ => ResultPresentation::default(),
         })
@@ -1166,7 +1170,11 @@ impl Plugin for ConformancePlugin {
             Mode::Typed { .. } | Mode::TypedPrivacy | Mode::TypedInvalidFailure => emit_final(
                 sink,
                 if query.selected_scope_id.as_deref().is_none_or(|s| s == "secure") {
-                    vec![typed_item("typed-suggestion")]
+                    if matches!(self.mode, Mode::Typed { .. }) && query.text == "catalog-overlap" {
+                        vec![typed_item("typed-login"), typed_item("typed-action")]
+                    } else {
+                        vec![typed_item("typed-suggestion")]
+                    }
                 } else {
                     Vec::new()
                 },

@@ -2524,6 +2524,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     registry_query_refresh = false;
                     effect = view_model.refresh_root_query().map(UiEffect::Query);
                 } else if let Some(command) = input_commands.next() {
+                    match &command {
+                        crikey_ui::UiCommand::StandardDoubleClick { .. } => standard_activation_session = command_session,
+                        crikey_ui::UiCommand::SetLogicalScroll(_) => {}
+                        _ => standard_activation_session = None,
+                    }
                     // Capture only this command's actual pre-apply root query,
                     // after all preceding query and route effects have settled.
                     root_submission = if matches!(&command, crikey_ui::UiCommand::ExecuteDefault) {

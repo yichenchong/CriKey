@@ -858,7 +858,12 @@ impl Management {
                     "Operation failed; see job details"
                 }
                 .into();
-                error.detail.clone()
+                match reconciliation {
+                    Some(reconciliation) => {
+                        format!("{}\nReconciliation: {}", error.detail, reconciliation.detail).into()
+                    }
+                    None => error.detail.clone(),
+                }
             }
             Some(JobOutcome::Cancelled) => "Cancelled".into(),
             None => match progress {
@@ -1200,7 +1205,8 @@ mod tests {
                 restart_required: true,
             };
             let status = management.package_job_status(operation, Some(&outcome), JobPhase::Terminal, None);
-            assert_eq!(&*status, "original operation error");
+            assert!(status.contains("original operation error"));
+            assert!(status.contains("reconciliation details"));
             assert_eq!(
                 &*management.panel.notice,
                 "Reconciliation failed; plugin admission remains failed-closed",

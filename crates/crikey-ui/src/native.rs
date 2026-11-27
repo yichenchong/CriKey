@@ -345,6 +345,8 @@ struct DeferredActionInput {
     token: u64,
     source: Arc<crate::ActionInputCheckpoint>,
     focus_ready: bool,
+    settings_owner: Option<crate::settings_management::FocusOwner>,
+    typed_focus: Option<egui::Id>,
     events: Vec<egui::Event>,
     navigation: Arc<crate::navigation::CompiledNavigation>,
     focus: Option<egui::Id>,
@@ -405,9 +407,23 @@ fn prepare_action_input(
         let valid = focused
             && pending.navigation == navigation
             && (owner.view != pending.source.view
+                || owner.typed != pending.source.typed
                 || (pending.focus == context.memory(|memory| memory.focused())
                     && pending.focus_lifetime == model.navigation.focus_lifetime))
             && editor_owned
+            && (!model.settings_open
+                || (owner.view != pending.source.view && !pending.focus_ready)
+                || pending.settings_owner.as_ref().is_some_and(|owner| {
+                    crate::settings_management::focused_owner(
+                        context,
+                        &model.navigation.settings_management,
+                    )
+                    .as_ref()
+                        == Some(owner)
+                }))
+            && (owner.typed.is_none()
+                || (owner.typed != pending.source.typed && !pending.focus_ready)
+                || context.memory(|memory| memory.focused() == pending.typed_focus))
             && receipt.is_none_or(|receipt| receipt.accepted)
             && owner.matches(
                 model.view,
@@ -416,13 +432,16 @@ fn prepare_action_input(
                 model.rows.get(model.selected),
                 model.action_panel.as_ref(),
                 (model.preview.focused, model.preview.detail),
+                model.navigation.standard.as_ref(),
+                model.navigation.standard_refresh_pending,
+                model.navigation.inline_arguments.as_ref(),
             );
         if valid {
             pending.events.append(&mut input.events);
-            if receipt.is_none()
-                || (model.settings_open && owner.view != pending.source.view && !pending.focus_ready)
-            {
-                // Establish a fresh Settings surface's ordinary editor focus
+            let new_editor = model.settings_open && owner.view != pending.source.view
+                || owner.typed.is_some() && owner.typed != pending.source.typed;
+            if receipt.is_none() || (new_editor && !pending.focus_ready) {
+                // Establish the replacement surface's ordinary editor focus
                 // once before delivering the retained stream.
                 let establish_focus = receipt.is_some();
                 pending.focus_ready |= establish_focus;
@@ -437,7 +456,11 @@ fn prepare_action_input(
             }
             if model.action_panel.is_some() {
                 context.memory_mut(|memory| memory.request_focus(editor));
-            } else if !model.settings_open && model.page.is_none() && !model.preview.focused {
+            } else if !model.settings_open
+                && model.navigation.inline_arguments.is_none()
+                && model.page.is_none()
+                && !model.preview.focused
+            {
                 context.memory_mut(|memory| memory.request_focus(query_edit_id()));
             }
             input.events = pending.events;
@@ -449,7 +472,11 @@ fn prepare_action_input(
             if resumed {
                 if model.action_panel.is_some() {
                     context.memory_mut(|memory| memory.request_focus(editor));
-                } else if !model.settings_open && model.page.is_none() && !model.preview.focused {
+                } else if !model.settings_open
+                    && model.navigation.inline_arguments.is_none()
+                    && model.page.is_none()
+                    && !model.preview.focused
+                {
                     context.memory_mut(|memory| memory.request_focus(query_edit_id()));
                 }
             }
@@ -513,6 +540,12 @@ fn prepare_action_input(
         let token = NEXT_INPUT
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
             .expect("native input identity exhausted");
+        let settings_owner = model.settings_open.then(|| {
+            crate::settings_management::focused_owner(
+                context,
+                &model.navigation.settings_management,
+            )
+        }).flatten();
         context.data_mut(|data| {
             data.insert_temp(action_input_queue(), token);
             data.insert_temp(
@@ -521,6 +554,12 @@ fn prepare_action_input(
                     token,
                     source: Arc::new(crate::ActionInputCheckpoint::of(model)),
                     focus_ready: false,
+                    settings_owner,
+                    typed_focus: model
+                        .navigation
+                        .inline_arguments
+                        .as_ref()
+                        .and_then(|_| context.memory(|memory| memory.focused())),
                     events,
                     navigation: navigation.clone(),
                     focus: context.memory(|memory| memory.focused()),
@@ -628,6 +667,33 @@ fn build_launcher_frame_with_transparency(
         }
     }
     if waiting_for_input {
+        if model.settings_open || model.navigation.inline_arguments.is_some() {
+            let settings_owner = model
+                .settings_open
+                .then(|| {
+                    crate::settings_management::focused_owner(
+                        context,
+                        &model.navigation.settings_management,
+                    )
+                })
+                .flatten();
+            let typed_focus = model
+                .navigation
+                .inline_arguments
+                .as_ref()
+                .and_then(|_| context.memory(|memory| memory.focused()));
+            context.data_mut(|data| {
+                if let Some(Some(mut pending)) =
+                    data.remove_temp::<Option<DeferredActionInput>>(action_input_queue())
+                {
+                    if pending.focus_ready {
+                        pending.settings_owner = settings_owner;
+                        pending.typed_focus = typed_focus;
+                    }
+                    data.insert_temp(action_input_queue(), Some(pending));
+                }
+            });
+        }
         commands.clear();
     } else {
         let host_boundary = action_boundary.is_some();
@@ -648,7 +714,10 @@ fn build_launcher_frame_with_transparency(
                     || commands.iter().any(|command| {
                         matches!(
                             command,
-                            UiCommand::ActivateSelectedAction | UiCommand::ActivateAction { .. }
+                            UiCommand::ActivateSelectedAction
+                                | UiCommand::ActivateAction { .. }
+                                | UiCommand::StandardActivate { .. }
+                                | UiCommand::StandardDoubleClick { .. }
                         )
                     })));
         if ordered && !commands.is_empty() {
@@ -927,11 +996,13 @@ impl FrameMailbox {
                 }
                 // Reconciliation is sticky under the mailbox lock. A later
                 // publication cannot revive an already retired host panel.
-                crate::reconcile_action_panel(
-                    &mut self.overlay.action_panel,
-                    &model.rows,
-                    &self.overlay.command_management,
-                );
+                if !self.overlay.navigation.standard_route {
+                    crate::reconcile_action_panel(
+                        &mut self.overlay.action_panel,
+                        &model.rows,
+                        &self.overlay.command_management,
+                    );
+                }
                 with_overlay(self, session, model)
             }
         };

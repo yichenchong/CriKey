@@ -1054,7 +1054,7 @@ fn grid_neighbor(
     match direction {
         1 if column + 1 < columns && index + 1 < end => index + 1,
         -1 if column > 0 => index - 1,
-        2 if index + columns < end => index + columns,
+        2 if index - column + columns < end => (index + columns).min(end - 1),
         2 if end < count => {
             let (_, next_end) = section_bounds(end, count, headers);
             (end + column).min(next_end - 1)
