@@ -317,12 +317,27 @@ pub(crate) struct FocusOwner {
 
 pub(crate) fn focused_owner(context: &egui::Context, panel: &Panel) -> Option<FocusOwner> {
     let id = context.memory(|memory| memory.focused())?;
-    let field = panel.fields.iter().find(|field| {
-        let editor = editor_id(panel.view, &field.key, field.secret);
-        id == editor.with("text")
-            || context.data(|data| data.get_temp::<egui::Id>(editor.with("private-focus"))) == Some(id)
-    }).map(|field| (field.key.clone(), field.secret, if field.secret { panel.schema } else { 0 }));
-    Some(FocusOwner { id, category: panel.category, query_reset: panel.query_reset, field })
+    let field = panel
+        .fields
+        .iter()
+        .find(|field| {
+            let editor = editor_id(panel.view, &field.key, field.secret);
+            id == editor.with("text")
+                || context.data(|data| data.get_temp::<egui::Id>(editor.with("private-focus"))) == Some(id)
+        })
+        .map(|field| {
+            (
+                field.key.clone(),
+                field.secret,
+                if field.secret { panel.schema } else { 0 },
+            )
+        });
+    Some(FocusOwner {
+        id,
+        category: panel.category,
+        query_reset: panel.query_reset,
+        field,
+    })
 }
 fn draw_input(
     ui: &mut egui::Ui,

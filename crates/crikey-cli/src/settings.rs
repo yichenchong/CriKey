@@ -283,6 +283,8 @@ fn encode(value: &str) -> String {
 
 pub(crate) fn closed_runtime_effect(effect: &UiEffect, owners: &[crikey_core::PluginId]) -> bool {
     match effect {
+        // The dispatch loop checks each inner effect separately.
+        UiEffect::InputBatch { .. } => false,
         UiEffect::ExecuteStandard { owner, .. }
         | UiEffect::OpenStandardLink { owner, .. }
         | UiEffect::ExecuteActionless { owner, .. }

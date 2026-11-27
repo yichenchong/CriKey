@@ -371,11 +371,8 @@ fn prepare_action_input(
             && (!model.settings_open
                 || !pending.focus_ready
                 || pending.settings_owner.as_ref().is_some_and(|owner| {
-                    crate::settings_management::focused_owner(
-                        context,
-                        &model.navigation.settings_management,
-                    )
-                    .as_ref()
+                    crate::settings_management::focused_owner(context, &model.navigation.settings_management)
+                        .as_ref()
                         == Some(owner)
                 }))
             && (owner.typed.is_none()
@@ -622,10 +619,7 @@ fn build_launcher_frame_with_transparency(
             let settings_owner = model
                 .settings_open
                 .then(|| {
-                    crate::settings_management::focused_owner(
-                        context,
-                        &model.navigation.settings_management,
-                    )
+                    crate::settings_management::focused_owner(context, &model.navigation.settings_management)
                 })
                 .flatten();
             let typed_focus = model
@@ -2313,7 +2307,11 @@ where
                     is_synthetic: false,
                     ..
                 } if self.active_session.is_some() && !self.ime.composing => {
-                    if self.graphics.as_ref().is_some_and(|graphics| has_action_input(&graphics.egui_context)) {
+                    if self
+                        .graphics
+                        .as_ref()
+                        .is_some_and(|graphics| has_action_input(&graphics.egui_context))
+                    {
                         None
                     } else {
                         translate_keyboard(
@@ -3729,7 +3727,11 @@ fn deferred_root_key(key: egui::Key, modifiers: egui::Modifiers, model: &ViewMod
         egui::Key::K => Key::Character("k"),
         egui::Key::Comma => Key::Character(","),
         egui::Key::Space => Key::Named(NamedKey::Space),
-        _ if model.settings_focus.as_deref().is_some_and(|focus| focus.starts_with("record:")) => {
+        _ if model
+            .settings_focus
+            .as_deref()
+            .is_some_and(|focus| focus.starts_with("record:")) =>
+        {
             Key::Character(key.name())
         }
         _ => return None,
