@@ -1,4 +1,4 @@
-//! Native preview workers share provider budgets, not UI or page surfaces.
+//! Native previews pin canonical catalog provenance while sharing provider budgets.
 use super::*;
 use crate::plugin_preview::{
     PreviewDispatcher, PreviewIdentity, PreviewPublish, PreviewRequest, PreviewState, PreviewUpdate,
@@ -14,10 +14,12 @@ struct Job {
 }
 pub(super) struct NativePreviewEndpoint {
     sender: SyncSender<Job>,
-    pub(super) gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
+    gates: BTreeMap<PluginId, Arc<PreviewActionGate>>,
     incarnations: NativeIncarnations,
     items: NativeItemStore,
     catalog_items: NativeItemStore,
+    static_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
+    commands: Arc<Mutex<NativeCommandPublications>>,
     pending: NativePreviewCalls,
     stopped: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -34,16 +36,15 @@ impl NativePreviewEndpoint {
         let pending: NativePreviewCalls = Arc::new(Mutex::new(Vec::new()));
         let stopped = Arc::new(AtomicBool::new(false));
         let thread_supervisors = provider.page_supervisors();
-        let gates: BTreeMap<_, _> = provider
-            .action_budgets()
-            .into_iter()
-            .map(|(owner, budget)| (owner, PreviewActionGate::new(budget)))
-            .collect();
-        let endpoint_gates = gates.clone();
+        let endpoint_gates = provider.action_gates();
+        let gates = endpoint_gates.clone();
         let incarnations = Arc::clone(&provider.incarnations);
         let thread_incarnations = Arc::clone(&incarnations);
         let thread_pending = Arc::clone(&pending);
         let thread_stopped = Arc::clone(&stopped);
+        let thread_commands = Arc::clone(&provider.catalog.commands);
+        let thread_catalog_items = Arc::clone(&provider.catalog.items);
+        let thread_static_items = Arc::clone(&provider.catalog.static_items);
         let spawned = std::thread::Builder::new()
             .name("crikey-native-preview".into())
             .spawn(move || {
@@ -91,6 +92,29 @@ impl NativePreviewEndpoint {
                             return Ok(PreviewState::Unavailable(
                                 "Preview originating worker retired".into(),
                             ));
+                        }
+                        if let Some(source) = identity.catalog_source.as_ref() {
+                            let commands = thread_commands.lock().unwrap_or_else(|error| error.into_inner());
+                            let items = thread_catalog_items
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            let static_items = thread_static_items
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            if canonical_preview_item(
+                                &commands,
+                                &items,
+                                &static_items,
+                                &identity.plugin,
+                                &identity.item,
+                                source,
+                            )
+                            .is_none()
+                            {
+                                return Ok(PreviewState::Unavailable(
+                                    "Preview catalog source retired".into(),
+                                ));
+                            }
                         }
                         worker.cancel_handle().reset();
                         job.control.install(worker.cancel_handle());
@@ -147,6 +171,8 @@ impl NativePreviewEndpoint {
             incarnations,
             items: Arc::clone(&provider.action_items),
             catalog_items: Arc::clone(&provider.catalog.items),
+            static_items: Arc::clone(&provider.catalog.static_items),
+            commands: Arc::clone(&provider.catalog.commands),
             pending,
             stopped,
             worker: Mutex::new(spawned.ok()),
@@ -180,7 +206,30 @@ impl PreviewDispatcher for NativePreviewEndpoint {
     fn foreground_blocked(&self, owner: &PluginId) -> bool {
         self.gates.get(owner).is_some_and(|gate| gate.has_foreground())
     }
-    fn lookup(&self, plugin: &PluginId, id: &ItemId) -> Option<(Item, u64)> {
+
+    fn foreground_conflicts(&self, preview_owner: &PluginId, action_owner: &PluginId) -> bool {
+        preview_owner == action_owner && self.gates.contains_key(preview_owner)
+    }
+
+    fn lookup(
+        &self,
+        plugin: &PluginId,
+        id: &ItemId,
+        source: Option<&crate::plugin_action::DeclaredCommandSource>,
+    ) -> Option<(Item, u64)> {
+        if let Some(source) = source {
+            let commands = self.commands.lock().unwrap_or_else(|error| error.into_inner());
+            let items = self
+                .catalog_items
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let static_items = self
+                .static_items
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            return canonical_preview_item(&commands, &items, &static_items, plugin, id, source)
+                .map(|(item, producer)| (item.clone(), producer));
+        }
         let key = (plugin.clone(), id.clone());
         let query = self
             .items
@@ -201,14 +250,32 @@ impl PreviewDispatcher for NativePreviewEndpoint {
             .cloned()
             .or(query)
     }
-    fn origin(&self, plugin: &PluginId, id: &ItemId) -> Option<u64> {
+    fn origin(
+        &self,
+        plugin: &PluginId,
+        id: &ItemId,
+        source: Option<&crate::plugin_action::DeclaredCommandSource>,
+    ) -> Option<u64> {
+        if let Some(source) = source {
+            let commands = self.commands.lock().unwrap_or_else(|error| error.into_inner());
+            let items = self
+                .catalog_items
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let static_items = self
+                .static_items
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            return canonical_preview_item(&commands, &items, &static_items, plugin, id, source)
+                .map(|(_, producer)| producer);
+        }
         let key = (plugin.clone(), id.clone());
         let query = self
             .items
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(&key)
-            .map(|(_, origin)| *origin);
+            .map(|(_, producer)| *producer);
         if query.is_some() && query == self.incarnation(plugin) {
             return query;
         }
@@ -216,7 +283,7 @@ impl PreviewDispatcher for NativePreviewEndpoint {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(&key)
-            .map(|(_, origin)| *origin)
+            .map(|(_, producer)| *producer)
             .or(query)
     }
     fn incarnation(&self, plugin: &PluginId) -> Option<u64> {
@@ -239,7 +306,7 @@ impl PreviewDispatcher for NativePreviewEndpoint {
             return Err("native preview incarnation unavailable".into());
         }
         let (item, producer) = self
-            .lookup(&identity.plugin, &identity.item)
+            .lookup(&identity.plugin, &identity.item, identity.catalog_source.as_ref())
             .ok_or("native preview item is no longer current")?;
         if producer != identity.incarnation {
             return Err("native preview originating worker retired".into());
@@ -281,6 +348,36 @@ impl PreviewDispatcher for NativePreviewEndpoint {
     }
 }
 
+pub(super) fn canonical_preview_item<'a>(
+    commands: &NativeCommandPublications,
+    items: &'a BTreeMap<(PluginId, ItemId), (Item, u64)>,
+    static_items: &'a BTreeMap<(PluginId, ItemId), Item>,
+    owner: &PluginId,
+    item: &ItemId,
+    source: &crate::plugin_action::DeclaredCommandSource,
+) -> Option<(&'a Item, u64)> {
+    let publication = commands.owners.get(owner)?;
+    if publication.status != NativeCommandStatus::Ready
+        || publication.instance != source.instance
+        || publication.generation != source.generation
+        || publication.producer != source.producer
+        || publication.revision != source.publication
+    {
+        return None;
+    }
+    let key = (owner.clone(), item.clone());
+    items
+        .get(&key)
+        .filter(|(item, producer)| item.plugin_id == *owner && *producer == source.producer)
+        .map(|(item, producer)| (item, *producer))
+        .or_else(|| {
+            static_items
+                .get(&key)
+                .filter(|item| item.plugin_id == *owner)
+                .map(|item| (item, source.producer))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +386,151 @@ mod tests {
     use crikey_ui::{LauncherViewModel, PreviewStatus, UiCommand};
     use std::process::Command;
     use std::sync::LazyLock;
+
+    #[test]
+    fn canonical_preview_excludes_same_id_suggestion_and_pins_publication() {
+        let owner = PluginId("native.preview".into());
+        let id = ItemId("shared".into());
+        let source = crate::plugin_action::DeclaredCommandSource {
+            instance: 3,
+            generation: Generation::ZERO,
+            producer: 7,
+            publication: 99,
+        };
+        let catalog = Item {
+            stable_id: id.clone(),
+            plugin_id: owner.clone(),
+            category: crikey_core::Category::Application,
+            label: "Canonical".into(),
+            description: String::new(),
+            target: String::new(),
+            search_terms: Vec::new(),
+            icon_reference: None,
+            argument_policy: crikey_core::ArgumentPolicy::Forbidden,
+            hit_policy: crikey_core::HitPolicy::Recorded,
+            score_hint: 0,
+            metadata: BTreeMap::from([("crikey.preview".into(), "deferred".into())]),
+            actions: Vec::new(),
+        };
+        let mut suggestion = catalog.clone();
+        suggestion.label = "Suggestion".into();
+        suggestion.metadata.clear();
+        let mut commands = NativeCommandPublications::default();
+        commands.owners.insert(
+            owner.clone(),
+            Arc::new(NativeCommandSnapshot {
+                plugin: owner.clone(),
+                revision: source.publication,
+                instance: source.instance,
+                generation: source.generation,
+                producer: source.producer,
+                status: NativeCommandStatus::Ready,
+                released: false,
+                declarations: Arc::from([]),
+            }),
+        );
+        let mut incarnations = NativeIncarnationState::default();
+        incarnations.insert(owner.clone(), source.producer);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let endpoint = NativePreviewEndpoint {
+            sender,
+            gates: BTreeMap::from([(
+                owner.clone(),
+                PreviewActionGate::new(crikey_plugin_supervisor::shared_budget_from_section(
+                    &Default::default(),
+                )),
+            )]),
+            incarnations: Arc::new(Mutex::new(incarnations)),
+            items: Arc::new(Mutex::new(BTreeMap::from([(
+                (owner.clone(), id.clone()),
+                (suggestion, source.producer),
+            )]))),
+            catalog_items: Arc::new(Mutex::new(BTreeMap::from([(
+                (owner.clone(), id.clone()),
+                (catalog, source.producer),
+            )]))),
+            static_items: Arc::new(Mutex::new(BTreeMap::new())),
+            commands: Arc::new(Mutex::new(commands)),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            stopped: Arc::new(AtomicBool::new(false)),
+            worker: Mutex::new(None),
+            wake: WakeSlot::default(),
+        };
+        assert_eq!(endpoint.lookup(&owner, &id, None).unwrap().0.label, "Suggestion");
+        assert_eq!(
+            endpoint.lookup(&owner, &id, Some(&source)).unwrap().0.label,
+            "Canonical"
+        );
+        assert_eq!(endpoint.origin(&owner, &id, Some(&source)), Some(7));
+        let identity = PreviewIdentity {
+            view: 1,
+            query: Generation::ZERO,
+            plugin: owner.clone(),
+            incarnation: 7,
+            item: id.clone(),
+            target: crikey_ui::ActionTarget::Command(crikey_core::CommandRef {
+                provider_id: owner.clone(),
+                command_id: "canonical".into(),
+            }),
+            catalog_source: Some(source.clone()),
+            selection: 1,
+            request: 1,
+        };
+        endpoint
+            .submit(
+                PreviewRequest {
+                    identity: identity.clone(),
+                },
+                Arc::new(|_| {}),
+            )
+            .unwrap();
+        assert_eq!(receiver.try_recv().unwrap().request.identity, identity);
+        for field in 0..4 {
+            let mut stale = source.clone();
+            match field {
+                0 => stale.instance += 1,
+                1 => stale.generation = Generation::from_raw(1),
+                2 => stale.producer += 1,
+                3 => stale.publication += 1,
+                _ => unreachable!(),
+            }
+            assert!(endpoint.lookup(&owner, &id, Some(&stale)).is_none());
+        }
+        let (static_item, _) = endpoint
+            .catalog_items
+            .lock()
+            .unwrap()
+            .remove(&(owner.clone(), id.clone()))
+            .unwrap();
+        endpoint
+            .static_items
+            .lock()
+            .unwrap()
+            .insert((owner.clone(), id.clone()), static_item);
+        endpoint.incarnations.lock().unwrap().remove(&owner);
+        assert_eq!(
+            endpoint.lookup(&owner, &id, Some(&source)).unwrap().0.label,
+            "Canonical"
+        );
+        assert_eq!(endpoint.origin(&owner, &id, Some(&source)), Some(source.producer));
+        assert!(
+            endpoint
+                .submit(
+                    PreviewRequest {
+                        identity: identity.clone()
+                    },
+                    Arc::new(|_| {})
+                )
+                .is_err(),
+            "retained static metadata never grants deferred preview to a replacement"
+        );
+        endpoint.commands.lock().unwrap().owners.clear();
+        assert!(endpoint.lookup(&owner, &id, Some(&source)).is_none());
+        assert!(endpoint.lookup(&owner, &id, None).is_some());
+        assert!(endpoint
+            .submit(PreviewRequest { identity }, Arc::new(|_| {}))
+            .is_err());
+    }
 
     struct Scratch(PathBuf);
     impl Drop for Scratch {
@@ -421,6 +663,11 @@ mod tests {
                 query: Generation::from_raw(1),
                 plugin: owner.clone(),
                 incarnation: origin,
+                target: crikey_ui::ActionTarget::Result {
+                    owner: owner.clone(),
+                    item: item.stable_id.clone(),
+                },
+                catalog_source: None,
                 item: item.stable_id.clone(),
                 selection: 1,
                 request: 1,
@@ -584,8 +831,16 @@ mod tests {
             "only catalog construction may initialize this preview"
         );
         let old_row = crikey_ui::ResultRow {
-            plugin: item.plugin_id,
-            item: item.stable_id,
+            target: crikey_ui::ActionTarget::Result {
+                owner: item.plugin_id.clone(),
+                item: item.stable_id.clone(),
+            },
+            source: Some(crikey_ui::ResultSource {
+                owner: item.plugin_id,
+                item: item.stable_id,
+                kind: crikey_ui::ResultSourceKind::Ordinary,
+            }),
+            command_state: None,
             label: item.label,
             description: item.description,
             icon_reference: None,
@@ -601,7 +856,11 @@ mod tests {
         let driver = NativeDriver::spawn(provider, pipeline, Box::new(|_| {}));
         let endpoint = &driver.preview_endpoint;
         let (old_item, old_origin) = endpoint
-            .lookup(&old_row.plugin, &old_row.item)
+            .lookup(
+                &old_row.source.as_ref().unwrap().owner,
+                &old_row.source.as_ref().unwrap().item,
+                None,
+            )
             .expect("published producer snapshot");
         let supervisor = driver
             .action_endpoint
@@ -614,7 +873,10 @@ mod tests {
             let _busy = supervisor.lock().unwrap();
             assert_eq!(endpoint.incarnation(&old_item.plugin_id), Some(old_origin));
             assert_eq!(
-                endpoint.lookup(&old_row.plugin, &old_row.item).unwrap().1,
+                endpoint
+                    .lookup(&old_item.plugin_id, &old_item.stable_id, None)
+                    .unwrap()
+                    .1,
                 old_origin
             );
         }
@@ -649,10 +911,7 @@ mod tests {
             driver.take_outcome().filter(|frame| {
                 frame.generation == action_generation
                     && !frame.pending_plugins
-                    && frame
-                        .rows
-                        .iter()
-                        .any(|row| row.plugin == old_row.plugin && row.item == old_row.item)
+                    && frame.rows.iter().any(|row| row.target == old_row.target)
             })
         });
 
@@ -708,7 +967,10 @@ mod tests {
             .expect("action replacement alive");
         assert_ne!(replacement, old_origin);
         assert_eq!(
-            endpoint.lookup(&old_row.plugin, &old_row.item).unwrap().1,
+            endpoint
+                .lookup(&old_item.plugin_id, &old_item.stable_id, None)
+                .unwrap()
+                .1,
             old_origin,
             "retained item must preserve its retired producer, never acquire replacement ownership"
         );
@@ -728,6 +990,8 @@ mod tests {
             plugin: old_item.plugin_id.clone(),
             incarnation: old_origin,
             item: old_item.stable_id.clone(),
+            target: selection.target.clone(),
+            catalog_source: None,
             selection: selection.revision,
             request: 91,
         };
@@ -762,7 +1026,7 @@ mod tests {
             .preview_selection()
             .expect("old row must really be selected");
         assert_eq!(reopened_selection.generation, action_generation);
-        assert_eq!(reopened_selection.item, old_row.item);
+        assert_eq!(reopened_selection.item, old_item.stable_id);
         service.synchronize(&mut model, &search);
         let reopened_frame = model.frame().expect("reopening must publish a frame");
         assert!(selected_worker_text(&reopened_frame).is_none());
@@ -782,11 +1046,15 @@ mod tests {
         driver.submit(fresh_generation, "text", 2, Vec::new(), false, 0);
         let fresh = wait_for("fresh query rendered item", || {
             driver.take_outcome().filter(|frame| {
-                frame.generation == fresh_generation && frame.rows.iter().any(|row| row.item == old_row.item)
+                frame.generation == fresh_generation
+                    && frame.rows.iter().any(|row| row.target == old_row.target)
             })
         });
         assert_eq!(
-            endpoint.lookup(&old_row.plugin, &old_row.item).unwrap().1,
+            endpoint
+                .lookup(&old_item.plugin_id, &old_item.stable_id, None)
+                .unwrap()
+                .1,
             replacement,
             "fresh publication must carry the actual replacement producer"
         );
@@ -796,7 +1064,7 @@ mod tests {
             vec![fresh
                 .rows
                 .iter()
-                .find(|row| row.item == old_row.item)
+                .find(|row| row.target == old_row.target)
                 .unwrap()
                 .clone()],
             false,

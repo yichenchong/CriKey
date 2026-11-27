@@ -1138,3 +1138,155 @@ class Impl(Plugin):
 
     std::env::remove_var(&key);
 }
+
+fn command_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility/test-plugins/modern-commands")
+}
+
+#[test]
+fn commands_use_catalog_and_suggest_instance_and_preserve_exact_targets() {
+    require_host_interpreter!();
+    use crikey_core::command::{CommandAvailability, ExecutableTarget, PluginCommands};
+    for entrypoint in ["commands_plugin:CommandsPlugin", "commands_plugin:AsyncCommands"] {
+        let scratch = Scratch::new("commands-origin");
+        let site = scratch.subdir("site");
+        let mut worker = spawn_worker("exact.owner", entrypoint, &command_fixture(), &site);
+        assert!(worker.supports_commands());
+        let incarnation = worker.incarnation();
+        // A fresh callback cannot fabricate the catalog state needed by commands.
+        assert!(matches!(
+            worker.commands(),
+            Err(crikey_python_host::HostError::CommandsFailed(_))
+        ));
+        let catalog = worker.build_catalog().expect("real catalog callback");
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].plugin_id, PluginId("exact.owner".into()));
+        assert_eq!(suggest(&mut worker, "valid").items.len(), 1);
+        let PluginCommands::Declarations(commands) = worker.commands().expect("declarations") else {
+            panic!("commands must be explicitly supported")
+        };
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].command_id, "durable-primary");
+        assert_eq!(commands[0].label, "Declared primary");
+        assert_eq!(commands[0].item_id, catalog[0].stable_id);
+        assert_eq!(commands[0].action_id, None);
+        assert_eq!(commands[0].argument_policy, crikey_core::ArgumentPolicy::Optional);
+        assert_eq!(
+            commands[1].action_id,
+            Some(crikey_core::ActionId("alternate".into()))
+        );
+        assert_eq!(commands[1].argument_policy, crikey_core::ArgumentPolicy::Required);
+        // Binding is host-controlled and does not claim catalog validation or
+        // authorize execution. Provider integration validates before Available.
+        let bound = commands[1].clone().bind(
+            PluginId("host-selected.owner".into()),
+            CommandAvailability::Unavailable,
+        );
+        assert_eq!(
+            bound.reference.provider_id,
+            PluginId("host-selected.owner".into())
+        );
+        assert_eq!(bound.availability, CommandAvailability::Unavailable);
+        assert_eq!(
+            bound.executable_target,
+            ExecutableTarget::Item {
+                item_id: catalog[0].stable_id.clone(),
+                action_id: Some(crikey_core::ActionId("alternate".into())),
+            }
+        );
+        assert_eq!(worker.incarnation(), incarnation);
+        assert!(worker.poll_alive());
+        worker.shutdown();
+    }
+}
+
+#[test]
+fn commands_refuse_malformed_and_oversized_callbacks_without_losing_instance() {
+    require_host_interpreter!();
+    use crikey_core::command::PluginCommands;
+    let scratch = Scratch::new("commands-bounds");
+    let site = scratch.subdir("site");
+    let mut worker = spawn_worker(
+        "commands.bounds",
+        "commands_plugin:CommandsPlugin",
+        &command_fixture(),
+        &site,
+    );
+    worker.build_catalog().expect("catalog primes this instance");
+    let incarnation = worker.incarnation();
+    for mode in [
+        "malformed",
+        "duplicate",
+        "control",
+        "unicode-id",
+        "policy",
+        "label",
+        "count",
+        "aggregate",
+        "escaped-frame",
+        "raises",
+    ] {
+        assert!(matches!(suggest(&mut worker, mode).state, BatchState::Final));
+        let error = worker.commands().expect_err(mode);
+        assert!(
+            matches!(error, crikey_python_host::HostError::CommandsFailed(_)),
+            "{mode}: {error}"
+        );
+        assert!(
+            error.to_string().len() < 256,
+            "failure must not echo huge callback values"
+        );
+        assert!(worker.poll_alive(), "{mode} must not corrupt the protocol");
+        suggest(&mut worker, "valid");
+        assert!(
+            matches!(&worker.commands().expect("recovery"), PluginCommands::Declarations(v) if v.len() == 2)
+        );
+        assert_eq!(worker.incarnation(), incarnation);
+    }
+    for (mode, count) in [
+        ("empty", 0),
+        ("limits", 1),
+        ("max-count", 10000),
+        ("exact-aggregate", 511),
+    ] {
+        suggest(&mut worker, mode);
+        let PluginCommands::Declarations(commands) = worker.commands().expect(mode) else {
+            panic!("{mode} should be accepted")
+        };
+        assert_eq!(commands.len(), count);
+    }
+    suggest(&mut worker, "valid");
+    worker.cancel_handle().cancel();
+    assert_eq!(
+        worker.commands().expect("latched cancellation"),
+        PluginCommands::Cancelled
+    );
+    worker.cancel_handle().reset();
+    assert!(matches!(
+        worker.commands().expect("after cancellation"),
+        PluginCommands::Declarations(_)
+    ));
+    worker.shutdown();
+}
+
+#[test]
+fn commands_without_override_are_explicitly_unsupported_not_metadata_inferred() {
+    require_host_interpreter!();
+    use crikey_core::command::PluginCommands;
+    let scratch = Scratch::new("commands-unsupported");
+    let site = scratch.subdir("site");
+    let mut worker = spawn_worker(
+        "commands.unsupported",
+        "commands_plugin:WithoutCommands",
+        &command_fixture(),
+        &site,
+    );
+    assert!(!worker.supports_commands());
+    assert_eq!(worker.build_catalog().expect("ordinary catalog").len(), 1);
+    assert_eq!(
+        worker.commands().expect("unsupported is not an empty catalog"),
+        PluginCommands::Unsupported
+    );
+    assert!(worker.poll_alive());
+    worker.shutdown();
+}

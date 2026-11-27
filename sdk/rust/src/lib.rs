@@ -17,7 +17,11 @@ pub mod bench;
 pub mod harness;
 pub mod packaging;
 
-pub use builder::{ActionBuilder, ItemBuilder, PageBuilder, PageCanvas, PageRect, WebSurfaceBuilder};
+pub use builder::{
+    ActionBuilder, CommandBuilder, ItemBuilder, PageBuilder, PageCanvas, PageRect, WebSurfaceBuilder,
+};
+pub use crikey_core::command::{PluginCommandDeclaration, PluginCommands, COMMANDS_CAPABILITY};
+
 pub use crikey_core::{
     NodeRole, NodeShape, PageColor, PageError, PageFrame, PageImage, PageInput, PageInputKind, PageNode,
     PageWebSurface, WebStorage,
@@ -271,6 +275,17 @@ pub struct PluginResource {
 
 /// The trait a native plugin implements (spec 16.7).
 pub trait Plugin {
+    /// Opt in only with an explicit implementation. Adapters without a command
+    /// callback (including WASM/C ABI) must retain this false default.
+    fn supports_commands(&self) -> bool {
+        false
+    }
+
+    /// Requested after this worker has built its catalog; never synthesize
+    /// declarations from labels or metadata. Poll cancellation during work.
+    fn commands(&mut self, _context: &dyn PluginContext) -> Result<PluginCommands> {
+        Ok(PluginCommands::Unsupported)
+    }
     /// Whether this plugin implements on-demand previews. Default is honest
     /// unsupported, including adapters for runtimes without preview callbacks.
     fn supports_preview(&self) -> bool {

@@ -29,6 +29,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crikey_app::{BatchState, FileItemSearch, QueryPipeline, ResultBatch};
+use crikey_app::{OrdinaryProviderState, OrdinarySearchProvider, OrdinarySearchSummary};
 use crikey_core::{Generation, Item, PluginId};
 use crikey_input_scheduler::{
     ActivationPolicy, DebouncePolicy, PluginPolicy, QueuePolicy, SchedulingProfile,
@@ -171,6 +172,7 @@ pub(crate) struct FileOutcome {
     /// carried rather than assumed so the caller's pending mark is taken off
     /// by what happened, not by what is expected to have happened.
     pub(crate) pending: bool,
+    pub(crate) state: OrdinaryProviderState,
 }
 
 /// The launcher's file provider: a worker thread and one in-flight search.
@@ -186,6 +188,7 @@ pub(crate) struct FileSearchDriver {
     /// The generation this driver has accepted and owes an answer for. See
     /// [`Outstanding`].
     outstanding: Mutex<Option<Outstanding>>,
+    evidence: Arc<Mutex<Option<(Generation, OrdinaryProviderState)>>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -218,6 +221,8 @@ impl FileSearchDriver {
             Condvar::new(),
         ));
         let outcome = Arc::new(Mutex::new(None));
+        let evidence = Arc::new(Mutex::new(None));
+        let thread_evidence = Arc::clone(&evidence);
         let current = Arc::new(AtomicU64::new(0));
         let forget_cache = Arc::new(AtomicBool::new(false));
 
@@ -238,6 +243,7 @@ impl FileSearchDriver {
                     forget_cache: thread_forget,
                     search: search(),
                     last_error: None,
+                    search_state: OrdinaryProviderState::Pending,
                 };
                 let (lock, cvar) = &*thread_mailbox;
                 loop {
@@ -259,7 +265,7 @@ impl FileSearchDriver {
 
                     // The search happens here, on this thread, never on the
                     // caller's.
-                    let answered = worker.answer(&job);
+                    let mut answered = worker.answer(&job);
 
                     // A late answer must never be offered under a newer
                     // generation. The whole check-store-wake is held under the
@@ -276,6 +282,15 @@ impl FileSearchDriver {
                     {
                         continue;
                     }
+                    let mut evidence = thread_evidence.lock().unwrap_or_else(|error| error.into_inner());
+                    if !evidence.as_ref().is_some_and(|(generation, state)| {
+                        *generation == job.generation && *state == OrdinaryProviderState::Failed
+                    }) {
+                        *evidence = Some((job.generation, answered.state));
+                    } else {
+                        answered.state = OrdinaryProviderState::Failed;
+                    }
+                    drop(evidence);
                     *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) = Some(answered);
                     wake();
                     drop(slot);
@@ -289,6 +304,7 @@ impl FileSearchDriver {
             cancel: Mutex::new(None),
             forget_cache,
             outstanding: Mutex::new(None),
+            evidence,
             worker: spawned.ok(),
         }
     }
@@ -304,6 +320,8 @@ impl FileSearchDriver {
     #[must_use]
     pub(crate) fn submit(&self, generation: Generation, query: &str, now: u64) -> bool {
         if !self.has_worker_thread() {
+            *self.evidence.lock().unwrap_or_else(|error| error.into_inner()) =
+                Some((generation, OrdinaryProviderState::Failed));
             return false;
         }
 
@@ -342,12 +360,16 @@ impl FileSearchDriver {
         let (lock, cvar) = &*self.mailbox;
         let mut slot = lock.lock().unwrap_or_else(|error| error.into_inner());
         if slot.stop {
+            *self.evidence.lock().unwrap_or_else(|error| error.into_inner()) =
+                Some((generation, OrdinaryProviderState::Failed));
             return false;
         }
         *self.outstanding.lock().unwrap_or_else(|error| error.into_inner()) = Some(Outstanding {
             generation,
             submitted_at: now,
         });
+        *self.evidence.lock().unwrap_or_else(|error| error.into_inner()) =
+            Some((generation, OrdinaryProviderState::Pending));
         slot.job = Some(FileJob {
             generation,
             query: query.to_owned(),
@@ -401,13 +423,31 @@ impl FileSearchDriver {
             .as_ref()
             .is_some_and(|owed| now.saturating_sub(owed.submitted_at) >= FILE_SETTLE_DEADLINE_MS)
         {
-            return outstanding.take().map(|owed| FileOutcome {
-                generation: owed.generation,
-                items: Vec::new(),
-                pending: false,
+            return outstanding.take().map(|owed| {
+                *self.evidence.lock().unwrap_or_else(|error| error.into_inner()) =
+                    Some((owed.generation, OrdinaryProviderState::Failed));
+                FileOutcome {
+                    generation: owed.generation,
+                    items: Vec::new(),
+                    pending: false,
+                    state: OrdinaryProviderState::Failed,
+                }
             });
         }
         None
+    }
+
+    /// Latest admission/terminal evidence, including rejected or wedged worker work.
+    pub(crate) fn ordinary_search_summary(&self, view: u64) -> Option<OrdinarySearchSummary> {
+        let (generation, state) = (*self.evidence.lock().unwrap_or_else(|error| error.into_inner()))?;
+        Some(OrdinarySearchSummary {
+            view,
+            generation,
+            providers: vec![OrdinarySearchProvider {
+                plugin: PluginId(FILE_SEARCH_PLUGIN.to_owned()),
+                state,
+            }],
+        })
     }
 
     /// Drops the prefix cache, so the next query reaches the backend.
@@ -470,6 +510,7 @@ struct FileSearchWorker {
     /// Last search failure reported, so a backend that is broken for the whole
     /// session says so once rather than once per keystroke.
     last_error: Option<String>,
+    search_state: OrdinaryProviderState,
 }
 
 /// What one query found, before anything has been ranked or rendered.
@@ -488,14 +529,33 @@ impl FileSearchWorker {
     /// the caller marked this source pending when it handed the job over and
     /// only an outcome under this generation takes that mark off again.
     fn answer(&mut self, job: &FileJob) -> FileOutcome {
+        self.search_state = OrdinaryProviderState::Empty;
         let (items, pending) = match self.serve(job) {
             Some(found) => (found.items, found.pending),
-            None => (Vec::new(), false),
+            None => {
+                self.search_state = OrdinaryProviderState::Failed;
+                (Vec::new(), false)
+            }
+        };
+        let state = if job.cancel.is_cancelled() {
+            OrdinaryProviderState::Cancelled
+        } else if matches!(
+            self.search_state,
+            OrdinaryProviderState::Failed | OrdinaryProviderState::Cancelled
+        ) {
+            self.search_state
+        } else if pending {
+            OrdinaryProviderState::Pending
+        } else if items.is_empty() {
+            OrdinaryProviderState::Empty
+        } else {
+            OrdinaryProviderState::Matches
         };
         FileOutcome {
             generation: job.generation,
             items,
             pending,
+            state,
         }
     }
 
@@ -516,6 +576,9 @@ impl FileSearchWorker {
         // scheduler's own wake-ups spends no wall-clock time waiting for them.
         for _ in 0..64 {
             let tick = self.pipeline.tick(at);
+            if !tick.errors.is_empty() {
+                self.search_state = OrdinaryProviderState::Failed;
+            }
             for cancellation in tick.cancellations {
                 let _ = self
                     .pipeline
@@ -740,12 +803,24 @@ impl FileSearchWorker {
             deadline: FILE_SEARCH_DEADLINE,
             cancel: cancel.clone(),
         };
-        match self.search.search_file_items(&self.owner, &query)? {
+        let Some(result) = self.search.search_file_items(&self.owner, &query) else {
+            self.search_state = OrdinaryProviderState::Failed;
+            return None;
+        };
+        match result {
             Ok((items, results)) => {
                 self.last_error = None;
+                self.search_state = match results.coverage {
+                    FileSearchCoverage::Complete => OrdinaryProviderState::Empty,
+                    FileSearchCoverage::Cancelled => OrdinaryProviderState::Cancelled,
+                    FileSearchCoverage::Partial | FileSearchCoverage::Deadline => {
+                        OrdinaryProviderState::Failed
+                    }
+                };
                 Some((items, results.coverage))
             }
             Err(error) => {
+                self.search_state = OrdinaryProviderState::Failed;
                 // Once per distinct reason: this is the query path, and a
                 // backend that is broken for the session would otherwise print
                 // a line per keystroke.
@@ -779,6 +854,53 @@ mod tests {
     use crikey_platform::{file_items, FileHit, FileKind, FileSearchResults};
 
     use super::*;
+
+    #[test]
+    fn terminal_evidence_distinguishes_complete_and_incomplete_coverage() {
+        for (coverage, expected) in [
+            (FileSearchCoverage::Complete, OrdinaryProviderState::Empty),
+            (FileSearchCoverage::Partial, OrdinaryProviderState::Failed),
+            (FileSearchCoverage::Deadline, OrdinaryProviderState::Failed),
+            (FileSearchCoverage::Cancelled, OrdinaryProviderState::Cancelled),
+        ] {
+            let mut search = RecordingSearch::new(&[], Arc::new(Mutex::new(Vec::new())));
+            search.coverage = coverage;
+            let mut worker = worker(Box::new(search));
+            let outcome = worker.answer(&job(3, "absent", 0));
+            assert_eq!(outcome.state, expected);
+            assert_eq!(outcome.generation, Generation::from_raw(3));
+        }
+    }
+
+    #[test]
+    fn unavailable_applicable_backend_is_failed_not_empty() {
+        struct Unavailable;
+        impl FileItemSearch for Unavailable {
+            fn search_file_items(
+                &self,
+                _: &PluginId,
+                _: &FileSearchQuery,
+            ) -> Option<crikey_core::Result<(Vec<Item>, FileSearchResults)>> {
+                None
+            }
+        }
+        let mut worker = worker(Box::new(Unavailable));
+        assert_eq!(
+            worker.answer(&job(1, "missing", 0)).state,
+            OrdinaryProviderState::Failed
+        );
+    }
+
+    #[test]
+    fn cancelled_file_job_is_never_empty_success() {
+        let mut worker = worker(Box::new(RecordingSearch::new(
+            &[],
+            Arc::new(Mutex::new(Vec::new())),
+        )));
+        let job = job(1, "missing", 0);
+        job.cancel.cancel();
+        assert_eq!(worker.answer(&job).state, OrdinaryProviderState::Cancelled);
+    }
 
     /// A file search that answers from a fixed set and counts what it was asked.
     struct RecordingSearch {
@@ -869,6 +991,7 @@ mod tests {
             forget_cache: Arc::new(AtomicBool::new(false)),
             search,
             last_error: None,
+            search_state: OrdinaryProviderState::Pending,
         }
     }
 
@@ -987,6 +1110,7 @@ mod tests {
             forget_cache: Arc::new(AtomicBool::new(false)),
             search: Box::new(RecordingSearch::new(&borrowed, Arc::clone(&queries))),
             last_error: None,
+            search_state: OrdinaryProviderState::Pending,
         };
         assert!(
             worker.quota() <= 100,
@@ -1340,6 +1464,7 @@ mod tests {
             generation: Generation::from_raw(1),
             items: Vec::new(),
             pending: false,
+            state: OrdinaryProviderState::Empty,
         });
 
         assert!(

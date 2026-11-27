@@ -235,3 +235,63 @@ fn out_of_tree_plugin_streams_cancels_isolated_and_restarts() {
     );
     supervisor.shutdown_all();
 }
+
+#[test]
+fn out_of_tree_commands_use_the_catalog_originating_worker() {
+    use crikey_core::command::PluginCommands;
+    let (executable, _) = conformance_binaries();
+    let owner = PluginId("conformance".into());
+    let mut supervisor = NativeSupervisor::new(SupervisorConfig::default());
+    supervisor
+        .register(launch_spec(&executable, "acceptance"), WorkerOptions::new())
+        .unwrap();
+    let connection;
+    {
+        let worker = supervisor.worker(&owner, 0).unwrap();
+        assert!(
+            worker.commands(1).is_err(),
+            "new worker has no catalog provenance"
+        );
+        let catalog = worker.build_catalog().unwrap();
+        connection = worker.connection_id();
+        let PluginCommands::Declarations(commands) = worker.commands(2).unwrap() else {
+            panic!("missing explicit declarations")
+        };
+        assert_eq!(commands[0].command_id, "conformance-one");
+        assert!(catalog
+            .iter()
+            .any(|item| item.stable_id == commands[0].item_id && item.plugin_id == owner));
+    }
+    assert_eq!(
+        supervisor.live_worker(&owner).unwrap().connection_id(),
+        connection
+    );
+    supervisor.release_worker(&owner, 1);
+    assert!(supervisor.live_worker(&owner).is_none());
+    // Reacquiring a process must not authorize declarations against a catalog
+    // produced by an earlier incarnation.
+    assert!(supervisor.worker(&owner, 2).unwrap().commands(3).is_err());
+    supervisor.shutdown_all();
+}
+
+#[test]
+fn raw_worker_command_declarations_cannot_bypass_host_validation() {
+    let (_, raw) = conformance_binaries();
+    for mode in [
+        "commands-invalid",
+        "commands-oversized",
+        "commands-count",
+        "commands-aggregate",
+    ] {
+        let mut worker =
+            crikey_native_host::NativeWorker::spawn(launch_spec(&raw, mode), WorkerOptions::new()).unwrap();
+        assert!(worker.handshake().commands);
+        worker.build_catalog().unwrap();
+        let error = worker.commands(7).unwrap_err();
+        assert!(
+            !error.to_string().is_empty(),
+            "malformed command refusal must be visible"
+        );
+        worker.shutdown();
+    }
+}

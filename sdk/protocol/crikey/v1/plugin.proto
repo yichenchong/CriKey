@@ -54,7 +54,26 @@ message Envelope {
     Gone gone = 42;
     PreviewRequest preview_request = 43;
     PreviewResponse preview_response = 44;
+    CommandsRequest commands_request = 45;
+    CommandsResponse commands_response = 46;
   }
+}
+
+// Optional commands_v1. Request only on the same connection after its complete
+// catalog; declarations name stable catalog targets, never inferred metadata.
+// Host supplies owner and availability after checking its current catalog.
+message CommandsRequest {}
+message CommandDeclaration {
+  string command_id = 1;
+  string label = 2;
+  string item_id = 3;
+  string action_id = 4; // Empty means the item's primary execution path.
+  int32 argument_policy = 5; // 1 forbidden, 2 optional, 3 required.
+}
+message CommandsResponse {
+  int32 status = 1; // 1 declarations, 2 unsupported, 3 cancelled, 4 failed.
+  repeated CommandDeclaration commands = 2;
+  string detail = 3;
 }
 
 // Optional capability "preview_v1", intersected with host support. Only

@@ -43,3 +43,13 @@ The acceptance helper builds this workspace with:
 cargo build --manifest-path compatibility/native-conformance/Cargo.toml \
   --target-dir target/native-conformance
 ```
+
+The `acceptance` mode explicitly negotiates `commands_v1` and declares
+`conformance-one` targeting stable catalog item `catalog-1`. Other modes retain
+unsupported behavior. `out_of_tree_commands_use_the_catalog_originating_worker`
+checks that a replacement process cannot declare against an earlier catalog.
+The SDK's `commands` example supplies stateful real-worker validation,
+unsupported, cancellation and malformed/oversized declaration scenarios.
+Raw `crikey-misbehaving-plugin` modes `commands-invalid`, `commands-oversized`,
+`commands-count` and `commands-aggregate` bypass SDK producer validation to
+exercise actual host decode/semantic refusals over the supervised channel.

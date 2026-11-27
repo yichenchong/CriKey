@@ -49,8 +49,10 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub mod command_preferences;
 mod discovery;
 mod layer;
+mod persistence;
 mod publisher;
 mod remote_catalog;
 mod snapshot;
@@ -62,6 +64,7 @@ use std::path::PathBuf;
 
 pub use discovery::{discover_plugin_schemas, DiscoveredSchema, SchemaProblem};
 pub use layer::{ConfigLayer, LAYER_COUNT};
+pub use persistence::ConfigRevision;
 pub use publisher::ConfigurationPublisher;
 pub use remote_catalog::{
     remote_catalog_sources, RemoteCatalogSource, DEFAULT_REMOTE_INTERVAL_MS, DEFAULT_REMOTE_MAX_BYTES,
@@ -83,6 +86,12 @@ pub use watch::ConfigSourceWatch;
 /// layer is that the answer is always a single path.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// A source changed since the caller's snapshot; the draft was not written.
+    #[error("configuration changed; reload and explicitly rebase the draft")]
+    Conflict,
+    /// Persistence succeeded, but a complete authoritative reload failed.
+    #[error("configuration saved, but effective configuration could not be reloaded")]
+    PersistedReload,
     /// A file exists but could not be read. An ABSENT file is never this: every
     /// layer is optional, and a machine with no configuration must start.
     #[error("cannot read {path}: {source}")]

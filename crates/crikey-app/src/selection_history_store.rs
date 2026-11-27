@@ -17,11 +17,10 @@
 //! History is an optimisation. Losing it costs the user some ranking quality
 //! until they select things again; refusing to start costs them the launcher.
 //! So every failure this module can observe — absent, non-regular, oversized,
-//! not UTF-8, not a record this version wrote — resolves to an empty history
-//! and is repaired by the next [`SelectionHistoryStore::save`]. There is
-//! exactly one failure the caller does see: a save that could not be written,
-//! which is reported so the user learns their history is not being kept, and
-//! which never stops the launch.
+//! not UTF-8, not a supported record — resolves to an empty history and is
+//! repaired by the next [`SelectionHistoryStore::save`]. Saves report I/O
+//! failures and explicitly reject invalid command records before touching disk;
+//! neither failure prevents launcher startup.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -29,22 +28,22 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crikey_core::{ItemId, PluginId};
-use crikey_ranking::{QueryAffinityRecord, SelectionHistorySnapshot, SelectionRecord};
+use crikey_core::{CommandRef, ItemId, PluginId};
+use crikey_ranking::{
+    CommandSelectionRecord, QueryAffinityRecord, SelectionHistorySnapshot, SelectionRecord,
+    MAX_COMMAND_RECORDS,
+};
 
 use crate::startup_recovery::{read_bounded, write_json_string, Cursor};
 
 /// Magic key and format version in one.
 ///
-/// A record opens with `"crikey_selection_history": 1`, so the very first key
-/// both identifies the file as this format's and pins the version. A future
-/// version bumps the number and this parser rejects it — which loads as an
-/// empty history, exactly as any other unreadable record does, rather than
-/// reinterpreting fields whose meaning has changed.
+/// Version 1 contains item selections and query affinities only. Version 2 adds
+/// exact successful command uses; migration never guesses commands from items.
 const MAGIC_KEY: &str = "crikey_selection_history";
 
-/// The format version this build writes and is the only one it accepts.
-const FORMAT_VERSION: u32 = 1;
+/// The version written; both version 1 and version 2 are accepted.
+const FORMAT_VERSION: u32 = 2;
 
 /// Distinguishes one save's staging file from every other save's in this
 /// process; the pid distinguishes it from every other process's.
@@ -92,6 +91,30 @@ impl SelectionHistoryStore {
             .unwrap_or_default()
     }
 
+    /// Saves a selective reset before publishing the replacement in-memory history.
+    /// A failed save leaves both the previous learned state and unrelated records intact.
+    pub fn reset_item(
+        &self,
+        history: &mut crikey_ranking::SelectionHistory,
+        owner: &PluginId,
+        item: &ItemId,
+    ) -> io::Result<bool> {
+        let mut candidate = history.snapshot();
+        let before = (candidate.selections.len(), candidate.query_affinities.len());
+        candidate
+            .selections
+            .retain(|record| &record.plugin != owner || &record.item != item);
+        candidate
+            .query_affinities
+            .retain(|record| &record.plugin != owner || &record.item != item);
+        if before == (candidate.selections.len(), candidate.query_affinities.len()) {
+            return Ok(false);
+        }
+        self.save(&candidate)?;
+        *history = crikey_ranking::SelectionHistory::from_snapshot(candidate);
+        Ok(true)
+    }
+
     /// Commits `snapshot` to the store's path.
     ///
     /// Written to a uniquely named sibling and renamed, for the reason
@@ -104,12 +127,31 @@ impl SelectionHistoryStore {
     ///
     /// # Errors
     ///
-    /// Whatever the directory creation, write or rename reported. The caller
-    /// reports it and carries on: an unwritable history costs the next launch
-    /// its learning, never this one its startup.
+    /// Invalid command identities, duplicate references and zero-use records
+    /// return `InvalidInput` before any I/O. Otherwise reports directory creation,
+    /// write or rename failures; callers can continue without durable learning.
     ///
     /// [`StartupJournal::save`]: crate::StartupJournal::save
     pub fn save(&self, snapshot: &SelectionHistorySnapshot) -> io::Result<()> {
+        let mut command_refs = std::collections::BTreeSet::new();
+        for record in &snapshot.commands {
+            record
+                .reference
+                .validate()
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+            if record.frequency == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "zero command frequency",
+                ));
+            }
+            if !command_refs.insert(&record.reference) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate command identity",
+                ));
+            }
+        }
         if let Some(parent) = self.path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
@@ -137,7 +179,7 @@ impl SelectionHistoryStore {
 // Serialization
 // ---------------------------------------------------------------------------
 //
-// One JSON object, three keys, in a fixed order. The parser is strict for the
+// One JSON object with versioned keys, in a fixed order. The parser is strict for the
 // same reason the journal's is: anything it does not recognize is corruption,
 // and corruption loads as an empty history rather than as a guess at what the
 // user once selected.
@@ -174,6 +216,14 @@ fn within_budget(snapshot: &SelectionHistorySnapshot, budget: u64) -> SelectionH
             (&left.query, &left.plugin, &left.item).cmp(&(&right.query, &right.plugin, &right.item))
         })
     });
+    let mut commands: Vec<&CommandSelectionRecord> = snapshot.commands.iter().collect();
+    commands.sort_unstable_by(|left, right| {
+        right
+            .frequency
+            .cmp(&left.frequency)
+            .then_with(|| right.last_selected_secs.cmp(&left.last_selected_secs))
+            .then_with(|| right.reference.cmp(&left.reference))
+    });
 
     let mut kept_selections = Vec::new();
     for record in selections {
@@ -186,6 +236,19 @@ fn within_budget(snapshot: &SelectionHistorySnapshot, budget: u64) -> SelectionH
         used += cost;
         kept_selections.push(record.clone());
     }
+
+    let mut kept_commands = Vec::new();
+    for record in commands.into_iter().take(MAX_COMMAND_RECORDS) {
+        scratch.clear();
+        push_command(&mut scratch, record);
+        let cost = scratch.len() as u64 + u64::from(!kept_commands.is_empty());
+        if used.saturating_add(cost) > budget {
+            break;
+        }
+        used += cost;
+        kept_commands.push(record.clone());
+    }
+    kept_commands.sort_unstable_by(|left, right| left.reference.cmp(&right.reference));
 
     let mut kept_affinities = Vec::new();
     for record in affinities {
@@ -208,6 +271,7 @@ fn within_budget(snapshot: &SelectionHistorySnapshot, budget: u64) -> SelectionH
     SelectionHistorySnapshot {
         selections: kept_selections,
         query_affinities: kept_affinities,
+        commands: kept_commands,
     }
 }
 
@@ -233,6 +297,13 @@ fn serialize(snapshot: &SelectionHistorySnapshot) -> String {
             out.push(',');
         }
         push_affinity(&mut out, record);
+    }
+    out.push_str("],\"commands\":[");
+    for (index, record) in snapshot.commands.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        push_command(&mut out, record);
     }
     out.push_str("]}");
     out
@@ -268,6 +339,18 @@ fn push_affinity(out: &mut String, record: &QueryAffinityRecord) {
     out.push('}');
 }
 
+fn push_command(out: &mut String, record: &CommandSelectionRecord) {
+    out.push_str("{\"provider_id\":");
+    write_json_string(out, &record.reference.provider_id.0);
+    out.push_str(",\"command_id\":");
+    write_json_string(out, &record.reference.command_id);
+    let _ = write!(
+        out,
+        ",\"frequency\":{},\"last_selected_secs\":{}}}",
+        record.frequency, record.last_selected_secs
+    );
+}
+
 /// Parses a saved record, or `None` if the bytes are not one this build wrote.
 fn parse(text: &str) -> Option<SelectionHistorySnapshot> {
     let mut cursor = Cursor::new(text);
@@ -279,12 +362,14 @@ fn parse(text: &str) -> Option<SelectionHistorySnapshot> {
         return None;
     }
     cursor.expect(':')?;
-    if cursor.number()? != FORMAT_VERSION {
+    let version = cursor.number()?;
+    if version != 1 && version != FORMAT_VERSION {
         return None;
     }
 
     let mut selections = None;
     let mut query_affinities = None;
+    let mut commands = None;
     while cursor.consume(',') {
         let key = cursor.string()?;
         cursor.expect(':')?;
@@ -292,6 +377,9 @@ fn parse(text: &str) -> Option<SelectionHistorySnapshot> {
             "selections" if selections.is_none() => selections = Some(parse_selections(&mut cursor)?),
             "query_affinities" if query_affinities.is_none() => {
                 query_affinities = Some(parse_query_affinities(&mut cursor)?)
+            }
+            "commands" if version == FORMAT_VERSION && commands.is_none() => {
+                commands = Some(parse_commands(&mut cursor)?)
             }
             // An unknown or repeated key means these bytes were not written by
             // this version, and guessing at them would be inventing history.
@@ -307,6 +395,7 @@ fn parse(text: &str) -> Option<SelectionHistorySnapshot> {
     Some(SelectionHistorySnapshot {
         selections: selections?,
         query_affinities: query_affinities?,
+        commands: if version == 1 { Vec::new() } else { commands? },
     })
 }
 
@@ -417,4 +506,183 @@ fn parse_query_affinity(cursor: &mut Cursor<'_>) -> Option<QueryAffinityRecord> 
         query: query?,
         count: count?,
     })
+}
+
+fn parse_commands(cursor: &mut Cursor<'_>) -> Option<Vec<CommandSelectionRecord>> {
+    cursor.expect('[')?;
+    let mut records = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    if cursor.consume(']') {
+        return Some(records);
+    }
+    loop {
+        if records.len() == MAX_COMMAND_RECORDS {
+            return None;
+        }
+        let record = parse_command(cursor)?;
+        if !seen.insert(record.reference.clone()) {
+            return None;
+        }
+        records.push(record);
+        if !cursor.consume(',') {
+            break;
+        }
+    }
+    cursor.expect(']')?;
+    Some(records)
+}
+
+fn parse_command(cursor: &mut Cursor<'_>) -> Option<CommandSelectionRecord> {
+    let mut provider_id = None;
+    let mut command_id = None;
+    let mut frequency = None;
+    let mut last_selected_secs = None;
+    cursor.expect('{')?;
+    loop {
+        let key = cursor.string()?;
+        cursor.expect(':')?;
+        match key.as_str() {
+            "provider_id" if provider_id.is_none() => provider_id = Some(PluginId(cursor.string()?)),
+            "command_id" if command_id.is_none() => command_id = Some(cursor.string()?),
+            "frequency" if frequency.is_none() => frequency = Some(cursor.number()?),
+            "last_selected_secs" if last_selected_secs.is_none() => {
+                last_selected_secs = Some(cursor.number_u64()?);
+            }
+            _ => return None,
+        }
+        if !cursor.consume(',') {
+            break;
+        }
+    }
+    cursor.expect('}')?;
+    let reference = CommandRef {
+        provider_id: provider_id?,
+        command_id: command_id?,
+    };
+    reference.validate().ok()?;
+    let frequency = frequency?;
+    if frequency == 0 {
+        return None;
+    }
+    Some(CommandSelectionRecord {
+        reference,
+        frequency,
+        last_selected_secs: last_selected_secs?,
+    })
+}
+
+#[cfg(test)]
+mod selective_reset_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn reset_saves_exact_owner_and_failed_save_keeps_memory() {
+        let path = std::env::temp_dir().join(format!("crikey-selective-reset-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        let store = SelectionHistoryStore::new(path.join("ranking.json"));
+        let item = ItemId("same-item".into());
+        let owner = PluginId("owner-a".into());
+        let other = PluginId("owner-b".into());
+        let snapshot = SelectionHistorySnapshot {
+            selections: vec![
+                SelectionRecord {
+                    plugin: owner.clone(),
+                    item: item.clone(),
+                    frequency: 2,
+                    last_selected_secs: Some(1),
+                },
+                SelectionRecord {
+                    plugin: other.clone(),
+                    item: item.clone(),
+                    frequency: 3,
+                    last_selected_secs: Some(2),
+                },
+            ],
+            query_affinities: vec![
+                QueryAffinityRecord {
+                    plugin: owner.clone(),
+                    item: item.clone(),
+                    query: "query".into(),
+                    count: 2,
+                },
+                QueryAffinityRecord {
+                    plugin: other.clone(),
+                    item: item.clone(),
+                    query: "query".into(),
+                    count: 3,
+                },
+            ],
+            commands: vec![
+                CommandSelectionRecord {
+                    reference: CommandRef {
+                        provider_id: owner.clone(),
+                        command_id: "first".into(),
+                    },
+                    frequency: 2,
+                    last_selected_secs: 1,
+                },
+                CommandSelectionRecord {
+                    reference: CommandRef {
+                        provider_id: owner.clone(),
+                        command_id: "second".into(),
+                    },
+                    frequency: 1,
+                    last_selected_secs: 2,
+                },
+            ],
+        };
+        let mut history = crikey_ranking::SelectionHistory::from_snapshot(snapshot.clone());
+        assert!(store.reset_item(&mut history, &owner, &item).unwrap());
+        assert_eq!(store.load(), history.snapshot());
+        assert_eq!(history.snapshot().selections[0].plugin, other);
+        assert_eq!(history.snapshot().query_affinities.len(), 1);
+        assert_eq!(history.snapshot().commands, snapshot.commands);
+        assert!(!store.reset_item(&mut history, &owner, &item).unwrap());
+        fs::remove_file(store.path()).unwrap();
+        fs::create_dir(store.path()).unwrap();
+        let mut history = crikey_ranking::SelectionHistory::from_snapshot(snapshot.clone());
+        assert!(store.reset_item(&mut history, &owner, &item).is_err());
+        assert_eq!(history.snapshot(), snapshot);
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod command_budget_tests {
+    use super::*;
+
+    #[test]
+    fn command_byte_budget_keeps_most_used_then_latest_with_exact_ties() {
+        let record = |id: &str, frequency, last_selected_secs| CommandSelectionRecord {
+            reference: CommandRef {
+                provider_id: PluginId("p".into()),
+                command_id: id.into(),
+            },
+            frequency,
+            last_selected_secs,
+        };
+        let mut snapshot = SelectionHistorySnapshot {
+            commands: vec![
+                record("a", 2, 1),
+                record("b", 1, 2),
+                record("c", 1, 2),
+                record("d", 1, 1),
+            ],
+            ..SelectionHistorySnapshot::default()
+        };
+        let mut scratch = String::new();
+        push_command(&mut scratch, &snapshot.commands[0]);
+        let budget = (envelope_bytes() + scratch.len() * 2 + 1) as u64;
+        let kept = within_budget(&snapshot, budget);
+        assert_eq!(
+            kept.commands
+                .iter()
+                .map(|record| record.reference.command_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "c"]
+        );
+        assert!(serialize(&kept).len() as u64 <= budget);
+        snapshot.commands.reverse();
+        assert_eq!(within_budget(&snapshot, budget), kept);
+    }
 }

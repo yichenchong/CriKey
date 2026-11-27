@@ -542,7 +542,10 @@ impl FrameObservation {
     fn capture(at: u64, view: &ViewModel) -> Result<Self, String> {
         let mut stale_items = 0usize;
         for row in view.rows.iter() {
-            let row_generation = fixture_row_generation(&row.item)?;
+            let crikey_ui::ActionTarget::Result { item, .. } = &row.target else {
+                return Err("ordinary query trace unexpectedly contains a declared command".to_owned());
+            };
+            let row_generation = fixture_row_generation(item)?;
             if row_generation != view.generation.get() {
                 stale_items = stale_items.saturating_add(1);
             }

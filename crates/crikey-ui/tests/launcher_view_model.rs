@@ -58,10 +58,8 @@
 //!   and preserves exact owner/item/action focus through admitted refreshes.
 //!   Missing targets invalidate rather than redirect. Escape clears action
 //!   search, then leaves a submenu, then closes the panel before root cancellation.
-//! * An empty query carries no rows. A publish that lands while the query is
-//!   empty is accepted with its rows dropped, and an edit back to the empty
-//!   query drops the rows that were standing: an untyped launcher is the query
-//!   field and nothing else.
+//! * Empty-query root publications can carry home rows under a fresh generation.
+//!   Clearing a query still retires the previous search rows immediately.
 //! * `set_settings(Vec<SettingRow>)` describes the settings surface and is the
 //!   one mutator a hidden launcher accepts, because it carries the host's
 //!   configuration rather than a launcher session. `open_settings(Option<&str>)`
@@ -101,8 +99,16 @@ fn action(id: &str) -> Action {
 /// A minimal row identified by `id`, carrying exactly one default action.
 fn row(id: &str) -> ResultRow {
     ResultRow {
-        plugin: PluginId("core".into()),
-        item: ItemId(id.to_owned()),
+        target: crikey_ui::ActionTarget::Result {
+            owner: PluginId("core".into()),
+            item: ItemId(id.to_owned()),
+        },
+        source: Some(crikey_ui::ResultSource {
+            owner: PluginId("core".into()),
+            item: ItemId(id.to_owned()),
+            kind: crikey_ui::ResultSourceKind::Ordinary,
+        }),
+        command_state: None,
         label: id.to_uppercase(),
         description: String::new(),
         icon_reference: None,
@@ -119,7 +125,7 @@ fn row(id: &str) -> ResultRow {
 
 fn action_intent(item: &str, action: &str) -> UiCommand {
     UiCommand::ActivateAction {
-        target: crikey_ui::ActionTarget {
+        target: crikey_ui::ActionTarget::Result {
             owner: PluginId("core".into()),
             item: ItemId(item.into()),
         },
@@ -137,7 +143,11 @@ fn numbered_rows(count: usize) -> Vec<ResultRow> {
 }
 
 fn row_ids(model: &ViewModel) -> Vec<&str> {
-    model.rows.iter().map(|entry| entry.item.0.as_str()).collect()
+    model
+        .rows
+        .iter()
+        .map(|entry| entry.source.as_ref().unwrap().item.0.as_str())
+        .collect()
 }
 
 #[track_caller]
@@ -145,8 +155,17 @@ fn selected_id(model: &ViewModel) -> &str {
     model
         .rows
         .get(model.selected)
-        .map(|entry| entry.item.0.as_str())
+        .map(|entry| entry.source.as_ref().unwrap().item.0.as_str())
         .expect("the selected index must address a row")
+}
+
+fn set_owner(row: &mut ResultRow, owner: PluginId) {
+    let source = row.source.as_mut().unwrap();
+    source.owner = owner.clone();
+    row.target = crikey_ui::ActionTarget::Result {
+        owner,
+        item: source.item.clone(),
+    };
 }
 
 /// Every command variant, so "ignored while hidden" and "never breaks the
@@ -166,6 +185,22 @@ fn every_command() -> Vec<UiCommand> {
         UiCommand::ShowActions,
         UiCommand::ExecuteDefault,
         action_intent("alpha", "copy-path"),
+        UiCommand::InvokeCommand {
+            target: command_row("exact").target,
+            argument: None,
+            generation: Generation::from_raw(1),
+            query: String::new(),
+            registry_revision: 9,
+        },
+        UiCommand::EditCommandPreference {
+            target: command_row("exact").target,
+            expected_revision: 12,
+            edit: crikey_ui::CommandPreferenceEdit::Favorite(true),
+        },
+        UiCommand::ResetCommandRanking {
+            target: command_row("exact").target,
+            registry_revision: 9,
+        },
         UiCommand::Cancel,
         UiCommand::Dismiss,
     ]
@@ -195,10 +230,8 @@ fn fresh_generation() -> Generation {
 
 /// What the fixtures type before they publish rows.
 ///
-/// Publishing into an empty query is not a state the launcher can be in: an
-/// untyped launcher is the query field and nothing else, so `publish` drops
-/// the rows. Every fixture that wants a result list types first, exactly as a
-/// user must.
+/// Ordinary search fixtures type a query; command home fixtures publish under
+/// their own freshly admitted empty-query generation.
 const FIXTURE_QUERY: &str = "fix";
 
 /// A visible launcher with `ids` published for `generation`. Activation, the
@@ -602,7 +635,11 @@ fn root_follow_revision_tracks_intent_and_identity_not_cosmetic_publication() {
     assert_eq!(cosmetic.rows[0].status.as_deref(), Some("Updated status"));
 
     let mut changed = cosmetic.rows.to_vec();
-    changed[0].plugin = PluginId("another-owner".into());
+    changed[0].target = crikey_ui::ActionTarget::Result {
+        owner: PluginId("another-owner".into()),
+        item: ItemId("alpha".into()),
+    };
+    changed[0].source.as_mut().expect("result source").owner = PluginId("another-owner".into());
     state.publish(generation, changed, false);
     let owner = expect_frame(&mut state);
     assert_eq!(owner.selected, 0);
@@ -629,6 +666,23 @@ fn root_follow_revision_tracks_intent_and_identity_not_cosmetic_publication() {
     let queried = expect_frame(&mut state);
     assert_eq!(queried.selected, 0);
     assert_eq!(queried.root_selection_revision, coalesced.root_selection_revision);
+
+    // Commands may share an ordinary source item without sharing identity.
+    state.publish(next, vec![command_row("first")], false);
+    let first_command = expect_frame(&mut state);
+    state.publish(next, vec![command_row("second")], false);
+    let second_command = expect_frame(&mut state);
+    assert_eq!(second_command.selected, 0);
+    assert_ne!(
+        first_command.root_selection_revision,
+        second_command.root_selection_revision
+    );
+    state.publish(next, vec![command_row("second")], false);
+    let identical_command = expect_frame(&mut state);
+    assert_eq!(
+        identical_command.root_selection_revision,
+        second_command.root_selection_revision
+    );
 }
 
 #[test]
@@ -1204,8 +1258,16 @@ fn no_command_can_leave_the_selection_out_of_range() {
 fn published_rows_reach_the_frame_with_every_display_field_intact() {
     let generation = fresh_generation();
     let decorated = ResultRow {
-        plugin: PluginId("builtin.applications".into()),
-        item: ItemId("app:/usr/bin/firefox".to_owned()),
+        target: crikey_ui::ActionTarget::Result {
+            owner: PluginId("builtin.applications".into()),
+            item: ItemId("app:/usr/bin/firefox".to_owned()),
+        },
+        source: Some(crikey_ui::ResultSource {
+            owner: PluginId("builtin.applications".into()),
+            item: ItemId("app:/usr/bin/firefox".to_owned()),
+            kind: crikey_ui::ResultSourceKind::Ordinary,
+        }),
+        command_state: None,
         label: "Firefox".to_owned(),
         description: "Web browser".to_owned(),
         icon_reference: Some("icon:firefox".to_owned()),
@@ -1230,8 +1292,13 @@ fn published_rows_reach_the_frame_with_every_display_field_intact() {
         .rows
         .first()
         .expect("the published row must reach the frame");
-    assert_eq!(presented.plugin, PluginId("builtin.applications".into()));
-    assert_eq!(presented.item, ItemId("app:/usr/bin/firefox".to_owned()));
+    assert_eq!(
+        presented.target,
+        crikey_ui::ActionTarget::Result {
+            owner: PluginId("builtin.applications".into()),
+            item: ItemId("app:/usr/bin/firefox".to_owned()),
+        }
+    );
     assert_eq!(presented.label, "Firefox");
     assert_eq!(presented.description, "Web browser");
     assert_eq!(presented.icon_reference.as_deref(), Some("icon:firefox"));
@@ -1283,7 +1350,11 @@ impl LauncherWindow for RecordingWindow {
         self.presented.push((
             model.generation.get(),
             model.query.clone(),
-            model.rows.iter().map(|entry| entry.item.0.clone()).collect(),
+            model
+                .rows
+                .iter()
+                .map(|entry| entry.source.as_ref().unwrap().item.0.clone())
+                .collect(),
             model.selected,
         ));
     }
@@ -1475,7 +1546,7 @@ fn provider_refresh_preserves_action_query_and_exact_owner_focus() {
     model.apply(UiCommand::SetActionQuery("reveal".into()));
     let original = expect_frame(&mut model);
     let mut sibling = rows_with_alternates(&["alpha"]).remove(0);
-    sibling.plugin = PluginId("other".into());
+    set_owner(&mut sibling, PluginId("other".into()));
     let mut replacement = vec![sibling];
     replacement.extend(rows_with_alternates(&["beta", "alpha"]));
     model.publish(generation, replacement, true);
@@ -1507,7 +1578,7 @@ fn vanished_owner_or_action_invalidates_and_never_revives_or_redirects() {
         if remove_action {
             replacement[0].alternate_actions.pop();
         } else {
-            replacement[0].plugin = PluginId("other".into());
+            set_owner(&mut replacement[0], PluginId("other".into()));
         }
         model.publish(generation, replacement, false);
         assert!(expect_frame(&mut model)
@@ -1562,7 +1633,7 @@ fn nested_back_clears_search_then_returns_to_panel_without_touching_root() {
     let mut model = open_showing_actions(fresh_generation(), &["alpha"]);
     let frame = model.frame();
     assert!(frame.is_none());
-    let target = crikey_ui::ActionTarget {
+    let target = crikey_ui::ActionTarget::Result {
         owner: PluginId("core".into()),
         item: ItemId("alpha".into()),
     };
@@ -1911,20 +1982,18 @@ fn a_query_of_multi_byte_characters_survives_editing_and_completion() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_publish_for_an_empty_query_carries_no_rows() {
+fn a_fresh_empty_query_publication_carries_home_rows() {
     let generation = fresh_generation();
     let mut view_model = LauncherViewModel::new();
     view_model.activate();
     view_model.begin_generation(generation);
 
-    // Whatever the host ranked for an untyped launcher, the model refuses to
-    // carry it: the window is the query field and nothing else until the user
-    // types.
+    // The host owns home composition; admission is a root view/generation gate.
     view_model.publish(generation, rows(&["alpha", "beta"]), false);
 
     let model = expect_frame(&mut view_model);
     assert_eq!(model.query, "");
-    assert!(model.rows.is_empty());
+    assert_eq!(row_ids(&model), vec!["alpha", "beta"]);
     assert_eq!(model.selected, 0);
 }
 
@@ -2093,13 +2162,16 @@ fn an_edited_setting_and_the_quit_control_are_the_hosts_work() {
     let generation = fresh_generation();
     let mut view_model = open_showing(generation, &["alpha"]);
     let _ = expect_frame(&mut view_model);
+    let request_id = crikey_ui::next_setting_edit_id();
 
     assert_eq!(
         view_model.apply(UiCommand::SetSetting {
+            request_id,
             key: "launcher.activation-hotkey".to_owned(),
             value: "Ctrl+Shift+Space".to_owned(),
         }),
         Some(UiEffect::SetSetting {
+            request_id,
             key: "launcher.activation-hotkey".to_owned(),
             value: "Ctrl+Shift+Space".to_owned(),
         }),
@@ -2374,14 +2446,27 @@ fn settings_retire_root_publications_and_return_requests_one_fresh_search() {
     }
 }
 
+fn returning_provider_row() -> ResultRow {
+    let mut provider = row("shared");
+    provider.target = crikey_ui::ActionTarget::Result {
+        owner: PluginId("provider".into()),
+        item: ItemId("shared".into()),
+    };
+    provider.source = Some(crikey_ui::ResultSource {
+        owner: PluginId("provider".into()),
+        item: ItemId("shared".into()),
+        kind: crikey_ui::ResultSourceKind::Ordinary,
+    });
+    provider
+}
+
 /// Return to a deliberately selected asynchronous result, before any fresh
 /// publication. Owner identity is distinct from the unchanged display name.
 fn returning_to_selected_provider() -> (LauncherViewModel, Generation, GenerationTracker) {
     let tracker = GenerationTracker::new();
     let old = tracker.advance();
     let mut model = open_showing(old, &["builtin", "shared"]);
-    let mut provider = row("shared");
-    provider.plugin = PluginId("provider".into());
+    let provider = returning_provider_row();
     model.publish(old, vec![row("builtin"), provider], false);
     model.apply(UiCommand::SelectNext);
     assert_eq!(expect_frame(&mut model).selected, 1);
@@ -2406,14 +2491,13 @@ fn return_selection_survives_phased_publications_and_matches_the_exact_owner() {
     model.publish(fresh, rows(&["shared", "builtin"]), true);
     assert_eq!(expect_frame(&mut model).selected, 0);
 
-    let mut provider = row("shared");
-    provider.plugin = PluginId("provider".into());
+    let provider = returning_provider_row();
     model.publish(fresh, vec![row("shared"), row("builtin"), provider], false);
     let restored = expect_frame(&mut model);
     assert_eq!(restored.selected, 2);
     assert_eq!(
-        restored.rows[restored.selected].plugin,
-        PluginId("provider".into())
+        restored.rows[restored.selected].target,
+        returning_provider_row().target
     );
     assert!(!restored.pending_plugins);
 }
@@ -2423,8 +2507,7 @@ fn navigation_return_retains_an_untouched_owner_target_across_fresh_generation()
     let tracker = GenerationTracker::new();
     let old = tracker.advance();
     let mut model = open_showing(old, &["shared"]);
-    let mut provider = row("shared");
-    provider.plugin = PluginId("provider".into());
+    let provider = returning_provider_row();
     model.publish(old, vec![provider.clone()], false);
     let _ = expect_frame(&mut model);
     model.apply(UiCommand::OpenSettings);
@@ -2438,8 +2521,8 @@ fn navigation_return_retains_an_untouched_owner_target_across_fresh_generation()
     let restored = expect_frame(&mut model);
     assert_eq!(restored.selected, 1);
     assert_eq!(
-        restored.rows[restored.selected].plugin,
-        PluginId("provider".into())
+        restored.rows[restored.selected].target,
+        returning_provider_row().target
     );
 }
 
@@ -2456,8 +2539,7 @@ fn explicit_navigation_cancels_return_selection_even_when_clamped_or_empty() {
             model.publish(fresh, if empty { Vec::new() } else { rows(&["builtin"]) }, true);
             let _ = expect_frame(&mut model);
             model.apply(command.clone());
-            let mut provider = row("shared");
-            provider.plugin = PluginId("provider".into());
+            let provider = returning_provider_row();
             model.publish(fresh, vec![row("builtin"), provider], false);
             assert_eq!(selected_id(&expect_frame(&mut model)), "builtin");
         }
@@ -2467,8 +2549,7 @@ fn explicit_navigation_cancels_return_selection_even_when_clamped_or_empty() {
     model.publish(fresh, rows(&["first", "second"]), true);
     let _ = expect_frame(&mut model);
     model.apply(UiCommand::SelectPrevious);
-    let mut provider = row("shared");
-    provider.plugin = PluginId("provider".into());
+    let provider = returning_provider_row();
     model.publish(fresh, vec![row("second"), provider, row("first")], false);
     assert_eq!(selected_id(&expect_frame(&mut model)), "first");
 }
@@ -2478,8 +2559,7 @@ fn completed_return_search_retires_an_absent_restoration_target() {
     let (mut model, fresh, _) = returning_to_selected_provider();
     model.publish(fresh, rows(&["builtin"]), false);
     let _ = expect_frame(&mut model);
-    let mut provider = row("shared");
-    provider.plugin = PluginId("provider".into());
+    let provider = returning_provider_row();
     model.publish(fresh, vec![row("builtin"), provider], false);
     assert_eq!(selected_id(&expect_frame(&mut model)), "builtin");
 }
@@ -2494,8 +2574,7 @@ fn query_completion_supersedes_the_pending_return_selection() {
         Some(UiEffect::Query("BUILTIN".into()))
     );
     assert_eq!(expect_frame(&mut model).query, "BUILTIN");
-    let mut provider = row("shared");
-    provider.plugin = PluginId("provider".into());
+    let provider = returning_provider_row();
     model.publish(fresh, vec![row("builtin"), provider.clone()], false);
     expect_idle(&mut model);
     let completed = tracker.advance();
@@ -2538,7 +2617,7 @@ fn dismissal_discards_an_unconsumed_return_search() {
     assert_eq!(model.view(), None);
     assert_eq!(model.take_query_refresh(), None);
     model.activate();
-    assert_eq!(model.take_query_refresh(), None);
+    assert_eq!(model.take_query_refresh().as_deref(), Some(""));
 }
 
 #[test]
@@ -2554,7 +2633,10 @@ fn a_return_search_reconciles_the_existing_user_selection() {
     model.begin_generation(fresh);
     model.publish(fresh, rows(&["beta", "alpha"]), false);
     let returned = expect_frame(&mut model);
-    assert_eq!(returned.rows[returned.selected].item, ItemId("beta".to_owned()));
+    assert_eq!(
+        returned.rows[returned.selected].source.as_ref().unwrap().item,
+        ItemId("beta".to_owned())
+    );
 }
 
 #[test]
@@ -2649,7 +2731,7 @@ fn preview_link_intent_cannot_follow_a_changed_selection() {
     model.apply(UiCommand::SelectNext);
     assert_eq!(
         model.apply(UiCommand::OpenPreviewLink {
-            target,
+            target: Box::new(target),
             url: "https://example.org/".into()
         }),
         None
@@ -2660,10 +2742,10 @@ fn preview_link_intent_cannot_follow_a_changed_selection() {
 fn preview_selection_and_republication_keep_exact_owner_for_colliding_item_ids() {
     use crikey_ui::PreviewStatus;
     let mut first = row("shared");
-    first.plugin = PluginId("native.first".into());
+    set_owner(&mut first, PluginId("native.first".into()));
     first.plugin_name = "Same display name".into();
     let mut second = row("shared");
-    second.plugin = PluginId("modern.second".into());
+    set_owner(&mut second, PluginId("modern.second".into()));
     second.plugin_name = "Same display name".into();
     let mut model = LauncherViewModel::new();
     model.activate();
@@ -2675,16 +2757,16 @@ fn preview_selection_and_republication_keep_exact_owner_for_colliding_item_ids()
         false,
     );
     let first_request = model.preview_selection().unwrap();
-    assert_eq!(first_request.plugin, first.plugin);
+    assert_eq!(first_request.plugin, first.source.as_ref().unwrap().owner);
     model.apply(UiCommand::SelectNext);
     let second_request = model.preview_selection().unwrap();
-    assert_eq!(second_request.plugin, second.plugin);
+    assert_eq!(second_request.plugin, second.source.as_ref().unwrap().owner);
     assert!(!model.publish_preview(&first_request, PreviewStatus::Empty));
     model.publish(Generation::from_raw(1), vec![second.clone(), first], false);
     assert_eq!(model.preview_selection(), Some(second_request.clone()));
     let frame = model.frame().unwrap();
     assert_eq!(frame.selected, 0);
-    assert_eq!(frame.rows[frame.selected].plugin, second.plugin);
+    assert_eq!(frame.rows[frame.selected].target, second.target);
     model.publish(Generation::from_raw(1), vec![row("shared")], false);
     assert!(!model.publish_preview(&second_request, PreviewStatus::Empty));
 }
@@ -2824,7 +2906,7 @@ fn navigation_back_restores_owner_query_selection_and_logical_scroll() {
     model.begin_generation(Generation::from_raw(1));
     let first = row("shared");
     let mut second = row("shared");
-    second.plugin = PluginId("other.owner".into());
+    set_owner(&mut second, PluginId("other.owner".into()));
     model.publish(
         Generation::from_raw(1),
         vec![first.clone(), second.clone()],
@@ -2850,7 +2932,7 @@ fn navigation_back_restores_owner_query_selection_and_logical_scroll() {
     model.publish(Generation::from_raw(1), vec![row("stale")], false);
     model.publish(Generation::from_raw(2), vec![second.clone(), first], false);
     let restored = model.frame().unwrap();
-    assert_eq!(restored.rows[restored.selected].plugin, second.plugin);
+    assert_eq!(restored.rows[restored.selected].target, second.target);
     assert_eq!(restored.query, "shared");
     assert_eq!(
         restored.navigation.scroll,
@@ -2883,7 +2965,7 @@ fn delayed_resume_uses_fake_clock_exact_boundary_and_fresh_admission() {
             let frame = model.frame().unwrap();
             assert_eq!(selected_id(&frame), "B");
         } else {
-            assert_eq!(model.take_query_refresh(), None);
+            assert_eq!(model.take_query_refresh().as_deref(), Some(""));
             let frame = model.frame().unwrap();
             assert!(frame.query.is_empty() && frame.rows.is_empty());
         }
@@ -3124,4 +3206,499 @@ fn restored_scroll_survives_provider_waves_until_explicit_navigation_or_edit() {
     );
     model.apply(UiCommand::SelectNext);
     assert!(!model.frame().unwrap().navigation.preserve_scroll);
+}
+
+fn command_row(id: &str) -> ResultRow {
+    let mut command = row("shared-target");
+    command.target = crikey_ui::ActionTarget::Command(crikey_core::CommandRef {
+        provider_id: PluginId("core".into()),
+        command_id: id.into(),
+    });
+    command.source.as_mut().unwrap().kind = crikey_ui::ResultSourceKind::DeclaredCatalog { epoch: 7 };
+    command.command_state = Some(crikey_ui::CommandRowState {
+        registry_revision: 9,
+        preference_revision: 12,
+        available: true,
+        unavailable_reason: None,
+        favorite: Some(0),
+        favorite_count: 2,
+        hidden: false,
+        fallback: None,
+        fallback_count: 0,
+        aliases: vec!["preserved".into()],
+        hotkey: Some("preserved".into()),
+        argument_policy: crikey_core::ArgumentPolicy::Optional,
+        argument: None,
+        ranking_reset_available: true,
+    });
+    command
+}
+
+#[test]
+fn commands_sharing_an_item_keep_selection_preview_and_navigation_identity() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let a = command_row("a");
+    let b = command_row("b");
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(Generation::from_raw(1), vec![a.clone(), b.clone()], false);
+    let preview_a = model.preview_selection().unwrap();
+    model.apply(UiCommand::SelectNext);
+    let preview_b = model.preview_selection().unwrap();
+    assert_ne!(preview_a.target, preview_b.target);
+    assert_eq!(preview_a.plugin, preview_b.plugin);
+    assert_eq!(preview_a.item, preview_b.item);
+    assert!(!model.publish_preview(&preview_a, crikey_ui::PreviewStatus::Empty));
+    model.publish(Generation::from_raw(1), vec![b.clone(), a.clone()], false);
+    assert_eq!(model.preview_selection(), Some(preview_b));
+    model.open_settings(None);
+    model.close_settings();
+    assert_eq!(model.take_query_refresh().as_deref(), Some(""));
+    model.begin_generation(Generation::from_raw(2));
+    model.publish(Generation::from_raw(2), vec![a, b.clone()], false);
+    let restored = model.frame().unwrap();
+    assert_eq!(restored.rows[restored.selected].target, b.target);
+}
+
+#[test]
+fn command_enter_invokes_exact_reference_not_the_items_first_action() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("not an implicit argument".into()));
+    model.begin_generation(Generation::from_raw(1));
+    let command = command_row("alternate-command");
+    model.publish(Generation::from_raw(1), vec![command.clone()], false);
+    let Some(UiEffect::InvokeCommand {
+        reference,
+        argument,
+        registry_revision,
+        generation,
+        query,
+        ..
+    }) = model.apply(UiCommand::ExecuteDefault)
+    else {
+        panic!("expected exact command invocation")
+    };
+    assert_eq!(crikey_ui::ActionTarget::Command(reference), command.target);
+    assert_eq!(argument, None);
+    assert_eq!(registry_revision, 9);
+    assert_eq!(generation, Generation::from_raw(1));
+    assert_eq!(query, "not an implicit argument");
+    assert!(model.apply(action_intent("shared-target", "run")).is_none());
+}
+
+#[test]
+fn command_fallback_click_rejects_stale_context_and_keeps_captured_argument() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("captured exactly".into()));
+    model.begin_generation(Generation::from_raw(1));
+    let mut command = command_row("fallback");
+    command.command_state.as_mut().unwrap().argument = Some("captured exactly".into());
+    let click = command
+        .primary_command(Generation::from_raw(1), "captured exactly")
+        .unwrap();
+    model.publish(Generation::from_raw(1), vec![command.clone()], false);
+    assert!(matches!(model.apply(click.clone()),
+        Some(UiEffect::InvokeCommand { argument: Some(argument), .. }) if argument == "captured exactly"));
+    model.apply(UiCommand::SetQuery("changed".into()));
+    model.begin_generation(Generation::from_raw(2));
+    model.publish(Generation::from_raw(2), vec![command], false);
+    assert_eq!(model.apply(click), None);
+}
+
+#[test]
+fn required_arguments_open_a_real_editor_and_forbidden_arguments_are_refused() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.begin_generation(Generation::from_raw(1));
+    let mut command = command_row("required");
+    command.command_state.as_mut().unwrap().argument_policy = crikey_core::ArgumentPolicy::Required;
+    model.publish(Generation::from_raw(1), vec![command.clone()], false);
+    assert_eq!(model.apply(UiCommand::ExecuteDefault), None);
+    assert!(model.frame().unwrap().action_panel.is_some());
+    let command_with_argument = UiCommand::InvokeCommand {
+        target: command.target.clone(),
+        argument: Some("one argument".into()),
+        generation: Generation::from_raw(1),
+        query: String::new(),
+        registry_revision: 9,
+    };
+    assert!(matches!(model.apply(command_with_argument.clone()),
+        Some(UiEffect::InvokeCommand { argument: Some(argument), .. }) if argument == "one argument"));
+    command.command_state.as_mut().unwrap().argument_policy = crikey_core::ArgumentPolicy::Forbidden;
+    model.publish(Generation::from_raw(1), vec![command], false);
+    assert_eq!(model.apply(command_with_argument), None);
+}
+
+#[test]
+fn ordinary_management_lists_all_exact_declarations_without_changing_result_dispatch() {
+    let generation = Generation::from_raw(1);
+    let mut model = open_showing(generation, &["shared-target"]);
+    model.set_command_management_rows(vec![command_row("b"), command_row("a")]);
+    model.apply(UiCommand::ShowActions);
+    let frame = model.frame().unwrap();
+    let management = frame.action_panel.as_ref().unwrap().tree().management_rows();
+    assert_eq!(management.len(), 2);
+    assert_eq!(management[0].target, command_row("a").target);
+    assert_eq!(management[1].target, command_row("b").target);
+    assert_eq!(
+        model.apply(UiCommand::EditCommandPreference {
+            target: management[1].target.clone(),
+            expected_revision: 12,
+            edit: crikey_ui::CommandPreferenceEdit::Hidden(true),
+        }),
+        Some(UiEffect::MutateCommandPreferences {
+            reference: crikey_core::CommandRef {
+                provider_id: PluginId("core".into()),
+                command_id: "b".into()
+            },
+            expected_revision: 12,
+            edit: crikey_ui::CommandPreferenceEdit::Hidden(true),
+        })
+    );
+    model.apply(UiCommand::ActionBack);
+    assert!(matches!(model.apply(UiCommand::ExecuteDefault),
+        Some(UiEffect::Execute { action, .. }) if action == ActionId("run".into())));
+}
+
+#[test]
+fn unavailable_saved_commands_stay_manageable_but_do_not_execute_or_reset_unknown_targets() {
+    let mut command = command_row("removed");
+    let state = command.command_state.as_mut().unwrap();
+    state.available = false;
+    state.unavailable_reason = Some("Provider removed".into());
+    state.ranking_reset_available = false;
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(Generation::from_raw(1), vec![command.clone()], false);
+    assert_eq!(model.apply(UiCommand::ExecuteDefault), None);
+    assert_eq!(
+        model.apply(UiCommand::ResetCommandRanking {
+            target: command.target.clone(),
+            registry_revision: 9,
+        }),
+        None
+    );
+    assert!(matches!(
+        model.apply(UiCommand::EditCommandPreference {
+            target: command.target.clone(),
+            expected_revision: 12,
+            edit: crikey_ui::CommandPreferenceEdit::Favorite(false),
+        }),
+        Some(UiEffect::MutateCommandPreferences { .. })
+    ));
+    assert_eq!(
+        model.apply(UiCommand::EditCommandPreference {
+            target: command.target,
+            expected_revision: 11,
+            edit: crikey_ui::CommandPreferenceEdit::Hidden(false),
+        }),
+        None
+    );
+}
+
+#[test]
+fn catalog_source_epoch_changes_retire_home_preview_authority() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.begin_generation(Generation::from_raw(1));
+    let mut command = command_row("preview");
+    model.publish(Generation::from_raw(1), vec![command.clone()], false);
+    let old = model.preview_selection().unwrap();
+    command.source.as_mut().unwrap().kind = crikey_ui::ResultSourceKind::DeclaredCatalog { epoch: 8 };
+    model.publish(Generation::from_raw(1), vec![command], false);
+    let current = model.preview_selection().unwrap();
+    assert_eq!(old.target, current.target);
+    assert_ne!(old.source, current.source);
+    assert_ne!(old.revision, current.revision);
+    assert!(!model.publish_preview(&old, crikey_ui::PreviewStatus::Empty));
+}
+
+#[test]
+fn host_only_commands_have_no_synthetic_item_or_plugin_preview() {
+    let mut command = command_row("host-settings");
+    command.source = None;
+    command.default_action = None;
+    command.alternate_actions.clear();
+    command.command_state.as_mut().unwrap().ranking_reset_available = false;
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(Generation::from_raw(1), vec![command.clone()], false);
+    assert_eq!(model.preview_selection(), None);
+    assert!(matches!(model.apply(UiCommand::ExecuteDefault),
+        Some(UiEffect::InvokeCommand { reference, .. })
+            if matches!(&command.target, crikey_ui::ActionTarget::Command(expected) if expected == &reference)));
+}
+
+#[test]
+fn preference_controls_are_revision_checked_and_do_not_optimistically_change_records() {
+    let mut command = command_row("forbidden");
+    command.command_state.as_mut().unwrap().argument_policy = crikey_core::ArgumentPolicy::Forbidden;
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(Generation::from_raw(1), vec![command.clone()], false);
+    assert_eq!(
+        model.apply(UiCommand::EditCommandPreference {
+            target: command.target.clone(),
+            expected_revision: 12,
+            edit: crikey_ui::CommandPreferenceEdit::Fallback(true),
+        }),
+        None
+    );
+    assert!(matches!(
+        model.apply(UiCommand::EditCommandPreference {
+            target: command.target.clone(),
+            expected_revision: 12,
+            edit: crikey_ui::CommandPreferenceEdit::MoveFavorite { position: 1 },
+        }),
+        Some(UiEffect::MutateCommandPreferences {
+            expected_revision: 12,
+            edit: crikey_ui::CommandPreferenceEdit::MoveFavorite { position: 1 },
+            ..
+        })
+    ));
+    let frame = model.frame().unwrap();
+    let current = frame.rows[0].command_state.as_ref().unwrap();
+    assert_eq!(current.favorite, Some(0));
+    assert_eq!(current.aliases, vec!["preserved"]);
+    assert_eq!(current.hotkey.as_deref(), Some("preserved"));
+    assert!(matches!(
+        model.apply(UiCommand::ResetCommandRanking {
+            target: command.target.clone(),
+            registry_revision: 9,
+        }),
+        Some(UiEffect::ResetCommandRanking {
+            registry_revision: 9,
+            ..
+        })
+    ));
+    assert_eq!(
+        model.apply(UiCommand::ResetCommandRanking {
+            target: command.target,
+            registry_revision: 8,
+        }),
+        None
+    );
+}
+
+#[test]
+fn command_query_recall_candidates_are_root_text_not_arguments_or_action_search() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("original root query".into()));
+    model.begin_generation(Generation::from_raw(1));
+    let mut command = command_row("recall");
+    command.command_state.as_mut().unwrap().argument = Some("different captured argument".into());
+    model.publish(Generation::from_raw(1), vec![command.clone()], false);
+    assert_eq!(model.submitted_root_query(), None);
+    assert_eq!(model.submitted_command_query(), Some("original root query"));
+    model.apply(UiCommand::ShowActions);
+    assert_eq!(model.submitted_command_query(), None);
+    model.apply(UiCommand::ActionBack);
+    command.command_state.as_mut().unwrap().argument = None;
+    command.command_state.as_mut().unwrap().argument_policy = crikey_core::ArgumentPolicy::Required;
+    model.publish(Generation::from_raw(1), vec![command], false);
+    assert_eq!(model.submitted_command_query(), None);
+    model.apply(UiCommand::SetQuery(String::new()));
+    model.begin_generation(Generation::from_raw(2));
+    model.publish(Generation::from_raw(2), vec![command_row("home")], false);
+    assert_eq!(model.submitted_command_query(), None);
+}
+
+#[test]
+fn settings_manage_absent_saved_references_without_a_root_row_or_item_source() {
+    let mut removed = command_row("removed-fallback");
+    removed.source = None;
+    let state = removed.command_state.as_mut().unwrap();
+    state.available = false;
+    state.unavailable_reason = Some("Command is no longer installed".into());
+    state.favorite = None;
+    state.fallback = Some(0);
+    state.fallback_count = 1;
+    state.ranking_reset_available = false;
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.set_command_management_rows(vec![removed.clone(), command_row("a")]);
+    model.open_settings(None);
+    let frame = model.frame().unwrap();
+    assert!(frame.rows.is_empty());
+    assert_eq!(frame.command_management.len(), 2);
+    assert_eq!(frame.command_management[1].target, removed.target);
+    assert!(matches!(
+        model.apply(UiCommand::EditCommandPreference {
+            target: removed.target.clone(),
+            expected_revision: 12,
+            edit: crikey_ui::CommandPreferenceEdit::Fallback(false),
+        }),
+        Some(UiEffect::MutateCommandPreferences {
+            edit: crikey_ui::CommandPreferenceEdit::Fallback(false),
+            ..
+        })
+    ));
+    assert!(matches!(
+        model.apply(UiCommand::EditCommandPreference {
+            target: removed.target.clone(),
+            expected_revision: 12,
+            edit: crikey_ui::CommandPreferenceEdit::Hidden(false),
+        }),
+        Some(UiEffect::MutateCommandPreferences { .. })
+    ));
+    model.close_settings();
+    assert_eq!(
+        model.apply(UiCommand::EditCommandPreference {
+            target: removed.target,
+            expected_revision: 12,
+            edit: crikey_ui::CommandPreferenceEdit::Fallback(false),
+        }),
+        None
+    );
+}
+
+#[test]
+fn fresh_and_default_reset_activation_request_new_home_publications() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    assert_eq!(model.take_query_refresh().as_deref(), Some(""));
+    model.activate();
+    assert_eq!(
+        model.take_query_refresh(),
+        None,
+        "visible activation remains idempotent"
+    );
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(
+        Generation::from_raw(1),
+        vec![command_row("favorite"), command_row("recent")],
+        false,
+    );
+    let home = model.frame().unwrap();
+    assert!(home.query.is_empty());
+    assert_eq!(home.rows.len(), 2);
+    assert!(model.preview_selection().is_some());
+    model.dismiss();
+    model.activate();
+    assert_eq!(model.take_query_refresh().as_deref(), Some(""));
+    model.publish(Generation::from_raw(1), vec![command_row("retired")], false);
+    assert!(model.frame().unwrap().rows.is_empty());
+    model.begin_generation(Generation::from_raw(2));
+    model.publish(
+        Generation::from_raw(2),
+        vec![command_row("favorite"), command_row("recent")],
+        false,
+    );
+    assert_eq!(model.frame().unwrap().rows.len(), 2);
+}
+
+#[test]
+fn optional_and_required_command_back_restore_discovery_query_exact_selection_and_anchor() {
+    for policy in [
+        crikey_core::ArgumentPolicy::Optional,
+        crikey_core::ArgumentPolicy::Required,
+    ] {
+        for settings in [false, true] {
+            let mut model = LauncherViewModel::new();
+            model.activate();
+            model.apply(UiCommand::SetQuery("command discovery".into()));
+            model.begin_generation(Generation::from_raw(1));
+            let first = command_row("first");
+            let mut selected = command_row("selected");
+            selected.argument_hint = Some("Argument supported".into());
+            selected.command_state.as_mut().unwrap().argument_policy = policy;
+            model.publish(
+                Generation::from_raw(1),
+                vec![first.clone(), selected.clone()],
+                false,
+            );
+            model.apply(UiCommand::SelectNext);
+            let anchor = crikey_ui::LogicalScroll { row: 1, offset: 6.0 };
+            model.apply(UiCommand::SetLogicalScroll(anchor.clone()));
+            let before = model.navigation_restoration();
+            assert_eq!(before.query, "command discovery");
+            assert_eq!(before.selected, Some(selected.target.clone()));
+            assert_eq!(before.scroll, anchor);
+            if settings {
+                model.open_settings(None);
+                model.close_settings();
+            } else {
+                model.open_page(web_page_surface());
+                model.close_page();
+            }
+            assert_eq!(model.take_query_refresh().as_deref(), Some("command discovery"));
+            model.begin_generation(Generation::from_raw(2));
+            model.publish(Generation::from_raw(2), vec![selected.clone(), first], false);
+            let restored = model.frame().unwrap();
+            assert_eq!(restored.query, "command discovery");
+            assert_eq!(restored.rows[restored.selected].target, selected.target);
+            assert_eq!(restored.navigation.scroll, anchor);
+        }
+    }
+}
+
+#[test]
+fn registry_refresh_keeps_the_exact_selected_command_through_new_generation_and_enter() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    model.apply(UiCommand::SetQuery("shared discovery".into()));
+    let first = command_row("first");
+    let mut selected = command_row("selected");
+    selected.command_state.as_mut().unwrap().argument_policy = crikey_core::ArgumentPolicy::Forbidden;
+    selected.argument_hint = None;
+    model.begin_generation(Generation::from_raw(1));
+    model.publish(
+        Generation::from_raw(1),
+        vec![first.clone(), selected.clone()],
+        false,
+    );
+    model.apply(UiCommand::SelectNext);
+    assert_eq!(model.refresh_root_query().as_deref(), Some("shared discovery"));
+    assert!(model.take_query_refresh().is_none());
+
+    model.begin_generation(Generation::from_raw(2));
+    model.publish(Generation::from_raw(2), vec![row("intermediate ordinary")], true);
+    model.publish(
+        Generation::from_raw(2),
+        vec![command_row("new-first"), first, selected.clone()],
+        false,
+    );
+    let frame = model.frame().unwrap();
+    assert_eq!(frame.selected, 2);
+    assert_eq!(frame.rows[frame.selected].target, selected.target);
+    let crikey_ui::ActionTarget::Command(expected) = selected.target else {
+        unreachable!()
+    };
+    assert!(matches!(model.apply(UiCommand::ExecuteDefault),
+        Some(UiEffect::InvokeCommand { reference, generation, .. })
+            if reference == expected && generation == Generation::from_raw(2)));
+}
+
+#[test]
+fn matching_dispatch_notice_retirement_cannot_erase_a_newer_unrelated_failure() {
+    let mut model = LauncherViewModel::new();
+    model.activate();
+    let dispatch = model
+        .publish_navigation_notice("Command was not invoked".into())
+        .unwrap();
+    model.set_navigation_notice("Configuration could not be written".into());
+    model.clear_navigation_notice(dispatch);
+    assert_eq!(
+        model.frame().unwrap().navigation.unavailable.as_deref(),
+        Some("Configuration could not be written")
+    );
+    let old = model
+        .publish_navigation_notice("Same diagnostic text".into())
+        .unwrap();
+    let newer = model
+        .publish_navigation_notice("Same diagnostic text".into())
+        .unwrap();
+    model.clear_navigation_notice(old);
+    assert_eq!(
+        model.frame().unwrap().navigation.unavailable.as_deref(),
+        Some("Same diagnostic text")
+    );
+    model.clear_navigation_notice(newer);
+    assert!(model.frame().unwrap().navigation.unavailable.is_none());
 }

@@ -25,21 +25,25 @@ pub const MAX_ACTION_QUERY_BYTES: usize = 8 * 1024;
 static NEXT_PANEL_FOCUS: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ActionTarget {
-    pub owner: PluginId,
-    pub item: ItemId,
+pub enum ActionTarget {
+    Result { owner: PluginId, item: ItemId },
+    Command(crikey_core::CommandRef),
 }
 
 impl ActionTarget {
     pub fn of(row: &ResultRow) -> Self {
-        Self {
-            owner: row.plugin.clone(),
-            item: row.item.clone(),
-        }
+        row.target.clone()
     }
 
     pub fn matches(&self, row: &ResultRow) -> bool {
-        self.owner == row.plugin && self.item == row.item
+        self == &row.target
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Result { owner, item } => owner.0.capacity() + item.0.capacity(),
+            Self::Command(reference) => reference.provider_id.0.capacity() + reference.command_id.capacity(),
+        }
     }
 }
 
@@ -51,6 +55,7 @@ pub enum HostAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ActionIdentity {
+    InvokeCommand,
     Plugin(ActionId),
     Host(HostAction),
     Submenu(String),
@@ -68,6 +73,9 @@ pub struct ActionPresentation {
 
 #[derive(Debug, Clone)]
 pub enum ActionEntry {
+    Command {
+        presentation: ActionPresentation,
+    },
     Plugin {
         action: ActionId,
         presentation: ActionPresentation,
@@ -152,6 +160,7 @@ pub struct ActionTree {
     sections: Vec<PreparedSection>,
     entries: Vec<PreparedEntry>,
     primary: Option<ActionIdentity>,
+    management: Vec<ResultRow>,
 }
 
 impl ActionTree {
@@ -159,8 +168,16 @@ impl ActionTree {
     /// executable plugin leaf must name a real action, including future nested presentations.
     pub fn new(row: &ResultRow, sections: Vec<ActionSection>) -> Result<Arc<Self>, ActionPanelRefusal> {
         let mut budget = TextBudget(0);
-        budget.identity(&row.plugin.0, "owner")?;
-        budget.identity(&row.item.0, "item")?;
+        match &row.target {
+            ActionTarget::Result { owner, item } => {
+                budget.identity(&owner.0, "owner")?;
+                budget.identity(&item.0, "item")?;
+            }
+            ActionTarget::Command(reference) => {
+                budget.identity(&reference.provider_id.0, "owner")?;
+                budget.identity(&reference.command_id, "command")?;
+            }
+        }
         if row.alternate_actions.len() > MAX_ACTION_ENTRIES - usize::from(row.default_action.is_some()) {
             return Err(ActionPanelRefusal::TooManyEntries);
         }
@@ -181,6 +198,7 @@ impl ActionTree {
             sections: Vec::with_capacity(sections.len()),
             entries: Vec::new(),
             primary: None,
+            management: Vec::new(),
         };
         let mut section_ids = HashSet::new();
         let mut identities = HashSet::new();
@@ -201,7 +219,11 @@ impl ActionTree {
                 tree.sections[index].children.push(child);
             }
         }
-        if let Some(action) = &row.default_action {
+        if matches!(row.target, ActionTarget::Command(_)) {
+            if tree.index(&ActionIdentity::InvokeCommand).is_some() {
+                tree.primary = Some(ActionIdentity::InvokeCommand);
+            }
+        } else if let Some(action) = &row.default_action {
             let identity = ActionIdentity::Plugin(action.action_id.clone());
             if tree.index(&identity).is_some() {
                 tree.primary = Some(identity);
@@ -231,7 +253,7 @@ impl ActionTree {
             }
         }
         let actions = row.default_action.iter().chain(row.alternate_actions.iter());
-        let plugin_entries = actions
+        let mut plugin_entries: Vec<ActionEntry> = actions
             .map(|action| ActionEntry::Plugin {
                 action: action.action_id.clone(),
                 presentation: ActionPresentation {
@@ -241,12 +263,27 @@ impl ActionTree {
                     shortcut: row
                         .default_action
                         .as_ref()
-                        .filter(|primary| primary.action_id == action.action_id)
+                        .filter(|primary| {
+                            matches!(row.target, ActionTarget::Result { .. })
+                                && primary.action_id == action.action_id
+                        })
                         .map(|_| "Enter".into()),
                     destructive: false,
                 },
             })
             .collect();
+        if matches!(row.target, ActionTarget::Command(_)) {
+            plugin_entries.insert(
+                0,
+                ActionEntry::Command {
+                    presentation: ActionPresentation {
+                        label: "Invoke Command".into(),
+                        shortcut: Some("Enter".into()),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
         Self::new(
             row,
             vec![
@@ -279,6 +316,36 @@ impl ActionTree {
     pub fn target(&self) -> &ActionTarget {
         &self.target
     }
+
+    pub fn management_rows(&self) -> &[ResultRow] {
+        &self.management
+    }
+
+    pub(crate) fn with_management(mut tree: Arc<Self>, row: &ResultRow, commands: &[ResultRow]) -> Arc<Self> {
+        if matches!(row.target, ActionTarget::Result { .. }) {
+            if let Some(source) = &row.source {
+                let mut related: Vec<_> = commands
+                    .iter()
+                    .filter(|command| {
+                        matches!(command.target, ActionTarget::Command(_))
+                            && command.source.as_ref().is_some_and(|candidate| {
+                                candidate.owner == source.owner && candidate.item == source.item
+                            })
+                    })
+                    .cloned()
+                    .collect();
+                related.sort_by(|left, right| match (&left.target, &right.target) {
+                    (ActionTarget::Command(left), ActionTarget::Command(right)) => left.cmp(right),
+                    _ => std::cmp::Ordering::Equal,
+                });
+                related.dedup_by(|left, right| left.target == right.target);
+                if let Some(tree) = Arc::get_mut(&mut tree) {
+                    tree.management = related;
+                }
+            }
+        }
+        tree
+    }
     pub fn primary(&self) -> Option<&ActionIdentity> {
         self.primary.as_ref()
     }
@@ -307,6 +374,21 @@ impl ActionTree {
             return Err(ActionPanelInvalidation::ActionUnavailable);
         }
         match identity {
+            ActionIdentity::InvokeCommand => {
+                let ActionTarget::Command(reference) = &current.target else {
+                    return Err(ActionPanelInvalidation::ActionUnavailable);
+                };
+                if !current
+                    .command_state
+                    .as_ref()
+                    .is_some_and(|state| state.available)
+                {
+                    return Err(ActionPanelInvalidation::ActionUnavailable);
+                }
+                Ok(Some(ActionExecution::Command {
+                    reference: reference.clone(),
+                }))
+            }
             ActionIdentity::Submenu(_) => Ok(None),
             ActionIdentity::Host(action) => Ok(Some(ActionExecution::Host(*action))),
             ActionIdentity::Plugin(action) => {
@@ -324,9 +406,13 @@ impl ActionTree {
                 if count != 1 {
                     return Err(ActionPanelInvalidation::ActionUnavailable);
                 }
+                let source = current
+                    .source
+                    .as_ref()
+                    .ok_or(ActionPanelInvalidation::ActionUnavailable)?;
                 Ok(Some(ActionExecution::Plugin {
-                    owner: current.plugin.clone(),
-                    item: current.item.clone(),
+                    owner: source.owner.clone(),
+                    item: source.item.clone(),
                     action: action.clone(),
                 }))
             }
@@ -355,6 +441,9 @@ impl ActionTree {
             return Err(ActionPanelRefusal::TooManyEntries);
         }
         let (identity, presentation, children) = match entry {
+            ActionEntry::Command { presentation } => {
+                (ActionIdentity::InvokeCommand, presentation, Vec::new())
+            }
             ActionEntry::Plugin { action, presentation } => {
                 if !available.contains(&action) {
                     return Err(ActionPanelRefusal::UnknownPluginAction(action));
@@ -480,6 +569,9 @@ pub struct VisibleAction<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionExecution {
+    Command {
+        reference: crikey_core::CommandRef,
+    },
     Plugin {
         owner: PluginId,
         item: ItemId,
@@ -811,8 +903,16 @@ mod tests {
 
     fn row() -> ResultRow {
         ResultRow {
-            plugin: PluginId("owner-a".into()),
-            item: ItemId("item".into()),
+            target: crate::ActionTarget::Result {
+                owner: PluginId("owner-a".into()),
+                item: ItemId("item".into()),
+            },
+            source: Some(crate::ResultSource {
+                owner: PluginId("owner-a".into()),
+                item: ItemId("item".into()),
+                kind: crate::ResultSourceKind::Ordinary,
+            }),
+            command_state: None,
             label: "Result".into(),
             description: String::new(),
             icon_reference: None,
@@ -899,8 +999,8 @@ mod tests {
         assert_eq!(
             panel.activation(&row),
             Ok(Some(ActionActivation::Execute(ActionExecution::Plugin {
-                owner: row.plugin.clone(),
-                item: row.item.clone(),
+                owner: row.source.as_ref().unwrap().owner.clone(),
+                item: row.source.as_ref().unwrap().item.clone(),
                 action: ActionId("remove".into()),
             })))
         );
@@ -924,8 +1024,8 @@ mod tests {
         assert_eq!(
             panel.tree().execution(&id("open"), &row),
             Ok(Some(ActionExecution::Plugin {
-                owner: row.plugin.clone(),
-                item: row.item.clone(),
+                owner: row.source.as_ref().unwrap().owner.clone(),
+                item: row.source.as_ref().unwrap().item.clone(),
                 action: ActionId("open".into()),
             }))
         );
@@ -997,7 +1097,10 @@ mod tests {
     fn same_item_from_another_owner_cannot_take_over_panel() {
         let row = row();
         let mut replacement = row.clone();
-        replacement.plugin = PluginId("owner-b".into());
+        replacement.target = ActionTarget::Result {
+            owner: PluginId("owner-b".into()),
+            item: ItemId("item".into()),
+        };
         let mut panel = ActionPanel::new(nested(&row));
         assert_eq!(
             panel.activation(&replacement),
@@ -1225,7 +1328,10 @@ mod tests {
             Err(ActionPanelInvalidation::ActionUnavailable)
         );
         stale = row.clone();
-        stale.item = ItemId("another-item".into());
+        stale.target = ActionTarget::Result {
+            owner: PluginId("owner-a".into()),
+            item: ItemId("another-item".into()),
+        };
         assert_eq!(
             tree.execution(primary, &stale),
             Err(ActionPanelInvalidation::TargetUnavailable)

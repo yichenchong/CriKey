@@ -1,4 +1,4 @@
-//! Selection-bound preview delivery, independent of custom page sessions.
+//! Selection-bound preview delivery with exact command/catalog provenance.
 use crikey_core::{Generation, ItemId, PluginId, PreviewContent};
 use std::sync::Arc;
 
@@ -9,6 +9,10 @@ pub struct PreviewIdentity {
     pub plugin: PluginId,
     pub incarnation: u64,
     pub item: ItemId,
+    /// Full row identity; commands sharing an item never share selection authority.
+    pub target: crikey_ui::ActionTarget,
+    /// Accepted provider publication, distinct from the producing incarnation.
+    pub catalog_source: Option<crate::plugin_action::DeclaredCommandSource>,
     pub selection: u64,
     pub request: u64,
 }
@@ -33,14 +37,26 @@ pub struct PreviewUpdate {
 pub(crate) type PreviewPublish = Arc<dyn Fn(PreviewUpdate) + Send + Sync>;
 pub(crate) trait PreviewDispatcher: Send + Sync {
     /// Returns the item and its immutable producing worker identity together.
-    fn lookup(&self, plugin: &PluginId, item: &ItemId) -> Option<(crikey_core::Item, u64)>;
-    fn origin(&self, plugin: &PluginId, item: &ItemId) -> Option<u64>;
+    fn lookup(
+        &self,
+        plugin: &PluginId,
+        item: &ItemId,
+        source: Option<&crate::plugin_action::DeclaredCommandSource>,
+    ) -> Option<(crikey_core::Item, u64)>;
+    fn origin(
+        &self,
+        plugin: &PluginId,
+        item: &ItemId,
+        source: Option<&crate::plugin_action::DeclaredCommandSource>,
+    ) -> Option<u64>;
     fn incarnation(&self, plugin: &PluginId) -> Option<u64>;
     fn set_wake(&self, wake: Arc<dyn Fn() + Send + Sync>);
     fn submit(&self, request: PreviewRequest, publish: PreviewPublish) -> Result<(), String>;
     fn cancel(&self, identity: &PreviewIdentity);
-    /// A foreground reservation fences speculative work on the actual worker.
+    /// Foreground callbacks have priority over speculative requests on the
+    /// provider's actual execution resources, not inferred owner prefixes.
     fn foreground_blocked(&self, owner: &PluginId) -> bool;
+    fn foreground_conflicts(&self, preview_owner: &PluginId, action_owner: &PluginId) -> bool;
 }
 
 /// One active operation and one replace-latest selection. Terminal delivery
@@ -56,6 +72,7 @@ pub struct PreviewService {
     terminal: Arc<std::sync::Mutex<Option<PreviewUpdate>>>,
     publish: PreviewPublish,
     sequence: u64,
+    retired_request: Option<u64>,
 }
 impl std::fmt::Debug for PreviewService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,6 +110,33 @@ impl PreviewService {
             terminal,
             publish,
             sequence: 0,
+            retired_request: None,
+        }
+    }
+
+    /// Foreground work retires preview/link authority immediately, but keeps
+    /// its active slot until the actual terminal delivery releases it.
+    pub fn retire_for_foreground(&mut self, model: &mut crikey_ui::LauncherViewModel, owner: &PluginId) {
+        if let Some((identity, endpoint)) = self.active.as_ref().filter(|(identity, endpoint)| {
+            self.endpoints[*endpoint].foreground_conflicts(&identity.plugin, owner)
+        }) {
+            self.retired_request = Some(identity.request);
+            self.endpoints[*endpoint].cancel(identity);
+        }
+        if let Some(selection) = self.selected.as_ref().filter(|selection| {
+            self.binding.is_some_and(|(endpoint, _)| {
+                self.endpoints[endpoint].foreground_conflicts(&selection.plugin, owner)
+            })
+        }) {
+            self.presented = None;
+            // Rebuild only the latest still-current intent on synchronize;
+            // admission remains fenced until the real foreground release.
+            self.binding = None;
+            model.publish_preview(
+                selection,
+                crikey_ui::PreviewStatus::Unavailable("Preview paused for foreground action".into()),
+            );
+            self.selected = None;
         }
     }
 
@@ -102,14 +146,21 @@ impl PreviewService {
         // Only authoritative item+producer publication can establish/re-establish
         // a binding. A current worker alone is never proof that it owns the row.
         let published_binding = selection.as_ref().and_then(|selection| {
-            self.endpoints.iter().enumerate().find_map(|(index, endpoint)| {
+            let source = catalog_source(selection, search).ok()?;
+            let mut matches = self.endpoints.iter().enumerate().filter_map(|(index, endpoint)| {
                 endpoint
-                    .origin(&selection.plugin, &selection.item)
+                    .origin(&selection.plugin, &selection.item, source)
                     .and_then(|incarnation| {
                         (endpoint.incarnation(&selection.plugin) == Some(incarnation))
                             .then_some((index, incarnation))
                     })
-            })
+            });
+            let first = matches.next();
+            if matches.next().is_some() {
+                None
+            } else {
+                first
+            }
         });
         let newly_bound = published_binding.is_some() && published_binding != self.binding;
         if self.selected != selection || newly_bound {
@@ -122,9 +173,19 @@ impl PreviewService {
                 self.endpoints[*endpoint].cancel(identity);
             }
             if let Some(selection) = selection {
+                let source = match catalog_source(&selection, search) {
+                    Ok(source) => source,
+                    Err(()) => {
+                        model.publish_preview(
+                            &selection,
+                            PreviewStatus::Unavailable("Preview catalog source unavailable".into()),
+                        );
+                        return;
+                    }
+                };
                 let mut matches = self.endpoints.iter().enumerate().filter_map(|(index, endpoint)| {
                     endpoint
-                        .lookup(&selection.plugin, &selection.item)
+                        .lookup(&selection.plugin, &selection.item, source)
                         .map(|item| (index, item))
                 });
                 let first = matches.next();
@@ -134,7 +195,9 @@ impl PreviewService {
                         PreviewStatus::Unavailable("Ambiguous preview ownership".into()),
                     );
                 } else if let Some((endpoint, (item, incarnation))) = first {
-                    if self.endpoints[endpoint].incarnation(&selection.plugin) != Some(incarnation) {
+                    if item.metadata.get("crikey.preview").map(String::as_str) == Some("deferred")
+                        && self.endpoints[endpoint].incarnation(&selection.plugin) != Some(incarnation)
+                    {
                         model.publish_preview(
                             &selection,
                             PreviewStatus::Unavailable("Preview owner unavailable".into()),
@@ -147,6 +210,14 @@ impl PreviewService {
                         self.binding = Some((endpoint, incarnation));
                         self.publish_metadata(model, &selection, Some(&item));
                     }
+                } else if matches!(
+                    selection.source.kind,
+                    crikey_ui::ResultSourceKind::DeclaredCatalog { .. }
+                ) {
+                    model.publish_preview(
+                        &selection,
+                        PreviewStatus::Unavailable("Preview catalog source unavailable".into()),
+                    );
                 } else {
                     let mut hits = search.results().iter().filter(|hit| {
                         hit.item.plugin_id == selection.plugin && hit.item.stable_id == selection.item
@@ -163,9 +234,22 @@ impl PreviewService {
                 }
             }
         }
-        // Row text can change without changing the selected owner/item.
-        // Keep host-known detail current without restarting deferred callbacks.
-        if self.metadata.is_some() {
+        if let Some(selection) = self
+            .selected
+            .as_ref()
+            .filter(|selection| catalog_source(selection, search).is_err())
+        {
+            self.binding = None;
+            self.presented = None;
+            self.metadata = None;
+            self.pending = None;
+            model.publish_preview(
+                selection,
+                PreviewStatus::Unavailable("Preview catalog source unavailable".into()),
+            );
+        } else if self.metadata.is_some() {
+            // Only host metadata is refreshed; deferred/pending/terminal content
+            // and catalog-source failures retain their own authority.
             if let Some(selection) = self.selected.take() {
                 self.publish_metadata(model, &selection, None);
                 self.selected = Some(selection);
@@ -175,6 +259,11 @@ impl PreviewService {
         // Revalidate retained content on every wake, even with no new selection.
         if self.presented.as_ref().is_some_and(|(identity, endpoint, _)| {
             self.endpoints[*endpoint].incarnation(&identity.plugin) != Some(identity.incarnation)
+                || !self.selected.as_ref().is_some_and(|selection| {
+                    catalog_source(selection, search)
+                        .is_ok_and(|source| source == identity.catalog_source.as_ref())
+                })
+                || !self.source_is_current(identity, *endpoint)
         }) {
             self.presented = None;
             if let Some(selection) = &self.selected {
@@ -196,23 +285,37 @@ impl PreviewService {
                 .is_some_and(|(identity, _)| identity == &update.identity)
             {
                 let (identity, endpoint) = self.active.take().unwrap();
+                let retired = self.retired_request == Some(identity.request);
+                if retired {
+                    self.retired_request = None;
+                }
                 let origin = self.endpoints[endpoint].incarnation(&identity.plugin);
                 // A dead worker can still finish its exact active request with a
                 // failure. Content must never outlive its originating worker,
                 // and a replacement incarnation cannot publish the old failure.
-                let admissible_origin = origin == Some(identity.incarnation)
-                    || (origin.is_none()
-                        && matches!(
-                            &update.state,
-                            PreviewState::Error(_) | PreviewState::Unavailable(_) | PreviewState::Cancelled
-                        ));
-                if self.selected.as_ref().is_some_and(|selection| {
-                    selection.view.get() == identity.view
-                        && selection.generation == identity.query
-                        && selection.plugin == identity.plugin
-                        && selection.item == identity.item
-                        && selection.revision == identity.selection
-                }) {
+                let admissible_origin = self.source_is_current(&identity, endpoint)
+                    && self.selected.as_ref().is_some_and(|selection| {
+                        catalog_source(selection, search)
+                            .is_ok_and(|source| source == identity.catalog_source.as_ref())
+                    })
+                    && (origin == Some(identity.incarnation)
+                        || (origin.is_none()
+                            && matches!(
+                                &update.state,
+                                PreviewState::Error(_)
+                                    | PreviewState::Unavailable(_)
+                                    | PreviewState::Cancelled
+                            )));
+                if !retired
+                    && self.selected.as_ref().is_some_and(|selection| {
+                        selection.view.get() == identity.view
+                            && selection.generation == identity.query
+                            && selection.plugin == identity.plugin
+                            && selection.item == identity.item
+                            && selection.revision == identity.selection
+                            && selection.target == identity.target
+                    })
+                {
                     let state = if !admissible_origin {
                         PreviewStatus::Unavailable("Preview owner unavailable".into())
                     } else {
@@ -241,7 +344,14 @@ impl PreviewService {
             }
         }
         if let Some((identity, endpoint)) = &self.active {
-            if self.endpoints[*endpoint].incarnation(&identity.plugin) != Some(identity.incarnation) {
+            if self.endpoints[*endpoint].incarnation(&identity.plugin) != Some(identity.incarnation)
+                || !self.selected.as_ref().is_some_and(|selection| {
+                    selection.target == identity.target
+                        && catalog_source(selection, search)
+                            .is_ok_and(|source| source == identity.catalog_source.as_ref())
+                        && self.source_is_current(identity, *endpoint)
+                })
+            {
                 self.endpoints[*endpoint].cancel(identity);
                 if let Some(selection) = &self.selected {
                     if selection.plugin == identity.plugin
@@ -279,6 +389,17 @@ impl PreviewService {
                     plugin: item.plugin_id,
                     incarnation,
                     item: selection.item.clone(),
+                    target: selection.target.clone(),
+                    catalog_source: match catalog_source(&selection, search) {
+                        Ok(source) => source.cloned(),
+                        Err(()) => {
+                            model.publish_preview(
+                                &selection,
+                                PreviewStatus::Unavailable("Preview catalog source unavailable".into()),
+                            );
+                            return;
+                        }
+                    },
                     selection: selection.revision,
                     request: sequence,
                 };
@@ -310,6 +431,10 @@ impl PreviewService {
             || target.incarnation != identity.incarnation
             || target.request != identity.request
             || self.endpoints[*endpoint].incarnation(&identity.plugin) != Some(identity.incarnation)
+            || !self.source_is_current(identity, *endpoint)
+            || target.selection.target != identity.target
+            || !catalog_source(&target.selection, search)
+                .is_ok_and(|source| source == identity.catalog_source.as_ref())
         {
             return Err("Preview link owner has retired".into());
         }
@@ -328,6 +453,12 @@ impl PreviewService {
         search
             .open_preview_url(&identity.plugin, url)
             .map_err(|error| error.to_string())
+    }
+    fn source_is_current(&self, identity: &PreviewIdentity, endpoint: usize) -> bool {
+        identity.catalog_source.as_ref().is_none_or(|source| {
+            self.endpoints[endpoint].origin(&identity.plugin, &identity.item, Some(source))
+                == Some(identity.incarnation)
+        })
     }
 
     fn publish_metadata(
@@ -407,6 +538,24 @@ impl Drop for PreviewService {
     }
 }
 
+/// Catalog admission epochs are resolved by the composition ledger, never
+/// interpreted as producing-worker incarnations.
+fn catalog_source<'a>(
+    selection: &crikey_ui::PreviewSelection,
+    search: &'a crate::SearchService,
+) -> Result<Option<&'a crate::plugin_action::DeclaredCommandSource>, ()> {
+    if selection.source.owner != selection.plugin || selection.source.item != selection.item {
+        return Err(());
+    }
+    match selection.source.kind {
+        crikey_ui::ResultSourceKind::Ordinary => Ok(None),
+        crikey_ui::ResultSourceKind::DeclaredCatalog { epoch } => search
+            .declared_catalog_source(&selection.plugin, epoch)
+            .map(Some)
+            .ok_or(()),
+    }
+}
+
 fn bounded_metadata_text(value: &str) -> String {
     const LIMIT: usize = 8192;
     const ELLIPSIS: &str = "…";
@@ -445,10 +594,20 @@ mod tests {
     }
 
     impl PreviewDispatcher for Endpoint {
-        fn lookup(&self, _: &PluginId, _: &ItemId) -> Option<(crikey_core::Item, u64)> {
+        fn lookup(
+            &self,
+            _: &PluginId,
+            _: &ItemId,
+            _: Option<&crate::plugin_action::DeclaredCommandSource>,
+        ) -> Option<(crikey_core::Item, u64)> {
             None
         }
-        fn origin(&self, _: &PluginId, _: &ItemId) -> Option<u64> {
+        fn origin(
+            &self,
+            _: &PluginId,
+            _: &ItemId,
+            _: Option<&crate::plugin_action::DeclaredCommandSource>,
+        ) -> Option<u64> {
             None
         }
         fn incarnation(&self, _: &PluginId) -> Option<u64> {
@@ -462,6 +621,9 @@ mod tests {
         fn foreground_blocked(&self, _: &PluginId) -> bool {
             false
         }
+        fn foreground_conflicts(&self, preview_owner: &PluginId, action_owner: &PluginId) -> bool {
+            preview_owner == action_owner
+        }
     }
 
     fn active_preview() -> (PreviewService, LauncherViewModel, Arc<Endpoint>, PreviewIdentity) {
@@ -473,8 +635,16 @@ mod tests {
         model.publish(
             generation,
             vec![ResultRow {
-                plugin: PluginId("preview-plugin".into()),
-                item: ItemId("preview-item".into()),
+                target: crikey_ui::ActionTarget::Result {
+                    owner: PluginId("preview-plugin".into()),
+                    item: ItemId("preview-item".into()),
+                },
+                source: Some(crikey_ui::ResultSource {
+                    owner: PluginId("preview-plugin".into()),
+                    item: ItemId("preview-item".into()),
+                    kind: crikey_ui::ResultSourceKind::Ordinary,
+                }),
+                command_state: None,
                 label: "Preview".into(),
                 description: String::new(),
                 icon_reference: None,
@@ -497,6 +667,8 @@ mod tests {
             plugin: PluginId("preview-plugin".into()),
             incarnation: 7,
             item: selection.item.clone(),
+            target: selection.target.clone(),
+            catalog_source: None,
             selection: selection.revision,
             request: 11,
         };
@@ -519,8 +691,86 @@ mod tests {
             terminal,
             publish,
             sequence: identity.request,
+            retired_request: None,
         };
         (service, model, endpoint, identity)
+    }
+
+    #[test]
+    fn command_identity_changes_retire_links_even_with_the_same_item() {
+        let (mut service, mut model, _, mut identity) = active_preview();
+        let mut row = model.selected_preview_row().unwrap().clone();
+        let owner = identity.plugin.clone();
+        let command = |name: &str| {
+            crikey_ui::ActionTarget::Command(crikey_core::CommandRef {
+                provider_id: owner.clone(),
+                command_id: name.into(),
+            })
+        };
+        row.target = command("a");
+        model.publish(identity.query, vec![row.clone()], false);
+        let selection = model.preview_selection().unwrap();
+        identity.target = selection.target.clone();
+        identity.selection = selection.revision;
+        service.selected = Some(selection);
+        service.active = Some((identity.clone(), 0));
+        (service.publish)(PreviewUpdate {
+            identity: identity.clone(),
+            state: PreviewState::Content(Arc::new(crikey_ui::PreparedPreview {
+                content: Arc::new(PreviewContent {
+                    text: None,
+                    image: None,
+                    values: vec![crikey_core::PreviewValue {
+                        label: "Link".into(),
+                        value: "https://example.com/command".into(),
+                        kind: crikey_core::PreviewValueKind::Link,
+                    }],
+                }),
+                blocks: Arc::default(),
+            })),
+        });
+        let search = crate::SearchService::new(crate::App::new());
+        service.synchronize(&mut model, &search);
+        let old_link = model.frame().unwrap().preview.link_target.clone().unwrap();
+        for name in ["b", "a"] {
+            row.target = command(name);
+            model.publish(identity.query, vec![row.clone()], false);
+            service.synchronize(&mut model, &search);
+            assert!(service.presented.is_none());
+            assert!(model.frame().unwrap().preview.link_target.is_none());
+            assert!(service
+                .open_link(&old_link, "https://example.com/command", &search)
+                .is_err());
+        }
+        assert_ne!(model.preview_selection().unwrap(), old_link.selection);
+    }
+
+    #[test]
+    fn home_command_requires_accepted_catalog_source_instead_of_ordinary_fallback() {
+        let (mut service, mut model, _, identity) = active_preview();
+        let mut row = model.selected_preview_row().unwrap().clone();
+        row.target = crikey_ui::ActionTarget::Command(crikey_core::CommandRef {
+            provider_id: identity.plugin,
+            command_id: "saved".into(),
+        });
+        row.source.as_mut().unwrap().kind = crikey_ui::ResultSourceKind::DeclaredCatalog { epoch: 99 };
+        row.description = "Must not fall back to this description".into();
+        let _ = model.apply(UiCommand::SetQuery(String::new()));
+        let generation = Generation::from_raw(identity.query.get() + 1);
+        model.begin_generation(generation);
+        model.publish(generation, vec![row], false);
+        assert!(
+            model.preview_selection().is_some(),
+            "home has a real admitted publication"
+        );
+        service.synchronize(&mut model, &crate::SearchService::new(crate::App::new()));
+        assert_eq!(
+            model.frame().unwrap().preview.status,
+            Some(PreviewStatus::Unavailable(
+                "Preview catalog source unavailable".into()
+            ))
+        );
+        assert!(service.presented.is_none());
     }
 
     #[test]
@@ -567,6 +817,65 @@ mod tests {
     }
 
     #[test]
+    fn cosmetic_republication_preserves_deferred_and_terminal_preview_authority() {
+        let content = Arc::new(crikey_ui::PreparedPreview {
+            content: Arc::new(PreviewContent {
+                text: Some(crikey_core::PreviewText::Plain("Canonical preview".into())),
+                ..Default::default()
+            }),
+            blocks: Arc::default(),
+        });
+        for (state, expected) in [
+            (PreviewState::Empty, PreviewStatus::Empty),
+            (
+                PreviewState::Error("Canonical failure".into()),
+                PreviewStatus::Error("Canonical failure".into()),
+            ),
+            (
+                PreviewState::Unavailable("Canonical unavailable".into()),
+                PreviewStatus::Unavailable("Canonical unavailable".into()),
+            ),
+            (
+                PreviewState::Content(Arc::clone(&content)),
+                PreviewStatus::Content(Arc::clone(&content)),
+            ),
+        ] {
+            let (mut service, mut model, _, identity) = active_preview();
+            let selection = model.preview_selection().unwrap();
+            let mut row = model.selected_preview_row().unwrap().clone();
+            let search = crate::SearchService::new(crate::App::new());
+            row.description = "Cosmetic description while loading".into();
+            row.plugin_name = "Cosmetic provider".into();
+            model.publish(identity.query, vec![row.clone()], false);
+            service.synchronize(&mut model, &search);
+            assert_eq!(model.preview_selection(), Some(selection.clone()));
+            assert_eq!(
+                model.frame().unwrap().preview.status,
+                Some(PreviewStatus::Loading)
+            );
+            assert_eq!(service.active.as_ref().map(|(active, _)| active), Some(&identity));
+            assert!(service.metadata.is_none());
+
+            (service.publish)(PreviewUpdate {
+                identity: identity.clone(),
+                state,
+            });
+            service.synchronize(&mut model, &search);
+            assert_eq!(model.frame().unwrap().preview.status, Some(expected.clone()));
+            assert!(service.active.is_none());
+
+            row.description = "Cosmetic description after completion".into();
+            row.plugin_name.clear();
+            row.category = "Cosmetic category".into();
+            model.publish(identity.query, vec![row], false);
+            service.synchronize(&mut model, &search);
+            assert_eq!(model.preview_selection(), Some(selection));
+            assert_eq!(model.frame().unwrap().preview.status, Some(expected));
+            assert!(service.metadata.is_none());
+        }
+    }
+
+    #[test]
     fn current_terminal_failure_survives_origin_death() {
         for state in [
             PreviewState::Error("worker timed out".into()),
@@ -592,7 +901,7 @@ mod tests {
 
     #[test]
     fn old_terminal_cannot_release_admission_or_hide_origin_retirement() {
-        for field in 0..7 {
+        for field in 0..9 {
             let (mut service, mut model, endpoint, mut stale) = active_preview();
             *endpoint.incarnation.lock().unwrap() = None;
             match field {
@@ -603,6 +912,20 @@ mod tests {
                 4 => stale.item = ItemId("old-item".into()),
                 5 => stale.selection -= 1,
                 6 => stale.request -= 1,
+                7 => {
+                    stale.target = crikey_ui::ActionTarget::Result {
+                        owner: stale.plugin.clone(),
+                        item: ItemId("other-target".into()),
+                    }
+                }
+                8 => {
+                    stale.catalog_source = Some(crate::plugin_action::DeclaredCommandSource {
+                        instance: 1,
+                        generation: stale.query,
+                        producer: stale.incarnation,
+                        publication: 1,
+                    })
+                }
                 _ => unreachable!(),
             }
             (service.publish)(PreviewUpdate {
@@ -706,7 +1029,7 @@ mod tests {
             );
             assert!(model
                 .apply(UiCommand::OpenPreviewLink {
-                    target,
+                    target: Box::new(target),
                     url: "https://example.com/preview".into(),
                 })
                 .is_none());
@@ -724,14 +1047,24 @@ mod tests {
             requests: Mutex<Vec<PluginId>>,
         }
         impl PreviewDispatcher for RoutingEndpoint {
-            fn lookup(&self, owner: &PluginId, item: &ItemId) -> Option<(crikey_core::Item, u64)> {
+            fn lookup(
+                &self,
+                owner: &PluginId,
+                item: &ItemId,
+                _: Option<&crate::plugin_action::DeclaredCommandSource>,
+            ) -> Option<(crikey_core::Item, u64)> {
                 self.items
                     .iter()
                     .find(|candidate| &candidate.plugin_id == owner && &candidate.stable_id == item)
                     .cloned()
                     .map(|item| (item, 7))
             }
-            fn origin(&self, owner: &PluginId, item: &ItemId) -> Option<u64> {
+            fn origin(
+                &self,
+                owner: &PluginId,
+                item: &ItemId,
+                _: Option<&crate::plugin_action::DeclaredCommandSource>,
+            ) -> Option<u64> {
                 self.items
                     .iter()
                     .any(|candidate| &candidate.plugin_id == owner && &candidate.stable_id == item)
@@ -757,7 +1090,12 @@ mod tests {
             }
             fn cancel(&self, _: &PreviewIdentity) {}
             fn foreground_blocked(&self, _: &PluginId) -> bool {
+                // This routing fixture admits previews only, never actions.
                 false
+            }
+            fn foreground_conflicts(&self, preview_owner: &PluginId, action_owner: &PluginId) -> bool {
+                preview_owner == action_owner
+                    && self.items.iter().any(|item| &item.plugin_id == preview_owner)
             }
         }
         let owners = ["native.first", "native.second", "modern.third"].map(|owner| PluginId(owner.into()));
@@ -793,9 +1131,16 @@ mod tests {
         let mut row = model.selected_preview_row().unwrap().clone();
         let generation = model.preview_selection().unwrap().generation;
         let search = crate::SearchService::new(crate::App::new());
-        row.item = ItemId("shared".into());
         for owner in &owners {
-            row.plugin = owner.clone();
+            row.target = crikey_ui::ActionTarget::Result {
+                owner: owner.clone(),
+                item: ItemId("shared".into()),
+            };
+            row.source = Some(crikey_ui::ResultSource {
+                owner: owner.clone(),
+                item: ItemId("shared".into()),
+                kind: crikey_ui::ResultSourceKind::Ordinary,
+            });
             model.publish(generation, vec![row.clone()], false);
             service.endpoints.clear();
             service.synchronize(&mut model, &search);
@@ -833,7 +1178,11 @@ mod tests {
             let mut row = model.selected_preview_row().unwrap().clone();
             match boundary {
                 0 => {
-                    row.item = ItemId("new-selection".into());
+                    row.target = crikey_ui::ActionTarget::Result {
+                        owner: identity.plugin.clone(),
+                        item: ItemId("new-selection".into()),
+                    };
+                    row.source.as_mut().unwrap().item = ItemId("new-selection".into());
                     model.publish(identity.query, vec![row], false);
                 }
                 1 | 2 => {
@@ -859,5 +1208,37 @@ mod tests {
             assert!(service.active.is_none());
             assert!(service.presented.is_none());
         }
+    }
+
+    #[test]
+    fn foreground_retirement_fences_even_content_completed_before_cancellation() {
+        let (mut service, mut model, _, identity) = active_preview();
+        let content = Arc::new(
+            crikey_ui::prepare_preview(Arc::new(PreviewContent {
+                text: Some(crikey_core::PreviewText::Plain("must not revive".into())),
+                ..Default::default()
+            }))
+            .unwrap(),
+        );
+        let retained = Arc::downgrade(&content);
+        (service.publish)(PreviewUpdate {
+            identity: identity.clone(),
+            state: PreviewState::Content(content),
+        });
+        service.retire_for_foreground(&mut model, &identity.plugin);
+        assert!(
+            service.active.is_some(),
+            "cancellation is not a fabricated terminal"
+        );
+        service.synchronize(&mut model, &crate::SearchService::new(crate::App::new()));
+        assert!(service.active.is_none());
+        assert!(service.presented.is_none());
+        let frame = model.frame().unwrap();
+        assert!(frame.preview.link_target.is_none());
+        assert!(
+            !matches!(&frame.preview.status, Some(crikey_ui::PreviewStatus::Content(content))
+            if matches!(content.content.text.as_ref(), Some(crikey_core::PreviewText::Plain(text)) if text == "must not revive"))
+        );
+        assert!(retained.upgrade().is_none());
     }
 }

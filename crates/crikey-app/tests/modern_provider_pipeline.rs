@@ -1257,8 +1257,16 @@ fn catalog_only_deferred_preview_keeps_the_actual_producer_after_empty_suggest()
     model.publish(
         frame.generation,
         vec![crikey_ui::ResultRow {
-            plugin: item.plugin_id,
-            item: item.stable_id,
+            target: crikey_ui::ActionTarget::Result {
+                owner: item.plugin_id.clone(),
+                item: item.stable_id.clone(),
+            },
+            source: Some(crikey_ui::ResultSource {
+                owner: item.plugin_id,
+                item: item.stable_id,
+                kind: crikey_ui::ResultSourceKind::Ordinary,
+            }),
+            command_state: None,
             label: item.label,
             description: item.description,
             icon_reference: None,
@@ -1399,7 +1407,7 @@ fn modern_action_submission_is_nonblocking_and_budgeted() {
     assert_eq!(completion.request_id, first);
     assert_eq!(completion.plugin, action_plugin);
     assert_eq!(completion.item_id, item.stable_id);
-    assert_eq!(completion.action_id, ActionId("open".to_owned()));
+    assert_eq!(completion.action_id, Some(ActionId("open".to_owned())));
     assert_eq!(completion.outcome.unwrap(), crikey_app::ActionEffect::Completed);
     assert!(
         endpoint.poll_plugin_actions().is_empty(),

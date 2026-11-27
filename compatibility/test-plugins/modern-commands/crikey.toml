@@ -1,0 +1,22 @@
+manifest-version = 1
+
+# Opt in at worker startup with a package-working-directory command-ui-mode
+# file containing integration. Without it, existing declaration test modes stay
+# unchanged. Integration callbacks append to command-ui-executions.log (1 MiB).
+# The command-ui-pending query cooperatively waits five seconds; for observing
+# successful completion, an installed test copy may set [performance]
+# suggest-hard-timeout-ms = 10000. Otherwise a real timeout remains a failure.
+# Integration ui-shared uses a real deferred preview: COMMAND_UI_CATALOG and
+# https://example.invalid/command-fixture. The conflicting suggestion uses
+# COMMAND_UI_SUGGESTION and /command-fixture-suggestion. Callback witnesses go
+# to command-ui-previews.log (1 MiB); no document-open permission is granted.
+
+[plugin]
+id = "commands-fixture"
+name = "Modern Commands Fixture"
+version = "1.0.0"
+runtime = "python"
+entrypoint = "commands_plugin:CommandsPlugin"
+
+[python]
+requires-python = ">=3.12"

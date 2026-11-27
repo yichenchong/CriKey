@@ -9,13 +9,133 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use crate::plugin_page::PageUpdate;
 use crikey_core::{ActionId, CoreError, Item, ItemId, PageInput, PluginId, Result as CoreResult};
 use crikey_plugin_model::{permissions::admit_web_surface, FilesystemScope, Permissions};
 
-use crate::plugin_page::PageUpdate;
-
 type CompletionCallback = Arc<dyn Fn() + Send + Sync>;
 type ActionItems = Mutex<BTreeMap<(PluginId, ItemId), (Item, u64)>>;
+
+/// Exact provider publication backing an accepted canonical catalog.
+/// This is not a UI epoch or a live-worker requirement for command execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredCommandSource {
+    pub instance: u64,
+    pub generation: crikey_core::Generation,
+    pub producer: u64,
+    pub publication: u64,
+}
+
+/// Ordinary actions remain strict; only declared commands may call the
+/// genuinely actionless item callback.
+#[derive(Debug)]
+pub(crate) enum AdmittedPluginWork {
+    Action(ActionId),
+    Command {
+        declaration: crikey_core::command::CommandDeclaration,
+        action_id: Option<ActionId>,
+        source: DeclaredCommandSource,
+    },
+}
+
+impl AdmittedPluginWork {
+    pub(crate) fn action_id(&self) -> Option<&ActionId> {
+        match self {
+            Self::Action(id) => Some(id),
+            Self::Command { action_id, .. } => action_id.as_ref(),
+        }
+    }
+
+    pub(crate) fn command_source(
+        &self,
+    ) -> Option<(&crikey_core::command::CommandDeclaration, &DeclaredCommandSource)> {
+        match self {
+            Self::Command {
+                declaration, source, ..
+            } => Some((declaration, source)),
+            Self::Action(_) => None,
+        }
+    }
+
+    pub(crate) fn validate(&self, item: &Item, argument: Option<&str>) -> CoreResult<()> {
+        match self {
+            Self::Action(id) => {
+                let (action, _) = validate_action_item(item, id, argument)?;
+                if action.execution_policy != crikey_core::ExecutionPolicy::Plugin {
+                    return Err(CoreError::Invalid("selected action is not plugin-owned".into()));
+                }
+            }
+            Self::Command {
+                declaration,
+                action_id,
+                ..
+            } => {
+                if validate_declared_command_item(declaration, item, argument)?.as_ref() != action_id.as_ref()
+                {
+                    return Err(CoreError::Invalid(
+                        "declared command action changed after admission".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validate the canonical frozen target at both admission and execution.
+pub(crate) fn validate_declared_command_item(
+    declaration: &crikey_core::command::CommandDeclaration,
+    item: &Item,
+    argument: Option<&str>,
+) -> CoreResult<Option<ActionId>> {
+    use crikey_core::command::{CommandAvailability, ExecutableTarget};
+    declaration
+        .validate()
+        .map_err(|reason| CoreError::Invalid(reason.into()))?;
+    let ExecutableTarget::Item { item_id, action_id } = &declaration.executable_target else {
+        return Err(CoreError::Invalid(
+            "host command cannot be dispatched to a plugin".into(),
+        ));
+    };
+    if declaration.availability != CommandAvailability::Available
+        || declaration.reference.provider_id != item.plugin_id
+        || item_id != &item.stable_id
+        || declaration.argument_policy != item.argument_policy
+    {
+        return Err(CoreError::Invalid(
+            "declared command target or policy is no longer current".into(),
+        ));
+    }
+    match item.argument_policy {
+        crikey_core::ArgumentPolicy::Forbidden if argument.is_some() => {
+            return Err(CoreError::Invalid(
+                "this command does not accept an argument".into(),
+            ));
+        }
+        crikey_core::ArgumentPolicy::Required if argument.is_none_or(str::is_empty) => {
+            return Err(CoreError::Invalid("this command requires an argument".into()));
+        }
+        _ => {}
+    }
+    let mut ids = BTreeSet::new();
+    if item.actions.iter().any(|action| !ids.insert(&action.action_id)) {
+        return Err(CoreError::Invalid(
+            "declared command catalog has duplicate action IDs".into(),
+        ));
+    }
+    let selected = action_id
+        .as_ref()
+        .or_else(|| item.actions.first().map(|action| &action.action_id));
+    if let Some(selected) = selected {
+        let (action, _) = validate_action_item(item, selected, argument)?;
+        if action.execution_policy != crikey_core::ExecutionPolicy::Plugin {
+            return Err(CoreError::Invalid(
+                "declared command action is not plugin-owned".into(),
+            ));
+        }
+    }
+    Ok(selected.cloned())
+}
 
 /// Process-scoped terminal notification, independent of result/session wakes.
 /// Ring only after releasing the completion mailbox lock, so the receiver may
@@ -77,7 +197,7 @@ pub struct PluginActionCompletion {
     pub request_id: ActionRequestId,
     pub plugin: PluginId,
     pub item_id: ItemId,
-    pub action_id: ActionId,
+    pub action_id: Option<ActionId>,
     pub outcome: CoreResult<ActionEffect>,
 }
 
@@ -187,6 +307,19 @@ pub(crate) fn resolve_action_item(
 /// terminal completion is emitted, including transport failures, timeout,
 /// cancellation and worker reaping.
 pub trait PluginActionExecutor: Send + Sync {
+    /// Resolve and freeze only the exact canonical catalog publication.
+    /// Adapters without declaration support refuse, never use ordinary lookup.
+    fn submit_declared_command_with_receipt(
+        &self,
+        _declaration: &crikey_core::command::CommandDeclaration,
+        _source: &DeclaredCommandSource,
+        _argument: Option<&str>,
+    ) -> CoreResult<PluginActionReceipt> {
+        Err(CoreError::Invalid(
+            "runtime does not support declared commands".into(),
+        ))
+    }
+
     /// Admits `action_id` for an item belonging to `plugin`.
     fn submit_plugin_action(
         &self,
@@ -520,6 +653,20 @@ impl PluginActionRouter {
         })
     }
 
+    /// Canonical commands never resolve through suggestion-first item lookup.
+    pub fn submit_declared_command_with_receipt(
+        &self,
+        declaration: &crikey_core::command::CommandDeclaration,
+        source: &DeclaredCommandSource,
+        argument: Option<&str>,
+    ) -> CoreResult<PluginActionReceipt> {
+        let owner = &declaration.reference.provider_id;
+        self.providers
+            .get(owner)
+            .ok_or_else(|| CoreError::Invalid(format!("no action runtime owns plugin `{}`", owner.0)))?
+            .submit_declared_command_with_receipt(declaration, source, argument)
+    }
+
     /// Dispatches and obtains privacy evidence from the same accepted snapshot.
     pub fn submit(
         &self,
@@ -690,6 +837,77 @@ mod tests {
             metadata: BTreeMap::new(),
             actions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn declared_validation_keeps_exact_primary_action_policy_and_arguments() {
+        use crikey_core::command::{CommandAvailability, CommandDeclaration, CommandRef, ExecutableTarget};
+        use crikey_core::{Action, ExecutionPolicy};
+        let mut target = item("native.commands");
+        let mut declaration = CommandDeclaration {
+            reference: CommandRef {
+                provider_id: target.plugin_id.clone(),
+                command_id: "run".into(),
+            },
+            label: "Run".into(),
+            executable_target: ExecutableTarget::Item {
+                item_id: target.stable_id.clone(),
+                action_id: None,
+            },
+            availability: CommandAvailability::Available,
+            argument_policy: ArgumentPolicy::Forbidden,
+        };
+        let validate = |declaration: &CommandDeclaration, item: &Item, argument| {
+            super::validate_declared_command_item(declaration, item, argument)
+        };
+        assert_eq!(validate(&declaration, &target, None).unwrap(), None);
+        assert!(validate(&declaration, &target, Some("not allowed")).is_err());
+        target.actions.push(Action {
+            action_id: ActionId("primary".into()),
+            label: "Primary".into(),
+            description: String::new(),
+            applicable_categories: vec![Category::Keyword],
+            icon_reference: None,
+            execution_policy: ExecutionPolicy::Plugin,
+        });
+        let mut alternate = target.actions[0].clone();
+        alternate.action_id = ActionId("alternate".into());
+        target.actions.push(alternate);
+        assert_eq!(
+            validate(&declaration, &target, None).unwrap(),
+            Some(ActionId("primary".into()))
+        );
+        declaration.executable_target = ExecutableTarget::Item {
+            item_id: target.stable_id.clone(),
+            action_id: Some(ActionId("alternate".into())),
+        };
+        assert_eq!(
+            validate(&declaration, &target, None).unwrap(),
+            Some(ActionId("alternate".into()))
+        );
+        target.actions[1].applicable_categories = vec![Category::Application];
+        assert!(validate(&declaration, &target, None).is_err());
+        target.actions[1].applicable_categories.clear();
+        target.actions[1].execution_policy = ExecutionPolicy::HostMediated;
+        assert!(validate(&declaration, &target, None).is_err());
+        target.actions[1].execution_policy = ExecutionPolicy::Plugin;
+        target.actions.push(target.actions[1].clone());
+        assert!(
+            validate(&declaration, &target, None).is_err(),
+            "ambiguous IDs never select the first match"
+        );
+        target.actions.pop();
+        target.argument_policy = ArgumentPolicy::Required;
+        assert!(
+            validate(&declaration, &target, Some("captured")).is_err(),
+            "policy equality is authoritative"
+        );
+        declaration.argument_policy = ArgumentPolicy::Required;
+        assert!(validate(&declaration, &target, None).is_err());
+        assert!(validate(&declaration, &target, Some("")).is_err());
+        assert!(validate(&declaration, &target, Some("captured as one string")).is_ok());
+        target.plugin_id = PluginId("other.owner".into());
+        assert!(validate(&declaration, &target, Some("captured")).is_err());
     }
 
     #[test]
@@ -1131,7 +1349,7 @@ mod tests {
                     request_id: request_id_for_thread,
                     plugin,
                     item_id,
-                    action_id,
+                    action_id: Some(action_id),
                     outcome: Ok(super::ActionEffect::Completed),
                 });
             });

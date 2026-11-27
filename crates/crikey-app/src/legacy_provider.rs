@@ -486,6 +486,7 @@ pub struct LegacyProvider {
     /// `LegacyRuntime::deliver`, whose lifecycle accounting intentionally
     /// treats plugin exceptions as accepted callbacks.
     catalog_failures: BTreeMap<PluginId, String>,
+    suggestion_outcomes: BTreeMap<PluginId, BatchState>,
     action_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     /// Content root of each loaded package, so the icon resolver can read the
@@ -561,6 +562,7 @@ impl LegacyProvider {
             cancellation,
             catalog_requests: Vec::new(),
             catalog_failures: BTreeMap::new(),
+            suggestion_outcomes: BTreeMap::new(),
             action_items: Arc::new(Mutex::new(BTreeMap::new())),
             catalog_items: Arc::new(Mutex::new(BTreeMap::new())),
             package_dirs: BTreeMap::new(),
@@ -1042,6 +1044,7 @@ impl LegacyProvider {
         now: Millis,
     ) -> Option<ViewModel> {
         let generation = pipeline.keystroke(query, now);
+        self.suggestion_outcomes.clear();
         let (mut suggestions, dead_plugins) = self.collect_suggestions(query, now);
 
         let tick = pipeline.tick(now);
@@ -1063,7 +1066,11 @@ impl LegacyProvider {
                 ResultBatch {
                     generation: request.generation,
                     plugin: request.plugin.clone(),
-                    state: BatchState::Final,
+                    state: self
+                        .suggestion_outcomes
+                        .get(&request.plugin)
+                        .copied()
+                        .unwrap_or(BatchState::Failed),
                     items,
                 },
                 now,
@@ -1123,6 +1130,14 @@ impl LegacyProvider {
     fn settle(&mut self, now: Millis) {
         let replies = self.runtime.worker_mut().drain_replies();
         for response in replies {
+            if response.callback == LegacyCallback::OnSuggest {
+                let state = match &response.outcome {
+                    LegacyOutcome::Suggestions(_) => BatchState::Final,
+                    LegacyOutcome::Abandoned => BatchState::Cancelled,
+                    _ => BatchState::Failed,
+                };
+                self.suggestion_outcomes.insert(response.plugin.clone(), state);
+            }
             if response.callback == LegacyCallback::OnCatalog {
                 if let LegacyOutcome::Failed(error) = &response.outcome {
                     self.catalog_failures.insert(
@@ -1373,7 +1388,11 @@ fn enqueue_legacy_completion(
     if mailbox.len() >= ACTION_COMPLETION_CAPACITY {
         eprintln!(
             "crikey: legacy action completion mailbox overflow for {} / {}",
-            completion.plugin.0, completion.action_id.0
+            completion.plugin.0,
+            completion
+                .action_id
+                .as_ref()
+                .map_or("default callback", |action| action.0.as_str())
         );
         return;
     }
@@ -1441,6 +1460,7 @@ pub struct LegacyDriver {
     /// reaching into the pipeline it does not own.
     health: Arc<Mutex<Vec<(PluginId, PluginHealth)>>>,
     outcome: Arc<Mutex<Option<ViewModel>>>,
+    search_summary: Arc<Mutex<Option<crate::query_pipeline::OrdinarySearchSummary>>>,
     /// Search generation the UI last submitted. The supervisor re-reads it
     /// before publishing and drops any answer that is no longer current.
     current: Arc<AtomicU64>,
@@ -1479,6 +1499,7 @@ impl LegacyDriver {
             Condvar::new(),
         ));
         let outcome = Arc::new(Mutex::new(None));
+        let search_summary = Arc::new(Mutex::new(None));
         let catalog_results = Arc::new(Mutex::new(Vec::new()));
         let health = Arc::new(Mutex::new(Vec::new()));
         let current = Arc::new(AtomicU64::new(0));
@@ -1502,6 +1523,7 @@ impl LegacyDriver {
         let thread_catalog_results = Arc::clone(&catalog_results);
         let thread_health = Arc::clone(&health);
         let thread_outcome = Arc::clone(&outcome);
+        let thread_search_summary = Arc::clone(&search_summary);
         let thread_current = Arc::clone(&current);
         let thread_completion_mailbox = Arc::clone(&completion_mailbox);
         let thread_action_wake = action_endpoint.action_wake.clone();
@@ -1540,7 +1562,7 @@ impl LegacyDriver {
                                             request_id: request.request_id.clone(),
                                             plugin: request.plugin.clone(),
                                             item_id: request.item_id.clone(),
-                                            action_id: request.action_id.clone(),
+                                            action_id: Some(request.action_id.clone()),
                                             outcome: Err(crikey_core::CoreError::Cancelled),
                                         },
                                     );
@@ -1601,7 +1623,7 @@ impl LegacyDriver {
                                     request_id,
                                     plugin,
                                     item_id,
-                                    action_id,
+                                    action_id: Some(action_id),
                                     outcome: outcome.map(|()| crate::ActionEffect::Completed),
                                 },
                             );
@@ -1650,6 +1672,8 @@ impl LegacyDriver {
                         settings_open: false,
                         settings: Arc::default(),
                         settings_focus: None,
+                        command_management: Arc::default(),
+                        setting_edits: Arc::default(),
                         show_hints: true,
                         rounded_corners: true,
                         page: None,
@@ -1668,6 +1692,11 @@ impl LegacyDriver {
                     {
                         continue;
                     }
+                    let mut summary = pipeline.ordinary_search_summary(0);
+                    summary.generation = job.generation;
+                    *thread_search_summary
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(summary);
                     *thread_outcome.lock().unwrap_or_else(|error| error.into_inner()) = Some(merged.clone());
                     publish(&merged);
                     drop(slot);
@@ -1681,6 +1710,7 @@ impl LegacyDriver {
                 catalog_results,
                 health,
                 outcome,
+                search_summary,
                 current,
                 cancellation,
                 has_plugins,
@@ -1693,6 +1723,7 @@ impl LegacyDriver {
                 catalog_results,
                 health,
                 outcome,
+                search_summary,
                 current,
                 cancellation,
                 has_plugins: false,
@@ -1758,6 +1789,26 @@ impl LegacyDriver {
         if slot.stop {
             return;
         }
+        *self
+            .search_summary
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(crate::query_pipeline::OrdinarySearchSummary {
+                view: 0,
+                generation,
+                providers: self
+                    .plugins()
+                    .into_iter()
+                    .map(|plugin| crate::query_pipeline::OrdinarySearchProvider {
+                        plugin,
+                        state: if self.worker.is_some() {
+                            crate::command_preferences::OrdinaryProviderState::Pending
+                        } else {
+                            crate::command_preferences::OrdinaryProviderState::Failed
+                        },
+                    })
+                    .collect(),
+            });
         slot.job = Some(LegacyJob {
             generation,
             query: query.to_owned(),
@@ -1778,6 +1829,20 @@ impl LegacyDriver {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
+    }
+
+    /// Latest admitted query's evidence, independently of optional frame publication.
+    /// The root view is supplied by the composition owner and must be checked with generation.
+    pub fn ordinary_search_summary(&self, view: u64) -> Option<crate::query_pipeline::OrdinarySearchSummary> {
+        let generation = Generation::from_raw(self.current.load(Ordering::Acquire));
+        let mut summary = self
+            .search_summary
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .filter(|summary| summary.generation == generation)?;
+        summary.view = view;
+        Some(summary)
     }
 
     /// Whether any legacy plugin loaded and is being served by the supervisor.

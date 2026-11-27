@@ -775,6 +775,22 @@ fn crash(reason: &str) -> ! {
 }
 
 impl Plugin for ConformancePlugin {
+    fn supports_commands(&self) -> bool {
+        matches!(self.mode, Mode::Acceptance)
+    }
+
+    fn commands(&mut self, context: &dyn PluginContext) -> Result<crikey_plugin_sdk::PluginCommands> {
+        if context.cancellation().is_cancelled() {
+            return Ok(crikey_plugin_sdk::PluginCommands::Cancelled);
+        }
+        if !self.supports_commands() {
+            return Ok(crikey_plugin_sdk::PluginCommands::Unsupported);
+        }
+        Ok(crikey_plugin_sdk::PluginCommands::Declarations(vec![
+            crikey_plugin_sdk::CommandBuilder::new("conformance-one", "Conformance one", "catalog-1")
+                .build()?,
+        ]))
+    }
     fn start(&mut self, _context: &dyn PluginContext) -> Result<()> {
         if matches!(self.mode, Mode::CrashOnStart) {
             crash("crash-on-start requested");

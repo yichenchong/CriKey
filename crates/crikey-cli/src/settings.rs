@@ -60,6 +60,11 @@ pub(crate) const LAUNCHER_SETTINGS: &[(&str, &str, bool)] = &[
         "Query history (off, session, persistent)",
         false,
     ),
+    (
+        "launcher.command-home",
+        "Command home (compact, favorites, recent, favorites-and-recent)",
+        false,
+    ),
 ];
 
 pub(crate) fn apply_navigation_preferences(
@@ -109,13 +114,17 @@ pub(crate) fn rows(store: Option<&ConfigStore>) -> Vec<SettingRow> {
                 .unwrap_or(match *key {
                     "launcher.resume-delay-ms" => "0",
                     "launcher.query-history" => "session",
+                    "launcher.command-home" => "compact",
                     _ => "",
                 })
                 .to_owned();
             let source = store
                 .and_then(|store| store.layer_of(key))
                 .map_or(
-                    if matches!(*key, "launcher.resume-delay-ms" | "launcher.query-history") {
+                    if matches!(
+                        *key,
+                        "launcher.resume-delay-ms" | "launcher.query-history" | "launcher.command-home"
+                    ) {
                         "builtin-defaults"
                     } else {
                         UNSET
@@ -219,6 +228,10 @@ pub(crate) fn validate(key: &str, value: &str) -> Result<(), String> {
         return Err(format!("`{key}` cannot be set to an empty value"));
     }
     match key {
+        "launcher.command-home" => match value {
+            "compact" | "favorites" | "recent" | "favorites-and-recent" => Ok(()),
+            _ => Err("Command home must be compact, favorites, recent, or favorites-and-recent".into()),
+        },
         "launcher.resume-delay-ms" => value
             .parse::<u64>()
             .map(|_| ())
@@ -287,10 +300,18 @@ pub(crate) fn validate(key: &str, value: &str) -> Result<(), String> {
 /// write as effective would be lying about which chord the launcher answers to.
 pub(crate) fn persist(store: &mut ConfigStore, key: &str, value: &str) -> Result<String, String> {
     validate(key, value)?;
-    store.set_user_global(key, value);
+    let expected = store.revision();
     store
-        .save()
-        .map_err(|error| format!("`{key}` could not be written: {error}"))?;
+        .commit_user_global(key, value, &expected)
+        .map_err(|error| match error {
+            crikey_config::ConfigError::Conflict => {
+                "Configuration changed; reload and retry this edit".to_owned()
+            }
+            crikey_config::ConfigError::PersistedReload => {
+                "Setting was saved, but the effective configuration could not be reloaded".to_owned()
+            }
+            _ => format!("`{key}` could not be written"),
+        })?;
     let effective = store.get(key).unwrap_or_default();
     if effective == value {
         Ok(format!("{key} = {value}"))
@@ -446,46 +467,6 @@ impl ActivationHotkey {
     }
 }
 
-/// Applies one `SetSetting` the settings surface asked the host to persist, and
-/// re-binds the accelerator when that is the key that changed.
-///
-/// One function for both halves because they must never disagree: a chord
-/// written to disk that the running process is not listening for is the same
-/// trap as a chord the process holds that no file records.
-pub(crate) fn apply_setting(
-    store: Option<&mut ConfigStore>,
-    hotkey: &mut ActivationHotkey,
-    registrar: &mut dyn HotkeyRegistrar,
-    key: &str,
-    value: &str,
-) -> String {
-    let Some(store) = store else {
-        return format!(
-            "{key} was not saved: this launch could not read its configuration and is running on \
-             built-in defaults"
-        );
-    };
-    let saved = match persist(store, key, value) {
-        Ok(report) => report,
-        Err(refusal) => return refusal,
-    };
-    if key != KEY_ACTIVATION_HOTKEY {
-        return saved;
-    }
-    // The value that WINS, not the value that was written: a profile may still
-    // outrank the user's file, and the launcher must listen for the chord it
-    // reports rather than the one the panel typed.
-    let effective = configured_hotkey(Some(store));
-    match hotkey.bind(registrar, &effective) {
-        Ok(None) => saved,
-        Ok(Some(warning)) => format!("{saved}; {warning}"),
-        Err(reason) => format!(
-            "{saved}, but {effective} could not be registered ({reason}); {} stays in force",
-            hotkey.bound().unwrap_or("no activation hotkey")
-        ),
-    }
-}
-
 /// Arms the launcher to come up with the settings panel open on the hotkey row,
 /// and returns the diagnostic the caller must also record.
 ///
@@ -546,6 +527,9 @@ pub(crate) fn residency(effect: &UiEffect) -> Option<Residency> {
         | UiEffect::ClearQueryHistory
         | UiEffect::InputBatch { .. }
         | UiEffect::Execute { .. }
+        | UiEffect::InvokeCommand { .. }
+        | UiEffect::MutateCommandPreferences { .. }
+        | UiEffect::ResetCommandRanking { .. }
         | UiEffect::OpenPreviewLink { .. }
         | UiEffect::SetSetting { .. }
         | UiEffect::PageInput(_)
@@ -810,6 +794,7 @@ mod tests {
         assert_eq!(residency(&UiEffect::Query("x".to_owned())), None);
         assert_eq!(
             residency(&UiEffect::SetSetting {
+                request_id: crikey_ui::next_setting_edit_id(),
                 key: KEY_MAX_RESULTS.to_owned(),
                 value: "5".to_owned(),
             }),
@@ -939,13 +924,10 @@ mod tests {
             .expect("the default chord is free");
         assert_eq!(hotkey.bound(), Some("Ctrl+Alt+Space"));
 
-        let report = apply_setting(
-            Some(&mut store),
-            &mut hotkey,
-            &mut registrar,
-            KEY_ACTIVATION_HOTKEY,
-            "Ctrl+Shift+P",
-        );
+        let report = persist(&mut store, KEY_ACTIVATION_HOTKEY, "Ctrl+Shift+P").unwrap();
+        hotkey
+            .bind(&mut registrar, &configured_hotkey(Some(&store)))
+            .unwrap();
 
         assert_eq!(report, "launcher.activation-hotkey = Ctrl+Shift+P");
         assert_eq!(
@@ -972,16 +954,16 @@ mod tests {
             .bind(&mut registrar, "Ctrl+Alt+Space")
             .expect("the default chord is free");
 
-        let report = apply_setting(
-            Some(&mut store),
-            &mut hotkey,
-            &mut registrar,
-            KEY_ACTIVATION_HOTKEY,
-            "Ctrl+Shift+P",
+        persist(&mut store, KEY_ACTIVATION_HOTKEY, "Ctrl+Shift+P").unwrap();
+        let refusal = hotkey
+            .bind(&mut registrar, &configured_hotkey(Some(&store)))
+            .unwrap_err();
+        assert!(!refusal.is_empty());
+        assert_eq!(
+            store.get(KEY_ACTIVATION_HOTKEY),
+            Some("Ctrl+Shift+P"),
+            "desired configuration remains distinct from the held OS binding"
         );
-
-        assert!(report.contains("could not be registered"), "{report}");
-        assert!(report.contains("Ctrl+Alt+Space stays in force"), "{report}");
         assert_eq!(hotkey.bound(), Some("Ctrl+Alt+Space"));
         assert_eq!(registrar.live(), vec!["Ctrl+Alt+Space"]);
     }
@@ -990,16 +972,9 @@ mod tests {
     fn an_unparseable_accelerator_never_reaches_the_configuration_file() {
         let directory = ConfigDir::new("hotkey-garbage");
         let mut store = directory.store();
-        let mut hotkey = ActivationHotkey::default();
-        let mut registrar = FakeRegistrar::default();
+        let registrar = FakeRegistrar::default();
 
-        let report = apply_setting(
-            Some(&mut store),
-            &mut hotkey,
-            &mut registrar,
-            KEY_ACTIVATION_HOTKEY,
-            "Ctrl+",
-        );
+        let report = persist(&mut store, KEY_ACTIVATION_HOTKEY, "Ctrl+").unwrap_err();
 
         assert!(report.contains("not a valid accelerator"), "{report}");
         assert!(registrar.log.is_empty(), "{:?}", registrar.log);
@@ -1032,13 +1007,10 @@ mod tests {
             .bind(&mut registrar, "Ctrl+Alt+K")
             .expect("the profile's chord is free");
 
-        let report = apply_setting(
-            Some(&mut store),
-            &mut hotkey,
-            &mut registrar,
-            KEY_ACTIVATION_HOTKEY,
-            "Ctrl+Shift+P",
-        );
+        let report = persist(&mut store, KEY_ACTIVATION_HOTKEY, "Ctrl+Shift+P").unwrap();
+        hotkey
+            .bind(&mut registrar, &configured_hotkey(Some(&store)))
+            .unwrap();
 
         assert!(report.contains("still supplies Ctrl+Alt+K"), "{report}");
         assert_eq!(
@@ -1234,21 +1206,6 @@ mod tests {
 
         let refused = persist(&mut store, "launcher.nope", "x").expect_err("an unknown key is not a setting");
         assert!(refused.contains("is not a launcher setting"), "{refused}");
-    }
-
-    #[test]
-    fn a_configuration_that_could_not_be_loaded_refuses_the_write_instead_of_dropping_it() {
-        let mut hotkey = ActivationHotkey::default();
-        let mut registrar = FakeRegistrar::default();
-        let report = apply_setting(
-            None,
-            &mut hotkey,
-            &mut registrar,
-            KEY_ACTIVATION_HOTKEY,
-            "Ctrl+Shift+P",
-        );
-        assert!(report.contains("was not saved"), "{report}");
-        assert!(registrar.log.is_empty(), "{:?}", registrar.log);
     }
 
     #[test]

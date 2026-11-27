@@ -441,6 +441,9 @@ fn a_legacy_items_default_action_executes_in_its_owning_plugin() {
         sleep(Duration::from_millis(5));
     }
     let row = row.expect("the legacy plugin must offer a suggestion to launch");
+    let crikey_ui::ActionTarget::Result { item: item_id, .. } = &row.target else {
+        panic!("the legacy suggestion must retain ordinary result identity");
+    };
     let action = row
         .default_action
         .clone()
@@ -448,7 +451,7 @@ fn a_legacy_items_default_action_executes_in_its_owning_plugin() {
     assert_eq!(action.execution_policy, ExecutionPolicy::Plugin);
 
     let request_id = router
-        .submit_by_item_id(&row.item, &action.action_id, None)
+        .submit_by_item_id(item_id, &action.action_id, None)
         .expect("the exact owner admits its own row's default action");
     assert_eq!(request_id.plugin, well_behaved);
 
@@ -463,8 +466,8 @@ fn a_legacy_items_default_action_executes_in_its_owning_plugin() {
 
     assert_eq!(completion.request_id, request_id);
     assert_eq!(completion.plugin, well_behaved);
-    assert_eq!(completion.item_id, row.item);
-    assert_eq!(completion.action_id, action.action_id);
+    assert_eq!(&completion.item_id, item_id);
+    assert_eq!(completion.action_id, Some(action.action_id));
     assert_eq!(completion.outcome.unwrap(), crikey_app::ActionEffect::Completed);
     assert!(router.poll().is_empty(), "completion drains once");
 
@@ -527,6 +530,9 @@ fn a_legacy_action_refused_by_its_budget_is_reported_as_an_action_refusal() {
         sleep(Duration::from_millis(5));
     }
     let row = row.expect("the legacy plugin must offer a suggestion to launch");
+    let crikey_ui::ActionTarget::Result { item: item_id, .. } = &row.target else {
+        panic!("the legacy suggestion must retain ordinary result identity");
+    };
     let action = row
         .default_action
         .clone()
@@ -538,7 +544,7 @@ fn a_legacy_action_refused_by_its_budget_is_reported_as_an_action_refusal() {
         .try_acquire_owned(BudgetKind::Action)
         .expect("the declared action slot admits the first unit");
     let error = router
-        .submit_by_item_id(&row.item, &action.action_id, None)
+        .submit_by_item_id(item_id, &action.action_id, None)
         .expect_err("a second action must be refused while the only slot is held");
     assert!(
         error.to_string().contains("action budget is full"),
