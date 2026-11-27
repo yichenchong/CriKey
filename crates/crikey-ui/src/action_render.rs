@@ -152,6 +152,11 @@ pub(super) fn draw(
                 })
             {
                 commands.push(UiCommand::ActivateSelectedAction);
+                // Return relinquishes TextEdit focus even when the host keeps
+                // this panel open (for example after refusing an input batch).
+                // Retain this editor, without reclaiming focus on later paints
+                // from argument editors or another surface.
+                response.request_focus();
             }
             // Follow selection/layout changes, not repaints: wheel and scrollbar
             // gestures must be free to leave the selected entry off screen.
