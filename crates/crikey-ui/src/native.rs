@@ -546,6 +546,7 @@ fn prepare_action_input(
         let token = NEXT_INPUT
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
             .expect("native input identity exhausted");
+        let focus = context.memory(|memory| memory.focused());
         let settings_owner = model
             .settings_open
             .then(|| {
@@ -561,14 +562,10 @@ fn prepare_action_input(
                     source: Arc::new(crate::ActionInputCheckpoint::of(model)),
                     focus_ready: false,
                     settings_owner,
-                    typed_focus: model
-                        .navigation
-                        .inline_arguments
-                        .as_ref()
-                        .and_then(|_| context.memory(|memory| memory.focused())),
+                    typed_focus: model.navigation.inline_arguments.as_ref().and(focus),
                     events,
                     navigation: navigation.clone(),
-                    focus: context.memory(|memory| memory.focused()),
+                    focus,
                     focus_lifetime: model.navigation.focus_lifetime,
                 }),
             );
