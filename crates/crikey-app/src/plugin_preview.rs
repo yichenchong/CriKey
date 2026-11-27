@@ -849,7 +849,10 @@ mod tests {
             model.publish(identity.query, vec![row.clone()], false);
             service.synchronize(&mut model, &search);
             assert_eq!(model.preview_selection(), Some(selection.clone()));
-            assert_eq!(model.frame().unwrap().preview.status, Some(PreviewStatus::Loading));
+            assert_eq!(
+                model.frame().unwrap().preview.status,
+                Some(PreviewStatus::Loading)
+            );
             assert_eq!(service.active.as_ref().map(|(active, _)| active), Some(&identity));
             assert!(service.metadata.is_none());
 
