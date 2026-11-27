@@ -308,9 +308,196 @@ pub fn build_launcher_frame(context: &egui::Context, input: RawInput, model: &Vi
     )
 }
 
+#[derive(Clone)]
+struct DeferredActionInput {
+    token: u64,
+    source: Arc<crate::ActionInputCheckpoint>,
+    focus_ready: bool,
+    events: Vec<egui::Event>,
+}
+
+fn action_input_queue() -> egui::Id {
+    egui::Id::new("crikey-action-input-tail")
+}
+
+fn has_action_input(context: &egui::Context) -> bool {
+    context.data(|data| data.get_temp::<u64>(action_input_queue()).is_some())
+}
+
+fn clear_action_input(context: &egui::Context) {
+    context.data_mut(|data| {
+        data.remove::<Option<DeferredActionInput>>(action_input_queue());
+        data.remove::<u64>(action_input_queue());
+        data.remove::<bool>(egui::Id::new("crikey-action-ime"));
+    });
+}
+
+/// Remove a host key from the focused editor's stream. The existing TextEdit
+/// admits only its prefix; a host receipt, not an egui repaint, releases its tail.
+fn prepare_action_input(
+    context: &egui::Context,
+    input: &mut RawInput,
+    model: &ViewModel,
+) -> (Option<UiCommand>, bool, bool) {
+    let editor = egui::Id::new("crikey-action-search");
+    let focused = input.focused
+        && !input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::WindowFocused(false)));
+    let pending = context
+        .data_mut(|data| data.remove_temp::<Option<DeferredActionInput>>(action_input_queue()))
+        .flatten();
+    context.data_mut(|data| data.remove::<u64>(action_input_queue()));
+    let mut resumed = false;
+    if let Some(mut pending) = pending {
+        let receipt = model
+            .input_receipt
+            .as_ref()
+            .filter(|receipt| receipt.token == pending.token);
+        let owner = receipt.map_or(pending.source.as_ref(), |receipt| &receipt.owner);
+        let editor_owned = model.action_panel.as_ref().is_none_or(|panel| {
+            pending
+                .source
+                .panel
+                .as_ref()
+                .is_none_or(|before| before.focus_token() != panel.focus_token())
+                || context.memory(|memory| memory.focused() == Some(editor))
+        });
+        let valid = focused
+            && editor_owned
+            && receipt.is_none_or(|receipt| receipt.accepted)
+            && owner.matches(
+                model.view,
+                model.generation,
+                &model.query,
+                model.rows.get(model.selected),
+                model.action_panel.as_ref(),
+                (model.preview.focused, model.preview.detail),
+                model.navigation.standard.as_ref(),
+                model.navigation.standard_refresh_pending,
+                model.navigation.inline_arguments.as_ref().map(|input| (input.revision, input.draft_revision)),
+            );
+        if valid {
+            pending.events.append(&mut input.events);
+            if receipt.is_none()
+                || (model.settings_open && owner.view != pending.source.view && !pending.focus_ready)
+            {
+                // Establish a fresh Settings surface's ordinary editor focus
+                // once before delivering the retained stream.
+                let establish_focus = receipt.is_some();
+                pending.focus_ready |= establish_focus;
+                context.data_mut(|data| {
+                    data.insert_temp(action_input_queue(), pending.token);
+                    data.insert_temp(action_input_queue(), Some(pending));
+                });
+                if establish_focus {
+                    context.request_repaint();
+                }
+                return (None, true, false);
+            }
+            if model.action_panel.is_some() {
+                context.memory_mut(|memory| memory.request_focus(editor));
+            } else if !model.settings_open && model.page.is_none() && !model.preview.focused {
+                context.memory_mut(|memory| memory.request_focus(egui::Id::new("crikey-root-search")));
+            }
+            input.events = pending.events;
+            resumed = true;
+        } else {
+            // Only the obsolete suffix is retired. Distinct newer keys were
+            // held by native ingress too, and still belong to the current view.
+            resumed = focused && !input.events.is_empty();
+            if resumed {
+                if model.action_panel.is_some() {
+                    context.memory_mut(|memory| memory.request_focus(editor));
+                } else if !model.settings_open && model.page.is_none() && !model.preview.focused {
+                    context.memory_mut(|memory| memory.request_focus(egui::Id::new("crikey-root-search")));
+                }
+            }
+        }
+    }
+    if !focused || (model.action_panel.is_none() && !resumed) {
+        return (None, false, resumed);
+    }
+    if model.action_panel.is_some() && !context.memory(|memory| memory.focused() == Some(editor)) {
+        return (None, false, resumed);
+    }
+    let mut composing = context.data(|data| {
+        data.get_temp::<bool>(egui::Id::new("crikey-action-ime"))
+            .unwrap_or(false)
+    });
+    let mut boundary = None;
+    for (index, event) in input.events.iter().enumerate() {
+        match event {
+            egui::Event::Ime(egui::ImeEvent::Enabled) => composing = true,
+            egui::Event::Ime(egui::ImeEvent::Preedit(text)) => composing |= !text.is_empty(),
+            egui::Event::Ime(egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled) => composing = false,
+            egui::Event::Key {
+                key,
+                modifiers,
+                pressed: true,
+                ..
+            } if !composing => {
+                let command = if model.action_panel.is_some() {
+                    if let Some(command @ (UiCommand::ShowActions | UiCommand::OpenSettings)) =
+                        deferred_root_key(*key, *modifiers, model)
+                    {
+                        command
+                    } else {
+                        if !modifiers.matches_logically(egui::Modifiers::NONE) {
+                            continue;
+                        }
+                        match key {
+                            // TextEdit owns Return and its existing suffix rule.
+                            egui::Key::Enter => break,
+                            egui::Key::ArrowDown => UiCommand::SelectNext,
+                            egui::Key::ArrowUp => UiCommand::SelectPrevious,
+                            egui::Key::PageDown => UiCommand::PageDown,
+                            egui::Key::PageUp => UiCommand::PageUp,
+                            egui::Key::Escape => UiCommand::ActionBack,
+                            _ => continue,
+                        }
+                    }
+                } else if let Some(command) = deferred_root_key(*key, *modifiers, model) {
+                    command
+                } else {
+                    continue;
+                };
+                boundary = Some((index, command));
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some((index, command)) = boundary else {
+        return (None, false, resumed);
+    };
+    let events = input.events.split_off(index + 1);
+    input.events.pop();
+    if !events.is_empty() {
+        static NEXT_INPUT: AtomicU64 = AtomicU64::new(1);
+        let token = NEXT_INPUT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .expect("native input identity exhausted");
+        context.data_mut(|data| {
+            data.insert_temp(action_input_queue(), token);
+            data.insert_temp(
+                action_input_queue(),
+                Some(DeferredActionInput {
+                    token,
+                    source: Arc::new(crate::ActionInputCheckpoint::of(model)),
+                    focus_ready: false,
+                    events,
+                }),
+            );
+        });
+    }
+    (Some(command), false, resumed)
+}
+
 fn build_launcher_frame_with_transparency(
     context: &egui::Context,
-    input: RawInput,
+    mut input: RawInput,
     model: &ViewModel,
     transparent: bool,
     native_web_input: bool,
@@ -332,6 +519,8 @@ fn build_launcher_frame_with_transparency(
             pointer.position = previous_position;
         }
     }
+    let (action_boundary, waiting_for_input, resumed_input) =
+        prepare_action_input(context, &mut input, model);
     let mut commands = Vec::new();
     let mut pass_commands = Vec::new();
     let mut first_pass = true;
@@ -396,6 +585,40 @@ fn build_launcher_frame_with_transparency(
                     },
                 };
             }
+        }
+    }
+    if waiting_for_input {
+        commands.clear();
+    } else {
+        let host_boundary = action_boundary.is_some();
+        if let Some(command) = action_boundary {
+            commands.push(command);
+        }
+        let edited_action_query = model.action_panel.is_some()
+            && commands.len() > 1
+            && commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::SetActionQuery(_)));
+        let ordered = resumed_input
+            || has_action_input(context)
+            || (edited_action_query
+                && (host_boundary
+                    || commands.iter().any(|command| {
+                        matches!(
+                            command,
+                            UiCommand::ActivateSelectedAction
+                                | UiCommand::ActivateAction { .. }
+                                | UiCommand::StandardActivate { .. }
+                                | UiCommand::StandardDoubleClick { .. }
+                        )
+                    })));
+        if ordered && !commands.is_empty() {
+            let continuation = context.data(|data| data.get_temp::<u64>(action_input_queue()));
+            commands = vec![UiCommand::ApplyInputBatch {
+                continuation,
+                source: Arc::new(crate::ActionInputCheckpoint::of(model)),
+                commands,
+            }];
         }
     }
     NativeUiFrame { output, commands }
@@ -497,6 +720,9 @@ struct SharedState {
 /// hands.
 #[derive(Debug, Clone)]
 struct Overlay {
+    view: Option<crate::ViewId>,
+    input_receipt: Option<Arc<crate::ActionInputReceipt>>,
+    action_panel: Option<Arc<crate::ActionPanel>>,
     root_selection_revision: u64,
     settings_open: bool,
     settings: Arc<[SettingRow]>,
@@ -525,6 +751,9 @@ impl Default for Overlay {
     /// has said otherwise, and `false` is what the derive would supply.
     fn default() -> Self {
         Self {
+            view: None,
+            input_receipt: None,
+            action_panel: None,
             root_selection_revision: 0,
             settings_open: false,
             settings: Arc::from([] as [SettingRow; 0]),
@@ -562,7 +791,20 @@ fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
                 .map_or(model.generation, |floor| floor.max(model.generation)),
         );
     }
+    let action_panel = match (&mailbox.overlay.action_panel, &model.action_panel) {
+        (Some(retained), Some(incoming))
+            if mailbox.overlay_session == Some(session)
+                && retained.focus_token() == incoming.focus_token()
+                && retained.invalidation().is_some() =>
+        {
+            Some(retained.clone())
+        }
+        _ => model.action_panel.clone(),
+    };
     mailbox.overlay = Overlay {
+        view: model.view,
+        input_receipt: model.input_receipt.clone(),
+        action_panel,
         root_selection_revision: model.root_selection_revision,
         settings_open: model.settings_open,
         settings: Arc::clone(&model.settings),
@@ -601,7 +843,11 @@ fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> View
     if mailbox.overlay_session != Some(session) {
         return model.clone();
     }
+    let action_panel = mailbox.overlay.action_panel.clone();
     ViewModel {
+        view: mailbox.overlay.view,
+        input_receipt: mailbox.overlay.input_receipt.clone(),
+        action_panel,
         root_selection_revision: mailbox.overlay.root_selection_revision,
         settings_open: mailbox.overlay.settings_open,
         settings: Arc::clone(&mailbox.overlay.settings),
@@ -616,6 +862,8 @@ fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> View
         // identity. Only the host-reconciled frame may carry typed preview.
         preview: crate::PreviewPane {
             ratio: mailbox.overlay.preview.ratio,
+            focused: mailbox.overlay.preview.focused,
+            detail: mailbox.overlay.preview.detail,
             ..Default::default()
         },
         ..model.clone()
@@ -628,11 +876,22 @@ impl FrameMailbox {
         let model = match source {
             FrameSource::Host => {
                 record_overlay(self, session, model);
-                model.clone()
+                let mut model = model.clone();
+                model.action_panel = self.overlay.action_panel.clone();
+                model
             }
             FrameSource::Provider => {
                 if !admits_results(self, session, model) {
                     return false;
+                }
+                // Reconciliation is sticky under the mailbox lock. A later
+                // publication cannot revive an already retired host panel.
+                if !self.overlay.navigation.standard_route {
+                    crate::reconcile_action_panel(
+                        &mut self.overlay.action_panel,
+                        &model.rows,
+                        &self.overlay.command_management,
+                    );
                 }
                 with_overlay(self, session, model)
             }
@@ -1986,17 +2245,24 @@ where
                     event,
                     is_synthetic: false,
                     ..
-                } if self.active_session.is_some() && !self.ime.composing => translate_keyboard(
-                    event.logical_key.as_ref(),
-                    event.state,
-                    self.modifiers,
-                    self.frame.as_ref(),
-                    matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
-                        && self
-                            .graphics
-                            .as_ref()
-                            .is_some_and(|graphics| egui_popup_open(&graphics.egui_context)),
-                ),
+                } if self.active_session.is_some() && !self.ime.composing => {
+                    if self
+                        .graphics
+                        .as_ref()
+                        .is_some_and(|graphics| has_action_input(&graphics.egui_context))
+                    {
+                        None
+                    } else {
+                        translate_keyboard(
+                            event.logical_key.as_ref(),
+                            event.state,
+                            self.modifiers,
+                            self.frame.as_ref(),
+                            matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
+                                && self.graphics.as_ref().is_some_and(|graphics| egui_popup_open(&graphics.egui_context)),
+                        )
+                    }
+                }
                 _ => None,
             };
         }
@@ -2137,6 +2403,9 @@ where
             // would be a second, divergent path.
             WindowEvent::Focused(focused) => {
                 if !focused {
+                    if let Some(graphics) = &self.graphics {
+                        clear_action_input(&graphics.egui_context);
+                    }
                     self.dispatch_command(event_loop, UiCommand::CancelShortcutCapture);
                 }
                 let dismiss =
@@ -2684,6 +2953,8 @@ impl GraphicsState {
 
     fn hide(&mut self) {
         self.typed_editor.clear();
+        clear_action_input(&self.egui_context);
+        let _ = self.egui_state.take_egui_input(&self.window);
         self.window.set_ime_allowed(false);
         self.window.set_visible(false);
         for id in release_launcher_textures(&self.egui_context) {
@@ -3189,6 +3460,68 @@ fn egui_popup_open(context: &egui::Context) -> bool {
     })
 }
 
+fn native_shortcut_capture(key: Key<&str>, modifiers: ModifiersState, target: &str) -> UiCommand {
+    if key == Key::Named(NamedKey::Escape) {
+        return UiCommand::CancelShortcutCapture;
+    }
+    let key_name = match key {
+        Key::Character(" ") => "Space".into(),
+        Key::Character(text) => text.to_uppercase(),
+        Key::Named(NamedKey::ArrowUp) => "Up".into(),
+        Key::Named(NamedKey::ArrowDown) => "Down".into(),
+        Key::Named(NamedKey::ArrowLeft) => "Left".into(),
+        Key::Named(NamedKey::ArrowRight) => "Right".into(),
+        Key::Named(named) => format!("{named:?}"),
+        _ => String::new(),
+    };
+    let mut chord = String::new();
+    for (pressed, name) in [
+        (modifiers.control_key(), "Ctrl+"),
+        (modifiers.alt_key(), "Alt+"),
+        (modifiers.shift_key(), "Shift+"),
+        (modifiers.super_key(), "Super+"),
+    ] {
+        if pressed {
+            chord.push_str(name);
+        }
+    }
+    chord.push_str(&key_name);
+    match crikey_platform::Accelerator::parse(&chord) {
+        Ok(chord) => UiCommand::RecordShortcut(chord.canonical()),
+        Err(_) => UiCommand::BeginShortcutCapture(target.into()),
+    }
+}
+
+#[cfg(test)]
+mod shortcut_capture_tests {
+    use super::*;
+
+    #[test]
+    fn native_space_shortcut_capture_reaches_edit_draft() {
+        for target in ["launcher.activation-hotkey", "command-key"] {
+            for key in [Key::Character(" "), Key::Named(NamedKey::Space)] {
+                let mut model = crate::LauncherViewModel::new();
+                model.activate();
+                model.apply(UiCommand::BeginShortcutCapture(target.into()));
+                let command =
+                    native_shortcut_capture(key, ModifiersState::CONTROL | ModifiersState::ALT, target);
+                assert!(
+                    matches!(&command, UiCommand::RecordShortcut(chord) if chord == "Ctrl+Alt+Space"),
+                    "native Space must produce a canonical recorded chord: {command:?}"
+                );
+                assert!(model.apply(command).is_none(), "recording must not execute");
+                assert_eq!(model.shortcut_capture(), None);
+                let frame = model.frame().expect("recorded shortcut draft");
+                assert!(frame.setting_edits.iter().any(|edit| {
+                    edit.key == format!("capture:{target}")
+                        && edit.value == "Ctrl+Alt+Space"
+                        && edit.status == crate::SettingEditStatus::Saved
+                }));
+            }
+        }
+    }
+}
+
 pub(super) fn translate_keyboard(
     logical_key: Key<&str>,
     state: ElementState,
@@ -3204,38 +3537,32 @@ pub(super) fn translate_keyboard(
     if popup_open && matches!(logical_key, Key::Named(NamedKey::Escape)) {
         return None;
     }
-    if let Some(key) = model
+    translate_logical_key(logical_key, modifiers, model)
+}
+
+fn translate_logical_key(
+    key: Key<&str>,
+    modifiers: ModifiersState,
+    model: Option<&ViewModel>,
+) -> Option<UiCommand> {
+    if let Some(target) = model
         .and_then(|model| model.settings_focus.as_deref())
         .and_then(|focus| focus.strip_prefix("record:"))
     {
-        if matches!(logical_key, Key::Named(NamedKey::Escape)) {
-            return Some(UiCommand::CancelShortcutCapture);
-        }
-        let key_name = match logical_key {
-            Key::Character(text) => text.to_uppercase(),
-            Key::Named(NamedKey::ArrowUp) => "Up".into(),
-            Key::Named(NamedKey::ArrowDown) => "Down".into(),
-            Key::Named(NamedKey::ArrowLeft) => "Left".into(),
-            Key::Named(NamedKey::ArrowRight) => "Right".into(),
-            Key::Named(named) => format!("{named:?}"),
-            _ => String::new(),
-        };
-        let mut chord = String::new();
-        for (pressed, name) in [
-            (modifiers.control_key(), "Ctrl+"),
-            (modifiers.alt_key(), "Alt+"),
-            (modifiers.shift_key(), "Shift+"),
-            (modifiers.super_key(), "Super+"),
-        ] {
-            if pressed {
-                chord.push_str(name);
-            }
-        }
-        chord.push_str(&key_name);
-        return Some(match crikey_platform::Accelerator::parse(&chord) {
-            Ok(chord) => UiCommand::RecordShortcut(chord.canonical()),
-            Err(_) => UiCommand::BeginShortcutCapture(key.into()),
-        });
+        return Some(native_shortcut_capture(key, modifiers, target));
+    }
+    let command = if cfg!(target_os = "macos") {
+        modifiers.super_key()
+    } else {
+        modifiers.control_key()
+    };
+    if matches!(key, Key::Character(","))
+        && command
+        && !modifiers.alt_key()
+        && !modifiers.shift_key()
+        && model.is_none_or(|model| model.page.as_ref().is_none_or(|page| page.frame.web.is_none()))
+    {
+        return Some(UiCommand::OpenSettings);
     }
     // While a page is open the plugin's surface owns the keyboard, exactly as
     // the settings surface does below: Enter presses the focused node, Tab
@@ -3248,22 +3575,22 @@ pub(super) fn translate_keyboard(
     // `None` -- so the page never sees the key that closes it and a plugin
     // cannot trap the user inside its own surface.
     if model.is_some_and(|model| model.page.is_some()) {
-        return matches!(logical_key, Key::Named(NamedKey::Escape)).then_some(UiCommand::ClosePage);
+        return matches!(key, Key::Named(NamedKey::Escape)).then_some(UiCommand::ClosePage);
     }
     // While the settings surface is open its editors own the keyboard: Enter
     // commits an edit and Tab walks between rows, so neither may still run a
     // result. Escape is the exception, because closing the surface is what it
     // means there.
     if model.is_some_and(|model| model.settings_open) {
-        return matches!(logical_key, Key::Named(NamedKey::Escape)).then_some(UiCommand::Cancel);
+        return matches!(key, Key::Named(NamedKey::Escape)).then_some(UiCommand::Cancel);
     }
     if model.is_some_and(|model| {
         model.navigation.inline_arguments.is_some() && !model.navigation.standard_refresh_pending
     }) {
         return None;
     }
-    if matches!(logical_key, Key::Named(NamedKey::Enter)) && modifiers.alt_key()
-        || matches!(logical_key, Key::Character(text) if text.eq_ignore_ascii_case("k"))
+    if matches!(key, Key::Named(NamedKey::Enter)) && modifiers.alt_key()
+        || matches!(key, Key::Character(text) if text.eq_ignore_ascii_case("k"))
             && (modifiers.control_key() || modifiers.super_key())
             && !modifiers.alt_key()
     {
@@ -3274,8 +3601,8 @@ pub(super) fn translate_keyboard(
         // particular, raw Return must not run before queued text is admitted.
         return None;
     }
-    if model.is_some_and(|model| model.preview.status.is_some()) {
-        if matches!(logical_key, Key::Named(NamedKey::F6)) {
+    if model.is_some_and(|model| model.preview.status.is_some() || model.preview.focused) {
+        if matches!(key, Key::Named(NamedKey::F6)) {
             return Some(if model.is_some_and(|model| model.preview.focused) {
                 UiCommand::LeavePreview
             } else {
@@ -3283,15 +3610,15 @@ pub(super) fn translate_keyboard(
             });
         }
         if model.is_some_and(|model| model.preview.focused) {
-            return matches!(logical_key, Key::Named(NamedKey::Escape)).then_some(UiCommand::LeavePreview);
+            return matches!(key, Key::Named(NamedKey::Escape)).then_some(UiCommand::LeavePreview);
         }
     }
-    if matches!(logical_key, Key::Named(NamedKey::Enter)) {
+    if matches!(key, Key::Named(NamedKey::Enter)) {
         if let Some(model) = model.filter(|model| model.navigation.standard.is_some()) {
             return standard_render::primary_command(model);
         }
     }
-    match logical_key {
+    match key {
         Key::Named(NamedKey::ArrowLeft) if model.is_some_and(|m| m.navigation.standard.is_some()) => {
             Some(UiCommand::StandardHorizontal(false))
         }
@@ -3318,6 +3645,38 @@ pub(super) fn translate_keyboard(
         Key::Named(NamedKey::Enter) => Some(UiCommand::ExecuteDefault),
         _ => None,
     }
+}
+
+fn deferred_root_key(key: egui::Key, modifiers: egui::Modifiers, model: &ViewModel) -> Option<UiCommand> {
+    let key = match key {
+        egui::Key::ArrowDown => Key::Named(NamedKey::ArrowDown),
+        egui::Key::ArrowUp => Key::Named(NamedKey::ArrowUp),
+        egui::Key::ArrowLeft => Key::Named(NamedKey::ArrowLeft),
+        egui::Key::ArrowRight => Key::Named(NamedKey::ArrowRight),
+        egui::Key::PageDown => Key::Named(NamedKey::PageDown),
+        egui::Key::PageUp => Key::Named(NamedKey::PageUp),
+        egui::Key::Tab => Key::Named(NamedKey::Tab),
+        egui::Key::Escape => Key::Named(NamedKey::Escape),
+        egui::Key::Enter => Key::Named(NamedKey::Enter),
+        egui::Key::F6 => Key::Named(NamedKey::F6),
+        egui::Key::K => Key::Character("k"),
+        egui::Key::Comma => Key::Character(","),
+        _ => return None,
+    };
+    let mut native = ModifiersState::empty();
+    native.set(ModifiersState::SHIFT, modifiers.shift);
+    // egui's portable COMMAND constant carries only the logical alias.
+    // Reify it for the shared native adapter, retaining explicit physical bits.
+    native.set(
+        ModifiersState::CONTROL,
+        modifiers.ctrl || (modifiers.command && !cfg!(target_os = "macos")),
+    );
+    native.set(ModifiersState::ALT, modifiers.alt);
+    native.set(
+        ModifiersState::SUPER,
+        modifiers.mac_cmd || (modifiers.command && cfg!(target_os = "macos")),
+    );
+    translate_logical_key(key, native, Some(model))
 }
 
 fn canvas_fill(colors: theme::Palette, transparent: bool) -> egui::Color32 {
@@ -3587,6 +3946,7 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
             let response = ui.add_sized(
                 [ui.available_width(), theme::FIELD_HEIGHT],
                 TextEdit::singleline(&mut query)
+                    .id(egui::Id::new("crikey-root-search"))
                     .font(TextStyle::Heading)
                     .hint_text("Search apps, files, and actions")
                     .hint_text_font(TextStyle::Heading)
@@ -6195,6 +6555,8 @@ mod transparency_tests {
         }
 
         let model = ViewModel {
+            view: None,
+            input_receipt: None,
             generation: crikey_core::Generation::ZERO,
             query: String::new(),
             rows: Arc::default(),
@@ -6488,6 +6850,8 @@ mod lifecycle_tests {
             mailbox.latest = Some(PendingFrame {
                 session: 7,
                 model: ViewModel {
+                    view: None,
+                    input_receipt: None,
                     generation: crikey_core::Generation::ZERO,
                     query: String::new(),
                     rows: Arc::default(),
@@ -6625,6 +6989,8 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
         mailbox.latest = Some(PendingFrame {
             session: 1,
             model: ViewModel {
+                view: None,
+                input_receipt: None,
                 generation: crikey_core::Generation::ZERO,
                 query: String::new(),
                 rows: Arc::default(),
@@ -7001,6 +7367,8 @@ mod window_geometry_tests {
 
     fn view(query: &str, settings_open: bool) -> ViewModel {
         ViewModel {
+            view: None,
+            input_receipt: None,
             generation: crikey_core::Generation::ZERO,
             query: query.to_owned(),
             rows: Arc::default(),
@@ -7104,6 +7472,190 @@ mod window_geometry_tests {
             !with_overlay(&mailbox, 7, &view("term", false)).settings_open,
             "closing the surface is the host's to say, and it sticks"
         );
+    }
+
+    #[test]
+    fn direct_provider_republication_preserves_or_invalidates_the_owned_input_continuation() {
+        fn apply(
+            launcher: &mut crate::LauncherViewModel,
+            command: UiCommand,
+            effects: &mut Vec<crate::UiEffect>,
+        ) {
+            match launcher.apply(command) {
+                Some(crate::UiEffect::InputBatch {
+                    continuation,
+                    commands,
+                }) => {
+                    for command in commands {
+                        apply(launcher, command, effects);
+                    }
+                    if let Some(token) = continuation {
+                        launcher.finish_input_batch(token);
+                    }
+                }
+                Some(effect) => effects.push(effect),
+                None => {}
+            }
+        }
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let input = |events| RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(720.0, 640.0),
+            )),
+            focused: true,
+            events,
+            ..Default::default()
+        };
+        for mutation in ["unchanged", "target", "action"] {
+            let context = create_launcher_context();
+            let mut row = view_with_rows(1).rows[0].clone();
+            let action = |id: &str, label: &str| crikey_core::Action {
+                action_id: crikey_core::ActionId(id.into()),
+                label: label.into(),
+                description: String::new(),
+                applicable_categories: Vec::new(),
+                icon_reference: None,
+                execution_policy: crikey_core::ExecutionPolicy::Plugin,
+            };
+            row.default_action = Some(action("run", "Run"));
+            row.alternate_actions = vec![action("copy", "Copy A"), action("reveal", "Copy B")];
+            let mut launcher = crate::LauncherViewModel::new();
+            launcher.activate();
+            launcher.apply(UiCommand::SetQuery("q".into()));
+            launcher.begin_generation(crikey_core::Generation::from_raw(1));
+            launcher.publish(crikey_core::Generation::from_raw(1), vec![row], false);
+            launcher.apply(UiCommand::ShowActions);
+            let host = launcher.frame().unwrap();
+            let _ = build_launcher_frame(&context, input(vec![]), &host);
+            let frame = build_launcher_frame(
+                &context,
+                input(vec![
+                    egui::Event::Text("Copy".into()),
+                    key(egui::Key::ArrowDown),
+                    key(egui::Key::Enter),
+                ]),
+                &host,
+            );
+            let mut effects = Vec::new();
+            for command in frame.commands {
+                apply(&mut launcher, command, &mut effects);
+            }
+            assert!(effects.is_empty());
+            let host = launcher.frame().unwrap();
+            let mut provider = host.clone();
+            provider.view = None;
+            provider.input_receipt = None;
+            provider.action_panel = None;
+            if mutation != "unchanged" {
+                let mut row = provider.rows[0].clone();
+                if mutation == "target" {
+                    let source = row.source.as_mut().unwrap();
+                    source.item = crikey_core::ItemId("replacement".into());
+                    row.target = crate::ActionTarget::Result {
+                        owner: source.owner.clone(),
+                        item: source.item.clone(),
+                    };
+                } else {
+                    row.alternate_actions
+                        .retain(|action| action.action_id.0 != "reveal");
+                }
+                provider.rows = vec![row].into();
+            }
+            // This is the results-only mailbox path used by submit_results;
+            // provider defaults must not replace host editor ownership.
+            let mut mailbox = FrameMailbox::default();
+            assert!(mailbox.publish(7, &host, FrameSource::Host));
+            assert!(mailbox.publish(7, &provider, FrameSource::Provider));
+            if mutation != "unchanged" {
+                let mut restored = host.clone();
+                restored.view = None;
+                restored.input_receipt = None;
+                restored.action_panel = None;
+                assert!(mailbox.publish(7, &restored, FrameSource::Provider));
+                assert!(mailbox
+                    .latest
+                    .as_ref()
+                    .unwrap()
+                    .model
+                    .action_panel
+                    .as_ref()
+                    .unwrap()
+                    .invalidation()
+                    .is_some());
+                // A cosmetic host republication with the same panel token
+                // cannot undo an earlier admitted provider retirement either.
+                assert!(mailbox.publish(7, &host, FrameSource::Host));
+                assert!(mailbox
+                    .latest
+                    .as_ref()
+                    .unwrap()
+                    .model
+                    .action_panel
+                    .as_ref()
+                    .unwrap()
+                    .invalidation()
+                    .is_some());
+            }
+            let overlaid = mailbox.latest.as_ref().unwrap().model.clone();
+            assert_eq!(overlaid.view, host.view);
+            assert!(Arc::ptr_eq(
+                overlaid.input_receipt.as_ref().unwrap(),
+                host.input_receipt.as_ref().unwrap(),
+            ));
+            let frame = build_launcher_frame(&context, input(vec![]), &overlaid);
+            for command in frame.commands {
+                apply(&mut launcher, command, &mut effects);
+            }
+            if mutation == "unchanged" {
+                assert_eq!(
+                    effects,
+                    vec![crate::UiEffect::Execute {
+                        owner: crikey_core::PluginId("geometry-fixture".into()),
+                        item: crikey_core::ItemId("item-0".into()),
+                        action: crikey_core::ActionId("reveal".into()),
+                    }]
+                );
+            } else {
+                assert!(effects.is_empty(), "{mutation}");
+                let old_token = host.action_panel.as_ref().unwrap().focus_token();
+                launcher.apply(UiCommand::ActionBack);
+                launcher.apply(UiCommand::ActionBack);
+                launcher.apply(UiCommand::ShowActions);
+                let reopened = launcher.frame().unwrap();
+                assert_ne!(reopened.action_panel.as_ref().unwrap().focus_token(), old_token);
+                assert!(mailbox.publish(7, &reopened, FrameSource::Host));
+                assert!(mailbox
+                    .latest
+                    .as_ref()
+                    .unwrap()
+                    .model
+                    .action_panel
+                    .as_ref()
+                    .unwrap()
+                    .invalidation()
+                    .is_none());
+                let _ = build_launcher_frame(&context, input(vec![]), &reopened);
+                let frame = build_launcher_frame(&context, input(vec![key(egui::Key::Enter)]), &reopened);
+                for command in frame.commands {
+                    apply(&mut launcher, command, &mut effects);
+                }
+                assert_eq!(
+                    effects,
+                    vec![crate::UiEffect::Execute {
+                        owner: crikey_core::PluginId("geometry-fixture".into()),
+                        item: crikey_core::ItemId("item-0".into()),
+                        action: crikey_core::ActionId("run".into()),
+                    }]
+                );
+            }
+        }
     }
 
     /// The hint-line preference is the host's half of a frame too, and a

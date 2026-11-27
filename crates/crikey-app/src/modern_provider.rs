@@ -4186,6 +4186,8 @@ impl ModernDriver {
                         pending |= frame.pending_plugins;
                     }
                     let merged = ViewModel {
+                        view: None,
+                        input_receipt: None,
                         generation: job.generation,
                         query: job.query,
                         rows: rows.into(),

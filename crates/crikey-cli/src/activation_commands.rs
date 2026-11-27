@@ -187,6 +187,8 @@ fn required_value<'a>(remaining: &mut std::slice::Iter<'a, String>, option: &str
 /// that a real view model crosses the same submit/draw path the launcher uses.
 fn measurement_frame(generation: Generation) -> ViewModel {
     ViewModel {
+        view: None,
+        input_receipt: None,
         generation,
         query: "measure-activation".to_owned(),
         rows: Arc::from(Vec::<ResultRow>::new()),

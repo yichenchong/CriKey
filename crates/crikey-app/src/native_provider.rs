@@ -3997,6 +3997,8 @@ impl NativeDriver {
                             let mut rows = builtin_rows.clone();
                             rows.extend(frame.rows.iter().cloned());
                             let merged = ViewModel {
+                                view: None,
+                                input_receipt: None,
                                 generation: *generation,
                                 query: query.clone(),
                                 rows: rows.into(),
@@ -4054,6 +4056,8 @@ impl NativeDriver {
                         pending |= frame.pending_plugins;
                     }
                     let merged = ViewModel {
+                        view: None,
+                        input_receipt: None,
                         generation: job.generation,
                         query: job.query,
                         rows: rows.into(),

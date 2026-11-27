@@ -1585,7 +1585,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 report_concurrency_refusals(&mut reported_refusals, report);
             }
 
-            let mut root_submission = false;
+            let mut root_submission = None;
             let (mut command_session, effect) = match event {
                 NativeLauncherEvent::Activated => {
                     // A rapid off/on hotkey pair may supersede the queued
@@ -1610,9 +1610,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         crikey_ui::UiCommand::SetLogicalScroll(_) => {}
                         _ => standard_activation_session = None,
                     }
-                    root_submission = matches!(&command, crikey_ui::UiCommand::ExecuteDefault)
-                        && (view_model.submitted_root_query().is_some()
-                            || view_model.submitted_command_query().is_some());
+                    if matches!(&command, crikey_ui::UiCommand::ExecuteDefault) {
+                        root_submission = view_model
+                            .submitted_root_query()
+                            .map(|(query, _, _)| query)
+                            .or_else(|| view_model.submitted_command_query())
+                            .map(str::to_owned);
+                    }
                     let effect =
                         apply_native_command(&mut view_model, &mut retained, &mut hotkey_intent, command);
                     (Some(session), effect)
@@ -1719,7 +1723,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             // Read before the match consumes the effect: the window and the
             // process are one decision made in one place, so no arm can grow
             // its own private answer to "does this end the launcher".
-            let disposition = effect.as_ref().and_then(settings::residency);
+            let mut disposition = effect.as_ref().and_then(settings::residency);
             // Leaving a covered root retires its old publications. Re-enter it
             // through ordinary query dispatch, after the page lifecycle effect
             // has run, and never duplicate a query already requested this turn.
@@ -1727,7 +1731,12 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             let mut effect = effect.or_else(|| shortcut_root_query.map(UiEffect::Query));
             let mut registry_query_refresh =
                 command_projection_revision != search.command_snapshot().revision;
+            let mut input_commands = Vec::new().into_iter();
+            let mut input_continuation = None;
             loop {
+                if let Some(next) = effect.as_ref().and_then(settings::residency) {
+                    disposition = Some(next);
+                }
                 match effect {
                     Some(UiEffect::OpenStandardLink { owner, context, url }) => {
                         if search.open_view_url(&owner, &context, &view_model.standard_host_state(), &url).is_err() {
@@ -1762,6 +1771,16 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             eprintln!("crikey: {message}");
                             view_model.set_navigation_notice(message);
                         }
+                    }
+                    Some(UiEffect::InputBatch {
+                        continuation,
+                        commands,
+                    }) => {
+                        // This entire editor prefix/key pair runs in this one
+                        // callback. Foreign completions are polled only above,
+                        // never between its ordinary reducer/host-effect steps.
+                        input_commands = commands.into_iter();
+                        input_continuation = continuation;
                     }
                     Some(UiEffect::OpenPreviewLink { target, url }) => {
                         if let Err(reason) = previews.open_link(&target, &url, &search) {
@@ -1965,10 +1984,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                         view_model.clear_navigation_notice(notice);
                                     }
                                     previews.retire_for_foreground(&mut view_model, &reference.provider_id);
-                                    if root_submission && argument.is_none() && receipt.query_history_allowed
-                                    {
-                                        if let Err(error) = query_history.record_submitted(&query) {
-                                            eprintln!("crikey: query history: {error}");
+                                    if argument.is_none() && receipt.query_history_allowed {
+                                        if let Some(query) = root_submission.as_deref() {
+                                            if let Err(error) = query_history.record_submitted(query) {
+                                                eprintln!("crikey: query history: {error}");
+                                            }
                                         }
                                     }
                                     match receipt.submission {
@@ -2236,8 +2256,8 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                 if matches!(&receipt.submission, ActionSubmission::Pending(_)) {
                                     previews.retire_for_foreground(&mut view_model, &owner);
                                 }
-                                if root_submission && receipt.query_history_allowed {
-                                    if let Some((query, _, _)) = view_model.submitted_root_query() {
+                                if receipt.query_history_allowed {
+                                    if let Some(query) = root_submission.as_deref() {
                                         if let Err(error) = query_history.record_submitted(query) {
                                             eprintln!("crikey: query history: {error}");
                                         }
@@ -2319,21 +2339,41 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         _ => {}
                     }
                 }
-                effect = match view_model.take_query_refresh() {
-                    Some(raw) => {
-                        registry_query_refresh = false;
-                        Some(UiEffect::Query(raw))
+                if let Some(raw) = view_model.take_query_refresh() {
+                    registry_query_refresh = false;
+                    effect = Some(UiEffect::Query(raw));
+                } else if registry_query_refresh
+                    && view_model
+                        .view()
+                        .is_some_and(|(_, kind)| kind == crikey_ui::ViewKind::RootList)
+                {
+                    registry_query_refresh = false;
+                    effect = view_model.refresh_root_query().map(UiEffect::Query);
+                } else if let Some(command) = input_commands.next() {
+                    match &command {
+                        crikey_ui::UiCommand::StandardDoubleClick { .. } => standard_activation_session = command_session,
+                        crikey_ui::UiCommand::SetLogicalScroll(_) => {}
+                        _ => standard_activation_session = None,
                     }
-                    None if registry_query_refresh
-                        && view_model
-                            .view()
-                            .is_some_and(|(_, kind)| kind == crikey_ui::ViewKind::RootList) =>
-                    {
-                        registry_query_refresh = false;
-                        view_model.refresh_root_query().map(UiEffect::Query)
+                    // Capture only this command's actual pre-apply root query,
+                    // after all preceding query and route effects have settled.
+                    root_submission = if matches!(&command, crikey_ui::UiCommand::ExecuteDefault) {
+                        view_model
+                            .submitted_root_query()
+                            .map(|(query, _, _)| query)
+                            .or_else(|| view_model.submitted_command_query())
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    };
+                    effect =
+                        apply_native_command(&mut view_model, &mut retained, &mut hotkey_intent, command);
+                } else {
+                    if let Some(token) = input_continuation.take() {
+                        view_model.finish_input_batch(token);
                     }
-                    None => break,
-                };
+                    break;
+                }
             }
             if open_shortcut_input
                 && retained.explicit_input.is_some()
