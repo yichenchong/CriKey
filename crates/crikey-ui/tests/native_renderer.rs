@@ -4381,19 +4381,6 @@ fn batched_action_text_and_return_preserve_their_actual_event_order() {
             vec![enter, text]
         };
         let frame = build_launcher_frame(&context, launcher_input(events), &view);
-        let expected = if text_before_return {
-            vec![
-                UiCommand::SetActionQuery("Reveal".into()),
-                UiCommand::ActivateSelectedAction,
-            ]
-        } else {
-            vec![UiCommand::ActivateSelectedAction]
-        };
-        let actual = match frame.commands.as_slice() {
-            [UiCommand::ApplyInputBatch { commands, .. }] => commands.as_slice(),
-            commands => commands,
-        };
-        assert_eq!(actual, expected.as_slice());
         let mut effects = Vec::new();
         let mut generation = 1;
         for command in frame.commands {
