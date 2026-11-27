@@ -1161,13 +1161,28 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             // Read before the match consumes the effect: the window and the
             // process are one decision made in one place, so no arm can grow
             // its own private answer to "does this end the launcher".
-            let disposition = effect.as_ref().and_then(settings::residency);
+            let mut disposition = effect.as_ref().and_then(settings::residency);
             // Leaving a covered root retires its old publications. Re-enter it
             // through ordinary query dispatch, after the page lifecycle effect
             // has run, and never duplicate a query already requested this turn.
             let mut effect = effect;
+            let mut input_commands = Vec::new().into_iter();
+            let mut input_continuation = None;
             loop {
+                if let Some(next) = effect.as_ref().and_then(settings::residency) {
+                    disposition = Some(next);
+                }
                 match effect {
+                    Some(UiEffect::InputBatch {
+                        continuation,
+                        commands,
+                    }) => {
+                        // This entire editor prefix/key pair runs in this one
+                        // callback. Foreign completions are polled only above,
+                        // never between its ordinary reducer/host-effect steps.
+                        input_commands = commands.into_iter();
+                        input_continuation = continuation;
+                    }
                     Some(UiEffect::OpenPreviewLink { target, url }) => {
                         if let Err(reason) = previews.open_link(&target, &url, &search) {
                             view_model
@@ -1406,10 +1421,16 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     }
                     None => {}
                 }
-                effect = match view_model.take_query_refresh() {
-                    Some(raw) => Some(UiEffect::Query(raw)),
-                    None => break,
-                };
+                if let Some(raw) = view_model.take_query_refresh() {
+                    effect = Some(UiEffect::Query(raw));
+                } else if let Some(command) = input_commands.next() {
+                    effect = view_model.apply(command);
+                } else {
+                    if let Some(token) = input_continuation.take() {
+                        view_model.finish_input_batch(token);
+                    }
+                    break;
+                }
             }
             // Returning from a failed page republishes root rows synchronously.
             // Attach its diagnostic only afterwards, so that publication cannot
