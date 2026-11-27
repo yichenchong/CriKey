@@ -4,7 +4,7 @@ use crate::action_panel::{ActionIdentity, ActionPanelInvalidation};
 
 pub(super) const HEIGHT: f32 = 244.0;
 
-fn egui_navigation_modifiers(modifiers: egui::Modifiers) -> crikey_platform::Modifiers {
+pub(super) fn egui_navigation_modifiers(modifiers: egui::Modifiers) -> crikey_platform::Modifiers {
     // COMMAND is an abstract shortcut modifier. Physical Ctrl/mac_cmd fields
     // remain exact, including combinations containing both.
     let abstract_command = modifiers.command && !modifiers.ctrl && !modifiers.mac_cmd;
