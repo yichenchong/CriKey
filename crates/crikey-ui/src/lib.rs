@@ -518,6 +518,8 @@ pub struct ActionInputCheckpoint {
     pub(crate) primary: Option<ActionId>,
     pub(crate) panel: Option<Arc<ActionPanel>>,
     pub(crate) preview_focus: (bool, bool),
+    // Opaque editor authority only: never retain drafts or argument values.
+    pub(crate) typed: Option<typed_input::TypedInputIdentity>,
 }
 
 impl ActionInputCheckpoint {
@@ -534,7 +536,12 @@ impl ActionInputCheckpoint {
                 .map(|action| action.action_id.clone()),
             panel: model.action_panel.clone(),
             preview_focus: (model.preview.focused, model.preview.detail),
+            typed: Self::typed_identity(model.navigation.inline_arguments.as_ref()),
         }
+    }
+
+    pub(crate) fn typed_identity(input: Option<&InlineArguments>) -> Option<typed_input::TypedInputIdentity> {
+        input.map(typed_input::TypedInputIdentity::of)
     }
 
     fn same_panel(&self, panel: Option<&Arc<ActionPanel>>) -> bool {
@@ -560,6 +567,7 @@ impl ActionInputCheckpoint {
         row: Option<&ResultRow>,
         panel: Option<&Arc<ActionPanel>>,
         preview_focus: (bool, bool),
+        typed: Option<&InlineArguments>,
     ) -> bool {
         self.view.is_some()
             && self.view == view
@@ -570,6 +578,11 @@ impl ActionInputCheckpoint {
                     .and_then(|row| row.default_action.as_ref())
                     .map(|action| &action.action_id)
             && self.preview_focus == preview_focus
+            && match (&self.typed, typed) {
+                (Some(identity), Some(input)) => identity.matches(input),
+                (None, None) => true,
+                _ => false,
+            }
             && self.same_panel(panel)
             && match (&self.target, row) {
                 (Some(target), Some(row)) => target.matches(row),
@@ -587,6 +600,7 @@ impl PartialEq for ActionInputCheckpoint {
             && self.target == other.target
             && self.primary == other.primary
             && self.preview_focus == other.preview_focus
+            && self.typed == other.typed
             && self.same_panel(other.panel.as_ref())
     }
 }
@@ -1865,6 +1879,7 @@ impl LauncherViewModel {
                 .map(|action| action.action_id.clone()),
             panel: self.action_panel.clone(),
             preview_focus: (self.preview.focused, self.preview.detail),
+            typed: ActionInputCheckpoint::typed_identity(self.inline_arguments.as_ref()),
         };
         self.input_receipt = Some(Arc::new(ActionInputReceipt {
             token,
@@ -2083,6 +2098,7 @@ impl LauncherViewModel {
                     self.rows.get(self.selected),
                     self.action_panel.as_ref(),
                     (self.preview.focused, self.preview.detail),
+                    self.inline_arguments.as_ref(),
                 );
                 let query_refused = source_valid
                     && commands.iter().any(|command| {

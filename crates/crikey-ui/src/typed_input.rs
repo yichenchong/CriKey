@@ -21,6 +21,42 @@ pub struct InlineArguments {
     pub command: Option<(crikey_core::CommandRef, u64)>,
 }
 
+/// Continuation authority, deliberately excluding all draft and live values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TypedInputIdentity {
+    revision: u64,
+    view: crate::ViewId,
+    generation: crikey_core::Generation,
+    fingerprint: [u8; 32],
+    executable: crikey_core::structured_arguments::ExecutableKey,
+    source: crate::PublicationIdentity,
+    command: Option<(crikey_core::CommandRef, u64)>,
+}
+
+impl TypedInputIdentity {
+    pub(crate) fn of(input: &InlineArguments) -> Self {
+        Self {
+            revision: input.revision,
+            view: input.view,
+            generation: input.generation,
+            fingerprint: input.fingerprint,
+            executable: input.executable.clone(),
+            source: input.source.clone(),
+            command: input.command.clone(),
+        }
+    }
+
+    pub(crate) fn matches(&self, input: &InlineArguments) -> bool {
+        self.revision == input.revision
+            && self.view == input.view
+            && self.generation == input.generation
+            && self.fingerprint == input.fingerprint
+            && self.executable == input.executable
+            && self.source == input.source
+            && self.command == input.command
+    }
+}
+
 /// Move-only payload. Debug deliberately excludes even nonsecret argument text.
 pub struct TypedInputSubmission {
     pub revision: u64,
@@ -39,7 +75,7 @@ impl std::fmt::Debug for TypedInputSubmission {
 
 #[derive(Debug, Default)]
 pub(crate) struct TypedEditor {
-    revision: Option<(u64, crate::ViewId, crikey_core::Generation)>,
+    revision: Option<TypedInputIdentity>,
     draft_revision: u64,
     values: ArgumentValues,
     composing: bool,
@@ -115,8 +151,12 @@ impl TypedEditor {
         *self = Self::default();
     }
     pub(crate) fn retire_unless(&mut self, input: Option<&InlineArguments>) {
-        let identity = input.map(|input| (input.revision, input.view, input.generation));
-        if identity != self.revision {
+        let matches = match (&self.revision, input) {
+            (Some(identity), Some(input)) => identity.matches(input),
+            (None, None) => true,
+            _ => false,
+        };
+        if !matches {
             self.clear();
         }
     }
@@ -131,10 +171,10 @@ impl TypedEditor {
             self.clear();
             return None;
         };
-        let fresh = self.revision != Some((input.revision, input.view, input.generation));
+        let fresh = self.revision.as_ref().is_none_or(|identity| !identity.matches(input));
         if fresh {
             self.clear();
-            self.revision = Some((input.revision, input.view, input.generation));
+            self.revision = Some(TypedInputIdentity::of(input));
             self.draft_revision = input.draft_revision;
             self.values = input.schema.default_values().ok()?;
             for (id, value) in &input.draft.values {

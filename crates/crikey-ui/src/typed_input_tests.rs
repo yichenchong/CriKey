@@ -121,6 +121,74 @@ fn click(position: egui::Pos2) -> Vec<egui::Event> {
 }
 
 #[test]
+fn ordered_native_input_cannot_cancel_a_replacement_typed_context() {
+    for replacement in 0..4 {
+        let mut model = model(password_schema());
+        let original = model.frame().unwrap();
+        let source = Arc::new(crate::ActionInputCheckpoint::of(&original));
+        let mut input = model.inline_arguments().unwrap().clone();
+        let context = crate::create_launcher_context();
+        let mut editor = TypedEditor::default();
+        paint(&context, &mut editor, &input, Vec::new());
+        paint(
+            &context,
+            &mut editor,
+            &input,
+            vec![egui::Event::Text("hunter2".into())],
+        );
+        assert!(!editor.values.0.is_empty());
+        match replacement {
+            0 => input.revision += 1,
+            1 => {
+                let mut schema = (*input.schema).clone();
+                schema.fields[0].label = "Replacement password".into();
+                input.schema = Arc::new(schema);
+            }
+            2 => input.executable.target.item = ItemId("replacement".into()),
+            _ => input.source = PublicationIdentity::Catalog {
+                instance: 1,
+                generation: Generation::from_raw(1),
+                producer: 1,
+                publication: 2,
+            },
+        }
+        assert!(model.open_inline_arguments(
+            input.revision,
+            input.executable,
+            input.schema,
+            input.source,
+            input.command,
+        ));
+        editor.retire_unless(model.inline_arguments());
+        assert!(editor.values.0.is_empty(), "replacement retires live passwords");
+        assert!(model.apply(UiCommand::ApplyInputBatch {
+            continuation: Some(41),
+            source,
+            commands: vec![UiCommand::Cancel],
+        }).is_none());
+        assert!(model.inline_arguments().is_some());
+        let current = model.frame().unwrap();
+        assert!(!current.input_receipt.as_ref().unwrap().accepted);
+
+        // The refusal retires only stale intent; a deliberate current batch
+        // still follows the existing reducer/effect path.
+        let effect = model.apply(UiCommand::ApplyInputBatch {
+            continuation: Some(42),
+            source: Arc::new(crate::ActionInputCheckpoint::of(&current)),
+            commands: vec![UiCommand::Cancel],
+        });
+        let Some(crate::UiEffect::InputBatch { commands, .. }) = effect else {
+            panic!("current typed input must be admitted");
+        };
+        for command in commands {
+            model.apply(command);
+        }
+        model.finish_input_batch(42);
+        assert!(model.inline_arguments().is_none());
+    }
+}
+
+#[test]
 fn native_password_input_is_fixed_masked_move_only_and_excluded_from_drafts() {
     let model = model(password_schema());
     let input = model.inline_arguments().unwrap();

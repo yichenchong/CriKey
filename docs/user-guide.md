@@ -281,8 +281,9 @@ guidance and fixed codes, not exception text or rejected values. Re-enter
 passwords after submission.
 While inline input is open its editor owns keyboard input; Escape closes the
 editor before query clearing, Back or dismissal. Covering/hiding root or changing
-view, generation or input revision clears the live native editor. Only the
-separate nonsecret logical draft is eligible for restoration.
+view, generation, input revision, schema or exact source clears the live native
+editor. Retained native input cannot edit or submit a replacement typed context.
+Only the separate nonsecret logical draft is eligible for restoration.
 
 The schema belongs to the exact plugin/item/action. Commands sharing that
 executable, actions, aliases and global shortcuts use the same schema; none
