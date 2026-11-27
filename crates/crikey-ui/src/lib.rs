@@ -1019,14 +1019,7 @@ impl LauncherViewModel {
         });
         rows.dedup_by(|left, right| left.target == right.target);
         self.command_management = rows.into();
-        if let Some(panel) = &mut self.action_panel {
-            let replacement = self
-                .rows
-                .iter()
-                .find(|row| panel.tree().target().matches(row))
-                .and_then(|row| action_tree(row, &self.command_management).ok());
-            let _ = Arc::make_mut(panel).reconcile(replacement);
-        }
+        reconcile_action_panel(&mut self.action_panel, &self.rows, &self.command_management);
         self.dirty |= self.visible;
     }
 
@@ -1526,14 +1519,7 @@ impl LauncherViewModel {
         // One move into a shared allocation per accepted publish; from here on
         // every frame of this result set is a refcount bump.
         self.rows = rows.into();
-        if let Some(panel) = &mut self.action_panel {
-            let replacement = self
-                .rows
-                .iter()
-                .find(|row| panel.tree().target().matches(row))
-                .and_then(|row| action_tree(row, &self.command_management).ok());
-            let _ = Arc::make_mut(panel).reconcile(replacement);
-        }
+        reconcile_action_panel(&mut self.action_panel, &self.rows, &self.command_management);
         self.pending_plugins = pending_plugins;
         self.published = Some(generation);
         if !pending_plugins {
@@ -2694,6 +2680,25 @@ impl LauncherViewModel {
             .iter()
             .position(|row| row.target == anchor.target)
             .unwrap_or(self.selected.min(last))
+    }
+}
+
+/// Rebuilds an exact target's panel with the host's authoritative management projection.
+/// Reconciliation retains the panel's sticky invalidation and never revives retired actions.
+fn reconcile_action_panel(
+    panel: &mut Option<Arc<ActionPanel>>,
+    rows: &[ResultRow],
+    management: &[ResultRow],
+) {
+    if let Some(panel) = panel {
+        if panel.invalidation().is_some() {
+            return;
+        }
+        let replacement = rows
+            .iter()
+            .find(|row| panel.tree().target().matches(row))
+            .and_then(|row| action_tree(row, management).ok());
+        let _ = Arc::make_mut(panel).reconcile(replacement);
     }
 }
 

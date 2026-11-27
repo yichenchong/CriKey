@@ -5628,7 +5628,12 @@ fn ordered_action_tail_cannot_cross_generation_focus_or_session_retirement() {
             "target" | "action" => {
                 let mut row = view.rows[0].clone();
                 if retirement == "target" {
-                    row.item = ItemId("replacement".into());
+                    let source = row.source.as_mut().unwrap();
+                    source.item = ItemId("replacement".into());
+                    row.target = crikey_ui::ActionTarget::Result {
+                        owner: source.owner.clone(),
+                        item: source.item.clone(),
+                    };
                 } else {
                     row.alternate_actions
                         .retain(|action| action.action_id.0 != "reveal");
@@ -5847,7 +5852,12 @@ fn ordered_action_obsolete_tail_does_not_discard_distinct_fresh_native_keys() {
         launcher.begin_generation(Generation::from_raw(2));
         let mut rows = view.rows.to_vec();
         let mut second = rows[0].clone();
-        second.item = ItemId("second".into());
+        let source = second.source.as_mut().unwrap();
+        source.item = ItemId("second".into());
+        second.target = crikey_ui::ActionTarget::Result {
+            owner: source.owner.clone(),
+            item: source.item.clone(),
+        };
         rows.push(second);
         launcher.publish(Generation::from_raw(2), rows, false);
         view = launcher.frame().unwrap();
