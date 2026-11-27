@@ -19,7 +19,11 @@ use crikey_ui::{
 };
 
 fn model(query: &str) -> ViewModel {
+    let mut owner = crikey_ui::LauncherViewModel::new();
+    owner.activate();
     ViewModel {
+        view: owner.view().map(|(view, _)| view),
+        input_receipt: None,
         generation: Generation::ZERO,
         query: query.to_owned(),
         rows: Arc::default(),
@@ -4784,11 +4788,11 @@ fn batched_action_text_and_return_preserve_their_actual_event_order() {
             vec![enter, text]
         };
         let frame = build_launcher_frame(&context, launcher_input(events), &view);
-        let effects: Vec<_> = frame
-            .commands
-            .into_iter()
-            .filter_map(|command| launcher.apply(command))
-            .collect();
+        let mut effects = Vec::new();
+        let mut generation = 1;
+        for command in frame.commands {
+            apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+        }
         assert_eq!(
             effects,
             vec![crikey_ui::UiEffect::Execute {
@@ -4972,6 +4976,93 @@ fn recall_text_and_return_preserve_both_actual_event_orders() {
         };
         assert_eq!(effects, vec![crikey_ui::UiEffect::Query(expected.into())]);
         assert_eq!(state.frame().unwrap().query, expected);
+    }
+}
+
+fn ordered_action_launcher() -> crikey_ui::LauncherViewModel {
+    let mut launcher = action_launcher();
+    let root = launcher.frame().unwrap();
+    let mut row = root.rows[0].clone();
+    row.default_action.as_mut().unwrap().label = "Run first".into();
+    row.alternate_actions[0].label = "Copy target".into();
+    row.alternate_actions[1].label = "Copy alternate".into();
+    launcher.publish(root.generation, vec![row], false);
+    launcher.apply(UiCommand::ShowActions);
+    launcher
+}
+
+fn apply_ordered_test_command(
+    launcher: &mut crikey_ui::LauncherViewModel,
+    command: UiCommand,
+    rows: &[ResultRow],
+    generation: &mut u64,
+    effects: &mut Vec<crikey_ui::UiEffect>,
+) {
+    let mut effect = launcher.apply(command);
+    loop {
+        match effect {
+            Some(crikey_ui::UiEffect::InputBatch {
+                continuation,
+                commands,
+            }) => {
+                for command in commands {
+                    apply_ordered_test_command(launcher, command, rows, generation, effects);
+                }
+                if let Some(token) = continuation {
+                    launcher.finish_input_batch(token);
+                }
+            }
+            Some(effect) => {
+                if matches!(&effect, crikey_ui::UiEffect::Query(_)) {
+                    // The existing synchronous root consumer admits/publishes
+                    // its answer before the following command, as the host does.
+                    *generation += 1;
+                    let current = Generation::from_raw(*generation);
+                    launcher.begin_generation(current);
+                    launcher.publish(current, rows.to_vec(), false);
+                }
+                effects.push(effect);
+            }
+            None => {}
+        }
+        if let Some(raw) = launcher.take_query_refresh() {
+            effect = Some(crikey_ui::UiEffect::Query(raw));
+        } else {
+            break;
+        }
+    }
+}
+
+fn drive_ordered_action_input(
+    context: &egui::Context,
+    launcher: &mut crikey_ui::LauncherViewModel,
+    events: Vec<egui::Event>,
+) -> (ViewModel, Vec<crikey_ui::UiEffect>) {
+    // Each host key consumes one boundary; a fresh Settings route needs one
+    // ordinary focus-establishing paint. No sleeps or timing assumptions.
+    let turns = events.len() + 2;
+    let mut view = launcher.frame().unwrap();
+    let rows = view.rows.clone();
+    let _ = build_launcher_frame(context, launcher_input(vec![]), &view);
+    let mut input = launcher_input(events);
+    let mut effects = Vec::new();
+    let mut generation = 1;
+    for _ in 0..turns {
+        let frame = build_launcher_frame(context, input, &view);
+        input = launcher_input(vec![]);
+        for command in frame.commands {
+            apply_ordered_test_command(launcher, command, &rows, &mut generation, &mut effects);
+        }
+        view = launcher.frame().unwrap_or(view);
+    }
+    (view, effects)
+}
+
+fn ordered_execution(action: &str) -> crikey_ui::UiEffect {
+    crikey_ui::UiEffect::Execute {
+        owner: PluginId("renderer-fixture".into()),
+        item: ItemId("item-0".into()),
+        action: crikey_core::ActionId(action.into()),
     }
 }
 
@@ -5924,6 +6015,252 @@ fn explicit_input_supersedes_a_partial_return_scroll() {
 }
 
 #[test]
+fn ordered_action_text_navigation_and_return_execute_the_correct_filtered_leaf() {
+    for text_first in [true, false] {
+        let context = create_launcher_context();
+        let mut launcher = ordered_action_launcher();
+        let text = egui::Event::Text("Copy".into());
+        let down = key_press(egui::Key::ArrowDown, egui::Modifiers::NONE);
+        let mut events = if text_first {
+            vec![text, down]
+        } else {
+            vec![down, text]
+        };
+        events.push(key_press(egui::Key::Enter, egui::Modifiers::NONE));
+        let (view, effects) = drive_ordered_action_input(&context, &mut launcher, events);
+        assert_eq!(view.query, "fixture");
+        assert_eq!(
+            effects,
+            vec![ordered_execution(if text_first { "reveal" } else { "copy" })]
+        );
+    }
+}
+
+#[test]
+fn ordered_action_selection_paste_navigation_and_return_use_the_existing_editor() {
+    let context = create_launcher_context();
+    let mut launcher = ordered_action_launcher();
+    launcher.apply(UiCommand::SetActionQuery("replace this".into()));
+    let (_, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![
+            key_press(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Paste("Copy".into()),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ],
+    );
+    assert_eq!(effects, vec![ordered_execution("reveal")]);
+}
+
+#[test]
+fn ordered_action_nested_back_then_filter_and_return_respects_each_back_rung() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    launcher.apply(UiCommand::ShowActions);
+    let view = launcher.frame().unwrap();
+    launcher.apply(UiCommand::ActivateAction {
+        target: crikey_ui::ActionTarget::of(&view.rows[0]),
+        identity: crikey_ui::ActionIdentity::Submenu("launcher-settings".into()),
+    });
+    let (view, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![
+            egui::Event::Text("Copy".into()),
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            egui::Event::Text("Reveal".into()),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ],
+    );
+    assert_eq!(view.query, "fixture");
+    assert_eq!(effects, vec![ordered_execution("reveal")]);
+}
+
+#[test]
+fn ordered_action_close_transfers_focus_before_root_text_and_return() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    launcher.apply(UiCommand::ShowActions);
+    let (view, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Text("replacement".into()),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ],
+    );
+    assert_eq!(view.query, "replacement");
+    assert_eq!(
+        effects,
+        vec![
+            crikey_ui::UiEffect::Query("replacement".into()),
+            ordered_execution("run"),
+        ]
+    );
+}
+
+#[test]
+fn ordered_action_close_discovery_filter_and_return_uses_the_new_panel() {
+    let physical_command = egui::Modifiers {
+        ctrl: !cfg!(target_os = "macos"),
+        mac_cmd: cfg!(target_os = "macos"),
+        command: true,
+        ..egui::Modifiers::NONE
+    };
+    for (name, discovery) in [
+        (
+            "logical command",
+            key_press(egui::Key::K, egui::Modifiers::COMMAND),
+        ),
+        ("physical command", key_press(egui::Key::K, physical_command)),
+        ("alt enter", key_press(egui::Key::Enter, egui::Modifiers::ALT)),
+    ] {
+        let context = create_launcher_context();
+        let mut launcher = action_launcher();
+        launcher.apply(UiCommand::ShowActions);
+        let (_, effects) = drive_ordered_action_input(
+            &context,
+            &mut launcher,
+            vec![
+                key_press(egui::Key::Escape, egui::Modifiers::NONE),
+                discovery,
+                egui::Event::Text("Reveal".into()),
+                key_press(egui::Key::Enter, egui::Modifiers::NONE),
+            ],
+        );
+        assert_eq!(effects, vec![ordered_execution("reveal")], "{name}");
+    }
+}
+
+#[test]
+fn ordered_action_close_preview_focus_back_and_return_use_the_shared_adapter() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    let selection = launcher.preview_selection().unwrap();
+    launcher.publish_preview(&selection, crikey_ui::PreviewStatus::Loading);
+    launcher.apply(UiCommand::ShowActions);
+    let (view, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::F6, egui::Modifiers::NONE),
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ],
+    );
+    assert!(!view.preview.focused);
+    assert_eq!(effects, vec![ordered_execution("run")]);
+}
+
+#[test]
+fn ordered_action_close_settings_back_and_return_use_the_shared_adapter() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    launcher.apply(UiCommand::ShowActions);
+    let (view, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::Comma, egui::Modifiers::COMMAND),
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ],
+    );
+    assert!(!view.settings_open);
+    assert_eq!(effects.last(), Some(&ordered_execution("run")));
+}
+
+#[test]
+fn ordered_action_composition_navigation_return_and_commit_never_execute() {
+    let context = create_launcher_context();
+    let mut launcher = ordered_action_launcher();
+    let (_, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("Co".into())),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+            egui::Event::Ime(egui::ImeEvent::Commit("Copy".into())),
+        ],
+    );
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn ordered_action_tail_cannot_cross_generation_focus_or_session_retirement() {
+    for retirement in ["generation", "focus", "session", "target", "action"] {
+        let context = create_launcher_context();
+        let mut launcher = ordered_action_launcher();
+        let mut view = launcher.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+        let frame = build_launcher_frame(
+            &context,
+            launcher_input(vec![
+                egui::Event::Text("Copy".into()),
+                key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+                key_press(egui::Key::Enter, egui::Modifiers::NONE),
+            ]),
+            &view,
+        );
+        let mut generation = 1;
+        let mut effects = Vec::new();
+        for command in frame.commands {
+            apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+        }
+        assert!(effects.is_empty());
+        view = launcher.frame().unwrap();
+        let mut input = launcher_input(vec![]);
+        match retirement {
+            "generation" => {
+                launcher.begin_generation(Generation::from_raw(2));
+                launcher.publish(Generation::from_raw(2), view.rows.to_vec(), false);
+                view = launcher.frame().unwrap();
+            }
+            "focus" => {
+                input.focused = false;
+                input.events.push(egui::Event::WindowFocused(false));
+            }
+            "session" => {
+                launcher.dismiss();
+                launcher.activate();
+                view = launcher.frame().unwrap();
+            }
+            "target" | "action" => {
+                let mut row = view.rows[0].clone();
+                if retirement == "target" {
+                    let source = row.source.as_mut().unwrap();
+                    source.item = ItemId("replacement".into());
+                    row.target = crikey_ui::ActionTarget::Result {
+                        owner: source.owner.clone(),
+                        item: source.item.clone(),
+                    };
+                } else {
+                    row.alternate_actions
+                        .retain(|action| action.action_id.0 != "reveal");
+                }
+                launcher.publish(view.generation, vec![row], false);
+                view = launcher.frame().unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let frame = build_launcher_frame(&context, input, &view);
+        for command in frame.commands {
+            apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+        }
+        assert!(effects.is_empty(), "{retirement}");
+    }
+}
+
+#[test]
 fn a_reachable_partial_return_releases_the_original_scroll_intent() {
     let (mut state, mut frames, _) = pending_scroll_return();
     state.publish(Generation::from_raw(1), (0..40).map(result_row).collect(), true);
@@ -5990,4 +6327,251 @@ fn terminal_empty_return_clears_the_anchor_before_another_settings_back() {
 #[test]
 fn pending_empty_return_preserves_the_anchor_across_another_settings_back() {
     assert_empty_return_scroll(true);
+}
+
+#[test]
+fn ordered_action_retained_root_text_precedes_a_genuinely_newer_return() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    launcher.apply(UiCommand::ShowActions);
+    let mut view = launcher.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Text("replacement".into()),
+        ]),
+        &view,
+    );
+    let mut generation = 1;
+    let mut effects = Vec::new();
+    for command in frame.commands {
+        apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+    }
+    view = launcher.frame().unwrap();
+    assert!(view.action_panel.is_none());
+    // Native ingress holds newer host keys in this same egui stream while
+    // the older suffix is owned; they cannot overtake its text.
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)]),
+        &view,
+    );
+    for command in frame.commands {
+        apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+    }
+    assert_eq!(launcher.frame().unwrap().query, "replacement");
+    assert_eq!(
+        effects,
+        vec![
+            crikey_ui::UiEffect::Query("replacement".into()),
+            ordered_execution("run"),
+        ]
+    );
+}
+
+#[test]
+fn ordered_action_batch_rejects_a_source_replaced_before_the_host_callback() {
+    let context = create_launcher_context();
+    let mut launcher = ordered_action_launcher();
+    let view = launcher.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            egui::Event::Text("Copy".into()),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ]),
+        &view,
+    );
+    let mut row = view.rows[0].clone();
+    row.alternate_actions
+        .retain(|action| action.action_id.0 != "reveal");
+    launcher.publish(view.generation, vec![row], false);
+    let mut generation = 1;
+    let mut effects = Vec::new();
+    for command in frame.commands {
+        apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+    }
+    let view = launcher.frame().unwrap();
+    let frame = build_launcher_frame(&context, launcher_input(vec![]), &view);
+    for command in frame.commands {
+        apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+    }
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn ordered_action_foreign_finish_cannot_consume_the_validated_batch_token() {
+    let context = create_launcher_context();
+    let mut launcher = ordered_action_launcher();
+    let view = launcher.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+    let mut frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ]),
+        &view,
+    );
+    let Some(crikey_ui::UiEffect::InputBatch {
+        continuation: Some(token),
+        commands,
+    }) = launcher.apply(frame.commands.pop().unwrap())
+    else {
+        panic!("a real retained tail requires an atomic host batch");
+    };
+    for command in commands {
+        assert!(launcher.apply(command).is_none());
+    }
+    launcher.finish_input_batch(token + 1);
+    assert!(launcher.frame().unwrap().input_receipt.is_none());
+    launcher.finish_input_batch(token);
+    assert!(launcher.frame().unwrap().input_receipt.is_some());
+    launcher.finish_input_batch(token);
+    assert!(launcher.frame().is_none(), "the receipt is one-shot");
+}
+
+#[test]
+fn ordered_action_obsolete_tail_does_not_discard_distinct_fresh_native_keys() {
+    for key in [egui::Key::Enter, egui::Key::ArrowDown] {
+        let context = create_launcher_context();
+        let mut launcher = action_launcher();
+        launcher.apply(UiCommand::ShowActions);
+        let mut view = launcher.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+        let frame = build_launcher_frame(
+            &context,
+            launcher_input(vec![
+                key_press(egui::Key::Escape, egui::Modifiers::NONE),
+                egui::Event::Text("obsolete".into()),
+            ]),
+            &view,
+        );
+        let mut generation = 1;
+        let mut effects = Vec::new();
+        for command in frame.commands {
+            apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+        }
+        launcher.apply(UiCommand::SetQuery("current".into()));
+        launcher.begin_generation(Generation::from_raw(2));
+        let mut rows = view.rows.to_vec();
+        let mut second = rows[0].clone();
+        let source = second.source.as_mut().unwrap();
+        source.item = ItemId("second".into());
+        second.target = crikey_ui::ActionTarget::Result {
+            owner: source.owner.clone(),
+            item: source.item.clone(),
+        };
+        rows.push(second);
+        launcher.publish(Generation::from_raw(2), rows, false);
+        view = launcher.frame().unwrap();
+        generation = 2;
+        let frame = build_launcher_frame(
+            &context,
+            launcher_input(vec![key_press(key, egui::Modifiers::NONE)]),
+            &view,
+        );
+        for command in frame.commands {
+            apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+        }
+        let current = launcher.frame().unwrap_or(view);
+        assert_eq!(current.query, "current");
+        if key == egui::Key::Enter {
+            assert_eq!(effects, vec![ordered_execution("run")]);
+        } else {
+            assert_eq!(current.selected, 1);
+            assert!(effects.is_empty());
+        }
+    }
+}
+
+#[test]
+fn ordered_action_oversized_utf8_query_refuses_submission_before_any_callback() {
+    for paste in [false, true] {
+        for retained_tail in [false, true] {
+            let context = create_launcher_context();
+            let mut launcher = ordered_action_launcher();
+            // This fits the editor's character limit but exceeds the shared
+            // action-query UTF-8 byte limit, without relying on truncation.
+            let query = "é".repeat(crikey_ui::action_panel::MAX_ACTION_QUERY_BYTES / 2 + 1);
+            let mut events = vec![if paste {
+                egui::Event::Paste(query)
+            } else {
+                egui::Event::Text(query)
+            }];
+            if retained_tail {
+                events.push(key_press(egui::Key::ArrowDown, egui::Modifiers::NONE));
+            }
+            events.push(key_press(egui::Key::Enter, egui::Modifiers::NONE));
+            let (view, mut effects) = drive_ordered_action_input(&context, &mut launcher, events);
+            assert!(
+                effects.is_empty(),
+                "a refused query cannot execute the prior leaf"
+            );
+            let panel = view.action_panel.as_ref().unwrap();
+            assert_eq!(panel.query(), "");
+            assert_eq!(
+                panel.selected(),
+                Some(&crikey_ui::ActionIdentity::Plugin(crikey_core::ActionId(
+                    "run".into()
+                )))
+            );
+            assert!(view.rows[0].status.is_some());
+
+            // Once the preserved valid state is visibly back, a separate
+            // deliberate Enter is still usable; no sticky refusal flag exists.
+            let frame = build_launcher_frame(
+                &context,
+                launcher_input(vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)]),
+                &view,
+            );
+            let mut generation = 1;
+            for command in frame.commands {
+                apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+            }
+            assert_eq!(effects, vec![ordered_execution("run")]);
+        }
+    }
+}
+
+#[test]
+fn ordered_action_results_only_frame_cannot_authorize_atomic_input() {
+    let context = create_launcher_context();
+    let mut launcher = ordered_action_launcher();
+    let mut unowned = launcher.frame().unwrap();
+    assert!(unowned.view.is_some());
+    unowned.view = None;
+    let _ = build_launcher_frame(&context, launcher_input(vec![]), &unowned);
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            egui::Event::Text("Copy".into()),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ]),
+        &unowned,
+    );
+    let mut generation = 1;
+    let mut effects = Vec::new();
+    for command in frame.commands {
+        apply_ordered_test_command(
+            &mut launcher,
+            command,
+            &unowned.rows,
+            &mut generation,
+            &mut effects,
+        );
+    }
+    let owned = launcher.frame().unwrap();
+    assert!(owned.view.is_some());
+    let frame = build_launcher_frame(&context, launcher_input(vec![]), &owned);
+    for command in frame.commands {
+        apply_ordered_test_command(&mut launcher, command, &owned.rows, &mut generation, &mut effects);
+    }
+    assert!(effects.is_empty());
 }
