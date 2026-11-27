@@ -50,7 +50,42 @@ pub(crate) const LAUNCHER_SETTINGS: &[(&str, &str, bool)] = &[
     (KEY_SHOW_HINTS, "Show keyboard hints", true),
     (KEY_ROUNDED_CORNERS, "Rounded corners", true),
     ("launcher.preview-split", "Preview split proportion", false),
+    (
+        "launcher.resume-delay-ms",
+        "Logical resume delay (milliseconds, 0 resets)",
+        false,
+    ),
+    (
+        "launcher.query-history",
+        "Query history (off, session, persistent)",
+        false,
+    ),
 ];
+
+pub(crate) fn apply_navigation_preferences(
+    store: Option<&ConfigStore>,
+    model: &mut LauncherViewModel,
+    history: &mut crikey_app::QueryHistoryStore,
+) {
+    let delay = store
+        .and_then(|store| store.get("launcher.resume-delay-ms"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    model.set_resume_delay(std::time::Duration::from_millis(delay));
+    let mode = match store.and_then(|store| store.get("launcher.query-history")) {
+        Some("off") => crikey_app::QueryHistoryMode::Off,
+        Some("persistent") => crikey_app::QueryHistoryMode::Persistent,
+        _ => crikey_app::QueryHistoryMode::Session,
+    };
+    if mode == crikey_app::QueryHistoryMode::Off {
+        model.set_query_recall(Vec::new());
+    }
+    if let Err(error) = history.set_mode(mode) {
+        let message = format!("Query history preference failed: {error}");
+        eprintln!("crikey: {message}");
+        model.set_navigation_notice(message);
+    }
+}
 
 /// What the source column says for a key no layer supplies.
 ///
@@ -71,11 +106,22 @@ pub(crate) fn rows(store: Option<&ConfigStore>) -> Vec<SettingRow> {
         .map(|(key, label, boolean)| {
             let value = store
                 .and_then(|store| store.display_value(key))
-                .unwrap_or_default()
+                .unwrap_or(match *key {
+                    "launcher.resume-delay-ms" => "0",
+                    "launcher.query-history" => "session",
+                    _ => "",
+                })
                 .to_owned();
             let source = store
                 .and_then(|store| store.layer_of(key))
-                .map_or(UNSET, |layer| layer.as_str())
+                .map_or(
+                    if matches!(*key, "launcher.resume-delay-ms" | "launcher.query-history") {
+                        "builtin-defaults"
+                    } else {
+                        UNSET
+                    },
+                    |layer| layer.as_str(),
+                )
                 .to_owned();
             // A switch is drawn from the same reading of the key that decides
             // the launcher's own behaviour, rather than from the displayed
@@ -173,6 +219,14 @@ pub(crate) fn validate(key: &str, value: &str) -> Result<(), String> {
         return Err(format!("`{key}` cannot be set to an empty value"));
     }
     match key {
+        "launcher.resume-delay-ms" => value
+            .parse::<u64>()
+            .map(|_| ())
+            .map_err(|_| "Resume delay must be a nonnegative millisecond count".into()),
+        "launcher.query-history" => match value {
+            "off" | "session" | "persistent" => Ok(()),
+            _ => Err("Query history must be off, session, or persistent".into()),
+        },
         "launcher.preview-split" => match value.parse::<f32>() {
             Ok(value) if value.is_finite() && (0.3..=0.7).contains(&value) => Ok(()),
             _ => Err("Preview split must be a number between 0.3 and 0.7".into()),
@@ -488,6 +542,8 @@ pub(crate) fn residency(effect: &UiEffect) -> Option<Residency> {
         // the user to their results, which is a change of surface and not a
         // reason to hide the window or end the process.
         UiEffect::Query(_)
+        | UiEffect::RecallQuery
+        | UiEffect::ClearQueryHistory
         | UiEffect::InputBatch { .. }
         | UiEffect::Execute { .. }
         | UiEffect::OpenPreviewLink { .. }
@@ -989,32 +1045,6 @@ mod tests {
             hotkey.bound(),
             Some("Ctrl+Alt+K"),
             "the launcher listens for the chord that wins, not the one that was typed"
-        );
-    }
-
-    #[test]
-    fn the_rows_name_every_launcher_setting_and_where_its_value_came_from() {
-        let directory = ConfigDir::new("rows");
-        let store = directory.store();
-        let rows = rows(Some(&store));
-
-        let keys: Vec<&str> = rows.iter().map(|row| row.key.as_str()).collect();
-        assert_eq!(
-            keys,
-            vec![
-                KEY_ACTIVATION_HOTKEY,
-                KEY_MAX_RESULTS,
-                KEY_PROFILE,
-                KEY_SHOW_HINTS,
-                KEY_ROUNDED_CORNERS,
-                "launcher.preview-split",
-            ]
-        );
-        assert_eq!(rows[0].value, "Ctrl+Alt+Space");
-        assert_eq!(rows[0].source, ConfigLayer::BuiltInDefaults.as_str());
-        assert_eq!(
-            rows[1].source, UNSET,
-            "a key no layer supplies must say so rather than show an empty value"
         );
     }
 

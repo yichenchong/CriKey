@@ -685,6 +685,7 @@ struct Overlay {
     /// answered a query behind it.
     page: Option<PageSurface>,
     preview: crate::PreviewPane,
+    navigation: crate::NavigationPresentation,
 }
 
 impl Default for Overlay {
@@ -704,6 +705,7 @@ impl Default for Overlay {
             rounded_corners: true,
             page: None,
             preview: crate::PreviewPane::default(),
+            navigation: Default::default(),
         }
     }
 }
@@ -752,6 +754,7 @@ fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
         rounded_corners: model.rounded_corners,
         page: model.page.clone(),
         preview: model.preview.clone(),
+        navigation: model.navigation.clone(),
     };
     mailbox.overlay_session = Some(session);
 }
@@ -790,6 +793,7 @@ fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> View
         show_hints: mailbox.overlay.show_hints,
         rounded_corners: mailbox.overlay.rounded_corners,
         page: mailbox.overlay.page.clone(),
+        navigation: mailbox.overlay.navigation.clone(),
         // A provider frame lacks the exact logical selection/request admission
         // identity. Only the host-reconciled frame may carry typed preview.
         preview: crate::PreviewPane {
@@ -1949,7 +1953,7 @@ where
             };
         }
         // Linux does not forward preedit to egui. Fence composition-owned
-        // action keys here, at their actual native event position, rather than
+        // launcher transient-control keys here, at their actual native event position, rather than
         // overwriting the renderer's batch-start state with the final IME state.
         let ime_owned_action_key = self.ime.composing
             && self
@@ -1962,7 +1966,7 @@ where
                     && self.modifiers.alt_key()
                     || matches!(event.logical_key.as_ref(), Key::Character(text) if text.eq_ignore_ascii_case("k"))
                         && (self.modifiers.control_key() || self.modifiers.super_key());
-                discovery || self.frame.as_ref().is_some_and(|frame| frame.action_panel.is_some())
+                discovery || self.frame.as_ref().is_some_and(|frame| frame.action_panel.is_some() || !frame.navigation.recall.is_empty())
                     && matches!(event.logical_key.as_ref(), Key::Named(
                         NamedKey::Enter | NamedKey::Escape | NamedKey::ArrowUp | NamedKey::ArrowDown
                         | NamedKey::PageUp | NamedKey::PageDown))
@@ -2183,7 +2187,13 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     // both get the whole window: the page's own extent is the plugin's to
     // choose, so there is nothing to compute it from, and a page laid out into
     // the compact window would have almost no room to draw in.
-    if model.settings_open || model.page.is_some() || model.preview.status.is_some() {
+    if model.settings_open
+        || model.page.is_some()
+        || model.preview.status.is_some()
+        || model.navigation.can_go_back
+        || model.navigation.unavailable.is_some()
+        || !model.navigation.recall.is_empty()
+    {
         return expanded_height;
     }
     if !shows_results(model) {
@@ -3141,7 +3151,7 @@ fn translate_logical_key(
     {
         return Some(UiCommand::ShowActions);
     }
-    if model.is_some_and(|model| model.action_panel.is_some()) {
+    if model.is_some_and(|model| model.action_panel.is_some() || !model.navigation.recall.is_empty()) {
         // Keep action keys in the same egui event batch as search edits. In
         // particular, raw Return must not run before queued text is admitted.
         return None;
@@ -3160,6 +3170,17 @@ fn translate_logical_key(
     }
     match key {
         Key::Named(NamedKey::ArrowDown) => Some(UiCommand::SelectNext),
+        Key::Named(NamedKey::ArrowUp)
+            if model.is_some_and(|model| {
+                model.query.is_empty()
+                    && model.rows.is_empty()
+                    && model.navigation.recall.is_empty()
+                    && !model.settings_open
+                    && !model.navigation.can_go_back
+            }) =>
+        {
+            Some(UiCommand::RecallQuery)
+        }
         Key::Named(NamedKey::ArrowUp) => Some(UiCommand::SelectPrevious),
         Key::Named(NamedKey::PageDown) => Some(UiCommand::PageDown),
         Key::Named(NamedKey::PageUp) => Some(UiCommand::PageUp),
@@ -3232,6 +3253,28 @@ fn draw_launcher(
     }
     preview_render::keyboard(context, model, commands);
     action_render::keyboard(context, model, commands);
+    let recall_composing = context.data(|data| {
+        data.get_temp::<bool>(egui::Id::new("crikey-action-ime"))
+            .unwrap_or(false)
+    });
+    let recall_ime_batch = context.input(|input| {
+        input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Ime(_)))
+    });
+    if !recall_composing
+        && !recall_ime_batch
+        && model.query.is_empty()
+        && model.rows.is_empty()
+        && model.navigation.recall.is_empty()
+        && !model.settings_open
+        && model.page.is_none()
+        && !model.navigation.can_go_back
+        && context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp))
+    {
+        commands.push(UiCommand::RecallQuery);
+    }
     // Ctrl+, is what every desktop means by "open preferences". It is consumed
     // from the egui frame rather than translated out of the raw key event so
     // that the headless frame builder answers to the shortcut exactly as the
@@ -3271,7 +3314,36 @@ fn draw_launcher(
         )
         .show(context, |ui| {
             draw_query(ui, model, commands, colors);
-            if let Some(page) = &model.page {
+            if !model.settings_open
+                && (model.navigation.can_go_back || model.navigation.unavailable.is_some())
+            {
+                ui.horizontal(|ui| {
+                    if model.navigation.can_go_back && ui.button("Back  Esc").clicked() {
+                        commands.push(UiCommand::Back);
+                    }
+                    ui.label(model.navigation.title.as_ref());
+                });
+            }
+            if let Some(reason) = &model.navigation.unavailable {
+                ui.label(reason);
+            }
+            if !model.navigation.recall.is_empty() {
+                ui.label("Submitted searches");
+                egui::ScrollArea::vertical()
+                    .max_height((ui.available_height() - STATUS_BLOCK_HEIGHT).max(0.0))
+                    .show(ui, |ui| {
+                        for (index, query) in model.navigation.recall.iter().enumerate() {
+                            let response =
+                                ui.selectable_label(index == model.navigation.recall_selected, query);
+                            if response.clicked() {
+                                commands.push(UiCommand::SetQuery(query.clone()));
+                            }
+                            if index == model.navigation.recall_selected {
+                                response.scroll_to_me(None);
+                            }
+                        }
+                    });
+            } else if let Some(page) = &model.page {
                 // A page takes the result area for the same reason the
                 // settings surface does, and it is drawn in the same place:
                 // below the query field, above the status line. The model
@@ -3285,7 +3357,9 @@ fn draw_launcher(
                 // user cannot reach behind a panel is only noise.
                 ui.add_space(theme::SPACE_3);
                 draw_settings(ui, model, commands, colors);
-            } else if shows_results(model) {
+            } else if shows_results(model)
+                && !(model.navigation.can_go_back && model.navigation.unavailable.is_some())
+            {
                 // A launcher with nothing to list is the query field and
                 // nothing else: no card, no list, and none of the spacing that
                 // would hold room for one. The predicate is shared with
@@ -3328,9 +3402,15 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
                     .desired_width(f32::INFINITY)
                     .margin(Margin::symmetric(theme::SPACE_3, theme::SPACE_1))
                     .frame(false)
-                    .interactive(model.page.is_none() && model.action_panel.is_none())
+                    .interactive(
+                        !model.settings_open
+                            && model.page.is_none()
+                            && model.action_panel.is_none()
+                            && !(model.navigation.can_go_back && model.navigation.unavailable.is_some()),
+                    )
                     .lock_focus(true),
             );
+            let recall_submitted = response.lost_focus();
             // The query field takes the keyboard back on every frame, which is
             // right for a launcher whose only job is typing -- except while the
             // settings surface or a page is open, where it would tear focus out
@@ -3341,7 +3421,11 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
             // and an editor that keeps it goes on swallowing every `Text`
             // event, so the user would type into a query they cannot see
             // instead of into the field the page is showing them.
-            if model.page.is_some() || model.preview.focused || model.action_panel.is_some() {
+            if model.page.is_some()
+                || model.preview.focused
+                || model.action_panel.is_some()
+                || (model.navigation.can_go_back && model.navigation.unavailable.is_some())
+            {
                 if response.has_focus() {
                     response.surrender_focus();
                 }
@@ -3351,6 +3435,21 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
             if response.changed() {
                 flatten_line_breaks(&mut query);
                 commands.push(UiCommand::SetQuery(query));
+            }
+            // Recall acceptance shares the ordered single-line editor boundary
+            // with Actions: preceding edits are emitted first; text after
+            // Return is not allowed to replace the accepted picker entry.
+            if !model.navigation.recall.is_empty()
+                && recall_submitted
+                && ui.input(|input| {
+                    input.events.iter().any(|event| {
+                        matches!(event,
+                    egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. }
+                    if modifiers.matches_logically(egui::Modifiers::NONE))
+                    })
+                })
+            {
+                commands.push(UiCommand::ExecuteDefault);
             }
         });
 }
@@ -3394,6 +3493,7 @@ fn draw_results(
     colors: theme::Palette,
     body_height: Option<f32>,
 ) {
+    let restoration_id = egui::Id::new("crikey.logical-scroll-restoration");
     // Nothing below the field until there is something to put there. The card
     // that used to stand here said "Searching" or "No matches" inside a
     // full-width box, so the moment a key was pressed the launcher grew into a
@@ -3403,6 +3503,11 @@ fn draw_results(
     if model.rows.is_empty() {
         return;
     }
+
+    let previous_restoration = ui.data(|data| data.get_temp::<u64>(restoration_id));
+    let mut restoring = model.navigation.preserve_scroll
+        && model.navigation.restoration != 0
+        && previous_restoration != Some(model.navigation.restoration);
 
     // What the list may occupy is what is left after everything drawn under
     // it, measured rather than guessed. This used to subtract a flat
@@ -3423,6 +3528,12 @@ fn draw_results(
     };
     let reserved = overlay + BLOCK_GAP + STATUS_BLOCK_HEIGHT;
     let list_height = body_height.unwrap_or_else(|| (ui.available_height() - reserved).max(0.0));
+    // ScrollArea's aligned target subtracts the parent UI's item spacing,
+    // not the zero spacing we give its row contents. Compensate so a logical
+    // row offset is restored exactly rather than acquiring that reveal margin.
+    let restoration_spacing = ui.spacing().item_spacing.y;
+    let mut requested_offset = None;
+    let mut reachable = false;
     egui::ScrollArea::vertical()
         // Vertically the list is exactly as tall as its rows, up to the cap:
         // filling the cap regardless would put empty space between the last
@@ -3430,20 +3541,69 @@ fn draw_results(
         // look like a mostly empty window.
         .auto_shrink([false, true])
         .max_height(list_height)
-        .show(ui, |ui| {
+        .show_viewport(ui, |ui, viewport| {
             ui.set_min_width(ui.available_width());
             // The gap between rows is exactly ROW_GAP, which the window height
             // is computed from. egui's own item spacing would be added on top
             // of it and put the arithmetic out by a few pixels per row.
             ui.spacing_mut().item_spacing.y = 0.0;
+            // A wheel gesture over this list supersedes an unfinished return,
+            // even if the short publication cannot scroll yet.
+            if ui.rect_contains_pointer(ui.clip_rect()) && ui.input(|input| input.raw_scroll_delta.y != 0.0) {
+                restoring = false;
+            }
+            let content_top = ui.next_widget_position().y;
+            // The paint clip includes egui's visual overflow margin; logical
+            // anchors must use the actual viewport or every return drifts.
+            let viewport = viewport.translate(vec2(0.0, content_top));
             let mut selected_row = None;
+            let mut first_visible = None;
+            let mut restoration_rect = None;
             for (index, row) in model.rows.iter().enumerate() {
                 let response = draw_result_row(ui, row, index == model.selected, commands, colors);
+                if first_visible.is_none()
+                    && response.rect.max.y > viewport.top()
+                    && response.rect.min.y < viewport.bottom()
+                {
+                    first_visible = Some(crate::LogicalScroll {
+                        row: index,
+                        offset: (viewport.top() - response.rect.top()).max(0.0),
+                    });
+                }
+                if restoring
+                    && index
+                        == model
+                            .navigation
+                            .scroll
+                            .row
+                            .min(model.rows.len().saturating_sub(1))
+                {
+                    requested_offset =
+                        Some(response.rect.top() - content_top + model.navigation.scroll.offset);
+                    restoration_rect =
+                        Some(response.rect.translate(vec2(0.0, model.navigation.scroll.offset)));
+                }
                 if index == model.selected {
                     selected_row = Some(response);
                 }
                 if index + 1 != model.rows.len() {
                     ui.add_space(theme::ROW_GAP);
+                }
+            }
+            if let Some(rect) = restoration_rect {
+                reachable = model.navigation.scroll.row < model.rows.len()
+                    && requested_offset.is_some_and(|offset| {
+                        offset <= (ui.min_rect().height() - viewport.height()).max(0.0)
+                    });
+                // An unreachable partial anchor must not start an animation
+                // that clamps to zero and requests another identical paint.
+                if !model.pending_plugins || reachable {
+                    ui.scroll_to_rect(rect.translate(vec2(0.0, restoration_spacing)), Some(Align::Min));
+                }
+            }
+            if !restoring {
+                if let Some(scroll) = first_visible {
+                    commands.push(UiCommand::SetLogicalScroll(scroll));
                 }
             }
 
@@ -3471,10 +3631,17 @@ fn draw_results(
                     || previous.selected != anchor.selected
                     || previous.row_geometry != anchor.row_geometry
             });
-            if follow {
+            if follow && !restoring && !model.navigation.preserve_scroll {
                 response.scroll_to_me(None);
             }
         });
+    // A partial list may clamp the requested viewport. Keep the original
+    // model anchor, and retry on publication instead of reporting that clamp
+    // back through SetLogicalScroll. Only a reachable or terminal restoration
+    // consumes the token; no retained row snapshots or per-frame copies.
+    if !restoring || !model.pending_plugins || reachable {
+        ui.data_mut(|data| data.insert_temp(restoration_id, model.navigation.restoration));
+    }
 }
 
 #[path = "preview_render.rs"]
@@ -5178,12 +5345,15 @@ fn draw_settings(
                         .color(colors.text),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Close  Esc").clicked() {
+                    if ui.button("Back  Esc").clicked() {
                         commands.push(UiCommand::CloseSettings);
                     }
                 });
             });
             ui.add_space(theme::SPACE_2);
+            if ui.button("Clear query history").clicked() {
+                commands.push(UiCommand::ClearQueryHistory);
+            }
             if model.settings.is_empty() {
                 ui.label(
                     RichText::new("The launcher host published no settings.")
@@ -5619,6 +5789,7 @@ mod transparency_tests {
             show_hints: true,
             rounded_corners: true,
             preview: Default::default(),
+            navigation: Default::default(),
         };
         let input = RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -5894,6 +6065,7 @@ mod lifecycle_tests {
                     show_hints: true,
                     rounded_corners: true,
                     preview: Default::default(),
+                    navigation: Default::default(),
                 },
             });
             mailbox.wake_session = Some(7);
@@ -6030,6 +6202,7 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
                 show_hints: true,
                 rounded_corners: true,
                 preview: Default::default(),
+                navigation: Default::default(),
             },
         });
         mailbox.wake_session = Some(1);
@@ -6389,6 +6562,7 @@ mod window_geometry_tests {
             show_hints: true,
             rounded_corners: true,
             preview: Default::default(),
+            navigation: Default::default(),
         }
     }
 
@@ -8137,6 +8311,58 @@ mod web_input_tests {
                             "Enter must follow preedit and target the current document: {commands:?}"
                         ),
                     }
+                }
+                // Linux does not send preedit to egui. Exercise the actual
+                // NativeApplication fence with native preedit/key/commit
+                // ordering, including a redraw before the composition ends.
+                for redraw_during_composition in [false, true] {
+                    let mut launcher = crate::LauncherViewModel::new();
+                    launcher.activate();
+                    launcher.set_query_recall(vec!["previous submission".into(), "older submission".into()]);
+                    let recall = launcher.frame().expect("recall frame");
+                    self.handle.submit_frame(&recall).expect("publish recall picker");
+                    assert!(self.application.accept_latest_frame(session, false));
+                    self.application
+                        .graphics
+                        .as_mut()
+                        .expect("graphics")
+                        .draw(&recall)
+                        .expect("focus real query editor");
+                    lock_recover(&self.commands).clear();
+                    self.application.window_event(
+                        event_loop,
+                        window_id,
+                        WindowEvent::Ime(Ime::Preedit("に".into(), Some((3, 3)))),
+                    );
+                    let mut arrow = event.clone();
+                    if let WindowEvent::KeyboardInput { event: key, .. } = &mut arrow {
+                        key.logical_key = Key::Named(NamedKey::ArrowDown);
+                        key.physical_key = PhysicalKey::Code(winit::keyboard::KeyCode::ArrowDown);
+                        key.text = None;
+                    }
+                    self.application.window_event(event_loop, window_id, arrow);
+                    if redraw_during_composition {
+                        self.application.redraw(event_loop);
+                        assert!(
+                            lock_recover(&self.commands).is_empty(),
+                            "candidate arrows belong to native IME, not recall"
+                        );
+                    }
+                    self.application
+                        .window_event(event_loop, window_id, event.clone());
+                    self.application.window_event(
+                        event_loop,
+                        window_id,
+                        WindowEvent::Ime(Ime::Commit("日本".into())),
+                    );
+                    self.application.redraw(event_loop);
+                    let commands = std::mem::take(&mut *lock_recover(&self.commands));
+                    assert!(matches!(commands.as_slice(), [UiCommand::SetQuery(text)] if text == "日本"),
+                        "native composition may only commit query text, never navigate/accept recall: {commands:?}");
+                    for command in commands {
+                        let _ = launcher.apply(command);
+                    }
+                    assert_eq!(launcher.frame().expect("committed query").query, "日本");
                 }
                 assert!(self.application.terminal_error.is_none());
                 event_loop.exit();

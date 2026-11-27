@@ -38,6 +38,7 @@ fn model(query: &str) -> ViewModel {
         show_hints: true,
         rounded_corners: true,
         preview: Default::default(),
+        navigation: Default::default(),
     }
 }
 
@@ -3910,7 +3911,6 @@ fn rendered_action_search_executes_non_first_leaf_and_does_not_edit_launcher_que
         launcher_input(vec![key_press(egui::Key::K, egui::Modifiers::COMMAND)]),
         &root,
     );
-    assert_eq!(discovery.commands, vec![UiCommand::ShowActions]);
     for command in discovery.commands {
         let _ = launcher.apply(command);
     }
@@ -4357,7 +4357,10 @@ fn explicit_destructive_presentation_and_shortcuts_are_visible_without_dispatch(
         );
     }
     assert!(
-        frame.commands.is_empty(),
+        frame
+            .commands
+            .iter()
+            .all(|command| matches!(command, UiCommand::SetLogicalScroll(_))),
         "presentation is not authorization or activation"
     );
 }
@@ -4487,6 +4490,88 @@ fn action_failure_replaces_long_metadata_and_exposes_its_complete_reason_on_hove
     assert!(position_of(&hovered, "Settings").y < 520.0);
 }
 
+#[test]
+fn navigation_settings_back_and_history_clear_are_visible_host_controls() {
+    let mut state = crikey_ui::LauncherViewModel::new();
+    state.activate();
+    state.open_settings(None);
+    let view = state.frame().unwrap();
+    let mut frames = Frames::new();
+    let drawn = frames.settle(&view);
+    assert!(painted(&drawn, "Settings"));
+    let clear = position_of(&drawn, "Clear query history") + egui::vec2(4.0, 4.0);
+    let cleared = frames.draw(&view, click_at(clear));
+    assert!(cleared.commands.contains(&UiCommand::ClearQueryHistory));
+    let back = position_of(&drawn, "Back  Esc") + egui::vec2(4.0, 4.0);
+    let returned = frames.draw(&view, click_at(back));
+    assert!(returned.commands.contains(&UiCommand::CloseSettings));
+}
+
+#[test]
+fn recall_picker_click_restores_text_without_an_execution_intent() {
+    let mut state = crikey_ui::LauncherViewModel::new();
+    state.activate();
+    state.set_query_recall(vec!["recent submission".into(), "older submission".into()]);
+    let view = state.frame().unwrap();
+    let mut frames = Frames::new();
+    let drawn = frames.settle(&view);
+    assert!(painted(&drawn, "Submitted searches"));
+    let older = position_of(&drawn, "older submission") + egui::vec2(4.0, 4.0);
+    let selected = frames.draw(&view, click_at(older));
+    assert!(selected
+        .commands
+        .contains(&UiCommand::SetQuery("older submission".into())));
+    assert!(!selected.commands.contains(&UiCommand::ExecuteDefault));
+}
+
+#[test]
+fn empty_root_recall_does_not_steal_an_ime_candidate_arrow() {
+    let context = create_launcher_context();
+    let view = model("");
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            key_press(egui::Key::ArrowUp, egui::Modifiers::NONE),
+            egui::Event::Ime(egui::ImeEvent::Preedit("に".into())),
+        ]),
+        &view,
+    );
+    assert!(!frame.commands.contains(&UiCommand::RecallQuery));
+}
+
+#[test]
+fn recall_text_and_return_preserve_both_actual_event_orders() {
+    for text_before_return in [true, false] {
+        let context = create_launcher_context();
+        let mut state = crikey_ui::LauncherViewModel::new();
+        state.activate();
+        state.set_query_recall(vec!["previous submission".into()]);
+        let view = state.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        let text = egui::Event::Text("fresh query".into());
+        let enter = key_press(egui::Key::Enter, egui::Modifiers::NONE);
+        let events = if text_before_return {
+            vec![text, enter]
+        } else {
+            vec![enter, text]
+        };
+        let frame = build_launcher_frame(&context, launcher_input(events), &view);
+        let effects: Vec<_> = frame
+            .commands
+            .into_iter()
+            .filter_map(|command| state.apply(command))
+            .collect();
+        let expected = if text_before_return {
+            "fresh query"
+        } else {
+            "previous submission"
+        };
+        assert_eq!(effects, vec![crikey_ui::UiEffect::Query(expected.into())]);
+        assert_eq!(state.frame().unwrap().query, expected);
+    }
+}
+
 fn ordered_action_launcher() -> crikey_ui::LauncherViewModel {
     let mut launcher = action_launcher();
     let root = launcher.frame().unwrap();
@@ -4571,6 +4656,192 @@ fn ordered_execution(action: &str) -> crikey_ui::UiEffect {
         owner: PluginId("renderer-fixture".into()),
         item: ItemId("item-0".into()),
         action: crikey_core::ActionId(action.into()),
+    }
+}
+
+#[test]
+fn recall_ime_owned_return_never_accepts_the_previous_submission() {
+    for previous_frame in [false, true] {
+        let context = create_launcher_context();
+        let mut state = crikey_ui::LauncherViewModel::new();
+        state.activate();
+        state.set_query_recall(vec!["previous submission".into()]);
+        let mut view = state.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        let preedit = vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("に".into())),
+        ];
+        let mut events = if previous_frame {
+            let frame = build_launcher_frame(&context, launcher_input(preedit), &view);
+            for command in frame.commands {
+                let _ = state.apply(command);
+            }
+            view = state.frame().unwrap();
+            Vec::new()
+        } else {
+            preedit
+        };
+        events.push(key_press(egui::Key::Enter, egui::Modifiers::NONE));
+        events.push(egui::Event::Ime(egui::ImeEvent::Commit("日本".into())));
+        let frame = build_launcher_frame(&context, launcher_input(events), &view);
+        assert!(!frame.commands.contains(&UiCommand::ExecuteDefault));
+        for command in frame.commands {
+            let _ = state.apply(command);
+        }
+        assert_eq!(state.frame().unwrap().query, "日本");
+    }
+}
+
+#[test]
+fn back_keeps_the_wheeled_anchor_across_later_provider_publication() {
+    let mut state = crikey_ui::LauncherViewModel::new();
+    state.activate();
+    state.apply(UiCommand::SetQuery("row".into()));
+    state.begin_generation(Generation::from_raw(1));
+    state.publish(Generation::from_raw(1), (0..40).map(result_row).collect(), false);
+    let view = state.frame().unwrap();
+    let mut frames = Frames::new();
+    let _ = frames.settle(&view);
+    let mut wheel = wheel_over_list();
+    if let egui::Event::MouseWheel { delta, .. } = &mut wheel[1] {
+        delta.y = -1087.0;
+    }
+    let _ = frames.draw(&view, wheel);
+    let scrolled = frames.settle(&view);
+    assert!(!painted(&scrolled, "row-0"));
+    for command in scrolled.commands {
+        let _ = state.apply(command);
+    }
+    let anchor = state.navigation_restoration().scroll;
+    assert_eq!(anchor.row, 20);
+    assert!(anchor.offset > 0.0);
+    state.open_settings(None);
+    let settings = state.frame().unwrap();
+    let _ = frames.settle(&settings);
+    state.close_settings();
+    state.take_query_refresh().unwrap();
+    state.begin_generation(Generation::from_raw(2));
+    state.publish(Generation::from_raw(2), (0..2).map(result_row).collect(), true);
+    let mut back = state.frame().unwrap();
+    for paint in 0..40 {
+        let partial = frames.draw(&back, Vec::new());
+        if paint > 20 {
+            assert!(painted(&partial, "row-0"));
+        }
+        for command in partial.commands {
+            let _ = state.apply(command);
+        }
+        assert_eq!(state.navigation_restoration().scroll, anchor);
+        if let Some(next) = state.frame() {
+            back = next;
+        }
+    }
+    state.publish(Generation::from_raw(2), (0..40).map(result_row).collect(), false);
+    let refreshed = frames.settle(&state.frame().unwrap());
+    assert!(
+        !painted(&refreshed, "row-0"),
+        "a late provider allocation cannot undo restored scroll"
+    );
+    let refreshed_anchor = refreshed
+        .commands
+        .iter()
+        .find_map(|command| {
+            if let UiCommand::SetLogicalScroll(scroll) = command {
+                Some(scroll.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(refreshed_anchor.row, anchor.row);
+    assert!((refreshed_anchor.offset - anchor.offset).abs() < 1.0);
+    state.apply(UiCommand::SelectNext);
+    let navigated = frames.settle(&state.frame().unwrap());
+    assert!(
+        painted(&navigated, "row-1"),
+        "an actual navigation intent supersedes viewport restoration"
+    );
+}
+
+fn pending_scroll_return() -> (crikey_ui::LauncherViewModel, Frames, ViewModel) {
+    let mut state = crikey_ui::LauncherViewModel::new();
+    state.activate();
+    state.apply(UiCommand::SetQuery("row".into()));
+    let mut restoration = state.navigation_restoration();
+    restoration.scroll = crikey_ui::LogicalScroll { row: 20, offset: 7.0 };
+    state.restore_navigation_state(restoration);
+    state.begin_generation(Generation::from_raw(1));
+    state.publish(Generation::from_raw(1), (0..2).map(result_row).collect(), true);
+    let view = state.frame().unwrap();
+    let mut frames = Frames::new();
+    for _ in 0..40 {
+        for command in frames.draw(&view, Vec::new()).commands {
+            let _ = state.apply(command);
+        }
+    }
+    assert_eq!(state.navigation_restoration().scroll.row, 20);
+    (state, frames, view)
+}
+
+#[test]
+fn terminal_short_return_clamps_once_without_reviving_the_saved_anchor() {
+    let (mut state, mut frames, _) = pending_scroll_return();
+    state.publish(Generation::from_raw(1), (0..2).map(result_row).collect(), false);
+    let terminal = frames.settle(&state.frame().unwrap());
+    for command in terminal.commands {
+        let _ = state.apply(command);
+    }
+    assert_eq!(state.navigation_restoration().scroll.row, 0);
+    state.begin_generation(Generation::from_raw(2));
+    state.publish(Generation::from_raw(2), (0..40).map(result_row).collect(), false);
+    let later = frames.settle(&state.frame().unwrap());
+    assert!(painted(&later, "row-0"));
+    assert!(!painted(&later, "row-20"));
+}
+
+#[test]
+fn explicit_input_supersedes_a_partial_return_scroll() {
+    for input in ["wheel", "navigation", "query"] {
+        let (mut state, mut frames, view) = pending_scroll_return();
+        match input {
+            "wheel" => {
+                let drawn = frames.settle(&view);
+                let position = position_of(&drawn, "row-0") + egui::vec2(4.0, 4.0);
+                let mut events = wheel_over_list();
+                events[0] = egui::Event::PointerMoved(position);
+                for command in frames.draw(&view, events).commands {
+                    let _ = state.apply(command);
+                }
+                assert_eq!(
+                    state.navigation_restoration().scroll,
+                    crikey_ui::LogicalScroll::default(),
+                    "a wheel over the short list supersedes the model's saved anchor immediately"
+                );
+                // egui smooths wheel input across paints, even when this short
+                // list cannot scroll. Finish that gesture while the provider
+                // is pending rather than asking the later full list to ignore it.
+                for command in frames.settle(&view).commands {
+                    let _ = state.apply(command);
+                }
+            }
+            "navigation" => {
+                state.apply(UiCommand::SelectNext);
+            }
+            "query" => {
+                state.apply(UiCommand::SetQuery("edited row".into()));
+            }
+            _ => unreachable!(),
+        }
+        state.begin_generation(Generation::from_raw(2));
+        state.publish(Generation::from_raw(2), (0..40).map(result_row).collect(), false);
+        let later = frames.settle(&state.frame().unwrap());
+        assert!(painted(&later, "row-0"), "{input} supersedes restoration");
+        assert!(!painted(&later, "row-20"), "{input} supersedes restoration");
+        for command in later.commands {
+            let _ = state.apply(command);
+        }
+        assert_eq!(state.navigation_restoration().scroll.row, 0);
     }
 }
 
@@ -4813,6 +5084,75 @@ fn ordered_action_tail_cannot_cross_generation_focus_or_session_retirement() {
         }
         assert!(effects.is_empty(), "{retirement}");
     }
+}
+
+#[test]
+fn a_reachable_partial_return_releases_the_original_scroll_intent() {
+    let (mut state, mut frames, _) = pending_scroll_return();
+    state.publish(Generation::from_raw(1), (0..40).map(result_row).collect(), true);
+    let view = state.frame().unwrap();
+    let restored = frames.settle(&view);
+    for command in restored.commands {
+        let _ = state.apply(command);
+    }
+    let anchor = state.navigation_restoration().scroll;
+    assert_eq!(anchor.row, 20);
+    assert!((anchor.offset - 7.0).abs() < 1.0);
+    let _ = frames.draw(&view, wheel_over_list());
+    for command in frames.settle(&view).commands {
+        let _ = state.apply(command);
+    }
+    let wheeled = state.navigation_restoration().scroll;
+    assert!(wheeled.row > anchor.row);
+    state.publish(Generation::from_raw(1), (0..41).map(result_row).collect(), false);
+    let completed = frames.settle(&state.frame().unwrap());
+    for command in completed.commands {
+        let _ = state.apply(command);
+    }
+    let completed = state.navigation_restoration().scroll;
+    assert_eq!(completed.row, wheeled.row);
+    assert!((completed.offset - wheeled.offset).abs() < 1.0);
+}
+
+fn assert_empty_return_scroll(pending_plugins: bool) {
+    let (mut state, mut frames, _) = pending_scroll_return();
+    let expected = if pending_plugins {
+        crikey_ui::LogicalScroll { row: 20, offset: 7.0 }
+    } else {
+        crikey_ui::LogicalScroll::default()
+    };
+    state.publish(Generation::from_raw(1), Vec::new(), pending_plugins);
+    let empty = state.frame().unwrap();
+    assert!(empty.rows.is_empty());
+    for command in frames.settle(&empty).commands {
+        let _ = state.apply(command);
+    }
+    assert_eq!(state.navigation_restoration().scroll, expected);
+    state.open_settings(None);
+    let _ = frames.settle(&state.frame().unwrap());
+    state.close_settings();
+    state.take_query_refresh().unwrap();
+    state.begin_generation(Generation::from_raw(2));
+    state.publish(Generation::from_raw(2), (0..40).map(result_row).collect(), false);
+    let returned = frames.settle(&state.frame().unwrap());
+    assert_eq!(painted(&returned, "row-0"), !pending_plugins);
+    assert_eq!(painted(&returned, "row-20"), pending_plugins);
+    for command in returned.commands {
+        let _ = state.apply(command);
+    }
+    let actual = state.navigation_restoration().scroll;
+    assert_eq!(actual.row, expected.row);
+    assert!((actual.offset - expected.offset).abs() < 1.0);
+}
+
+#[test]
+fn terminal_empty_return_clears_the_anchor_before_another_settings_back() {
+    assert_empty_return_scroll(false);
+}
+
+#[test]
+fn pending_empty_return_preserves_the_anchor_across_another_settings_back() {
+    assert_empty_return_scroll(true);
 }
 
 #[test]

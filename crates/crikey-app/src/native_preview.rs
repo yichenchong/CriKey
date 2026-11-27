@@ -416,18 +416,19 @@ mod tests {
             let previews = &driver.preview_endpoint;
             let actions = driver.action_executor();
             let (send, receive) = mpsc::channel();
+            let identity = PreviewIdentity {
+                view: 1,
+                query: Generation::from_raw(1),
+                plugin: owner.clone(),
+                incarnation: origin,
+                item: item.stable_id.clone(),
+                selection: 1,
+                request: 1,
+            };
             previews
                 .submit(
                     PreviewRequest {
-                        identity: PreviewIdentity {
-                            view: 1,
-                            query: Generation::from_raw(1),
-                            plugin: owner.clone(),
-                            incarnation: origin,
-                            item: item.stable_id.clone(),
-                            selection: 1,
-                            request: 1,
-                        },
+                        identity: identity.clone(),
                     },
                     Arc::new(move |update| send.send(update).unwrap()),
                 )
@@ -447,7 +448,27 @@ mod tests {
             }
             let before = Instant::now();
             let action = &item.actions[0].action_id;
-            let request = actions.submit_plugin_action(&owner, &item, action, None).unwrap();
+            let admission = actions.submit_plugin_action(&owner, &item, action, None);
+            if mode == "stale" {
+                let refusal = admission.expect_err("a mismatched dynamic producer must refuse admission");
+                assert!(refusal.to_string().contains("no longer current"), "{refusal}");
+                assert_eq!(budget.in_flight(BudgetKind::Action), 1);
+                assert!(!witnesses.0.join("preview-cancelled").exists());
+                assert!(!witnesses.0.join("executions").exists());
+                assert!(actions.poll_plugin_actions().is_empty());
+                previews.cancel(&identity);
+                wait_for("explicit stale-case preview cancellation", || {
+                    witnesses.0.join("preview-cancelled").exists().then_some(())
+                });
+                fs::write(witnesses.0.join("preview-release"), "").unwrap();
+                assert!(matches!(
+                    receive.recv_timeout(Duration::from_secs(5)).unwrap().state,
+                    PreviewState::Cancelled
+                ));
+                assert_eq!(budget.in_flight(BudgetKind::Action), 0);
+                continue;
+            }
+            let request = admission.unwrap();
             assert!(before.elapsed() < Duration::from_secs(1), "UI waited for preview");
             wait_for("preview cancellation observed", || {
                 witnesses.0.join("preview-cancelled").exists().then_some(())
@@ -668,7 +689,7 @@ mod tests {
             .outcome
             .expect_err("a retired dynamic origin must not execute on its replacement");
         assert!(
-            refusal.to_string().contains("originating worker retired"),
+            refusal.to_string().contains("originating worker was replaced"),
             "{refusal}"
         );
         assert!(

@@ -764,6 +764,16 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     // there. Readiness is therefore recorded by the callback below, on the
     // first event the loop actually delivers - see `ready_on_first_event`.
     let mut view_model = LauncherViewModel::new();
+    let history_expiry = Duration::from_secs(24 * 60 * 60);
+    let mut query_history = per_user_state_dir().map_or_else(
+        || crikey_app::QueryHistoryStore::session(history_expiry),
+        |dir| crikey_app::QueryHistoryStore::new(dir.join("query-history.json"), history_expiry),
+    );
+    settings::apply_navigation_preferences(
+        configuration.as_ref().map(|configuration| &configuration.store),
+        &mut view_model,
+        &mut query_history,
+    );
     // The settings panel has content before the user opens it, because the one
     // occasion it opens by itself is a hotkey that could not be bound — and a
     // panel that came up empty on exactly that occasion would be no better than
@@ -880,6 +890,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     )));
                     view_model
                         .set_preview_ratio(settings::configured_preview_split(Some(&configuration.store)));
+                    settings::apply_navigation_preferences(
+                        Some(&configuration.store),
+                        &mut view_model,
+                        &mut query_history,
+                    );
                     // Aliases are host configuration, so a hand edit takes
                     // effect on the next query rather than the next restart.
                     search.set_aliases(configured_aliases(&configuration.store));
@@ -966,7 +981,20 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
             if let Some(update) = search.poll_page() {
                 if update.closed {
                     web_page.close("plugin page closed");
-                    view_model.close_page();
+                    if let Some(reason) = update.failure {
+                        if let Some(page) = view_model.page() {
+                            let route = crikey_ui::NavigationRoute::CustomPage {
+                                plugin: page.plugin.clone(),
+                                page_id: page.page_id.clone(),
+                                title: page.plugin_name.clone(),
+                            };
+                            view_model.page_reopen_failed(route, reason);
+                        } else {
+                            view_model.set_navigation_notice(format!("Page unavailable: {reason}"));
+                        }
+                    } else {
+                        view_model.close_page();
+                    }
                 } else {
                     let owner = search.page_owner().map(|(plugin, _)| plugin);
                     let frame = Arc::new(update.frame);
@@ -1134,6 +1162,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 report_concurrency_refusals(&mut reported_refusals, report);
             }
 
+            let mut root_submission = None;
             let (command_session, effect) = match event {
                 NativeLauncherEvent::Activated => {
                     // A rapid off/on hotkey pair may supersede the queued
@@ -1148,7 +1177,13 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     (None, None)
                 }
                 NativeLauncherEvent::Command { session, command } => {
-                    (Some(session), view_model.apply(command))
+                    if matches!(&command, crikey_ui::UiCommand::ExecuteDefault) {
+                        root_submission = view_model
+                            .submitted_root_query()
+                            .map(|(query, _, _)| query.to_owned());
+                    }
+                    let effect = view_model.apply(command);
+                    (Some(session), effect)
                 }
                 // The wake that brought this turn about. Everything it asks
                 // for — draining the drivers and republishing — happened
@@ -1173,6 +1208,16 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     disposition = Some(next);
                 }
                 match effect {
+                    Some(UiEffect::RecallQuery) => {
+                        view_model.set_query_recall(query_history.snapshot());
+                    }
+                    Some(UiEffect::ClearQueryHistory) => {
+                        if let Err(error) = query_history.clear() {
+                            let message = format!("Query history clear failed: {error}");
+                            eprintln!("crikey: {message}");
+                            view_model.set_navigation_notice(message);
+                        }
+                    }
                     Some(UiEffect::InputBatch {
                         continuation,
                         commands,
@@ -1253,7 +1298,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         // (spec 32.10). `close_page` is inert when none is open.
                         web_page.close("launcher was dismissed");
                         search.close_page();
-                        view_model.close_page();
                     }
                     Some(UiEffect::Quit) => {
                         web_page.close("launcher is quitting");
@@ -1291,6 +1335,11 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             configuration.as_ref().map(|configuration| &configuration.store),
                         ));
                         eprintln!("crikey: {report}");
+                        settings::apply_navigation_preferences(
+                            configuration.as_ref().map(|configuration| &configuration.store),
+                            &mut view_model,
+                            &mut query_history,
+                        );
                     }
                     Some(UiEffect::PageInput(input)) => {
                         // A page that has stopped answering is reported once, on
@@ -1349,7 +1398,6 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         // nothing open so a session can never outlive its surface.
                         web_page.close("page was closed");
                         search.close_page();
-                        view_model.close_page();
                     }
                     Some(UiEffect::Execute { owner, item, action }) => {
                         // A calculated row is resolved first and settled entirely
@@ -1390,7 +1438,16 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             // applies the same host-mediated gate, and
                             // `record_selection` below can finally record having
                             // opened it.
-                            let submission = search.execute_owned(&owner, &item, &action);
+                            let submission = search.execute_owned(&owner, &item, &action).map(|receipt| {
+                                if receipt.query_history_allowed {
+                                    if let Some(query) = root_submission.as_deref() {
+                                        if let Err(error) = query_history.record_submitted(query) {
+                                            eprintln!("crikey: query history: {error}");
+                                        }
+                                    }
+                                }
+                                receipt.submission
+                            });
                             match submission {
                                 Ok(ActionSubmission::Completed) => {
                                     search.set_history_time(history_clock.advance());
@@ -1421,9 +1478,34 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     }
                     None => {}
                 }
+                if let Some(route @ crikey_ui::NavigationRoute::CustomPage { .. }) =
+                    view_model.take_page_reopen()
+                {
+                    if let crikey_ui::NavigationRoute::CustomPage { plugin, page_id, .. } = &route {
+                        if let Err(reason) = open_plugin_page(
+                            &mut search,
+                            &mut view_model,
+                            &mut web_page,
+                            plugin,
+                            page_id,
+                            page_window,
+                        ) {
+                            view_model.page_reopen_failed(route, reason);
+                        }
+                    }
+                }
                 if let Some(raw) = view_model.take_query_refresh() {
                     effect = Some(UiEffect::Query(raw));
                 } else if let Some(command) = input_commands.next() {
+                    // Capture only this command's actual pre-apply root query,
+                    // after all preceding query and route effects have settled.
+                    root_submission = if matches!(&command, crikey_ui::UiCommand::ExecuteDefault) {
+                        view_model
+                            .submitted_root_query()
+                            .map(|(query, _, _)| query.to_owned())
+                    } else {
+                        None
+                    };
                     effect = view_model.apply(command);
                 } else {
                     if let Some(token) = input_continuation.take() {
@@ -1668,11 +1750,9 @@ fn close_failed_web_page(
 
 /// Opens a plugin-drawn page and puts it on screen.
 ///
-/// Both halves have to happen or neither: a session with no surface leaves a
-/// plugin drawing frames nobody shows, and a surface with no session leaves
-/// the user looking at a page that will never answer a keystroke. The session
-/// is started first because it is the half that can fail -- the plugin may
-/// have gone away between asking for the page and the host acting on it.
+/// First admit the bounded logical route, then close old resources and open
+/// a fresh page session. Failure leaves a host-owned unavailable route with Back,
+/// never an orphaned session or an action replay.
 fn open_plugin_page(
     search: &mut SearchService,
     view_model: &mut LauncherViewModel,
@@ -1682,11 +1762,6 @@ fn open_plugin_page(
     window: (u32, u32),
 ) -> Result<(), String> {
     let (width, height) = initial_page_viewport(window.0, window.1);
-    web_page.begin_page((width, height));
-    if let Err(error) = search.open_page(plugin, page_id, width, height, page_palette()) {
-        view_model.close_page();
-        return Err(error.to_string());
-    }
     // The submission left "Action pending" on the row. The action did not stay
     // pending, it became a page; leaving the message there would go on telling
     // the user to wait after the page has opened and closed again.
@@ -1709,12 +1784,22 @@ fn open_plugin_page(
         web_caret_area: None,
     });
     if !shown {
-        // The launcher was dismissed while the action ran, so the model has no
-        // surface to put this on. The session started a moment ago, and
-        // leaving it would be the same leak dismissal itself was fixed for:
-        // a plugin drawing frames for a screen that is gone. Nothing failed
-        // here -- the user closed the launcher -- so this is not an error.
-        search.close_page();
+        return Ok(());
+    }
+    // Admit the logical entry before retiring any live resource. Refusal at the
+    // navigation bound must leave the existing page usable.
+    web_page.begin_page((width, height));
+    if let Err(error) = search.open_page(plugin, page_id, width, height, page_palette()) {
+        let reason = error.to_string();
+        view_model.page_reopen_failed(
+            crikey_ui::NavigationRoute::CustomPage {
+                plugin: plugin.clone(),
+                page_id: page_id.into(),
+                title: plugin.0.clone(),
+            },
+            reason.clone(),
+        );
+        return Err(reason);
     }
     Ok(())
 }
@@ -3149,6 +3234,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn settings_back_reopens_a_fresh_page_session_without_replaying_execution() {
+        let runtime = Arc::new(PageRuntime::default());
+        let mut search = page_service(&runtime);
+        let mut model = LauncherViewModel::new();
+        let mut web = web_page_runtime();
+        let owner = PluginId("test.page".into());
+        model.activate();
+        open_plugin_page(&mut search, &mut model, &mut web, &owner, "nested", (800, 600)).unwrap();
+        let old_view = model.view();
+        assert_eq!(
+            model.apply(crikey_ui::UiCommand::OpenSettings),
+            Some(UiEffect::ClosePage)
+        );
+        web.close("covered by settings");
+        search.close_page();
+        assert!(search.page_owner().is_none());
+        assert_eq!(*runtime.closes.lock().unwrap(), 1);
+        model.apply(crikey_ui::UiCommand::CloseSettings);
+        let crikey_ui::NavigationRoute::CustomPage { plugin, page_id, .. } =
+            model.take_page_reopen().unwrap()
+        else {
+            panic!("expected custom route");
+        };
+        open_plugin_page(&mut search, &mut model, &mut web, &plugin, &page_id, (800, 600)).unwrap();
+        assert_ne!(model.view(), old_view);
+        assert_eq!(*runtime.opens.lock().unwrap(), 2);
+        assert_eq!(search.page_owner(), Some((owner, "nested".into())));
+        assert!(model.page().unwrap().web_surface_id.is_none());
+        assert!(!model.page().unwrap().answered);
+    }
+
+    #[test]
+    fn vanished_suspended_page_owner_has_visible_back_instead_of_a_loading_surface() {
+        let runtime = Arc::new(PageRuntime::default());
+        let mut search = page_service(&runtime);
+        let mut model = LauncherViewModel::new();
+        let mut web = web_page_runtime();
+        model.activate();
+        open_plugin_page(
+            &mut search,
+            &mut model,
+            &mut web,
+            &PluginId("test.page".into()),
+            "nested",
+            (800, 600),
+        )
+        .unwrap();
+        model.apply(crikey_ui::UiCommand::OpenSettings);
+        search.close_page();
+        model.close_settings();
+        let crikey_ui::NavigationRoute::CustomPage { plugin, page_id, .. } =
+            model.take_page_reopen().unwrap()
+        else {
+            panic!("expected custom route");
+        };
+        let mut unavailable = SearchService::new(App::new());
+        assert!(open_plugin_page(
+            &mut unavailable,
+            &mut model,
+            &mut web,
+            &plugin,
+            &page_id,
+            (800, 600)
+        )
+        .is_err());
+        let frame = model.frame().unwrap();
+        assert!(frame.page.is_none());
+        assert!(frame.navigation.unavailable.is_some() && frame.navigation.can_go_back);
+        model.apply(crikey_ui::UiCommand::Back);
+        assert_eq!(model.view().unwrap().1, crikey_ui::ViewKind::RootList);
+    }
+
     fn page_service(runtime: &Arc<PageRuntime>) -> SearchService {
         page_service_with_permissions(
             runtime,
@@ -3297,12 +3455,9 @@ mod tests {
         assert!(web_page.active.is_none());
     }
 
-    /// An action can finish after the user has dismissed the launcher, and the
-    /// hidden model refuses the surface. The session started a moment earlier
-    /// has to go with it: keeping it would leave the plugin drawing frames for
-    /// a screen that is gone, which is the leak dismissal itself closes.
+    /// A late action completion cannot create a surface or a hidden session.
     #[test]
-    fn a_page_opening_into_a_dismissed_launcher_is_rolled_back() {
+    fn a_page_opening_into_a_dismissed_launcher_is_not_admitted() {
         let runtime = Arc::new(PageRuntime::default());
         let mut search = page_service(&runtime);
         let mut view_model = LauncherViewModel::default();
@@ -3320,11 +3475,6 @@ mod tests {
         )
         .expect("a dismissed launcher is not a failure");
 
-        assert_eq!(
-            *runtime.closes.lock().expect("stub state"),
-            1,
-            "the session opened for the refused surface was closed again"
-        );
         assert!(
             search.page_owner().is_none(),
             "no page owns a screen the user cannot see"

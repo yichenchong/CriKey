@@ -235,13 +235,122 @@ when the host republishes the same results or updates their display details.
 Keyboard navigation reveals the selected result, even at the first or last row;
 a new query or a changed selected target also follows the selection.
 
-Dismissal clears the current query and results; reopening starts a fresh
-launcher session rather than resuming the previous view. Results still in flight
-from the dismissed session cannot populate the reopened launcher. Opening
-settings does not turn incoming search results into settings content. Returning
-refreshes the search and restores a deliberately selected result when it arrives,
-even after an initial partial result list. Navigating or editing the query
-supersedes that return selection; completion of the search ends restoration.
+### Navigation, logical resume, and query recall
+
+Settings and custom pages have a title and **Back**. Escape returns one level:
+preview focus/detail, an open action search/submenu/panel, the previous view,
+then root-query clearing and dismissal. The host retains the root query,
+owner-qualified selection, logical scope and list scroll anchor. Returning
+issues a fresh search and reconciles the exact owner/item across partial
+publications. The saved viewport anchor stays pending until enough results
+arrive to restore it, or the search finishes and clamps it. Wheel input,
+explicit navigation or query editing supersedes pending viewport restoration.
+Explicit navigation or query editing also supersedes the return selection.
+Navigation is bounded to 16 entries including the current view
+and 8 MiB of retained host content; shared result/icon allocations count once.
+An excessive push is refused with a visible reason.
+
+Covering a custom page closes its session and web surface before another
+surface opens. Back opens its saved owner/page route with fresh request and
+surface identities; it does not execute the original action again. Arbitrary
+web-document state, display lists and engine pixels are not snapshots. A missing
+owner yields **Page unavailable** with a working Back rather than an endless
+loading surface. Root query completion stays inactive on that unavailable route.
+Settings and real custom pages exercise this navigation now;
+worker-backed list/detail/form/grid flow verification is still required when
+those typed P6 views are introduced.
+
+`launcher.resume-delay-ms` defaults to `0`: dismissal immediately resets to root.
+A positive millisecond value resumes the logical view only if reopened strictly
+before that monotonic deadline. At the boundary or after process restart it
+starts at root. Hide always retires asynchronous admission and closes page/web
+resources; resume issues fresh work and cannot revive an old answer. Argument
+drafts are excluded from navigation snapshots. No navigation snapshot is written
+to disk.
+
+`launcher.query-history` accepts `session` (default), `off`, or opt-in
+`persistent`. Enter on a root primary action records its submitted query only
+after successful admission, using the exact item/action snapshot that execution
+accepted. Native/modern non-argument submissions can qualify; legacy/free-form
+adapters are conservatively excluded because they cannot attest that their
+execution text is nonsecret. Argument-bearing, stale/refused, alternate-action
+and ambiguous submissions never authorize collection. Typing and action search
+are not submissions. Query recall is separate from ranking history.
+
+Installed canonical catalog targets remain executable after a healthy static
+catalog producer is released. A live suggestion can override its exact
+owner/item entry; a retired suggestion cannot lend its old worker identity to
+a replacement process. Admission and execution consume the same frozen item,
+while current owner, permission and worker-liveness checks still apply.
+
+From an empty root query with no results, press Up to open
+the submitted-search picker, Up/Down to choose, and Enter or click to restore
+the text without executing it. Escape closes the picker. Up in populated
+results continues ordinary result navigation.
+
+Recall keeps at most 100 distinct submissions (4 KiB each, 256 KiB total),
+newest first, expiring after 24 hours of the current process's monotonic time.
+Session history disappears on restart and never writes a file. Persistent
+history uses `query-history.json` in the private state directory; restarting
+loads it only with explicit persistent configuration and starts a new recall
+expiry interval. Without a safe state directory session recall still works,
+but durable opt-in is refused visibly. Switching to session/off removes old
+durable history; off stops collection even if deletion fails. **Clear query
+history** in Settings clears recall and deletes its file without resetting
+ranking. Storage failures are reported; no persistence is silently promised.
+
+For example:
+
+```sh
+crikey settings set launcher.resume-delay-ms 30000
+crikey settings set launcher.query-history persistent
+```
+
+#### Private-desktop navigation acceptance fixture
+
+Build with `cargo build --manifest-path
+crates/crikey-ui/tests/fixtures/navigation/Cargo.toml`. Stage its `crikey.toml`
+and `target/debug/crikey-navigation-fixture` under a private writable package
+directory with the same relative executable path. Launch on an isolated private
+desktop with `CRIKEY_NATIVE_PLUGIN_ROOTS` pointing to the parent of that private
+package and private `CRIKEY_CONFIG_DIR`, `CRIKEY_STATE_DIR`, `CRIKEY_DATA_DIR`
+and `CRIKEY_CACHE_DIR`. Do not use an existing desktop's launcher state.
+
+The fixture writes `navigation-lifecycle.log` adjacent to its executable,
+without inheriting an environment variable or relaxing worker isolation.
+Startup/page execution fails explicitly if that fixture-only log cannot be
+opened or written. The log is bounded to 1 MiB; archive/clear it before another
+acceptance run if needed. The visible opening counter is derived from this
+shared log on every Opened callback, so replacement workers do not reset it.
+
+Search `Navigation fixture`, move to a non-first result, wheel-scroll, and Enter
+to open its real native page. Open host Settings, then Back: the page's opening
+counter must increase and the lifecycle log must show `closed` before the new
+`opened`, with only one `execute` record. Back again must restore query,
+selection and logical list position, including after later provider publications
+while the selected row is offscreen. Repeat dismissal/reopen with delay `0`
+and a positive delay, then expire the delay.
+
+For genuine unavailability, while Settings covers the page, rename the staged
+fixture executable out of its manifest-declared path and stop its existing
+worker. Back must fail to open a replacement and show the unavailable route
+with working Back to root. Stopping a worker alone is not proof: the supervisor
+may restart it. Restore the staged executable before testing recovery. Do not
+modify a user's installed package or bypass the running-launcher package lock.
+
+Use the empty-root Up picker to check session/off/persistent/clear behavior
+across restart, and type text before/after Return in one input batch to verify
+ordered recall acceptance.
+
+On Linux, also exercise native IME preedit → candidate arrow/Return → commit
+while recall is open, both before one redraw and across a redraw. Candidate
+keys must not select or accept history. The ignored native-window regression
+`native_touch_dispatch_precedes_ime_and_cannot_retarget_after_redraw` covers this
+actual application path; egui-only IME injection is not equivalent coverage.
+
+Native desktop geometry, actual OS behavior and later typed P6 flow acceptance
+remain separate runtime gates, not claims made by these instructions or model
+tests.
 
 Typing updates the visible query immediately. Local catalog search runs in the
 current UI frame; plugin results arrive incrementally and late results from an

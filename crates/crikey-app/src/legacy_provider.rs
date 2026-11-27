@@ -1654,6 +1654,7 @@ impl LegacyDriver {
                         rounded_corners: true,
                         page: None,
                         preview: Default::default(),
+                        navigation: Default::default(),
                     };
 
                     // Keep the staleness check, queued-job check, and

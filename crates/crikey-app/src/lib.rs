@@ -18,7 +18,11 @@ mod plugin_icons;
 mod plugin_page;
 mod plugin_preview;
 mod preview_action_budget;
+mod query_history_store;
 mod query_pipeline;
+pub use query_history_store::{
+    MonotonicQueryHistoryClock, QueryHistoryClock, QueryHistoryMode, QueryHistoryStore,
+};
 mod remote_catalog;
 mod selection_history_store;
 mod startup_recovery;
@@ -43,8 +47,8 @@ pub use legacy_provider::{
 pub use modern_provider::{ModernDriver, ModernProvider, ModernUnavailable};
 pub use native_provider::{NativeDriver, NativeProvider, NativeUnavailable};
 pub use plugin_action::{
-    ActionEffect, ActionRequestId, ActionSubmission, HostCapability, PluginActionCompletion,
-    PluginActionExecutor, PluginActionRouter,
+    ActionEffect, ActionReceipt, ActionRequestId, ActionSubmission, HostCapability, PluginActionCompletion,
+    PluginActionExecutor, PluginActionReceipt, PluginActionRouter,
 };
 pub use plugin_icons::{
     IconFetch, PluginIconResolver, PluginResourceSource, MAX_PLUGIN_ICON_BYTES, PLUGIN_ICON_DEADLINE,
@@ -1687,15 +1691,16 @@ impl SearchService {
         argument: Option<&str>,
     ) -> CoreResult<ActionSubmission> {
         self.execute_current(None, item_id, action_id, argument)
+            .map(|receipt| receipt.submission)
     }
 
-    /// UI dispatch is always owner-qualified, including asynchronous provider rows.
+    /// Execution and privacy evidence share one authoritative admission snapshot.
     pub fn execute_owned(
         &self,
         owner: &PluginId,
         item_id: &ItemId,
         action_id: &ActionId,
-    ) -> CoreResult<ActionSubmission> {
+    ) -> CoreResult<ActionReceipt> {
         self.execute_current(Some(owner), item_id, action_id, None)
     }
 
@@ -1705,7 +1710,7 @@ impl SearchService {
         item_id: &ItemId,
         action_id: &ActionId,
         argument: Option<&str>,
-    ) -> CoreResult<ActionSubmission> {
+    ) -> CoreResult<ActionReceipt> {
         let mut matching_hits = self.results.iter().filter(|hit| {
             &hit.item.stable_id == item_id && owner.is_none_or(|owner| &hit.item.plugin_id == owner)
         });
@@ -1715,47 +1720,33 @@ impl SearchService {
             })?;
             return match owner {
                 Some(owner) => router.submit_owned_item(owner, item_id, action_id, argument),
-                None => router.submit_by_item_id(item_id, action_id, argument),
+                None => router
+                    .submit_by_item_id(item_id, action_id, argument)
+                    .map(|request_id| PluginActionReceipt {
+                        request_id,
+                        query_history_allowed: false,
+                    }),
             }
-            .map(ActionSubmission::Pending);
+            .map(|receipt| ActionReceipt {
+                submission: ActionSubmission::Pending(receipt.request_id),
+                query_history_allowed: receipt.query_history_allowed,
+            });
         };
         if matching_hits.next().is_some() {
             return Err(crikey_core::CoreError::Invalid(
                 "selected result has ambiguous item ownership".to_owned(),
             ));
         }
-        let action = hit
-            .item
-            .actions
-            .iter()
-            .find(|action| &action.action_id == action_id)
-            .ok_or_else(|| {
-                crikey_core::CoreError::Invalid("selected action is no longer available".to_owned())
-            })?;
-        if !action.applicable_categories.is_empty()
-            && !action.applicable_categories.contains(&hit.item.category)
-        {
-            return Err(crikey_core::CoreError::Invalid(format!(
-                "action `{}` is not applicable to item category `{}`",
-                action.action_id.0,
-                hit.item.category.as_str()
-            )));
-        }
-        match hit.item.argument_policy {
-            ArgumentPolicy::Forbidden if argument.is_some() => {
-                return Err(crikey_core::CoreError::Invalid(
-                    "this item does not accept an argument".to_owned(),
-                ))
-            }
-            ArgumentPolicy::Required if argument.is_none_or(str::is_empty) => {
-                return Err(crikey_core::CoreError::Invalid(
-                    "this item requires an argument".to_owned(),
-                ))
-            }
-            _ => {}
-        }
+        let (action, query_history_allowed) =
+            plugin_action::validate_action_item(&hit.item, action_id, argument)?;
         match action.execution_policy {
-            ExecutionPolicy::HostMediated => self.dispatch_host_mediated(&hit.item, action, argument),
+            ExecutionPolicy::HostMediated => {
+                self.dispatch_host_mediated(&hit.item, action, argument)
+                    .map(|submission| ActionReceipt {
+                        submission,
+                        query_history_allowed,
+                    })
+            }
             ExecutionPolicy::Plugin => self
                 .plugin_actions
                 .as_ref()
@@ -1763,7 +1754,10 @@ impl SearchService {
                     crikey_core::CoreError::Invalid("plugin-owned action runtime is unavailable".to_owned())
                 })?
                 .submit(&hit.item.plugin_id, &hit.item, action_id, argument)
-                .map(ActionSubmission::Pending),
+                .map(|receipt| ActionReceipt {
+                    submission: ActionSubmission::Pending(receipt.request_id),
+                    query_history_allowed: receipt.query_history_allowed,
+                }),
         }
     }
 
@@ -2682,6 +2676,7 @@ mod page_ownership {
                 ..PageFrame::default()
             },
             closed: true,
+            failure: None,
         });
         let update = service.poll_page().expect("the closing update is delivered");
         assert!(update.closed);
