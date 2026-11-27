@@ -128,6 +128,35 @@ Because an alias replaces the word, the literal reading is not also tried: once
 `ss` means Settings, something whose own name reads `ss` is no longer found by
 it. Edits take effect on your next query, not your next restart.
 
+Command aliases are separate from this textual table. Open a declared command's
+Actions controls, or **Settings → Shortcuts / Configure Commands**, and save its
+command alias or global shortcut. Search settings by command name, alias or key.
+Exact command aliases lead alias prefixes, followed by ordinary results, even
+with a one-result ceiling. Aliases never execute automatically; typing an alias
+followed by a space does not implicitly supply arguments.
+
+Use **Record shortcut** (or **Record** on activation) to capture a chord, including
+Space-based chords such as `Ctrl+Alt+Space`, then Save it. Escape, focus loss and
+hiding stop recording. An already registered chord is captured instead of
+toggling the launcher or invoking its command.
+Failed saves retain the draft, including newer edits made while saving.
+
+Saved desired shortcuts, their effective configuration layer and actual active
+registrations are distinct. An OS refusal preserves the previous usable binding;
+cleanup failures remain visible. Unassign occupied shortcuts before swapping
+commands. Removed or unavailable commands cannot execute through queued receipts.
+Optional commands execute without an argument; Required commands open fresh
+free-form input. Hidden direct actions remain hidden unless their still-current
+deliberate shortcut result opens a page. Native command `ShowPage` outcomes support
+this presentation; Modern Python execution currently discards returned outcomes,
+so Modern command shortcuts do not open result pages. New input or dismissal
+supersedes the Native presentation intent.
+
+Global registration uses X11, the Wayland GlobalShortcuts portal, or Windows'
+native service. Desktop policy can refuse a chord; macOS global registration is
+unavailable. Platform compilation is not desktop runtime verification.
+
+
 Plugin discovery roots are optional environment path lists:
 
 * `CRIKEY_MODERN_PLUGIN_ROOTS` — directories containing modern Python plugin

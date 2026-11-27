@@ -4770,7 +4770,7 @@ fn back_keeps_the_wheeled_anchor_across_later_provider_publication() {
 }
 
 #[test]
-fn command_management_renders_real_p4_controls_without_p5_editors() {
+fn command_management_preserves_membership_controls_and_submits_exact_shortcut_edits() {
     let mut row = result_row(0);
     row.target = crikey_ui::ActionTarget::Command(crikey_core::CommandRef {
         provider_id: PluginId("renderer-fixture".into()),
@@ -4792,6 +4792,7 @@ fn command_management_renders_real_p4_controls_without_p5_editors() {
         argument: None,
         ranking_reset_available: true,
     });
+    let target = row.target.clone();
     let mut model = crikey_ui::LauncherViewModel::new();
     model.activate();
     model.begin_generation(Generation::from_raw(1));
@@ -4804,8 +4805,130 @@ fn command_management_renders_real_p4_controls_without_p5_editors() {
     assert!(painted(&frame, "Favorite / Home"));
     assert!(painted(&frame, "Hidden from discovery"));
     assert!(painted(&frame, "Fallback"));
-    assert!(!painted(&frame, "stored alias"));
-    assert!(!painted(&frame, "stored shortcut"));
+    assert!(painted(&frame, "stored alias"));
+    assert!(painted(&frame, "stored shortcut"));
+
+    let mut last_submission = None;
+    for (previous, value, expected) in [
+        (
+            "stored alias",
+            "new-alias",
+            crikey_ui::CommandPreferenceEdit::SetAlias(Some("new-alias".into())),
+        ),
+        (
+            "stored shortcut",
+            "Ctrl+Alt+J",
+            crikey_ui::CommandPreferenceEdit::SetHotkey(Some("Ctrl+Alt+J".into())),
+        ),
+    ] {
+        let visible = build_launcher_frame(&context, launcher_input(Vec::new()), &view);
+        let editor = visible
+            .output
+            .shapes
+            .iter()
+            .filter_map(|clipped| {
+                let origin = text_origin(&clipped.shape, previous)?;
+                let point = origin + egui::vec2(4.0, 4.0);
+                clipped.clip_rect.contains(point).then_some(point)
+            })
+            .next_back()
+            .expect("the editable value is visible inside the management scroll area");
+        let _ = build_launcher_frame(&context, launcher_input(click_at(editor)), &view);
+        let crikey_ui::ActionTarget::Command(reference) = &target else {
+            unreachable!()
+        };
+        let key = crikey_ui::command_edit_key(
+            reference,
+            matches!(&expected, crikey_ui::CommandPreferenceEdit::SetHotkey(_)),
+        );
+        let draft_id = egui::Id::new(("crikey-setting-draft", key.as_str()));
+        assert_eq!(
+            context.memory(|memory| memory.focused()),
+            Some(draft_id.with("editor")),
+            "click the editor, not the assigned shortcut metadata in the result row"
+        );
+        let typed = build_launcher_frame(
+            &context,
+            launcher_input(vec![
+                key_press(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text(value.into()),
+            ]),
+            &view,
+        );
+        assert_eq!(
+            context.data(|data| data.get_temp::<String>(draft_id)),
+            Some(value.into())
+        );
+        assert!(
+            !typed
+                .commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::EditCommandShortcut { .. })),
+            "typing edits a draft rather than committing it"
+        );
+        let submitted = build_launcher_frame(
+            &context,
+            launcher_input(vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)]),
+            &view,
+        );
+        let request = submitted
+            .commands
+            .into_iter()
+            .find(|command| {
+                matches!(command, UiCommand::EditCommandShortcut { target: edited, edit, .. }
+                if edited == &target && edit == &expected)
+            })
+            .expect("committing the focused editor submits its exact command and semantic edit");
+        let UiCommand::EditCommandShortcut { request_id, .. } = &request else {
+            unreachable!()
+        };
+        let request_id = *request_id;
+        assert_ne!(request_id, 0);
+        last_submission = Some(request_id);
+        assert!(matches!(model.apply(request),
+            Some(crikey_ui::UiEffect::MutateCommandPreferences {
+                request_id: admitted, expected_revision: 7, edit, ..
+            }) if admitted == request_id && edit == expected));
+    }
+    let mut frames = Frames {
+        context: context.clone(),
+        clock: 100.0,
+    };
+    let before_scroll = frames.settle(&view);
+    let anchor = position_of(&before_scroll, "Ctrl+Alt+J");
+    let _ = frames.draw(
+        &view,
+        vec![
+            egui::Event::PointerMoved(anchor + egui::vec2(4.0, 4.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -48.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    let scrolled = frames.settle(&view);
+    let scrolled_anchor = position_of(&scrolled, "Ctrl+Alt+J");
+    assert!(
+        scrolled_anchor.y < anchor.y - 1.0,
+        "the user actually scrolled the management sheet"
+    );
+    let crikey_ui::ActionTarget::Command(reference) = &target else {
+        unreachable!()
+    };
+    model.command_edit_completed(crikey_ui::CommandPreferenceEditOutcome {
+        request_id: last_submission.unwrap(),
+        reference: reference.clone(),
+        edit: crikey_ui::CommandPreferenceEdit::SetHotkey(Some("Ctrl+Alt+J".into())),
+        status: crikey_ui::SettingEditStatus::Failed,
+    });
+    model.publish(Generation::from_raw(1), view.rows.to_vec(), false);
+    let refreshed = model.frame().unwrap();
+    let after_refresh = frames.settle(&refreshed);
+    assert!(
+        (position_of(&after_refresh, "Ctrl+Alt+J").y - scrolled_anchor.y).abs() < 1.0,
+        "unchanged selection across provider refresh and draft ACK preserves manual scroll"
+    );
 }
 
 #[test]

@@ -494,6 +494,15 @@ impl SearchService {
                 }
             }
         } else {
+            // Command aliases see the admitted raw text, before textual rewriting.
+            for reference in preferences.aliases(&registry, context.query.trim()) {
+                let row = self.command_row(reference, &registry, &preferences, None, Vec::new());
+                if row.command_state.as_ref().is_some_and(|state| state.available)
+                    && seen.insert(reference.clone())
+                {
+                    rows.push(row);
+                }
+            }
             let query = self.aliases.expand(self.normalizer.normalize(context.query));
             let affinity = self.history.affinities_for(&query);
             let mut matches = Vec::new();
@@ -524,8 +533,9 @@ impl SearchService {
             }
             matches.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
             for (reference, _, highlights) in matches {
-                seen.insert(reference.clone());
-                rows.push(self.command_row(reference, &registry, &preferences, None, highlights));
+                if seen.insert(reference.clone()) {
+                    rows.push(self.command_row(reference, &registry, &preferences, None, highlights));
+                }
             }
             if let Some(search) = context
                 .fallback
@@ -878,6 +888,62 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].reference, first);
         assert_eq!(recent[1].reference, second);
+    }
+
+    #[test]
+    fn aliases_use_raw_text_exact_before_prefix_and_exclude_hidden_unavailable() {
+        let mut search = service();
+        let owner = PluginId("crikey.host".into());
+        let mut declarations = Vec::new();
+        let mut records = Vec::new();
+        for (id, alias, hidden, available) in [
+            ("a-prefix", "gopher", false, true),
+            ("z-exact", "go", false, true),
+            ("hidden", "gone", true, true),
+            ("missing", "good", false, false),
+        ] {
+            let reference = CommandRef {
+                provider_id: owner.clone(),
+                command_id: id.into(),
+            };
+            declarations.push(CommandDeclaration {
+                reference: reference.clone(),
+                label: "Unrelated label".into(),
+                executable_target: ExecutableTarget::Host(HostCommand::OpenSettings),
+                availability: if available {
+                    crikey_core::CommandAvailability::Available
+                } else {
+                    crikey_core::CommandAvailability::Unavailable
+                },
+                argument_policy: ArgumentPolicy::Forbidden,
+            });
+            records.push(crikey_config::command_preferences::CommandPreference {
+                reference,
+                hidden,
+                alias: Some(alias.into()),
+                hotkey: None,
+            });
+        }
+        search
+            .command_registry
+            .publish_owner(&owner, declarations)
+            .unwrap();
+        Arc::make_mut(&mut search.command_preferences_snapshot)
+            .preferences
+            .records = records;
+        let generation = search.app.generations().current();
+        let rows = search.compose_command_rows(CommandCompositionContext::root(generation, "GO"));
+        let ids: Vec<_> = rows
+            .iter()
+            .map(|row| match &row.target {
+                ActionTarget::Command(reference) => reference.command_id.as_str(),
+                _ => panic!("alias must retain command reference"),
+            })
+            .collect();
+        assert_eq!(ids, ["z-exact", "a-prefix"]);
+        assert!(search
+            .compose_command_rows(CommandCompositionContext::root(generation, "go argument"))
+            .is_empty());
     }
 }
 

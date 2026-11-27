@@ -741,8 +741,8 @@ fn the_backend_hands_out_a_working_hotkey_service_under_x11_and_refuses_a_headle
     let previous = std::env::var("DISPLAY").ok();
     std::env::set_var("DISPLAY", server.display());
 
-    let mut backend = LinuxBackend::with_desktop_environment(DesktopEnvironment::X11);
-    let outcome = backend.hotkeys().map(|hotkeys| {
+    let backend = LinuxBackend::with_desktop_environment(DesktopEnvironment::X11);
+    let outcome = backend.hotkey_factory()().map(|mut hotkeys| {
         hotkeys
             .register(&binding("Ctrl+Alt+Space"))
             .expect("the chord registers through the backend accessor");
@@ -762,13 +762,12 @@ fn the_backend_hands_out_a_working_hotkey_service_under_x11_and_refuses_a_headle
     // depends on the portal rather than on the session, and `wayland_portal.rs`
     // pins both answers against a portal it controls.
     let desktop = DesktopEnvironment::Headless;
-    let mut backend = LinuxBackend::with_desktop_environment(desktop);
-    match backend.hotkeys() {
+    let backend = LinuxBackend::with_desktop_environment(desktop);
+    match backend.hotkey_factory()() {
         Ok(_) => panic!("{desktop:?} has no display and no portal and must not hand out a hotkey service"),
-        Err(CoreError::Invalid(message)) => assert!(
+        Err(message) => assert!(
             message.contains(&format!("{desktop:?}")),
             "the refusal must name the session it refused for, got: {message}"
         ),
-        Err(other) => panic!("unexpected error kind: {other:?}"),
     }
 }

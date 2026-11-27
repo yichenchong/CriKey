@@ -3,23 +3,26 @@ use crikey_app::{
     CommandPreferencesSnapshot, CommandPreferencesStore, CommandRegistrySnapshot, PreferenceError,
     PreferenceMutation,
 };
-use crikey_config::{
-    command_preferences::KEY_COMMAND_PREFERENCES, ConfigLayer, ConfigRevision, ConfigSourceWatch, ConfigStore,
-};
+#[cfg(test)]
+use crikey_config::command_preferences::KEY_COMMAND_PREFERENCES;
+use crikey_config::{ConfigLayer, ConfigRevision, ConfigSourceWatch, ConfigStore};
 use crikey_platform::StandardDirectories;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+pub(crate) struct MutationRequest {
+    pub request_id: u64,
+    pub config: ConfigStore,
+    pub registry: Arc<CommandRegistrySnapshot>,
+    pub expected_revision: u64,
+    pub reference: crikey_core::CommandRef,
+    pub edit: crikey_ui::CommandPreferenceEdit,
+    pub session: bool,
+}
+
 pub(crate) enum Request {
     Poll,
-    Mutate {
-        config: ConfigStore,
-        registry: Arc<CommandRegistrySnapshot>,
-        expected_revision: u64,
-        reference: crikey_core::CommandRef,
-        edit: crikey_ui::CommandPreferenceEdit,
-        session: bool,
-    },
+    Mutate(MutationRequest),
     Setting {
         config: ConfigStore,
         request_id: u64,
@@ -27,12 +30,20 @@ pub(crate) enum Request {
         value: String,
     },
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionState {
+    Authoritative,
+    Unavailable,
+    PersistedReloadRequired,
+}
 pub(crate) struct Completion {
+    pub state: CompletionState,
     pub config: Option<ConfigStore>,
     pub preferences: Option<Arc<CommandPreferencesSnapshot>>,
     pub report: Option<String>,
     pub based_on: ConfigRevision,
     pub setting_edit: Option<crikey_ui::SettingEditOutcome>,
+    pub command_edit: Option<crikey_ui::CommandPreferenceEditOutcome>,
 }
 pub(crate) struct PreferenceWorker {
     sender: Option<mpsc::SyncSender<Request>>,
@@ -74,16 +85,20 @@ impl PreferenceWorker {
                             }
                             state.reload(&store)
                         }
-                        Request::Mutate {
+                        Request::Mutate(MutationRequest {
+                            request_id,
                             mut config,
                             registry,
                             expected_revision,
                             reference,
                             edit,
                             session,
-                        } => {
+                        }) => {
                             let based_on = state.revision();
-                            if !state.accepts(&config) {
+                            let mut saved = false;
+                            let submitted_reference = reference.clone();
+                            let submitted_edit = edit.clone();
+                            let mut completion = if !state.accepts(&config) {
                                 state.conflict(&store)
                             } else {
                                 let target = if session {
@@ -117,11 +132,20 @@ impl PreferenceWorker {
                                             preferences.layer.map_or("unset", |layer| layer.as_str())
                                         );
                                         state.replace(config);
+                                        saved = true;
                                         state.completion(based_on, Some(preferences), Some(report))
                                     }
+                                    Err(PreferenceError::PersistedReload) => state.persisted_reload(based_on),
                                     Err(error) => state.completion(based_on, None, Some(describe(error))),
                                 }
-                            }
+                            };
+                            completion.command_edit = Some(crikey_ui::CommandPreferenceEditOutcome {
+                                request_id,
+                                reference: submitted_reference,
+                                edit: submitted_edit,
+                                status: edit_status(saved, completion.state),
+                            });
+                            completion
                         }
                         Request::Setting {
                             mut config,
@@ -133,8 +157,10 @@ impl PreferenceWorker {
                             let mut saved = false;
                             let mut completion = if !state.accepts(&config) {
                                 state.conflict(&store)
+                            } else if let Err(report) = validate_setting_edit(&config, &key, &value) {
+                                state.completion(based_on, None, Some(report))
                             } else {
-                                match crate::settings::persist(&mut config, &key, &value) {
+                                match crate::settings::persist_typed(&mut config, &key, &value) {
                                     Ok(report) => {
                                         let result = store
                                             .lock()
@@ -146,28 +172,20 @@ impl PreferenceWorker {
                                                 saved = true;
                                                 state.completion(based_on, Some(preferences), Some(report))
                                             }
-                                            Err(error) => {
-                                                state.authoritative = false;
-                                                state.completion(
-                                                    based_on,
-                                                    None,
-                                                    Some(format!("{report}; {}", describe(error))),
-                                                )
-                                            }
+                                            Err(_) => state.persisted_reload(based_on),
                                         }
                                     }
-                                    Err(report) => state.completion(based_on, None, Some(report)),
+                                    Err(crikey_config::ConfigError::PersistedReload) => {
+                                        state.persisted_reload(based_on)
+                                    }
+                                    Err(error) => state.completion(based_on, None, Some(error.to_string())),
                                 }
                             };
                             completion.setting_edit = Some(crikey_ui::SettingEditOutcome {
                                 request_id,
                                 key,
                                 value,
-                                status: if saved {
-                                    crikey_ui::SettingEditStatus::Saved
-                                } else {
-                                    crikey_ui::SettingEditStatus::Failed
-                                },
+                                status: edit_status(saved, completion.state),
                             });
                             completion
                         }
@@ -239,6 +257,37 @@ impl PreferenceWorker {
             )
         })
     }
+    pub fn submit_mutation(
+        &self,
+        request: MutationRequest,
+    ) -> Result<(), (crikey_ui::CommandPreferenceEditOutcome, String)> {
+        self.try_submit(Request::Mutate(request)).map_err(|error| {
+            let (request, message) = match error {
+                mpsc::TrySendError::Full(request) => {
+                    (request, "Configuration edit queue is busy; retry this edit")
+                }
+                mpsc::TrySendError::Disconnected(request) => (request, "Configuration edits are closed"),
+            };
+            let Request::Mutate(MutationRequest {
+                request_id,
+                reference,
+                edit,
+                ..
+            }) = request
+            else {
+                unreachable!()
+            };
+            (
+                crikey_ui::CommandPreferenceEditOutcome {
+                    request_id,
+                    reference,
+                    edit,
+                    status: crikey_ui::SettingEditStatus::Failed,
+                },
+                message.to_owned(),
+            )
+        })
+    }
     pub fn take(&self) -> Option<Completion> {
         self.receiver.try_recv().ok()
     }
@@ -289,12 +338,25 @@ impl WorkerConfiguration {
         report: Option<String>,
     ) -> Completion {
         Completion {
+            state: if self.authoritative {
+                CompletionState::Authoritative
+            } else {
+                CompletionState::Unavailable
+            },
             config: self.config.clone(),
             preferences,
             report,
             based_on,
             setting_edit: None,
+            command_edit: None,
         }
+    }
+    fn persisted_reload(&mut self, based_on: ConfigRevision) -> Completion {
+        self.authoritative = false;
+        let mut completion =
+            self.completion(based_on, None, Some(describe(PreferenceError::PersistedReload)));
+        completion.state = CompletionState::PersistedReloadRequired;
+        completion
     }
     fn conflict(&self, store: &Mutex<CommandPreferencesStore>) -> Completion {
         let preferences = store
@@ -311,27 +373,14 @@ impl WorkerConfiguration {
     fn reload(&mut self, store: &Mutex<CommandPreferencesStore>) -> Completion {
         let based_on = self.revision();
         self.authoritative = false;
-        let mut config =
-            match crate::LauncherConfiguration::load_store(&self.directories, &self.session_overrides) {
-                Ok(config) => config,
-                Err(report) => return self.completion(based_on, None, Some(report)),
-            };
-        // Session-only preference edits are newer than the original --set
-        // arguments. Preserve that document without replacing policy/profile
-        // layers or promoting effective values into another layer.
-        if let Some(current) = &self.config {
-            let session = match current.command_preferences_at(ConfigLayer::SessionOverride) {
-                Ok(session) => session,
-                Err(report) => return self.completion(based_on, None, Some(report)),
-            };
-            if let Some(session) = session {
-                let encoded = match session.encode() {
-                    Ok(encoded) => encoded,
-                    Err(report) => return self.completion(based_on, None, Some(report)),
-                };
-                config.set_session_override(KEY_COMMAND_PREFERENCES, &encoded);
-            }
-        }
+        let loaded = match &self.config {
+            Some(current) => current.reload().map_err(|error| error.to_string()),
+            None => crate::LauncherConfiguration::load_store(&self.directories, &self.session_overrides),
+        };
+        let config = match loaded {
+            Ok(config) => config,
+            Err(report) => return self.completion(based_on, None, Some(report)),
+        };
         let result = store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -365,6 +414,8 @@ fn mutation(
 ) -> Result<PreferenceMutation, String> {
     use crikey_ui::CommandPreferenceEdit;
     match edit {
+        CommandPreferenceEdit::SetAlias(alias) => Ok(PreferenceMutation::SetAlias { reference, alias }),
+        CommandPreferenceEdit::SetHotkey(hotkey) => Ok(PreferenceMutation::SetHotkey { reference, hotkey }),
         CommandPreferenceEdit::Hidden(hidden) => {
             let mut record = preferences
                 .records
@@ -428,6 +479,28 @@ fn move_reference(
         .ok_or("Saved command is no longer in this list")?;
     let reference = list.remove(old);
     list.insert(position, reference);
+    Ok(())
+}
+
+fn edit_status(saved: bool, state: CompletionState) -> crikey_ui::SettingEditStatus {
+    if state == CompletionState::PersistedReloadRequired {
+        crikey_ui::SettingEditStatus::PersistedReloadRequired
+    } else if saved {
+        crikey_ui::SettingEditStatus::Saved
+    } else {
+        crikey_ui::SettingEditStatus::Failed
+    }
+}
+
+fn validate_setting_edit(config: &ConfigStore, key: &str, value: &str) -> Result<(), String> {
+    crate::settings::validate(key, value)?;
+    if key == crikey_config::KEY_ACTIVATION_HOTKEY {
+        let (current, retained) = config
+            .project_user_global_candidates(key, value)
+            .map_err(|error| error.to_string())?;
+        current.validate_command_hotkey_conflicts()?;
+        retained.validate_command_hotkey_conflicts()?;
+    }
     Ok(())
 }
 
@@ -760,6 +833,318 @@ mod authority_tests {
         );
         assert_eq!(std::fs::read_to_string(path).unwrap(), "[invalid");
     }
+
+    #[test]
+    fn saved_unknown_completion_retains_registrations_input_and_requires_retained_loader_recovery() {
+        let scratch = Scratch::new();
+        let directories = StandardDirectories::resolve(
+            DirectoryConvention::current(),
+            &DirectoryEnvironment::new()
+                .set("HOME", &scratch.0)
+                .set("APPDATA", &scratch.0)
+                .set("LOCALAPPDATA", &scratch.0)
+                .set("CRIKEY_CONFIG_DIR", &scratch.0),
+        )
+        .unwrap();
+        let policy = scratch.0.join("custom-policy.toml");
+        std::fs::write(&policy, "[launcher]\nmax-results = 17\n").unwrap();
+        let overrides = vec![("launcher.show-hints".into(), "false".into())];
+        let config = ConfigStore::load_with_overrides(&directories, Some(&policy), &overrides).unwrap();
+        let published = Mutex::new(CommandPreferencesStore::load(&config).unwrap());
+        let original = published.lock().unwrap().snapshot();
+        let mut state = WorkerConfiguration {
+            watch: Some(config.source_watch()),
+            config: Some(config.clone()),
+            authoritative: true,
+            directories,
+            session_overrides: Vec::new(),
+        };
+        let mut desired = config.clone();
+        desired
+            .commit_user_global("launcher.command-home", "favorites", &config.revision())
+            .unwrap();
+        let saved = std::fs::read(config.config_path()).unwrap();
+        // Exercise the typed post-persistence failure boundary with an actual
+        // durable desired document and an unavailable retained policy source.
+        std::fs::write(&policy, "[invalid").unwrap();
+        let unknown = state.persisted_reload(config.revision());
+        assert_eq!(unknown.state, CompletionState::PersistedReloadRequired);
+        assert!(unknown.preferences.is_none());
+        assert_eq!(
+            edit_status(false, unknown.state),
+            crikey_ui::SettingEditStatus::PersistedReloadRequired
+        );
+        assert!(!state.accepts(&desired));
+        assert_eq!(published.lock().unwrap().snapshot().revision, original.revision);
+        let unavailable = state.reload(&published);
+        assert_eq!(unavailable.state, CompletionState::Unavailable);
+        assert!(unavailable.preferences.is_none());
+        assert_eq!(std::fs::read(config.config_path()).unwrap(), saved);
+        std::fs::write(&policy, "[launcher]\nmax-results = 17\n").unwrap();
+        let recovered = state.reload(&published);
+        assert_eq!(recovered.state, CompletionState::Authoritative);
+        let effective = recovered.config.unwrap();
+        assert_eq!(effective.get("launcher.command-home"), Some("favorites"));
+        assert_eq!(effective.get("launcher.max-results"), Some("17"));
+        assert_eq!(effective.get("launcher.show-hints"), Some("false"));
+        assert!(state.accepts(&effective));
+        assert_eq!(std::fs::read(config.config_path()).unwrap(), saved);
+    }
+
+    #[test]
+    fn activation_save_rejects_shadowed_durable_command_binding_without_writing() {
+        use crikey_config::command_preferences::{CommandPreference, CommandPreferences};
+        use std::time::Duration;
+        let scratch = Scratch::new();
+        let directories = StandardDirectories::resolve(
+            DirectoryConvention::current(),
+            &DirectoryEnvironment::new()
+                .set("HOME", &scratch.0)
+                .set("APPDATA", &scratch.0)
+                .set("LOCALAPPDATA", &scratch.0)
+                .set("CRIKEY_CONFIG_DIR", &scratch.0),
+        )
+        .unwrap();
+        let durable = CommandPreferences {
+            records: vec![CommandPreference {
+                reference: crikey_core::command::builtin_commands().remove(0).reference,
+                hidden: false,
+                alias: None,
+                hotkey: Some("Ctrl+Shift+G".into()),
+            }],
+            favorites: Vec::new(),
+            fallbacks: Vec::new(),
+        };
+        let mut config = crate::LauncherConfiguration::load_store(&directories, &[]).unwrap();
+        config.set_user_global(KEY_COMMAND_PREFERENCES, &durable.encode().unwrap());
+        config.save().unwrap();
+        let path = config.config_path().to_owned();
+        let disk_before = std::fs::read(&path).unwrap();
+        config.set_session_override(
+            KEY_COMMAND_PREFERENCES,
+            &CommandPreferences::default().encode().unwrap(),
+        );
+        let store = Arc::new(Mutex::new(CommandPreferencesStore::empty()));
+        let worker =
+            PreferenceWorker::spawn(store, Some(config), directories.clone(), Vec::new(), || {}).unwrap();
+        let startup = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(startup
+            .preferences
+            .as_ref()
+            .unwrap()
+            .preferences
+            .records
+            .is_empty());
+        let before = startup.config.unwrap();
+        let activation_before = crate::settings::configured_hotkey(Some(&before));
+        worker
+            .submit_setting(
+                41,
+                before,
+                crikey_config::KEY_ACTIVATION_HOTKEY.into(),
+                "Shift+Ctrl+G".into(),
+            )
+            .unwrap();
+        let refused = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(refused.state, CompletionState::Authoritative);
+        assert_eq!(
+            refused.setting_edit,
+            Some(crikey_ui::SettingEditOutcome {
+                request_id: 41,
+                key: crikey_config::KEY_ACTIVATION_HOTKEY.into(),
+                value: "Shift+Ctrl+G".into(),
+                status: crikey_ui::SettingEditStatus::Failed,
+            })
+        );
+        assert_eq!(
+            crate::settings::configured_hotkey(refused.config.as_ref()),
+            activation_before
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+        let restarted = crate::LauncherConfiguration::load_store(&directories, &[]).unwrap();
+        assert_eq!(
+            restarted.command_preferences_at(ConfigLayer::UserGlobal).unwrap(),
+            Some(durable)
+        );
+        assert_eq!(
+            crate::settings::configured_hotkey(Some(&restarted)),
+            activation_before
+        );
+    }
+
+    #[test]
+    fn activation_save_resolves_retained_profile_winners_not_inactive_documents() {
+        use crikey_config::command_preferences::{CommandPreference, CommandPreferences};
+        use crikey_ui::SettingEditStatus;
+        use std::time::Duration;
+        for (profile_has_command, profile_activation, expected) in [
+            (true, None, SettingEditStatus::Failed),
+            (false, None, SettingEditStatus::Saved),
+            (true, Some("Ctrl+Shift+H"), SettingEditStatus::Saved),
+        ] {
+            let scratch = Scratch::new();
+            let directories = StandardDirectories::resolve(
+                DirectoryConvention::current(),
+                &DirectoryEnvironment::new()
+                    .set("HOME", &scratch.0)
+                    .set("APPDATA", &scratch.0)
+                    .set("LOCALAPPDATA", &scratch.0)
+                    .set("CRIKEY_CONFIG_DIR", &scratch.0),
+            )
+            .unwrap();
+            let command = CommandPreferences {
+                records: vec![CommandPreference {
+                    reference: crikey_core::command::builtin_commands().remove(0).reference,
+                    hidden: false,
+                    alias: None,
+                    hotkey: Some("Ctrl+Shift+G".into()),
+                }],
+                favorites: Vec::new(),
+                fallbacks: Vec::new(),
+            };
+            let empty = CommandPreferences::default();
+            let profile_commands = if profile_has_command { &command } else { &empty };
+            let profile_dir = directories.config_dir().join("profiles");
+            std::fs::create_dir_all(&profile_dir).unwrap();
+            let activation = profile_activation
+                .map(|chord| format!("[launcher]\nactivation-hotkey = '{chord}'\n"))
+                .unwrap_or_default();
+            std::fs::write(
+                profile_dir.join("work.toml"),
+                format!(
+                    "{activation}[commands]\npreferences = '''\n{}'''\n",
+                    profile_commands.encode().unwrap()
+                ),
+            )
+            .unwrap();
+            let mut config = crate::LauncherConfiguration::load_store(&directories, &[]).unwrap();
+            config.set_user_global("launcher.profile", "work");
+            config.set_user_global(KEY_COMMAND_PREFERENCES, &command.encode().unwrap());
+            config.save().unwrap();
+            let path = config.config_path().to_owned();
+            let disk_before = std::fs::read(&path).unwrap();
+            config.set_session_override(KEY_COMMAND_PREFERENCES, &empty.encode().unwrap());
+            let store = Arc::new(Mutex::new(CommandPreferencesStore::empty()));
+            let worker =
+                PreferenceWorker::spawn(store, Some(config), directories.clone(), Vec::new(), || {}).unwrap();
+            let initial = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            worker
+                .submit_setting(
+                    51,
+                    initial.config.unwrap(),
+                    crikey_config::KEY_ACTIVATION_HOTKEY.into(),
+                    "Ctrl+Shift+G".into(),
+                )
+                .unwrap();
+            let completion = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(completion.setting_edit.unwrap().status, expected);
+            if expected == SettingEditStatus::Failed {
+                assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+            }
+            let restarted = crate::LauncherConfiguration::load_store(&directories, &[]).unwrap();
+            assert_eq!(
+                restarted.layer_of(KEY_COMMAND_PREFERENCES),
+                Some(ConfigLayer::Profile)
+            );
+            assert_eq!(
+                CommandPreferences::decode(restarted.get(KEY_COMMAND_PREFERENCES).unwrap()).unwrap(),
+                *profile_commands
+            );
+            assert!(restarted.validate_command_hotkey_conflicts().is_ok());
+            if let Some(activation) = profile_activation {
+                assert_eq!(crate::settings::configured_hotkey(Some(&restarted)), activation);
+            }
+        }
+    }
+
+    #[test]
+    fn command_hotkey_save_checks_retained_activation_without_rejecting_shadowed_commands() {
+        use crikey_config::command_preferences::{CommandPreference, CommandPreferences};
+        use crikey_ui::{CommandPreferenceEdit, SettingEditStatus};
+        use std::time::Duration;
+        for profile_shadows_commands in [false, true] {
+            let scratch = Scratch::new();
+            let directories = StandardDirectories::resolve(
+                DirectoryConvention::current(),
+                &DirectoryEnvironment::new()
+                    .set("HOME", &scratch.0)
+                    .set("APPDATA", &scratch.0)
+                    .set("LOCALAPPDATA", &scratch.0)
+                    .set("CRIKEY_CONFIG_DIR", &scratch.0),
+            )
+            .unwrap();
+            let reference = crikey_core::command::builtin_commands().remove(0).reference;
+            let mut config = crate::LauncherConfiguration::load_store(&directories, &[]).unwrap();
+            let preferences = CommandPreferences {
+                records: vec![CommandPreference {
+                    reference: reference.clone(),
+                    hidden: false,
+                    alias: None,
+                    hotkey: None,
+                }],
+                favorites: Vec::new(),
+                fallbacks: Vec::new(),
+            };
+            config.set_user_global(KEY_COMMAND_PREFERENCES, &preferences.encode().unwrap());
+            config.set_user_global(crikey_config::KEY_ACTIVATION_HOTKEY, "Ctrl+Shift+G");
+            if profile_shadows_commands {
+                let profile_dir = directories.config_dir().join("profiles");
+                std::fs::create_dir_all(&profile_dir).unwrap();
+                std::fs::write(
+                    profile_dir.join("work.toml"),
+                    format!(
+                        "[commands]\npreferences = '''\n{}'''\n",
+                        CommandPreferences::default().encode().unwrap()
+                    ),
+                )
+                .unwrap();
+                config.set_user_global("launcher.profile", "work");
+            }
+            config.save().unwrap();
+            let path = config.config_path().to_owned();
+            let disk_before = std::fs::read(&path).unwrap();
+            config.set_session_override(crikey_config::KEY_ACTIVATION_HOTKEY, "Ctrl+Shift+H");
+            let store = Arc::new(Mutex::new(CommandPreferencesStore::empty()));
+            let worker =
+                PreferenceWorker::spawn(store, Some(config), directories.clone(), Vec::new(), || {}).unwrap();
+            let initial = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            worker
+                .submit_mutation(MutationRequest {
+                    request_id: 61,
+                    config: initial.config.unwrap(),
+                    registry: Arc::new(CommandRegistrySnapshot::default()),
+                    expected_revision: initial.preferences.unwrap().revision,
+                    reference,
+                    edit: CommandPreferenceEdit::SetHotkey(Some("Ctrl+Shift+G".into())),
+                    session: false,
+                })
+                .unwrap();
+            let completion = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            let expected = if profile_shadows_commands {
+                SettingEditStatus::Saved
+            } else {
+                SettingEditStatus::Failed
+            };
+            assert_eq!(completion.command_edit.unwrap().status, expected);
+            let restarted = crate::LauncherConfiguration::load_store(&directories, &[]).unwrap();
+            assert!(restarted.validate_command_hotkey_conflicts().is_ok());
+            if profile_shadows_commands {
+                assert!(completion.preferences.unwrap().preferences.records.is_empty());
+                assert_eq!(
+                    restarted
+                        .command_preferences_at(ConfigLayer::UserGlobal)
+                        .unwrap()
+                        .unwrap()
+                        .records[0]
+                        .hotkey
+                        .as_deref(),
+                    Some("Ctrl+Shift+G")
+                );
+            } else {
+                assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -799,12 +1184,20 @@ mod layer_consumer_tests {
         let global_other = reference("global.owner");
         let session_only = reference("session.owner");
         let mut expected_global = CommandPreferences {
-            records: vec![CommandPreference {
-                reference: selected.clone(),
-                hidden: false,
-                alias: Some("global-alias".into()),
-                hotkey: Some("Ctrl+Shift+G".into()),
-            }],
+            records: vec![
+                CommandPreference {
+                    reference: selected.clone(),
+                    hidden: false,
+                    alias: Some("global-alias".into()),
+                    hotkey: Some("Ctrl+Shift+G".into()),
+                },
+                CommandPreference {
+                    reference: global_other.clone(),
+                    hidden: true,
+                    alias: Some("occupied".into()),
+                    hotkey: Some("Ctrl+Shift+O".into()),
+                },
+            ],
             favorites: vec![global_other.clone(), selected.clone()],
             fallbacks: vec![selected.clone(), global_other],
         };
@@ -830,15 +1223,21 @@ mod layer_consumer_tests {
         let registry = Arc::new(CommandRegistrySnapshot::default());
         for edit in [
             CommandPreferenceEdit::Hidden(true),
+            CommandPreferenceEdit::SetAlias(Some("new-alias".into())),
+            CommandPreferenceEdit::SetHotkey(Some("Ctrl+Shift+N".into())),
+            CommandPreferenceEdit::SetAlias(None),
+            CommandPreferenceEdit::SetHotkey(None),
             CommandPreferenceEdit::Favorite(false),
             CommandPreferenceEdit::Fallback(false),
         ] {
             let effect = UiEffect::MutateCommandPreferences {
                 reference: selected.clone(),
+                request_id: 1,
                 expected_revision: current.preferences.as_ref().unwrap().revision,
                 edit: edit.clone(),
             };
             let UiEffect::MutateCommandPreferences {
+                request_id,
                 reference,
                 expected_revision,
                 edit: semantic_edit,
@@ -847,17 +1246,23 @@ mod layer_consumer_tests {
                 unreachable!();
             };
             worker
-                .submit(Request::Mutate {
+                .submit(Request::Mutate(MutationRequest {
+                    request_id,
                     config: current.config.take().unwrap(),
                     registry: Arc::clone(&registry),
                     expected_revision,
                     reference,
                     edit: semantic_edit,
                     session: false,
-                })
+                }))
                 .unwrap();
             current = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
             let preferences = current.preferences.as_ref().expect("semantic edit must commit");
+            assert_eq!(current.state, CompletionState::Authoritative);
+            let ack = current.command_edit.as_ref().unwrap();
+            assert_eq!(ack.request_id, 1);
+            assert_eq!(ack.edit, edit);
+            assert_eq!(ack.status, crikey_ui::SettingEditStatus::Saved);
             assert_eq!(preferences.preferences, session);
             assert_eq!(preferences.layer, Some(ConfigLayer::SessionOverride));
             assert_eq!(
@@ -872,6 +1277,8 @@ mod layer_consumer_tests {
             );
             match edit {
                 CommandPreferenceEdit::Hidden(hidden) => expected_global.records[0].hidden = hidden,
+                CommandPreferenceEdit::SetAlias(alias) => expected_global.records[0].alias = alias,
+                CommandPreferenceEdit::SetHotkey(hotkey) => expected_global.records[0].hotkey = hotkey,
                 CommandPreferenceEdit::Favorite(false) => {
                     expected_global.favorites.retain(|saved| saved != &selected)
                 }
@@ -891,6 +1298,36 @@ mod layer_consumer_tests {
                     .unwrap(),
                 None
             );
+        }
+        let path = current.config.as_ref().unwrap().config_path().to_owned();
+        let disk_before = std::fs::read(&path).unwrap();
+        for (index, edit) in [
+            CommandPreferenceEdit::SetAlias(Some("OCCUPIED".into())),
+            CommandPreferenceEdit::SetHotkey(Some("Shift+Ctrl+O".into())),
+            CommandPreferenceEdit::SetHotkey(Some(crate::settings::configured_hotkey(
+                current.config.as_ref(),
+            ))),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            worker
+                .submit(Request::Mutate(MutationRequest {
+                    request_id: 100 + index as u64,
+                    config: current.config.as_ref().unwrap().clone(),
+                    registry: Arc::clone(&registry),
+                    expected_revision: current.preferences.as_ref().unwrap().revision,
+                    reference: selected.clone(),
+                    edit: edit.clone(),
+                    session: false,
+                }))
+                .unwrap();
+            let refused = worker.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            let ack = refused.command_edit.unwrap();
+            assert_eq!(ack.request_id, 100 + index as u64);
+            assert_eq!(ack.edit, edit);
+            assert_eq!(ack.status, crikey_ui::SettingEditStatus::Failed);
+            assert_eq!(std::fs::read(&path).unwrap(), disk_before);
         }
     }
 }

@@ -155,6 +155,13 @@ struct PortalState {
     /// When set, a bind succeeds but reports an empty bound set: the portal
     /// took the request and honoured none of it.
     bind_nothing: bool,
+    held_approval: bool,
+    refuse_close: bool,
+    closed_requests: Vec<String>,
+    bound_sessions: HashMap<String, String>,
+    create_response: Option<u32>,
+    hold_creation: bool,
+    create_requests: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -226,11 +233,30 @@ impl GlobalShortcuts {
             text(&options, "session_handle_token")
         );
 
-        {
+        server
+            .at(
+                path(&request),
+                PortalRequest {
+                    log: self.log.clone(),
+                    path: request.clone(),
+                },
+            )
+            .await
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let (response, hold) = {
             let mut state = lock(&self.log.state);
             state.client = Some(client.clone());
-            state.sessions.push(session.clone());
+            state.create_requests += 1;
+            (state.create_response, state.hold_creation)
+        };
+        if hold {
+            return Ok(path(&request));
         }
+        if let Some(code) = response {
+            respond(emitter.connection(), &client, &request, code, HashMap::new()).await;
+            return Ok(path(&request));
+        }
+        lock(&self.log.state).sessions.push(session.clone());
 
         // A real portal answers `Close` on the session it just handed out, and
         // this backend closes every session it replaces.
@@ -253,7 +279,7 @@ impl GlobalShortcuts {
 
     async fn bind_shortcuts(
         &self,
-        _session: OwnedObjectPath,
+        session: OwnedObjectPath,
         shortcuts: Vec<(String, HashMap<String, OwnedValue>)>,
         _parent_window: String,
         options: HashMap<String, OwnedValue>,
@@ -263,10 +289,32 @@ impl GlobalShortcuts {
         let client = sender_of(&header);
         let request = request_path(&client, &text(&options, "handle_token"));
         let asked: Vec<String> = shortcuts.iter().map(|(id, _)| id.clone()).collect();
+        emitter
+            .connection()
+            .object_server()
+            .at(
+                path(&request),
+                PortalRequest {
+                    log: self.log.clone(),
+                    path: request.clone(),
+                },
+            )
+            .await
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
 
         let (refuse, bind_nothing) = {
             let mut state = lock(&self.log.state);
             state.binds.push(asked.clone());
+            if state.held_approval {
+                return Ok(path(&request));
+            }
+            if !state.refuse && !state.bind_nothing {
+                for id in &asked {
+                    state
+                        .bound_sessions
+                        .insert(id.clone(), session.as_str().to_owned());
+                }
+            }
             (state.refuse, state.bind_nothing)
         };
 
@@ -300,8 +348,25 @@ struct PortalSession {
 
 #[zbus::interface(name = "org.freedesktop.portal.Session")]
 impl PortalSession {
+    fn close(&self) -> zbus::fdo::Result<()> {
+        let mut state = lock(&self.log.state);
+        if state.refuse_close {
+            return Err(zbus::fdo::Error::Failed("session retained".into()));
+        }
+        state.closed.push(self.path.clone());
+        state.bound_sessions.retain(|_, session| session != &self.path);
+        Ok(())
+    }
+}
+
+struct PortalRequest {
+    log: PortalLog,
+    path: String,
+}
+#[zbus::interface(name = "org.freedesktop.portal.Request")]
+impl PortalRequest {
     fn close(&self) {
-        lock(&self.log.state).closed.push(self.path.clone());
+        lock(&self.log.state).closed_requests.push(self.path.clone());
     }
 }
 
@@ -396,12 +461,11 @@ impl Fixture {
     /// Fires an activation the way the portal does: a unicast signal naming the
     /// shortcut id, addressed to the client that bound it.
     fn activate(&self, shortcut_id: &str) {
-        let session = self
-            .log
-            .sessions()
-            .last()
+        let session = lock(&self.log.state)
+            .bound_sessions
+            .get(shortcut_id)
             .cloned()
-            .expect("a session was created before anything could be bound");
+            .expect("this shortcut has a live bound session");
         self._portal
             .emit_signal(
                 Some(self.log.client()),
@@ -524,10 +588,7 @@ fn registering_one_chord_twice_binds_it_once_however_it_is_spelled() {
 
 /// A second, different chord is bound alongside the first.
 ///
-/// Kills the shortcut a bind-once-per-session portal invites: dropping the
-/// accelerators already held when a new one is added. The portal permits one
-/// `BindShortcuts` per session, so the second registration has to carry the
-/// whole set on a new session, and both ids have to be in it.
+/// Separate sessions keep earlier approval and physical ownership intact.
 #[test]
 fn a_second_chord_is_bound_alongside_the_first_rather_than_replacing_it() {
     let mut fixture = Fixture::start();
@@ -542,16 +603,24 @@ fn a_second_chord_is_bound_alongside_the_first_rather_than_replacing_it() {
         .expect("the second registration binds");
 
     let binds = fixture.log.binds();
-    assert_eq!(binds.len(), 2, "a new chord needs a new bind, got {binds:?}");
-    assert_eq!(
-        binds[1].len(),
-        2,
-        "the second bind must carry both chords, or the first one is silently released: {binds:?}"
-    );
-    assert!(
-        binds[1].iter().any(|id| binds[0].contains(id)),
-        "the second bind must still include the first chord: {binds:?}"
-    );
+    assert_eq!(binds.len(), 2);
+    assert_eq!(binds[0].len(), 1);
+    assert_eq!(binds[1].len(), 1);
+    let (sender, receiver) = mpsc::channel();
+    fixture
+        .service()
+        .set_activation_handler(Some(Box::new(move |binding| {
+            sender.send(binding.accelerator.clone()).unwrap();
+        })));
+    fixture.activate(&binds[0][0]);
+    fixture.activate(&binds[1][0]);
+    assert_eq!(receiver.recv_timeout(LIMIT).unwrap(), "Ctrl+Alt+Space");
+    assert_eq!(receiver.recv_timeout(LIMIT).unwrap(), "Ctrl+Alt+K");
+    let retained = lock(&fixture.log.state).bound_sessions[&binds[0][0]].clone();
+    fixture.service().unregister(&binding("Ctrl+Alt+K")).unwrap();
+    assert!(!lock(&fixture.log.state).closed.contains(&retained));
+    fixture.activate(&binds[0][0]);
+    assert_eq!(receiver.recv_timeout(LIMIT).unwrap(), "Ctrl+Alt+Space");
 }
 
 /// A portal that refuses the request leaves nothing claimed.
@@ -683,4 +752,153 @@ fn dropping_the_service_closes_the_session_it_still_held() {
     fixture.log.wait_for("the live session closed", |state| {
         state.closed.contains(&live_session)
     });
+}
+
+#[test]
+fn quitting_pending_portal_approval_closes_request_and_session_without_waiting_for_user() {
+    let mut fixture = Fixture::start();
+    lock(&fixture.log.state).held_approval = true;
+    let mut service = fixture.service.take().unwrap();
+    let cancel = service.cancellation_handle().unwrap();
+    let (done, result) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let registration = service.register(&binding("Ctrl+Alt+Space"));
+        let cleanup = service.shutdown(&[]);
+        done.send((registration, cleanup)).unwrap();
+    });
+    fixture
+        .log
+        .wait_for("pending approval", |state| !state.binds.is_empty());
+    cancel.stop();
+    let (registration, cleanup) = result
+        .recv_timeout(DROP_LIMIT)
+        .expect("cancellation interrupts portal approval rather than waiting 120 seconds");
+    assert!(registration.is_err());
+    assert!(cleanup.is_ok());
+    worker.join().unwrap();
+    let state = lock(&fixture.log.state);
+    assert_eq!(state.closed_requests.len(), 1);
+    assert!(state
+        .sessions
+        .iter()
+        .all(|session| state.closed.contains(session)));
+    assert!(state.bound_sessions.is_empty());
+}
+
+#[test]
+fn refused_session_close_keeps_physical_cleanup_obligation_and_allows_retry() {
+    let mut fixture = Fixture::start();
+    fixture.service().register(&binding("Ctrl+Alt+Space")).unwrap();
+    let session = fixture.log.sessions().last().unwrap().clone();
+    lock(&fixture.log.state).refuse_close = true;
+    assert!(fixture.service().unregister(&binding("Ctrl+Alt+Space")).is_err());
+    assert!(!lock(&fixture.log.state).closed.contains(&session));
+    assert!(!lock(&fixture.log.state).bound_sessions.is_empty());
+    lock(&fixture.log.state).refuse_close = false;
+    fixture.service().unregister(&binding("Ctrl+Alt+Space")).unwrap();
+    assert!(lock(&fixture.log.state).closed.contains(&session));
+    assert!(lock(&fixture.log.state).bound_sessions.is_empty());
+}
+
+#[test]
+fn cancellation_before_native_entry_cannot_open_a_new_approval_request() {
+    let mut fixture = Fixture::start();
+    let cancel = fixture.service().cancellation_handle().unwrap();
+    let admitted_epoch = cancel.epoch();
+    cancel.cancel();
+    assert!(fixture
+        .service()
+        .register_at(&binding("Ctrl+Alt+Space"), admitted_epoch)
+        .is_err());
+    assert!(fixture.log.binds().is_empty());
+    assert!(fixture.log.sessions().is_empty());
+    fixture.service().register(&binding("Ctrl+Alt+Space")).unwrap();
+    assert_eq!(lock(&fixture.log.state).bound_sessions.len(), 1);
+}
+
+#[test]
+fn a_late_old_session_activation_cannot_inherit_a_reused_chord() {
+    let mut fixture = Fixture::start();
+    fixture.service().register(&binding("Ctrl+Alt+Space")).unwrap();
+    let id = fixture.log.binds()[0][0].clone();
+    let old_session = lock(&fixture.log.state).bound_sessions[&id].clone();
+    fixture.service().unregister(&binding("Ctrl+Alt+Space")).unwrap();
+    fixture.service().register(&binding("Ctrl+Alt+Space")).unwrap();
+    assert_ne!(old_session, lock(&fixture.log.state).bound_sessions[&id]);
+    let (sender, received) = mpsc::channel();
+    fixture
+        .service()
+        .set_activation_handler(Some(Box::new(move |binding| {
+            sender.send(binding.accelerator.clone()).unwrap();
+        })));
+    fixture
+        ._portal
+        .emit_signal(
+            Some(fixture.log.client()),
+            PORTAL_PATH,
+            SHORTCUTS_INTERFACE,
+            "Activated",
+            &(
+                path(&old_session),
+                id.as_str(),
+                0u64,
+                HashMap::<String, Value<'_>>::new(),
+            ),
+        )
+        .unwrap();
+    fixture.activate(&id);
+    assert_eq!(received.recv_timeout(LIMIT).unwrap(), "Ctrl+Alt+Space");
+    assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+}
+
+#[test]
+fn rejected_or_dismissed_creation_does_not_poison_subsequent_registration() {
+    for response in [1, 2] {
+        let mut fixture = Fixture::start();
+        lock(&fixture.log.state).create_response = Some(response);
+        assert!(fixture.service().register(&binding("Ctrl+Alt+Space")).is_err());
+        assert!(fixture.log.sessions().is_empty());
+        assert!(lock(&fixture.log.state).bound_sessions.is_empty());
+        lock(&fixture.log.state).create_response = None;
+        fixture.service().register(&binding("Ctrl+Alt+Space")).unwrap();
+        let id = fixture.log.binds()[0][0].clone();
+        let (sender, received) = mpsc::channel();
+        fixture
+            .service()
+            .set_activation_handler(Some(Box::new(move |binding| {
+                sender.send(binding.accelerator.clone()).unwrap();
+            })));
+        fixture.activate(&id);
+        assert_eq!(received.recv_timeout(LIMIT).unwrap(), "Ctrl+Alt+Space");
+        fixture.service().shutdown(&[]).unwrap();
+        assert!(lock(&fixture.log.state).bound_sessions.is_empty());
+    }
+}
+
+#[test]
+fn cancelled_creation_with_no_session_recovers_after_confirmed_absence() {
+    let mut fixture = Fixture::start();
+    lock(&fixture.log.state).hold_creation = true;
+    let mut service = fixture.service.take().unwrap();
+    let cancel = service.cancellation_handle().unwrap();
+    let (done, result) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let registration = service.register(&binding("Ctrl+Alt+Space"));
+        done.send((registration, service)).unwrap();
+    });
+    fixture
+        .log
+        .wait_for("creation request", |state| state.create_requests == 1);
+    cancel.cancel();
+    let (registration, service) = result.recv_timeout(DROP_LIMIT).unwrap();
+    worker.join().unwrap();
+    assert!(registration.is_err());
+    assert!(fixture.log.sessions().is_empty());
+    assert_eq!(lock(&fixture.log.state).closed_requests.len(), 1);
+    fixture.service = Some(service);
+    lock(&fixture.log.state).hold_creation = false;
+    fixture.service().register(&binding("Ctrl+Alt+Space")).unwrap();
+    assert_eq!(lock(&fixture.log.state).bound_sessions.len(), 1);
+    fixture.service().shutdown(&[]).unwrap();
+    assert!(lock(&fixture.log.state).bound_sessions.is_empty());
 }

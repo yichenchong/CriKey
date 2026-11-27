@@ -300,18 +300,23 @@ pub(crate) fn validate(key: &str, value: &str) -> Result<(), String> {
 /// write as effective would be lying about which chord the launcher answers to.
 pub(crate) fn persist(store: &mut ConfigStore, key: &str, value: &str) -> Result<String, String> {
     validate(key, value)?;
+    persist_typed(store, key, value).map_err(|error| match error {
+        crikey_config::ConfigError::Conflict => "Configuration changed; reload and retry this edit".into(),
+        crikey_config::ConfigError::PersistedReload => {
+            "Setting was saved, but the effective configuration could not be reloaded".into()
+        }
+        _ => format!("`{key}` could not be written"),
+    })
+}
+
+/// The worker validates first and retains typed persistence/reload outcomes.
+pub(crate) fn persist_typed(
+    store: &mut ConfigStore,
+    key: &str,
+    value: &str,
+) -> Result<String, crikey_config::ConfigError> {
     let expected = store.revision();
-    store
-        .commit_user_global(key, value, &expected)
-        .map_err(|error| match error {
-            crikey_config::ConfigError::Conflict => {
-                "Configuration changed; reload and retry this edit".to_owned()
-            }
-            crikey_config::ConfigError::PersistedReload => {
-                "Setting was saved, but the effective configuration could not be reloaded".to_owned()
-            }
-            _ => format!("`{key}` could not be written"),
-        })?;
+    store.commit_user_global(key, value, &expected)?;
     let effective = store.get(key).unwrap_or_default();
     if effective == value {
         Ok(format!("{key} = {value}"))
@@ -320,150 +325,6 @@ pub(crate) fn persist(store: &mut ConfigStore, key: &str, value: &str) -> Result
         Ok(format!(
             "{key} saved as {value}, but {layer} still supplies {effective}"
         ))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The activation hotkey
-// ---------------------------------------------------------------------------
-
-/// The platform side of one global accelerator.
-///
-/// A trait rather than a direct call so the rebinding rules — which binding
-/// survives a refusal, and in which order the two grabs are taken — are decided
-/// by code that can run on a host with no display server at all. Those rules
-/// are the part that was wrong; the Win32 and X11 calls underneath are not.
-pub(crate) trait HotkeyRegistrar {
-    /// Takes `accelerator`, installing the activation handler with it.
-    fn register(&mut self, accelerator: &str) -> Result<(), String>;
-    /// Releases an accelerator this registrar took.
-    fn unregister(&mut self, accelerator: &str) -> Result<(), String>;
-}
-
-/// The registrar the launcher actually runs with: the platform backend the
-/// search service owns, wired to the renderer's toggle.
-///
-/// Borrowed rather than owned, and rebuilt at each call site, because the event
-/// loop owns the one [`SearchService`] and a registrar that held it for the
-/// life of the process would take that borrow away from every query.
-///
-/// A target with no global-shortcut backend refuses instead of pretending: the
-/// launcher then comes up resident with its settings open, which is the honest
-/// state of a launcher nothing can raise by keyboard.
-///
-/// [`SearchService`]: crikey_app::SearchService
-pub(crate) struct PlatformHotkeys<'a> {
-    pub(crate) search: &'a mut crikey_app::SearchService,
-    pub(crate) handle: crikey_ui::NativeLauncherHandle,
-}
-
-impl HotkeyRegistrar for PlatformHotkeys<'_> {
-    fn register(&mut self, accelerator: &str) -> Result<(), String> {
-        #[cfg(any(windows, target_os = "linux"))]
-        {
-            // A fresh handle per registration: the handler outlives this call
-            // and the backend owns it until the next `set_activation_handler`.
-            let handle = self.handle.clone();
-            self.search
-                .register_activation_hotkey(
-                    accelerator,
-                    Box::new(move |_| {
-                        let _ = handle.request_toggle();
-                    }),
-                )
-                .map_err(|error| error.to_string())
-        }
-        #[cfg(not(any(windows, target_os = "linux")))]
-        {
-            let _ = (&mut self.search, &self.handle);
-            Err(unsupported_platform(accelerator))
-        }
-    }
-
-    fn unregister(&mut self, accelerator: &str) -> Result<(), String> {
-        #[cfg(any(windows, target_os = "linux"))]
-        {
-            self.search
-                .unregister_activation_hotkey(accelerator)
-                .map_err(|error| error.to_string())
-        }
-        #[cfg(not(any(windows, target_os = "linux")))]
-        {
-            let _ = &mut self.search;
-            Err(unsupported_platform(accelerator))
-        }
-    }
-}
-
-/// Why a target with no `Capability::GlobalHotkeys` backend can take no chord.
-#[cfg(not(any(windows, target_os = "linux")))]
-fn unsupported_platform(accelerator: &str) -> String {
-    format!("this build has no global-shortcut backend, so {accelerator} cannot be bound")
-}
-
-/// The accelerator this launch currently holds, and the accelerator it last
-/// tried to hold.
-///
-/// Both are needed. `bound` is what must be released when a new chord is taken;
-/// `attempted` is what stops a configuration reload from re-attempting, on
-/// every poll of the file watcher for the life of the process, a chord the
-/// platform has already refused.
-#[derive(Debug, Default)]
-pub(crate) struct ActivationHotkey {
-    bound: Option<String>,
-    attempted: Option<String>,
-}
-
-impl ActivationHotkey {
-    /// The accelerator that is live, or `None` when the launcher holds none.
-    pub(crate) fn bound(&self) -> Option<&str> {
-        self.bound.as_deref()
-    }
-
-    /// Whether `accelerator` is what this launch last tried to bind, refused or
-    /// not.
-    pub(crate) fn is_current(&self, accelerator: &str) -> bool {
-        self.attempted.as_deref() == Some(accelerator)
-    }
-
-    /// Takes `accelerator`, keeping whatever is live if the platform refuses.
-    ///
-    /// The new grab is taken BEFORE the old one is released, and that order is
-    /// the whole point: a chord another application already owns must cost the
-    /// user nothing, and releasing first would open a window in which a typo in
-    /// the settings panel leaves a resident launcher that no key combination
-    /// reaches. Register-first has no such window — at worst both chords are
-    /// live for the few microseconds between the two calls — so a refusal needs
-    /// no recovery path, it simply changes nothing.
-    ///
-    /// Re-binding the chord that is already live does nothing at all rather
-    /// than churning the grab, so a configuration reload that changed some
-    /// other key never briefly drops the hotkey.
-    ///
-    /// `Ok(Some(..))` carries the one non-fatal outcome: the new chord is live
-    /// and the old one could not be handed back. That is worth saying, because
-    /// the stranded accelerator goes on opening the launcher without appearing
-    /// anywhere in its configuration.
-    pub(crate) fn bind(
-        &mut self,
-        registrar: &mut dyn HotkeyRegistrar,
-        accelerator: &str,
-    ) -> Result<Option<String>, String> {
-        self.attempted = Some(accelerator.to_owned());
-        if self.bound.as_deref() == Some(accelerator) {
-            return Ok(None);
-        }
-        registrar.register(accelerator)?;
-        let Some(previous) = self.bound.replace(accelerator.to_owned()) else {
-            return Ok(None);
-        };
-        match registrar.unregister(&previous) {
-            Ok(()) => Ok(None),
-            Err(error) => Ok(Some(format!(
-                "{accelerator} is now the activation hotkey, but {previous} could not be released \
-                 ({error}); it keeps opening CriKey until the launcher restarts"
-            ))),
-        }
     }
 }
 
@@ -657,64 +518,6 @@ mod tests {
     use crikey_platform::{DirectoryConvention, DirectoryEnvironment, StandardDirectories};
     use crikey_ui::UiCommand;
 
-    /// A registrar that records what it was asked to do and refuses whatever it
-    /// was told to refuse, standing in for a desktop where another application
-    /// already owns the chord.
-    #[derive(Debug, Default)]
-    struct FakeRegistrar {
-        refuse: Vec<String>,
-        refuse_release: bool,
-        log: Vec<String>,
-    }
-
-    impl FakeRegistrar {
-        fn refusing(accelerator: &str) -> Self {
-            Self {
-                refuse: vec![accelerator.to_owned()],
-                ..Self::default()
-            }
-        }
-
-        /// The accelerators the platform is still holding, in the order they
-        /// were taken, which is what "exactly one chord is live" is read from.
-        fn live(&self) -> Vec<&str> {
-            let mut live: Vec<&str> = Vec::new();
-            for entry in &self.log {
-                let Some((verb, accelerator)) = entry.split_once(' ') else {
-                    continue;
-                };
-                match verb {
-                    "register" if !self.refuse.iter().any(|refused| refused == accelerator) => {
-                        if !live.contains(&accelerator) {
-                            live.push(accelerator);
-                        }
-                    }
-                    "unregister" if !self.refuse_release => live.retain(|held| *held != accelerator),
-                    _ => {}
-                }
-            }
-            live
-        }
-    }
-
-    impl HotkeyRegistrar for FakeRegistrar {
-        fn register(&mut self, accelerator: &str) -> Result<(), String> {
-            self.log.push(format!("register {accelerator}"));
-            if self.refuse.iter().any(|refused| refused == accelerator) {
-                return Err("the chord is already owned by another application".to_owned());
-            }
-            Ok(())
-        }
-
-        fn unregister(&mut self, accelerator: &str) -> Result<(), String> {
-            self.log.push(format!("unregister {accelerator}"));
-            if self.refuse_release {
-                return Err("the shortcut service is gone".to_owned());
-            }
-            Ok(())
-        }
-    }
-
     /// A private configuration directory, removed on drop, so a test writes a
     /// real `config.toml` through the real store rather than through a stub.
     struct ConfigDir {
@@ -804,15 +607,8 @@ mod tests {
 
     #[test]
     fn a_refused_hotkey_leaves_the_launcher_running_and_opens_the_row_that_fixes_it() {
-        let mut hotkey = ActivationHotkey::default();
-        let mut registrar = FakeRegistrar::refusing("Ctrl+Alt+Space");
-        let reason = hotkey
-            .bind(&mut registrar, "Ctrl+Alt+Space")
-            .expect_err("the desktop already owns the chord");
-        assert_eq!(hotkey.bound(), None);
-
         let mut view_model = LauncherViewModel::new();
-        let diagnostic = surface_hotkey_failure(&mut view_model, "Ctrl+Alt+Space", &reason);
+        let diagnostic = surface_hotkey_failure(&mut view_model, "Ctrl+Alt+Space", "already owned");
         assert!(diagnostic.contains("Ctrl+Alt+Space"), "{diagnostic}");
         assert!(diagnostic.contains("already owned"), "{diagnostic}");
         assert!(diagnostic.contains("stays running"), "{diagnostic}");
@@ -827,157 +623,27 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_rebind_keeps_the_accelerator_that_already_works() {
-        let mut hotkey = ActivationHotkey::default();
-        let mut registrar = FakeRegistrar::refusing("Ctrl+Shift+P");
-        hotkey
-            .bind(&mut registrar, "Ctrl+Alt+Space")
-            .expect("the first chord is free");
-
-        let reason = hotkey
-            .bind(&mut registrar, "Ctrl+Shift+P")
-            .expect_err("the second chord is taken");
-        assert!(reason.contains("already owned"), "{reason}");
-        assert_eq!(
-            hotkey.bound(),
-            Some("Ctrl+Alt+Space"),
-            "a refused chord must never cost the user the one that works"
-        );
-        assert_eq!(
-            registrar.live(),
-            vec!["Ctrl+Alt+Space"],
-            "the live grab is never released on behalf of a chord that was refused"
-        );
-    }
-
-    #[test]
-    fn an_accepted_rebind_leaves_exactly_one_chord_live() {
-        let mut hotkey = ActivationHotkey::default();
-        let mut registrar = FakeRegistrar::default();
-        hotkey
-            .bind(&mut registrar, "Ctrl+Alt+Space")
-            .expect("the first chord is free");
-        let warning = hotkey
-            .bind(&mut registrar, "Ctrl+Shift+P")
-            .expect("the second chord is free");
-
-        assert_eq!(warning, None);
-        assert_eq!(hotkey.bound(), Some("Ctrl+Shift+P"));
-        assert_eq!(
-            registrar.live(),
-            vec!["Ctrl+Shift+P"],
-            "the old grab is handed back, so one chord opens the launcher and not two"
-        );
-        assert_eq!(
-            registrar.log,
-            vec![
-                "register Ctrl+Alt+Space".to_owned(),
-                "register Ctrl+Shift+P".to_owned(),
-                "unregister Ctrl+Alt+Space".to_owned(),
-            ],
-            "the new chord is taken before the old one is released"
-        );
-    }
-
-    #[test]
-    fn re_binding_the_live_chord_does_not_touch_the_grab() {
-        let mut hotkey = ActivationHotkey::default();
-        let mut registrar = FakeRegistrar::default();
-        hotkey
-            .bind(&mut registrar, "Ctrl+Alt+Space")
-            .expect("the chord is free");
-        hotkey
-            .bind(&mut registrar, "Ctrl+Alt+Space")
-            .expect("re-binding what is already live is not a failure");
-
-        assert_eq!(registrar.log, vec!["register Ctrl+Alt+Space".to_owned()]);
-    }
-
-    #[test]
-    fn an_old_chord_that_cannot_be_released_is_reported_rather_than_forgotten() {
-        let mut hotkey = ActivationHotkey::default();
-        let mut registrar = FakeRegistrar {
-            refuse_release: true,
-            ..FakeRegistrar::default()
-        };
-        hotkey
-            .bind(&mut registrar, "Ctrl+Alt+Space")
-            .expect("the first chord is free");
-        let warning = hotkey
-            .bind(&mut registrar, "Ctrl+Shift+P")
-            .expect("the second chord is free")
-            .expect("the stranded grab is worth a sentence");
-
-        assert!(warning.contains("Ctrl+Alt+Space"), "{warning}");
-        assert!(warning.contains("could not be released"), "{warning}");
-        assert_eq!(hotkey.bound(), Some("Ctrl+Shift+P"));
-    }
-
-    #[test]
-    fn setting_the_activation_hotkey_persists_to_the_user_global_layer_and_rebinds_live() {
+    fn setting_the_activation_hotkey_persists_to_the_user_global_layer() {
         let directory = ConfigDir::new("hotkey-set");
         let mut store = directory.store();
-        let mut hotkey = ActivationHotkey::default();
-        let mut registrar = FakeRegistrar::default();
-        hotkey
-            .bind(&mut registrar, &configured_hotkey(Some(&store)))
-            .expect("the default chord is free");
-        assert_eq!(hotkey.bound(), Some("Ctrl+Alt+Space"));
-
         let report = persist(&mut store, KEY_ACTIVATION_HOTKEY, "Ctrl+Shift+P").unwrap();
-        hotkey
-            .bind(&mut registrar, &configured_hotkey(Some(&store)))
-            .unwrap();
-
         assert_eq!(report, "launcher.activation-hotkey = Ctrl+Shift+P");
-        assert_eq!(
-            hotkey.bound(),
-            Some("Ctrl+Shift+P"),
-            "the running process must listen for the chord it just saved"
-        );
         let reloaded = directory.store();
         assert_eq!(reloaded.get(KEY_ACTIVATION_HOTKEY), Some("Ctrl+Shift+P"));
         assert_eq!(
             reloaded.layer_of(KEY_ACTIVATION_HOTKEY),
-            Some(ConfigLayer::UserGlobal),
-            "the panel writes the same layer `crikey config` reports"
+            Some(ConfigLayer::UserGlobal)
         );
-    }
-
-    #[test]
-    fn a_hotkey_the_platform_refuses_leaves_the_working_one_in_force() {
-        let directory = ConfigDir::new("hotkey-refused");
-        let mut store = directory.store();
-        let mut hotkey = ActivationHotkey::default();
-        let mut registrar = FakeRegistrar::refusing("Ctrl+Shift+P");
-        hotkey
-            .bind(&mut registrar, "Ctrl+Alt+Space")
-            .expect("the default chord is free");
-
-        persist(&mut store, KEY_ACTIVATION_HOTKEY, "Ctrl+Shift+P").unwrap();
-        let refusal = hotkey
-            .bind(&mut registrar, &configured_hotkey(Some(&store)))
-            .unwrap_err();
-        assert!(!refusal.is_empty());
-        assert_eq!(
-            store.get(KEY_ACTIVATION_HOTKEY),
-            Some("Ctrl+Shift+P"),
-            "desired configuration remains distinct from the held OS binding"
-        );
-        assert_eq!(hotkey.bound(), Some("Ctrl+Alt+Space"));
-        assert_eq!(registrar.live(), vec!["Ctrl+Alt+Space"]);
     }
 
     #[test]
     fn an_unparseable_accelerator_never_reaches_the_configuration_file() {
         let directory = ConfigDir::new("hotkey-garbage");
         let mut store = directory.store();
-        let registrar = FakeRegistrar::default();
 
         let report = persist(&mut store, KEY_ACTIVATION_HOTKEY, "Ctrl+").unwrap_err();
 
         assert!(report.contains("not a valid accelerator"), "{report}");
-        assert!(registrar.log.is_empty(), "{:?}", registrar.log);
         let reloaded = directory.store();
         assert_eq!(
             reloaded.get(KEY_ACTIVATION_HOTKEY),
@@ -1001,22 +667,14 @@ mod tests {
         )
         .expect("the profile can be written");
         let mut store = directory.store();
-        let mut hotkey = ActivationHotkey::default();
-        let mut registrar = FakeRegistrar::default();
-        hotkey
-            .bind(&mut registrar, "Ctrl+Alt+K")
-            .expect("the profile's chord is free");
 
         let report = persist(&mut store, KEY_ACTIVATION_HOTKEY, "Ctrl+Shift+P").unwrap();
-        hotkey
-            .bind(&mut registrar, &configured_hotkey(Some(&store)))
-            .unwrap();
 
         assert!(report.contains("still supplies Ctrl+Alt+K"), "{report}");
         assert_eq!(
-            hotkey.bound(),
-            Some("Ctrl+Alt+K"),
-            "the launcher listens for the chord that wins, not the one that was typed"
+            configured_hotkey(Some(&store)),
+            "Ctrl+Alt+K",
+            "registration consumes the complete effective state, not the submitted draft"
         );
     }
 
@@ -1206,17 +864,5 @@ mod tests {
 
         let refused = persist(&mut store, "launcher.nope", "x").expect_err("an unknown key is not a setting");
         assert!(refused.contains("is not a launcher setting"), "{refused}");
-    }
-
-    #[test]
-    fn a_reload_does_not_re_attempt_a_chord_this_launch_already_tried() {
-        let mut hotkey = ActivationHotkey::default();
-        let mut registrar = FakeRegistrar::refusing("Ctrl+Alt+Space");
-        let _ = hotkey.bind(&mut registrar, "Ctrl+Alt+Space");
-        assert!(
-            hotkey.is_current("Ctrl+Alt+Space"),
-            "a refused chord is still the one this launch is configured for"
-        );
-        assert!(!hotkey.is_current("Ctrl+Shift+P"));
     }
 }
