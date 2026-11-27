@@ -440,6 +440,10 @@ pub struct PageSurface {
 /// [`LauncherViewModel::publish`] built.
 #[derive(Debug, Clone)]
 pub struct ViewModel {
+    /// Host view/session identity; results-only frames have no input authority.
+    pub view: Option<ViewId>,
+    /// One-shot acknowledgment of an ordered native input boundary.
+    pub input_receipt: Option<Arc<ActionInputReceipt>>,
     pub generation: Generation,
     pub query: String,
     pub rows: Arc<[ResultRow]>,
@@ -500,6 +504,97 @@ pub struct ViewModel {
     pub navigation: NavigationPresentation,
 }
 
+/// Opaque ownership checkpoint for a split native input batch.
+#[derive(Debug, Clone)]
+pub struct ActionInputCheckpoint {
+    pub(crate) view: Option<ViewId>,
+    pub(crate) generation: Generation,
+    pub(crate) query: String,
+    pub(crate) target: Option<ActionTarget>,
+    pub(crate) primary: Option<ActionId>,
+    pub(crate) panel: Option<Arc<ActionPanel>>,
+    pub(crate) preview_focus: (bool, bool),
+}
+
+impl ActionInputCheckpoint {
+    pub(crate) fn of(model: &ViewModel) -> Self {
+        Self {
+            view: model.view,
+            generation: model.generation,
+            query: model.query.clone(),
+            target: model.rows.get(model.selected).map(ActionTarget::of),
+            primary: model
+                .rows
+                .get(model.selected)
+                .and_then(|row| row.default_action.as_ref())
+                .map(|action| action.action_id.clone()),
+            panel: model.action_panel.clone(),
+            preview_focus: (model.preview.focused, model.preview.detail),
+        }
+    }
+
+    fn same_panel(&self, panel: Option<&Arc<ActionPanel>>) -> bool {
+        match (&self.panel, panel) {
+            (Some(expected), Some(current)) => {
+                expected.focus_token() == current.focus_token()
+                    && expected.layout_revision() == current.layout_revision()
+                    && expected.query() == current.query()
+                    && expected.path() == current.path()
+                    && expected.selected() == current.selected()
+                    && expected.invalidation() == current.invalidation()
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn matches(
+        &self,
+        view: Option<ViewId>,
+        generation: Generation,
+        query: &str,
+        row: Option<&ResultRow>,
+        panel: Option<&Arc<ActionPanel>>,
+        preview_focus: (bool, bool),
+    ) -> bool {
+        self.view.is_some()
+            && self.view == view
+            && self.generation == generation
+            && self.query == query
+            && self.primary.as_ref()
+                == row
+                    .and_then(|row| row.default_action.as_ref())
+                    .map(|action| &action.action_id)
+            && self.preview_focus == preview_focus
+            && self.same_panel(panel)
+            && match (&self.target, row) {
+                (Some(target), Some(row)) => target.matches(row),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl PartialEq for ActionInputCheckpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.view == other.view
+            && self.generation == other.generation
+            && self.query == other.query
+            && self.target == other.target
+            && self.primary == other.primary
+            && self.preview_focus == other.preview_focus
+            && self.same_panel(other.panel.as_ref())
+    }
+}
+
+/// Proof that the host applied an ordered input boundary.
+#[derive(Debug, Clone)]
+pub struct ActionInputReceipt {
+    pub(crate) token: u64,
+    pub(crate) accepted: bool,
+    pub(crate) owner: ActionInputCheckpoint,
+}
+
 /// Keyboard-only interaction surface (spec 6.3).
 ///
 /// Not [`Eq`]: a page input carries pointer coordinates, which are floats.
@@ -531,6 +626,12 @@ pub enum UiCommand {
     SetLogicalScroll(LogicalScroll),
     RecallQuery,
     ClearQueryHistory,
+    /// Apply this editor prefix and host key atomically in the composition root.
+    ApplyInputBatch {
+        continuation: Option<u64>,
+        source: Arc<ActionInputCheckpoint>,
+        commands: Vec<UiCommand>,
+    },
     FocusPreview,
     LeavePreview,
     ShowPreviewDetail,
@@ -642,6 +743,12 @@ pub enum UiEffect {
         registry_revision: u64,
     },
     ClearQueryHistory,
+    /// Apply serially without polling foreign completions between commands,
+    /// then acknowledge a retained continuation with `finish_input_batch`.
+    InputBatch {
+        continuation: Option<u64>,
+        commands: Vec<UiCommand>,
+    },
     /// The query text changed; schedule a generation for it (spec 6.2.2).
     Query(String),
     /// Run `action` on `item` (spec 6.2.10). The launcher stays open —
@@ -780,6 +887,8 @@ pub struct LauncherViewModel {
     visible: bool,
     view_id: ViewId,
     publication_view: Option<ViewId>,
+    input_receipt: Option<Arc<ActionInputReceipt>>,
+    input_batch: Option<u64>,
     query_refresh: bool,
     restore_selection: bool,
     /// Set by every accepted mutation and cleared by `frame`, so mutations
@@ -887,6 +996,8 @@ impl LauncherViewModel {
             visible: false,
             view_id: ViewId(0),
             publication_view: None,
+            input_receipt: None,
+            input_batch: None,
             query_refresh: false,
             restore_selection: false,
             dirty: false,
@@ -1284,6 +1395,7 @@ impl LauncherViewModel {
         self.view_id = ViewId(self.view_id.0.checked_add(1).expect("view identity exhausted"));
         self.recall = Arc::default();
         self.publication_view = None;
+        self.input_receipt = None;
         self.pending_plugins = false;
         self.close_actions();
     }
@@ -1358,6 +1470,8 @@ impl LauncherViewModel {
         self.page_reopen = None;
         self.navigation_scroll = LogicalScroll::default();
         self.preserve_scroll = false;
+        self.input_receipt = None;
+        self.input_batch = None;
         self.visible = false;
         self.dirty = false;
         self.query.clear();
@@ -1485,6 +1599,8 @@ impl LauncherViewModel {
 
         self.dirty = false;
         Some(ViewModel {
+            view: Some(self.view_id),
+            input_receipt: self.input_receipt.clone(),
             // The active generation, not the published one: the frame carries
             // the generation the query text belongs to.
             generation: self.active.unwrap_or(Generation::ZERO),
@@ -1510,6 +1626,33 @@ impl LauncherViewModel {
             preview: self.preview.clone(),
             navigation: self.navigation_presentation(),
         })
+    }
+
+    /// Completes a validated native command batch after all ordinary host effects.
+    pub fn finish_input_batch(&mut self, token: u64) {
+        if self.input_batch != Some(token) || !self.visible {
+            return;
+        }
+        self.input_batch = None;
+        let owner = ActionInputCheckpoint {
+            view: Some(self.view_id),
+            generation: self.active.unwrap_or(Generation::ZERO),
+            query: self.query.clone(),
+            target: self.rows.get(self.selected).map(ActionTarget::of),
+            primary: self
+                .rows
+                .get(self.selected)
+                .and_then(|row| row.default_action.as_ref())
+                .map(|action| action.action_id.clone()),
+            panel: self.action_panel.clone(),
+            preview_focus: (self.preview.focused, self.preview.detail),
+        };
+        self.input_receipt = Some(Arc::new(ActionInputReceipt {
+            token,
+            accepted: true,
+            owner,
+        }));
+        self.dirty = true;
     }
 
     /// The sole command entry point (spec 6.3).
@@ -1592,6 +1735,46 @@ impl LauncherViewModel {
                 self.recall = Arc::default();
                 self.dirty = true;
                 Some(UiEffect::ClearQueryHistory)
+            }
+            UiCommand::ApplyInputBatch {
+                continuation,
+                source,
+                commands,
+            } => {
+                let source_valid = source.matches(
+                    Some(self.view_id),
+                    self.active.unwrap_or(Generation::ZERO),
+                    &self.query,
+                    self.rows.get(self.selected),
+                    self.action_panel.as_ref(),
+                    (self.preview.focused, self.preview.detail),
+                );
+                let query_refused = source_valid
+                    && commands.iter().any(|command| {
+                        matches!(command, UiCommand::SetActionQuery(query)
+                        if query.len() > action_panel::MAX_ACTION_QUERY_BYTES)
+                    });
+                if source_valid && !query_refused {
+                    self.input_batch = continuation;
+                    Some(UiEffect::InputBatch {
+                        continuation,
+                        commands,
+                    })
+                } else {
+                    if query_refused {
+                        let _ = self
+                            .set_selected_status(action_panel::ActionPanelRefusal::QueryTooLong.to_string());
+                    }
+                    if let Some(token) = continuation {
+                        self.input_receipt = Some(Arc::new(ActionInputReceipt {
+                            token,
+                            accepted: false,
+                            owner: (*source).clone(),
+                        }));
+                        self.dirty = true;
+                    }
+                    None
+                }
             }
             UiCommand::OpenPreviewLink { target, url } => {
                 let target = *target;
@@ -1906,6 +2089,9 @@ impl LauncherViewModel {
     /// The completed text is an ordinary edit, so the host schedules a
     /// generation for it exactly as if the user had typed it.
     fn complete(&mut self) -> Option<UiEffect> {
+        if self.view().is_none_or(|(_, kind)| kind != ViewKind::RootList) {
+            return None;
+        }
         let row = self.rows.get(self.selected)?;
         if self.query == row.label {
             return None;
