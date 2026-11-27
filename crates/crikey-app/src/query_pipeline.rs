@@ -802,13 +802,15 @@ impl QueryPipeline {
         self.presentation_dirty = false;
 
         Some(ViewModel {
+            view: None,
+            input_receipt: None,
             generation: self.generation,
             query: self.query.clone(),
             rows: Arc::clone(&self.rows),
             selected: 0,
             root_selection_revision: 0,
             pending_plugins,
-            actions_open: false,
+            action_panel: None,
             // A pipeline frame carries results, never the launcher's own
             // settings or a plugin's page: both are host state that no query
             // can open or fill, and both are restored from the host overlay.

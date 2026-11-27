@@ -19,14 +19,18 @@ use crikey_ui::{
 };
 
 fn model(query: &str) -> ViewModel {
+    let mut owner = crikey_ui::LauncherViewModel::new();
+    owner.activate();
     ViewModel {
+        view: owner.view().map(|(view, _)| view),
+        input_receipt: None,
         generation: Generation::ZERO,
         query: query.to_owned(),
         rows: Arc::default(),
         selected: 0,
         root_selection_revision: 0,
         pending_plugins: false,
-        actions_open: false,
+        action_panel: None,
         settings_open: false,
         settings: Arc::default(),
         settings_focus: None,
@@ -770,7 +774,6 @@ fn root_manual_scroll_survives_identical_and_cosmetic_publications() {
     assert_eq!(view.rows[anchor].status.as_deref(), Some("Updated status"));
     let updated = frames.settle_model(&mut state, &mut view);
     assert!(root_row_visible(&updated, "Updated visible result"));
-    assert!(painted(&updated, "Updated description"));
     assert_eq!(
         root_row_geometry(&updated, "Updated visible result").unwrap().0,
         before
@@ -3870,4 +3873,1186 @@ fn split_and_narrow_detail_share_one_current_image_and_retire_it_on_replacement(
     let closed = preview_frame(&context, &view, 480.0);
     assert!(closed.output.textures_delta.free.contains(&new_id));
     assert!(current.upgrade().is_none());
+}
+
+fn action_launcher() -> crikey_ui::LauncherViewModel {
+    use crikey_core::{Action, ActionId, ExecutionPolicy};
+    let mut row = result_row(0);
+    let action = |id: &str, label: &str| Action {
+        action_id: ActionId(id.into()),
+        label: label.into(),
+        description: String::new(),
+        applicable_categories: Vec::new(),
+        icon_reference: None,
+        execution_policy: ExecutionPolicy::Plugin,
+    };
+    row.default_action = Some(action("run", "Run selected"));
+    row.alternate_actions = vec![
+        action("copy", "Copy selected"),
+        action("reveal", "Reveal selected"),
+    ];
+    let mut launcher = crikey_ui::LauncherViewModel::new();
+    launcher.activate();
+    let _ = launcher.apply(UiCommand::SetQuery("fixture".into()));
+    launcher.begin_generation(Generation::from_raw(1));
+    launcher.publish(Generation::from_raw(1), vec![row], false);
+    launcher
+}
+
+#[test]
+fn rendered_action_search_executes_non_first_leaf_and_does_not_edit_launcher_query() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    let root = launcher.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(vec![]), &root);
+    let discovery = build_launcher_frame(
+        &context,
+        launcher_input(vec![key_press(egui::Key::K, egui::Modifiers::COMMAND)]),
+        &root,
+    );
+    assert_eq!(discovery.commands, vec![UiCommand::ShowActions]);
+    for command in discovery.commands {
+        let _ = launcher.apply(command);
+    }
+    let open = launcher.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(vec![]), &open);
+    let typed = build_launcher_frame(
+        &context,
+        launcher_input(vec![egui::Event::Text("Reveal".into())]),
+        &open,
+    );
+    assert!(typed
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetActionQuery(query) if query == "Reveal")));
+    assert!(!typed
+        .commands
+        .iter()
+        .any(|command| matches!(command, UiCommand::SetQuery(_))));
+    for command in typed.commands {
+        let _ = launcher.apply(command);
+    }
+    let filtered = launcher.frame().unwrap();
+    assert_eq!(filtered.query, "fixture");
+    let painted = build_launcher_frame(&context, launcher_input(vec![]), &filtered);
+    assert!(painted
+        .output
+        .shapes
+        .iter()
+        .any(|shape| contains_text(&shape.shape, "Reveal selected")));
+    assert!(!painted
+        .output
+        .shapes
+        .iter()
+        .any(|shape| contains_text(&shape.shape, "Copy selected")));
+    let execute = build_launcher_frame(
+        &context,
+        launcher_input(vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)]),
+        &filtered,
+    );
+    let effects: Vec<_> = execute
+        .commands
+        .into_iter()
+        .filter_map(|command| launcher.apply(command))
+        .collect();
+    assert_eq!(
+        effects,
+        vec![crikey_ui::UiEffect::Execute {
+            owner: PluginId("renderer-fixture".into()),
+            item: ItemId("item-0".into()),
+            action: crikey_core::ActionId("reveal".into()),
+        }]
+    );
+}
+
+fn long_action_launcher() -> crikey_ui::LauncherViewModel {
+    use crikey_core::{Action, ActionId, ExecutionPolicy};
+    let mut row = result_row(0);
+    row.alternate_actions = (0..40)
+        .map(|index| Action {
+            action_id: ActionId(format!("long-{index}")),
+            label: format!("Long action {index:02}"),
+            description: String::new(),
+            applicable_categories: Vec::new(),
+            icon_reference: None,
+            execution_policy: ExecutionPolicy::Plugin,
+        })
+        .collect();
+    let mut launcher = crikey_ui::LauncherViewModel::new();
+    launcher.activate();
+    let _ = launcher.apply(UiCommand::SetQuery("fixture".into()));
+    launcher.begin_generation(Generation::from_raw(1));
+    launcher.publish(Generation::from_raw(1), vec![row], false);
+    let _ = launcher.apply(UiCommand::ShowActions);
+    launcher
+}
+
+fn wheel_over_action(frame: &crikey_ui::NativeUiFrame, label: &str) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(position_of(frame, label) + egui::vec2(2.0, 4.0)),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -400.0),
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+#[test]
+fn action_sheet_wheel_stays_scrolled_until_keyboard_selection_changes() {
+    let mut launcher = long_action_launcher();
+    let view = launcher.frame().unwrap();
+    let mut frames = Frames::new();
+    let first = frames.settle(&view);
+    assert!(painted(&first, "Long action 00"));
+    let _ = frames.draw(&view, wheel_over_action(&first, "Long action 00"));
+    let scrolled = frames.settle(&view);
+    assert!(
+        !painted(&scrolled, "Long action 00"),
+        "stationary frames must not undo scrolling away from the selection"
+    );
+    let keyboard = frames.draw(
+        &view,
+        vec![key_press(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+    );
+    assert!(keyboard.commands.contains(&UiCommand::SelectNext));
+    for command in keyboard.commands {
+        let _ = launcher.apply(command);
+    }
+    let moved = launcher.frame().unwrap();
+    assert_eq!(
+        moved.action_panel.as_ref().unwrap().selected(),
+        Some(&crikey_ui::action_panel::ActionIdentity::Plugin(
+            crikey_core::ActionId("long-1".into())
+        ))
+    );
+    assert!(painted(&frames.settle(&moved), "Long action 01"));
+}
+
+#[test]
+fn action_sheet_search_clamps_a_scrolled_viewport_and_restores_browse_selection() {
+    let mut launcher = long_action_launcher();
+    let view = launcher.frame().unwrap();
+    let mut frames = Frames::new();
+    let first = frames.settle(&view);
+    let _ = frames.draw(&view, wheel_over_action(&first, "Long action 00"));
+    assert!(!painted(&frames.settle(&view), "Long action 00"));
+    let typed = frames.draw(&view, vec![egui::Event::Text("Long action 39".into())]);
+    for command in typed.commands {
+        let _ = launcher.apply(command);
+    }
+    let filtered = launcher.frame().unwrap();
+    assert_eq!(filtered.action_panel.as_ref().unwrap().visible_entries().len(), 1);
+    assert!(painted(&frames.settle(&filtered), "Long action 39"));
+    let escape = frames.draw(
+        &filtered,
+        vec![key_press(egui::Key::Escape, egui::Modifiers::NONE)],
+    );
+    for command in escape.commands {
+        let _ = launcher.apply(command);
+    }
+    let restored = launcher.frame().unwrap();
+    assert_eq!(
+        restored.action_panel.as_ref().unwrap().selected(),
+        view.action_panel.as_ref().unwrap().selected()
+    );
+    assert!(painted(&frames.settle(&restored), "Long action 00"));
+}
+
+fn action_text_is_visible(frame: &crikey_ui::NativeUiFrame, label: &str) -> bool {
+    fn text_rect(shape: &egui::Shape, label: &str) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == label => {
+                Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_rect(shape, label)),
+            _ => None,
+        }
+    }
+    frame.output.shapes.iter().any(|clipped| {
+        text_rect(&clipped.shape, label).is_some_and(|rect| clipped.clip_rect.contains_rect(rect))
+    })
+}
+
+#[test]
+fn action_sheet_multihit_search_reveals_a_retained_selection_inside_its_clip() {
+    let mut launcher = long_action_launcher();
+    let mut frames = Frames::new();
+    let _ = frames.settle(&launcher.frame().unwrap());
+    for _ in 0..20 {
+        let _ = launcher.apply(UiCommand::SelectNext);
+    }
+    let view = launcher.frame().unwrap();
+    let selected = view.action_panel.as_ref().unwrap().selected().cloned();
+    assert!(action_text_is_visible(&frames.settle(&view), "Long action 20"));
+    let typed = frames.draw(&view, vec![egui::Event::Text("Long action 2".into())]);
+    for command in typed.commands {
+        let _ = launcher.apply(command);
+    }
+    let filtered = launcher.frame().unwrap();
+    let panel = filtered.action_panel.as_ref().unwrap();
+    assert_eq!(panel.selected(), selected.as_ref());
+    assert!(panel.visible_entries().len() > 1);
+    let revealed = frames.settle(&filtered);
+    assert!(
+        action_text_is_visible(&revealed, "Long action 20"),
+        "filtering must reveal a retained identity, not leave its galley clipped away"
+    );
+    let _ = frames.draw(&filtered, wheel_over_action(&revealed, "Long action 20"));
+    assert!(
+        !action_text_is_visible(&frames.settle(&filtered), "Long action 20"),
+        "a completed layout transition must not keep overriding later wheel scrolling"
+    );
+}
+
+#[test]
+fn action_sheet_opening_does_not_synthesize_selection_navigation() {
+    use crikey_ui::action_panel::ActionIdentity;
+    let mut launcher = long_action_launcher();
+    let mut view = launcher.frame().unwrap();
+    let selected = ActionIdentity::Plugin(crikey_core::ActionId("long-39".into()));
+    assert!(Arc::make_mut(view.action_panel.as_mut().unwrap()).select(&selected));
+    let mut frames = Frames::new();
+    let opened = frames.settle(&view);
+    assert!(
+        action_text_is_visible(&opened, "Long action 00"),
+        "opening establishes a selection baseline without scheduling an animated scroll"
+    );
+    assert!(!action_text_is_visible(&opened, "Long action 39"));
+}
+
+#[test]
+fn action_sheet_reopening_starts_at_the_top_without_following_the_old_selection() {
+    let mut launcher = long_action_launcher();
+    let view = launcher.frame().unwrap();
+    let mut frames = Frames::new();
+    let opened = frames.settle(&view);
+    let _ = frames.draw(&view, wheel_over_action(&opened, "Long action 00"));
+    assert!(!action_text_is_visible(&frames.settle(&view), "Long action 00"));
+    let _ = launcher.apply(UiCommand::ActionBack);
+    let closed = launcher.frame().unwrap();
+    assert!(closed.action_panel.is_none());
+    let _ = frames.draw(&closed, Vec::new());
+    let _ = launcher.apply(UiCommand::ShowActions);
+    let reopened = launcher.frame().unwrap();
+    assert_eq!(
+        reopened.action_panel.as_ref().unwrap().selected(),
+        view.action_panel.as_ref().unwrap().selected()
+    );
+    let first = frames.draw(&reopened, Vec::new());
+    assert!(
+        action_text_is_visible(&first, "Long action 00"),
+        "a fresh sheet must start at the top, not inherit the retired sheet's viewport"
+    );
+    assert!(action_text_is_visible(
+        &frames.settle(&reopened),
+        "Long action 00"
+    ));
+    let _ = frames.draw(&reopened, wheel_over_action(&first, "Long action 00"));
+    assert!(
+        !action_text_is_visible(&frames.settle(&reopened), "Long action 00"),
+        "the reset must happen only on opening, not on subsequent stationary frames"
+    );
+}
+
+#[test]
+fn action_sheet_unchanged_provider_refresh_preserves_manual_scroll() {
+    let mut launcher = long_action_launcher();
+    let view = launcher.frame().unwrap();
+    let mut frames = Frames::new();
+    let opened = frames.settle(&view);
+    let _ = frames.draw(&view, wheel_over_action(&opened, "Long action 00"));
+    let scrolled = frames.settle(&view);
+    assert!(!action_text_is_visible(&scrolled, "Long action 00"));
+    let anchor = (1..40)
+        .map(|index| format!("Long action {index:02}"))
+        .find(|label| action_text_is_visible(&scrolled, label))
+        .expect("manual scrolling leaves a visible action to anchor");
+    let before = position_of(&scrolled, &anchor);
+    launcher.publish(Generation::from_raw(1), view.rows.to_vec(), false);
+    let refreshed = launcher.frame().unwrap();
+    assert_eq!(
+        refreshed.action_panel.as_ref().unwrap().selected(),
+        view.action_panel.as_ref().unwrap().selected()
+    );
+    let after = frames.settle(&refreshed);
+    assert!(!action_text_is_visible(&after, "Long action 00"));
+    assert!(action_text_is_visible(&after, &anchor));
+    assert!((position_of(&after, &anchor).y - before.y).abs() < 1.0);
+}
+
+#[test]
+fn action_sheet_changed_provider_layout_reveals_the_retained_identity() {
+    let mut launcher = long_action_launcher();
+    let mut frames = Frames::new();
+    let _ = frames.settle(&launcher.frame().unwrap());
+    for _ in 0..20 {
+        let _ = launcher.apply(UiCommand::SelectNext);
+    }
+    let view = launcher.frame().unwrap();
+    assert!(action_text_is_visible(&frames.settle(&view), "Long action 20"));
+    let mut rows = view.rows.to_vec();
+    rows[0].alternate_actions.rotate_left(20);
+    launcher.publish(Generation::from_raw(1), rows, false);
+    let refreshed = launcher.frame().unwrap();
+    assert_eq!(
+        refreshed.action_panel.as_ref().unwrap().selected(),
+        view.action_panel.as_ref().unwrap().selected()
+    );
+    assert!(action_text_is_visible(
+        &frames.settle(&refreshed),
+        "Long action 20"
+    ));
+}
+
+#[test]
+fn action_sheet_submenu_back_reveals_the_exact_parent_selection() {
+    use crikey_ui::action_panel::{
+        ActionActivation, ActionEntry, ActionIdentity, ActionPanelNavigation, ActionPresentation,
+        ActionSection, ActionTree,
+    };
+    let mut launcher = long_action_launcher();
+    let mut view = launcher.frame().unwrap();
+    let leaf = |index: usize| ActionEntry::Plugin {
+        action: crikey_core::ActionId(format!("long-{index}")),
+        presentation: ActionPresentation {
+            label: format!("Long action {index:02}"),
+            ..Default::default()
+        },
+    };
+    let mut entries: Vec<_> = (0..39).map(leaf).collect();
+    entries.push(ActionEntry::Submenu {
+        id: "last-menu".into(),
+        presentation: ActionPresentation {
+            label: "Last submenu".into(),
+            ..Default::default()
+        },
+        entries: vec![leaf(39)],
+    });
+    let tree = ActionTree::new(
+        &view.rows[0],
+        vec![ActionSection {
+            id: "long".into(),
+            label: "Actions".into(),
+            entries,
+        }],
+    )
+    .unwrap();
+    view.action_panel = Some(Arc::new(crikey_ui::ActionPanel::new(tree)));
+    let mut frames = Frames::new();
+    let _ = frames.settle(&view);
+    let parent = ActionIdentity::Submenu("last-menu".into());
+    assert!(Arc::make_mut(view.action_panel.as_mut().unwrap()).select(&parent));
+    assert!(painted(&frames.settle(&view), "Last submenu"));
+    assert_eq!(
+        Arc::make_mut(view.action_panel.as_mut().unwrap()).activation(&view.rows[0]),
+        Ok(Some(ActionActivation::EnteredSubmenu))
+    );
+    assert!(painted(&frames.settle(&view), "Long action 39"));
+    assert_eq!(
+        Arc::make_mut(view.action_panel.as_mut().unwrap()).back(),
+        ActionPanelNavigation::Changed
+    );
+    assert_eq!(view.action_panel.as_ref().unwrap().selected(), Some(&parent));
+    assert!(painted(&frames.settle(&view), "Last submenu"));
+}
+
+#[test]
+fn discovery_shortcuts_do_not_steal_settings_page_or_composition_input() {
+    for (key, modifiers, expected_keysym, expected_modifiers) in [
+        (
+            egui::Key::K,
+            egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+            u32::from(b'k'),
+            crikey_ui::WEB_MODIFIER_CONTROL,
+        ),
+        (
+            egui::Key::K,
+            egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND,
+            u32::from(b'k'),
+            crikey_ui::WEB_MODIFIER_META,
+        ),
+        (
+            egui::Key::Enter,
+            egui::Modifiers::ALT,
+            0xff0d,
+            crikey_ui::WEB_MODIFIER_ALT,
+        ),
+    ] {
+        for surface in 0..3 {
+            let context = create_launcher_context();
+            let mut view = match surface {
+                0 => hotkey_settings_model(),
+                1 => page_view(vec![]),
+                _ => painted_web_view(41, 1, &[0; 8]),
+            };
+            view.query = "retained".into();
+            let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+            let frame =
+                build_launcher_frame(&context, launcher_input(vec![key_press(key, modifiers)]), &view);
+            assert!(!frame.commands.contains(&UiCommand::ShowActions));
+            if surface == 2 {
+                assert!(web_inputs(&frame).iter().any(|input| matches!(
+                    input, WebSurfaceInput::Key { surface_id: 41, pressed: true, keysym, modifiers, .. }
+                        if *keysym == expected_keysym && *modifiers == expected_modifiers
+                )));
+            }
+        }
+        let context = create_launcher_context();
+        let mut launcher = action_launcher();
+        let root = launcher.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(vec![]), &root);
+        let frame = build_launcher_frame(
+            &context,
+            launcher_input(vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("composing".into())),
+                key_press(key, modifiers),
+            ]),
+            &root,
+        );
+        assert!(!frame.commands.contains(&UiCommand::ShowActions));
+    }
+}
+
+#[test]
+fn explicit_destructive_presentation_and_shortcuts_are_visible_without_dispatch() {
+    use crikey_ui::action_panel::{ActionEntry, ActionPresentation, ActionSection, ActionTree};
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    let mut view = launcher.frame().unwrap();
+    let tree = ActionTree::new(
+        &view.rows[0],
+        vec![ActionSection {
+            id: "explicit".into(),
+            label: "Explicit section".into(),
+            entries: vec![ActionEntry::Plugin {
+                action: crikey_core::ActionId("copy".into()),
+                presentation: ActionPresentation {
+                    label: "Remove saved entry".into(),
+                    destructive: true,
+                    shortcut: Some("Ctrl+Shift+R".into()),
+                    icon_reference: Some("unresolved-resource".into()),
+                    ..Default::default()
+                },
+            }],
+        }],
+    )
+    .unwrap();
+    view.action_panel = Some(Arc::new(crikey_ui::ActionPanel::new(tree)));
+    let frame = build_launcher_frame(&context, launcher_input(vec![]), &view);
+    for text in [
+        "Explicit section",
+        "Remove saved entry",
+        "Destructive",
+        "Ctrl+Shift+R",
+    ] {
+        assert!(
+            frame
+                .output
+                .shapes
+                .iter()
+                .any(|shape| contains_text(&shape.shape, text)),
+            "{text}"
+        );
+    }
+    assert!(
+        frame.commands.is_empty(),
+        "presentation is not authorization or activation"
+    );
+}
+
+#[test]
+fn batched_action_text_and_return_preserve_their_actual_event_order() {
+    for text_before_return in [true, false] {
+        let context = create_launcher_context();
+        let mut launcher = action_launcher();
+        let _ = launcher.apply(UiCommand::ShowActions);
+        let view = launcher.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+        let text = egui::Event::Text("Reveal".into());
+        let enter = key_press(egui::Key::Enter, egui::Modifiers::NONE);
+        let events = if text_before_return {
+            vec![text, enter]
+        } else {
+            vec![enter, text]
+        };
+        let frame = build_launcher_frame(&context, launcher_input(events), &view);
+        let mut effects = Vec::new();
+        let mut generation = 1;
+        for command in frame.commands {
+            apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+        }
+        assert_eq!(
+            effects,
+            vec![crikey_ui::UiEffect::Execute {
+                owner: PluginId("renderer-fixture".into()),
+                item: ItemId("item-0".into()),
+                action: crikey_core::ActionId(if text_before_return { "reveal" } else { "run" }.into()),
+            }]
+        );
+        assert_eq!(launcher.frame().unwrap().query, "fixture");
+    }
+}
+
+#[test]
+fn composition_owned_return_followed_by_commit_never_executes_an_action() {
+    for composition_started_in_previous_frame in [false, true] {
+        let context = create_launcher_context();
+        let mut launcher = action_launcher();
+        let _ = launcher.apply(UiCommand::ShowActions);
+        let mut view = launcher.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+        let preedit = vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("Re".into())),
+        ];
+        let mut events = if composition_started_in_previous_frame {
+            let frame = build_launcher_frame(&context, launcher_input(preedit), &view);
+            for command in frame.commands {
+                assert!(launcher.apply(command).is_none());
+            }
+            view = launcher.frame().unwrap();
+            Vec::new()
+        } else {
+            preedit
+        };
+        events.push(key_press(egui::Key::Enter, egui::Modifiers::NONE));
+        events.push(egui::Event::Ime(egui::ImeEvent::Commit("Reveal".into())));
+        let frame = build_launcher_frame(&context, launcher_input(events), &view);
+        assert!(!frame.commands.contains(&UiCommand::ActivateSelectedAction));
+        assert!(!frame
+            .commands
+            .iter()
+            .any(|command| matches!(command, UiCommand::SetQuery(_))));
+        for command in frame.commands {
+            assert!(launcher.apply(command).is_none());
+        }
+        let frame = launcher.frame().unwrap();
+        assert_eq!(frame.query, "fixture");
+        assert_eq!(frame.action_panel.as_ref().unwrap().query(), "Reveal");
+    }
+}
+
+#[test]
+fn action_failure_replaces_long_metadata_and_exposes_its_complete_reason_on_hover() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    let mut view = launcher.frame().unwrap();
+    let mut rows = view.rows.to_vec();
+    rows[0].description =
+        "A long provider description that would otherwise consume the entire line ".repeat(20);
+    let diagnostic = format!(
+        "Action failed: {} terminal diagnostic detail",
+        "specific cause ".repeat(30)
+    );
+    rows[0].status = Some(diagnostic.clone());
+    view.rows = rows.into();
+    let input = |time, events| {
+        let mut input = launcher_input(events);
+        input.time = Some(time);
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(480.0, 520.0),
+        ));
+        input
+    };
+    let first = build_launcher_frame(&context, input(0.0, vec![]), &view);
+    let status = position_of(&first, "Action failed");
+    assert!(
+        status.x < 200.0,
+        "failure feedback must start before lengthy row metadata"
+    );
+    assert!(!painted(&first, "A long provider description"));
+    assert!(position_of(&first, "Settings").y < 520.0);
+    let pointer = status + egui::vec2(4.0, 4.0);
+    let _ = build_launcher_frame(
+        &context,
+        input(1.0, vec![egui::Event::PointerMoved(pointer)]),
+        &view,
+    );
+    let hovered = build_launcher_frame(&context, input(3.0, vec![]), &view);
+    let count = |frame: &crikey_ui::NativeUiFrame| {
+        frame
+            .output
+            .shapes
+            .iter()
+            .filter(|shape| contains_text(&shape.shape, &diagnostic))
+            .count()
+    };
+    assert!(
+        count(&hovered) > count(&first),
+        "hover must expose the full diagnostic in a real tooltip"
+    );
+    assert!(position_of(&hovered, "Settings").y < 520.0);
+}
+
+fn ordered_action_launcher() -> crikey_ui::LauncherViewModel {
+    let mut launcher = action_launcher();
+    let root = launcher.frame().unwrap();
+    let mut row = root.rows[0].clone();
+    row.default_action.as_mut().unwrap().label = "Run first".into();
+    row.alternate_actions[0].label = "Copy target".into();
+    row.alternate_actions[1].label = "Copy alternate".into();
+    launcher.publish(root.generation, vec![row], false);
+    launcher.apply(UiCommand::ShowActions);
+    launcher
+}
+
+fn apply_ordered_test_command(
+    launcher: &mut crikey_ui::LauncherViewModel,
+    command: UiCommand,
+    rows: &[ResultRow],
+    generation: &mut u64,
+    effects: &mut Vec<crikey_ui::UiEffect>,
+) {
+    let mut effect = launcher.apply(command);
+    loop {
+        match effect {
+            Some(crikey_ui::UiEffect::InputBatch {
+                continuation,
+                commands,
+            }) => {
+                for command in commands {
+                    apply_ordered_test_command(launcher, command, rows, generation, effects);
+                }
+                if let Some(token) = continuation {
+                    launcher.finish_input_batch(token);
+                }
+            }
+            Some(effect) => {
+                if matches!(&effect, crikey_ui::UiEffect::Query(_)) {
+                    // The existing synchronous root consumer admits/publishes
+                    // its answer before the following command, as the host does.
+                    *generation += 1;
+                    let current = Generation::from_raw(*generation);
+                    launcher.begin_generation(current);
+                    launcher.publish(current, rows.to_vec(), false);
+                }
+                effects.push(effect);
+            }
+            None => {}
+        }
+        if let Some(raw) = launcher.take_query_refresh() {
+            effect = Some(crikey_ui::UiEffect::Query(raw));
+        } else {
+            break;
+        }
+    }
+}
+
+fn drive_ordered_action_input(
+    context: &egui::Context,
+    launcher: &mut crikey_ui::LauncherViewModel,
+    events: Vec<egui::Event>,
+) -> (ViewModel, Vec<crikey_ui::UiEffect>) {
+    // Each host key consumes one boundary; a fresh Settings route needs one
+    // ordinary focus-establishing paint. No sleeps or timing assumptions.
+    let turns = events.len() + 2;
+    let mut view = launcher.frame().unwrap();
+    let rows = view.rows.clone();
+    let _ = build_launcher_frame(context, launcher_input(vec![]), &view);
+    let mut input = launcher_input(events);
+    let mut effects = Vec::new();
+    let mut generation = 1;
+    for _ in 0..turns {
+        let frame = build_launcher_frame(context, input, &view);
+        input = launcher_input(vec![]);
+        for command in frame.commands {
+            apply_ordered_test_command(launcher, command, &rows, &mut generation, &mut effects);
+        }
+        view = launcher.frame().unwrap_or(view);
+    }
+    (view, effects)
+}
+
+fn ordered_execution(action: &str) -> crikey_ui::UiEffect {
+    crikey_ui::UiEffect::Execute {
+        owner: PluginId("renderer-fixture".into()),
+        item: ItemId("item-0".into()),
+        action: crikey_core::ActionId(action.into()),
+    }
+}
+
+#[test]
+fn ordered_action_text_navigation_and_return_execute_the_correct_filtered_leaf() {
+    for text_first in [true, false] {
+        let context = create_launcher_context();
+        let mut launcher = ordered_action_launcher();
+        let text = egui::Event::Text("Copy".into());
+        let down = key_press(egui::Key::ArrowDown, egui::Modifiers::NONE);
+        let mut events = if text_first {
+            vec![text, down]
+        } else {
+            vec![down, text]
+        };
+        events.push(key_press(egui::Key::Enter, egui::Modifiers::NONE));
+        let (view, effects) = drive_ordered_action_input(&context, &mut launcher, events);
+        assert_eq!(view.query, "fixture");
+        assert_eq!(
+            effects,
+            vec![ordered_execution(if text_first { "reveal" } else { "copy" })]
+        );
+    }
+}
+
+#[test]
+fn ordered_action_selection_paste_navigation_and_return_use_the_existing_editor() {
+    let context = create_launcher_context();
+    let mut launcher = ordered_action_launcher();
+    launcher.apply(UiCommand::SetActionQuery("replace this".into()));
+    let (_, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![
+            key_press(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Paste("Copy".into()),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ],
+    );
+    assert_eq!(effects, vec![ordered_execution("reveal")]);
+}
+
+#[test]
+fn ordered_action_nested_back_then_filter_and_return_respects_each_back_rung() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    launcher.apply(UiCommand::ShowActions);
+    let view = launcher.frame().unwrap();
+    launcher.apply(UiCommand::ActivateAction {
+        target: crikey_ui::ActionTarget::of(&view.rows[0]),
+        identity: crikey_ui::ActionIdentity::Submenu("launcher-settings".into()),
+    });
+    let (view, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![
+            egui::Event::Text("Copy".into()),
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            egui::Event::Text("Reveal".into()),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ],
+    );
+    assert_eq!(view.query, "fixture");
+    assert_eq!(effects, vec![ordered_execution("reveal")]);
+}
+
+#[test]
+fn ordered_action_close_transfers_focus_before_root_text_and_return() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    launcher.apply(UiCommand::ShowActions);
+    let (view, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Text("replacement".into()),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ],
+    );
+    assert_eq!(view.query, "replacement");
+    assert_eq!(
+        effects,
+        vec![
+            crikey_ui::UiEffect::Query("replacement".into()),
+            ordered_execution("run"),
+        ]
+    );
+}
+
+#[test]
+fn ordered_action_close_discovery_filter_and_return_uses_the_new_panel() {
+    let physical_command = egui::Modifiers {
+        ctrl: !cfg!(target_os = "macos"),
+        mac_cmd: cfg!(target_os = "macos"),
+        command: true,
+        ..egui::Modifiers::NONE
+    };
+    for (name, discovery) in [
+        (
+            "logical command",
+            key_press(egui::Key::K, egui::Modifiers::COMMAND),
+        ),
+        ("physical command", key_press(egui::Key::K, physical_command)),
+        ("alt enter", key_press(egui::Key::Enter, egui::Modifiers::ALT)),
+    ] {
+        let context = create_launcher_context();
+        let mut launcher = action_launcher();
+        launcher.apply(UiCommand::ShowActions);
+        let (_, effects) = drive_ordered_action_input(
+            &context,
+            &mut launcher,
+            vec![
+                key_press(egui::Key::Escape, egui::Modifiers::NONE),
+                discovery,
+                egui::Event::Text("Reveal".into()),
+                key_press(egui::Key::Enter, egui::Modifiers::NONE),
+            ],
+        );
+        assert_eq!(effects, vec![ordered_execution("reveal")], "{name}");
+    }
+}
+
+#[test]
+fn ordered_action_close_preview_focus_back_and_return_use_the_shared_adapter() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    let selection = launcher.preview_selection().unwrap();
+    launcher.publish_preview(&selection, crikey_ui::PreviewStatus::Loading);
+    launcher.apply(UiCommand::ShowActions);
+    let (view, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::F6, egui::Modifiers::NONE),
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ],
+    );
+    assert!(!view.preview.focused);
+    assert_eq!(effects, vec![ordered_execution("run")]);
+}
+
+#[test]
+fn ordered_action_close_settings_back_and_return_use_the_shared_adapter() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    launcher.apply(UiCommand::ShowActions);
+    let (view, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::Comma, egui::Modifiers::COMMAND),
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ],
+    );
+    assert!(!view.settings_open);
+    assert_eq!(effects.last(), Some(&ordered_execution("run")));
+}
+
+#[test]
+fn ordered_action_composition_navigation_return_and_commit_never_execute() {
+    let context = create_launcher_context();
+    let mut launcher = ordered_action_launcher();
+    let (_, effects) = drive_ordered_action_input(
+        &context,
+        &mut launcher,
+        vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit("Co".into())),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+            egui::Event::Ime(egui::ImeEvent::Commit("Copy".into())),
+        ],
+    );
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn ordered_action_tail_cannot_cross_generation_focus_or_session_retirement() {
+    for retirement in ["generation", "focus", "session", "target", "action"] {
+        let context = create_launcher_context();
+        let mut launcher = ordered_action_launcher();
+        let mut view = launcher.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+        let frame = build_launcher_frame(
+            &context,
+            launcher_input(vec![
+                egui::Event::Text("Copy".into()),
+                key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+                key_press(egui::Key::Enter, egui::Modifiers::NONE),
+            ]),
+            &view,
+        );
+        let mut generation = 1;
+        let mut effects = Vec::new();
+        for command in frame.commands {
+            apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+        }
+        assert!(effects.is_empty());
+        view = launcher.frame().unwrap();
+        let mut input = launcher_input(vec![]);
+        match retirement {
+            "generation" => {
+                launcher.begin_generation(Generation::from_raw(2));
+                launcher.publish(Generation::from_raw(2), view.rows.to_vec(), false);
+                view = launcher.frame().unwrap();
+            }
+            "focus" => {
+                input.focused = false;
+                input.events.push(egui::Event::WindowFocused(false));
+            }
+            "session" => {
+                launcher.dismiss();
+                launcher.activate();
+                view = launcher.frame().unwrap();
+            }
+            "target" | "action" => {
+                let mut row = view.rows[0].clone();
+                if retirement == "target" {
+                    row.item = ItemId("replacement".into());
+                } else {
+                    row.alternate_actions
+                        .retain(|action| action.action_id.0 != "reveal");
+                }
+                launcher.publish(view.generation, vec![row], false);
+                view = launcher.frame().unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let frame = build_launcher_frame(&context, input, &view);
+        for command in frame.commands {
+            apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+        }
+        assert!(effects.is_empty(), "{retirement}");
+    }
+}
+
+#[test]
+fn ordered_action_retained_root_text_precedes_a_genuinely_newer_return() {
+    let context = create_launcher_context();
+    let mut launcher = action_launcher();
+    launcher.apply(UiCommand::ShowActions);
+    let mut view = launcher.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            key_press(egui::Key::Escape, egui::Modifiers::NONE),
+            key_press(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Text("replacement".into()),
+        ]),
+        &view,
+    );
+    let mut generation = 1;
+    let mut effects = Vec::new();
+    for command in frame.commands {
+        apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+    }
+    view = launcher.frame().unwrap();
+    assert!(view.action_panel.is_none());
+    // Native ingress holds newer host keys in this same egui stream while
+    // the older suffix is owned; they cannot overtake its text.
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)]),
+        &view,
+    );
+    for command in frame.commands {
+        apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+    }
+    assert_eq!(launcher.frame().unwrap().query, "replacement");
+    assert_eq!(
+        effects,
+        vec![
+            crikey_ui::UiEffect::Query("replacement".into()),
+            ordered_execution("run"),
+        ]
+    );
+}
+
+#[test]
+fn ordered_action_batch_rejects_a_source_replaced_before_the_host_callback() {
+    let context = create_launcher_context();
+    let mut launcher = ordered_action_launcher();
+    let view = launcher.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            egui::Event::Text("Copy".into()),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ]),
+        &view,
+    );
+    let mut row = view.rows[0].clone();
+    row.alternate_actions
+        .retain(|action| action.action_id.0 != "reveal");
+    launcher.publish(view.generation, vec![row], false);
+    let mut generation = 1;
+    let mut effects = Vec::new();
+    for command in frame.commands {
+        apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+    }
+    let view = launcher.frame().unwrap();
+    let frame = build_launcher_frame(&context, launcher_input(vec![]), &view);
+    for command in frame.commands {
+        apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+    }
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn ordered_action_foreign_finish_cannot_consume_the_validated_batch_token() {
+    let context = create_launcher_context();
+    let mut launcher = ordered_action_launcher();
+    let view = launcher.frame().unwrap();
+    let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+    let mut frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ]),
+        &view,
+    );
+    let Some(crikey_ui::UiEffect::InputBatch {
+        continuation: Some(token),
+        commands,
+    }) = launcher.apply(frame.commands.pop().unwrap())
+    else {
+        panic!("a real retained tail requires an atomic host batch");
+    };
+    for command in commands {
+        assert!(launcher.apply(command).is_none());
+    }
+    launcher.finish_input_batch(token + 1);
+    assert!(launcher.frame().unwrap().input_receipt.is_none());
+    launcher.finish_input_batch(token);
+    assert!(launcher.frame().unwrap().input_receipt.is_some());
+    launcher.finish_input_batch(token);
+    assert!(launcher.frame().is_none(), "the receipt is one-shot");
+}
+
+#[test]
+fn ordered_action_obsolete_tail_does_not_discard_distinct_fresh_native_keys() {
+    for key in [egui::Key::Enter, egui::Key::ArrowDown] {
+        let context = create_launcher_context();
+        let mut launcher = action_launcher();
+        launcher.apply(UiCommand::ShowActions);
+        let mut view = launcher.frame().unwrap();
+        let _ = build_launcher_frame(&context, launcher_input(vec![]), &view);
+        let frame = build_launcher_frame(
+            &context,
+            launcher_input(vec![
+                key_press(egui::Key::Escape, egui::Modifiers::NONE),
+                egui::Event::Text("obsolete".into()),
+            ]),
+            &view,
+        );
+        let mut generation = 1;
+        let mut effects = Vec::new();
+        for command in frame.commands {
+            apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+        }
+        launcher.apply(UiCommand::SetQuery("current".into()));
+        launcher.begin_generation(Generation::from_raw(2));
+        let mut rows = view.rows.to_vec();
+        let mut second = rows[0].clone();
+        second.item = ItemId("second".into());
+        rows.push(second);
+        launcher.publish(Generation::from_raw(2), rows, false);
+        view = launcher.frame().unwrap();
+        generation = 2;
+        let frame = build_launcher_frame(
+            &context,
+            launcher_input(vec![key_press(key, egui::Modifiers::NONE)]),
+            &view,
+        );
+        for command in frame.commands {
+            apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+        }
+        let current = launcher.frame().unwrap_or(view);
+        assert_eq!(current.query, "current");
+        if key == egui::Key::Enter {
+            assert_eq!(effects, vec![ordered_execution("run")]);
+        } else {
+            assert_eq!(current.selected, 1);
+            assert!(effects.is_empty());
+        }
+    }
+}
+
+#[test]
+fn ordered_action_oversized_utf8_query_refuses_submission_before_any_callback() {
+    for paste in [false, true] {
+        for retained_tail in [false, true] {
+            let context = create_launcher_context();
+            let mut launcher = ordered_action_launcher();
+            // This fits the editor's character limit but exceeds the shared
+            // action-query UTF-8 byte limit, without relying on truncation.
+            let query = "é".repeat(crikey_ui::action_panel::MAX_ACTION_QUERY_BYTES / 2 + 1);
+            let mut events = vec![if paste {
+                egui::Event::Paste(query)
+            } else {
+                egui::Event::Text(query)
+            }];
+            if retained_tail {
+                events.push(key_press(egui::Key::ArrowDown, egui::Modifiers::NONE));
+            }
+            events.push(key_press(egui::Key::Enter, egui::Modifiers::NONE));
+            let (view, mut effects) = drive_ordered_action_input(&context, &mut launcher, events);
+            assert!(
+                effects.is_empty(),
+                "a refused query cannot execute the prior leaf"
+            );
+            let panel = view.action_panel.as_ref().unwrap();
+            assert_eq!(panel.query(), "");
+            assert_eq!(
+                panel.selected(),
+                Some(&crikey_ui::ActionIdentity::Plugin(crikey_core::ActionId(
+                    "run".into()
+                )))
+            );
+            assert!(view.rows[0].status.is_some());
+
+            // Once the preserved valid state is visibly back, a separate
+            // deliberate Enter is still usable; no sticky refusal flag exists.
+            let frame = build_launcher_frame(
+                &context,
+                launcher_input(vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)]),
+                &view,
+            );
+            let mut generation = 1;
+            for command in frame.commands {
+                apply_ordered_test_command(&mut launcher, command, &view.rows, &mut generation, &mut effects);
+            }
+            assert_eq!(effects, vec![ordered_execution("run")]);
+        }
+    }
+}
+
+#[test]
+fn ordered_action_results_only_frame_cannot_authorize_atomic_input() {
+    let context = create_launcher_context();
+    let mut launcher = ordered_action_launcher();
+    let mut unowned = launcher.frame().unwrap();
+    assert!(unowned.view.is_some());
+    unowned.view = None;
+    let _ = build_launcher_frame(&context, launcher_input(vec![]), &unowned);
+    let frame = build_launcher_frame(
+        &context,
+        launcher_input(vec![
+            egui::Event::Text("Copy".into()),
+            key_press(egui::Key::ArrowDown, egui::Modifiers::NONE),
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+        ]),
+        &unowned,
+    );
+    let mut generation = 1;
+    let mut effects = Vec::new();
+    for command in frame.commands {
+        apply_ordered_test_command(
+            &mut launcher,
+            command,
+            &unowned.rows,
+            &mut generation,
+            &mut effects,
+        );
+    }
+    let owned = launcher.frame().unwrap();
+    assert!(owned.view.is_some());
+    let frame = build_launcher_frame(&context, launcher_input(vec![]), &owned);
+    for command in frame.commands {
+        apply_ordered_test_command(&mut launcher, command, &owned.rows, &mut generation, &mut effects);
+    }
+    assert!(effects.is_empty());
 }

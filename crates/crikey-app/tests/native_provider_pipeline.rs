@@ -342,6 +342,80 @@ fn native_suggestions_cross_pipeline_intake_under_current_generation() {
     provider.shutdown(180);
 }
 
+/// A real supervised action must wake the host without another query or input.
+/// Draining inside the callback also proves publication precedes notification
+/// and the completion mailbox is unlocked when the callback runs.
+#[test]
+fn native_action_completion_wakes_without_another_query() {
+    let (conformance, _) = conformance_binaries();
+    let scratch = Scratch::new("action-wake");
+    let plugins_root = scratch.subdir("plugins");
+    write_native_plugin(&plugins_root, "page", &conformance, "page");
+    let plugin = native_plugin("page");
+    let mut pipeline = QueryPipeline::new(PipelineConfig::default());
+    let provider = NativeProvider::load_with_collection_window(
+        &mut pipeline,
+        &[plugins_root],
+        ROW_DELIVERY_WINDOW,
+        &DisabledPlugins::default(),
+    );
+    assert!(
+        provider.plugins().contains(&plugin),
+        "the native page fixture must load; unavailable: {:?}",
+        provider.unavailable(),
+    );
+    let (published, publication_rx) = std::sync::mpsc::channel();
+    let driver = NativeDriver::spawn(
+        provider,
+        pipeline,
+        Box::new(move |frame| {
+            let _ = published.send(frame.clone());
+        }),
+    );
+    driver.submit(Generation::from_raw(1), "page", 17, Vec::new(), false, 0);
+    let frame = publication_rx
+        .recv_timeout(ROW_DELIVERY_WINDOW)
+        .expect("the native page item must reach the driver");
+    assert!(frame.rows.iter().any(|row| row.plugin_name == plugin.0));
+
+    let executor = driver.action_executor();
+    let callback_executor = Arc::downgrade(&executor);
+    let (notified, notification_rx) = std::sync::mpsc::channel();
+    driver.set_action_wake(move || {
+        let completions = callback_executor
+            .upgrade()
+            .expect("the driver retains the action endpoint during notification")
+            .poll_plugin_actions();
+        let _ = notified.send(completions);
+    });
+    let item_id = ItemId("page-playground".to_owned());
+    let action_id = ActionId("open-page".to_owned());
+    let request_id = executor
+        .submit_plugin_action_by_id(&plugin, &item_id, &action_id, None)
+        .expect("the native page action must be admitted");
+
+    // No further query, input, or completion polling drives the supervisor.
+    let mut completions = notification_rx
+        .recv_timeout(ROW_DELIVERY_WINDOW)
+        .expect("the supervised native action must notify the host");
+    assert_eq!(completions.len(), 1, "notification must follow publication");
+    let completion = completions.pop().unwrap();
+    assert_eq!(completion.request_id, request_id);
+    assert_eq!(completion.plugin, plugin);
+    assert_eq!(completion.item_id, item_id);
+    assert_eq!(completion.action_id, action_id);
+    assert_eq!(
+        completion.outcome.expect("the native page action must succeed"),
+        crikey_app::ActionEffect::ShowPage {
+            page_id: "playground".to_owned(),
+        },
+    );
+    assert!(
+        executor.poll_plugin_actions().is_empty(),
+        "the terminal outcome is emitted once",
+    );
+}
+
 #[test]
 fn native_distinct_source_dirs_use_their_own_workers() {
     let (conformance, _) = conformance_binaries();

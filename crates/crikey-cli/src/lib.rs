@@ -695,6 +695,20 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     native_driver.set_wake(move || {
         let _ = page_wake_handle.request_provider_answer();
     });
+    // Action terminals have process lifetime, not presentation lifetime. Drain
+    // them while hidden too, without reactivating a retired launcher session.
+    let action_wake_handle = render_handle.clone();
+    native_driver.set_action_wake(move || {
+        let _ = action_wake_handle.request_action_completion();
+    });
+    let action_wake_handle = render_handle.clone();
+    modern_driver.set_action_wake(move || {
+        let _ = action_wake_handle.request_action_completion();
+    });
+    let action_wake_handle = render_handle.clone();
+    legacy_driver.set_action_wake(move || {
+        let _ = action_wake_handle.request_action_completion();
+    });
     // Plugin-owned actions use the same exact-owner endpoints and budget
     // handles retained by the provider drivers. Registering this router before
     // the event loop makes `crikey run` execute selected legacy/modern/native
@@ -814,6 +828,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
     #[cfg(not(target_os = "linux"))]
     let mut web_page = WebPageRuntime::new();
     let mut retained = RetainedRows::default();
+    let mut action_origins = std::collections::BTreeMap::new();
     // Per-plugin refusal totals already reported, so a growing counter is
     // announced once per increase rather than on every turn of the loop.
     let mut reported_refusals: std::collections::BTreeMap<PluginId, crikey_app::ConcurrencyRefusals> =
@@ -896,6 +911,23 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     if search.record_selection(&completion.item_id) {
                         commit_selection_history(selection_history.as_ref(), &search);
                     }
+                }
+                let origin = action_origins.remove(&completion.request_id).flatten();
+                let may_present = origin.is_some_and(|(view, session)| {
+                    render_handle.is_visible_session(session)
+                        && view_model.view().is_some_and(|(current, _)| current == view)
+                });
+                if !may_present {
+                    // Draining still releases endpoint admission/budgets. A
+                    // completion from a hidden or replaced view cannot open a
+                    // page or attach status to the next launcher session.
+                    if let Err(error) = completion.outcome {
+                        eprintln!(
+                            "crikey: action failed ({} / {}): {error}",
+                            completion.plugin.0, completion.action_id.0
+                        );
+                    }
+                    continue;
                 }
                 let message = match completion.outcome {
                     Ok(ActionEffect::Completed) => format!(
@@ -1123,18 +1155,34 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                 // above, before the match, exactly as it does for every other
                 // event; there is no command and no effect.
                 NativeLauncherEvent::ProviderAnswer => (None, None),
+                NativeLauncherEvent::ActionCompletion => (None, None),
             };
 
             // Read before the match consumes the effect: the window and the
             // process are one decision made in one place, so no arm can grow
             // its own private answer to "does this end the launcher".
-            let disposition = effect.as_ref().and_then(settings::residency);
+            let mut disposition = effect.as_ref().and_then(settings::residency);
             // Leaving a covered root retires its old publications. Re-enter it
             // through ordinary query dispatch, after the page lifecycle effect
             // has run, and never duplicate a query already requested this turn.
             let mut effect = effect;
+            let mut input_commands = Vec::new().into_iter();
+            let mut input_continuation = None;
             loop {
+                if let Some(next) = effect.as_ref().and_then(settings::residency) {
+                    disposition = Some(next);
+                }
                 match effect {
+                    Some(UiEffect::InputBatch {
+                        continuation,
+                        commands,
+                    }) => {
+                        // This entire editor prefix/key pair runs in this one
+                        // callback. Foreign completions are polled only above,
+                        // never between its ordinary reducer/host-effect steps.
+                        input_commands = commands.into_iter();
+                        input_continuation = continuation;
+                    }
                     Some(UiEffect::OpenPreviewLink { target, url }) => {
                         if let Err(reason) = previews.open_link(&target, &url, &search) {
                             view_model
@@ -1303,7 +1351,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         search.close_page();
                         view_model.close_page();
                     }
-                    Some(UiEffect::Execute { item, action }) => {
+                    Some(UiEffect::Execute { owner, item, action }) => {
                         // A calculated row is resolved first and settled entirely
                         // here. Its value never entered the catalog and copying it
                         // is not one of the three host-mediated catalog actions, so
@@ -1312,6 +1360,10 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                         // capability and makes the call itself.
                         let calculated = retained
                             .generation()
+                            .filter(|_| {
+                                owner.0 == calculator::CALCULATOR_PLUGIN
+                                    && action.0 == "crikey.calculator.copy"
+                            })
                             .and_then(|generation| calculator.resolve(generation, &item))
                             .map(str::to_owned);
                         if let Some(text) = calculated {
@@ -1338,7 +1390,7 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                             // applies the same host-mediated gate, and
                             // `record_selection` below can finally record having
                             // opened it.
-                            let submission = search.execute(&item, &action);
+                            let submission = search.execute_owned(&owner, &item, &action);
                             match submission {
                                 Ok(ActionSubmission::Completed) => {
                                     search.set_history_time(history_clock.advance());
@@ -1351,6 +1403,10 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                                     }
                                 }
                                 Ok(ActionSubmission::Pending(request_id)) => {
+                                    action_origins.insert(
+                                        request_id.clone(),
+                                        view_model.view().map(|(view, _)| view).zip(command_session),
+                                    );
                                     let message = format!(
                                         "Action pending ({} / request {})",
                                         request_id.plugin.0, request_id.sequence
@@ -1365,10 +1421,16 @@ fn run_native_launcher(overrides: &[(String, String)]) -> Result<(), String> {
                     }
                     None => {}
                 }
-                effect = match view_model.take_query_refresh() {
-                    Some(raw) => Some(UiEffect::Query(raw)),
-                    None => break,
-                };
+                if let Some(raw) = view_model.take_query_refresh() {
+                    effect = Some(UiEffect::Query(raw));
+                } else if let Some(command) = input_commands.next() {
+                    effect = view_model.apply(command);
+                } else {
+                    if let Some(token) = input_continuation.take() {
+                        view_model.finish_input_batch(token);
+                    }
+                    break;
+                }
             }
             // Returning from a failed page republishes root rows synchronously.
             // Attach its diagnostic only afterwards, so that publication cannot

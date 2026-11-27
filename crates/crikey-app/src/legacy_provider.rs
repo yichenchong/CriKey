@@ -1237,6 +1237,7 @@ enum LegacyWork {
 struct LegacyActionEndpoint {
     sender: SyncSender<LegacyActionRequest>,
     completions: Arc<Mutex<VecDeque<PluginActionCompletion>>>,
+    action_wake: crate::plugin_action::CompletionWake,
     budgets: BTreeMap<PluginId, PluginBudgetHandle>,
     items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
     catalog_items: Arc<Mutex<BTreeMap<(PluginId, ItemId), Item>>>,
@@ -1365,6 +1366,7 @@ impl crate::PluginActionExecutor for LegacyActionEndpoint {
 /// mailbox without bound when nothing is draining it.
 fn enqueue_legacy_completion(
     mailbox: &Mutex<VecDeque<PluginActionCompletion>>,
+    action_wake: &crate::plugin_action::CompletionWake,
     completion: PluginActionCompletion,
 ) {
     let mut mailbox = mailbox.lock().unwrap_or_else(|error| error.into_inner());
@@ -1376,6 +1378,8 @@ fn enqueue_legacy_completion(
         return;
     }
     mailbox.push_back(completion);
+    drop(mailbox);
+    action_wake.ring();
 }
 
 /// One query handed to the legacy supervisor thread, tagged with the search
@@ -1485,6 +1489,7 @@ impl LegacyDriver {
         let action_endpoint = Arc::new(LegacyActionEndpoint {
             sender: action_sender,
             completions: Arc::clone(&completion_mailbox),
+            action_wake: crate::plugin_action::CompletionWake::default(),
             budgets: provider.action_budgets(),
             items: Arc::clone(&provider.action_items),
             catalog_items: Arc::clone(&provider.catalog_items),
@@ -1499,6 +1504,7 @@ impl LegacyDriver {
         let thread_outcome = Arc::clone(&outcome);
         let thread_current = Arc::clone(&current);
         let thread_completion_mailbox = Arc::clone(&completion_mailbox);
+        let thread_action_wake = action_endpoint.action_wake.clone();
         let thread_in_flight = Arc::clone(&action_endpoint.in_flight);
         let spawned = std::thread::Builder::new()
             .name("crikey-legacy".to_owned())
@@ -1529,6 +1535,7 @@ impl LegacyDriver {
                                     thread_in_flight.fetch_sub(1, Ordering::AcqRel);
                                     enqueue_legacy_completion(
                                         &thread_completion_mailbox,
+                                        &thread_action_wake,
                                         PluginActionCompletion {
                                             request_id: request.request_id.clone(),
                                             plugin: request.plugin.clone(),
@@ -1589,6 +1596,7 @@ impl LegacyDriver {
                             thread_in_flight.fetch_sub(1, Ordering::AcqRel);
                             enqueue_legacy_completion(
                                 &thread_completion_mailbox,
+                                &thread_action_wake,
                                 PluginActionCompletion {
                                     request_id,
                                     plugin,
@@ -1630,13 +1638,15 @@ impl LegacyDriver {
                         pending |= frame.pending_plugins;
                     }
                     let merged = ViewModel {
+                        view: None,
+                        input_receipt: None,
                         generation: job.generation,
                         query: job.query,
                         rows: rows.into(),
                         selected: job.selected,
                         root_selection_revision: 0,
                         pending_plugins: pending,
-                        actions_open: false,
+                        action_panel: None,
                         settings_open: false,
                         settings: Arc::default(),
                         settings_focus: None,
@@ -1689,6 +1699,11 @@ impl LegacyDriver {
                 worker: None,
             },
         }
+    }
+
+    /// Installs the terminal action notification independently of result wakes.
+    pub fn set_action_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
+        self.action_endpoint.action_wake.install(Arc::new(wake));
     }
 
     /// Installs the gate every host-mediated legacy action must pass.

@@ -14,7 +14,10 @@ use std::sync::Arc;
 use crikey_core::{Action, ActionId, Generation, ItemId, PageFrame, PageInput, PluginId};
 use crikey_platform::IconImage;
 
+pub mod action_panel;
 mod native;
+use action_panel::{ActionActivation, ActionExecution, ActionPanelNavigation, ActionTree, HostAction};
+pub use action_panel::{ActionIdentity, ActionPanel, ActionTarget};
 mod preview_content;
 mod session_end;
 pub use preview_content::{prepare_preview, PreparedPreview, PreviewBlock, PreviewBlockKind, PreviewSpan};
@@ -309,6 +312,10 @@ pub struct PageSurface {
 /// [`LauncherViewModel::publish`] built.
 #[derive(Debug, Clone)]
 pub struct ViewModel {
+    /// Host view/session identity; results-only frames have no input authority.
+    pub view: Option<ViewId>,
+    /// One-shot acknowledgment of an ordered native input boundary.
+    pub input_receipt: Option<Arc<ActionInputReceipt>>,
     pub generation: Generation,
     pub query: String,
     pub rows: Arc<[ResultRow]>,
@@ -324,7 +331,7 @@ pub struct ViewModel {
     /// The overlay is view-model state rather than renderer state, so which
     /// rung `Cancel` backs out of is decided in one place and every renderer
     /// draws the same launcher.
-    pub actions_open: bool,
+    pub action_panel: Option<Arc<ActionPanel>>,
     /// True while the settings surface is showing (spec 6.3).
     pub settings_open: bool,
     /// What the settings surface lists, as the host last described it.
@@ -365,11 +372,108 @@ pub struct ViewModel {
     pub preview: PreviewPane,
 }
 
+/// Opaque ownership checkpoint for a split native input batch.
+#[derive(Debug, Clone)]
+pub struct ActionInputCheckpoint {
+    pub(crate) view: Option<ViewId>,
+    pub(crate) generation: Generation,
+    pub(crate) query: String,
+    pub(crate) target: Option<ActionTarget>,
+    pub(crate) primary: Option<ActionId>,
+    pub(crate) panel: Option<Arc<ActionPanel>>,
+    pub(crate) preview_focus: (bool, bool),
+}
+
+impl ActionInputCheckpoint {
+    pub(crate) fn of(model: &ViewModel) -> Self {
+        Self {
+            view: model.view,
+            generation: model.generation,
+            query: model.query.clone(),
+            target: model.rows.get(model.selected).map(ActionTarget::of),
+            primary: model
+                .rows
+                .get(model.selected)
+                .and_then(|row| row.default_action.as_ref())
+                .map(|action| action.action_id.clone()),
+            panel: model.action_panel.clone(),
+            preview_focus: (model.preview.focused, model.preview.detail),
+        }
+    }
+
+    fn same_panel(&self, panel: Option<&Arc<ActionPanel>>) -> bool {
+        match (&self.panel, panel) {
+            (Some(expected), Some(current)) => {
+                expected.focus_token() == current.focus_token()
+                    && expected.layout_revision() == current.layout_revision()
+                    && expected.query() == current.query()
+                    && expected.path() == current.path()
+                    && expected.selected() == current.selected()
+                    && expected.invalidation() == current.invalidation()
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn matches(
+        &self,
+        view: Option<ViewId>,
+        generation: Generation,
+        query: &str,
+        row: Option<&ResultRow>,
+        panel: Option<&Arc<ActionPanel>>,
+        preview_focus: (bool, bool),
+    ) -> bool {
+        self.view.is_some()
+            && self.view == view
+            && self.generation == generation
+            && self.query == query
+            && self.primary.as_ref()
+                == row
+                    .and_then(|row| row.default_action.as_ref())
+                    .map(|action| &action.action_id)
+            && self.preview_focus == preview_focus
+            && self.same_panel(panel)
+            && match (&self.target, row) {
+                (Some(target), Some(row)) => target.matches(row),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl PartialEq for ActionInputCheckpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.view == other.view
+            && self.generation == other.generation
+            && self.query == other.query
+            && self.target == other.target
+            && self.primary == other.primary
+            && self.preview_focus == other.preview_focus
+            && self.same_panel(other.panel.as_ref())
+    }
+}
+
+/// Proof that the host applied an ordered input boundary.
+#[derive(Debug, Clone)]
+pub struct ActionInputReceipt {
+    pub(crate) token: u64,
+    pub(crate) accepted: bool,
+    pub(crate) owner: ActionInputCheckpoint,
+}
+
 /// Keyboard-only interaction surface (spec 6.3).
 ///
 /// Not [`Eq`]: a page input carries pointer coordinates, which are floats.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiCommand {
+    /// Apply this editor prefix and host key atomically in the composition root.
+    ApplyInputBatch {
+        continuation: Option<u64>,
+        source: Arc<ActionInputCheckpoint>,
+        commands: Vec<UiCommand>,
+    },
     FocusPreview,
     LeavePreview,
     ShowPreviewDetail,
@@ -387,7 +491,13 @@ pub enum UiCommand {
     /// Opens the action list of the selected row (spec 6.3).
     ShowActions,
     ExecuteDefault,
-    ExecuteAlternate(usize),
+    SetActionQuery(String),
+    ActivateAction {
+        target: ActionTarget,
+        identity: ActionIdentity,
+    },
+    ActivateSelectedAction,
+    ActionBack,
     Cancel,
     Dismiss,
     /// Shows the settings surface (spec 6.3).
@@ -448,11 +558,18 @@ pub const PAGE_SIZE: usize = 8;
 /// Not [`Eq`], for the same reason [`UiCommand`] is not.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiEffect {
+    /// Apply serially without polling foreign completions between commands,
+    /// then acknowledge a retained continuation with `finish_input_batch`.
+    InputBatch {
+        continuation: Option<u64>,
+        commands: Vec<UiCommand>,
+    },
     /// The query text changed; schedule a generation for it (spec 6.2.2).
     Query(String),
     /// Run `action` on `item` (spec 6.2.10). The launcher stays open —
     /// dismissing after an execution is the host's decision, not the UI's.
     Execute {
+        owner: PluginId,
         item: ItemId,
         action: ActionId,
     },
@@ -582,6 +699,8 @@ pub struct LauncherViewModel {
     visible: bool,
     view_id: ViewId,
     publication_view: Option<ViewId>,
+    input_receipt: Option<Arc<ActionInputReceipt>>,
+    input_batch: Option<u64>,
     query_refresh: bool,
     restore_selection: bool,
     /// The return search's owner-qualified choice, independent of temporary
@@ -610,7 +729,7 @@ pub struct LauncherViewModel {
     /// opposite is true and the row must be followed wherever it moves.
     navigated: bool,
     /// Whether the selected row's action list is open (spec 6.3).
-    actions_open: bool,
+    action_panel: Option<Arc<ActionPanel>>,
     pending_plugins: bool,
     /// Whether the settings surface is showing (spec 6.3).
     ///
@@ -671,6 +790,8 @@ impl LauncherViewModel {
             visible: false,
             view_id: ViewId(0),
             publication_view: None,
+            input_receipt: None,
+            input_batch: None,
             query_refresh: false,
             restore_selection: false,
             restoration_target: None,
@@ -680,7 +801,7 @@ impl LauncherViewModel {
             selected: 0,
             root_selection_revision: 0,
             navigated: false,
-            actions_open: false,
+            action_panel: None,
             pending_plugins: false,
             settings_open: false,
             settings: Arc::default(),
@@ -738,7 +859,9 @@ impl LauncherViewModel {
     fn change_view(&mut self) {
         self.view_id = ViewId(self.view_id.0.checked_add(1).expect("view identity exhausted"));
         self.publication_view = None;
+        self.input_receipt = None;
         self.pending_plugins = false;
+        self.close_actions();
     }
 
     /// Shows the launcher. Idempotent: activating an open one keeps its query,
@@ -776,13 +899,15 @@ impl LauncherViewModel {
             return;
         }
 
+        self.input_receipt = None;
+        self.input_batch = None;
         self.visible = false;
         self.dirty = false;
         self.query.clear();
         self.rows = Arc::default();
         self.selected = 0;
         self.navigated = false;
-        self.actions_open = false;
+        self.action_panel = None;
         self.pending_plugins = false;
         self.settings_open = false;
         self.settings_focus = None;
@@ -855,11 +980,8 @@ impl LauncherViewModel {
         // Return searches deliberately retag `published` in `begin_generation`.
         if self.published == Some(generation)
             && (self.selected != selected
-                || self
-                    .rows
-                    .get(self.selected)
-                    .map(|row| (&row.plugin_name, &row.item))
-                    != rows.get(selected).map(|row| (&row.plugin_name, &row.item)))
+                || self.rows.get(self.selected).map(|row| (&row.plugin, &row.item))
+                    != rows.get(selected).map(|row| (&row.plugin, &row.item)))
         {
             self.root_selection_revision = self.root_selection_revision.wrapping_add(1);
         }
@@ -867,9 +989,7 @@ impl LauncherViewModel {
         // One move into a shared allocation per accepted publish; from here on
         // every frame of this result set is a refcount bump.
         self.rows = rows.into();
-        // The overlay describes the alternates of a row snapshot that no longer
-        // exists, so a republish closes it rather than offering stale actions.
-        self.actions_open = false;
+        reconcile_action_panel(&mut self.action_panel, &self.rows);
         self.pending_plugins = pending_plugins;
         self.published = Some(generation);
         if !pending_plugins {
@@ -891,6 +1011,8 @@ impl LauncherViewModel {
 
         self.dirty = false;
         Some(ViewModel {
+            view: Some(self.view_id),
+            input_receipt: self.input_receipt.clone(),
             // The active generation, not the published one: the frame carries
             // the generation the query text belongs to.
             generation: self.active.unwrap_or(Generation::ZERO),
@@ -900,7 +1022,7 @@ impl LauncherViewModel {
             selected: self.selected,
             root_selection_revision: self.root_selection_revision,
             pending_plugins: self.pending_plugins,
-            actions_open: self.actions_open,
+            action_panel: self.action_panel.clone(),
             settings_open: self.settings_open,
             // Shared for the same reason the rows are.
             settings: Arc::clone(&self.settings),
@@ -913,6 +1035,33 @@ impl LauncherViewModel {
             rounded_corners: self.rounded_corners,
             preview: self.preview.clone(),
         })
+    }
+
+    /// Completes a validated native command batch after all ordinary host effects.
+    pub fn finish_input_batch(&mut self, token: u64) {
+        if self.input_batch != Some(token) || !self.visible {
+            return;
+        }
+        self.input_batch = None;
+        let owner = ActionInputCheckpoint {
+            view: Some(self.view_id),
+            generation: self.active.unwrap_or(Generation::ZERO),
+            query: self.query.clone(),
+            target: self.rows.get(self.selected).map(ActionTarget::of),
+            primary: self
+                .rows
+                .get(self.selected)
+                .and_then(|row| row.default_action.as_ref())
+                .map(|action| action.action_id.clone()),
+            panel: self.action_panel.clone(),
+            preview_focus: (self.preview.focused, self.preview.detail),
+        };
+        self.input_receipt = Some(Arc::new(ActionInputReceipt {
+            token,
+            accepted: true,
+            owner,
+        }));
+        self.dirty = true;
     }
 
     /// The sole command entry point (spec 6.3).
@@ -932,6 +1081,46 @@ impl LauncherViewModel {
         }
 
         match command {
+            UiCommand::ApplyInputBatch {
+                continuation,
+                source,
+                commands,
+            } => {
+                let source_valid = source.matches(
+                    Some(self.view_id),
+                    self.active.unwrap_or(Generation::ZERO),
+                    &self.query,
+                    self.rows.get(self.selected),
+                    self.action_panel.as_ref(),
+                    (self.preview.focused, self.preview.detail),
+                );
+                let query_refused = source_valid
+                    && commands.iter().any(|command| {
+                        matches!(command, UiCommand::SetActionQuery(query)
+                        if query.len() > action_panel::MAX_ACTION_QUERY_BYTES)
+                    });
+                if source_valid && !query_refused {
+                    self.input_batch = continuation;
+                    Some(UiEffect::InputBatch {
+                        continuation,
+                        commands,
+                    })
+                } else {
+                    if query_refused {
+                        let _ = self
+                            .set_selected_status(action_panel::ActionPanelRefusal::QueryTooLong.to_string());
+                    }
+                    if let Some(token) = continuation {
+                        self.input_receipt = Some(Arc::new(ActionInputReceipt {
+                            token,
+                            accepted: false,
+                            owner: (*source).clone(),
+                        }));
+                        self.dirty = true;
+                    }
+                    None
+                }
+            }
             UiCommand::OpenPreviewLink { target, url } => {
                 if self.preview_selection().as_ref() == Some(&target.selection)
                     && self.preview.link_target.as_ref() == Some(&target)
@@ -945,7 +1134,7 @@ impl LauncherViewModel {
                 if self.preview.status.is_some() {
                     self.preview.focused = true;
                     self.preview.detail = matches!(command, UiCommand::ShowPreviewDetail);
-                    self.actions_open = false;
+                    self.action_panel = None;
                     self.dirty = true;
                 }
                 None
@@ -964,22 +1153,21 @@ impl LauncherViewModel {
                 })
             }
             UiCommand::SetQuery(text) => self.retype(text),
-            UiCommand::SelectNext => {
-                self.select(self.selected.saturating_add(1));
+            UiCommand::SelectNext | UiCommand::SelectPrevious | UiCommand::PageDown | UiCommand::PageUp => {
+                let delta = match command {
+                    UiCommand::SelectNext => 1,
+                    UiCommand::SelectPrevious => -1,
+                    UiCommand::PageDown => PAGE_SIZE as isize,
+                    _ => -(PAGE_SIZE as isize),
+                };
+                if let Some(panel) = &mut self.action_panel {
+                    self.dirty |= Arc::make_mut(panel).move_selection(delta);
+                } else {
+                    self.select(self.selected.saturating_add_signed(delta));
+                }
                 None
             }
-            UiCommand::SelectPrevious => {
-                self.select(self.selected.saturating_sub(1));
-                None
-            }
-            UiCommand::PageDown => {
-                self.select(self.selected.saturating_add(PAGE_SIZE));
-                None
-            }
-            UiCommand::PageUp => {
-                self.select(self.selected.saturating_sub(PAGE_SIZE));
-                None
-            }
+            UiCommand::Complete if self.action_panel.is_some() => None,
             UiCommand::Complete => self.complete(),
             // Opening the action list schedules nothing and runs nothing: it is
             // pure UI state, so the host has no work and the change reaches the
@@ -988,17 +1176,31 @@ impl LauncherViewModel {
                 self.open_actions();
                 None
             }
-            UiCommand::ExecuteDefault => {
-                let row = self.rows.get(self.selected)?;
-                let effect = execute(row, row.default_action.as_ref()?);
-                self.close_actions();
-                Some(effect)
+            UiCommand::SetActionQuery(query) => {
+                if let Some(panel) = &mut self.action_panel {
+                    match Arc::make_mut(panel).set_query(query) {
+                        Ok(changed) => self.dirty |= changed,
+                        Err(reason) => {
+                            let _ = self.set_selected_status(reason.to_string());
+                        }
+                    }
+                }
+                None
             }
-            UiCommand::ExecuteAlternate(index) => {
-                let row = self.rows.get(self.selected)?;
-                let effect = execute(row, row.alternate_actions.get(index)?);
-                self.close_actions();
-                Some(effect)
+            UiCommand::ActivateAction { target, identity } => self.dispatch_action(&target, &identity),
+            UiCommand::ActivateSelectedAction => self.activate_panel(),
+            UiCommand::ActionBack => {
+                self.action_back();
+                None
+            }
+            UiCommand::ExecuteDefault => {
+                if self.action_panel.is_some() {
+                    return self.activate_panel();
+                }
+                let row = self.current_action_row()?;
+                let target = ActionTarget::of(row);
+                let identity = ActionIdentity::Plugin(row.default_action.as_ref()?.action_id.clone());
+                self.dispatch_action(&target, &identity)
             }
             UiCommand::OpenSettings => {
                 // The one settings transition that is not purely UI state: it
@@ -1051,8 +1253,8 @@ impl LauncherViewModel {
                 self.close_settings();
                 None
             }
-            UiCommand::Cancel if self.actions_open => {
-                self.close_actions();
+            UiCommand::Cancel if self.action_panel.is_some() => {
+                self.action_back();
                 None
             }
             // Clearing the query is an ordinary edit, so it goes through the
@@ -1078,6 +1280,7 @@ impl LauncherViewModel {
         }
         self.restore_selection = false;
         self.restoration_target = None;
+        self.close_actions();
         self.publication_view = None;
         self.preview_selection();
 
@@ -1089,7 +1292,7 @@ impl LauncherViewModel {
             self.rows = Arc::default();
             self.selected = 0;
             self.navigated = false;
-            self.actions_open = false;
+            self.action_panel = None;
         }
         self.dirty = true;
         Some(UiEffect::Query(text))
@@ -1132,6 +1335,18 @@ impl LauncherViewModel {
         let Some(selected) = self.rows.get(self.selected) else {
             return false;
         };
+        // Status is host feedback, not an unbounded copy of a worker exception.
+        // Bound once at admission; paint and hover share the same UTF-8 text.
+        let mut status = status;
+        let limit = action_panel::MAX_ACTION_TEXT_BYTES;
+        if status.len() > limit {
+            let mut end = limit - '…'.len_utf8();
+            while !status.is_char_boundary(end) {
+                end -= 1;
+            }
+            status.truncate(end);
+            status.push('…');
+        }
         if selected.status.as_deref() == Some(status.as_str()) {
             return true;
         }
@@ -1544,37 +1759,104 @@ impl LauncherViewModel {
         true
     }
 
-    /// Opens the action list of the selected row (spec 6.3).
-    ///
-    /// Only a row that carries alternate actions has a list worth showing: the
-    /// default action already answers to `ExecuteDefault`, so an overlay over
-    /// nothing is not a state the launcher can be left stuck in. Reopening an
-    /// open list changes nothing.
     fn open_actions(&mut self) {
-        if self.actions_open {
+        if self.action_panel.is_some() {
             return;
         }
-
-        let has_alternates = self
-            .rows
-            .get(self.selected)
-            .is_some_and(|row| !row.alternate_actions.is_empty());
-        if !has_alternates {
+        let Some(row) = self.current_action_row() else {
             return;
+        };
+        match action_tree(row) {
+            Ok(tree) => {
+                self.action_panel = Some(Arc::new(ActionPanel::new(tree)));
+                self.navigated = true;
+                self.preview.focused = false;
+                self.preview.detail = false;
+                self.dirty = true;
+            }
+            Err(reason) => {
+                let _ = self.set_selected_status(reason.to_string());
+            }
         }
+    }
 
-        self.actions_open = true;
+    fn current_action_row(&self) -> Option<&ResultRow> {
+        if self.settings_open
+            || self.page.is_some()
+            || self.active != self.published
+            || self.publication_view != Some(self.view_id)
+        {
+            return None;
+        }
+        self.rows.get(self.selected)
+    }
+
+    fn action_back(&mut self) {
+        if self
+            .action_panel
+            .as_mut()
+            .is_none_or(|panel| Arc::make_mut(panel).back() == ActionPanelNavigation::Close)
+        {
+            self.close_actions();
+        }
         self.dirty = true;
+    }
+
+    fn activate_panel(&mut self) -> Option<UiEffect> {
+        self.current_action_row()?;
+        let panel = self.action_panel.as_mut()?;
+        let row = self.rows.iter().find(|row| panel.tree().target().matches(row))?;
+        let activation = Arc::make_mut(panel).activation(row).ok().flatten();
+        self.dirty = true;
+        match activation {
+            Some(ActionActivation::Execute(execution)) => self.execute_action(execution),
+            _ => None,
+        }
+    }
+
+    fn dispatch_action(&mut self, target: &ActionTarget, identity: &ActionIdentity) -> Option<UiEffect> {
+        self.current_action_row()?;
+        let row = self.rows.get(self.selected)?;
+        if !target.matches(row) {
+            return None;
+        }
+        if let Some(panel) = &mut self.action_panel {
+            if panel.tree().target() != target || panel.invalidation().is_some() {
+                return None;
+            }
+            if let Some(execution) = panel.tree().execution(identity, row).ok().flatten() {
+                return self.execute_action(execution);
+            }
+            if !Arc::make_mut(panel).select(identity) && panel.selected() != Some(identity) {
+                return None;
+            }
+            return self.activate_panel();
+        }
+        let tree = action_tree(row).ok()?;
+        let execution = tree.execution(identity, row).ok().flatten()?;
+        self.execute_action(execution)
+    }
+
+    fn execute_action(&mut self, execution: ActionExecution) -> Option<UiEffect> {
+        self.close_actions();
+        match execution {
+            ActionExecution::Plugin { owner, item, action } => {
+                Some(UiEffect::Execute { owner, item, action })
+            }
+            ActionExecution::Host(HostAction::OpenSettings) => {
+                self.open_settings(None).then_some(UiEffect::ClosePage)
+            }
+        }
     }
 
     /// Closes the action list. An already closed list is not a change, so this
     /// produces no frame of its own.
     fn close_actions(&mut self) {
-        if !self.actions_open {
+        if self.action_panel.is_none() {
             return;
         }
 
-        self.actions_open = false;
+        self.action_panel = None;
         self.dirty = true;
     }
 
@@ -1591,7 +1873,7 @@ impl LauncherViewModel {
         // Only leaving the row retires its action list; a boundary key still
         // reveals the same selected row without closing its actions.
         if target != self.selected {
-            self.actions_open = false;
+            self.close_actions();
         }
 
         self.selected = target;
@@ -1647,9 +1929,27 @@ impl LauncherViewModel {
     }
 }
 
-fn execute(row: &ResultRow, action: &Action) -> UiEffect {
-    UiEffect::Execute {
-        item: row.item.clone(),
-        action: action.action_id.clone(),
+fn reconcile_action_panel(panel: &mut Option<Arc<ActionPanel>>, rows: &[ResultRow]) {
+    if let Some(panel) = panel {
+        let replacement = rows
+            .iter()
+            .find(|row| panel.tree().target().matches(row))
+            .and_then(|row| action_tree(row).ok());
+        let _ = Arc::make_mut(panel).reconcile(replacement);
     }
+}
+
+fn action_tree(row: &ResultRow) -> Result<Arc<ActionTree>, action_panel::ActionPanelRefusal> {
+    use action_panel::{ActionEntry, ActionPresentation};
+    let host = ActionEntry::Submenu {
+        id: "launcher-settings".into(),
+        presentation: ActionPresentation {
+            label: "Launcher Settings".into(),
+            description: "Open launcher settings.".into(),
+            icon_reference: Some("host:settings".into()),
+            ..Default::default()
+        },
+        entries: vec![ActionTree::open_settings_entry()],
+    };
+    ActionTree::from_flat(row, vec![host])
 }

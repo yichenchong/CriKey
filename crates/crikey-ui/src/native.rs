@@ -3,7 +3,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
@@ -245,6 +245,9 @@ pub enum NativeLauncherEvent {
     /// active, so an answer belonging to a dismissed or superseded activation
     /// is dropped rather than merged into a newer one.
     ProviderAnswer,
+    /// Process-scoped action terminals are ready to drain, including while
+    /// hidden. This notification never activates or presents the launcher.
+    ActionCompletion,
 }
 
 /// Creates an egui context configured with the launcher's shared visual tokens.
@@ -293,9 +296,193 @@ pub fn build_launcher_frame(context: &egui::Context, input: RawInput, model: &Vi
     build_launcher_frame_with_transparency(context, input, model, false, false)
 }
 
+#[derive(Clone)]
+struct DeferredActionInput {
+    token: u64,
+    source: Arc<crate::ActionInputCheckpoint>,
+    focus_ready: bool,
+    events: Vec<egui::Event>,
+}
+
+fn action_input_queue() -> egui::Id {
+    egui::Id::new("crikey-action-input-tail")
+}
+
+fn has_action_input(context: &egui::Context) -> bool {
+    context.data(|data| data.get_temp::<u64>(action_input_queue()).is_some())
+}
+
+fn clear_action_input(context: &egui::Context) {
+    context.data_mut(|data| {
+        data.remove::<Option<DeferredActionInput>>(action_input_queue());
+        data.remove::<u64>(action_input_queue());
+        data.remove::<bool>(egui::Id::new("crikey-action-ime"));
+    });
+}
+
+/// Remove a host key from the focused editor's stream. The existing TextEdit
+/// admits only its prefix; a host receipt, not an egui repaint, releases its tail.
+fn prepare_action_input(
+    context: &egui::Context,
+    input: &mut RawInput,
+    model: &ViewModel,
+) -> (Option<UiCommand>, bool, bool) {
+    let editor = egui::Id::new("crikey-action-search");
+    let focused = input.focused
+        && !input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::WindowFocused(false)));
+    let pending = context
+        .data_mut(|data| data.remove_temp::<Option<DeferredActionInput>>(action_input_queue()))
+        .flatten();
+    context.data_mut(|data| data.remove::<u64>(action_input_queue()));
+    let mut resumed = false;
+    if let Some(mut pending) = pending {
+        let receipt = model
+            .input_receipt
+            .as_ref()
+            .filter(|receipt| receipt.token == pending.token);
+        let owner = receipt.map_or(pending.source.as_ref(), |receipt| &receipt.owner);
+        let editor_owned = model.action_panel.as_ref().is_none_or(|panel| {
+            pending
+                .source
+                .panel
+                .as_ref()
+                .is_none_or(|before| before.focus_token() != panel.focus_token())
+                || context.memory(|memory| memory.focused() == Some(editor))
+        });
+        let valid = focused
+            && editor_owned
+            && receipt.is_none_or(|receipt| receipt.accepted)
+            && owner.matches(
+                model.view,
+                model.generation,
+                &model.query,
+                model.rows.get(model.selected),
+                model.action_panel.as_ref(),
+                (model.preview.focused, model.preview.detail),
+            );
+        if valid {
+            pending.events.append(&mut input.events);
+            if receipt.is_none()
+                || (model.settings_open && owner.view != pending.source.view && !pending.focus_ready)
+            {
+                // Establish a fresh Settings surface's ordinary editor focus
+                // once before delivering the retained stream.
+                let establish_focus = receipt.is_some();
+                pending.focus_ready |= establish_focus;
+                context.data_mut(|data| {
+                    data.insert_temp(action_input_queue(), pending.token);
+                    data.insert_temp(action_input_queue(), Some(pending));
+                });
+                if establish_focus {
+                    context.request_repaint();
+                }
+                return (None, true, false);
+            }
+            if model.action_panel.is_some() {
+                context.memory_mut(|memory| memory.request_focus(editor));
+            } else if !model.settings_open && model.page.is_none() && !model.preview.focused {
+                context.memory_mut(|memory| memory.request_focus(egui::Id::new("crikey-root-search")));
+            }
+            input.events = pending.events;
+            resumed = true;
+        } else {
+            // Only the obsolete suffix is retired. Distinct newer keys were
+            // held by native ingress too, and still belong to the current view.
+            resumed = focused && !input.events.is_empty();
+            if resumed {
+                if model.action_panel.is_some() {
+                    context.memory_mut(|memory| memory.request_focus(editor));
+                } else if !model.settings_open && model.page.is_none() && !model.preview.focused {
+                    context.memory_mut(|memory| memory.request_focus(egui::Id::new("crikey-root-search")));
+                }
+            }
+        }
+    }
+    if !focused || (model.action_panel.is_none() && !resumed) {
+        return (None, false, resumed);
+    }
+    if model.action_panel.is_some() && !context.memory(|memory| memory.focused() == Some(editor)) {
+        return (None, false, resumed);
+    }
+    let mut composing = context.data(|data| {
+        data.get_temp::<bool>(egui::Id::new("crikey-action-ime"))
+            .unwrap_or(false)
+    });
+    let mut boundary = None;
+    for (index, event) in input.events.iter().enumerate() {
+        match event {
+            egui::Event::Ime(egui::ImeEvent::Enabled) => composing = true,
+            egui::Event::Ime(egui::ImeEvent::Preedit(text)) => composing |= !text.is_empty(),
+            egui::Event::Ime(egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled) => composing = false,
+            egui::Event::Key {
+                key,
+                modifiers,
+                pressed: true,
+                ..
+            } if !composing => {
+                let command = if model.action_panel.is_some() {
+                    if let Some(command @ (UiCommand::ShowActions | UiCommand::OpenSettings)) =
+                        deferred_root_key(*key, *modifiers, model)
+                    {
+                        command
+                    } else {
+                        if !modifiers.matches_logically(egui::Modifiers::NONE) {
+                            continue;
+                        }
+                        match key {
+                            // TextEdit owns Return and its existing suffix rule.
+                            egui::Key::Enter => break,
+                            egui::Key::ArrowDown => UiCommand::SelectNext,
+                            egui::Key::ArrowUp => UiCommand::SelectPrevious,
+                            egui::Key::PageDown => UiCommand::PageDown,
+                            egui::Key::PageUp => UiCommand::PageUp,
+                            egui::Key::Escape => UiCommand::ActionBack,
+                            _ => continue,
+                        }
+                    }
+                } else if let Some(command) = deferred_root_key(*key, *modifiers, model) {
+                    command
+                } else {
+                    continue;
+                };
+                boundary = Some((index, command));
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some((index, command)) = boundary else {
+        return (None, false, resumed);
+    };
+    let events = input.events.split_off(index + 1);
+    input.events.pop();
+    if !events.is_empty() {
+        static NEXT_INPUT: AtomicU64 = AtomicU64::new(1);
+        let token = NEXT_INPUT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .expect("native input identity exhausted");
+        context.data_mut(|data| {
+            data.insert_temp(action_input_queue(), token);
+            data.insert_temp(
+                action_input_queue(),
+                Some(DeferredActionInput {
+                    token,
+                    source: Arc::new(crate::ActionInputCheckpoint::of(model)),
+                    focus_ready: false,
+                    events,
+                }),
+            );
+        });
+    }
+    (Some(command), false, resumed)
+}
+
 fn build_launcher_frame_with_transparency(
     context: &egui::Context,
-    input: RawInput,
+    mut input: RawInput,
     model: &ViewModel,
     transparent: bool,
     native_web_input: bool,
@@ -315,6 +502,8 @@ fn build_launcher_frame_with_transparency(
             pointer.position = previous_position;
         }
     }
+    let (action_boundary, waiting_for_input, resumed_input) =
+        prepare_action_input(context, &mut input, model);
     let mut commands = Vec::new();
     let mut pass_commands = Vec::new();
     let mut first_pass = true;
@@ -346,6 +535,37 @@ fn build_launcher_frame_with_transparency(
             }
         }
     });
+    if waiting_for_input {
+        commands.clear();
+    } else {
+        let host_boundary = action_boundary.is_some();
+        if let Some(command) = action_boundary {
+            commands.push(command);
+        }
+        let edited_action_query = model.action_panel.is_some()
+            && commands.len() > 1
+            && commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::SetActionQuery(_)));
+        let ordered = resumed_input
+            || has_action_input(context)
+            || (edited_action_query
+                && (host_boundary
+                    || commands.iter().any(|command| {
+                        matches!(
+                            command,
+                            UiCommand::ActivateSelectedAction | UiCommand::ActivateAction { .. }
+                        )
+                    })));
+        if ordered && !commands.is_empty() {
+            let continuation = context.data(|data| data.get_temp::<u64>(action_input_queue()));
+            commands = vec![UiCommand::ApplyInputBatch {
+                continuation,
+                source: Arc::new(crate::ActionInputCheckpoint::of(model)),
+                commands,
+            }];
+        }
+    }
     NativeUiFrame { output, commands }
 }
 
@@ -356,6 +576,7 @@ enum NativeEvent {
     Hide { session: u64 },
     FrameReady { session: u64 },
     ProviderAnswer { session: u64 },
+    ActionCompletion,
     RepaintAfter(Duration),
     DriverError(String),
     Exit,
@@ -432,6 +653,7 @@ struct SharedState {
     lifecycle: AtomicU64,
     frames: Mutex<FrameMailbox>,
     latency: Mutex<ActivationLatencyTracker>,
+    action_wake_pending: AtomicBool,
 }
 
 /// The part of a frame that belongs to the host rather than to a query.
@@ -443,6 +665,9 @@ struct SharedState {
 /// hands.
 #[derive(Debug, Clone)]
 struct Overlay {
+    view: Option<crate::ViewId>,
+    input_receipt: Option<Arc<crate::ActionInputReceipt>>,
+    action_panel: Option<Arc<crate::ActionPanel>>,
     root_selection_revision: u64,
     settings_open: bool,
     settings: Arc<[SettingRow]>,
@@ -468,6 +693,9 @@ impl Default for Overlay {
     /// has said otherwise, and `false` is what the derive would supply.
     fn default() -> Self {
         Self {
+            view: None,
+            input_receipt: None,
+            action_panel: None,
             root_selection_revision: 0,
             settings_open: false,
             settings: Arc::from([] as [SettingRow; 0]),
@@ -502,7 +730,20 @@ fn record_overlay(mailbox: &mut FrameMailbox, session: u64, model: &ViewModel) {
                 .map_or(model.generation, |floor| floor.max(model.generation)),
         );
     }
+    let action_panel = match (&mailbox.overlay.action_panel, &model.action_panel) {
+        (Some(retained), Some(incoming))
+            if mailbox.overlay_session == Some(session)
+                && retained.focus_token() == incoming.focus_token()
+                && retained.invalidation().is_some() =>
+        {
+            Some(retained.clone())
+        }
+        _ => model.action_panel.clone(),
+    };
     mailbox.overlay = Overlay {
+        view: model.view,
+        input_receipt: model.input_receipt.clone(),
+        action_panel,
         root_selection_revision: model.root_selection_revision,
         settings_open: model.settings_open,
         settings: Arc::clone(&model.settings),
@@ -537,7 +778,11 @@ fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> View
     if mailbox.overlay_session != Some(session) {
         return model.clone();
     }
+    let action_panel = mailbox.overlay.action_panel.clone();
     ViewModel {
+        view: mailbox.overlay.view,
+        input_receipt: mailbox.overlay.input_receipt.clone(),
+        action_panel,
         root_selection_revision: mailbox.overlay.root_selection_revision,
         settings_open: mailbox.overlay.settings_open,
         settings: Arc::clone(&mailbox.overlay.settings),
@@ -549,6 +794,8 @@ fn with_overlay(mailbox: &FrameMailbox, session: u64, model: &ViewModel) -> View
         // identity. Only the host-reconciled frame may carry typed preview.
         preview: crate::PreviewPane {
             ratio: mailbox.overlay.preview.ratio,
+            focused: mailbox.overlay.preview.focused,
+            detail: mailbox.overlay.preview.detail,
             ..Default::default()
         },
         ..model.clone()
@@ -561,12 +808,17 @@ impl FrameMailbox {
         let model = match source {
             FrameSource::Host => {
                 record_overlay(self, session, model);
-                model.clone()
+                let mut model = model.clone();
+                model.action_panel = self.overlay.action_panel.clone();
+                model
             }
             FrameSource::Provider => {
                 if !admits_results(self, session, model) {
                     return false;
                 }
+                // Reconciliation is sticky under the mailbox lock. A later
+                // publication cannot revive an already retired host panel.
+                crate::reconcile_action_panel(&mut self.overlay.action_panel, &model.rows);
                 with_overlay(self, session, model)
             }
         };
@@ -712,6 +964,14 @@ impl SharedState {
         }
     }
 
+    fn claim_action_wake(&self) -> bool {
+        !self.action_wake_pending.swap(true, Ordering::AcqRel)
+    }
+
+    fn acknowledge_action_wake(&self) {
+        self.action_wake_pending.store(false, Ordering::Release);
+    }
+
     fn clear_all_frames(&self) {
         let mut mailbox = lock_recover(&self.frames);
         mailbox.latest = None;
@@ -729,6 +989,7 @@ impl Default for SharedState {
             lifecycle: AtomicU64::new(lifecycle_state(0, false)),
             frames: Mutex::new(FrameMailbox::default()),
             latency: Mutex::new(ActivationLatencyTracker::new()),
+            action_wake_pending: AtomicBool::new(false),
         }
     }
 }
@@ -857,6 +1118,20 @@ impl NativeLauncherHandle {
         Ok(())
     }
 
+    /// Announces process-scoped terminal action work without touching session
+    /// or visibility state. Every registered action endpoint uses this route,
+    /// not the presentation-scoped provider-answer route.
+    pub fn request_action_completion(&self) -> Result<(), RendererError> {
+        if !self.shared.claim_action_wake() {
+            return Ok(());
+        }
+        if let Err(error) = self.proxy.send(NativeEvent::ActionCompletion) {
+            self.shared.acknowledge_action_wake();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Replaces the frame waiting for the UI thread with the newest immutable
     /// view model and wakes the loop at most once for that session.
     ///
@@ -936,6 +1211,11 @@ impl NativeLauncherHandle {
 
     pub fn is_visible(&self) -> bool {
         self.shared.is_visible()
+    }
+
+    /// Whether a presentation effect still belongs to this exact activation.
+    pub fn is_visible_session(&self, session: u64) -> bool {
+        self.shared.is_visible_session(session)
     }
 
     /// Reports process-lifetime count plus p95 over the fixed retained ring.
@@ -1601,6 +1881,12 @@ where
                     (self.on_event)(NativeLauncherEvent::ProviderAnswer);
                 }
             }
+            NativeEvent::ActionCompletion => {
+                // Retire first: a producer completing during the host drain
+                // must be able to announce another turn, even without a view.
+                self.shared.acknowledge_action_wake();
+                (self.on_event)(NativeLauncherEvent::ActionCompletion);
+            }
             NativeEvent::RepaintAfter(delay) => self.schedule_repaint(delay),
             NativeEvent::DriverError(message) => {
                 self.fail(event_loop, RendererError::Driver(message));
@@ -1649,11 +1935,38 @@ where
                     is_synthetic: false,
                     ..
                 } if self.active_session.is_some() && !self.ime.composing => {
-                    translate_keyboard(event, self.modifiers, self.frame.as_ref())
+                    if self
+                        .graphics
+                        .as_ref()
+                        .is_some_and(|graphics| has_action_input(&graphics.egui_context))
+                    {
+                        None
+                    } else {
+                        translate_keyboard(event, self.modifiers, self.frame.as_ref())
+                    }
                 }
                 _ => None,
             };
         }
+        // Linux does not forward preedit to egui. Fence composition-owned
+        // action keys here, at their actual native event position, rather than
+        // overwriting the renderer's batch-start state with the final IME state.
+        let ime_owned_action_key = self.ime.composing
+            && self
+                .frame
+                .as_ref()
+                .is_some_and(|frame| !frame.settings_open && frame.page.is_none())
+            && matches!(&event,
+            WindowEvent::KeyboardInput { event, .. } if {
+                let discovery = matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Enter))
+                    && self.modifiers.alt_key()
+                    || matches!(event.logical_key.as_ref(), Key::Character(text) if text.eq_ignore_ascii_case("k"))
+                        && (self.modifiers.control_key() || self.modifiers.super_key());
+                discovery || self.frame.as_ref().is_some_and(|frame| frame.action_panel.is_some())
+                    && matches!(event.logical_key.as_ref(), Key::Named(
+                        NamedKey::Enter | NamedKey::Escape | NamedKey::ArrowUp | NamedKey::ArrowDown
+                        | NamedKey::PageUp | NamedKey::PageDown))
+            });
         {
             let Some(graphics) = self.graphics.as_mut() else {
                 return;
@@ -1662,7 +1975,7 @@ where
                 &event,
                 WindowEvent::CursorMoved { .. } | WindowEvent::CursorLeft { .. }
             );
-            if (command.is_none() && !web_consumed) || pointer_position_changed {
+            if (command.is_none() && !web_consumed && !ime_owned_action_key) || pointer_position_changed {
                 let response = graphics
                     .egui_state
                     .on_window_event(graphics.window.as_ref(), &event);
@@ -1746,6 +2059,11 @@ where
             // clear the view model and hide the window; hiding here as well
             // would be a second, divergent path.
             WindowEvent::Focused(focused) => {
+                if !focused {
+                    if let Some(graphics) = &self.graphics {
+                        clear_action_input(&graphics.egui_context);
+                    }
+                }
                 let dismiss =
                     should_dismiss_on_focus_change(focused, self.active_session.is_some(), self.focused);
                 let web_surface_id = self.web_surface_id();
@@ -1841,7 +2159,7 @@ struct GraphicsState {
 /// field and nothing else. A query with no rows has nothing to list, and the
 /// count in the footer already says so.
 fn shows_results(model: &ViewModel) -> bool {
-    !model.query.is_empty() && !model.rows.is_empty()
+    !model.query.is_empty() && (!model.rows.is_empty() || model.action_panel.is_some())
 }
 
 /// How tall the window has to be to show `model`, in logical pixels.
@@ -1893,11 +2211,8 @@ fn desired_window_height(model: &ViewModel, expanded_height: u32) -> u32 {
     // opened its actions into a window sized for the list alone and pushed the
     // status line off the bottom -- the same clipping, from the other
     // direction, and one that a long result set hides because it is clamped.
-    let actions = if model.actions_open {
-        let buttons = model.rows.get(model.selected).map_or(0, |row| {
-            usize::from(row.default_action.is_some()) + row.alternate_actions.len()
-        });
-        BLOCK_GAP + actions_overlay_height(buttons)
+    let actions = if model.action_panel.is_some() {
+        BLOCK_GAP + actions_overlay_height()
     } else {
         0.0
     };
@@ -2284,6 +2599,8 @@ impl GraphicsState {
     }
 
     fn hide(&mut self) {
+        clear_action_input(&self.egui_context);
+        let _ = self.egui_state.take_egui_input(&self.window);
         self.window.set_ime_allowed(false);
         self.window.set_visible(false);
         for id in release_launcher_textures(&self.egui_context) {
@@ -2776,6 +3093,27 @@ fn translate_keyboard(
     if event.state != ElementState::Pressed {
         return None;
     }
+    translate_logical_key(event.logical_key.as_ref(), modifiers, model)
+}
+
+fn translate_logical_key(
+    key: Key<&str>,
+    modifiers: ModifiersState,
+    model: Option<&ViewModel>,
+) -> Option<UiCommand> {
+    let command = if cfg!(target_os = "macos") {
+        modifiers.super_key()
+    } else {
+        modifiers.control_key()
+    };
+    if matches!(key, Key::Character(","))
+        && command
+        && !modifiers.alt_key()
+        && !modifiers.shift_key()
+        && model.is_none_or(|model| model.page.as_ref().is_none_or(|page| page.frame.web.is_none()))
+    {
+        return Some(UiCommand::OpenSettings);
+    }
     // While a page is open the plugin's surface owns the keyboard, exactly as
     // the settings surface does below: Enter presses the focused node, Tab
     // walks the page's focus ring, and typing goes into whatever field the
@@ -2787,19 +3125,29 @@ fn translate_keyboard(
     // `None` -- so the page never sees the key that closes it and a plugin
     // cannot trap the user inside its own surface.
     if model.is_some_and(|model| model.page.is_some()) {
-        return matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
-            .then_some(UiCommand::ClosePage);
+        return matches!(key, Key::Named(NamedKey::Escape)).then_some(UiCommand::ClosePage);
     }
     // While the settings surface is open its editors own the keyboard: Enter
     // commits an edit and Tab walks between rows, so neither may still run a
     // result. Escape is the exception, because closing the surface is what it
     // means there.
     if model.is_some_and(|model| model.settings_open) {
-        return matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
-            .then_some(UiCommand::Cancel);
+        return matches!(key, Key::Named(NamedKey::Escape)).then_some(UiCommand::Cancel);
     }
-    if model.is_some_and(|model| model.preview.status.is_some()) {
-        if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::F6)) {
+    if matches!(key, Key::Named(NamedKey::Enter)) && modifiers.alt_key()
+        || matches!(key, Key::Character(text) if text.eq_ignore_ascii_case("k"))
+            && (modifiers.control_key() || modifiers.super_key())
+            && !modifiers.alt_key()
+    {
+        return Some(UiCommand::ShowActions);
+    }
+    if model.is_some_and(|model| model.action_panel.is_some()) {
+        // Keep action keys in the same egui event batch as search edits. In
+        // particular, raw Return must not run before queued text is admitted.
+        return None;
+    }
+    if model.is_some_and(|model| model.preview.status.is_some() || model.preview.focused) {
+        if matches!(key, Key::Named(NamedKey::F6)) {
             return Some(if model.is_some_and(|model| model.preview.focused) {
                 UiCommand::LeavePreview
             } else {
@@ -2807,31 +3155,49 @@ fn translate_keyboard(
             });
         }
         if model.is_some_and(|model| model.preview.focused) {
-            return matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape))
-                .then_some(UiCommand::LeavePreview);
+            return matches!(key, Key::Named(NamedKey::Escape)).then_some(UiCommand::LeavePreview);
         }
     }
-    match event.logical_key.as_ref() {
+    match key {
         Key::Named(NamedKey::ArrowDown) => Some(UiCommand::SelectNext),
         Key::Named(NamedKey::ArrowUp) => Some(UiCommand::SelectPrevious),
         Key::Named(NamedKey::PageDown) => Some(UiCommand::PageDown),
         Key::Named(NamedKey::PageUp) => Some(UiCommand::PageUp),
         Key::Named(NamedKey::Tab) => Some(UiCommand::Complete),
         Key::Named(NamedKey::Escape) => Some(UiCommand::Cancel),
-        Key::Named(NamedKey::Enter) if modifiers.alt_key() => Some(UiCommand::ShowActions),
         Key::Named(NamedKey::Enter) => Some(UiCommand::ExecuteDefault),
-        Key::Character(text) if model.is_some_and(|model| model.actions_open) => {
-            let mut characters = text.chars();
-            let digit = characters.next()?.to_digit(10)?;
-            if characters.next().is_some() || digit == 0 {
-                return None;
-            }
-            let index = digit as usize - 1;
-            let row = model?.rows.get(model?.selected)?;
-            (index < row.alternate_actions.len()).then_some(UiCommand::ExecuteAlternate(index))
-        }
         _ => None,
     }
+}
+
+fn deferred_root_key(key: egui::Key, modifiers: egui::Modifiers, model: &ViewModel) -> Option<UiCommand> {
+    let key = match key {
+        egui::Key::ArrowDown => Key::Named(NamedKey::ArrowDown),
+        egui::Key::ArrowUp => Key::Named(NamedKey::ArrowUp),
+        egui::Key::PageDown => Key::Named(NamedKey::PageDown),
+        egui::Key::PageUp => Key::Named(NamedKey::PageUp),
+        egui::Key::Tab => Key::Named(NamedKey::Tab),
+        egui::Key::Escape => Key::Named(NamedKey::Escape),
+        egui::Key::Enter => Key::Named(NamedKey::Enter),
+        egui::Key::F6 => Key::Named(NamedKey::F6),
+        egui::Key::K => Key::Character("k"),
+        egui::Key::Comma => Key::Character(","),
+        _ => return None,
+    };
+    let mut native = ModifiersState::empty();
+    native.set(ModifiersState::SHIFT, modifiers.shift);
+    // egui's portable COMMAND constant carries only the logical alias.
+    // Reify it for the shared native adapter, retaining explicit physical bits.
+    native.set(
+        ModifiersState::CONTROL,
+        modifiers.ctrl || (modifiers.command && !cfg!(target_os = "macos")),
+    );
+    native.set(ModifiersState::ALT, modifiers.alt);
+    native.set(
+        ModifiersState::SUPER,
+        modifiers.mac_cmd || (modifiers.command && cfg!(target_os = "macos")),
+    );
+    translate_logical_key(key, native, Some(model))
 }
 
 fn canvas_fill(colors: theme::Palette, transparent: bool) -> egui::Color32 {
@@ -2865,6 +3231,7 @@ fn draw_launcher(
         preview_render::release_texture(context);
     }
     preview_render::keyboard(context, model, commands);
+    action_render::keyboard(context, model, commands);
     // Ctrl+, is what every desktop means by "open preferences". It is consumed
     // from the egui frame rather than translated out of the raw key event so
     // that the headless frame builder answers to the shortcut exactly as the
@@ -2928,7 +3295,7 @@ fn draw_launcher(
                 // on the window's bottom edge.
                 ui.add_space(theme::SPACE_3);
                 preview_render::draw_results_and_preview(ui, model, commands, colors);
-                if model.actions_open {
+                if model.action_panel.is_some() {
                     ui.add_space(theme::SPACE_3);
                     draw_actions(ui, model, commands, colors);
                 }
@@ -2954,13 +3321,14 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
             let response = ui.add_sized(
                 [ui.available_width(), theme::FIELD_HEIGHT],
                 TextEdit::singleline(&mut query)
+                    .id(egui::Id::new("crikey-root-search"))
                     .font(TextStyle::Heading)
                     .hint_text("Search apps, files, and actions")
                     .hint_text_font(TextStyle::Heading)
                     .desired_width(f32::INFINITY)
                     .margin(Margin::symmetric(theme::SPACE_3, theme::SPACE_1))
                     .frame(false)
-                    .interactive(model.page.is_none())
+                    .interactive(model.page.is_none() && model.action_panel.is_none())
                     .lock_focus(true),
             );
             // The query field takes the keyboard back on every frame, which is
@@ -2973,7 +3341,7 @@ fn draw_query(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand
             // and an editor that keeps it goes on swallowing every `Text`
             // event, so the user would type into a query they cannot see
             // instead of into the field the page is showing them.
-            if model.page.is_some() || model.preview.focused {
+            if model.page.is_some() || model.preview.focused || model.action_panel.is_some() {
                 if response.has_focus() {
                     response.surrender_focus();
                 }
@@ -3046,18 +3414,10 @@ fn draw_results(
     // The central panel's bottom inner margin is already outside
     // `available_height`, so it must not be counted again here.
     //
-    // The actions overlay stands between the list and the footer, so with it
-    // open the list gives up the overlay and a second gap as well. Its height
-    // follows the number of buttons the selected row publishes, because a row
-    // with three alternates draws an overlay half again as tall as one with
-    // none. [`draw_launcher`] spends the gap above the overlay whether or not
-    // [`draw_actions`] finds a row to describe.
-    let overlay = if model.actions_open {
-        BLOCK_GAP
-            + model.rows.get(model.selected).map_or(0.0, |row| {
-                let buttons = usize::from(row.default_action.is_some()) + row.alternate_actions.len();
-                actions_overlay_height(buttons)
-            })
+    // The bounded sheet scrolls internally and reserves the same geometry even
+    // when its target has disappeared and it displays an invalidation.
+    let overlay = if model.action_panel.is_some() {
+        BLOCK_GAP + actions_overlay_height()
     } else {
         0.0
     };
@@ -3171,33 +3531,45 @@ fn draw_result_row(
                     ui.add(egui::Label::new(highlighted_label(row, colors)).truncate());
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = theme::SPACE_1;
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(row_metadata(row))
-                                    .size(theme::TEXT_SMALL)
-                                    .color(colors.text_muted),
-                            )
-                            .truncate(),
-                        );
-                        if let Some(hint) = &row.argument_hint {
-                            ui.label(RichText::new(hint).size(theme::TEXT_SMALL).color(colors.accent));
-                        }
                         if let Some(status) = &row.status {
-                            ui.label(
-                                RichText::new(status)
-                                    .size(theme::TEXT_SMALL)
-                                    .color(colors.warning),
+                            // Failure feedback replaces metadata, rather than
+                            // losing its entire width to a long description.
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(status)
+                                        .size(theme::TEXT_SMALL)
+                                        .color(colors.warning),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(status);
+                        } else {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(row_metadata(row))
+                                        .size(theme::TEXT_SMALL)
+                                        .color(colors.text_muted),
+                                )
+                                .truncate(),
                             );
+                            if let Some(hint) = &row.argument_hint {
+                                ui.label(RichText::new(hint).size(theme::TEXT_SMALL).color(colors.accent));
+                            }
                         }
                     });
                 });
                 if selected && ui.max_rect().width() > 520.0 {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if !row.alternate_actions.is_empty() && ui.button("Actions  Alt+Enter").clicked() {
+                        if ui.button("Actions").clicked() {
                             commands.push(UiCommand::ShowActions);
                         }
                         if row.default_action.is_some() && ui.button("Run  Enter").clicked() {
-                            commands.push(UiCommand::ExecuteDefault);
+                            commands.push(UiCommand::ActivateAction {
+                                target: crate::ActionTarget::of(row),
+                                identity: crate::ActionIdentity::Plugin(
+                                    row.default_action.as_ref().unwrap().action_id.clone(),
+                                ),
+                            });
                         }
                     });
                 }
@@ -3374,80 +3746,16 @@ fn highlighted_label(row: &ResultRow, colors: theme::Palette) -> LayoutJob {
     job
 }
 
-/// The height of the header row [`draw_actions`] opens with, in logical
-/// pixels: one line of [`theme::TEXT_LABEL`] text, which egui lays out 24 px
-/// tall. There is no way to ask a style for that figure without laying the
-/// text out, so it is measured instead -- see [`actions_overlay_height`].
-const ACTIONS_HEADER_HEIGHT: f32 = 24.0;
-
-/// How tall the overlay [`draw_actions`] draws is, in logical pixels, for a
-/// row publishing `buttons` actions.
-///
-/// [`draw_results`] has to know this before the overlay is drawn, because the
-/// overlay comes out of the room the result list would otherwise take. The sum
-/// follows the drawing directly: the frame's [`theme::SPACE_3`] inner margin
-/// at the top and bottom, the header row, the explicit [`theme::SPACE_2`]
-/// under the header plus the one [`theme::ITEM_SPACING_Y`] egui adds ahead of
-/// the first button -- `add_space` advances the cursor and nothing else, so
-/// the implicit spacing lands after the explicit gap and not before it -- and
-/// then one button per action at [`theme::CONTROL_HEIGHT`], separated by item
-/// spacing.
-///
-/// Measured, not guessed:
-/// `a_clamped_window_still_leaves_the_status_line_room_to_be_read` lays the
-/// overlay out and fails if the frame it draws is not this tall, so a
-/// restyled overlay cannot quietly grow over the status line again.
-fn actions_overlay_height(buttons: usize) -> f32 {
-    let chrome = theme::SPACE_3 * 2.0 + ACTIONS_HEADER_HEIGHT + theme::SPACE_2 + theme::ITEM_SPACING_Y;
-    let stack =
-        (buttons as f32) * theme::CONTROL_HEIGHT + (buttons.saturating_sub(1) as f32) * theme::ITEM_SPACING_Y;
-    chrome + stack
+/// Fixed sheet budget, shared with its independently scrolling renderer.
+fn actions_overlay_height() -> f32 {
+    action_render::HEIGHT
 }
 
+#[path = "action_render.rs"]
+mod action_render;
+
 fn draw_actions(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiCommand>, colors: theme::Palette) {
-    let Some(row) = model.rows.get(model.selected) else {
-        return;
-    };
-    // A sheet, not a bordered box: it is the only thing under the field while
-    // it is open, so the surface tier is enough to say it stands over the
-    // list. The accent outline it used to carry only shouted.
-    Frame::default()
-        .fill(colors.surface)
-        .rounding(Rounding::same(theme::RADIUS_MEDIUM))
-        .inner_margin(Margin::same(theme::SPACE_3))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Actions")
-                        .size(theme::TEXT_LABEL)
-                        .strong()
-                        .color(colors.text),
-                );
-                ui.label(RichText::new(display_label(row)).small().color(colors.text_muted));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new("Esc to close").small().color(colors.text_muted));
-                });
-            });
-            ui.add_space(theme::SPACE_2);
-            if let Some(action) = &row.default_action {
-                if ui
-                    .button(format!("Enter  {}", action.label))
-                    .on_hover_text(&action.description)
-                    .clicked()
-                {
-                    commands.push(UiCommand::ExecuteDefault);
-                }
-            }
-            for (index, action) in row.alternate_actions.iter().enumerate() {
-                if ui
-                    .button(format!("{}  {}", index + 1, action.label))
-                    .on_hover_text(&action.description)
-                    .clicked()
-                {
-                    commands.push(UiCommand::ExecuteAlternate(index));
-                }
-            }
-        });
+    action_render::draw(ui, model, commands, colors);
 }
 
 /// Draws the plugin-drawn page and turns this frame's input into page events
@@ -4059,8 +4367,9 @@ fn web_frame_pointer(context: &egui::Context) -> Arc<Mutex<WebPointerState>> {
 /// a frame, preserving hardware keycodes, repeat, wheel phase and IME ranges.
 /// Its event copies inform chrome without fallback replay, including touch:
 /// deferred contacts must never be delivered to a later surface identity.
-/// Standalone frames preserve pointer/scroll/IME and named navigation keys;
-/// missing hardware metadata remains zero. Printable text arrives as text.
+/// Standalone frames preserve pointer/scroll/IME, named navigation keys and
+/// modified printable shortcuts; missing hardware metadata remains zero.
+/// Unmodified printable input remains text-only to avoid duplicate insertion.
 fn web_frame_input(
     ui: &egui::Ui,
     page: &PageSurface,
@@ -4190,7 +4499,7 @@ fn web_frame_input(
                     modifiers,
                     ..
                 } => {
-                    if let Some(keysym) = egui_web_keysym(*key) {
+                    if let Some(keysym) = egui_web_keysym(*key, *modifiers) {
                         commands.push(UiCommand::WebInput(WebSurfaceInput::Key {
                             surface_id,
                             timestamp_ms,
@@ -4228,7 +4537,7 @@ fn web_frame_input(
     });
 }
 
-fn egui_web_keysym(key: egui::Key) -> Option<u32> {
+fn egui_web_keysym(key: egui::Key, modifiers: egui::Modifiers) -> Option<u32> {
     let named = match key {
         egui::Key::ArrowDown => NamedKey::ArrowDown,
         egui::Key::ArrowLeft => NamedKey::ArrowLeft,
@@ -4244,6 +4553,23 @@ fn egui_web_keysym(key: egui::Key) -> Option<u32> {
         egui::Key::PageUp => NamedKey::PageUp,
         egui::Key::PageDown => NamedKey::PageDown,
         _ => {
+            if modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd {
+                let symbol = match key {
+                    egui::Key::Space => " ",
+                    egui::Key::Minus => "-",
+                    egui::Key::Quote => "'",
+                    _ => key.symbol_or_name(),
+                };
+                if let [byte] = symbol.as_bytes() {
+                    if byte.is_ascii() {
+                        return Some(u32::from(if modifiers.shift {
+                            *byte
+                        } else {
+                            byte.to_ascii_lowercase()
+                        }));
+                    }
+                }
+            }
             let function = key.name().strip_prefix('F')?.parse::<u32>().ok()?;
             return (1..=35).contains(&function).then_some(0xffbd + function);
         }
@@ -5177,6 +5503,35 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
             if settings.clicked() {
                 commands.push(UiCommand::OpenSettings);
             }
+            if !model.settings_open && model.page.is_none() && !model.rows.is_empty() {
+                let actions = ui
+                    .add(
+                        egui::Label::new(RichText::new("Actions  Ctrl/Cmd+K").small())
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text("Discover actions: Ctrl/Cmd+K or Alt+Enter");
+                if actions.clicked() {
+                    commands.push(UiCommand::ShowActions);
+                }
+                if let Some(row) = model.rows.get(model.selected) {
+                    if let Some(action) = &row.default_action {
+                        let primary = ui
+                            .add_sized(
+                                [110.0, theme::FOOTER_HEIGHT],
+                                egui::Label::new(RichText::new(format!("{}  Enter", action.label)).small())
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(&action.label);
+                        if primary.clicked() {
+                            commands.push(UiCommand::ActivateAction {
+                                target: crate::ActionTarget::of(row),
+                                identity: crate::ActionIdentity::Plugin(action.action_id.clone()),
+                            });
+                        }
+                    }
+                }
+            }
             // Only the legend is optional; the `Settings  Ctrl+,` control above
             // is drawn unconditionally, because it is the one mouse route into
             // the settings surface and hiding it would make the setting that
@@ -5185,7 +5540,7 @@ fn draw_status(ui: &mut egui::Ui, model: &ViewModel, commands: &mut Vec<UiComman
             // `interact_size.y` above, and what remains is the same one line of
             // small text the window arithmetic in `STATUS_BLOCK_HEIGHT` is
             // measured against.
-            if model.show_hints {
+            if model.show_hints && (model.rows.is_empty() || model.page.is_some() || model.settings_open) {
                 ui.label(
                     RichText::new(if web_page {
                         "Tab navigate page   Esc close page"
@@ -5248,13 +5603,15 @@ mod transparency_tests {
         }
 
         let model = ViewModel {
+            view: None,
+            input_receipt: None,
             generation: crikey_core::Generation::ZERO,
             query: String::new(),
             rows: Arc::default(),
             selected: 0,
             root_selection_revision: 0,
             pending_plugins: false,
-            actions_open: false,
+            action_panel: None,
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,
@@ -5521,13 +5878,15 @@ mod lifecycle_tests {
             mailbox.latest = Some(PendingFrame {
                 session: 7,
                 model: ViewModel {
+                    view: None,
+                    input_receipt: None,
                     generation: crikey_core::Generation::ZERO,
                     query: String::new(),
                     rows: Arc::default(),
                     selected: 0,
                     root_selection_revision: 0,
                     pending_plugins: false,
-                    actions_open: false,
+                    action_panel: None,
                     settings_open: false,
                     settings: Arc::default(),
                     settings_focus: None,
@@ -5603,6 +5962,28 @@ mod lifecycle_tests {
         );
     }
 
+    #[test]
+    fn action_completion_wakes_are_process_scoped_and_coalesce_until_drained() {
+        let state = SharedState::default();
+        assert!(!state.is_visible());
+        assert!(state.claim_action_wake());
+        assert!(!state.claim_action_wake());
+        let session = state.claim_activation().unwrap();
+        assert!(state.is_visible_session(session));
+        assert!(
+            !state.claim_action_wake(),
+            "activation cannot discard a process wake"
+        );
+        assert!(state.claim_hide(session));
+        assert!(!state.is_visible());
+        state.acknowledge_action_wake();
+        assert!(
+            state.claim_action_wake(),
+            "hidden terminal work can announce another drain"
+        );
+        assert!(!state.is_visible());
+    }
+
     /// The promise is per session, so an announcement left outstanding by a
     /// session that ended cannot silence the next one.
     #[test]
@@ -5633,13 +6014,15 @@ fn clearing_all_frames_releases_a_queued_frame_for_shutdown() {
         mailbox.latest = Some(PendingFrame {
             session: 1,
             model: ViewModel {
+                view: None,
+                input_receipt: None,
                 generation: crikey_core::Generation::ZERO,
                 query: String::new(),
                 rows: Arc::default(),
                 selected: 0,
                 root_selection_revision: 0,
                 pending_plugins: false,
-                actions_open: false,
+                action_panel: None,
                 settings_open: false,
                 settings: Arc::default(),
                 settings_focus: None,
@@ -5990,13 +6373,15 @@ mod window_geometry_tests {
 
     fn view(query: &str, settings_open: bool) -> ViewModel {
         ViewModel {
+            view: None,
+            input_receipt: None,
             generation: crikey_core::Generation::ZERO,
             query: query.to_owned(),
             rows: Arc::default(),
             selected: 0,
             root_selection_revision: 0,
             pending_plugins: false,
-            actions_open: false,
+            action_panel: None,
             settings_open,
             settings: Arc::default(),
             settings_focus: None,
@@ -6082,6 +6467,185 @@ mod window_geometry_tests {
             !with_overlay(&mailbox, 7, &view("term", false)).settings_open,
             "closing the surface is the host's to say, and it sticks"
         );
+    }
+
+    #[test]
+    fn direct_provider_republication_preserves_or_invalidates_the_owned_input_continuation() {
+        fn apply(
+            launcher: &mut crate::LauncherViewModel,
+            command: UiCommand,
+            effects: &mut Vec<crate::UiEffect>,
+        ) {
+            match launcher.apply(command) {
+                Some(crate::UiEffect::InputBatch {
+                    continuation,
+                    commands,
+                }) => {
+                    for command in commands {
+                        apply(launcher, command, effects);
+                    }
+                    if let Some(token) = continuation {
+                        launcher.finish_input_batch(token);
+                    }
+                }
+                Some(effect) => effects.push(effect),
+                None => {}
+            }
+        }
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let input = |events| RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(720.0, 640.0),
+            )),
+            focused: true,
+            events,
+            ..Default::default()
+        };
+        for mutation in ["unchanged", "target", "action"] {
+            let context = create_launcher_context();
+            let mut row = view_with_rows(1).rows[0].clone();
+            let action = |id: &str, label: &str| crikey_core::Action {
+                action_id: crikey_core::ActionId(id.into()),
+                label: label.into(),
+                description: String::new(),
+                applicable_categories: Vec::new(),
+                icon_reference: None,
+                execution_policy: crikey_core::ExecutionPolicy::Plugin,
+            };
+            row.default_action = Some(action("run", "Run"));
+            row.alternate_actions = vec![action("copy", "Copy A"), action("reveal", "Copy B")];
+            let mut launcher = crate::LauncherViewModel::new();
+            launcher.activate();
+            launcher.apply(UiCommand::SetQuery("q".into()));
+            launcher.begin_generation(crikey_core::Generation::from_raw(1));
+            launcher.publish(crikey_core::Generation::from_raw(1), vec![row], false);
+            launcher.apply(UiCommand::ShowActions);
+            let host = launcher.frame().unwrap();
+            let _ = build_launcher_frame(&context, input(vec![]), &host);
+            let frame = build_launcher_frame(
+                &context,
+                input(vec![
+                    egui::Event::Text("Copy".into()),
+                    key(egui::Key::ArrowDown),
+                    key(egui::Key::Enter),
+                ]),
+                &host,
+            );
+            let mut effects = Vec::new();
+            for command in frame.commands {
+                apply(&mut launcher, command, &mut effects);
+            }
+            assert!(effects.is_empty());
+            let host = launcher.frame().unwrap();
+            let mut provider = host.clone();
+            provider.view = None;
+            provider.input_receipt = None;
+            provider.action_panel = None;
+            if mutation != "unchanged" {
+                let mut row = provider.rows[0].clone();
+                if mutation == "target" {
+                    row.item = crikey_core::ItemId("replacement".into());
+                } else {
+                    row.alternate_actions
+                        .retain(|action| action.action_id.0 != "reveal");
+                }
+                provider.rows = vec![row].into();
+            }
+            // This is the results-only mailbox path used by submit_results;
+            // provider defaults must not replace host editor ownership.
+            let mut mailbox = FrameMailbox::default();
+            assert!(mailbox.publish(7, &host, FrameSource::Host));
+            assert!(mailbox.publish(7, &provider, FrameSource::Provider));
+            if mutation != "unchanged" {
+                let mut restored = host.clone();
+                restored.view = None;
+                restored.input_receipt = None;
+                restored.action_panel = None;
+                assert!(mailbox.publish(7, &restored, FrameSource::Provider));
+                assert!(mailbox
+                    .latest
+                    .as_ref()
+                    .unwrap()
+                    .model
+                    .action_panel
+                    .as_ref()
+                    .unwrap()
+                    .invalidation()
+                    .is_some());
+                // A cosmetic host republication with the same panel token
+                // cannot undo an earlier admitted provider retirement either.
+                assert!(mailbox.publish(7, &host, FrameSource::Host));
+                assert!(mailbox
+                    .latest
+                    .as_ref()
+                    .unwrap()
+                    .model
+                    .action_panel
+                    .as_ref()
+                    .unwrap()
+                    .invalidation()
+                    .is_some());
+            }
+            let overlaid = mailbox.latest.as_ref().unwrap().model.clone();
+            assert_eq!(overlaid.view, host.view);
+            assert!(Arc::ptr_eq(
+                overlaid.input_receipt.as_ref().unwrap(),
+                host.input_receipt.as_ref().unwrap(),
+            ));
+            let frame = build_launcher_frame(&context, input(vec![]), &overlaid);
+            for command in frame.commands {
+                apply(&mut launcher, command, &mut effects);
+            }
+            if mutation == "unchanged" {
+                assert_eq!(
+                    effects,
+                    vec![crate::UiEffect::Execute {
+                        owner: crikey_core::PluginId("geometry-fixture".into()),
+                        item: crikey_core::ItemId("item-0".into()),
+                        action: crikey_core::ActionId("reveal".into()),
+                    }]
+                );
+            } else {
+                assert!(effects.is_empty(), "{mutation}");
+                let old_token = host.action_panel.as_ref().unwrap().focus_token();
+                launcher.apply(UiCommand::ActionBack);
+                launcher.apply(UiCommand::ActionBack);
+                launcher.apply(UiCommand::ShowActions);
+                let reopened = launcher.frame().unwrap();
+                assert_ne!(reopened.action_panel.as_ref().unwrap().focus_token(), old_token);
+                assert!(mailbox.publish(7, &reopened, FrameSource::Host));
+                assert!(mailbox
+                    .latest
+                    .as_ref()
+                    .unwrap()
+                    .model
+                    .action_panel
+                    .as_ref()
+                    .unwrap()
+                    .invalidation()
+                    .is_none());
+                let _ = build_launcher_frame(&context, input(vec![]), &reopened);
+                let frame = build_launcher_frame(&context, input(vec![key(egui::Key::Enter)]), &reopened);
+                for command in frame.commands {
+                    apply(&mut launcher, command, &mut effects);
+                }
+                assert_eq!(
+                    effects,
+                    vec![crate::UiEffect::Execute {
+                        owner: crikey_core::PluginId("geometry-fixture".into()),
+                        item: crikey_core::ItemId("item-0".into()),
+                        action: crikey_core::ActionId("run".into()),
+                    }]
+                );
+            }
+        }
     }
 
     /// The hint-line preference is the host's half of a frame too, and a
@@ -6733,7 +7297,9 @@ mod window_geometry_tests {
             let mut all = model.rows.to_vec();
             all[0] = first;
             model.rows = all.into();
-            model.actions_open = true;
+            model.action_panel = Some(Arc::new(crate::ActionPanel::new(
+                crate::action_tree(&model.rows[model.selected]).unwrap(),
+            )));
 
             let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
             let bottom = frame_bottom(&frame_at(&model, height));
@@ -6779,9 +7345,7 @@ mod window_geometry_tests {
             }
         }
 
-        // Three actions per row, so the overlay is tall enough that reserving
-        // its chrome alone would not be enough either.
-        const BUTTONS: usize = 3;
+        // A structured sheet has a fixed height and scrolls its bounded entries.
 
         for actions_open in [false, true] {
             // Far more results than the window can hold: this is the case the
@@ -6798,7 +7362,11 @@ mod window_geometry_tests {
                 })
                 .collect();
             model.rows = rows.into();
-            model.actions_open = actions_open;
+            model.action_panel = actions_open.then(|| {
+                Arc::new(crate::ActionPanel::new(
+                    crate::action_tree(&model.rows[model.selected]).unwrap(),
+                ))
+            });
 
             let height = desired_window_height(&model, theme::DEFAULT_WINDOW_HEIGHT);
             assert_eq!(
@@ -6913,9 +7481,8 @@ mod window_geometry_tests {
                 );
                 assert_eq!(
                     sheets[1].height(),
-                    actions_overlay_height(BUTTONS),
-                    "the actions overlay for {BUTTONS} actions is not the height \
-                     draw_results reserves for it"
+                    actions_overlay_height(),
+                    "the action sheet must match the height reserved above the footer"
                 );
             }
         }

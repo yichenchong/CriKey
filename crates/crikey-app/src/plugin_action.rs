@@ -7,12 +7,39 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crikey_core::{ActionId, CoreError, Item, ItemId, PageInput, PluginId, Result as CoreResult};
 use crikey_plugin_model::{permissions::admit_web_surface, FilesystemScope, Permissions};
 
 use crate::plugin_page::PageUpdate;
+
+type CompletionCallback = Arc<dyn Fn() + Send + Sync>;
+
+/// Process-scoped terminal notification, independent of result/session wakes.
+/// Ring only after releasing the completion mailbox lock, so the receiver may
+/// drain immediately without blocking the producer.
+#[derive(Clone, Default)]
+pub(crate) struct CompletionWake(Arc<Mutex<Option<CompletionCallback>>>);
+
+impl CompletionWake {
+    pub(crate) fn install(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = Some(wake);
+    }
+
+    pub(crate) fn ring(&self) {
+        let wake = self.0.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+}
+
+impl fmt::Debug for CompletionWake {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("CompletionWake").finish_non_exhaustive()
+    }
+}
 
 /// Identifier assigned when a plugin action is admitted to an endpoint.
 ///
@@ -391,6 +418,22 @@ impl PluginActionRouter {
             .get(plugin)
             .ok_or_else(|| CoreError::Invalid(format!("no action runtime owns plugin `{}`", plugin.0)))?
             .submit_plugin_action(plugin, item, action_id, argument)
+    }
+
+    /// Resolves only the requested owner's current provider snapshot.
+    pub fn submit_owned_item(
+        &self,
+        plugin: &PluginId,
+        item_id: &ItemId,
+        action_id: &ActionId,
+        argument: Option<&str>,
+    ) -> CoreResult<ActionRequestId> {
+        let executor = self
+            .providers
+            .get(plugin)
+            .filter(|executor| executor.owns_item(plugin, item_id))
+            .ok_or_else(|| CoreError::Invalid("selected owner's result is no longer current".into()))?;
+        executor.submit_plugin_action_by_id(plugin, item_id, action_id, argument)
     }
 
     /// Drains all terminal action outcomes without waiting for a plugin.
@@ -941,5 +984,75 @@ mod tests {
         assert!(completions
             .iter()
             .any(|completion| completion.request_id == second_request));
+    }
+
+    #[test]
+    fn direct_result_dispatch_never_borrows_a_colliding_siblings_snapshot() {
+        struct Snapshot {
+            available: AtomicBool,
+            retire_on_lookup: AtomicBool,
+            calls: Mutex<Vec<(PluginId, ActionId)>>,
+        }
+        impl PluginActionExecutor for Snapshot {
+            fn submit_plugin_action(
+                &self,
+                _owner: &PluginId,
+                _item: &Item,
+                _action: &ActionId,
+                _argument: Option<&str>,
+            ) -> CoreResult<super::ActionRequestId> {
+                panic!("direct rows must use the provider's current snapshot");
+            }
+            fn owns_item(&self, _owner: &PluginId, item: &ItemId) -> bool {
+                let live = item.0 == "shared" && self.available.load(Ordering::SeqCst);
+                if self.retire_on_lookup.load(Ordering::SeqCst) {
+                    self.available.store(false, Ordering::SeqCst);
+                }
+                live
+            }
+            fn submit_plugin_action_by_id(
+                &self,
+                owner: &PluginId,
+                _item: &ItemId,
+                action: &ActionId,
+                _argument: Option<&str>,
+            ) -> CoreResult<super::ActionRequestId> {
+                if !self.available.load(Ordering::SeqCst) || action.0 != "reveal" {
+                    return Err(crikey_core::CoreError::Invalid("snapshot retired".into()));
+                }
+                self.calls.lock().unwrap().push((owner.clone(), action.clone()));
+                Ok(super::ActionRequestId {
+                    plugin: owner.clone(),
+                    sequence: 1,
+                })
+            }
+        }
+        let snapshot = || {
+            Arc::new(Snapshot {
+                available: AtomicBool::new(true),
+                retire_on_lookup: AtomicBool::new(false),
+                calls: Mutex::new(Vec::new()),
+            })
+        };
+        let first = snapshot();
+        let sibling = snapshot();
+        let owner = PluginId("first".into());
+        let other = PluginId("sibling".into());
+        let item = ItemId("shared".into());
+        let action = ActionId("reveal".into());
+        let mut router = PluginActionRouter::default();
+        router.register([owner.clone()], first.clone()).unwrap();
+        router.register([other], sibling.clone()).unwrap();
+        router.submit_owned_item(&owner, &item, &action, None).unwrap();
+        assert_eq!(
+            *first.calls.lock().unwrap(),
+            vec![(owner.clone(), action.clone())]
+        );
+        assert!(sibling.calls.lock().unwrap().is_empty());
+        first.retire_on_lookup.store(true, Ordering::SeqCst);
+        assert!(router.submit_owned_item(&owner, &item, &action, None).is_err());
+        assert!(router.submit_owned_item(&owner, &item, &action, None).is_err());
+        assert_eq!(first.calls.lock().unwrap().len(), 1);
+        assert!(sibling.calls.lock().unwrap().is_empty());
     }
 }

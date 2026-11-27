@@ -488,6 +488,7 @@ pub(crate) fn residency(effect: &UiEffect) -> Option<Residency> {
         // the user to their results, which is a change of surface and not a
         // reason to hide the window or end the process.
         UiEffect::Query(_)
+        | UiEffect::InputBatch { .. }
         | UiEffect::Execute { .. }
         | UiEffect::OpenPreviewLink { .. }
         | UiEffect::SetSetting { .. }

@@ -108,6 +108,7 @@ mod linux {
     struct Host {
         activations: usize,
         answers: usize,
+        action_completions: usize,
         return_query: bool,
         completed: Option<ViewModel>,
         model: ViewModel,
@@ -136,6 +137,7 @@ mod linux {
         let host = Arc::new(Mutex::new(Host {
             activations: 0,
             answers: 0,
+            action_completions: 0,
             return_query: false,
             completed: None,
             model: empty_model(),
@@ -166,6 +168,7 @@ mod linux {
                         }
                     }
                     NativeLauncherEvent::Command { .. } => {}
+                    NativeLauncherEvent::ActionCompletion => state.action_completions += 1,
                 }
                 std::mem::take(&mut state.return_query)
             };
@@ -294,6 +297,23 @@ mod linux {
             ));
         }
 
+        // Unlike result presentation, terminal action work must reach a parked,
+        // hidden host. No activation or input is sent to make these drains run.
+        for expected in 1..=2 {
+            thread::sleep(QUIET);
+            handle
+                .request_action_completion()
+                .map_err(|error| format!("the hidden action notification was refused: {error}"))?;
+            wait_for(UI_LIMIT, || {
+                (lock(host).action_completions == expected).then_some(())
+            })
+            .ok_or_else(|| format!("hidden action terminal {expected} never reached the idle host"))?;
+            let state = lock(host);
+            if handle.is_visible() || state.activations != 1 || state.answers != 4 {
+                return Err("an action completion changed hidden-session presentation".into());
+            }
+        }
+
         Ok(())
     }
 
@@ -317,13 +337,15 @@ mod linux {
 
     fn empty_model() -> ViewModel {
         ViewModel {
+            view: None,
+            input_receipt: None,
             generation: Generation::ZERO,
             query: String::new(),
             rows: Arc::default(),
             selected: 0,
             root_selection_revision: 0,
             pending_plugins: false,
-            actions_open: false,
+            action_panel: None,
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,

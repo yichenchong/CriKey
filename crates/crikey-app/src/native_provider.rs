@@ -1969,10 +1969,9 @@ struct NativeActionEndpoint {
     /// a `Closed` for the old page could overtake the `Opened` for the new one
     /// on the same child.
     page_closing: Mutex<Option<PageClosing>>,
-    /// Rings the host's event loop when a page frame or an action completion
-    /// lands. Installed after the renderer exists, so it is optional until
-    /// then; a headless caller that never installs one simply polls.
+    /// Rings the host's event loop when a page frame lands.
     wake: WakeSlot,
+    action_wake: crate::plugin_action::CompletionWake,
 }
 impl crate::PluginActionExecutor for NativeActionEndpoint {
     fn submit_plugin_action(
@@ -2279,7 +2278,7 @@ fn report_page_failure(session: &PageSession) {
 fn enqueue_native_completion(
     mailbox: &Mutex<VecDeque<PluginActionCompletion>>,
     completion: PluginActionCompletion,
-    wake: Option<&PageWake>,
+    action_wake: &crate::plugin_action::CompletionWake,
 ) {
     let mut mailbox = mailbox.lock().unwrap_or_else(|error| error.into_inner());
     if mailbox.len() >= ACTION_COMPLETION_CAPACITY {
@@ -2291,13 +2290,8 @@ fn enqueue_native_completion(
     }
     mailbox.push_back(completion);
     drop(mailbox);
-    // An action that finished on a worker thread is invisible until the loop
-    // turns. That matters most for the completion that opens a page: without
-    // this the surface would appear only once the user pressed some unrelated
-    // key.
-    if let Some(wake) = wake {
-        wake();
-    }
+    // Publish before notifying: the callback may drain the mailbox immediately.
+    action_wake.ring();
 }
 
 /// Drives [`NativeProvider::drive_query`] away from the UI thread (spec 6.5;
@@ -2324,15 +2318,16 @@ pub struct NativeDriver {
 }
 
 impl NativeDriver {
-    /// Installs the callback that wakes the host's event loop.
-    ///
-    /// Page frames and action completions are produced on worker threads, and
-    /// the launcher sleeps between keystrokes. Without this they would sit in
-    /// their mailboxes until something unrelated woke the loop, which for a
-    /// page means a surface that freezes after every interaction and never
-    /// animates. Optional so a headless caller that polls can skip it.
+    /// Installs the callback that wakes the host for page frames and lifecycle
+    /// changes. Headless callers that poll can skip it.
     pub fn set_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
         self.action_endpoint.wake.install(Arc::new(wake));
+    }
+
+    /// Installs the process-scoped callback for terminal action completions.
+    /// The completion mailbox is published and unlocked before notification.
+    pub fn set_action_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
+        self.action_endpoint.action_wake.install(Arc::new(wake));
     }
 
     /// Moves the provider and pipeline to a supervisor thread. A thread spawn
@@ -2379,6 +2374,7 @@ impl NativeDriver {
             page: Mutex::new(None),
             page_closing: Mutex::new(None),
             wake: WakeSlot::default(),
+            action_wake: crate::plugin_action::CompletionWake::default(),
         });
         let busy = Arc::new(AtomicBool::new(false));
         let thread_mailbox = Arc::clone(&mailbox);
@@ -2389,6 +2385,7 @@ impl NativeDriver {
         let thread_busy = Arc::clone(&busy);
         let thread_completion_mailbox = Arc::clone(&completion_mailbox);
         let thread_wake = Some(action_endpoint.wake.handle());
+        let thread_action_wake = action_endpoint.action_wake.clone();
         let lifecycle_supervisors = provider.page_supervisors();
         let lifecycle_incarnations = Arc::clone(&provider.incarnations);
         let preview_lifecycle_wake = preview_endpoint.lifecycle_wake();
@@ -2452,7 +2449,7 @@ impl NativeDriver {
                                     enqueue_native_completion(
                                         &thread_completion_mailbox,
                                         completion,
-                                        thread_wake.as_ref(),
+                                        &thread_action_wake,
                                     );
                                 }
                                 drop(slot);
@@ -2526,7 +2523,7 @@ impl NativeDriver {
                             enqueue_native_completion(
                                 &thread_completion_mailbox,
                                 completion,
-                                thread_wake.as_ref(),
+                                &thread_action_wake,
                             );
                             *thread_health.lock().unwrap_or_else(|error| error.into_inner()) =
                                 pipeline.plugin_health_report();
@@ -2573,13 +2570,15 @@ impl NativeDriver {
                             let mut rows = builtin_rows.clone();
                             rows.extend(frame.rows.iter().cloned());
                             let merged = ViewModel {
+                                view: None,
+                                input_receipt: None,
                                 generation: *generation,
                                 query: query.clone(),
                                 rows: rows.into(),
                                 selected: *selected,
                                 root_selection_revision: 0,
                                 pending_plugins: *builtin_pending || frame.pending_plugins,
-                                actions_open: false,
+                                action_panel: None,
                                 settings_open: false,
                                 settings: Arc::default(),
                                 settings_focus: None,
@@ -2626,13 +2625,15 @@ impl NativeDriver {
                         pending |= frame.pending_plugins;
                     }
                     let merged = ViewModel {
+                        view: None,
+                        input_receipt: None,
                         generation: job.generation,
                         query: job.query,
                         rows: rows.into(),
                         selected: job.selected,
                         root_selection_revision: 0,
                         pending_plugins: pending,
-                        actions_open: false,
+                        action_panel: None,
                         settings_open: false,
                         settings: Arc::default(),
                         settings_focus: None,

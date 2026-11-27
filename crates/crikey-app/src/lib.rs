@@ -1686,16 +1686,38 @@ impl SearchService {
         action_id: &ActionId,
         argument: Option<&str>,
     ) -> CoreResult<ActionSubmission> {
-        let mut matching_hits = self.results.iter().filter(|hit| &hit.item.stable_id == item_id);
+        self.execute_current(None, item_id, action_id, argument)
+    }
+
+    /// UI dispatch is always owner-qualified, including asynchronous provider rows.
+    pub fn execute_owned(
+        &self,
+        owner: &PluginId,
+        item_id: &ItemId,
+        action_id: &ActionId,
+    ) -> CoreResult<ActionSubmission> {
+        self.execute_current(Some(owner), item_id, action_id, None)
+    }
+
+    fn execute_current(
+        &self,
+        owner: Option<&PluginId>,
+        item_id: &ItemId,
+        action_id: &ActionId,
+        argument: Option<&str>,
+    ) -> CoreResult<ActionSubmission> {
+        let mut matching_hits = self.results.iter().filter(|hit| {
+            &hit.item.stable_id == item_id && owner.is_none_or(|owner| &hit.item.plugin_id == owner)
+        });
         let Some(hit) = matching_hits.next() else {
-            return self
-                .plugin_actions
-                .as_ref()
-                .ok_or_else(|| {
-                    crikey_core::CoreError::Invalid("selected result is no longer current".to_owned())
-                })?
-                .submit_by_item_id(item_id, action_id, argument)
-                .map(ActionSubmission::Pending);
+            let router = self.plugin_actions.as_ref().ok_or_else(|| {
+                crikey_core::CoreError::Invalid("selected result is no longer current".to_owned())
+            })?;
+            return match owner {
+                Some(owner) => router.submit_owned_item(owner, item_id, action_id, argument),
+                None => router.submit_by_item_id(item_id, action_id, argument),
+            }
+            .map(ActionSubmission::Pending);
         };
         if matching_hits.next().is_some() {
             return Err(crikey_core::CoreError::Invalid(
@@ -2296,6 +2318,80 @@ mod tests {
             .execute(&ItemId("same".to_owned()), &ActionId("run".to_owned()))
             .expect_err("an ambiguous item id must not select an arbitrary owner");
         assert!(error.to_string().contains("ambiguous item ownership"));
+    }
+
+    #[test]
+    fn filtered_panel_execution_reaches_only_the_selected_owners_non_first_callback() {
+        use crikey_ui::{LauncherViewModel, UiCommand, UiEffect};
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<(PluginId, ActionId)>>);
+        impl PluginActionExecutor for Recorder {
+            fn submit_plugin_action(
+                &self,
+                owner: &PluginId,
+                _item: &Item,
+                action: &ActionId,
+                _argument: Option<&str>,
+            ) -> CoreResult<ActionRequestId> {
+                self.0.lock().unwrap().push((owner.clone(), action.clone()));
+                Ok(ActionRequestId {
+                    plugin: owner.clone(),
+                    sequence: 1,
+                })
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let mut router = PluginActionRouter::default();
+        router
+            .register([plugin(OWNER), plugin(OTHER)], recorder.clone())
+            .unwrap();
+        let mut service = accepting(ResultLimits::default());
+        service.set_plugin_action_router(Arc::new(router));
+        for owner in [OWNER, OTHER] {
+            let mut item = burning("same", owner);
+            item.actions = ["run", "copy", "reveal"]
+                .into_iter()
+                .map(|id| Action {
+                    action_id: ActionId(id.into()),
+                    label: id.into(),
+                    description: String::new(),
+                    applicable_categories: vec![Category::Application],
+                    icon_reference: None,
+                    execution_policy: ExecutionPolicy::Plugin,
+                })
+                .collect();
+            service.replace_catalog(&plugin(owner), 1, vec![item]).unwrap();
+        }
+        let generation = service.submit_query("fire").unwrap();
+        let rows = service.result_rows();
+        let selected_owner = rows[0].plugin.clone();
+        let mut ui = LauncherViewModel::new();
+        ui.activate();
+        let _ = ui.apply(UiCommand::SetQuery("fire".into()));
+        ui.begin_generation(generation);
+        ui.publish(generation, rows, false);
+        let _ = ui.apply(UiCommand::ShowActions);
+        let _ = ui.apply(UiCommand::SetActionQuery("reveal".into()));
+        let frame = ui.frame().unwrap();
+        assert_eq!(frame.action_panel.as_ref().unwrap().visible_entries().len(), 1);
+        let Some(UiEffect::Execute { owner, item, action }) = ui.apply(UiCommand::ActivateSelectedAction)
+        else {
+            panic!("filtered leaf must produce execution");
+        };
+        assert_eq!(owner, selected_owner);
+        assert_eq!(action.0, "reveal");
+        service.execute_owned(&owner, &item, &action).unwrap();
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            vec![(selected_owner.clone(), ActionId("reveal".into()))]
+        );
+        service.replace_catalog(&selected_owner, 2, vec![]).unwrap();
+        assert!(service.execute_owned(&selected_owner, &item, &action).is_err());
+        assert_eq!(
+            recorder.0.lock().unwrap().len(),
+            1,
+            "a removed owner must not redirect to its sibling"
+        );
     }
 
     #[test]

@@ -250,13 +250,15 @@ mod linux {
 
     fn query_model(query: &str) -> ViewModel {
         ViewModel {
+            view: None,
+            input_receipt: None,
             generation: Generation::ZERO,
             query: query.to_owned(),
             rows: Arc::default(),
             selected: 0,
             root_selection_revision: 0,
             pending_plugins: false,
-            actions_open: false,
+            action_panel: None,
             settings_open: false,
             settings: Arc::default(),
             settings_focus: None,
