@@ -425,17 +425,17 @@ fn prepare_action_input(
                 || (owner.typed != pending.source.typed && !pending.focus_ready)
                 || context.memory(|memory| memory.focused() == pending.typed_focus))
             && receipt.is_none_or(|receipt| receipt.accepted)
-            && owner.matches(
-                model.view,
-                model.generation,
-                &model.query,
-                model.rows.get(model.selected),
-                model.action_panel.as_ref(),
-                (model.preview.focused, model.preview.detail),
-                model.navigation.standard.as_ref(),
-                model.navigation.standard_refresh_pending,
-                model.navigation.inline_arguments.as_ref(),
-            );
+            && owner.matches(crate::CurrentInputState {
+                view: model.view,
+                generation: model.generation,
+                query: &model.query,
+                row: model.rows.get(model.selected),
+                panel: model.action_panel.as_ref(),
+                preview_focus: (model.preview.focused, model.preview.detail),
+                standard: model.navigation.standard.as_ref(),
+                standard_refresh_pending: model.navigation.standard_refresh_pending,
+                typed: model.navigation.inline_arguments.as_ref(),
+            });
         if valid {
             pending.events.append(&mut input.events);
             let new_editor = model.settings_open && owner.view != pending.source.view
