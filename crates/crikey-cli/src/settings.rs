@@ -386,6 +386,7 @@ pub(crate) fn residency(effect: &UiEffect) -> Option<Residency> {
         UiEffect::Query(_)
         | UiEffect::RecallQuery
         | UiEffect::ClearQueryHistory
+        | UiEffect::InputBatch { .. }
         | UiEffect::Execute { .. }
         | UiEffect::InvokeCommand { .. }
         | UiEffect::MutateCommandPreferences { .. }

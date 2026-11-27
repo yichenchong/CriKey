@@ -346,6 +346,8 @@ mod linux {
 
     fn empty_model() -> ViewModel {
         ViewModel {
+            view: None,
+            input_receipt: None,
             generation: Generation::ZERO,
             query: String::new(),
             rows: Arc::default(),
