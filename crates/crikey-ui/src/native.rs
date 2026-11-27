@@ -413,11 +413,8 @@ fn prepare_action_input(
             && editor_owned
             && (!model.settings_open
                 || (owner.view != pending.source.view && !pending.focus_ready)
-                || pending.settings_owner.as_ref().is_some_and(|owner| {
-                    crate::settings_management::focused_owner(context, &model.navigation.settings_management)
-                        .as_ref()
-                        == Some(owner)
-                }))
+                || crate::settings_management::focused_owner(context, &model.navigation.settings_management)
+                    == pending.settings_owner)
             && (owner.typed.is_none()
                 || (owner.typed != pending.source.typed && !pending.focus_ready)
                 || context.memory(|memory| memory.focused() == pending.typed_focus))
