@@ -1035,7 +1035,10 @@ fn apply_standard_frame_commands(model: &mut LauncherViewModel, commands: Vec<Ui
     let mut effects = Vec::new();
     for command in commands {
         match model.apply(command) {
-            Some(UiEffect::InputBatch { continuation, commands }) => {
+            Some(UiEffect::InputBatch {
+                continuation,
+                commands,
+            }) => {
                 effects.extend(apply_standard_frame_commands(model, commands));
                 if let Some(token) = continuation {
                     model.finish_input_batch(token);
@@ -1099,7 +1102,10 @@ fn standard_action_search_and_arrows_precede_same_frame_enter() {
                 &current,
             );
             if turn == 0 && case != 2 {
-                assert!(frame.commands.iter().any(|command| matches!(command, UiCommand::ApplyInputBatch { .. })));
+                assert!(frame
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, UiCommand::ApplyInputBatch { .. })));
             }
             effects.extend(apply_standard_frame_commands(&mut model, frame.commands));
             if let Some(next) = model.frame() {
@@ -1127,15 +1133,21 @@ fn standard_input_checkpoint_rejects_replaced_revision_before_any_command() {
     let mut context = open(&mut model, "checkpoint", descriptor(1));
     let source = Arc::new(ActionInputCheckpoint::of(&model.frame().unwrap()));
     context.revision = NonZeroU64::new(12).unwrap();
-    assert!(model.publish_standard_view(owner(), 7, ViewReply {
-        context,
-        descriptor: descriptor(1),
-    }));
-    assert!(model.apply(UiCommand::ApplyInputBatch {
-        continuation: Some(97),
-        source,
-        commands: vec![UiCommand::SetQuery("stale".into()), UiCommand::ExecuteDefault],
-    }).is_none());
+    assert!(model.publish_standard_view(
+        owner(),
+        7,
+        ViewReply {
+            context,
+            descriptor: descriptor(1),
+        }
+    ));
+    assert!(model
+        .apply(UiCommand::ApplyInputBatch {
+            continuation: Some(97),
+            source,
+            commands: vec![UiCommand::SetQuery("stale".into()), UiCommand::ExecuteDefault],
+        })
+        .is_none());
     assert_eq!(model.query, "");
     let receipt = model.frame().unwrap().input_receipt.unwrap();
     assert_eq!(receipt.token, 97);
@@ -1151,26 +1163,36 @@ fn standard_input_receipt_pins_poststate_and_drops_old_tail_after_refresh() {
     let view = model.frame().unwrap();
     let renderer = create_launcher_context();
     let _ = build_launcher_frame(&renderer, input_events(vec![]), &view);
-    let frame = build_launcher_frame(&renderer, input_events(vec![
-        press(egui::Key::ArrowDown),
-        egui::Event::Text("stale".into()),
-        press(egui::Key::Enter),
-    ]), &view);
+    let frame = build_launcher_frame(
+        &renderer,
+        input_events(vec![
+            press(egui::Key::ArrowDown),
+            egui::Event::Text("stale".into()),
+            press(egui::Key::Enter),
+        ]),
+        &view,
+    );
     assert!(apply_standard_frame_commands(&mut model, frame.commands).is_empty());
     let acknowledged = model.frame().unwrap();
     let receipt = acknowledged.input_receipt.as_ref().unwrap();
     assert!(receipt.accepted);
     assert_eq!(receipt.owner, ActionInputCheckpoint::of(&acknowledged));
     context.revision = NonZeroU64::new(12).unwrap();
-    assert!(model.publish_standard_view(owner(), 7, ViewReply {
-        context,
-        descriptor: descriptor(1),
-    }));
+    assert!(model.publish_standard_view(
+        owner(),
+        7,
+        ViewReply {
+            context,
+            descriptor: descriptor(1),
+        }
+    ));
     model.apply(UiCommand::ShowActions);
     let refreshed = model.frame().unwrap();
-    let frame = build_launcher_frame(&renderer, input_events(vec![
-        egui::Event::Text("fresh".into()),
-    ]), &refreshed);
+    let frame = build_launcher_frame(
+        &renderer,
+        input_events(vec![egui::Event::Text("fresh".into())]),
+        &refreshed,
+    );
     assert!(apply_standard_frame_commands(&mut model, frame.commands).is_empty());
     assert_eq!(model.action_panel.as_ref().unwrap().query(), "fresh");
 }

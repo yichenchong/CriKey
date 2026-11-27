@@ -518,9 +518,7 @@ fn catalog_and_suggestion_schemas_for_the_same_executable_remain_independently_u
             worker
                 .execute_typed_confirmed(confirmed, typed_values("conformance-secret"))
                 .unwrap(),
-            crikey_core::structured_view::TypedExecutionOutcome::Submission(
-                SubmissionOutcome::Completed
-            )
+            crikey_core::structured_view::TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
         );
         assert_eq!(
             worker
@@ -531,9 +529,7 @@ fn catalog_and_suggestion_schemas_for_the_same_executable_remain_independently_u
                     typed_values("conformance-secret"),
                 )
                 .unwrap(),
-            crikey_core::structured_view::TypedExecutionOutcome::Submission(
-                SubmissionOutcome::Completed
-            )
+            crikey_core::structured_view::TypedExecutionOutcome::Submission(SubmissionOutcome::Completed)
         );
         worker.shutdown();
     }
