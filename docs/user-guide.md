@@ -168,6 +168,11 @@ Other command-management controls appear only as their backing services become
 available. Escape/Back first clears action search, then leaves a submenu, then
 closes Actions; the launcher query is unchanged. Settings editors, custom pages
 and IME composition retain their own keyboard input.
+Text edits, action navigation and Back are applied in their input order, even
+when delivered together. A retained input suffix follows an intentional host
+view/focus transition, but is retired on focus loss, dismissal or a stale source.
+A query exceeding the UTF-8 byte limit refuses its whole submission, including
+a simultaneous Enter; it never runs the prior selected action instead.
 
 An admitted provider refresh preserves action search and focus for the exact
 owner, item and action. A vanished target or action shows an unavailable
